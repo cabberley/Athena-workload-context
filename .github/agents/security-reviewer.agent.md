@@ -1,7 +1,7 @@
 ---
 name: Athena Security Reviewer
 description: Performs independent read-only review of identity, RBAC, private networking, MCP tools, data handling, prompt injection, and supply-chain risk.
-model: gpt-5.5
+model: gpt-5.6-sol
 tools: ["read", "search", "web"]
 disable-model-invocation: true
 ---

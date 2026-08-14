@@ -1,7 +1,7 @@
 ---
 name: Backend Context API Engineer
 description: Implements the typed Context API, authorization boundaries, draft and publish workflow, and persistence adapters.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

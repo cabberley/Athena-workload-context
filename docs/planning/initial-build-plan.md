@@ -50,8 +50,8 @@ Run this wave serially.
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-001 | Define the canonical context and evidence contracts | Architect + Contract Engineer | GPT-5.5 design, GPT-5.6 Sol implementation | Bootstrap | Pydantic contracts and JSON Schema define manifests, profiles, roles, relationships, evidence snapshots, verdicts, controls, and risk acceptance. ADR records declared-versus-inferred precedence. |
-| WC-002 | Create the canonical constrained-topology fixture | Contract Engineer | GPT-5.6 Sol | WC-001 | One immutable synthetic evidence snapshot represents the database, worker, web, load-balancer, zones, and dependencies. Canonical hashing is deterministic. |
+| WC-001 | Define the canonical context and evidence contracts | Architect + Contract Engineer | GPT-5.5 design, GPT-5.6 Sol architecture challenge, then MAI-Code-1.1-Flash implementation | Bootstrap | GPT-5.6 Sol approves or returns the architecture design before implementation begins. Pydantic contracts and JSON Schema define manifests, profiles, roles, relationships, evidence snapshots, verdicts, controls, and risk acceptance. ADR records declared-versus-inferred precedence. |
+| WC-002 | Create the canonical constrained-topology fixture | Contract Engineer | MAI-Code-1.1-Flash | WC-001 | One immutable synthetic evidence snapshot represents the database, worker, web, load-balancer, zones, and dependencies. Canonical hashing is deterministic. |
 
 ### Contract vocabulary
 
@@ -74,10 +74,10 @@ WC-003 and WC-004 can then run in parallel.
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-003 | Implement environment profile inheritance and manifest validation | Contract Engineer | GPT-5.6 Sol | WC-001 | Production, Development, and Training profiles validate; circular inheritance and unresolved references fail closed. |
-| WC-004 | Implement deterministic contextual policy evaluation | Policy Engineer | GPT-5.3 Codex | WC-001, WC-002 | Pure policy functions evaluate singleton DB, worker-zone, and web-zone controls with evidence and clause references. |
-| WC-005 | Add the three-environment golden proof | Test Engineer | GPT-5.3 Codex | WC-003, WC-004 | The same snapshot digest yields the expected matrix through one code path. Negative tests remove constraints, move workers, collapse zones, expire risk acceptance, and omit evidence. |
-| WC-006 | Add a local reference-demo command | Backend Engineer | GPT-5.6 Sol | WC-005 | One command emits deterministic JSON and human-readable results and exits nonzero on oracle failure. |
+| WC-003 | Implement environment profile inheritance and manifest validation | Contract Engineer | MAI-Code-1.1-Flash | WC-001 | Production, Development, and Training profiles validate; circular inheritance and unresolved references fail closed. |
+| WC-004 | Implement deterministic contextual policy evaluation | Policy Engineer | MAI-Code-1.1-Flash | WC-001, WC-002 | Pure policy functions evaluate singleton DB, worker-zone, and web-zone controls with evidence and clause references. |
+| WC-005 | Add the three-environment golden proof | Test Engineer | MAI-Code-1.1-Flash | WC-003, WC-004 | The same snapshot digest yields the expected matrix through one code path. Negative tests remove constraints, move workers, collapse zones, expire risk acceptance, and omit evidence. |
+| WC-006 | Add a local reference-demo command | Backend Engineer | MAI-Code-1.1-Flash | WC-005 | One command emits deterministic JSON and human-readable results and exits nonzero on oracle failure. |
 
 ### Day 3 gate
 
@@ -90,28 +90,28 @@ concurrently against frozen contracts.
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-007 | Implement Context API and versioned manifest workflow | Backend Engineer | GPT-5.6 Sol | WC-006 | Draft, validate, approve, publish, supersede, compare, and audit work through typed ports. API is the only writer. |
-| WC-008 | Deploy a private read-only Azure MCP foundation | Azure Platform Engineer | GPT-5.6 Sol | WC-006 | Private authenticated ingress, pinned version, hosting identity, read-only mode, exact tool allowlist, and narrow RBAC are proven. |
-| WC-009 | Implement the typed Azure MCP evidence client | Azure Platform Engineer | GPT-5.6 Sol | WC-006 | Scope, schema, tool, freshness, count, size, and provenance validation fail closed; fixture and malformed-response tests pass. |
-| WC-010 | Implement evidence-backed cohort proposals | Cohort Engineer | GPT-5.6 Sol | WC-006 | Multi-signal cohort proposals include confidence, evidence, dissent, and dynamic selectors. A 1,000-resource synthetic test avoids per-VM approval. |
-| WC-011 | Build the Context Studio shell and manifest editor | UX Engineer | GPT-5.4 | WC-006 | Accessible authenticated shell, workload catalogue, environment comparison, structured manifest editor, and visible draft state. |
+| WC-007 | Implement Context API and versioned manifest workflow | Backend Engineer | MAI-Code-1.1-Flash | WC-006 | Draft, validate, approve, publish, supersede, compare, and audit work through typed ports. API is the only writer. |
+| WC-008 | Deploy a private read-only Azure MCP foundation | Azure Platform Engineer | MAI-Code-1.1-Flash | WC-006 | Private authenticated ingress, pinned version, hosting identity, read-only mode, exact tool allowlist, and narrow RBAC are proven. |
+| WC-009 | Implement the typed Azure MCP evidence client | Azure Platform Engineer | MAI-Code-1.1-Flash | WC-006 | Scope, schema, tool, freshness, count, size, and provenance validation fail closed; fixture and malformed-response tests pass. |
+| WC-010 | Implement evidence-backed cohort proposals | Cohort Engineer | MAI-Code-1.1-Flash | WC-006 | Multi-signal cohort proposals include confidence, evidence, dissent, and dynamic selectors. A 1,000-resource synthetic test avoids per-VM approval. |
+| WC-011 | Build the Context Studio shell and manifest editor | UX Engineer | MAI-Code-1.1-Flash | WC-006 | Accessible authenticated shell, workload catalogue, environment comparison, structured manifest editor, and visible draft state. |
 
 ## Wave 3: vertical product slices
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-012 | Add cohort review and approval to Context Studio | UX + Cohort Engineers | GPT-5.4 / GPT-5.6 Sol | WC-007, WC-010, WC-011 | Users approve, split, merge, or reject cohorts and preview generated selectors without editing individual resources. |
-| WC-013 | Evaluate a live demo workload through Azure MCP | Backend + Azure Platform | GPT-5.6 Sol | WC-007, WC-008, WC-009 | Live evidence becomes one immutable snapshot and is evaluated without direct Azure access by the context identity. |
-| WC-014 | Expose the read/propose-only Athena Context MCP | Agent and MCP Engineer | GPT-5.6 Sol | WC-007 | Tools resolve workload, get context, compare environments, explain findings, read history, and propose bounded patches. No publish or remediation tools exist. |
-| WC-015 | Add intended-versus-observed topology and findings views | UX Engineer | GPT-5.4 | WC-012, WC-013 | Declared, observed, inferred, and exception relationships are visually distinct and every finding shows evidence and manifest version. |
+| WC-012 | Add cohort review and approval to Context Studio | UX + Cohort Engineers | MAI-Code-1.1-Flash | WC-007, WC-010, WC-011 | Users approve, split, merge, or reject cohorts and preview generated selectors without editing individual resources. |
+| WC-013 | Evaluate a live demo workload through Azure MCP | Backend + Azure Platform | MAI-Code-1.1-Flash | WC-007, WC-008, WC-009 | Live evidence becomes one immutable snapshot and is evaluated without direct Azure access by the context identity. |
+| WC-014 | Expose the read/propose-only Athena Context MCP | Agent and MCP Engineer | MAI-Code-1.1-Flash | WC-007 | Tools resolve workload, get context, compare environments, explain findings, read history, and propose bounded patches. No publish or remediation tools exist. |
+| WC-015 | Add intended-versus-observed topology and findings views | UX Engineer | MAI-Code-1.1-Flash | WC-012, WC-013 | Declared, observed, inferred, and exception relationships are visually distinct and every finding shows evidence and manifest version. |
 
 ## Wave 4: operational awareness
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-016 | Add one event-driven reassessment path | Eventing Engineer | GPT-5.6 Sol | WC-007, WC-009, WC-013 | One Azure Resource Notification or Monitor alert is normalized, deduplicated, placed on Service Bus, and triggers scoped reassessment. |
-| WC-017 | Add one workload-aware capacity forecast | Eventing Engineer | GPT-5.6 Sol | WC-007, WC-009 | Aggregated metric history produces time-to-threshold, confidence, horizon stage, and insufficient-data outcomes. |
-| WC-018 | Add grounded embedded Copilot | Agent and MCP + UX | GPT-5.6 Sol / GPT-5.4 | WC-014, WC-015 | Copilot explains why environment verdicts differ using cited deterministic findings and refuses unsupported questions. |
+| WC-016 | Add one event-driven reassessment path | Eventing Engineer | MAI-Code-1.1-Flash | WC-007, WC-009, WC-013 | One Azure Resource Notification or Monitor alert is normalized, deduplicated, placed on Service Bus, and triggers scoped reassessment. |
+| WC-017 | Add one workload-aware capacity forecast | Eventing Engineer | MAI-Code-1.1-Flash | WC-007, WC-009 | Aggregated metric history produces time-to-threshold, confidence, horizon stage, and insufficient-data outcomes. |
+| WC-018 | Add grounded embedded Copilot | Agent and MCP + UX | MAI-Code-1.1-Flash | WC-014, WC-015 | Copilot explains why environment verdicts differ using cited deterministic findings and refuses unsupported questions. |
 
 ## Wave 5: integration and release gate
 
@@ -119,8 +119,8 @@ Run serially.
 
 | ID | Issue | Owner | Model | Depends on | Acceptance |
 |---|---|---|---|---|---|
-| WC-019 | Complete private Azure deployment and observability | Azure Platform Engineer | GPT-5.6 Sol | WC-013 through WC-018 | Managed identities, private networking, health probes, traces, queues, and least-privilege role matrix are validated. |
-| WC-020 | Run adversarial, security, scale, and end-to-end gates | Coordinator + Reviewers | GPT-5.5 review, GPT-5.6 Sol fixes | WC-019 | No unresolved high-severity issues; 1,000-resource cohort test, three-profile oracle, event path, forecast, MCP, web, and Copilot all pass. |
+| WC-019 | Complete private Azure deployment and observability | Azure Platform Engineer | MAI-Code-1.1-Flash | WC-013 through WC-018 | Managed identities, private networking, health probes, traces, queues, and least-privilege role matrix are validated. |
+| WC-020 | Run adversarial, security, scale, and end-to-end gates | Coordinator + Reviewers | GPT-5.6 Sol review and validation; MAI-Code-1.1-Flash fixes | WC-019 | No unresolved high-severity issues; 1,000-resource cohort test, three-profile oracle, event path, forecast, MCP, web, and Copilot all pass. |
 
 ## Day gates
 
@@ -143,8 +143,9 @@ Run serially.
 Every builder PR receives:
 
 1. automated tests and static checks;
-2. independent GPT-5.5 adversarial review in fresh context;
-3. security review for identity, MCP, eventing, or data-boundary changes; and
-4. coordinator integration review.
+2. independent GPT-5.6 Sol code review in fresh context;
+3. GPT-5.6 Sol security review for identity, MCP, eventing, or data-boundary changes; and
+4. independent GPT-5.6 Sol integration validation using recorded test, CI, deployment, and demo
+   evidence.
 
 No model approves its own implementation.

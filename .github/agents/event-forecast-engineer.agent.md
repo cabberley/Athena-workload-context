@@ -1,7 +1,7 @@
 ---
 name: Eventing and Forecast Engineer
 description: Implements event normalization, correlation triggers, idempotent processing, and workload-aware capacity forecasting.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

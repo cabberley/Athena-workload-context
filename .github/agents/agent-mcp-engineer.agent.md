@@ -1,7 +1,7 @@
 ---
 name: Agent and Context MCP Engineer
 description: Builds the Athena Context MCP server and shared grounded agent core used by web Copilot and future channels.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

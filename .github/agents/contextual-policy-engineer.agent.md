@@ -1,7 +1,7 @@
 ---
 name: Contextual Policy Engineer
 description: Implements deterministic workload and environment-specific policy evaluation using declared intent and observed evidence.
-model: gpt-5.3-codex
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

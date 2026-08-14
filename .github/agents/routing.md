@@ -5,6 +5,7 @@
 | Issue intent | Primary agent | Required skill |
 |---|---|---|
 | Change product boundary or contract | Architect | `architecture-adr` |
+| Challenge architecture before implementation | Architecture Reviewer | `architecture-review` |
 | Add or change manifest fields | Contract and Manifest | `manifest-author` |
 | Add Context API behavior | Backend Context API | `context-api` |
 | Configure private Azure MCP or Azure RBAC | Azure Platform and MCP | `azure-mcp-integration` |
@@ -14,6 +15,8 @@
 | Change the web experience | UX | `context-studio` |
 | Add Context MCP tools or Copilot behavior | Agent and MCP | `context-mcp` |
 | Expand or repair tests | Test Engineer | `test-hardening` |
+| Review implementation correctness | Code Reviewer | `code-review` |
+| Validate integrated milestone behavior | Integration Validator | `integration-validation` |
 | Review security boundaries | Security Reviewer | `security-review` |
 | Prepare a release | Release Reviewer | `release-review` |
 

@@ -8,7 +8,8 @@ description: Routes Athena work to the correct agent, ownership lane, reviewers,
 3. List exact owned paths and serialized shared paths.
 4. Define prerequisites and dependent issues.
 5. Write measurable acceptance criteria and negative cases.
-6. Assign an independent reviewer using a different model or checkpoint.
+6. Assign MAI-Code-1.1-Flash for implementation and GPT-5.6 Sol for independent fresh-context code
+   review and validation.
 7. Name targeted tests and live validation, if any.
 8. Reject issues that combine architecture, implementation, deployment, and release without a
    justified dependency structure.
