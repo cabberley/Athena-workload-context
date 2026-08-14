@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "athena-workload-context"
+version = "0.1.0"
+description = "Customer-hosted workload context and operational judgment layer for Azure MCP."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "pydantic>=2.11",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.17",
+  "pytest>=8.4",
+  "pytest-cov>=6.2",
+  "ruff>=0.12",
+]
+
+[project.scripts]
+athena-context = "athena_context.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S"]
+
+[tool.mypy]
+python_version = "3.14"
+mypy_path = "src"
+packages = ["athena_context"]
+warn_unused_ignores = true
+disallow_untyped_defs = true
+strict_equality = true
