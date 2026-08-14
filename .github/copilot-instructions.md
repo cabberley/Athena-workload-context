@@ -59,11 +59,13 @@ Athena must retain the real residual risk while suppressing unsupported generic 
 ## Agent workflow
 
 - Use the specialist agent and skill matching the issue.
-- Builders and reviewers must use different models or model checkpoints and fresh context.
-- GPT-5.6 Sol coordinates and performs complex integration.
-- GPT-5.5 owns architecture challenge and independent review.
-- GPT-5.3 Codex handles bounded implementation and test-heavy work.
-- GPT-5.4 handles UX, documentation, and secondary review.
+- MAI-Code-1.1-Flash is the required initial implementation model for code, tests, UX, and
+  infrastructure.
+- GPT-5.6 Sol coordinates integration, performs independent code review, and validates results.
+- GPT-5.5 owns architecture design. GPT-5.6 Sol performs the independent fresh-context architecture
+  challenge before implementation.
 - GPT-5.4 mini handles lightweight exploration and command execution.
+- Builders do not review or approve their own work. Reviewers receive requirements and the diff in
+  fresh context.
 
 See `AGENTS.md`, `.github/agents/team.md`, and `docs/planning/model-allocation.md`.

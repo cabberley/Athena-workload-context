@@ -1,7 +1,7 @@
 ---
 name: Athena Release Reviewer
 description: Performs independent read-only release readiness review across scope, tests, security gates, documentation, migration, rollback, and versioning.
-model: gpt-5.5
+model: gpt-5.6-sol
 tools: ["read", "search"]
 disable-model-invocation: true
 ---

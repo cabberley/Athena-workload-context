@@ -1,7 +1,7 @@
 ---
 name: Contract and Manifest Engineer
 description: Implements versioned Pydantic contracts, JSON Schemas, workload manifests, inheritance, validation, and compatibility tests.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

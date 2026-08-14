@@ -1,7 +1,7 @@
 ---
 name: Athena UX Engineer
 description: Builds the accessible Context Studio for workload configuration, cohort approval, topology, findings, history, and embedded Copilot.
-model: gpt-5.4
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

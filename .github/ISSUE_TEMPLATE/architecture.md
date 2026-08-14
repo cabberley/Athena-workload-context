@@ -21,5 +21,9 @@ assignees: []
 ## Owner and reviewers
 
 - Architect:
+- GPT-5.6 Sol Architecture Reviewer:
 - Contract reviewer:
 - Security reviewer:
+
+Implementation must not begin until the Architecture Reviewer records `approved-for-implementation`
+or all blocking corrections are resolved and re-reviewed.

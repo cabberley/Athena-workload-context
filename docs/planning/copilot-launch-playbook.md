@@ -24,9 +24,10 @@ Read README.md, ARCHITECTURE.md, AGENTS.md, .github/copilot-instructions.md,
 .github/agents/team.md, and docs/planning/initial-build-plan.md.
 
 Prepare Wave 0 issues WC-001 and WC-002. Do not start dependent implementation until the public
-contracts and ownership are frozen. Assign GPT-5.5 architecture design, GPT-5.6 Sol contract
-implementation, GPT-5.3 Codex test coverage, and independent fresh-context review. Keep each issue
-on a separate branch and preserve the context/evidence identity boundary.
+contracts and ownership are frozen. Assign GPT-5.5 architecture design, then require GPT-5.6 Sol
+fresh-context architecture challenge before MAI-Code-1.1-Flash implementation begins. Assign
+MAI-Code-1.1-Flash test coverage and GPT-5.6 Sol independent code review and validation. Keep each
+issue on a separate branch and preserve the context/evidence identity boundary.
 ```
 
 ## Day 1
@@ -38,11 +39,14 @@ Recommended agents:
 
 ```text
 /agent architect
+/agent architecture-reviewer
 /agent contract-manifest-engineer
 /agent test-engineer
 ```
 
-Do not enable broad fleet execution until WC-001 merges.
+Run the architecture reviewer in a fresh Copilot session after the ADR and proposed contracts are
+ready. MAI implementation must not begin until it records `approved-for-implementation`. Do not
+enable broad fleet execution until WC-001 merges.
 
 ## After contract lock: complete the proof first
 
@@ -62,18 +66,23 @@ orchestration, or the same application router.
 
 ## Review loop
 
-For each implementation:
+For each implementation, launch the disabled reviewer agents manually in fresh Copilot sessions:
 
 ```text
 builder implementation
   -> targeted tests
-  -> /review or assigned GPT-5.5 reviewer
-  -> /security-review when relevant
+  -> /agent code-reviewer
+  -> /agent security-reviewer when relevant
   -> builder corrections
-  -> release/integration gate
+  -> /agent integration-validator for an integrated milestone
+  -> /agent release-reviewer for a release candidate
 ```
 
 Reviewers receive requirements and the diff, not the builder's reasoning transcript.
+MAI-Code-1.1-Flash applies corrections; GPT-5.6 Sol revalidates the corrected diff and test results.
+
+Each reviewer prompt must include the issue or milestone acceptance criteria, relevant diff, and
+recorded validation evidence. Reviewer profiles are intentionally not invoked automatically.
 
 ## When the GitHub repository is known
 

@@ -1,7 +1,7 @@
 ---
 name: Athena Test Engineer
 description: Designs deterministic unit, contract, integration, security, scale, and live test coverage without owning production behavior.
-model: gpt-5.3-codex
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

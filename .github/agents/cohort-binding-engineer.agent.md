@@ -1,7 +1,7 @@
 ---
 name: Cohort Binding Engineer
 description: Builds evidence-backed resource clustering, cohort confidence, dynamic selectors, and fail-closed role binding.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute"]
 ---
 

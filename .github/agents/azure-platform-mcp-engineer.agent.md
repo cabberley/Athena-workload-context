@@ -1,7 +1,7 @@
 ---
 name: Azure Platform and MCP Engineer
 description: Builds the private read-only Azure MCP evidence plane, typed evidence client, managed identities, RBAC, networking, and Bicep deployment.
-model: gpt-5.6-sol
+model: mai-code-1.1-flash
 tools: ["read", "search", "edit", "execute", "web"]
 ---
 
