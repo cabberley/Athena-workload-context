@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from jsonschema import Draft202012Validator
 from pydantic import TypeAdapter, ValidationError
 
 from athena_context import __version__
@@ -23,6 +25,7 @@ from athena_context.contracts import (
     EvidenceGapRecord,
     EvidenceGapRef,
     EvidenceItemRef,
+    EvidenceResourceRef,
     EvidenceScope,
     EvidenceSnapshot,
     FailedResponseCollectorAttempt,
@@ -30,7 +33,6 @@ from athena_context.contracts import (
     GovernanceProfileScope,
     HealthEventEvidenceRecord,
     IngestionSignature,
-    IngestionSignatureVerification,
     JwtHeader,
     MetricAggregateEvidenceRecord,
     NamePatternSelector,
@@ -50,6 +52,8 @@ from athena_context.contracts import (
     SuccessResponseCollectorAttempt,
     TimeoutNoResponseCollectorAttempt,
     TokenVerification,
+    TrustedKeyAnchor,
+    TrustedKeyRecord,
     WorkloadManifest,
     WorkloadRole,
     canonicalize_json,
@@ -62,6 +66,7 @@ from athena_context.contracts import (
     compute_semantic_digest,
     compute_token_verification_digest,
     compute_verified_claims_digest,
+    sha256_hex,
 )
 from athena_context.contracts.common import NormalizationCollisionError
 
@@ -270,16 +275,16 @@ def test_risk_acceptance_and_finding_valid() -> None:
         ),
         evidenceRef=EvidenceItemRef(
             refType="evidenceItem",
-            snapshotId="snap-wc001-canonical-001",
+            snapshotId="snap-111111111111",
             snapshotArtifactDigest="sha256:" + "a" * 64,
             snapshotSemanticDigest="sha256:" + "b" * 64,
             itemDigest="sha256:" + "c" * 64,
-            collectorAttemptId="attempt-001",
+            collectorAttemptId="attempt-111111111111",
             collectorAttemptDigest="sha256:" + "d" * 64,
             collectorToolName="azure.resourceInventory.read",
             collectorToolVersion="1.0.0",
             collectorAttemptAt=datetime.now(tz=UTC),
-            collectorIdentityEvidenceRef="identity-evidence-private-azure-mcp",
+            collectorIdentityEvidenceRef="identity-111111111111",
             sourceResponseDigest="sha256:" + "e" * 64,
             sourceResponsePointer="/value/0",
         ),
@@ -307,16 +312,16 @@ def test_capability_and_scope_variants_are_valid() -> None:
 def test_evidence_reference_and_gap_models_validate() -> None:
     item_ref = EvidenceItemRef(
         refType="evidenceItem",
-        snapshotId="snap-1",
+        snapshotId="snap-222222222222",
         snapshotArtifactDigest="sha256:" + "a" * 64,
         snapshotSemanticDigest="sha256:" + "b" * 64,
         itemDigest="sha256:" + "c" * 64,
-        collectorAttemptId="attempt-1",
+        collectorAttemptId="attempt-111111111111",
         collectorAttemptDigest="sha256:" + "d" * 64,
         collectorToolName="azure.resourceInventory.read",
         collectorToolVersion="1.0.0",
         collectorAttemptAt=datetime.now(tz=UTC),
-        collectorIdentityEvidenceRef="identity-evidence-private-azure-mcp",
+        collectorIdentityEvidenceRef="identity-111111111111",
         sourceResponseDigest="sha256:" + "e" * 64,
         sourceResponsePointer="/value/0",
     )
@@ -324,10 +329,10 @@ def test_evidence_reference_and_gap_models_validate() -> None:
 
     gap_ref = EvidenceGapRef(
         refType="evidenceGap",
-        snapshotId="snap-1",
+        snapshotId="snap-222222222222",
         snapshotArtifactDigest="sha256:" + "a" * 64,
         snapshotSemanticDigest="sha256:" + "b" * 64,
-        gapId="gap-1",
+        gapId="gap-111111111111",
         gapRecordDigest="sha256:" + "c" * 64,
         evidenceScope=SubscriptionScope(
             scopeType="subscription",
@@ -335,12 +340,12 @@ def test_evidence_reference_and_gap_models_validate() -> None:
             subscriptionId="00000000-0000-0000-0000-000000000000",
         ),
         expectedRecordType="resource",
-        collectorAttemptId="attempt-2",
+        collectorAttemptId="attempt-222222222222",
         collectorAttemptDigest="sha256:" + "d" * 64,
         collectorToolName="azure.resourceInventory.read",
         collectorToolVersion="1.0.0",
         collectorAttemptAt=datetime.now(tz=UTC),
-        collectorIdentityEvidenceRef="identity-evidence-private-azure-mcp",
+        collectorIdentityEvidenceRef="identity-111111111111",
         gapReason="missing",
     )
     assert gap_ref.gap_reason == "missing"
@@ -402,7 +407,7 @@ def _valid_response_envelope() -> dict[str, object]:
 def _build_valid_success_attempt(
     *,
     response_digest: str | None = None,
-    attempt_id: str = "attempt-success-001",
+    attempt_id: str = "attempt-111111111111",
 ) -> SuccessResponseCollectorAttempt:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     payload = {
@@ -415,7 +420,7 @@ def _build_valid_success_attempt(
         "responseDigest": response_digest
         or compute_response_envelope_digest(_valid_response_envelope()),
         "responseReceivedAt": (now + timedelta(seconds=5)).isoformat(),
-        "collectorIdentityEvidenceRef": "identity-evidence-private-azure-mcp",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
     }
     payload["attemptDigest"] = compute_artifact_digest(payload)
     return SuccessResponseCollectorAttempt.model_validate(
@@ -431,14 +436,14 @@ def _build_valid_timeout_attempt() -> TimeoutNoResponseCollectorAttempt:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     payload = {
         "attemptType": "timeoutNoResponse",
-        "attemptId": "attempt-timeout-001",
+        "attemptId": "attempt-222222222222",
         "attemptStartedAt": now.isoformat(),
         "toolName": "azure.resourceInventory.read",
         "toolVersion": "1.0.0",
         "requestDigest": _sha256("req-timeout"),
         "deadlineAt": (now + timedelta(seconds=30)).isoformat(),
         "timedOutAt": (now + timedelta(seconds=45)).isoformat(),
-        "collectorIdentityEvidenceRef": "identity-evidence-private-azure-mcp",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
     }
     payload["attemptDigest"] = compute_artifact_digest(payload)
     return TimeoutNoResponseCollectorAttempt.model_validate(
@@ -457,7 +462,7 @@ def _build_valid_failed_attempt(
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     payload = {
         "attemptType": "failedResponse",
-        "attemptId": "attempt-failed-001",
+        "attemptId": "attempt-333333333333",
         "attemptStartedAt": now,
         "toolName": "azure.resourceInventory.read",
         "toolVersion": "1.0.0",
@@ -466,7 +471,7 @@ def _build_valid_failed_attempt(
         "failureStatus": "invalid",
         "failureDigest": compute_failure_envelope_digest(failure_envelope),
         "responseReceivedAt": now + timedelta(seconds=5),
-        "collectorIdentityEvidenceRef": "identity-evidence-private-azure-mcp",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
     }
     payload["attemptDigest"] = compute_artifact_digest(payload)
     return FailedResponseCollectorAttempt.model_validate(payload)
@@ -504,11 +509,11 @@ def _build_valid_snapshot(
     )
     collector = SnapshotCollector(
         collectorType="azureMcpHost",
-        collectorIdentityEvidenceRef="identity-evidence-private-azure-mcp",
-        mcpHostId="mcp-host-001",
+        collectorIdentityEvidenceRef="identity-111111111111",
+        mcpHostId="mcp-111111111111",
         tenantId=tenant_id,
         trustAnchorRef="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
-        ingestionServiceId="azure-mcp-ingestion",
+        ingestionServiceId="ingestion-111111111111",
         ingestionAudience="api://athena-ingestion",
         toolAllowlistDigest=_sha256("tool-allowlist"),
     )
@@ -544,7 +549,7 @@ def _build_valid_snapshot(
     resource_record = ResourceEvidenceRecord.model_validate(record_payload)
     semantic_digest = _sha256("snapshot-semantic")
     snapshot_payload = {
-        "snapshotId": "snapshot-evidence-001",
+        "snapshotId": "snap-333333333333",
         "compatibility": {
             "artifactKind": "evidenceSnapshot",
             "schemaVersion": "1.0.0",
@@ -571,7 +576,7 @@ def _build_valid_snapshot(
         "evidenceRefs": [
             {
                 "refType": "evidenceItem",
-                "snapshotId": "snapshot-evidence-001",
+                "snapshotId": "snap-333333333333",
                 "snapshotArtifactDigest": _sha256("placeholder"),
                 "snapshotSemanticDigest": semantic_digest,
                 "itemDigest": resource_record.item_digest,
@@ -605,14 +610,14 @@ def _build_valid_gap_snapshot(
     )
     collector = SnapshotCollector(
         collectorType="azureMcpHost",
-        collectorIdentityEvidenceRef="identity-evidence-private-azure-mcp",
-        mcpHostId="mcp-host-001",
+        collectorIdentityEvidenceRef="identity-111111111111",
+        mcpHostId="mcp-111111111111",
         tenantId=tenant_id,
         trustAnchorRef=(
             "https://contoso.vault.azure.net/keys/athena-key/"
             "0123456789abcdef0123456789abcdef"
         ),
-        ingestionServiceId="azure-mcp-ingestion",
+        ingestionServiceId="ingestion-111111111111",
         ingestionAudience="api://athena-ingestion",
         toolAllowlistDigest=_sha256("tool-allowlist"),
     )
@@ -624,7 +629,7 @@ def _build_valid_gap_snapshot(
         observed_at = attempt.observed_at
     gap_payload: dict[str, object] = {
         "recordType": "evidenceGap",
-        "gapId": "gap-resource-001",
+        "gapId": "gap-222222222222",
         "evidenceScope": scope.model_dump(mode="json", by_alias=True),
         "gapReason": "malformed" if attempt.attempt_type == "successResponse" else "missing",
         "expectedRecordType": "resource",
@@ -640,7 +645,7 @@ def _build_valid_gap_snapshot(
     gap = EvidenceGapRecord.model_validate(gap_payload)
     semantic_digest = _sha256("snapshot-gap-semantic")
     snapshot_payload: dict[str, object] = {
-        "snapshotId": "snapshot-gap-001",
+        "snapshotId": "snap-444444444444",
         "compatibility": {
             "artifactKind": "evidenceSnapshot",
             "schemaVersion": "1.0.0",
@@ -662,7 +667,7 @@ def _build_valid_gap_snapshot(
         "evidenceRefs": [
             {
                 "refType": "evidenceGap",
-                "snapshotId": "snapshot-gap-001",
+                "snapshotId": "snap-444444444444",
                 "snapshotArtifactDigest": _sha256("placeholder"),
                 "snapshotSemanticDigest": semantic_digest,
                 "gapId": gap.gap_id,
@@ -719,7 +724,7 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
         CollectorIdentityEvidence.model_validate(
             {
                 **{
-                    "identityEvidenceId": "identity-1",
+                    "identityEvidenceId": "identity-222222222222",
                     "identityEvidenceType": "entraJwtTokenEvidence",
                     "tokenHash": _sha256("token-1"),
                     "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
@@ -728,9 +733,9 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
                         "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
                         "audience": "api://athena-ingestion",
                         "tenantId": "11111111-1111-1111-1111-111111111111",
-                        "managedIdentityObjectId": "object-123",
-                        "managedIdentityClientId": "client-123",
-                        "subject": "object-123",
+                        "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+                        "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+                        "subject": "22222222-2222-2222-2222-222222222222",
                         "jti": "jti-123",
                         "issuedAt": "2025-01-02T11:00:00+00:00",
                         "expiresAt": "2025-01-02T13:00:00+00:00",
@@ -747,20 +752,20 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
                         "schemaVersion": "1.0.0",
                         "semanticContractVersion": "1.0.0",
                         "policyContractVersion": "1.0.0",
-                        "identityEvidenceId": "identity-1",
+                        "identityEvidenceId": "identity-222222222222",
                         "tokenHash": _sha256("token-1"),
                         "tokenVerificationStatus": "valid",
                         "tokenVerificationDigest": _sha256("token-verify"),
-                        "mcpHostId": "mcp-host-001",
+                        "mcpHostId": "mcp-111111111111",
                         "mcpHostTenantId": "11111111-1111-1111-1111-111111111111",
-                        "mcpHostManagedIdentityObjectId": "object-123",
-                        "mcpHostManagedIdentityClientId": "client-123",
-                        "ingestionServiceId": "azure-mcp-ingestion",
+                        "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+                        "mcpHostManagedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+                        "ingestionServiceId": "ingestion-111111111111",
                         "ingestionAudience": "api://athena-ingestion",
                         "toolAllowlistDigest": _sha256("tool-allowlist"),
-                        "derivedCollectorIdentityRef": "identity-evidence-private-azure-mcp",
+                        "derivedCollectorIdentityRef": "identity-111111111111",
                         "attemptBinding": {
-                            "attemptId": "attempt-001",
+                            "attemptId": "attempt-111111111111",
                             "attemptType": "successResponse",
                             "attemptDigest": _sha256("attempt"),
                             "toolName": "azure.resourceInventory.read",
@@ -806,7 +811,7 @@ def test_attempt_digest_and_mismatched_attempts_are_rejected() -> None:
         )
 
     payload = attempt.model_dump(mode="json", by_alias=True)
-    payload["attemptId"] = "attempt-success-999"
+    payload["attemptId"] = "attempt-999999999999"
     with pytest.raises(ValidationError):
         SuccessResponseCollectorAttempt.model_validate(payload)
 
@@ -851,51 +856,36 @@ def test_ingestion_signature_rejects_fabricated_or_none_algorithm() -> None:
         IngestionSignature(
             signatureAlgorithm="none",
             keyVaultKeyId="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
+            keyName="athena-key",
             keyVersion="0123456789abcdef0123456789abcdef",
             signedPreimageDigest=_sha256("payload"),
             signature="alg:none",
             signedAt=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
             trustAnchorRef="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
-            keyStatusAtSigning="active",
-            signatureVerification=IngestionSignatureVerification(
-                status="valid",
-                verifiedAt=datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
-                keyVersion="0123456789abcdef0123456789abcdef",
-            ),
         )
 
     with pytest.raises(ValidationError):
         IngestionSignature(
             signatureAlgorithm="RS256",
             keyVaultKeyId="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
+            keyName="athena-key",
             keyVersion="0123456789abcdef0123456789abcdef",
             signedPreimageDigest=_sha256("payload"),
             signature="",
             signedAt=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
             trustAnchorRef="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
-            keyStatusAtSigning="active",
-            signatureVerification=IngestionSignatureVerification(
-                status="valid",
-                verifiedAt=datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
-                keyVersion="0123456789abcdef0123456789abcdef",
-            ),
         )
 
     with pytest.raises(ValidationError):
         IngestionSignature(
             signatureAlgorithm="RS256",
             keyVaultKeyId="https://contoso.vault.azure.net\\keys\\athena-key\\0123456789abcdef0123456789abcdef",
+            keyName="athena-key",
             keyVersion="0123456789abcdef0123456789abcdef",
             signedPreimageDigest=_sha256("payload"),
             signature="AQID",
             signedAt=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
             trustAnchorRef="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
-            keyStatusAtSigning="active",
-            signatureVerification=IngestionSignatureVerification(
-                status="valid",
-                verifiedAt=datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
-                keyVersion="0123456789abcdef0123456789abcdef",
-            ),
         )
 
 
@@ -905,7 +895,7 @@ def _build_valid_identity_evidence(
     tenant_id: str = "11111111-1111-1111-1111-111111111111",
     trust_anchor: str = "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
     response_digest: str | None = None,
-    attempt_id: str = "attempt-success-identity-evidence",
+    attempt_id: str = "attempt-444444444444",
     collector_attempt: CollectorAttempt | None = None,
     binding_overrides: dict[str, object] | None = None,
     claims_audience: str = "api://athena-ingestion",
@@ -914,20 +904,25 @@ def _build_valid_identity_evidence(
     not_before: datetime | None = None,
     expires_at: datetime | None = None,
     verified_at: datetime | None = None,
+    derived_at_override: datetime | None = None,
 ) -> CollectorIdentityEvidence:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     issued_at = issued_at or now - timedelta(minutes=5)
     not_before = not_before or issued_at
     expires_at = expires_at or now + timedelta(minutes=30)
     verified_at = verified_at or now
+    signing_anchor = _trusted_key_anchor(
+        private_key.public_key(),
+        key_vault_key_id=trust_anchor,
+    )
     token_hash = _sha256("token-1")
     verified_claims_payload = {
         "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
         "audience": claims_audience,
         "tenantId": tenant_id,
-        "managedIdentityObjectId": "object-123",
-        "managedIdentityClientId": "client-123",
-        "subject": "object-123",
+        "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+        "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+        "subject": "22222222-2222-2222-2222-222222222222",
         "jti": "jti-123",
         "issuedAt": issued_at,
         "notBefore": not_before,
@@ -954,11 +949,21 @@ def _build_valid_identity_evidence(
             "requestDigest": _sha256("req-identity"),
             "responseDigest": response_digest or _sha256("resp-identity"),
             "responseReceivedAt": now + timedelta(seconds=5),
-            "collectorIdentityEvidenceRef": "identity-evidence-private-azure-mcp",
+            "collectorIdentityEvidenceRef": "identity-111111111111",
         }
         attempt["attemptDigest"] = compute_artifact_digest(attempt)
     else:
         attempt = collector_attempt.model_dump(mode="python", by_alias=True)
+    attempt_type = attempt["attemptType"]
+    if attempt_type in {"successResponse", "failedResponse"}:
+        attempt_observed_at = attempt["responseReceivedAt"]
+    elif attempt_type == "timeoutNoResponse":
+        attempt_observed_at = attempt["timedOutAt"]
+    else:
+        attempt_observed_at = attempt["observedAt"]
+    assert isinstance(attempt_observed_at, datetime)
+    derived_at = derived_at_override or attempt_observed_at
+    signed_at = derived_at + timedelta(seconds=1)
     binding_fields = {
         "attemptId",
         "attemptType",
@@ -984,30 +989,41 @@ def _build_valid_identity_evidence(
         "schemaVersion": "1.0.0",
         "semanticContractVersion": "1.0.0",
         "policyContractVersion": "1.0.0",
-        "identityEvidenceId": "identity-evidence-private-azure-mcp",
+        "identityEvidenceId": "identity-111111111111",
         "tokenHash": token_hash,
         "tokenVerificationStatus": "valid",
         "tokenVerificationDigest": token_verification_digest,
         "verifiedClaimsDigest": verified_claims_digest,
-        "mcpHostId": "mcp-host-001",
+        "mcpHostId": "mcp-111111111111",
         "mcpHostTenantId": tenant_id,
-        "mcpHostManagedIdentityObjectId": "object-123",
-        "mcpHostManagedIdentityClientId": "client-123",
-        "ingestionServiceId": "azure-mcp-ingestion",
+        "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+        "mcpHostManagedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+        "ingestionServiceId": "ingestion-111111111111",
         "ingestionAudience": ingestion_audience,
         "toolAllowlistDigest": _sha256("tool-allowlist"),
-        "derivedCollectorIdentityRef": "identity-evidence-private-azure-mcp",
+        "derivedCollectorIdentityRef": "identity-111111111111",
         "attemptBinding": attempt_binding_payload,
-        "derivedAt": now,
+        "derivedAt": derived_at,
     }
     derivation_payload["derivationDigest"] = compute_artifact_digest(derivation_payload)
-    canonical_preimage = canonicalize_json(
-        {
-            key: value
-            for key, value in derivation_payload.items()
-            if key != "derivationDigest"
-        }
-    )
+    derivation_preimage = {
+        key: value
+        for key, value in derivation_payload.items()
+        if key != "derivationDigest"
+    }
+    signature_preimage = {
+        "signaturePreimageType": "athena.trustedIngestionSignature",
+        "signaturePreimageVersion": "1.0.0",
+        "signatureAlgorithm": "RS256",
+        "keyVaultKeyId": trust_anchor,
+        "keyName": signing_anchor.key_name,
+        "keyVersion": signing_anchor.key_version,
+        "signedAt": signed_at,
+        "trustAnchorRef": trust_anchor,
+        "derivation": derivation_preimage,
+    }
+    signed_preimage_digest = compute_artifact_digest(signature_preimage)
+    canonical_preimage = canonicalize_json(signature_preimage)
     signature = base64.b64encode(
         private_key.sign(
             canonical_preimage.encode("utf-8"),
@@ -1016,7 +1032,7 @@ def _build_valid_identity_evidence(
         )
     ).decode("ascii")
     identity_payload = {
-        "identityEvidenceId": "identity-evidence-private-azure-mcp",
+        "identityEvidenceId": "identity-111111111111",
         "identityEvidenceType": "entraJwtTokenEvidence",
         "tokenHash": token_hash,
         "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
@@ -1029,22 +1045,17 @@ def _build_valid_identity_evidence(
         "ingestionDerivation": {
             **derivation_payload,
             "attemptBinding": attempt_binding_payload,
-            "derivedAt": now,
+            "derivedAt": derived_at,
         },
         "ingestionSignature": {
             "signatureAlgorithm": "RS256",
             "keyVaultKeyId": trust_anchor,
-            "keyVersion": "0123456789abcdef0123456789abcdef",
-            "signedPreimageDigest": derivation_payload["derivationDigest"],
+            "keyName": signing_anchor.key_name,
+            "keyVersion": signing_anchor.key_version,
+            "signedPreimageDigest": signed_preimage_digest,
             "signature": signature,
-            "signedAt": now,
+            "signedAt": signed_at,
             "trustAnchorRef": trust_anchor,
-            "keyStatusAtSigning": "active",
-            "signatureVerification": {
-                "status": "valid",
-                "verifiedAt": now + timedelta(seconds=1),
-                "keyVersion": "0123456789abcdef0123456789abcdef",
-            },
         },
     }
     identity_payload["identityEvidenceDigest"] = compute_artifact_digest(
@@ -1057,13 +1068,61 @@ def _build_valid_identity_evidence(
     return CollectorIdentityEvidence.model_validate(identity_payload)
 
 
+def _trusted_key_resolver(
+    public_key: object,
+    *,
+    key_vault_key_id: str = (
+        "https://contoso.vault.azure.net/keys/athena-key/"
+        "0123456789abcdef0123456789abcdef"
+    ),
+    enabled: bool = True,
+    activated_at: datetime = datetime(2025, 1, 1, tzinfo=UTC),
+    retired_at: datetime | None = None,
+    expires_at: datetime | None = datetime(2025, 2, 1, tzinfo=UTC),
+) -> Callable[[TrustedKeyAnchor], TrustedKeyRecord | None]:
+    anchor = _trusted_key_anchor(public_key, key_vault_key_id=key_vault_key_id)
+    record = TrustedKeyRecord(
+        anchor=anchor,
+        public_key=public_key,
+        enabled=enabled,
+        activated_at=activated_at,
+        retired_at=retired_at,
+        expires_at=expires_at,
+    )
+
+    def resolve(lookup: TrustedKeyAnchor) -> TrustedKeyRecord | None:
+        return record if lookup == anchor else None
+
+    return resolve
+
+
+def _trusted_key_anchor(
+    public_key: object,
+    *,
+    key_vault_key_id: str = (
+        "https://contoso.vault.azure.net/keys/athena-key/"
+        "0123456789abcdef0123456789abcdef"
+    ),
+) -> TrustedKeyAnchor:
+    assert hasattr(public_key, "public_bytes")
+    encoded = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return TrustedKeyAnchor.from_key_vault_key_id(
+        key_vault_key_id,
+        public_key_fingerprint=sha256_hex(encoded),
+    )
+
+
 def test_key_vault_signature_verifies_and_rejects_forgery() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key = private_key.public_key()
     evidence = _build_valid_identity_evidence(private_key=private_key)
     assert evidence.verify_signature(
-        key_resolver=lambda key_id: public_key,
-        trust_anchor_ref=evidence.trust_anchor_ref,
+        key_resolver=_trusted_key_resolver(public_key),
+        trusted_key_anchor=_trusted_key_anchor(public_key),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
     )
 
     forged = evidence.model_copy(
@@ -1083,21 +1142,33 @@ def test_key_vault_signature_verifies_and_rejects_forgery() -> None:
         },
     )
     assert not forged.verify_signature(
-        key_resolver=lambda key_id: public_key,
-        trust_anchor_ref=evidence.trust_anchor_ref,
+        key_resolver=_trusted_key_resolver(public_key),
+        trusted_key_anchor=_trusted_key_anchor(public_key),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
     )
 
     other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     assert not evidence.verify_signature(
-        key_resolver=lambda key_id: other_key.public_key(),
-        trust_anchor_ref=evidence.trust_anchor_ref,
+        key_resolver=_trusted_key_resolver(other_key.public_key()),
+        trusted_key_anchor=_trusted_key_anchor(other_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
     )
     assert not evidence.verify_signature(
-        key_resolver=lambda key_id: public_key,
-        trust_anchor_ref=(
-            "https://different.vault.azure.net/keys/athena-key/"
-            "0123456789abcdef0123456789abcdef"
+        key_resolver=_trusted_key_resolver(
+            public_key,
+            key_vault_key_id=(
+                "https://different.vault.azure.net/keys/athena-key/"
+                "0123456789abcdef0123456789abcdef"
+            ),
         ),
+        trusted_key_anchor=_trusted_key_anchor(
+            public_key,
+            key_vault_key_id=(
+                "https://different.vault.azure.net/keys/athena-key/"
+                "0123456789abcdef0123456789abcdef"
+            ),
+        ),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
     )
 
 
@@ -1135,7 +1206,7 @@ def test_snapshot_evaluation_rejects_expired_and_out_of_window_values() -> None:
 def test_snapshot_rejects_cross_snapshot_and_missing_refs() -> None:
     snapshot = _build_valid_snapshot()
     payload = snapshot.model_dump(mode="json", by_alias=True)
-    payload["evidenceRefs"][0]["snapshotId"] = "snapshot-evidence-999"
+    payload["evidenceRefs"][0]["snapshotId"] = "snap-999999999999"
     with pytest.raises(ValidationError):
         EvidenceSnapshot.model_validate(payload)
 
@@ -1175,7 +1246,7 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     response_digest = compute_response_envelope_digest(response_envelope)
     success_attempt = _build_valid_success_attempt(
         response_digest=response_digest,
-        attempt_id="attempt-success-envelope-001",
+        attempt_id="attempt-555555555555",
     )
     identity = _build_valid_identity_evidence(
         private_key=private_key,
@@ -1194,7 +1265,8 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     assert (
         valid_snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=response_resolver,
         )
         is valid_snapshot
@@ -1209,7 +1281,8 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     with pytest.raises(AthenaValidationError, match="does not resolve"):
         nonexistent.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=response_resolver,
         )
 
@@ -1237,7 +1310,8 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     assert (
         failed_snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=failure_resolver,
         )
         is failed_snapshot
@@ -1253,7 +1327,7 @@ def test_gap_ref_exact_equality_and_timeout_payload_prohibition() -> None:
         failure_payload_pointer="/error/code",
     )
     payload = failed_snapshot.model_dump(mode="python", by_alias=True)
-    payload["evidenceRefs"][0]["collectorIdentityEvidenceRef"] = "identity-forged"
+    payload["evidenceRefs"][0]["collectorIdentityEvidenceRef"] = "identity-999999999999"
     _refresh_snapshot_digest(payload)
     with pytest.raises(ValidationError, match="collectorIdentityEvidenceRef"):
         EvidenceSnapshot.model_validate(payload)
@@ -1284,7 +1358,7 @@ def test_rfc6901_invalid_escape_remains_rejected() -> None:
     snapshot = _build_valid_snapshot()
     payload = snapshot.evidence_refs[0].model_dump(mode="python", by_alias=True)
     payload["sourceResponsePointer"] = "/properties/~2invalid"
-    with pytest.raises(ValidationError, match="approved response envelope path"):
+    with pytest.raises(ValidationError, match="pattern"):
         EvidenceItemRef.model_validate(payload)
 
 
@@ -1312,7 +1386,7 @@ def test_resource_scope_rejects_subscription_and_component_prefix_confusion() ->
     record["itemDigest"] = compute_evidence_record_digest(record)
     payload["evidenceRefs"][0]["itemDigest"] = record["itemDigest"]
     _refresh_snapshot_digest(payload)
-    with pytest.raises(ValidationError, match="begin with /subscriptions"):
+    with pytest.raises(ValidationError, match="pattern"):
         EvidenceSnapshot.model_validate(payload)
 
     payload = snapshot.model_dump(mode="python", by_alias=True)
@@ -1436,7 +1510,9 @@ def test_exact_signed_attempt_binding_and_utc_timestamps_are_required() -> None:
         },
     )
     assert not evidence.verify_signature(
-        key_resolver=lambda key_id: private_key.public_key(),
+        key_resolver=_trusted_key_resolver(private_key.public_key()),
+        trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
         attempt=attempt,
     )
 
@@ -1489,7 +1565,8 @@ def test_rfc6901_empty_string_resolves_envelope_root() -> None:
     assert (
         snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: response_envelope,
         )
         is snapshot
@@ -1517,7 +1594,8 @@ def test_resolved_source_rejects_recomputed_local_mutation() -> None:
     with pytest.raises(AthenaValidationError, match="does not match"):
         mutated.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: response_envelope,
         )
 
@@ -1567,7 +1645,7 @@ def test_pointer_cannot_resolve_digest_excluded_transport_field() -> None:
         private_key=private_key,
         collector_attempt=attempt,
     )
-    with pytest.raises(ValidationError, match="approved response envelope path"):
+    with pytest.raises(ValidationError, match="pattern"):
         _build_valid_snapshot(
             attempt=attempt,
             identity_evidence=identity,
@@ -1588,13 +1666,14 @@ def test_signed_derivation_must_match_snapshot_collector_metadata() -> None:
     )
     snapshot = _build_valid_snapshot(attempt=attempt, identity_evidence=identity)
     payload = snapshot.model_dump(mode="python", by_alias=True)
-    payload["collector"]["mcpHostId"] = "forged-mcp-host"
+    payload["collector"]["mcpHostId"] = "mcp-999999999999"
     _refresh_snapshot_digest(payload)
     forged = EvidenceSnapshot.model_validate(payload)
     with pytest.raises(AthenaValidationError, match="signed ingestion derivation"):
         forged.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
         )
 
@@ -1608,9 +1687,9 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
         ),
         "audience": "api://athena-ingestion",
         "tenantId": "11111111-1111-1111-1111-111111111111",
-        "managedIdentityObjectId": "object-123",
-        "managedIdentityClientId": "client-123",
-        "subject": "object-123",
+        "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+        "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+        "subject": "22222222-2222-2222-2222-222222222222",
         "jti": "jti-123",
         "issuedAt": now - timedelta(minutes=5),
         "notBefore": now - timedelta(minutes=5),
@@ -1652,7 +1731,8 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
     with pytest.raises(AthenaValidationError, match="valid at snapshot collectedAt"):
         snapshot.validate_for_evaluation(
             as_of=now + timedelta(minutes=10),
-            key_resolver=lambda key_id: private_key.public_key(),
+            key_resolver=_trusted_key_resolver(private_key.public_key()),
+            trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
         )
 
@@ -1667,7 +1747,7 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
         ),
         ("jti", "jti-456"),
         ("issuedAt", datetime(2025, 1, 2, 11, 50, tzinfo=UTC)),
-        ("subject", "client-123"),
+        ("subject", "33333333-3333-3333-3333-333333333333"),
     ],
 )
 def test_signed_verified_claim_mutation_is_rejected(
@@ -1733,7 +1813,8 @@ def test_signed_verified_claim_mutation_is_rejected(
     ):
         snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
+            key_resolver=_trusted_key_resolver(public_key),
+            trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
         )
 
@@ -1879,10 +1960,15 @@ def test_safe_evidence_constraints_are_present_in_generated_schema() -> None:
     )
 
     resource_schema = ResourceEvidenceRecord.model_json_schema()
-    safe_text_schema = resource_schema["$defs"]["SafeEvidenceText"]
-    assert safe_text_schema["pattern"] == "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
-    assert safe_text_schema["minLength"] == 1
-    assert safe_text_schema["maxLength"] == 128
+    assert (
+        resource_schema["$defs"]["IdentityEvidenceIdentifier"]["pattern"]
+        == "^identity-[a-f0-9]{12}$"
+    )
+    snapshot_schema = EvidenceSnapshot.model_json_schema()
+    assert (
+        snapshot_schema["$defs"]["SnapshotIdentifier"]["pattern"]
+        == "^snap-[a-f0-9]{12}$"
+    )
 
 
 def test_evidence_gap_record_rejects_sensitive_payload_pointer() -> None:
@@ -1896,7 +1982,7 @@ def test_evidence_gap_record_rejects_sensitive_payload_pointer() -> None:
     payload = snapshot.evidence_records[0].model_dump(mode="python", by_alias=True)
     payload["failurePayloadPointer"] = "/items/0/password"
     payload["itemDigest"] = compute_evidence_record_digest(payload)
-    with pytest.raises(ValidationError, match="approved envelope path"):
+    with pytest.raises(ValidationError, match="pattern"):
         EvidenceGapRecord.model_validate(payload)
 
 
@@ -1915,5 +2001,316 @@ def test_evidence_item_pointer_rejects_arbitrary_persisted_tokens(
     snapshot = _build_valid_snapshot()
     payload = snapshot.evidence_refs[0].model_dump(mode="python", by_alias=True)
     payload["sourceResponsePointer"] = pointer
-    with pytest.raises(ValidationError, match="approved response envelope path"):
+    with pytest.raises(ValidationError, match="pattern"):
         EvidenceItemRef.model_validate(payload)
+
+
+def test_configured_trust_anchor_rejects_attacker_key_resolution() -> None:
+    trusted_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    attacker_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    contoso_anchor = (
+        "https://contoso.vault.azure.net/keys/athena-key/"
+        "0123456789abcdef0123456789abcdef"
+    )
+    attacker_anchor = (
+        "https://attacker.vault.azure.net/keys/attacker-key/"
+        "fedcba9876543210fedcba9876543210"
+    )
+    attacker_evidence = _build_valid_identity_evidence(
+        private_key=attacker_private_key,
+        trust_anchor=attacker_anchor,
+    )
+    forged = attacker_evidence.model_copy(
+        deep=True,
+        update={"trust_anchor_ref": contoso_anchor},
+    )
+    attacker_record = TrustedKeyRecord(
+        anchor=_trusted_key_anchor(
+            attacker_private_key.public_key(),
+            key_vault_key_id=attacker_anchor,
+        ),
+        public_key=attacker_private_key.public_key(),
+        enabled=True,
+        activated_at=datetime(2025, 1, 1, tzinfo=UTC),
+        expires_at=datetime(2025, 2, 1, tzinfo=UTC),
+    )
+    assert not forged.verify_signature(
+        key_resolver=lambda lookup: attacker_record,
+        trusted_key_anchor=_trusted_key_anchor(trusted_private_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+    trusted_evidence = _build_valid_identity_evidence(
+        private_key=trusted_private_key,
+    )
+    assert not trusted_evidence.verify_signature(
+        key_resolver=lambda lookup: attacker_record,
+        trusted_key_anchor=_trusted_key_anchor(trusted_private_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+    contoso_attacker_evidence = _build_valid_identity_evidence(
+        private_key=attacker_private_key,
+        trust_anchor=contoso_anchor,
+    )
+    attacker_contoso_record = TrustedKeyRecord(
+        anchor=_trusted_key_anchor(
+            attacker_private_key.public_key(),
+            key_vault_key_id=contoso_anchor,
+        ),
+        public_key=attacker_private_key.public_key(),
+        enabled=True,
+        activated_at=datetime(2025, 1, 1, tzinfo=UTC),
+        expires_at=datetime(2025, 2, 1, tzinfo=UTC),
+    )
+    assert not contoso_attacker_evidence.verify_signature(
+        key_resolver=lambda lookup: attacker_contoso_record,
+        trusted_key_anchor=_trusted_key_anchor(
+            trusted_private_key.public_key(),
+            key_vault_key_id=contoso_anchor,
+        ),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "activated_at", "retired_at", "expires_at"),
+    [
+        (
+            False,
+            datetime(2025, 1, 1, tzinfo=UTC),
+            None,
+            datetime(2025, 2, 1, tzinfo=UTC),
+        ),
+        (
+            True,
+            datetime(2025, 1, 1, tzinfo=UTC),
+            datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
+            None,
+        ),
+        (
+            True,
+            datetime(2025, 1, 1, tzinfo=UTC),
+            None,
+            datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
+        ),
+        (
+            True,
+            datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
+            None,
+            datetime(2025, 2, 1, tzinfo=UTC),
+        ),
+    ],
+)
+def test_trusted_key_state_and_lifecycle_reject_invalid_records(
+    enabled: bool,
+    activated_at: datetime,
+    retired_at: datetime | None,
+    expires_at: datetime | None,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    anchor = _trusted_key_anchor(private_key.public_key())
+    matching_key_record = TrustedKeyRecord(
+        anchor=anchor,
+        public_key=private_key.public_key(),
+        enabled=enabled,
+        activated_at=activated_at,
+        retired_at=retired_at,
+        expires_at=expires_at,
+    )
+    assert not evidence.verify_signature(
+        key_resolver=lambda lookup: matching_key_record,
+        trusted_key_anchor=matching_key_record.anchor,
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+
+def test_signature_time_and_artifact_verification_metadata_are_untrusted() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    future_signature = evidence.ingestion_signature.model_copy(
+        update={"signed_at": datetime(2035, 1, 1, tzinfo=UTC)}
+    )
+    future_evidence = evidence.model_copy(
+        deep=True,
+        update={"ingestion_signature": future_signature},
+    )
+    assert not future_evidence.verify_signature(
+        key_resolver=_trusted_key_resolver(
+            private_key.public_key(),
+            expires_at=datetime(2040, 1, 1, tzinfo=UTC),
+        ),
+        trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+    payload = evidence.model_dump(mode="python", by_alias=True)
+    payload["ingestionSignature"]["signatureVerification"] = {
+        "status": "valid",
+        "verifiedAt": datetime(2035, 1, 1, tzinfo=UTC),
+        "keyVersion": "0123456789abcdef0123456789abcdef",
+    }
+    payload["ingestionSignature"]["keyStatusAtSigning"] = "active"
+    with pytest.raises(ValidationError):
+        CollectorIdentityEvidence.model_validate(payload)
+
+
+def test_signed_attempt_chronology_is_required_without_external_attempt() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(
+        private_key=private_key,
+        derived_at_override=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
+    )
+    assert not evidence.verify_signature(
+        key_resolver=_trusted_key_resolver(private_key.public_key()),
+        trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+        as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    "sensitive_value",
+    [
+        "password123",
+        "bearer-token",
+        (
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJzdWIiOiJzeW50aGV0aWMtaWRlbnRpdHkifQ."
+            "abcdefghijklmnopqrstuvwxyz0123456789"
+        ),
+        "patientName",
+        "jane.doe@example.com",
+        "Server=x;Password=y",
+        "client-secret",
+        "alice-smith",
+    ],
+)
+def test_generated_schema_matches_runtime_sensitive_text_rejection(
+    sensitive_value: str,
+) -> None:
+    snapshot = _build_valid_snapshot()
+    payload = snapshot.evidence_records[0].model_dump(mode="json", by_alias=True)
+    payload["collectorIdentityEvidenceRef"] = sensitive_value
+    payload["provenance"]["collectorIdentityEvidenceRef"] = sensitive_value
+    schema = ResourceEvidenceRecord.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        ResourceEvidenceRecord.model_validate(payload)
+
+
+def test_generated_schema_rejects_sensitive_tags_and_pointers() -> None:
+    tag_validator = Draft202012Validator(ApprovedResourceTags.model_json_schema())
+    for payload in (
+        {"application": "password123"},
+        {"component": "patientName"},
+        {"managedBy": "bearer-token"},
+    ):
+        assert list(tag_validator.iter_errors(payload))
+        with pytest.raises(ValidationError):
+            ApprovedResourceTags.model_validate(payload)
+
+    snapshot = _build_valid_snapshot()
+    ref_payload = snapshot.evidence_refs[0].model_dump(mode="json", by_alias=True)
+    ref_payload["sourceResponsePointer"] = "/items/password123"
+    ref_schema = EvidenceItemRef.model_json_schema()
+    assert list(Draft202012Validator(ref_schema).iter_errors(ref_payload))
+    with pytest.raises(ValidationError):
+        EvidenceItemRef.model_validate(ref_payload)
+
+
+def test_generated_schema_rejects_sensitive_snapshot_identifier() -> None:
+    snapshot = _build_valid_snapshot()
+    payload = snapshot.model_dump(mode="json", by_alias=True)
+    payload["snapshotId"] = "password123"
+    schema = EvidenceSnapshot.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        EvidenceSnapshot.model_validate(payload)
+
+
+def test_entra_identity_ids_are_guid_constrained_in_runtime_and_schema() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    payload = evidence.model_dump(mode="json", by_alias=True)
+    for claims_path in (
+        payload["verifiedClaims"],
+        payload["tokenVerification"]["verifiedClaims"],
+    ):
+        claims_path["managedIdentityObjectId"] = "patientName"
+        claims_path["managedIdentityClientId"] = "patientName"
+        claims_path["subject"] = "patientName"
+    derivation = payload["ingestionDerivation"]
+    derivation["mcpHostManagedIdentityObjectId"] = "patientName"
+    derivation["mcpHostManagedIdentityClientId"] = "patientName"
+    schema = CollectorIdentityEvidence.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        CollectorIdentityEvidence.model_validate(payload)
+
+
+def test_key_vault_anchor_url_is_schema_visible() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    snapshot = _build_valid_snapshot(identity_evidence=evidence)
+    payload = snapshot.model_dump(mode="json", by_alias=True)
+    payload["collector"]["trustAnchorRef"] = "password123"
+    identity = payload["identityEvidence"][0]
+    identity["trustAnchorRef"] = "password123"
+    identity["ingestionSignature"]["keyVaultKeyId"] = "password123"
+    identity["ingestionSignature"]["trustAnchorRef"] = "password123"
+    schema = EvidenceSnapshot.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        EvidenceSnapshot.model_validate(payload)
+
+
+def test_observed_relationship_resource_endpoints_are_scope_checked() -> None:
+    snapshot = _build_valid_snapshot()
+    payload = snapshot.model_dump(mode="python", by_alias=True)
+    attempt = snapshot.collector_attempts[0]
+    existing_record = snapshot.evidence_records[0]
+    relationship_record = {
+        "recordType": "observedRelationship",
+        "relationship": {
+            "relationshipClass": "observed",
+            "relationshipId": "relationship-111111111111",
+            "kind": "dependsOn",
+            "source": {
+                "refKind": "resourceRef",
+                "resourceId": existing_record.resource_id,
+            },
+            "target": {
+                "refKind": "resourceRef",
+                "resourceId": (
+                    "/subscriptions/22222222-2222-2222-2222-222222222222/"
+                    "resourceGroups/rg-other/providers/Microsoft.Compute/"
+                    "virtualMachines/vm-other"
+                ),
+            },
+            "evidenceItemRef": "item-111111111111",
+            "observedAt": attempt.response_received_at,
+        },
+        "provenance": existing_record.provenance.model_dump(
+            mode="python",
+            by_alias=True,
+        ),
+        "collectorAttemptDigest": attempt.attempt_digest,
+        "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
+    }
+    relationship_record["itemDigest"] = compute_evidence_record_digest(
+        relationship_record
+    )
+    payload["evidenceRecords"] = [relationship_record]
+    payload["evidenceRefs"][0]["itemDigest"] = relationship_record["itemDigest"]
+    _refresh_snapshot_digest(payload)
+    with pytest.raises(ValidationError, match="relationship resource endpoint"):
+        EvidenceSnapshot.model_validate(payload)
+
+
+def test_evidence_resource_id_constraint_is_schema_visible() -> None:
+    payload = {"refKind": "resourceRef", "resourceId": "patientName"}
+    schema = EvidenceResourceRef.model_json_schema()
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        EvidenceResourceRef.model_validate(payload)

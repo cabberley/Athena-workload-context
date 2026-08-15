@@ -372,13 +372,23 @@ Evidence record constraints:
   matching `^app-[a-f0-9]{12}$` and `^component-[a-f0-9]{12}$`.
 - Log and metric records persist only aggregate values, query metadata, and evidence references.
 - Raw log bodies, secrets, PHI, PII, credentials, and proprietary payloads are invalid.
-- Evidence text is code-like rather than narrative. Remaining code fields match
-  `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$` and reject email addresses, patient/person-name syntax,
-  password/secret/credential/token/key/connection-string syntax, Azure resource IDs outside typed
-  `resourceId` fields, Key Vault URLs, JWT-shaped values, proprietary-payload markers, and free-form
-  JSON or delimiter payloads. Metric names, activity operations, recommendation codes, resource
-  state, health fields, activity status, Advisor category/impact, and tag classifications use closed
-  enums rather than this fallback code grammar. This validation is a persistence boundary, not a
+- Evidence contracts persist no fallback human or code text. Metric names, activity operations,
+  recommendation codes, resource type/location/zone/state, health fields, activity status, Advisor
+  category/impact, tool names, failure codes/status, and tag classifications are closed enums.
+  Application/component names are opaque registry ids. Snapshot, collector-attempt,
+  identity-evidence, gap, relationship, relationship-endpoint, and evidence-item identifiers are
+  opaque prefixed ids with exactly 12 lowercase hexadecimal characters. The prefixes are `snap-`,
+  `attempt-`, `identity-`, `gap-`, `mcp-`, `ingestion-`, `relationship-`, `role-`, `item-`, and
+  `external-`. Azure resource IDs remain only in typed, scope-validated resource fields.
+  Those fields expose a schema-visible absolute Azure resource-ID grammar requiring an exact
+  subscription GUID, optional resource-group component, provider namespace, and complete type/name
+  pairs; runtime additionally performs component parsing, normalization, and authorized-scope
+  containment.
+- Every persisted restriction is authoritative in generated JSON Schema as an `enum`, `pattern`,
+  `minLength`, `maxLength`, closed object, or discriminated union. No sensitive-data restriction is
+  implemented only in an `AfterValidator`. Runtime and Draft 2020-12 JSON Schema tests both reject
+  password, bearer/JWT, patient/person-name, email, connection-string, secret/key, Azure-path,
+  SSN-shaped, and proprietary-payload probes. This is a persistence boundary, not a
   data-loss-prevention guarantee; collectors must project only approved aggregate/configuration
   fields before contract validation.
 
@@ -503,7 +513,7 @@ properties.
 | `identityEvidenceId` | id | 1 | Referenced by collector attempts and evidence records. |
 | `tokenHash` | digest string | 1 | SHA-256 of the original token bytes; token bytes are not stored. |
 | `jwtHeader` | object | 1 | Closed fields: `alg`, `kid`, `typ`; `alg` must be `RS256`, `typ` must be `JWT`, and `kid` must match `^[A-Za-z0-9_-]{8,128}$` for WC-001. |
-| `trustAnchorRef` | string | 1 | Grammar `^entra:[0-9a-fA-F-]{36}:[A-Za-z0-9_.:/-]{3,128}$`; resolves to a configured Entra tenant OIDC/JWKS trust anchor. |
+| `trustAnchorRef` | string | 1 | Exact versioned Key Vault key URL for the configured trusted-ingestion signing anchor. It is declarative only and never selects an arbitrary key. |
 | `verifiedClaims` | object | 1 | Closed Entra claims listed below. |
 | `tokenVerification` | object | 1 | Complete closed verified claims, their digest, verification time, key id, status, and verification digest for the original Entra JWS. |
 | `ingestionDerivation` | object | 1 | Trusted binding from verified token evidence to exactly one MCP host collector attempt. |
@@ -523,11 +533,16 @@ Token verification is closed and environment-configured. It contains the complet
 `verifiedClaims` object with no exclusions. The copy under `tokenVerification` must equal the
 identity-evidence `verifiedClaims` object byte-for-byte after canonicalization, and the same digest
 must appear in the Key Vault-signed `ingestionDerivation`. `trustAnchorRef` resolves to the expected
-Entra tenant issuer, audience, and JWKS URI for the private Azure MCP deployment. `jwtHeader.kid`
-must match a key in the resolved JWKS at `tokenVerification.verifiedAt`. Verification statuses are
+trusted-ingestion Key Vault signing key only. Entra issuer, audience, and JWKS trust are resolved
+independently from deployment configuration using `verifiedClaims.tenantId`, issuer, audience, and
+`jwtHeader.kid`; they never reuse `trustAnchorRef`. `jwtHeader.kid` must match a key in that
+independently configured JWKS at `tokenVerification.verifiedAt`. Verification statuses are
 `valid`, `expired`, `notYetValid`, `badSignature`, `unknownKey`, `untrustedIssuer`,
 `audienceMismatch`, `claimMismatch`, and `trustAnchorUnavailable`. Publication and evaluation
 require `tokenVerification.status = valid` at the snapshot `collectedAt` time.
+`tenantId`, `managedIdentityObjectId`, `managedIdentityClientId`, and `subject`, plus the copied
+tenant/object/client ids in `ingestionDerivation`, use the schema-visible Azure GUID grammar; they
+cannot persist free text.
 
 The closed `ingestionDerivation` set is `derivationPreimageType`, `derivationPreimageVersion`,
 `schemaVersion`, `semanticContractVersion`, `policyContractVersion`, `identityEvidenceId`,
@@ -563,16 +578,41 @@ defaulted or omitted except the conditional attempt fields above. Derivation dig
 uses the same duplicate-key rejection, NFC pre-validation, datetime normalization, ordering, and
 number rules as artifact digest canonicalization.
 
-The closed `ingestionSignature` set is `signatureAlgorithm`, `keyVaultKeyId`,
-`keyVersion`, `signedPreimageDigest`, `signature`, `signedAt`, `trustAnchorRef`,
-`keyStatusAtSigning`, and `signatureVerification`. `signatureAlgorithm` is `RS256` for WC-001.
+The closed `ingestionSignature` set is `signatureAlgorithm`, `keyVaultKeyId`, `keyName`,
+`keyVersion`, `signedPreimageDigest`, `signature`, `signedAt`, and `trustAnchorRef`.
+Caller-supplied key state and signature-verification status/time are not persisted.
+`signatureAlgorithm` is `RS256` for WC-001.
 `keyVaultKeyId` grammar is
 `^https://[A-Za-z0-9-]+\\.vault\\.azure\\.net/keys/[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$`.
-`signedPreimageDigest` must equal `ingestionDerivation.derivationDigest`. The Key Vault signed
-preimage is exactly the canonicalized `ingestionDerivation` object excluding `/derivationDigest`;
-it is not a free-form claim set and cannot omit the attempt binding. Signature verification
-recomputes `derivationDigest`, verifies `signedPreimageDigest`, and then verifies the Key Vault
-signature over the same canonical bytes.
+The same schema-visible grammar applies to every persisted trusted-ingestion `trustAnchorRef`,
+including `SnapshotCollector`, `CollectorIdentityEvidence`, and `IngestionSignature`.
+`keyName` and `keyVersion` must exactly equal the corresponding URL components.
+The Key Vault signed preimage is a closed object containing
+`signaturePreimageType = athena.trustedIngestionSignature`,
+`signaturePreimageVersion = 1.0.0`, `signatureAlgorithm`, `keyVaultKeyId`, `keyName`, `keyVersion`,
+`signedAt`, `trustAnchorRef`, and the canonicalized `ingestionDerivation` excluding only
+`/derivationDigest`. `signedPreimageDigest` is SHA-256 over this complete object. The preimage is not
+a free-form claim set and cannot omit signing time, key identity, contract metadata, verified-claims
+digest, or attempt binding.
+
+Signature verification requires an explicit configured `TrustedKeyAnchor` lookup and a
+`TrustedKeyRecord` result. The anchor contains the exact versioned Key Vault URL, parsed key name,
+parsed key version, and SHA-256 fingerprint of the DER SubjectPublicKeyInfo bytes. The trusted
+record contains that exact anchor, public verification key, enabled state, activation time, optional
+retirement time, and optional expiry time; construction rejects a record whose actual public-key
+fingerprint differs from the configured anchor. The artifact
+`trustAnchorRef`, `ingestionSignature.trustAnchorRef`, `keyVaultKeyId`, `keyName`, and `keyVersion`,
+the resolver lookup anchor, and the returned record anchor must all be exactly equal. A resolver
+record for another vault, key name, or key version is rejected even if its public key verifies the
+signature. The resolver returns only operator-configured approved anchors; artifact fields never
+cause an unconfigured key to be fetched.
+
+Trusted evaluation supplies `asOf`, which is also the signature verification time. Verification
+requires the trusted key to be enabled and activated at `signedAt`, not retired or expired at either
+`signedAt` or `asOf`, and exactly version-matched. It also requires attempt observation/completion
+`<= ingestionDerivation.derivedAt <= ingestionSignature.signedAt <= asOf`, and token verification
+`verifiedAt <= derivedAt`. Artifact-supplied `keyStatusAtSigning`, `signatureVerification.status`,
+and `signatureVerification.verifiedAt` are forbidden unknown fields.
 
 The retained proof is the canonical `collectorIdentityEvidence` record: `tokenHash`, `jwtHeader`,
 verified claims, token verification metadata, attempt-bound ingestion derivation, Key Vault
@@ -583,15 +623,11 @@ recorded Entra verification status, the token hash reference, and exact equality
 `ingestionDerivation.attemptBinding` and the referenced `CollectorAttempt`; they must not reinterpret
 an Athena caller token as collector proof.
 
-Trusted ingestion key rotation is explicit: each accepted Key Vault key version is in exactly one
-closed state, `active`, `verifyOnly`, or `retired`. New evidence may be signed only by `active`
-versions. `verifyOnly` versions remain trusted for previously published artifacts until all
-referencing snapshots expire or are superseded. `retired` versions fail verification unless an
-operator-published emergency trust record explicitly references the affected artifact digests.
-Signature verification statuses are `valid`, `badSignature`, `unknownKey`, `retiredKey`,
-`trustAnchorUnavailable`, `preimageMismatch`, and `expiredVerification`. Publication and evaluation
-require both `tokenVerification.status = valid` and
-`ingestionSignature.signatureVerification.status = valid`.
+Trusted ingestion key rotation is external to the artifact. Each configured key record has an
+operator-controlled enabled flag, activation time, optional retirement time, and optional expiry
+time. Disabled, not-yet-active, retired, expired, missing, or version-mismatched records fail closed.
+Publication and evaluation require `tokenVerification.status = valid` and successful cryptographic
+verification against the configured record at trusted `asOf`.
 
 A snapshot whose verified collector identity is the Athena context-plane identity, whose
 tool/version is not allowlisted, whose trusted ingestion derivation does not match the verified
@@ -1694,6 +1730,7 @@ class IngestionDerivationSketch(ClosedSketch):
     token_hash: str
     token_verification_status: str
     token_verification_digest: str
+    verified_claims_digest: str
     mcp_host_id: str
     mcp_host_tenant_id: str
     mcp_host_managed_identity_object_id: str
@@ -1706,28 +1743,15 @@ class IngestionDerivationSketch(ClosedSketch):
     derived_at: datetime
     derivation_digest: str
 
-class SignatureVerificationSketch(ClosedSketch):
-    verified_at: datetime
-    status: Literal[
-        "valid",
-        "badSignature",
-        "unknownKey",
-        "retiredKey",
-        "trustAnchorUnavailable",
-        "preimageMismatch",
-        "expiredVerification",
-    ]
-
 class IngestionSignatureSketch(ClosedSketch):
     signature_algorithm: Literal["RS256"]
     key_vault_key_id: str
+    key_name: str
     key_version: str
     signed_preimage_digest: str
     signature: str
     signed_at: datetime
     trust_anchor_ref: str
-    key_status_at_signing: Literal["active", "verifyOnly", "retired"]
-    signature_verification: SignatureVerificationSketch
 
 class CollectorIdentityEvidenceSketch(ClosedSketch):
     identity_evidence_type: Literal["entraJwtTokenEvidence"]
