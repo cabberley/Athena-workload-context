@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+import rfc8785
+
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -109,9 +111,10 @@ def _render_canonical(value: Any) -> str:
 
 
 def canonicalize_json(value: Any) -> str:
-    """Return RFC 8785-compatible canonical JSON bytes as a UTF-8 string."""
+    """Return RFC 8785-compatible canonical JSON as a UTF-8 string."""
     normalized = _normalize_json_value(value)
-    return _render_canonical(normalized)
+    encoded = rfc8785.dumps(normalized)
+    return encoded.decode("utf-8")
 
 
 def sha256_hex(value: str | bytes) -> str:

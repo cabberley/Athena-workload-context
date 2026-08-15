@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -579,6 +579,102 @@ class ProfileSettings(AthenaBaseModel):
     )
 
 
+class WorkloadIdentity(AthenaBaseModel):
+    display_name: str = Field(
+        ..., alias="displayName", min_length=1, max_length=200,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    environment: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    business_criticality: str | None = Field(
+        default=None,
+        alias="businessCriticality",
+        min_length=1,
+        max_length=64,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    data_sensitivity: str | None = Field(
+        default=None,
+        alias="dataSensitivity",
+        min_length=1,
+        max_length=64,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    allowed_evidence_scopes: list[EvidenceScope] = Field(
+        default_factory=list,
+        alias="allowedEvidenceScopes",
+        max_length=50,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+
+class OperationalOwnership(AthenaBaseModel):
+    business_owner: str | None = Field(
+        default=None,
+        alias="businessOwner",
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    technical_owner: str | None = Field(
+        default=None,
+        alias="technicalOwner",
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    operations_owner: str | None = Field(
+        default=None,
+        alias="operationsOwner",
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    security_owner: str | None = Field(
+        default=None,
+        alias="securityOwner",
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    approver: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+
+class ManifestAudit(AthenaBaseModel):
+    published_by: str = Field(
+        ..., alias="publishedBy", min_length=1, max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    reviewed_by: str | None = Field(
+        default=None,
+        alias="reviewedBy",
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    published_at: datetime | None = Field(
+        default=None,
+        alias="publishedAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    change_reason: str | None = Field(
+        default=None,
+        alias="changeReason",
+        min_length=1,
+        max_length=512,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+
 class ProfileOverride(AthenaBaseModel):
     profile_id: str = Field(
         ...,
@@ -602,6 +698,27 @@ class ProfileOverride(AthenaBaseModel):
         default=None, alias="ownerRef", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
+    @model_validator(mode="after")
+    def validate_disabled_refs(self) -> ProfileOverride:
+        if self.disabled_refs and (not self.owner_ref or not self.rationale):
+            raise AthenaValidationError("disabledRefs requires both ownerRef and rationale")
+        return self
+
+
+class ManifestRelationshipSet(AthenaBaseModel):
+    declared: list[DeclaredRelationship] = Field(
+        default_factory=list,
+        min_length=0,
+        max_length=500,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    exceptions: list[ExceptionRelationship] = Field(
+        default_factory=list,
+        min_length=0,
+        max_length=500,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
 
 class ProfileDefinition(AthenaBaseModel):
     profile_id: str = Field(
@@ -620,6 +737,82 @@ class ProfileDefinition(AthenaBaseModel):
     overrides: list[ProfileOverride] = Field(
         default_factory=list, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
+
+    def resolve(self, registry: dict[str, ProfileDefinition]) -> ProfileDefinition:
+        visited: set[str] = set()
+        resolved_settings = ProfileSettings.model_validate(
+            {"continuity": {"zoneLossContinuityRequired": False}}
+        )
+        inherited_chain: list[ProfileDefinition] = []
+        current_id: str | None = self.profile_id
+
+        while current_id is not None:
+            if current_id in visited:
+                raise AthenaValidationError(f"profile inheritance cycle detected: {current_id!r}")
+            visited.add(current_id)
+            current = registry.get(current_id)
+            if current is None:
+                raise AthenaValidationError(f"profile reference not found: {current_id!r}")
+            inherited_chain.append(current)
+            current_id = current.extends
+
+        for profile in reversed(inherited_chain):
+            resolved_settings = _merge_profile_settings(resolved_settings, profile.settings)
+
+        resolved_override_settings: dict[str, Any] = {
+            "continuity": {
+                "zoneLossContinuityRequired": (
+                    resolved_settings.continuity.zone_loss_continuity_required
+                )
+            }
+        }
+        return ProfileDefinition(
+            profileId=self.profile_id,
+            profileType=self.profile_type,
+            extends=self.extends,
+            settings=ProfileSettings.model_validate(resolved_override_settings),
+            overrides=self.overrides,
+        )
+
+    @classmethod
+    def validate_profile_hierarchy(cls, profiles: dict[str, ProfileDefinition]) -> None:
+        seen: set[str] = set()
+        stack: set[str] = set()
+
+        def walk(profile_id: str) -> None:
+            if profile_id in stack:
+                raise AthenaValidationError(f"profile inheritance cycle detected: {profile_id!r}")
+            if profile_id in seen:
+                return
+            seen.add(profile_id)
+            stack.add(profile_id)
+            profile = profiles.get(profile_id)
+            if profile is None:
+                raise AthenaValidationError(f"profile reference not found: {profile_id!r}")
+            if profile.extends is not None:
+                walk(profile.extends)
+            stack.remove(profile_id)
+
+        for profile_id in profiles:
+            walk(profile_id)
+
+
+def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_profile_settings(base: ProfileSettings, override: ProfileSettings) -> ProfileSettings:
+    merged = _deep_merge_dict(
+        base.model_dump(mode="json", by_alias=True),
+        override.model_dump(mode="json", by_alias=True),
+    )
+    return ProfileSettings.model_validate(merged)
 
 
 class RoleCardinalityExactlyOne(AthenaBaseModel):
@@ -690,8 +883,23 @@ class TagPredicateSelector(AthenaBaseModel):
     selector_type: Literal["tagPredicate"] = Field(
         ..., alias="selectorType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    predicates: list[str] = Field(
-        ..., min_length=1, max_length=20, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    value: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    predicates: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=20,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     max_matches: int = Field(
         default=1000,
@@ -699,14 +907,39 @@ class TagPredicateSelector(AthenaBaseModel):
         ge=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+
+    @model_validator(mode="after")
+    def validate_predicate_shape(self) -> TagPredicateSelector:
+        has_key_value = self.key is not None or self.value is not None
+        if self.predicates is None and not has_key_value:
+            raise AthenaValidationError("tagPredicate requires either key/value or predicates")
+        if self.predicates is not None and has_key_value:
+            raise AthenaValidationError("tagPredicate cannot mix key/value and predicates")
+        if self.predicates is not None and not self.predicates:
+            raise AthenaValidationError("predicates cannot be empty")
+        return self
 
 
 class NamePatternSelector(AthenaBaseModel):
     selector_type: Literal["namePattern"] = Field(
         ..., alias="selectorType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    pattern: str = Field(
-        ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    pattern: str | None = Field(
+        default=None,
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    prefix: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    suffix: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     max_matches: int = Field(
         default=1000,
@@ -714,6 +947,12 @@ class NamePatternSelector(AthenaBaseModel):
         ge=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+
+    @model_validator(mode="after")
+    def validate_name_pattern(self) -> NamePatternSelector:
+        if self.pattern is None and self.prefix is None and self.suffix is None:
+            raise AthenaValidationError("namePattern requires pattern, prefix, or suffix")
+        return self
 
 
 class ResourceTypeScopeSelector(AthenaBaseModel):
@@ -1326,6 +1565,14 @@ class RiskAcceptance(AthenaBaseModel):
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
 
+    @model_validator(mode="after")
+    def validate_risk_acceptance(self) -> RiskAcceptance:
+        if self.accepted_at > self.expires_at:
+            raise AthenaValidationError("acceptedAt must be earlier than or equal to expiresAt")
+        if self.active and self.expires_at <= datetime.now(tz=UTC):
+            raise AthenaValidationError("active risk acceptance cannot already be expired")
+        return self
+
 
 class Control(AthenaBaseModel):
     control_id: str = Field(
@@ -1402,14 +1649,16 @@ class WorkloadManifest(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    workload: dict[str, Any] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    workload: WorkloadIdentity = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
     profiles: dict[str, ProfileDefinition] = Field(
         ..., min_length=1, max_length=25, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     roles: list[WorkloadRole] = Field(
         ..., min_length=1, max_length=200, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    relationships: dict[str, list[Relationship]] = Field(
+    relationships: ManifestRelationshipSet = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     constraints: list[Constraint] = Field(
@@ -1433,11 +1682,13 @@ class WorkloadManifest(AthenaBaseModel):
         max_length=200,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    ownership: dict[str, Any] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    ownership: OperationalOwnership = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
     compatibility: CompatibilityMetadata = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    audit: dict[str, Any] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    audit: ManifestAudit = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
 
     @field_validator("profiles")
     @classmethod
@@ -1469,12 +1720,13 @@ class WorkloadManifest(AthenaBaseModel):
             raise AthenaValidationError(
                 "prototype manifest requires production, development, and training profiles"
             )
+        ProfileDefinition.validate_profile_hierarchy(self.profiles)
         return self
 
     def resolved_profiles(self) -> dict[str, ProfileDefinition]:
         resolved: dict[str, ProfileDefinition] = {}
         for profile_id, profile in self.profiles.items():
-            resolved[profile_id] = profile
+            resolved[profile_id] = profile.resolve(self.profiles)
         return resolved
 
 
@@ -1623,10 +1875,19 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    gap_reason: str = Field(
+    gap_reason: Literal[
+        "missing",
+        "stale",
+        "unauthorized",
+        "filtered",
+        "malformed",
+        "collectorUnavailable",
+        "scopeMismatch",
+        "responseOversized",
+        "unsupportedTool",
+    ] = Field(
         ...,
         alias="gapReason",
-        min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     failure_payload_digest: str | None = Field(
@@ -1923,10 +2184,14 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    authorization_status: str = Field(
+    authorization_status: Literal[
+        "denied",
+        "expiredCredential",
+        "scopeNotAllowed",
+        "identityMismatch",
+    ] = Field(
         ...,
         alias="authorizationStatus",
-        min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     observed_at: datetime = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
@@ -1975,10 +2240,15 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    unavailable_reason: str = Field(
+    unavailable_reason: Literal[
+        "notAllowlisted",
+        "notHosted",
+        "versionUnavailable",
+        "networkUnavailable",
+        "mcpUnavailable",
+    ] = Field(
         ...,
         alias="unavailableReason",
-        min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     observed_at: datetime = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
@@ -2280,10 +2550,19 @@ class EvidenceGapRecord(AthenaBaseModel):
     evidence_scope: EvidenceScope = Field(
         ..., alias="evidenceScope", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    gap_reason: str = Field(
+    gap_reason: Literal[
+        "missing",
+        "stale",
+        "unauthorized",
+        "filtered",
+        "malformed",
+        "collectorUnavailable",
+        "scopeMismatch",
+        "responseOversized",
+        "unsupportedTool",
+    ] = Field(
         ...,
         alias="gapReason",
-        min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     expected_record_type: EvidenceRecordType = Field(
@@ -2392,6 +2671,10 @@ __all__ = [
     "CapabilityRequirement",
     "CompatibilityMetadata",
     "ProducerInfo",
+    "WorkloadIdentity",
+    "OperationalOwnership",
+    "ManifestAudit",
+    "ManifestRelationshipSet",
     "SubscriptionScope",
     "ResourceGroupScope",
     "ResourceIdScope",
