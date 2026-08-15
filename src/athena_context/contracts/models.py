@@ -11,10 +11,13 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StringConstraints,
+    WithJsonSchema,
     field_validator,
     model_validator,
 )
@@ -394,7 +397,7 @@ class TrustedKeyAnchor:
     key_vault_key_id: str
     key_name: str
     key_version: str
-    public_key_fingerprint: str
+    public_key_fingerprint: Sha256Digest
 
     @classmethod
     def from_key_vault_key_id(
@@ -541,10 +544,23 @@ def compute_verified_claims_digest(value: Any) -> str:
     return compute_artifact_digest(_json_digest_payload(value))
 
 
+def compute_jti_digest(jti: str) -> str:
+    if not jti or len(jti) > 256:
+        raise AthenaValidationError("verified token jti must contain 1 to 256 characters")
+    return sha256_hex(normalize_nfc_text(jti))
+
+
 type SemanticVersionText = Annotated[
     str,
     StringConstraints(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$"),
 ]
+type AthenaCapabilityIdentifier = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^athena\.[a-z][a-z0-9-]{1,31}(?:\.[a-z][a-z0-9-]{1,31}){0,4}$"
+    ),
+]
+type AthenaProducerIdentifier = AthenaCapabilityIdentifier
 type ApplicationTagId = Annotated[
     str,
     StringConstraints(pattern=r"^app-[a-f0-9]{12}$"),
@@ -612,9 +628,97 @@ type AzureGuid = Annotated[
     str,
     StringConstraints(
         pattern=(
-            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
         )
+    ),
+]
+type Sha256Digest = Annotated[
+    str,
+    StringConstraints(pattern=r"^sha256:[a-f0-9]{64}$"),
+]
+_UTC_DATETIME_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:"
+    r"[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+)
+_UTC_DATETIME_RE = re.compile(_UTC_DATETIME_PATTERN)
+
+
+def _validate_utc_lexical_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if not _UTC_DATETIME_RE.fullmatch(value):
+            raise AthenaValidationError("timestamp text must use canonical UTC RFC 3339 syntax")
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+def _validate_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise AthenaValidationError("timestamp must be UTC")
+    return value
+
+
+type UtcDateTime = Annotated[
+    datetime,
+    BeforeValidator(_validate_utc_lexical_value),
+    AfterValidator(_validate_utc_datetime),
+    WithJsonSchema(
+        {
+            "type": "string",
+            "format": "date-time",
+            "pattern": _UTC_DATETIME_PATTERN,
+        }
+    ),
+]
+type JwtKeyIdentifier = Annotated[
+    str,
+    StringConstraints(
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]{8,128}$",
+    ),
+]
+type EntraIssuer = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^https://(?:login\.microsoftonline\.com/"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}/v2\.0|"
+            r"sts\.windows\.net/[0-9a-f]{8}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)$"
+        )
+    ),
+]
+type IngestionAudience = Annotated[
+    str,
+    StringConstraints(
+        min_length=9,
+        max_length=134,
+        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+    ),
+]
+type KeyVaultKeyName = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=127,
+        pattern=r"^[A-Za-z0-9-]{1,127}$",
+    ),
+]
+type KeyVaultKeyVersion = Annotated[
+    str,
+    StringConstraints(min_length=32, max_length=32, pattern=r"^[A-Fa-f0-9]{32}$"),
+]
+type StandardBase64Signature = Annotated[
+    str,
+    StringConstraints(
+        min_length=344,
+        max_length=684,
+        pattern=(
+            r"^(?:[A-Za-z0-9+/]{4}){85,171}"
+            r"(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        ),
     ),
 ]
 type VersionedKeyVaultKeyId = Annotated[
@@ -631,12 +735,36 @@ type AzureResourceIdentifier = Annotated[
     StringConstraints(
         pattern=(
             r"^/subscriptions/"
-            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/"
-            r"(?:resourceGroups/[A-Za-z0-9._()-]{1,90}/)?"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}/"
+            r"(?:resourceGroups/[A-Za-z0-9._()-]{0,89}[A-Za-z0-9_()-]/)?"
             r"providers/[A-Za-z0-9.]+"
             r"(?:/[A-Za-z0-9._()-]+/[A-Za-z0-9._()-]+)+$"
         )
+    ),
+]
+type ResourceGroupName = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=90,
+        pattern=r"^[A-Za-z0-9._()-]{0,89}[A-Za-z0-9_()-]$",
+    ),
+]
+type WorkspaceName = Annotated[
+    str,
+    StringConstraints(
+        min_length=4,
+        max_length=63,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{2,61}[A-Za-z0-9]$",
+    ),
+]
+type AzureRegionCode = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
     ),
 ]
 
@@ -1017,6 +1145,13 @@ def verify_trusted_ingestion_signature(
     ):
         return False
     if (
+        identity_evidence.token_verification.jti_digest
+        != identity_evidence.verified_claims.jti_digest
+        or identity_evidence.ingestion_derivation.jti_digest
+        != identity_evidence.verified_claims.jti_digest
+    ):
+        return False
+    if (
         identity_evidence.token_verification.token_verification_digest
         != compute_token_verification_digest(identity_evidence.token_verification)
     ):
@@ -1096,13 +1231,13 @@ def verify_trusted_ingestion_signature(
 
 
 class CapabilityRequirement(AthenaBaseModel):
-    capability_id: str = Field(
+    capability_id: AthenaCapabilityIdentifier = Field(
         ...,
         alias="capabilityId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    minimum_version: str = Field(
+    minimum_version: SemanticVersionText = Field(
         ...,
         alias="minimumVersion",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -1113,10 +1248,12 @@ class CapabilityRequirement(AthenaBaseModel):
 
 
 class ProducerInfo(AthenaBaseModel):
-    producer_id: str = Field(
+    producer_id: AthenaProducerIdentifier = Field(
         ..., alias="producerId", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    version: str = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    version: SemanticVersionText = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
 
 
 class CompatibilityMetadata(AthenaBaseModel):
@@ -1131,18 +1268,18 @@ class CompatibilityMetadata(AthenaBaseModel):
         alias="artifactKind",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    schema_version: str = Field(
+    schema_version: SemanticVersionText = Field(
         ..., alias="schemaVersion", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    semantic_contract_version: str = Field(
+    semantic_contract_version: SemanticVersionText = Field(
         ...,
         alias="semanticContractVersion",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    policy_contract_version: str = Field(
+    policy_contract_version: SemanticVersionText = Field(
         ..., alias="policyContractVersion", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    minimum_reader_version: str = Field(
+    minimum_reader_version: SemanticVersionText = Field(
         ..., alias="minimumReaderVersion", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     requires_capabilities: list[CapabilityRequirement] = Field(
@@ -1156,10 +1293,10 @@ class CompatibilityMetadata(AthenaBaseModel):
     extension_policy: Literal["rejectUnknownDecisionFields"] = Field(
         ..., alias="extensionPolicy", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    artifact_digest: str = Field(
+    artifact_digest: Sha256Digest = Field(
         ..., alias="artifactDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    semantic_digest: str = Field(
+    semantic_digest: Sha256Digest = Field(
         ..., alias="semanticDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
@@ -1169,13 +1306,13 @@ class SubscriptionScope(AthenaBaseModel):
     scope_type: Literal["subscription"] = Field(
         ..., alias="scopeType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tenant_id: str = Field(
+    tenant_id: AzureGuid = Field(
         ...,
         alias="tenantId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    subscription_id: str = Field(
+    subscription_id: AzureGuid = Field(
         ...,
         alias="subscriptionId",
         min_length=1,
@@ -1194,19 +1331,19 @@ class ResourceGroupScope(AthenaBaseModel):
     scope_type: Literal["resourceGroup"] = Field(
         ..., alias="scopeType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tenant_id: str = Field(
+    tenant_id: AzureGuid = Field(
         ...,
         alias="tenantId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    subscription_id: str = Field(
+    subscription_id: AzureGuid = Field(
         ...,
         alias="subscriptionId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    resource_group_name: str = Field(
+    resource_group_name: ResourceGroupName = Field(
         ...,
         alias="resourceGroupName",
         min_length=1,
@@ -1250,25 +1387,25 @@ class LogAnalyticsWorkspaceScope(AthenaBaseModel):
     scope_type: Literal["logAnalyticsWorkspace"] = Field(
         ..., alias="scopeType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tenant_id: str = Field(
+    tenant_id: AzureGuid = Field(
         ...,
         alias="tenantId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    subscription_id: str = Field(
+    subscription_id: AzureGuid = Field(
         ...,
         alias="subscriptionId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    resource_group_name: str = Field(
+    resource_group_name: ResourceGroupName = Field(
         ...,
         alias="resourceGroupName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    workspace_name: str = Field(
+    workspace_name: WorkspaceName = Field(
         ...,
         alias="workspaceName",
         min_length=1,
@@ -1295,7 +1432,9 @@ class ServiceHealthRegionScope(AthenaBaseModel):
         ..., alias="scopeType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     cloud: AzureCloud = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    region: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
+    region: AzureRegionCode = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
 
     @field_validator("region")
     @classmethod
@@ -2152,7 +2291,7 @@ class ObservedRelationship(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    observed_at: datetime = Field(
+    observed_at: UtcDateTime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
@@ -2724,19 +2863,19 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    snapshot_artifact_digest: str = Field(
+    snapshot_artifact_digest: Sha256Digest = Field(
         ...,
         alias="snapshotArtifactDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    snapshot_semantic_digest: str = Field(
+    snapshot_semantic_digest: Sha256Digest = Field(
         ...,
         alias="snapshotSemanticDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
@@ -2748,7 +2887,7 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -2766,7 +2905,7 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_at: datetime = Field(
+    collector_attempt_at: UtcDateTime = Field(
         ..., alias="collectorAttemptAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -2775,7 +2914,7 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    source_response_digest: str = Field(
+    source_response_digest: Sha256Digest = Field(
         ...,
         alias="sourceResponseDigest",
         min_length=1,
@@ -2823,13 +2962,13 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    snapshot_artifact_digest: str = Field(
+    snapshot_artifact_digest: Sha256Digest = Field(
         ...,
         alias="snapshotArtifactDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    snapshot_semantic_digest: str = Field(
+    snapshot_semantic_digest: Sha256Digest = Field(
         ...,
         alias="snapshotSemanticDigest",
         min_length=1,
@@ -2838,7 +2977,7 @@ class EvidenceGapRef(AthenaBaseModel):
     gap_id: GapIdentifier = Field(
         ..., alias="gapId", min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    gap_record_digest: str = Field(
+    gap_record_digest: Sha256Digest = Field(
         ...,
         alias="gapRecordDigest",
         min_length=1,
@@ -2856,7 +2995,7 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -2874,7 +3013,7 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_at: datetime = Field(
+    collector_attempt_at: UtcDateTime = Field(
         ..., alias="collectorAttemptAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -2898,7 +3037,7 @@ class EvidenceGapRef(AthenaBaseModel):
         alias="gapReason",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_payload_digest: str | None = Field(
+    failure_payload_digest: Sha256Digest | None = Field(
         default=None,
         alias="failurePayloadDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -2965,7 +3104,7 @@ class ContextRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    resolved_profile_digest: str = Field(
+    resolved_profile_digest: Sha256Digest = Field(
         ...,
         alias="resolvedProfileDigest",
         min_length=1,
@@ -2981,20 +3120,17 @@ class ContextRef(AthenaBaseModel):
 
 class JwtHeader(AthenaBaseModel):
     alg: Literal["RS256"] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    kid: str = Field(
+    kid: JwtKeyIdentifier = Field(
         ...,
-        min_length=8,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9_-]{8,128}$",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     typ: Literal["JWT"] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
 
 
 class VerifiedTokenClaims(AthenaBaseModel):
-    issuer: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
-    audience: str = Field(
-        ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    issuer: EntraIssuer = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    audience: IngestionAudience = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tenant_id: AzureGuid = Field(
         ...,
@@ -3017,16 +3153,16 @@ class VerifiedTokenClaims(AthenaBaseModel):
     subject: AzureGuid = Field(
         ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    jti: str = Field(
-        ..., min_length=1, max_length=128, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    jti_digest: Sha256Digest = Field(
+        ..., alias="jtiDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    issued_at: datetime = Field(
+    issued_at: UtcDateTime = Field(
         ..., alias="issuedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    not_before: datetime = Field(
+    not_before: UtcDateTime = Field(
         ..., alias="notBefore", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    expires_at: datetime = Field(
+    expires_at: UtcDateTime = Field(
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
@@ -3071,27 +3207,27 @@ class TokenVerification(AthenaBaseModel):
         "claimMismatch",
         "trustAnchorUnavailable",
     ] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    verified_at: datetime = Field(
+    verified_at: UtcDateTime = Field(
         ..., alias="verifiedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    key_id: str = Field(
+    key_id: JwtKeyIdentifier = Field(
         ...,
         alias="keyId",
-        min_length=8,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9_-]{8,128}$",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     verified_claims: VerifiedTokenClaims = Field(
         ..., alias="verifiedClaims", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    verified_claims_digest: str = Field(
+    verified_claims_digest: Sha256Digest = Field(
         ...,
         alias="verifiedClaimsDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    token_verification_digest: str = Field(
+    jti_digest: Sha256Digest = Field(
+        ..., alias="jtiDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    token_verification_digest: Sha256Digest = Field(
         ...,
         alias="tokenVerificationDigest",
         min_length=1,
@@ -3100,6 +3236,10 @@ class TokenVerification(AthenaBaseModel):
     @model_validator(mode="after")
     def validate_digest(self) -> TokenVerification:
         expected_claims_digest = compute_verified_claims_digest(self.verified_claims)
+        if self.jti_digest != self.verified_claims.jti_digest:
+            raise AthenaValidationError(
+                "TokenVerification.jtiDigest must equal verifiedClaims.jtiDigest"
+            )
         if self.verified_claims_digest != expected_claims_digest:
             raise AthenaValidationError(
                 "TokenVerification.verifiedClaimsDigest mismatched the complete verified claims"
@@ -3125,7 +3265,7 @@ class AttemptBinding(AthenaBaseModel):
     attempt_type: AttemptType = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3143,37 +3283,37 @@ class AttemptBinding(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    response_digest: str | None = Field(
+    response_digest: Sha256Digest | None = Field(
         default=None,
         alias="responseDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_digest: str | None = Field(
+    failure_digest: Sha256Digest | None = Field(
         default=None,
         alias="failureDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    response_received_at: datetime | None = Field(
+    response_received_at: UtcDateTime | None = Field(
         default=None,
         alias="responseReceivedAt",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    deadline_at: datetime | None = Field(
+    deadline_at: UtcDateTime | None = Field(
         default=None, alias="deadlineAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    timed_out_at: datetime | None = Field(
+    timed_out_at: UtcDateTime | None = Field(
         default=None, alias="timedOutAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    observed_at: datetime | None = Field(
+    observed_at: UtcDateTime | None = Field(
         default=None, alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
@@ -3267,25 +3407,25 @@ class IngestionDerivation(AthenaBaseModel):
         alias="derivationPreimageType",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    derivation_preimage_version: str = Field(
+    derivation_preimage_version: SemanticVersionText = Field(
         ...,
         alias="derivationPreimageVersion",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    schema_version: str = Field(
+    schema_version: SemanticVersionText = Field(
         ...,
         alias="schemaVersion",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    semantic_contract_version: str = Field(
+    semantic_contract_version: SemanticVersionText = Field(
         ...,
         alias="semanticContractVersion",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    policy_contract_version: str = Field(
+    policy_contract_version: SemanticVersionText = Field(
         ...,
         alias="policyContractVersion",
         min_length=1,
@@ -3297,7 +3437,7 @@ class IngestionDerivation(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    token_hash: str = Field(
+    token_hash: Sha256Digest = Field(
         ...,
         alias="tokenHash",
         min_length=1,
@@ -3318,17 +3458,20 @@ class IngestionDerivation(AthenaBaseModel):
         alias="tokenVerificationStatus",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    token_verification_digest: str = Field(
+    token_verification_digest: Sha256Digest = Field(
         ...,
         alias="tokenVerificationDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    verified_claims_digest: str = Field(
+    verified_claims_digest: Sha256Digest = Field(
         ...,
         alias="verifiedClaimsDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    jti_digest: Sha256Digest = Field(
+        ..., alias="jtiDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     mcp_host_id: McpHostIdentifier = Field(
         ...,
@@ -3360,13 +3503,13 @@ class IngestionDerivation(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    ingestion_audience: str = Field(
+    ingestion_audience: IngestionAudience = Field(
         ...,
         alias="ingestionAudience",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_allowlist_digest: str = Field(
+    tool_allowlist_digest: Sha256Digest = Field(
         ...,
         alias="toolAllowlistDigest",
         min_length=1,
@@ -3381,10 +3524,10 @@ class IngestionDerivation(AthenaBaseModel):
     attempt_binding: AttemptBinding = Field(
         ..., alias="attemptBinding", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    derived_at: datetime = Field(
+    derived_at: UtcDateTime = Field(
         ..., alias="derivedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    derivation_digest: str = Field(
+    derivation_digest: Sha256Digest = Field(
         ...,
         alias="derivationDigest",
         min_length=1,
@@ -3431,7 +3574,7 @@ class IngestionSignature(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    key_name: str = Field(
+    key_name: KeyVaultKeyName = Field(
         ...,
         alias="keyName",
         min_length=1,
@@ -3439,7 +3582,7 @@ class IngestionSignature(AthenaBaseModel):
         pattern=r"^[A-Za-z0-9-]{1,127}$",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    key_version: str = Field(
+    key_version: KeyVaultKeyVersion = Field(
         ...,
         alias="keyVersion",
         min_length=32,
@@ -3447,16 +3590,16 @@ class IngestionSignature(AthenaBaseModel):
         pattern=r"^[A-Fa-f0-9]{32}$",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    signed_preimage_digest: str = Field(
+    signed_preimage_digest: Sha256Digest = Field(
         ...,
         alias="signedPreimageDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    signature: str = Field(
-        ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    signature: StandardBase64Signature = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    signed_at: datetime = Field(
+    signed_at: UtcDateTime = Field(
         ..., alias="signedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     trust_anchor_ref: VersionedKeyVaultKeyId = Field(
@@ -3500,7 +3643,7 @@ class CollectorIdentityEvidence(AthenaBaseModel):
     identity_evidence_type: Literal["entraJwtTokenEvidence"] = Field(
         ..., alias="identityEvidenceType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    token_hash: str = Field(
+    token_hash: Sha256Digest = Field(
         ...,
         alias="tokenHash",
         min_length=1,
@@ -3527,7 +3670,7 @@ class CollectorIdentityEvidence(AthenaBaseModel):
     ingestion_signature: IngestionSignature = Field(
         ..., alias="ingestionSignature", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    identity_evidence_digest: str = Field(
+    identity_evidence_digest: Sha256Digest = Field(
         ...,
         alias="identityEvidenceDigest",
         min_length=1,
@@ -3569,6 +3712,14 @@ class CollectorIdentityEvidence(AthenaBaseModel):
             raise AthenaValidationError(
                 "complete verified claims digest must match token verification and "
                 "signed ingestion derivation"
+            )
+        if (
+            self.token_verification.jti_digest != self.verified_claims.jti_digest
+            or self.ingestion_derivation.jti_digest != self.verified_claims.jti_digest
+        ):
+            raise AthenaValidationError(
+                "tokenVerification and ingestionDerivation jtiDigest values must equal "
+                "verifiedClaims.jtiDigest"
             )
         if self.verified_claims.audience != self.ingestion_derivation.ingestion_audience:
             raise AthenaValidationError(
@@ -3641,7 +3792,7 @@ class CollectorIdentityEvidence(AthenaBaseModel):
 
 
 class _CollectorAttemptDigestBound(AthenaBaseModel):
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3670,7 +3821,7 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tool_name: EvidenceToolName = Field(
@@ -3685,19 +3836,19 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    response_digest: str = Field(
+    response_digest: Sha256Digest = Field(
         ...,
         alias="responseDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    response_received_at: datetime = Field(
+    response_received_at: UtcDateTime = Field(
         ..., alias="responseReceivedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -3706,7 +3857,7 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3746,7 +3897,7 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tool_name: EvidenceToolName = Field(
@@ -3761,7 +3912,7 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
@@ -3779,13 +3930,13 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_digest: str = Field(
+    failure_digest: Sha256Digest = Field(
         ...,
         alias="failureDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    response_received_at: datetime = Field(
+    response_received_at: UtcDateTime = Field(
         ..., alias="responseReceivedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -3794,7 +3945,7 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3834,7 +3985,7 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tool_name: EvidenceToolName = Field(
@@ -3849,16 +4000,16 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    deadline_at: datetime = Field(
+    deadline_at: UtcDateTime = Field(
         ..., alias="deadlineAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    timed_out_at: datetime = Field(
+    timed_out_at: UtcDateTime = Field(
         ..., alias="timedOutAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -3867,7 +4018,7 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3905,7 +4056,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tool_name: EvidenceToolName = Field(
@@ -3920,7 +4071,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
@@ -3936,7 +4087,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
         alias="authorizationStatus",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    observed_at: datetime = Field(
+    observed_at: UtcDateTime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -3945,7 +4096,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -3981,7 +4132,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_started_at: datetime = Field(
+    attempt_started_at: UtcDateTime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     tool_name: EvidenceToolName = Field(
@@ -3996,7 +4147,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    request_digest: str = Field(
+    request_digest: Sha256Digest = Field(
         ...,
         alias="requestDigest",
         min_length=1,
@@ -4013,7 +4164,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
         alias="unavailableReason",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    observed_at: datetime = Field(
+    observed_at: UtcDateTime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -4022,7 +4173,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    attempt_digest: str = Field(
+    attempt_digest: Sha256Digest = Field(
         ...,
         alias="attemptDigest",
         min_length=1,
@@ -4083,7 +4234,7 @@ class EvidenceRecordProvenance(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    source_response_digest: str | None = Field(
+    source_response_digest: Sha256Digest | None = Field(
         default=None,
         alias="sourceResponseDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -4093,7 +4244,7 @@ class EvidenceRecordProvenance(AthenaBaseModel):
         alias="sourceResponsePointer",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_payload_digest: str | None = Field(
+    failure_payload_digest: Sha256Digest | None = Field(
         default=None,
         alias="failurePayloadDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -4159,7 +4310,7 @@ class SnapshotCollector(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tenant_id: str = Field(
+    tenant_id: AzureGuid = Field(
         ...,
         alias="tenantId",
         min_length=1,
@@ -4177,13 +4328,13 @@ class SnapshotCollector(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    ingestion_audience: str = Field(
+    ingestion_audience: IngestionAudience = Field(
         ...,
         alias="ingestionAudience",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_allowlist_digest: str = Field(
+    tool_allowlist_digest: Sha256Digest = Field(
         ...,
         alias="toolAllowlistDigest",
         min_length=1,
@@ -4217,7 +4368,7 @@ class ApprovedResourceTags(AthenaBaseModel):
             "anyOf": [
                 {
                     "required": [field_name],
-                    "properties": {field_name: {"type": "string"}},
+                    "properties": {field_name: {"not": {"type": "null"}}},
                 }
                 for field_name in (
                     "environment",
@@ -4299,13 +4450,13 @@ class ResourceEvidenceRecord(AthenaBaseModel):
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4334,19 +4485,19 @@ class ObservedRelationshipEvidenceRecord(AthenaBaseModel):
     record_type: Literal["observedRelationship"] = Field(
         ..., alias="recordType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    relationship: Relationship = Field(
+    relationship: ObservedRelationship = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4389,10 +4540,10 @@ class MetricAggregateEvidenceRecord(AthenaBaseModel):
     aggregation: MetricAggregation = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    window_start: datetime = Field(
+    window_start: UtcDateTime = Field(
         ..., alias="windowStart", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    window_end: datetime = Field(
+    window_end: UtcDateTime = Field(
         ..., alias="windowEnd", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     value: float = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
@@ -4400,13 +4551,13 @@ class MetricAggregateEvidenceRecord(AthenaBaseModel):
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4446,10 +4597,10 @@ class HealthEventEvidenceRecord(AthenaBaseModel):
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
     status: HealthStatus = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    started_at: datetime = Field(
+    started_at: UtcDateTime = Field(
         ..., alias="startedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    ended_at: datetime = Field(
+    ended_at: UtcDateTime = Field(
         ..., alias="endedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     summary_code: HealthSummaryCode = Field(
@@ -4458,13 +4609,13 @@ class HealthEventEvidenceRecord(AthenaBaseModel):
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4500,22 +4651,22 @@ class ActivitySummaryEvidenceRecord(AthenaBaseModel):
     )
     status: ActivityStatus = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     count: int = Field(..., ge=0, json_schema_extra={"x-athena-semanticClass": "semantic"})
-    window_start: datetime = Field(
+    window_start: UtcDateTime = Field(
         ..., alias="windowStart", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    window_end: datetime = Field(
+    window_end: UtcDateTime = Field(
         ..., alias="windowEnd", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4559,13 +4710,13 @@ class AdvisorRecommendationEvidenceRecord(AthenaBaseModel):
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
@@ -4624,13 +4775,13 @@ class EvidenceGapRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_digest: str = Field(
+    collector_attempt_digest: Sha256Digest = Field(
         ...,
         alias="collectorAttemptDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    observed_at: datetime = Field(
+    observed_at: UtcDateTime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector_identity_evidence_ref: IdentityEvidenceIdentifier = Field(
@@ -4639,7 +4790,7 @@ class EvidenceGapRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_payload_digest: str | None = Field(
+    failure_payload_digest: Sha256Digest | None = Field(
         default=None,
         alias="failurePayloadDigest",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -4649,7 +4800,7 @@ class EvidenceGapRecord(AthenaBaseModel):
         alias="failurePayloadPointer",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    item_digest: str = Field(
+    item_digest: Sha256Digest = Field(
         ...,
         alias="itemDigest",
         min_length=1,
@@ -4706,10 +4857,10 @@ class EvidenceSnapshot(AthenaBaseModel):
         max_length=100,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collected_at: datetime = Field(
+    collected_at: UtcDateTime = Field(
         ..., alias="collectedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    expires_at: datetime = Field(
+    expires_at: UtcDateTime = Field(
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     collector: SnapshotCollector = Field(
@@ -5540,11 +5691,42 @@ __all__ = [
     "compute_evidence_record_digest",
     "compute_token_verification_digest",
     "compute_verified_claims_digest",
+    "compute_jti_digest",
     "compute_response_envelope_digest",
     "compute_failure_envelope_digest",
     "compute_evidence_snapshot_artifact_digest",
     "compute_evidence_snapshot_semantic_digest",
     "EvidenceEnvelopeResolver",
+    "Sha256Digest",
+    "AzureGuid",
+    "UtcDateTime",
+    "JwtKeyIdentifier",
+    "IngestionAudience",
+    "SemanticVersionText",
+    "VersionedKeyVaultKeyId",
+    "KeyVaultKeyName",
+    "KeyVaultKeyVersion",
+    "StandardBase64Signature",
+    "AzureResourceIdentifier",
+    "ResponseEvidencePointer",
+    "FailureEvidencePointer",
+    "ApplicationTagId",
+    "ComponentTagId",
+    "SnapshotIdentifier",
+    "AttemptIdentifier",
+    "IdentityEvidenceIdentifier",
+    "GapIdentifier",
+    "McpHostIdentifier",
+    "IngestionServiceIdentifier",
+    "EvidenceRoleIdentifier",
+    "EvidenceRelationshipIdentifier",
+    "EvidenceItemIdentifier",
+    "EvidenceExternalIdentifier",
+    "AthenaCapabilityIdentifier",
+    "AthenaProducerIdentifier",
+    "ResourceGroupName",
+    "WorkspaceName",
+    "AzureRegionCode",
     "ProducerInfo",
     "AzureCloud",
     "WorkloadIdentity",

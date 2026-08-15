@@ -520,15 +520,18 @@ properties.
 | `ingestionSignature` | object | 1 | Key Vault signature over the normalized attempt-bound verification/derivation preimage. |
 | `identityEvidenceDigest` | digest string | 1 | Digest over the evidence excluding `/identityEvidenceDigest` and token bytes. |
 
-The closed `verifiedClaims` set is `issuer`, `audience`, `tenantId`,
-`managedIdentityObjectId`, `managedIdentityClientId`, `subject`, `jti`, `issuedAt`, `notBefore`, and
-`expiresAt`. `issuedAt <= notBefore < expiresAt` is mandatory.
+The closed persisted `VerifiedTokenClaims` set is `issuer`, `audience`, `tenantId`,
+`managedIdentityObjectId`, `managedIdentityClientId`, `subject`, `jtiDigest`, `issuedAt`,
+`notBefore`, and `expiresAt`. Trusted token verification computes `jtiDigest` as lowercase
+`sha256:<64 hex>` over the NFC-normalized verified token `jti`. Raw `jti` is never persisted and is
+an unknown forbidden property in every retained proof schema. `issuedAt <= notBefore < expiresAt`
+is mandatory.
 `managedIdentityObjectId` is derived from the Entra `oid` claim; `managedIdentityClientId` is
 derived from `appid` or the configured managed identity mapping. No tool name, tool version, MCP
 host id, or Athena-specific authorization claim is trusted from the JWT.
 
 Token verification is closed and environment-configured. It contains the complete closed
-`verifiedClaims` object, `verifiedClaimsDigest`, verification time, key id, status, and
+`verifiedClaims` object, its exact `jtiDigest`, `verifiedClaimsDigest`, verification time, key id, status, and
 `tokenVerificationDigest`. `verifiedClaimsDigest` is SHA-256 over the complete canonical
 `verifiedClaims` object with no exclusions. The copy under `tokenVerification` must equal the
 identity-evidence `verifiedClaims` object byte-for-byte after canonicalization, and the same digest
@@ -540,13 +543,18 @@ independently configured JWKS at `tokenVerification.verifiedAt`. Verification st
 `valid`, `expired`, `notYetValid`, `badSignature`, `unknownKey`, `untrustedIssuer`,
 `audienceMismatch`, `claimMismatch`, and `trustAnchorUnavailable`. Publication and evaluation
 require `tokenVerification.status = valid` at the snapshot `collectedAt` time.
+Persisted Entra `kid` values use the documented base64url grammar
+`^[A-Za-z0-9_-]{8,128}$`; ingestion audiences use a deployment-configured
+`api://<lowercase DNS-like identifier>` grammar. These are shape constraints, while trusted
+configuration and cryptographic verification establish authority.
 `tenantId`, `managedIdentityObjectId`, `managedIdentityClientId`, and `subject`, plus the copied
 tenant/object/client ids in `ingestionDerivation`, use the schema-visible Azure GUID grammar; they
 cannot persist free text.
 
 The closed `ingestionDerivation` set is `derivationPreimageType`, `derivationPreimageVersion`,
 `schemaVersion`, `semanticContractVersion`, `policyContractVersion`, `identityEvidenceId`,
-`tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`, `verifiedClaimsDigest`, `mcpHostId`,
+`tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`, `verifiedClaimsDigest`,
+`jtiDigest`, `mcpHostId`,
 `mcpHostTenantId`, `mcpHostManagedIdentityObjectId`, `mcpHostManagedIdentityClientId`,
 `ingestionServiceId`, `ingestionAudience`, `toolAllowlistDigest`, `derivedCollectorIdentityRef`,
 `attemptBinding`, `derivedAt`, and `derivationDigest`.
@@ -572,7 +580,7 @@ digest-covered `CollectorAttempt`. A mismatch invalidates the snapshot.
 transport-only fields. `derivationDigest` is SHA-256 over the RFC 8785 JCS canonical UTF-8 bytes of
 `ingestionDerivation` after excluding only `/derivationDigest`; it includes the normalized
 `attemptBinding`, `tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`,
-`verifiedClaimsDigest`,
+`verifiedClaimsDigest`, `jtiDigest`,
 MCP-host identity and tenant, ingestion audience, contract versions, and `derivedAt`. No field may be
 defaulted or omitted except the conditional attempt fields above. Derivation digest canonicalization
 uses the same duplicate-key rejection, NFC pre-validation, datetime normalization, ordering, and
@@ -586,7 +594,14 @@ Caller-supplied key state and signature-verification status/time are not persist
 `^https://[A-Za-z0-9-]+\\.vault\\.azure\\.net/keys/[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$`.
 The same schema-visible grammar applies to every persisted trusted-ingestion `trustAnchorRef`,
 including `SnapshotCollector`, `CollectorIdentityEvidence`, and `IngestionSignature`.
-`keyName` and `keyVersion` must exactly equal the corresponding URL components.
+`keyName` uses the Key Vault `[A-Za-z0-9-]{1,127}` grammar and `keyVersion` is exactly 32 hex
+characters; both must exactly equal the corresponding URL components. Neither value is
+fixture-specific.
+The persisted signature encoding is standard RFC 4648 base64 with `+` and `/`, optional terminal
+padding only, no whitespace, and no base64url or compact-JWT dots. Its schema-visible length is
+344-684 characters, covering approved RSA 2048-4096 signature sizes. Narrative text, email,
+connection-string, token, and other non-base64 syntax is invalid. Schema acceptance never replaces
+cryptographic signature verification.
 The Key Vault signed preimage is a closed object containing
 `signaturePreimageType = athena.trustedIngestionSignature`,
 `signaturePreimageVersion = 1.0.0`, `signatureAlgorithm`, `keyVaultKeyId`, `keyName`, `keyVersion`,
@@ -1186,6 +1201,30 @@ Canonicalization standard:
 7. Encode the JCS output as UTF-8 with no byte order mark.
 8. Hash algorithm is SHA-256 over the canonical UTF-8 byte sequence. Digest strings use lowercase
    `sha256:<64 lowercase hex characters>`.
+
+All persisted provenance primitives use one shared schema-visible type:
+
+- `Sha256Digest`: `^sha256:[a-f0-9]{64}$`, including item, gap, request, response, failure, attempt,
+  token, verified-claims, derivation, identity-evidence, artifact, semantic, allowlist, and key
+  fingerprint digests;
+- `AzureGuid`: canonical lowercase `8-4-4-4-12` UUID text for tenant, subscription, managed-identity
+  object/client, and subject values;
+- `UtcDateTime`: JSON Schema `date-time` plus a terminal `Z` or `+00:00` UTC pattern, with runtime
+  pre-parse enforcement of the identical lexical grammar and rejection of naive, non-zero-offset,
+  lowercase-separator, negative-zero-offset, numeric-string, or over-precision values;
+- closed tool names, semantic versions, prefixed opaque ids, registry ids, Key Vault key names and
+  versions, Azure resource ids, evidence pointers, resource-group/workspace identifiers, region
+  codes, and standard-base64 signatures as specified above.
+  Resource-group names retain Azure's 1-90 character concrete-name grammar, workspace names retain
+  the 4-63 character Azure grammar, and region codes accept concrete lowercase Azure region syntax;
+  resource-group names cannot end in `.`, including when embedded in a resource ID. Trusted scope
+  containment, not fixture-specific prefixes, establishes authorization.
+
+Generated `EvidenceSnapshot` and `CollectorIdentityEvidence` schemas must contain no unconstrained
+string leaves. Runtime and Draft 2020-12 parity tests walk every digest, GUID, signature, version,
+pointer, registry, resource, and identifier definition; canonical values pass both, while malformed
+hashes, raw JWT/jti, email, SSN, connection-string, proprietary, patient-name, password, and secret
+probes fail both.
 
 Canonicalization tests must include composed/decomposed Unicode equivalence, normalized-key
 collision rejection, JCS ordering using UTF-16 code-unit semantics, datetime normalization, numeric

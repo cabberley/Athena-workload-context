@@ -2,66 +2,99 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import TypeAdapter, ValidationError
 
 from athena_context import __version__
 from athena_context.contracts import (
     ActivitySummaryEvidenceRecord,
+    ApplicationTagId,
     ApprovedResourceTags,
+    AthenaCapabilityIdentifier,
+    AthenaProducerIdentifier,
     AthenaValidationError,
+    AttemptIdentifier,
+    AzureGuid,
+    AzureRegionCode,
+    AzureResourceIdentifier,
     CapabilityRequirement,
     CollectorAttempt,
     CollectorIdentityEvidence,
     CompatibilityMetadata,
+    ComponentTagId,
     ContextRef,
     Control,
+    EvidenceExternalIdentifier,
     EvidenceGapRecord,
     EvidenceGapRef,
+    EvidenceItemIdentifier,
     EvidenceItemRef,
+    EvidenceRelationshipIdentifier,
     EvidenceResourceRef,
+    EvidenceRoleIdentifier,
     EvidenceScope,
     EvidenceSnapshot,
     FailedResponseCollectorAttempt,
+    FailureEvidencePointer,
     Finding,
+    GapIdentifier,
     GovernanceProfileScope,
     HealthEventEvidenceRecord,
+    IdentityEvidenceIdentifier,
+    IngestionAudience,
+    IngestionServiceIdentifier,
     IngestionSignature,
     JwtHeader,
+    JwtKeyIdentifier,
+    KeyVaultKeyName,
+    KeyVaultKeyVersion,
+    McpHostIdentifier,
     MetricAggregateEvidenceRecord,
     NamePatternSelector,
+    ObservedRelationship,
     ProducerInfo,
     ProfileContinuitySettings,
     ProfileDefinition,
     ProfileSettings,
     ResourceEvidenceRecord,
+    ResourceGroupName,
     ResourceGroupScope,
+    ResponseEvidencePointer,
     RiskAcceptance,
     RoleCardinalityBoundedRange,
     RoleCardinalityExactlyOne,
     Selector,
+    SemanticVersionText,
     ServiceHealthRegionScope,
+    Sha256Digest,
     SnapshotCollector,
+    SnapshotIdentifier,
+    StandardBase64Signature,
     SubscriptionScope,
     SuccessResponseCollectorAttempt,
     TimeoutNoResponseCollectorAttempt,
     TokenVerification,
     TrustedKeyAnchor,
     TrustedKeyRecord,
+    UtcDateTime,
+    VersionedKeyVaultKeyId,
     WorkloadManifest,
     WorkloadRole,
+    WorkspaceName,
     canonicalize_json,
     compute_artifact_digest,
     compute_evidence_record_digest,
     compute_evidence_snapshot_artifact_digest,
     compute_evidence_snapshot_semantic_digest,
     compute_failure_envelope_digest,
+    compute_jti_digest,
     compute_response_envelope_digest,
     compute_semantic_digest,
     compute_token_verification_digest,
@@ -164,8 +197,8 @@ def build_manifest() -> WorkloadManifest:
         requiresCapabilities=[],
         producedBy=ProducerInfo(producerId="athena.contracts", version="1.0.0"),
         extensionPolicy="rejectUnknownDecisionFields",
-        artifactDigest="sha256:placeholder-artifact",
-        semanticDigest="sha256:placeholder-semantic",
+        artifactDigest=_sha256("placeholder-artifact"),
+        semanticDigest=_sha256("placeholder-semantic"),
     )
     return WorkloadManifest(
         manifestId="wl-synthetic-clinical-platform",
@@ -179,7 +212,7 @@ def build_manifest() -> WorkloadManifest:
                     "scopeType": "resourceGroup",
                     "tenantId": "00000000-0000-0000-0000-000000000000",
                     "subscriptionId": "00000000-0000-0000-0000-000000000000",
-                    "resourceGroupName": "rg-athena-fixture",
+                    "resourceGroupName": "rg-111111111111",
                 }
             ],
         },
@@ -270,7 +303,7 @@ def test_risk_acceptance_and_finding_valid() -> None:
             manifestId="wl-synthetic-clinical-platform",
             manifestVersion="0.1.0",
             profileId="production",
-            resolvedProfileDigest="sha256:abc123",
+            resolvedProfileDigest=_sha256("resolved-profile"),
             clausePath="/constraints/db-zone-loss-spof",
         ),
         evidenceRef=EvidenceItemRef(
@@ -696,14 +729,14 @@ def _build_valid_gap_snapshot(
 
 
 def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fields() -> None:
-    valid_header = JwtHeader(alg="RS256", kid="abc12345", typ="JWT")
+    valid_header = JwtHeader(alg="RS256", kid="kid-0123456789abcdef", typ="JWT")
     assert valid_header.alg == "RS256"
 
     with pytest.raises(ValidationError):
         JwtHeader.model_validate(
             {
                 "alg": "RS256",
-                "kid": "abc12345",
+                "kid": "kid-0123456789abcdef",
                 "typ": "JWT",
                 "rawBearerToken": "Bearer deadbeef",
             }
@@ -714,7 +747,7 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
             {
                 "status": "valid",
                 "verifiedAt": datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
-                "keyId": "abc12345",
+                "keyId": "kid-0123456789abcdef",
                 "tokenVerificationDigest": _sha256("token-verify"),
                 "customerProprietary": {"apiToken": "secret"},
             }
@@ -727,7 +760,11 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
                     "identityEvidenceId": "identity-222222222222",
                     "identityEvidenceType": "entraJwtTokenEvidence",
                     "tokenHash": _sha256("token-1"),
-                    "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
+                    "jwtHeader": {
+                        "alg": "RS256",
+                        "kid": "kid-0123456789abcdef",
+                        "typ": "JWT",
+                    },
                     "trustAnchorRef": "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
                     "verifiedClaims": {
                         "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
@@ -736,14 +773,14 @@ def test_identity_evidence_rejects_raw_bearer_token_and_customer_proprietary_fie
                         "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
                         "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
                         "subject": "22222222-2222-2222-2222-222222222222",
-                        "jti": "jti-123",
+                        "jtiDigest": compute_jti_digest("jti-123"),
                         "issuedAt": "2025-01-02T11:00:00+00:00",
                         "expiresAt": "2025-01-02T13:00:00+00:00",
                     },
                     "tokenVerification": {
                         "status": "valid",
                         "verifiedAt": "2025-01-02T12:00:00+00:00",
-                        "keyId": "abc12345",
+                        "keyId": "kid-0123456789abcdef",
                         "tokenVerificationDigest": _sha256("token-verify"),
                     },
                     "ingestionDerivation": {
@@ -923,7 +960,7 @@ def _build_valid_identity_evidence(
         "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
         "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
         "subject": "22222222-2222-2222-2222-222222222222",
-        "jti": "jti-123",
+        "jtiDigest": compute_jti_digest("jti-123"),
         "issuedAt": issued_at,
         "notBefore": not_before,
         "expiresAt": expires_at,
@@ -932,9 +969,10 @@ def _build_valid_identity_evidence(
     token_verification_payload = {
         "status": "valid",
         "verifiedAt": verified_at,
-        "keyId": "abc12345",
+        "keyId": "kid-0123456789abcdef",
         "verifiedClaims": verified_claims_payload,
         "verifiedClaimsDigest": verified_claims_digest,
+        "jtiDigest": verified_claims_payload["jtiDigest"],
     }
     token_verification_digest = compute_token_verification_digest(
         token_verification_payload
@@ -994,6 +1032,7 @@ def _build_valid_identity_evidence(
         "tokenVerificationStatus": "valid",
         "tokenVerificationDigest": token_verification_digest,
         "verifiedClaimsDigest": verified_claims_digest,
+        "jtiDigest": verified_claims_payload["jtiDigest"],
         "mcpHostId": "mcp-111111111111",
         "mcpHostTenantId": tenant_id,
         "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
@@ -1035,7 +1074,11 @@ def _build_valid_identity_evidence(
         "identityEvidenceId": "identity-111111111111",
         "identityEvidenceType": "entraJwtTokenEvidence",
         "tokenHash": token_hash,
-        "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
+        "jwtHeader": {
+            "alg": "RS256",
+            "kid": "kid-0123456789abcdef",
+            "typ": "JWT",
+        },
         "trustAnchorRef": trust_anchor,
         "verifiedClaims": verified_claims_payload,
         "tokenVerification": {
@@ -1395,7 +1438,7 @@ def test_resource_scope_rejects_subscription_and_component_prefix_confusion() ->
             scopeType="resourceGroup",
             tenantId="11111111-1111-1111-1111-111111111111",
             subscriptionId="11111111-1111-1111-1111-111111111111",
-            resourceGroupName="rg-prod",
+            resourceGroupName="rg-222222222222",
         ).model_dump(mode="python", by_alias=True)
     ]
     record = payload["evidenceRecords"][0]
@@ -1521,7 +1564,7 @@ def test_exact_signed_attempt_binding_and_utc_timestamps_are_required() -> None:
     naive_attempt["responseReceivedAt"] = attempt.response_received_at.replace(tzinfo=None)
     naive_attempt.pop("attemptDigest")
     naive_attempt["attemptDigest"] = compute_artifact_digest(naive_attempt)
-    with pytest.raises(ValidationError, match="timezone-aware"):
+    with pytest.raises(ValidationError, match="timestamp must be UTC"):
         SuccessResponseCollectorAttempt.model_validate(naive_attempt)
 
 
@@ -1690,7 +1733,7 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
         "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
         "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
         "subject": "22222222-2222-2222-2222-222222222222",
-        "jti": "jti-123",
+        "jtiDigest": compute_jti_digest("jti-123"),
         "issuedAt": now - timedelta(minutes=5),
         "notBefore": now - timedelta(minutes=5),
         "expiresAt": now + timedelta(minutes=30),
@@ -1698,9 +1741,10 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
     token_payload = {
         "status": "valid",
         "verifiedAt": now,
-        "keyId": "abc12345",
+        "keyId": "kid-0123456789abcdef",
         "verifiedClaims": claims,
         "verifiedClaimsDigest": compute_verified_claims_digest(claims),
+        "jtiDigest": claims["jtiDigest"],
         "tokenVerificationDigest": _sha256("fabricated-token-verification"),
     }
     with pytest.raises(ValidationError, match="canonical preimage"):
@@ -1745,7 +1789,7 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
             "issuer",
             "https://sts.windows.net/11111111-1111-1111-1111-111111111111/",
         ),
-        ("jti", "jti-456"),
+        ("jtiDigest", compute_jti_digest("jti-456")),
         ("issuedAt", datetime(2025, 1, 2, 11, 50, tzinfo=UTC)),
         ("subject", "33333333-3333-3333-3333-333333333333"),
     ],
@@ -1772,6 +1816,7 @@ def test_signed_verified_claim_mutation_is_rejected(
         token_verification["verifiedClaims"]
     )
     token_verification["verifiedClaimsDigest"] = claims_digest
+    token_verification["jtiDigest"] = token_verification["verifiedClaims"]["jtiDigest"]
     token_verification["tokenVerificationDigest"] = compute_token_verification_digest(
         token_verification
     )
@@ -1782,6 +1827,7 @@ def test_signed_verified_claim_mutation_is_rejected(
     )
     identity_payload["ingestionDerivation"] = derivation
     derivation["verifiedClaimsDigest"] = claims_digest
+    derivation["jtiDigest"] = token_verification["verifiedClaims"]["jtiDigest"]
     derivation["tokenVerificationDigest"] = token_verification[
         "tokenVerificationDigest"
     ]
@@ -2013,7 +2059,7 @@ def test_configured_trust_anchor_rejects_attacker_key_resolution() -> None:
         "0123456789abcdef0123456789abcdef"
     )
     attacker_anchor = (
-        "https://attacker.vault.azure.net/keys/attacker-key/"
+        "https://attacker.vault.azure.net/keys/athena-key/"
         "fedcba9876543210fedcba9876543210"
     )
     attacker_evidence = _build_valid_identity_evidence(
@@ -2196,7 +2242,7 @@ def test_generated_schema_matches_runtime_sensitive_text_rejection(
     schema = ResourceEvidenceRecord.model_json_schema()
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
-        ResourceEvidenceRecord.model_validate(payload)
+        ResourceEvidenceRecord.model_validate_json(json.dumps(payload))
 
 
 def test_generated_schema_rejects_sensitive_tags_and_pointers() -> None:
@@ -2216,7 +2262,7 @@ def test_generated_schema_rejects_sensitive_tags_and_pointers() -> None:
     ref_schema = EvidenceItemRef.model_json_schema()
     assert list(Draft202012Validator(ref_schema).iter_errors(ref_payload))
     with pytest.raises(ValidationError):
-        EvidenceItemRef.model_validate(ref_payload)
+        EvidenceItemRef.model_validate_json(json.dumps(ref_payload))
 
 
 def test_generated_schema_rejects_sensitive_snapshot_identifier() -> None:
@@ -2226,7 +2272,7 @@ def test_generated_schema_rejects_sensitive_snapshot_identifier() -> None:
     schema = EvidenceSnapshot.model_json_schema()
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
-        EvidenceSnapshot.model_validate(payload)
+        EvidenceSnapshot.model_validate_json(json.dumps(payload))
 
 
 def test_entra_identity_ids_are_guid_constrained_in_runtime_and_schema() -> None:
@@ -2246,7 +2292,7 @@ def test_entra_identity_ids_are_guid_constrained_in_runtime_and_schema() -> None
     schema = CollectorIdentityEvidence.model_json_schema()
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
-        CollectorIdentityEvidence.model_validate(payload)
+        CollectorIdentityEvidence.model_validate_json(json.dumps(payload))
 
 
 def test_key_vault_anchor_url_is_schema_visible() -> None:
@@ -2262,7 +2308,7 @@ def test_key_vault_anchor_url_is_schema_visible() -> None:
     schema = EvidenceSnapshot.model_json_schema()
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
-        EvidenceSnapshot.model_validate(payload)
+        EvidenceSnapshot.model_validate_json(json.dumps(payload))
 
 
 def test_observed_relationship_resource_endpoints_are_scope_checked() -> None:
@@ -2314,3 +2360,363 @@ def test_evidence_resource_id_constraint_is_schema_visible() -> None:
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
         EvidenceResourceRef.model_validate(payload)
+
+
+def test_raw_jti_is_never_persisted_and_jti_digest_is_canonical() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    assert evidence.verified_claims.jti_digest == compute_jti_digest("jti-123")
+
+    payload = evidence.model_dump(mode="json", by_alias=True)
+    payload["verifiedClaims"]["jti"] = "jti-123"
+    payload["tokenVerification"]["verifiedClaims"]["jti"] = "jti-123"
+    schema = CollectorIdentityEvidence.model_json_schema()
+    assert CollectorIdentityEvidence.model_validate_json(
+        evidence.model_dump_json(by_alias=True)
+    )
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        CollectorIdentityEvidence.model_validate_json(json.dumps(payload))
+
+    def assert_no_raw_jti(node: object) -> None:
+        if isinstance(node, dict):
+            assert "jti" not in node
+            for value in node.values():
+                assert_no_raw_jti(value)
+        elif isinstance(node, list):
+            for value in node:
+                assert_no_raw_jti(value)
+
+    assert_no_raw_jti(schema)
+
+
+@pytest.mark.parametrize(
+    "invalid_signature",
+    [
+        "password123",
+        "signature with spaces",
+        "jane.doe@example.com",
+        "Server=x;Password=y",
+        "header.payload.signature",
+        "This is an arbitrary narrative signature value",
+    ],
+)
+def test_signature_encoding_runtime_and_schema_parity(
+    invalid_signature: str,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    payload = evidence.ingestion_signature.model_dump(mode="json", by_alias=True)
+    payload["signature"] = invalid_signature
+    schema = IngestionSignature.model_json_schema()
+    assert IngestionSignature.model_validate_json(
+        evidence.ingestion_signature.model_dump_json(by_alias=True)
+    )
+    assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValidationError):
+        IngestionSignature.model_validate_json(json.dumps(payload))
+
+
+def test_all_provenance_primitive_definitions_have_runtime_schema_parity() -> None:
+    signature_value = base64.b64encode(b"x" * 256).decode("ascii")
+    cases: list[tuple[str, object, str, tuple[str, ...]]] = [
+        ("StandardBase64Signature", StandardBase64Signature, signature_value, ("password123",)),
+        (
+            "VersionedKeyVaultKeyId",
+            VersionedKeyVaultKeyId,
+            (
+                "https://contoso.vault.azure.net/keys/athena-key/"
+                "0123456789abcdef0123456789abcdef"
+            ),
+            ("password123",),
+        ),
+        ("KeyVaultKeyVersion", KeyVaultKeyVersion, "0123456789abcdef0123456789abcdef", ("bad",)),
+        ("KeyVaultKeyName", KeyVaultKeyName, "athena-key", ("key name",)),
+        (
+            "JwtKeyIdentifier",
+            JwtKeyIdentifier,
+            "-KI3Q9nNR7bRofxmeZoXqbHZGew",
+            ("jane@example.com",),
+        ),
+        ("Sha256Digest", Sha256Digest, _sha256("canonical"), ("password123", "sha256:ABC")),
+        (
+            "AzureGuid",
+            AzureGuid,
+            "11111111-1111-1111-1111-111111111111",
+            ("patientName", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+        ),
+        (
+            "AzureResourceIdentifier",
+            AzureResourceIdentifier,
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg-prod/providers/Microsoft.Compute/virtualMachines/vm-01"
+            ),
+            ("password123",),
+        ),
+        ("ResponseEvidencePointer", ResponseEvidencePointer, "/items/0", ("/items/password123",)),
+        ("FailureEvidencePointer", FailureEvidencePointer, "/error/code", ("/error/password",)),
+        ("SemanticVersionText", SemanticVersionText, "1.0.0", ("password123",)),
+        ("ApplicationTagId", ApplicationTagId, "app-a1b2c3d4e5f6", ("password123",)),
+        (
+            "ComponentTagId",
+            ComponentTagId,
+            "component-012345abcdef",
+            ("patientName",),
+        ),
+        ("SnapshotIdentifier", SnapshotIdentifier, "snap-111111111111", ("password123",)),
+        ("AttemptIdentifier", AttemptIdentifier, "attempt-111111111111", ("bearer-token",)),
+        (
+            "IdentityEvidenceIdentifier",
+            IdentityEvidenceIdentifier,
+            "identity-111111111111",
+            ("jane.doe@example.com",),
+        ),
+        ("GapIdentifier", GapIdentifier, "gap-111111111111", ("123-45-6789",)),
+        ("McpHostIdentifier", McpHostIdentifier, "mcp-111111111111", ("patientName",)),
+        (
+            "IngestionServiceIdentifier",
+            IngestionServiceIdentifier,
+            "ingestion-111111111111",
+            ("Server=x;Password=y",),
+        ),
+        ("EvidenceRoleIdentifier", EvidenceRoleIdentifier, "role-111111111111", ("alice-smith",)),
+        (
+            "EvidenceRelationshipIdentifier",
+            EvidenceRelationshipIdentifier,
+            "relationship-111111111111",
+            ("customerProprietaryPayload",),
+        ),
+        ("EvidenceItemIdentifier", EvidenceItemIdentifier, "item-111111111111", ("raw.jwt.value",)),
+        (
+            "EvidenceExternalIdentifier",
+            EvidenceExternalIdentifier,
+            "external-111111111111",
+            ("client-secret",),
+        ),
+        (
+            "AthenaCapabilityIdentifier",
+            AthenaCapabilityIdentifier,
+            "athena.contracts",
+            ("password123",),
+        ),
+        (
+            "AthenaProducerIdentifier",
+            AthenaProducerIdentifier,
+            "athena.contracts",
+            ("patientName",),
+        ),
+        ("ResourceGroupName", ResourceGroupName, "rg-athena-fixture", ("Server=x;Password=y",)),
+        ("WorkspaceName", WorkspaceName, "athena-logs-prod", ("jane@example.com",)),
+        ("AzureRegionCode", AzureRegionCode, "australiaeast", ("patientName",)),
+        (
+            "IngestionAudience",
+            IngestionAudience,
+            "api://athena-ingestion",
+            ("password123",),
+        ),
+    ]
+    schemas = [
+        EvidenceSnapshot.model_json_schema(),
+        CollectorIdentityEvidence.model_json_schema(),
+    ]
+    definitions: dict[str, dict[str, object]] = {}
+    for schema in schemas:
+        definitions.update(schema.get("$defs", {}))
+
+    unconstrained_string_paths: list[str] = []
+
+    def walk_schema(node: object, path: str = "") -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "string" and not any(
+                keyword in node
+                for keyword in ("pattern", "enum", "format", "const", "$ref")
+            ):
+                unconstrained_string_paths.append(path)
+            for key, value in node.items():
+                walk_schema(value, f"{path}/{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk_schema(value, f"{path}/{index}")
+
+    for schema in schemas:
+        walk_schema(schema)
+    assert unconstrained_string_paths == []
+
+    targeted = {
+        name
+        for name, definition in definitions.items()
+        if definition.get("type") == "string"
+        and any(
+            marker in name
+            for marker in (
+                "Digest",
+                "Guid",
+                "Signature",
+                "Identifier",
+                "TagId",
+                "Pointer",
+                "Version",
+                "KeyName",
+                "ResourceGroupName",
+                "WorkspaceName",
+                "Audience",
+            )
+        )
+    }
+    covered: set[str] = set()
+    for name, definition in definitions.items():
+        matching = [case for case in cases if case[0] in name]
+        if name not in targeted:
+            continue
+        assert matching, f"no runtime/schema parity case for {name}"
+        _, alias, valid_value, invalid_values = matching[0]
+        validator = Draft202012Validator(definition)
+        assert not list(validator.iter_errors(valid_value)), name
+        assert TypeAdapter(alias).validate_python(valid_value) == valid_value
+        for invalid_value in invalid_values:
+            assert list(validator.iter_errors(invalid_value)), (name, invalid_value)
+            with pytest.raises(ValidationError):
+                TypeAdapter(alias).validate_python(invalid_value)
+        covered.add(name)
+    assert covered == targeted
+
+
+def test_utc_timestamp_alias_has_runtime_schema_parity() -> None:
+    schema = EvidenceSnapshot.model_json_schema()["$defs"]["UtcDateTime"]
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    assert not list(validator.iter_errors("2025-01-02T12:00:00Z"))
+    assert not list(validator.iter_errors("2025-01-02T12:00:00+00:00"))
+    assert TypeAdapter(UtcDateTime).validate_json('"2025-01-02T12:00:00+00:00"')
+    for invalid_value in (
+        "password123",
+        "2025-01-02T12:00:00+10:00",
+        "2025-01-02 12:00:00Z",
+    ):
+        assert list(validator.iter_errors(invalid_value))
+    assert TypeAdapter(UtcDateTime).validate_python(
+        datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
+    )
+    with pytest.raises(ValidationError):
+        TypeAdapter(UtcDateTime).validate_python(datetime(2025, 1, 2, 12, 0))
+
+    snapshot = _build_valid_snapshot()
+    snapshot_schema = EvidenceSnapshot.model_json_schema()
+    snapshot_validator = Draft202012Validator(
+        snapshot_schema,
+        format_checker=FormatChecker(),
+    )
+    for invalid_timestamp in (
+        "1735819200",
+        "2025-01-02T12:00:00-00:00",
+        "2025-01-02t12:00:00z",
+        "2025-01-02T12:00:00.1234567Z",
+    ):
+        payload = snapshot.model_dump(mode="json", by_alias=True)
+        payload["collectedAt"] = invalid_timestamp
+        assert list(snapshot_validator.iter_errors(payload))
+        with pytest.raises(ValidationError, match="canonical UTC RFC 3339"):
+            EvidenceSnapshot.model_validate_json(json.dumps(payload))
+
+    relationship_payload = {
+        "relationshipClass": "observed",
+        "relationshipId": "relationship-111111111111",
+        "kind": "dependsOn",
+        "source": {
+            "refKind": "roleRef",
+            "roleId": "role-111111111111",
+        },
+        "target": {
+            "refKind": "externalRef",
+            "externalId": "external-111111111111",
+        },
+        "evidenceItemRef": "item-111111111111",
+        "observedAt": "2025-01-02T22:00:00+10:00",
+    }
+    relationship_schema = ObservedRelationship.model_json_schema()
+    assert list(
+        Draft202012Validator(
+            relationship_schema,
+            format_checker=FormatChecker(),
+        ).iter_errors(relationship_payload)
+    )
+    with pytest.raises(ValidationError, match="canonical UTC RFC 3339"):
+        ObservedRelationship.model_validate_json(json.dumps(relationship_payload))
+
+
+def test_deployment_and_azure_identifier_grammars_accept_valid_shapes() -> None:
+    assert TypeAdapter(JwtKeyIdentifier).validate_python(
+        "-KI3Q9nNR7bRofxmeZoXqbHZGew"
+    )
+    assert TypeAdapter(IngestionAudience).validate_python(
+        "api://prod-ingestion"
+    )
+    assert TypeAdapter(KeyVaultKeyName).validate_python(
+        "prod-ingestion-signing"
+    )
+    assert TypeAdapter(ResourceGroupName).validate_python("rg-athena-fixture")
+    assert TypeAdapter(WorkspaceName).validate_python("athena-logs-prod")
+    assert TypeAdapter(AzureRegionCode).validate_python("uksouth")
+
+
+def test_resource_group_terminal_period_is_rejected_by_runtime_and_schema() -> None:
+    for alias, invalid_value in (
+        (ResourceGroupName, "rg."),
+        (
+            AzureResourceIdentifier,
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg./providers/Microsoft.Compute/virtualMachines/vm-01"
+            ),
+        ),
+    ):
+        schema = TypeAdapter(alias).json_schema()
+        assert list(Draft202012Validator(schema).iter_errors(invalid_value))
+        with pytest.raises(ValidationError):
+            TypeAdapter(alias).validate_python(invalid_value)
+
+
+def test_snapshot_schema_rejects_malformed_persistence_primitives() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    identity = _build_valid_identity_evidence(private_key=private_key)
+    snapshot = _build_valid_snapshot(identity_evidence=identity)
+    schema = EvidenceSnapshot.model_json_schema()
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    valid_payload = snapshot.model_dump(mode="json", by_alias=True)
+    assert not list(validator.iter_errors(valid_payload))
+    assert EvidenceSnapshot.model_validate_json(json.dumps(valid_payload))
+
+    mutations = [
+        ("evidenceRecords", 0, "itemDigest", "password123"),
+        ("authorizedScopes", 0, "tenantId", "patientName"),
+        ("collector", "tenantId", "not-a-guid"),
+        ("collector", "toolAllowlistDigest", "sha256:ABC"),
+        ("snapshotId", "jane.doe@example.com"),
+        ("identityEvidence", 0, "identityEvidenceId", "123-45-6789"),
+        (
+            "identityEvidence",
+            0,
+            "ingestionSignature",
+            "signature",
+            "header.payload.signature",
+        ),
+    ]
+    for mutation in mutations:
+        payload = snapshot.model_dump(mode="json", by_alias=True)
+        target: object = payload
+        for key in mutation[:-2]:
+            assert isinstance(target, (dict, list))
+            target = target[key]
+        field_name = mutation[-2]
+        invalid_value = mutation[-1]
+        assert isinstance(target, dict)
+        target[field_name] = invalid_value
+        assert list(validator.iter_errors(payload)), mutation
+        with pytest.raises(ValidationError):
+            EvidenceSnapshot.model_validate_json(json.dumps(payload))
+
+    raw_jti_payload = snapshot.model_dump(mode="json", by_alias=True)
+    raw_jti_payload["identityEvidence"][0]["verifiedClaims"]["jti"] = "raw-jti"
+    assert list(validator.iter_errors(raw_jti_payload))
+    with pytest.raises(ValidationError):
+        EvidenceSnapshot.model_validate_json(json.dumps(raw_jti_payload))
