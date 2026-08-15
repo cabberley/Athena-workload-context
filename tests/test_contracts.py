@@ -76,6 +76,7 @@ from athena_context.contracts import (
     Sha256Digest,
     SnapshotCollector,
     SnapshotIdentifier,
+    SnapshotPublicationRecord,
     StandardBase64Signature,
     SubscriptionScope,
     SuccessResponseCollectorAttempt,
@@ -90,18 +91,30 @@ from athena_context.contracts import (
     WorkspaceName,
     canonicalize_json,
     compute_artifact_digest,
+    compute_authorized_scopes_digest,
+    compute_collector_attempt_set_digest,
     compute_evidence_record_digest,
+    compute_evidence_record_set_digest,
+    compute_evidence_reference_set_digest,
     compute_evidence_snapshot_artifact_digest,
     compute_evidence_snapshot_semantic_digest,
     compute_failure_envelope_digest,
+    compute_identity_evidence_set_digest,
     compute_jti_digest,
     compute_response_envelope_digest,
     compute_semantic_digest,
+    compute_snapshot_attestation_preimage_digest,
     compute_token_verification_digest,
     compute_verified_claims_digest,
     sha256_hex,
+    snapshot_attestation_preimage,
 )
 from athena_context.contracts.common import NormalizationCollisionError
+
+_DEFAULT_ATTESTATION_PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
 
 
 def build_manifest() -> WorkloadManifest:
@@ -532,6 +545,7 @@ def _build_valid_snapshot(
     attempt: SuccessResponseCollectorAttempt | None = None,
     identity_evidence: CollectorIdentityEvidence | None = None,
     source_response_pointer: str = "/items/0",
+    attestation_private_key: rsa.RSAPrivateKey | None = None,
 ) -> EvidenceSnapshot:
     attempt = attempt or _build_valid_success_attempt()
     tenant_id = "11111111-1111-1111-1111-111111111111"
@@ -625,6 +639,10 @@ def _build_valid_snapshot(
         ],
     }
     _refresh_snapshot_digest(snapshot_payload)
+    _attest_snapshot_payload(
+        snapshot_payload,
+        private_key=attestation_private_key or _DEFAULT_ATTESTATION_PRIVATE_KEY,
+    )
     return EvidenceSnapshot.model_validate(snapshot_payload)
 
 
@@ -634,6 +652,7 @@ def _build_valid_gap_snapshot(
     identity_evidence: CollectorIdentityEvidence | None = None,
     failure_payload_digest: str | None = None,
     failure_payload_pointer: str | None = None,
+    attestation_private_key: rsa.RSAPrivateKey | None = None,
 ) -> EvidenceSnapshot:
     tenant_id = "11111111-1111-1111-1111-111111111111"
     scope = SubscriptionScope(
@@ -725,6 +744,10 @@ def _build_valid_gap_snapshot(
         ),
     }
     _refresh_snapshot_digest(snapshot_payload)
+    _attest_snapshot_payload(
+        snapshot_payload,
+        private_key=attestation_private_key or _DEFAULT_ATTESTATION_PRIVATE_KEY,
+    )
     return EvidenceSnapshot.model_validate(snapshot_payload)
 
 
@@ -942,6 +965,7 @@ def _build_valid_identity_evidence(
     expires_at: datetime | None = None,
     verified_at: datetime | None = None,
     derived_at_override: datetime | None = None,
+    jti: str = "jti-123",
 ) -> CollectorIdentityEvidence:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     issued_at = issued_at or now - timedelta(minutes=5)
@@ -960,7 +984,7 @@ def _build_valid_identity_evidence(
         "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
         "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
         "subject": "22222222-2222-2222-2222-222222222222",
-        "jtiDigest": compute_jti_digest("jti-123"),
+        "jtiDigest": compute_jti_digest(jti),
         "issuedAt": issued_at,
         "notBefore": not_before,
         "expiresAt": expires_at,
@@ -1158,6 +1182,102 @@ def _trusted_key_anchor(
     )
 
 
+def _attest_snapshot_payload(
+    payload: dict[str, object],
+    *,
+    private_key: rsa.RSAPrivateKey,
+) -> None:
+    anchor = _trusted_key_anchor(private_key.public_key())
+    compatibility = payload["compatibility"]
+    assert isinstance(compatibility, dict)
+    attempts = payload["collectorAttempts"]
+    identities = payload["identityEvidence"]
+    assert isinstance(attempts, list)
+    assert isinstance(identities, list)
+    attempt_times = []
+    for attempt in attempts:
+        assert isinstance(attempt, dict)
+        attempt_times.append(
+            attempt.get("responseReceivedAt")
+            or attempt.get("timedOutAt")
+            or attempt.get("observedAt")
+        )
+    identity_signature_times = []
+    identity_digests = []
+    for identity in identities:
+        assert isinstance(identity, dict)
+        signature = identity["ingestionSignature"]
+        assert isinstance(signature, dict)
+        identity_signature_times.append(signature["signedAt"])
+        identity_digests.append(identity["identityEvidenceDigest"])
+    collected_at = payload["collectedAt"]
+    expires_at = payload["expiresAt"]
+    assert isinstance(collected_at, datetime)
+    assert isinstance(expires_at, datetime)
+    chronology = [
+        value
+        for value in [collected_at, *attempt_times, *identity_signature_times]
+        if isinstance(value, datetime)
+    ]
+    attested_at = max(chronology) + timedelta(seconds=1)
+    assert attested_at < expires_at
+    attestation_payload: dict[str, object] = {
+        "attestationType": "trustedSnapshotPublication",
+        "attestationVersion": "1.0.0",
+        "artifactKind": compatibility["artifactKind"],
+        "schemaVersion": compatibility["schemaVersion"],
+        "semanticContractVersion": compatibility["semanticContractVersion"],
+        "policyContractVersion": compatibility["policyContractVersion"],
+        "snapshotId": payload["snapshotId"],
+        "artifactDigest": compatibility["artifactDigest"],
+        "semanticDigest": compatibility["semanticDigest"],
+        "identityEvidenceDigests": sorted(identity_digests),
+        "identityEvidenceSetDigest": compute_identity_evidence_set_digest(payload),
+        "collectedAt": collected_at,
+        "expiresAt": expires_at,
+        "authorizedScopesDigest": compute_authorized_scopes_digest(payload),
+        "collectorAttemptSetDigest": compute_collector_attempt_set_digest(payload),
+        "evidenceRecordSetDigest": compute_evidence_record_set_digest(payload),
+        "evidenceReferenceSetDigest": compute_evidence_reference_set_digest(payload),
+        "attestedAt": attested_at,
+        "signatureAlgorithm": "RS256",
+        "keyVaultKeyId": anchor.key_vault_key_id,
+        "keyName": anchor.key_name,
+        "keyVersion": anchor.key_version,
+        "trustAnchorRef": anchor.key_vault_key_id,
+    }
+    attestation_payload["signedPreimageDigest"] = (
+        compute_snapshot_attestation_preimage_digest(attestation_payload)
+    )
+    signature = private_key.sign(
+        canonicalize_json(snapshot_attestation_preimage(attestation_payload)).encode(
+            "utf-8"
+        ),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+    attestation_payload["signature"] = base64.b64encode(signature).decode("ascii")
+    payload["snapshotAttestation"] = attestation_payload
+
+
+def _snapshot_publication_resolver(
+    snapshot: EvidenceSnapshot,
+) -> Callable[[str], SnapshotPublicationRecord | None]:
+    record = SnapshotPublicationRecord(
+        snapshot_id=snapshot.snapshot_id,
+        artifact_digest=snapshot.compatibility.artifact_digest,
+        semantic_digest=snapshot.compatibility.semantic_digest,
+        schema_version=snapshot.compatibility.schema_version,
+        semantic_contract_version=snapshot.compatibility.semantic_contract_version,
+        published_at=snapshot.snapshot_attestation.attested_at + timedelta(seconds=1),
+    )
+
+    def resolve(snapshot_id: str) -> SnapshotPublicationRecord | None:
+        return record if snapshot_id == record.snapshot_id else None
+
+    return resolve
+
+
 def test_key_vault_signature_verifies_and_rejects_forgery() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key = private_key.public_key()
@@ -1239,11 +1359,19 @@ def test_service_health_region_scope_rejects_wildcards_and_invalid_cloud() -> No
 def test_snapshot_evaluation_rejects_expired_and_out_of_window_values() -> None:
     snapshot = _build_valid_snapshot()
     with pytest.raises(AthenaValidationError):
-        snapshot.validate_for_evaluation(as_of=datetime(2026, 8, 15, tzinfo=UTC))
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2026, 8, 15, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
+        )
 
     stale = _build_valid_snapshot()
     with pytest.raises(AthenaValidationError):
-        stale.validate_for_evaluation(as_of=datetime(2025, 1, 1, tzinfo=UTC))
+        stale.validate_for_evaluation(
+            as_of=datetime(2025, 1, 1, tzinfo=UTC),
+            expected_artifact_digest=stale.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(stale),
+        )
 
 
 def test_snapshot_rejects_cross_snapshot_and_missing_refs() -> None:
@@ -1298,6 +1426,7 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     valid_snapshot = _build_valid_snapshot(
         attempt=success_attempt,
         identity_evidence=identity,
+        attestation_private_key=private_key,
     )
     resolver_calls: list[tuple[str, str, str]] = []
 
@@ -1308,6 +1437,8 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     assert (
         valid_snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=valid_snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(valid_snapshot),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=response_resolver,
@@ -1320,10 +1451,13 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
         attempt=success_attempt,
         identity_evidence=identity,
         source_response_pointer="/items/1",
+        attestation_private_key=private_key,
     )
     with pytest.raises(AthenaValidationError, match="does not resolve"):
         nonexistent.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=nonexistent.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(nonexistent),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=response_resolver,
@@ -1340,6 +1474,7 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
         identity_evidence=failed_identity,
         failure_payload_digest=failed_attempt.failure_digest,
         failure_payload_pointer="/error/code",
+        attestation_private_key=private_key,
     )
 
     def failure_resolver(attempt_id: str, kind: str, digest: str) -> object:
@@ -1353,6 +1488,8 @@ def test_envelope_resolver_rejects_nonexistent_pointer_and_covers_failure() -> N
     assert (
         failed_snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=failed_snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(failed_snapshot),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=failure_resolver,
@@ -1604,10 +1741,13 @@ def test_rfc6901_empty_string_resolves_envelope_root() -> None:
         attempt=attempt,
         identity_evidence=identity,
         source_response_pointer="",
+        attestation_private_key=private_key,
     )
     assert (
         snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: response_envelope,
@@ -1626,17 +1766,24 @@ def test_resolved_source_rejects_recomputed_local_mutation() -> None:
         private_key=private_key,
         collector_attempt=attempt,
     )
-    snapshot = _build_valid_snapshot(attempt=attempt, identity_evidence=identity)
+    snapshot = _build_valid_snapshot(
+        attempt=attempt,
+        identity_evidence=identity,
+        attestation_private_key=private_key,
+    )
     payload = snapshot.model_dump(mode="python", by_alias=True)
     record = payload["evidenceRecords"][0]
     record["state"] = "deallocated"
     record["itemDigest"] = compute_evidence_record_digest(record)
     payload["evidenceRefs"][0]["itemDigest"] = record["itemDigest"]
     _refresh_snapshot_digest(payload)
+    _attest_snapshot_payload(payload, private_key=private_key)
     mutated = EvidenceSnapshot.model_validate(payload)
     with pytest.raises(AthenaValidationError, match="does not match"):
         mutated.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=mutated.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(mutated),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: response_envelope,
@@ -1707,14 +1854,21 @@ def test_signed_derivation_must_match_snapshot_collector_metadata() -> None:
         private_key=private_key,
         collector_attempt=attempt,
     )
-    snapshot = _build_valid_snapshot(attempt=attempt, identity_evidence=identity)
+    snapshot = _build_valid_snapshot(
+        attempt=attempt,
+        identity_evidence=identity,
+        attestation_private_key=private_key,
+    )
     payload = snapshot.model_dump(mode="python", by_alias=True)
     payload["collector"]["mcpHostId"] = "mcp-999999999999"
     _refresh_snapshot_digest(payload)
+    _attest_snapshot_payload(payload, private_key=private_key)
     forged = EvidenceSnapshot.model_validate(payload)
     with pytest.raises(AthenaValidationError, match="signed ingestion derivation"):
         forged.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=forged.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(forged),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
@@ -1771,10 +1925,13 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
     snapshot = _build_valid_snapshot(
         attempt=attempt,
         identity_evidence=expired_identity,
+        attestation_private_key=private_key,
     )
     with pytest.raises(AthenaValidationError, match="valid at snapshot collectedAt"):
         snapshot.validate_for_evaluation(
             as_of=now + timedelta(minutes=10),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
             key_resolver=_trusted_key_resolver(private_key.public_key()),
             trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
@@ -1852,13 +2009,16 @@ def test_signed_verified_claim_mutation_is_rejected(
     snapshot = _build_valid_snapshot(
         attempt=attempt,
         identity_evidence=mutated_identity,
+        attestation_private_key=private_key,
     )
     with pytest.raises(
         AthenaValidationError,
-        match="identity evidence verification failed",
+        match="identity evidence cryptographic verification failed",
     ):
         snapshot.validate_for_evaluation(
             as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
             key_resolver=_trusted_key_resolver(public_key),
             trusted_key_anchor=_trusted_key_anchor(public_key),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
@@ -2011,9 +2171,15 @@ def test_safe_evidence_constraints_are_present_in_generated_schema() -> None:
         == "^identity-[a-f0-9]{12}$"
     )
     snapshot_schema = EvidenceSnapshot.model_json_schema()
-    assert (
-        snapshot_schema["$defs"]["SnapshotIdentifier"]["pattern"]
-        == "^snap-[a-f0-9]{12}$"
+    snapshot_id_defs = [
+        definition
+        for name, definition in snapshot_schema["$defs"].items()
+        if "SnapshotIdentifier" in name
+    ]
+    assert snapshot_id_defs
+    assert all(
+        definition["pattern"] == "^snap-[a-f0-9]{12}$"
+        for definition in snapshot_id_defs
     )
 
 
@@ -2720,3 +2886,301 @@ def test_snapshot_schema_rejects_malformed_persistence_primitives() -> None:
     assert list(validator.iter_errors(raw_jti_payload))
     with pytest.raises(ValidationError):
         EvidenceSnapshot.model_validate_json(json.dumps(raw_jti_payload))
+
+
+def _recompute_forged_snapshot_public_hashes(snapshot: EvidenceSnapshot) -> None:
+    semantic_digest = compute_evidence_snapshot_semantic_digest(snapshot)
+    object.__setattr__(
+        snapshot.compatibility,
+        "semantic_digest",
+        semantic_digest,
+    )
+    for evidence_ref in snapshot.evidence_refs:
+        object.__setattr__(
+            evidence_ref,
+            "snapshot_semantic_digest",
+            semantic_digest,
+        )
+    artifact_digest = compute_evidence_snapshot_artifact_digest(snapshot)
+    object.__setattr__(
+        snapshot.compatibility,
+        "artifact_digest",
+        artifact_digest,
+    )
+    for evidence_ref in snapshot.evidence_refs:
+        object.__setattr__(
+            evidence_ref,
+            "snapshot_artifact_digest",
+            artifact_digest,
+        )
+
+
+def _build_attested_evaluation_fixture() -> tuple[
+    EvidenceSnapshot,
+    rsa.RSAPrivateKey,
+    dict[str, object],
+]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    envelope = _valid_response_envelope()
+    attempt = _build_valid_success_attempt(
+        response_digest=compute_response_envelope_digest(envelope)
+    )
+    identity = _build_valid_identity_evidence(
+        private_key=private_key,
+        collector_attempt=attempt,
+    )
+    snapshot = _build_valid_snapshot(
+        attempt=attempt,
+        identity_evidence=identity,
+        attestation_private_key=private_key,
+    )
+    return snapshot, private_key, envelope
+
+
+def _evaluate_attested_snapshot(
+    snapshot: EvidenceSnapshot,
+    *,
+    private_key: rsa.RSAPrivateKey,
+    envelope: dict[str, object],
+    expected_artifact_digest: str,
+    publication_snapshot: EvidenceSnapshot,
+    as_of: datetime = datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+    trusted_key_anchor: TrustedKeyAnchor | None = None,
+    key_resolver: Callable[[TrustedKeyAnchor], TrustedKeyRecord | None] | None = None,
+) -> EvidenceSnapshot:
+    return snapshot.validate_for_evaluation(
+        as_of=as_of,
+        expected_artifact_digest=expected_artifact_digest,
+        publication_resolver=_snapshot_publication_resolver(publication_snapshot),
+        key_resolver=key_resolver or _trusted_key_resolver(private_key.public_key()),
+        trusted_key_anchor=trusted_key_anchor
+        or _trusted_key_anchor(private_key.public_key()),
+        envelope_resolver=lambda attempt_id, kind, digest: envelope,
+    )
+
+
+def test_valid_snapshot_attestation_and_publication_record_are_required() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    assert (
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+        )
+        is snapshot
+    )
+    assert (
+        snapshot.snapshot_attestation.artifact_digest
+        == snapshot.compatibility.artifact_digest
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extendExpiry", "addSubscription", "changeSnapshotId", "deleteRecordsAndRefs"],
+)
+def test_snapshot_attestation_rejects_rehashed_snapshot_mutations(
+    mutation: str,
+) -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    trusted_digest = snapshot.compatibility.artifact_digest
+    forged = snapshot.model_copy(deep=True)
+    if mutation == "extendExpiry":
+        object.__setattr__(
+            forged,
+            "expires_at",
+            datetime(2035, 1, 1, tzinfo=UTC),
+        )
+        as_of = datetime(2030, 1, 1, tzinfo=UTC)
+    elif mutation == "addSubscription":
+        forged.authorized_scopes.append(
+            SubscriptionScope(
+                scopeType="subscription",
+                tenantId="11111111-1111-1111-1111-111111111111",
+                subscriptionId="22222222-2222-2222-2222-222222222222",
+            )
+        )
+        as_of = datetime(2025, 1, 2, 12, 10, tzinfo=UTC)
+    elif mutation == "changeSnapshotId":
+        object.__setattr__(forged, "snapshot_id", "snap-999999999999")
+        for evidence_ref in forged.evidence_refs:
+            object.__setattr__(evidence_ref, "snapshot_id", forged.snapshot_id)
+        as_of = datetime(2025, 1, 2, 12, 10, tzinfo=UTC)
+    else:
+        object.__setattr__(forged, "evidence_records", [])
+        object.__setattr__(forged, "evidence_refs", [])
+        as_of = datetime(2025, 1, 2, 12, 10, tzinfo=UTC)
+    _recompute_forged_snapshot_public_hashes(forged)
+    assert forged.compatibility.artifact_digest != trusted_digest
+    with pytest.raises(AthenaValidationError):
+        _evaluate_attested_snapshot(
+            forged,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=trusted_digest,
+            publication_snapshot=snapshot,
+            as_of=as_of,
+        )
+
+
+def test_snapshot_attestation_rejects_wrong_expected_digest_and_component_digest() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    with pytest.raises(AthenaValidationError, match="expected_artifact_digest"):
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=_sha256("wrong-published-snapshot"),
+            publication_snapshot=snapshot,
+        )
+
+    forged = snapshot.model_copy(deep=True)
+    forged_attestation = forged.snapshot_attestation.model_copy(
+        update={"authorized_scopes_digest": _sha256("wrong-scope-set")}
+    )
+    object.__setattr__(forged, "snapshot_attestation", forged_attestation)
+    with pytest.raises(AthenaValidationError, match="component digests"):
+        _evaluate_attested_snapshot(
+            forged,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+        )
+
+
+def test_snapshot_attestation_rejects_wrong_key_anchor_and_retired_key() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with pytest.raises(AthenaValidationError, match="attestation cryptographic"):
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+            trusted_key_anchor=_trusted_key_anchor(other_key.public_key()),
+            key_resolver=_trusted_key_resolver(other_key.public_key()),
+        )
+
+    other_anchor_url = (
+        "https://different.vault.azure.net/keys/athena-key/"
+        "0123456789abcdef0123456789abcdef"
+    )
+    with pytest.raises(AthenaValidationError, match="attestation cryptographic"):
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+            trusted_key_anchor=_trusted_key_anchor(
+                private_key.public_key(),
+                key_vault_key_id=other_anchor_url,
+            ),
+            key_resolver=_trusted_key_resolver(
+                private_key.public_key(),
+                key_vault_key_id=other_anchor_url,
+            ),
+        )
+
+    anchor = _trusted_key_anchor(private_key.public_key())
+    retired_record = TrustedKeyRecord(
+        anchor=anchor,
+        public_key=private_key.public_key(),
+        enabled=True,
+        activated_at=datetime(2025, 1, 1, tzinfo=UTC),
+        retired_at=datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
+    )
+    with pytest.raises(AthenaValidationError, match="attestation cryptographic"):
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda lookup: retired_record,
+        )
+
+
+def test_attempt_signature_cannot_be_replayed_as_snapshot_attestation() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    forged = snapshot.model_copy(deep=True)
+    attempt_signature = snapshot.identity_evidence[0].ingestion_signature.signature
+    forged_attestation = forged.snapshot_attestation.model_copy(
+        update={"signature": attempt_signature}
+    )
+    object.__setattr__(forged, "snapshot_attestation", forged_attestation)
+    with pytest.raises(AthenaValidationError, match="attestation cryptographic"):
+        _evaluate_attested_snapshot(
+            forged,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+        )
+
+
+def test_resolved_identity_must_match_attested_identity_digest_set() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    replacement = _build_valid_identity_evidence(
+        private_key=private_key,
+        collector_attempt=snapshot.collector_attempts[0],
+        jti="replacement-jti",
+    )
+    assert (
+        replacement.identity_evidence_id
+        == snapshot.identity_evidence[0].identity_evidence_id
+    )
+    assert (
+        replacement.identity_evidence_digest
+        != snapshot.identity_evidence[0].identity_evidence_digest
+    )
+    with pytest.raises(AthenaValidationError, match="resolved identity evidence digest"):
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
+            identity_evidence=[replacement],
+            key_resolver=_trusted_key_resolver(private_key.public_key()),
+            trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+            envelope_resolver=lambda attempt_id, kind, digest: envelope,
+        )
+
+
+def test_resolved_identity_digest_is_recomputed_and_extras_are_rejected() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    tampered = snapshot.identity_evidence[0].model_copy(deep=True)
+    object.__setattr__(tampered, "token_hash", _sha256("tampered-token"))
+    assert (
+        tampered.identity_evidence_digest
+        == snapshot.snapshot_attestation.identity_evidence_digests[0]
+    )
+    with pytest.raises(AthenaValidationError, match="canonical identity proof"):
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
+            identity_evidence=[tampered],
+            key_resolver=_trusted_key_resolver(private_key.public_key()),
+            trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+            envelope_resolver=lambda attempt_id, kind, digest: envelope,
+        )
+
+    extra = snapshot.identity_evidence[0].model_copy(
+        deep=True,
+        update={"identity_evidence_id": "identity-222222222222"},
+    )
+    with pytest.raises(AthenaValidationError, match="unreferenced identity"):
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
+            identity_evidence=[snapshot.identity_evidence[0], extra],
+            key_resolver=_trusted_key_resolver(private_key.public_key()),
+            trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+            envelope_resolver=lambda attempt_id, kind, digest: envelope,
+        )

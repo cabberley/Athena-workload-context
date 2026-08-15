@@ -450,6 +450,29 @@ class TrustedKeyRecord:
 type TrustedKeyResolver = Callable[[TrustedKeyAnchor], TrustedKeyRecord | None]
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotPublicationRecord:
+    snapshot_id: SnapshotIdentifier
+    artifact_digest: Sha256Digest
+    semantic_digest: Sha256Digest
+    schema_version: SemanticVersionText
+    semantic_contract_version: SemanticVersionText
+    published_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.published_at.tzinfo is None or self.published_at.utcoffset() != UTC.utcoffset(
+            self.published_at
+        ):
+            raise AthenaValidationError(
+                "SnapshotPublicationRecord.published_at must be UTC"
+            )
+
+
+type SnapshotPublicationResolver = Callable[
+    [SnapshotIdentifier], SnapshotPublicationRecord | None
+]
+
+
 def _is_valid_guid(value: str) -> bool:
     return bool(_GUID_RE.fullmatch(value)) and "*" not in value and "?" not in value
 
@@ -542,6 +565,12 @@ def compute_token_verification_digest(value: Any) -> str:
 
 def compute_verified_claims_digest(value: Any) -> str:
     return compute_artifact_digest(_json_digest_payload(value))
+
+
+def compute_collector_identity_evidence_digest(value: Any) -> str:
+    return compute_artifact_digest(
+        _without_root_fields(value, frozenset({"identityEvidenceDigest"}))
+    )
 
 
 def compute_jti_digest(jti: str) -> str:
@@ -801,8 +830,50 @@ def compute_evidence_snapshot_semantic_digest(value: Any) -> str:
     )
 
 
+def _canonical_set_digest(values: Iterable[Any]) -> str:
+    payloads = [_json_digest_payload(value) for value in values]
+    payloads.sort(key=canonicalize_json)
+    return compute_artifact_digest(payloads)
+
+
+def compute_authorized_scopes_digest(value: Any) -> str:
+    payload = _json_digest_payload(value)
+    scopes = payload.get("authorizedScopes", []) if isinstance(payload, dict) else value
+    return _canonical_set_digest(scopes)
+
+
+def compute_collector_attempt_set_digest(value: Any) -> str:
+    payload = _json_digest_payload(value)
+    attempts = payload.get("collectorAttempts", []) if isinstance(payload, dict) else value
+    return _canonical_set_digest(attempts)
+
+
+def compute_evidence_record_set_digest(value: Any) -> str:
+    payload = _json_digest_payload(value)
+    records = payload.get("evidenceRecords", []) if isinstance(payload, dict) else value
+    return _canonical_set_digest(records)
+
+
+def compute_evidence_reference_set_digest(value: Any) -> str:
+    payload = _json_digest_payload(value)
+    references = payload.get("evidenceRefs", []) if isinstance(payload, dict) else value
+    return _canonical_set_digest(references)
+
+
+def compute_identity_evidence_set_digest(value: Any) -> str:
+    payload = _json_digest_payload(value)
+    identities = payload.get("identityEvidence", []) if isinstance(payload, dict) else value
+    digests = sorted(
+        identity["identityEvidenceDigest"]
+        for identity in identities
+        if isinstance(identity, dict)
+    )
+    return compute_artifact_digest(digests)
+
+
 def _snapshot_digest_preimage(value: Any) -> dict[str, Any]:
     payload = _without_root_fields(value, frozenset())
+    payload.pop("snapshotAttestation", None)
     compatibility = payload.get("compatibility")
     if not isinstance(compatibility, dict):
         raise AthenaValidationError("snapshot digest preimage requires compatibility metadata")
@@ -1080,6 +1151,48 @@ def verify_key_vault_signature(
         return False
 
 
+def _resolve_valid_trusted_key(
+    *,
+    key_resolver: TrustedKeyResolver,
+    trusted_key_anchor: TrustedKeyAnchor,
+    key_vault_key_id: str,
+    key_name: str,
+    key_version: str,
+    signed_at: datetime,
+    as_of: datetime,
+) -> TrustedKeyRecord | None:
+    if (
+        key_vault_key_id != trusted_key_anchor.key_vault_key_id
+        or key_name != trusted_key_anchor.key_name
+        or key_version != trusted_key_anchor.key_version
+        or signed_at > as_of
+    ):
+        return None
+    try:
+        trusted_key = key_resolver(trusted_key_anchor)
+    except Exception:
+        return None
+    if trusted_key is None or trusted_key.anchor != trusted_key_anchor:
+        return None
+    if (
+        trusted_key.anchor.key_vault_key_id != key_vault_key_id
+        or trusted_key.anchor.key_name != key_name
+        or trusted_key.anchor.key_version != key_version
+        or not trusted_key.enabled
+        or signed_at < trusted_key.activated_at
+    ):
+        return None
+    if trusted_key.retired_at is not None and (
+        signed_at >= trusted_key.retired_at or as_of >= trusted_key.retired_at
+    ):
+        return None
+    if trusted_key.expires_at is not None and (
+        signed_at >= trusted_key.expires_at or as_of >= trusted_key.expires_at
+    ):
+        return None
+    return trusted_key
+
+
 def verify_trusted_ingestion_signature(
     identity_evidence: CollectorIdentityEvidence,
     *,
@@ -1196,30 +1309,16 @@ def verify_trusted_ingestion_signature(
     expected_signed_digest = compute_artifact_digest(signature_preimage)
     if signature.signed_preimage_digest != expected_signed_digest:
         return False
-    try:
-        trusted_key = key_resolver(trusted_key_anchor)
-    except Exception:
-        return False
-    if trusted_key is None or trusted_key.anchor != trusted_key_anchor:
-        return False
-    if (
-        trusted_key.anchor.key_vault_key_id != identity_evidence.trust_anchor_ref
-        or trusted_key.anchor.key_name != signature.key_name
-        or trusted_key.anchor.key_version != signature.key_version
-        or not trusted_key.enabled
-        or signature.signed_at < trusted_key.activated_at
-        or as_of < signature.signed_at
-    ):
-        return False
-    if trusted_key.retired_at is not None and (
-        signature.signed_at >= trusted_key.retired_at
-        or as_of >= trusted_key.retired_at
-    ):
-        return False
-    if trusted_key.expires_at is not None and (
-        signature.signed_at >= trusted_key.expires_at
-        or as_of >= trusted_key.expires_at
-    ):
+    trusted_key = _resolve_valid_trusted_key(
+        key_resolver=key_resolver,
+        trusted_key_anchor=trusted_key_anchor,
+        key_vault_key_id=signature.key_vault_key_id,
+        key_name=signature.key_name,
+        key_version=signature.key_version,
+        signed_at=signature.signed_at,
+        as_of=as_of,
+    )
+    if trusted_key is None:
         return False
     canonical = canonicalize_json(signature_preimage)
     return verify_key_vault_signature(
@@ -3741,9 +3840,7 @@ class CollectorIdentityEvidence(AthenaBaseModel):
             raise AthenaValidationError(
                 "ingestionSignature.signedAt must not precede ingestionDerivation.derivedAt"
             )
-        expected_identity_digest = compute_artifact_digest(
-            _without_root_fields(self, frozenset({"identityEvidenceDigest"}))
-        )
+        expected_identity_digest = compute_collector_identity_evidence_digest(self)
         if self.identity_evidence_digest != expected_identity_digest:
             raise AthenaValidationError(
                 "identityEvidenceDigest mismatched the canonical record without its own digest"
@@ -4840,6 +4937,246 @@ type EvidenceRecord = Annotated[
 ]
 
 
+class SnapshotAttestation(AthenaBaseModel):
+    attestation_type: Literal["trustedSnapshotPublication"] = Field(
+        ...,
+        alias="attestationType",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    attestation_version: Literal["1.0.0"] = Field(
+        ...,
+        alias="attestationVersion",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    artifact_kind: Literal["evidenceSnapshot"] = Field(
+        ...,
+        alias="artifactKind",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    schema_version: SemanticVersionText = Field(
+        ...,
+        alias="schemaVersion",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    semantic_contract_version: SemanticVersionText = Field(
+        ...,
+        alias="semanticContractVersion",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    policy_contract_version: SemanticVersionText = Field(
+        ...,
+        alias="policyContractVersion",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    snapshot_id: SnapshotIdentifier = Field(
+        ...,
+        alias="snapshotId",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    artifact_digest: Sha256Digest = Field(
+        ...,
+        alias="artifactDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    semantic_digest: Sha256Digest = Field(
+        ...,
+        alias="semanticDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    identity_evidence_digests: list[Sha256Digest] = Field(
+        ...,
+        alias="identityEvidenceDigests",
+        max_length=500,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    identity_evidence_set_digest: Sha256Digest = Field(
+        ...,
+        alias="identityEvidenceSetDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    collected_at: UtcDateTime = Field(
+        ...,
+        alias="collectedAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    expires_at: UtcDateTime = Field(
+        ...,
+        alias="expiresAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    authorized_scopes_digest: Sha256Digest = Field(
+        ...,
+        alias="authorizedScopesDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    collector_attempt_set_digest: Sha256Digest = Field(
+        ...,
+        alias="collectorAttemptSetDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    evidence_record_set_digest: Sha256Digest = Field(
+        ...,
+        alias="evidenceRecordSetDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    evidence_reference_set_digest: Sha256Digest = Field(
+        ...,
+        alias="evidenceReferenceSetDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    attested_at: UtcDateTime = Field(
+        ...,
+        alias="attestedAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    signature_algorithm: Literal["RS256"] = Field(
+        ...,
+        alias="signatureAlgorithm",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    key_vault_key_id: VersionedKeyVaultKeyId = Field(
+        ...,
+        alias="keyVaultKeyId",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    key_name: KeyVaultKeyName = Field(
+        ...,
+        alias="keyName",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    key_version: KeyVaultKeyVersion = Field(
+        ...,
+        alias="keyVersion",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    trust_anchor_ref: VersionedKeyVaultKeyId = Field(
+        ...,
+        alias="trustAnchorRef",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    signed_preimage_digest: Sha256Digest = Field(
+        ...,
+        alias="signedPreimageDigest",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    signature: StandardBase64Signature = Field(
+        ...,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+    @model_validator(mode="after")
+    def validate_attestation(self) -> SnapshotAttestation:
+        if self.identity_evidence_digests != sorted(
+            set(self.identity_evidence_digests)
+        ):
+            raise AthenaValidationError(
+                "snapshot attestation identityEvidenceDigests must be unique and sorted"
+            )
+        if self.collected_at >= self.expires_at:
+            raise AthenaValidationError(
+                "snapshot attestation collectedAt must precede expiresAt"
+            )
+        if self.attested_at < self.collected_at or self.attested_at >= self.expires_at:
+            raise AthenaValidationError(
+                "snapshot attestation attestedAt must be inside the snapshot lifetime"
+            )
+        parts = self.key_vault_key_id.split("/")
+        if (
+            self.trust_anchor_ref != self.key_vault_key_id
+            or self.key_name != parts[-2]
+            or self.key_version != parts[-1]
+        ):
+            raise AthenaValidationError(
+                "snapshot attestation key identity must exactly match its trust anchor"
+            )
+        expected = compute_snapshot_attestation_preimage_digest(self)
+        if self.signed_preimage_digest != expected:
+            raise AthenaValidationError(
+                "snapshot attestation signedPreimageDigest mismatched its canonical preimage"
+            )
+        return self
+
+
+def snapshot_attestation_preimage(value: Any) -> dict[str, Any]:
+    return _without_root_fields(
+        value,
+        frozenset({"signedPreimageDigest", "signature"}),
+    )
+
+
+def compute_snapshot_attestation_preimage_digest(value: Any) -> str:
+    return compute_artifact_digest(snapshot_attestation_preimage(value))
+
+
+def verify_snapshot_attestation_signature(
+    attestation: SnapshotAttestation,
+    *,
+    key_resolver: TrustedKeyResolver,
+    trusted_key_anchor: TrustedKeyAnchor,
+    as_of: datetime,
+) -> bool:
+    if (
+        attestation.trust_anchor_ref != attestation.key_vault_key_id
+        or attestation.attested_at > as_of
+        or attestation.signed_preimage_digest
+        != compute_snapshot_attestation_preimage_digest(attestation)
+    ):
+        return False
+    trusted_key = _resolve_valid_trusted_key(
+        key_resolver=key_resolver,
+        trusted_key_anchor=trusted_key_anchor,
+        key_vault_key_id=attestation.key_vault_key_id,
+        key_name=attestation.key_name,
+        key_version=attestation.key_version,
+        signed_at=attestation.attested_at,
+        as_of=as_of,
+    )
+    if trusted_key is None:
+        return False
+    return verify_key_vault_signature(
+        raw_signature=attestation.signature,
+        preimage=canonicalize_json(snapshot_attestation_preimage(attestation)),
+        public_key=trusted_key.public_key,
+        algorithm=attestation.signature_algorithm,
+    )
+
+
+def _snapshot_attestation_matches_components(
+    snapshot: Any,
+    *,
+    artifact_digest: str,
+    semantic_digest: str,
+) -> bool:
+    attestation = snapshot.snapshot_attestation
+    identity_digests = sorted(
+        identity.identity_evidence_digest for identity in snapshot.identity_evidence
+    )
+    return (
+        attestation.artifact_kind == snapshot.compatibility.artifact_kind
+        and attestation.schema_version == snapshot.compatibility.schema_version
+        and attestation.semantic_contract_version
+        == snapshot.compatibility.semantic_contract_version
+        and attestation.policy_contract_version
+        == snapshot.compatibility.policy_contract_version
+        and attestation.snapshot_id == snapshot.snapshot_id
+        and attestation.artifact_digest == artifact_digest
+        and attestation.semantic_digest == semantic_digest
+        and set(identity_digests).issubset(attestation.identity_evidence_digests)
+        and attestation.identity_evidence_set_digest
+        == compute_artifact_digest(attestation.identity_evidence_digests)
+        and attestation.collected_at == snapshot.collected_at
+        and attestation.expires_at == snapshot.expires_at
+        and attestation.authorized_scopes_digest
+        == compute_authorized_scopes_digest(snapshot)
+        and attestation.collector_attempt_set_digest
+        == compute_collector_attempt_set_digest(snapshot)
+        and attestation.evidence_record_set_digest
+        == compute_evidence_record_set_digest(snapshot)
+        and attestation.evidence_reference_set_digest
+        == compute_evidence_reference_set_digest(snapshot)
+    )
+
+
 class EvidenceSnapshot(AthenaBaseModel):
     snapshot_id: SnapshotIdentifier = Field(
         ...,
@@ -4889,6 +5226,11 @@ class EvidenceSnapshot(AthenaBaseModel):
         default_factory=list,
         alias="identityEvidence",
         max_length=500,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    snapshot_attestation: SnapshotAttestation = Field(
+        ...,
+        alias="snapshotAttestation",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
 
@@ -5311,12 +5653,40 @@ class EvidenceSnapshot(AthenaBaseModel):
                 "EvidenceSnapshot compatibility.semanticDigest mismatched the canonical snapshot "
                 "semantic preimage"
             )
+        attestation = self.snapshot_attestation
+        if not _snapshot_attestation_matches_components(
+            self,
+            artifact_digest=expected_artifact_digest,
+            semantic_digest=expected_semantic_digest,
+        ):
+            raise AthenaValidationError(
+                "SnapshotAttestation must exactly match all recomputed snapshot components"
+            )
+        latest_attempt_time = max(
+            _attempt_observation_time(attempt) for attempt in self.collector_attempts
+        )
+        latest_identity_signature = max(
+            (
+                identity.ingestion_signature.signed_at
+                for identity in self.identity_evidence
+            ),
+            default=self.collected_at,
+        )
+        if attestation.attested_at < max(
+            latest_attempt_time,
+            latest_identity_signature,
+        ):
+            raise AthenaValidationError(
+                "SnapshotAttestation.attestedAt must follow all signed attempts and identities"
+            )
         return self
 
     def validate_for_evaluation(
         self,
         *,
         as_of: datetime,
+        expected_artifact_digest: Sha256Digest,
+        publication_resolver: SnapshotPublicationResolver,
         identity_evidence: Iterable[CollectorIdentityEvidence] | None = None,
         identity_resolver: Callable[[str], CollectorIdentityEvidence] | None = None,
         key_resolver: TrustedKeyResolver | None = None,
@@ -5325,19 +5695,45 @@ class EvidenceSnapshot(AthenaBaseModel):
     ) -> EvidenceSnapshot:
         if as_of.tzinfo is None:
             raise AthenaValidationError("as_of must be timezone-aware")
-        if (
-            self.compatibility.artifact_digest
-            != compute_evidence_snapshot_artifact_digest(self)
-        ):
+        recomputed_artifact_digest = compute_evidence_snapshot_artifact_digest(self)
+        recomputed_semantic_digest = compute_evidence_snapshot_semantic_digest(self)
+        if self.compatibility.artifact_digest != recomputed_artifact_digest:
             raise AthenaValidationError(
                 "snapshot artifact digest must be valid at evaluation time"
             )
-        if (
-            self.compatibility.semantic_digest
-            != compute_evidence_snapshot_semantic_digest(self)
-        ):
+        if self.compatibility.semantic_digest != recomputed_semantic_digest:
             raise AthenaValidationError(
                 "snapshot semantic digest must be valid at evaluation time"
+            )
+        if expected_artifact_digest != recomputed_artifact_digest:
+            raise AthenaValidationError(
+                "trusted expected_artifact_digest must equal the recomputed snapshot digest"
+            )
+        publication = publication_resolver(self.snapshot_id)
+        if publication is None:
+            raise AthenaValidationError(
+                "snapshot is missing from the trusted publication registry"
+            )
+        if (
+            publication.snapshot_id != self.snapshot_id
+            or publication.artifact_digest != expected_artifact_digest
+            or publication.semantic_digest != recomputed_semantic_digest
+            or publication.schema_version != self.compatibility.schema_version
+            or publication.semantic_contract_version
+            != self.compatibility.semantic_contract_version
+            or publication.published_at < self.snapshot_attestation.attested_at
+            or publication.published_at > as_of
+        ):
+            raise AthenaValidationError(
+                "trusted snapshot publication record does not match the evaluated snapshot"
+            )
+        if not _snapshot_attestation_matches_components(
+            self,
+            artifact_digest=recomputed_artifact_digest,
+            semantic_digest=recomputed_semantic_digest,
+        ):
+            raise AthenaValidationError(
+                "snapshot attestation component digests do not match recomputed snapshot data"
             )
         if as_of < self.collected_at or as_of >= self.expires_at:
             raise AthenaValidationError(
@@ -5348,20 +5744,29 @@ class EvidenceSnapshot(AthenaBaseModel):
                 "snapshot evaluation requires either embedded identityEvidence or an "
                 "explicit trusted identity resolver"
             )
+        referenced_identity_ids = {
+            self.collector.collector_identity_evidence_ref
+        } | {
+            attempt.collector_identity_evidence_ref
+            for attempt in self.collector_attempts
+        } | {
+            record.collector_identity_evidence_ref
+            for record in self.evidence_records
+        }
         resolution_source = list(identity_evidence or self.identity_evidence)
         resolved_identity_lookup: dict[str, CollectorIdentityEvidence] = {}
         for identity in resolution_source:
+            if identity.identity_evidence_id not in referenced_identity_ids:
+                raise AthenaValidationError(
+                    "identityEvidence must not contain unreferenced identity proofs"
+                )
             if identity.identity_evidence_id in resolved_identity_lookup:
                 raise AthenaValidationError(
                     "identityEvidence must contain unique identityEvidenceId values"
                 )
             resolved_identity_lookup[identity.identity_evidence_id] = identity
         if identity_resolver is not None:
-            for identity_ref in {
-                attempt.collector_identity_evidence_ref for attempt in self.collector_attempts
-            } | {
-                record.collector_identity_evidence_ref for record in self.evidence_records
-            }:
+            for identity_ref in referenced_identity_ids:
                 if identity_ref in resolved_identity_lookup:
                     continue
                 resolved = identity_resolver(identity_ref)
@@ -5375,11 +5780,62 @@ class EvidenceSnapshot(AthenaBaseModel):
                         "mapping"
                     )
                 resolved_identity_lookup[identity_ref] = resolved
+        if set(resolved_identity_lookup) != referenced_identity_ids:
+            raise AthenaValidationError(
+                "every referenced snapshot identity must resolve exactly once"
+            )
+        for identity in resolved_identity_lookup.values():
+            if (
+                identity.identity_evidence_digest
+                != compute_collector_identity_evidence_digest(identity)
+            ):
+                raise AthenaValidationError(
+                    "resolved identityEvidenceDigest mismatched the canonical identity proof"
+                )
+        resolved_identity_digests = sorted(
+            identity.identity_evidence_digest
+            for identity in resolved_identity_lookup.values()
+        )
+        if (
+            resolved_identity_digests
+            != self.snapshot_attestation.identity_evidence_digests
+            or compute_artifact_digest(resolved_identity_digests)
+            != self.snapshot_attestation.identity_evidence_set_digest
+        ):
+            raise AthenaValidationError(
+                "resolved identity evidence digest set must exactly match the snapshot attestation"
+            )
+        if any(
+            identity.ingestion_signature.signed_at
+            > self.snapshot_attestation.attested_at
+            for identity in resolved_identity_lookup.values()
+        ):
+            raise AthenaValidationError(
+                "resolved identity signatures must not postdate snapshot attestation"
+            )
         if key_resolver is None or trusted_key_anchor is None:
             raise AthenaValidationError(
                 "snapshot evaluation requires an explicit configured trusted key anchor "
                 "and resolver for cryptographic verification"
             )
+        if not verify_snapshot_attestation_signature(
+            self.snapshot_attestation,
+            key_resolver=key_resolver,
+            trusted_key_anchor=trusted_key_anchor,
+            as_of=as_of,
+        ):
+            raise AthenaValidationError(
+                "snapshot attestation cryptographic verification failed"
+            )
+        for identity in resolved_identity_lookup.values():
+            if not identity.verify_signature(
+                key_resolver=key_resolver,
+                trusted_key_anchor=trusted_key_anchor,
+                as_of=as_of,
+            ):
+                raise AthenaValidationError(
+                    "resolved identity evidence cryptographic verification failed"
+                )
         attempt_lookup_by_id: dict[str, CollectorAttempt] = {}
         attempt_lookup_by_digest: dict[str, CollectorAttempt] = {}
         for attempt in self.collector_attempts:
@@ -5688,14 +6144,25 @@ __all__ = [
     "TrustedKeyAnchor",
     "TrustedKeyRecord",
     "TrustedKeyResolver",
+    "SnapshotPublicationRecord",
+    "SnapshotPublicationResolver",
     "compute_evidence_record_digest",
     "compute_token_verification_digest",
     "compute_verified_claims_digest",
+    "compute_collector_identity_evidence_digest",
     "compute_jti_digest",
     "compute_response_envelope_digest",
     "compute_failure_envelope_digest",
     "compute_evidence_snapshot_artifact_digest",
     "compute_evidence_snapshot_semantic_digest",
+    "compute_authorized_scopes_digest",
+    "compute_collector_attempt_set_digest",
+    "compute_evidence_record_set_digest",
+    "compute_evidence_reference_set_digest",
+    "compute_identity_evidence_set_digest",
+    "compute_snapshot_attestation_preimage_digest",
+    "snapshot_attestation_preimage",
+    "verify_snapshot_attestation_signature",
     "EvidenceEnvelopeResolver",
     "Sha256Digest",
     "AzureGuid",
@@ -5820,6 +6287,7 @@ __all__ = [
     "AdvisorRecommendationEvidenceRecord",
     "EvidenceGapRecord",
     "EvidenceRecord",
+    "SnapshotAttestation",
     "EvidenceSnapshot",
     "Finding",
     "Verdict",

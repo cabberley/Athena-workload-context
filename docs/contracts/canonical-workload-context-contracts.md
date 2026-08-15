@@ -357,6 +357,77 @@ Required fields:
 | `collector` | Azure MCP provenance | 1 | Tool names, versions, allowlist hash, and verified Entra token identity evidence. |
 | `collectorAttempts` | `CollectorAttempt` union array | 1-500 | Digest-covered attempts, including failures and no-response outcomes. |
 | `evidenceRecords` | `EvidenceRecord` union array | 0-30,000 | Bounded evidence records with digest-covered provenance. |
+| `snapshotAttestation` | `SnapshotAttestation` | 1 | Trusted publication receipt over the finalized snapshot digest and every component-set digest; excluded only from the snapshot artifact/semantic self-preimages. |
+
+### Trusted snapshot publication attestation
+
+Collector-attempt identity signatures prove individual MCP attempts; they do not attest the assembled
+snapshot. A closed `SnapshotAttestation` is therefore created only after the complete snapshot,
+including all identity evidence, attempts, records/gaps, and evidence references, is assembled.
+Attempt signatures cannot be reused as snapshot attestations because the attestation uses
+`attestationType = trustedSnapshotPublication`, a distinct closed preimage shape, and a separate
+signature over that shape.
+
+The closed attestation contains:
+
+| Field | Rule |
+|---|---|
+| `attestationType` / `attestationVersion` | `trustedSnapshotPublication` / `1.0.0`. |
+| `artifactKind` | `evidenceSnapshot`. |
+| `schemaVersion`, `semanticContractVersion`, `policyContractVersion` | Exact copies from snapshot compatibility metadata. |
+| `snapshotId`, `artifactDigest`, `semanticDigest` | Exact finalized snapshot values. |
+| `identityEvidenceDigests` | Unique sorted list of every retained `identityEvidenceDigest`. |
+| `identityEvidenceSetDigest` | SHA-256 over the sorted identity-evidence digest list. |
+| `collectedAt`, `expiresAt` | Exact snapshot lifetime. |
+| `authorizedScopesDigest` | SHA-256 over the canonical scope set sorted by canonical JSON. |
+| `collectorAttemptSetDigest` | SHA-256 over the complete canonical collector-attempt set. |
+| `evidenceRecordSetDigest` | SHA-256 over the complete canonical evidence-record/gap set. |
+| `evidenceReferenceSetDigest` | SHA-256 over the complete canonical evidence-reference set after finalized snapshot digest copies are populated. |
+| `attestedAt` | UTC time after all attempt and identity signatures and before snapshot expiry. |
+| signing fields | `signatureAlgorithm`, exact versioned `keyVaultKeyId`, `keyName`, `keyVersion`, `trustAnchorRef`, `signedPreimageDigest`, and standard-base64 `signature`. |
+
+Assembly and signing order is fixed:
+
+1. validate and digest response/failure envelopes, attempts, verified claims, identity evidence,
+   records/gaps, and references;
+2. assemble the complete snapshot with no attestation;
+3. compute `semanticDigest` and `artifactDigest`, excluding only compatibility self-digests,
+   snapshot-digest copies inside evidence references, and the entire absent/present
+   `/snapshotAttestation`;
+4. populate the finalized snapshot digest copies in every evidence reference;
+5. compute the five canonical component/set digests above;
+6. build the closed attestation preimage containing all attestation fields except
+   `signedPreimageDigest` and `signature`;
+7. RFC 8785 canonicalize that preimage, compute `signedPreimageDigest`, and sign the same bytes with
+   the configured trusted-ingestion Key Vault key; and
+8. persist the immutable snapshot and a trusted `SnapshotPublicationRecord` in the publication
+   registry.
+
+`SnapshotPublicationRecord` is outside the artifact and contains exact `snapshotId`,
+`artifactDigest`, `semanticDigest`, schema/semantic-contract versions, and trusted publication time.
+Evaluation requires both a mandatory `expected_artifact_digest` and an explicit trusted publication
+resolver. The expected digest, publication record digest, recomputed digest, and signed attestation
+digest must all be equal. The publication record snapshot id and versions must also match, and its
+trusted publication time must be between `attestedAt` and evaluation `asOf`.
+
+Evaluation recomputes every snapshot and component/set digest, verifies the attestation using the
+same configured `TrustedKeyAnchor`/`TrustedKeyRecord` fingerprint, version, enabled-state,
+activation, retirement, expiry, and trusted-`asOf` rules used for ingestion signatures, and then
+verifies the underlying attempt identity signatures. Extending expiry, adding scope, changing
+snapshot id/version/semantic contract, deleting records/references, or recomputing public hashes
+requires a new valid attestation and a new trusted publication record. A locally recomputed digest is
+never publication authority.
+
+Embedded and trusted-resolver identity evidence share one rule: the exact sorted digest set of the
+identities actually used during evaluation must equal `identityEvidenceDigests` and hash to
+`identityEvidenceSetDigest`. A resolver cannot substitute a newer or different proof with the same
+`identityEvidenceId`. Evaluation derives the required identity-id set only from the snapshot
+collector, attempts, and records; missing or unreferenced extra identities are invalid. It
+recomputes every `identityEvidenceDigest` from the complete resolved identity proof before comparing
+the set and cryptographically verifies every identity in that exact set. Every resolved identity
+signature must be at or before `attestedAt`.
+`attestationVersion` is the closed literal `1.0.0`; unknown versions are rejected rather than
+interpreted with v1 semantics.
 
 Evidence record constraints:
 
@@ -479,7 +550,8 @@ does not fabricate a successful `sourceResponseDigest` or `sourceResponsePointer
 variants.
 
 The snapshot artifact digest covers all collector attempts, evidence records, item digests, and
-collector identity evidence references after excluding the snapshot's own digest fields. The semantic digest covers
+collector identity evidence references after excluding the snapshot's own digest fields and
+`/snapshotAttestation`. The semantic digest uses the same non-recursive attestation exclusion and covers
 only fields derived from schema metadata with `x-athena-semanticClass = semantic`. If an evidence item or gap
 cannot be tied to a digest-covered collector attempt, it is invalid. If a concrete evidence item
 cites a non-`successResponse` attempt, it is invalid; evidence gaps may cite any attempt type.
@@ -1234,14 +1306,15 @@ Self-digest exclusion rules:
 
 | Digest | Input | Excluded fields before canonicalization |
 |---|---|---|
-| Artifact `artifactDigest` | Entire artifact | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, transport-only envelope fields. |
-| Artifact `semanticDigest` | Metadata-derived semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, and fields whose schema metadata is not `x-athena-semanticClass = semantic`. |
+| Artifact `artifactDigest` | Entire artifact | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, evidence-reference snapshot digest copies, transport-only envelope fields, and `/snapshotAttestation` for evidence snapshots only. |
+| Artifact `semanticDigest` | Metadata-derived semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, evidence-reference snapshot digest copies, `/snapshotAttestation` for evidence snapshots only, and fields whose schema metadata is not `x-athena-semanticClass = semantic`. |
 | Evidence record `itemDigest` | One evidence record | `/itemDigest` and transport-only envelope fields for that record. |
 | MCP response `responseDigest` or failure `failureDigest` | One canonical MCP response or bounded failure envelope | `/responseDigest`, `/failureDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
 | Verified claims `verifiedClaimsDigest` | The complete closed canonical `VerifiedTokenClaims` object | None. |
 | Collector `identityEvidenceDigest` | One collector identity evidence record | `/identityEvidenceDigest` and token material. |
 | Ingestion `derivationDigest` | One attempt-bound ingestion derivation preimage | `/derivationDigest` only. |
 | Collector attempt `attemptDigest` | One collector attempt | `/attemptDigest` and transport-only envelope fields for that attempt. |
+| Snapshot attestation `signedPreimageDigest` | Closed finalized snapshot publication preimage | `/signedPreimageDigest` and `/signature` only. |
 
 Transport-only envelope fields are closed: `requestId`, `correlationId`, `retryCount`,
 `transportLatencyMs`, `receivedAt`, and `rawTransportHeaders`. No other field may be excluded
