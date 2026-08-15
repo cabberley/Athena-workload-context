@@ -55,10 +55,11 @@ The canonical contracts are:
    specific digest-covered collector attempt. Collector attempts are closed variants for successful
    response, failed response, timeout/no-response, authorization failure, and tool-unavailable
    outcomes, so collector-unavailable snapshots can be valid without fabricated MCP responses. Every
-   attempt cites a verifiable signed collector identity attestation for the private Azure MCP
-   managed identity. Evidence records are profile-neutral and do not contain Athena judgments such
-   as clause paths, verdicts, or profile-specific `not required` statements. They do not contain
-   unrestricted log bodies, secrets, PHI, PII, or customer proprietary payloads.
+   attempt cites verified Entra JWT/token evidence for the private Azure MCP managed identity plus a
+   trusted ingestion derivation; Athena does not invent managed-identity-signed custom claims.
+   Evidence records are profile-neutral and do not contain Athena judgments such as clause paths,
+   verdicts, or profile-specific `not required` statements. They do not contain unrestricted log
+   bodies, secrets, PHI, PII, or customer proprietary payloads.
 7. **Provenance boundary.** Findings cite both a manifest clause and evidence reference. Context-plane
    provenance and private Azure MCP evidence-plane provenance remain distinct. The Athena context
    identity has no workload Reader role and never becomes the collector of Azure evidence. Findings
@@ -84,10 +85,11 @@ The canonical contracts are:
    the database zone, and web-service resources spanning at least two zones for profiles that require
    multi-zone web. Missing zone evidence is `unknown`; mismatched worker zone is `violation`; active
    singleton risk acceptance is `acceptedResidualRisk` or `expectedConstraint`, never `pass`.
-13. **Compatibility.** Contract schema versions use semantic versioning and include separate
-    artifact and semantic digests. Policy-affecting optional fields and enum additions require
-    closed `requiresCapabilities` and `minimumReaderVersion` metadata plus deterministic negotiation,
-    or a major version. Schema, digest, and compatibility metadata live only under `/compatibility`.
+13. **Compatibility.** Artifact schema, semantic-contract, and policy-contract versions are separate
+    semantic versions, and artifacts include separate artifact and semantic digests. Policy-affecting
+    optional fields and enum additions require closed `requiresCapabilities` and
+    `minimumReaderVersion` metadata plus deterministic negotiation, or a major semantic/policy
+    contract version. Schema, digest, and compatibility metadata live only under `/compatibility`.
     Digests use pre-validation NFC normalization with collision rejection, then unmodified RFC 8785
     JCS, exclude only their own digest fields and closed transport metadata, and use SHA-256.
     Semantic digests use closed pointer allowlists. Unknown major versions, unknown required
@@ -183,7 +185,7 @@ recreate generic Azure MCP capability. Narrow direct-read exceptions require a f
 The implementation phase must satisfy the measurable acceptance criteria in the design
 specification, including generated JSON Schemas with `additionalProperties: false`, discriminated
 union tests, closed enum tests, bounded collection tests, deterministic merge/cross-reference tests,
-distinct provenance tests, collector-attempt and signed-attestation tests, canonicalization/digest
+distinct provenance tests, collector-attempt and Entra token identity-evidence tests, canonicalization/digest
 fixture tests, evidence freshness and scope tests, the exact three-profile oracle, and
 compatibility/fail-closed tests. Implementation must not begin until the GPT-5.6 Sol Architecture
 Reviewer returns `approved-for-implementation` or this ADR is corrected.
