@@ -9,7 +9,15 @@ from typing import Annotated, Any, Literal, cast
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from athena_context.contracts.common import (
     AthenaValidationError,
@@ -223,6 +231,97 @@ type AzureCloud = Literal[
     "azureUSGovernment",
     "azureGermanCloud",
 ]
+type ResourceState = Literal["running", "stopped", "deallocated", "unknown"]
+type MetricAggregation = Literal[
+    "average",
+    "minimum",
+    "maximum",
+    "total",
+    "count",
+    "percentile50",
+    "percentile95",
+    "percentile99",
+]
+type MetricUnit = Literal[
+    "count",
+    "percent",
+    "bytes",
+    "bytesPerSecond",
+    "milliseconds",
+    "seconds",
+    "requestsPerSecond",
+    "cores",
+    "unknown",
+]
+type HealthKind = Literal["resourceHealth", "serviceHealth"]
+type HealthStatus = Literal["available", "unavailable", "degraded", "unknown"]
+type HealthSummaryCode = Literal[
+    "availabilityImpact",
+    "serviceDegradation",
+    "plannedMaintenance",
+    "configurationIssue",
+    "unknown",
+]
+type ActivityStatus = Literal["succeeded", "failed", "started", "unknown"]
+type AdvisorCategory = Literal[
+    "cost",
+    "highAvailability",
+    "performance",
+    "security",
+    "operationalExcellence",
+]
+type AdvisorImpact = Literal["high", "medium", "low"]
+type EvidenceMetricName = Literal[
+    "percentageCpu",
+    "availableMemoryBytes",
+    "diskReadBytesPerSecond",
+    "diskWriteBytesPerSecond",
+    "networkInBytesPerSecond",
+    "networkOutBytesPerSecond",
+    "availability",
+]
+type EvidenceActivityOperation = Literal[
+    "resourceWrite",
+    "resourceDelete",
+    "roleAssignmentWrite",
+    "deploymentWrite",
+    "maintenanceEvent",
+]
+type AdvisorRecommendationCode = Literal[
+    "costOptimization",
+    "availabilityImprovement",
+    "performanceOptimization",
+    "securityHardening",
+    "operationalExcellence",
+]
+type EvidenceEnvironment = Literal[
+    "production",
+    "development",
+    "training",
+    "test",
+    "disaster-recovery",
+    "sandbox",
+]
+type EvidenceWorkloadRole = Literal[
+    "database",
+    "worker",
+    "web-service",
+    "load-balancer",
+    "integration",
+    "storage",
+    "network",
+    "identity",
+    "observability",
+    "external-dependency",
+]
+type EvidenceManagedBy = Literal[
+    "terraform",
+    "bicep",
+    "arm",
+    "azure-policy",
+    "manual",
+    "unknown",
+]
 type GovernanceScopeType = Literal[
     "manifest",
     "profile",
@@ -242,6 +341,37 @@ _SHA256_RE = re.compile(r"^sha256:[a-fA-F0-9]{64}$")
 _AZURE_REGION_RE = re.compile(r"^(?!.*[*?])(?:[a-z0-9]+(?:-[a-z0-9]+)*)$")
 _KEY_VAULT_KEY_ID_RE = re.compile(
     r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/[A-Za-z0-9-]{1,127}/[A-Za-z0-9-]{1,127}$"
+)
+_SAFE_EVIDENCE_CODE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+_SAFE_TAG_VALUE_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+_SAFE_EVIDENCE_CODE_RE = re.compile(_SAFE_EVIDENCE_CODE_PATTERN)
+_SAFE_TAG_VALUE_RE = re.compile(_SAFE_TAG_VALUE_PATTERN)
+_SENSITIVE_EVIDENCE_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:password|passwd|pwd|secret|bearer|token|credential|proprietary)|"
+    r"(?:api|access|private|account|client)[-_ ]?key|"
+    r"client[-_ ]?secret|"
+    r"connection[-_ ]?string|"
+    r"shared[-_ ]?access[-_ ]?signature|"
+    r"patient(?:name|id)?|"
+    r"person(?:name|id)?|"
+    r"(?:first|last)[-_ ]?name|"
+    r"(?:jane|john|mary|james)[-_. ](?:doe|smith|jones|brown)|"
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|"
+    r"(?:^|[;?&])(?:AccountKey|SharedAccessSignature|sig)=|"
+    r"(?:^|/|\\)subscriptions(?:/|\\)|"
+    r"(?:^|/|\\)resourcegroups(?:/|\\)|"
+    r"\.vault\.azure\.net|"
+    r"^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}$"
+    r")"
+)
+_APPLICATION_TAG_ID_RE = re.compile(r"^app-[a-f0-9]{12}$")
+_COMPONENT_TAG_ID_RE = re.compile(r"^component-[a-f0-9]{12}$")
+_RESPONSE_EVIDENCE_POINTER_RE = re.compile(
+    r"^(?:|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"
+)
+_FAILURE_EVIDENCE_POINTER_RE = re.compile(
+    r"^(?:|/error(?:/(?:code|status))?|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"
 )
 _TRANSPORT_ONLY_ENVELOPE_FIELDS = frozenset(
     {
@@ -288,6 +418,21 @@ def _is_valid_json_pointer(value: str | None) -> bool:
     return True
 
 
+def _is_allowed_evidence_pointer(
+    value: str | None,
+    *,
+    envelope_kind: Literal["response", "failure"],
+) -> bool:
+    if not _is_valid_json_pointer(value):
+        return False
+    pattern = (
+        _RESPONSE_EVIDENCE_POINTER_RE
+        if envelope_kind == "response"
+        else _FAILURE_EVIDENCE_POINTER_RE
+    )
+    return value is not None and bool(pattern.fullmatch(value))
+
+
 def _json_digest_payload(value: Any) -> Any:
     if isinstance(value, AthenaBaseModel):
         return value.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -332,6 +477,78 @@ def compute_token_verification_digest(value: Any) -> str:
             frozenset({"tokenVerificationDigest"}),
         )
     )
+
+
+def compute_verified_claims_digest(value: Any) -> str:
+    return compute_artifact_digest(_json_digest_payload(value))
+
+
+def _validate_safe_evidence_text(value: str) -> str:
+    normalized = normalize_nfc_text(value)
+    if normalized != value or not _SAFE_EVIDENCE_CODE_RE.fullmatch(value):
+        raise AthenaValidationError(
+            "evidence text must be a normalized public-safe code without whitespace or payload data"
+        )
+    if _SENSITIVE_EVIDENCE_RE.search(value):
+        raise AthenaValidationError("evidence text contains sensitive or identifying syntax")
+    return value
+
+
+def _validate_safe_tag_value(value: str) -> str:
+    normalized = normalize_nfc_text(value)
+    if normalized != value or not _SAFE_TAG_VALUE_RE.fullmatch(value):
+        raise AthenaValidationError(
+            "approved resource tag values must be normalized lowercase public-safe codes"
+        )
+    if _SENSITIVE_EVIDENCE_RE.search(value):
+        raise AthenaValidationError("approved resource tag value contains sensitive syntax")
+    return value
+
+
+def _validate_application_tag_id(value: str) -> str:
+    if not _APPLICATION_TAG_ID_RE.fullmatch(value):
+        raise AthenaValidationError(
+            "application tags must be opaque approved registry ids: app- plus 12 lowercase hex"
+        )
+    return value
+
+
+def _validate_component_tag_id(value: str) -> str:
+    if not _COMPONENT_TAG_ID_RE.fullmatch(value):
+        raise AthenaValidationError(
+            "component tags must be opaque approved registry ids: component- plus 12 lowercase hex"
+        )
+    return value
+
+
+type SafeEvidenceText = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=_SAFE_EVIDENCE_CODE_PATTERN,
+    ),
+    AfterValidator(_validate_safe_evidence_text),
+]
+type SafeTagValue = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=64,
+        pattern=_SAFE_TAG_VALUE_PATTERN,
+    ),
+    AfterValidator(_validate_safe_tag_value),
+]
+type ApplicationTagId = Annotated[
+    str,
+    StringConstraints(pattern=r"^app-[a-f0-9]{12}$"),
+    AfterValidator(_validate_application_tag_id),
+]
+type ComponentTagId = Annotated[
+    str,
+    StringConstraints(pattern=r"^component-[a-f0-9]{12}$"),
+    AfterValidator(_validate_component_tag_id),
+]
 
 
 def compute_response_envelope_digest(value: Any) -> str:
@@ -678,6 +895,21 @@ def verify_trusted_ingestion_signature(
     if (
         identity_evidence.ingestion_derivation.derived_collector_identity_ref
         != identity_evidence.identity_evidence_id
+    ):
+        return False
+    expected_claims_digest = compute_verified_claims_digest(identity_evidence.verified_claims)
+    if identity_evidence.token_verification.verified_claims != identity_evidence.verified_claims:
+        return False
+    if (
+        identity_evidence.token_verification.verified_claims_digest
+        != expected_claims_digest
+        or identity_evidence.ingestion_derivation.verified_claims_digest
+        != expected_claims_digest
+    ):
+        return False
+    if (
+        identity_evidence.token_verification.token_verification_digest
+        != compute_token_verification_digest(identity_evidence.token_verification)
     ):
         return False
     if attempt is not None:
@@ -2296,7 +2528,7 @@ class EvidenceItemRef(AthenaBaseModel):
     ref_type: Literal["evidenceItem"] = Field(
         ..., alias="refType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    snapshot_id: str = Field(
+    snapshot_id: SafeEvidenceText = Field(
         ...,
         alias="snapshotId",
         min_length=1,
@@ -2320,7 +2552,7 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_attempt_id: str = Field(
+    collector_attempt_id: SafeEvidenceText = Field(
         ...,
         alias="collectorAttemptId",
         min_length=1,
@@ -2332,13 +2564,13 @@ class EvidenceItemRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_tool_name: str = Field(
+    collector_tool_name: SafeEvidenceText = Field(
         ...,
         alias="collectorToolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_tool_version: str = Field(
+    collector_tool_version: SafeEvidenceText = Field(
         ...,
         alias="collectorToolVersion",
         min_length=1,
@@ -2347,7 +2579,7 @@ class EvidenceItemRef(AthenaBaseModel):
     collector_attempt_at: datetime = Field(
         ..., alias="collectorAttemptAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -2381,9 +2613,12 @@ class EvidenceItemRef(AthenaBaseModel):
             raise AthenaValidationError(
                 "EvidenceItemRef.sourceResponseDigest must be a sha256 digest"
             )
-        if not _is_valid_json_pointer(self.source_response_pointer):
+        if not _is_allowed_evidence_pointer(
+            self.source_response_pointer,
+            envelope_kind="response",
+        ):
             raise AthenaValidationError(
-                "EvidenceItemRef.sourceResponsePointer is not a valid JSON Pointer"
+                "EvidenceItemRef.sourceResponsePointer is not an approved response envelope path"
             )
         return self
 
@@ -2392,7 +2627,7 @@ class EvidenceGapRef(AthenaBaseModel):
     ref_type: Literal["evidenceGap"] = Field(
         ..., alias="refType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    snapshot_id: str = Field(
+    snapshot_id: SafeEvidenceText = Field(
         ...,
         alias="snapshotId",
         min_length=1,
@@ -2410,7 +2645,7 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    gap_id: str = Field(
+    gap_id: SafeEvidenceText = Field(
         ..., alias="gapId", min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     gap_record_digest: str = Field(
@@ -2425,7 +2660,7 @@ class EvidenceGapRef(AthenaBaseModel):
     expected_record_type: ExpectedEvidenceRecordType = Field(
         ..., alias="expectedRecordType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_attempt_id: str = Field(
+    collector_attempt_id: SafeEvidenceText = Field(
         ...,
         alias="collectorAttemptId",
         min_length=1,
@@ -2437,13 +2672,13 @@ class EvidenceGapRef(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_tool_name: str = Field(
+    collector_tool_name: SafeEvidenceText = Field(
         ...,
         alias="collectorToolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_tool_version: str = Field(
+    collector_tool_version: SafeEvidenceText = Field(
         ...,
         alias="collectorToolVersion",
         min_length=1,
@@ -2452,7 +2687,7 @@ class EvidenceGapRef(AthenaBaseModel):
     collector_attempt_at: datetime = Field(
         ..., alias="collectorAttemptAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -2502,11 +2737,12 @@ class EvidenceGapRef(AthenaBaseModel):
             raise AthenaValidationError(
                 "EvidenceGapRef.failurePayloadDigest must be a sha256 digest when present"
             )
-        if self.failure_payload_pointer is not None and not _is_valid_json_pointer(
-            self.failure_payload_pointer
+        if self.failure_payload_pointer is not None and not _is_allowed_evidence_pointer(
+            self.failure_payload_pointer,
+            envelope_kind="failure",
         ):
             raise AthenaValidationError(
-                "EvidenceGapRef.failurePayloadPointer is not a valid JSON Pointer"
+                "EvidenceGapRef.failurePayloadPointer is not an approved envelope path"
             )
         if (self.failure_payload_digest is None) != (self.failure_payload_pointer is None):
             raise AthenaValidationError(
@@ -2565,7 +2801,7 @@ class JwtHeader(AthenaBaseModel):
     typ: Literal["JWT"] = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
 
 
-class VerifiedEntraClaims(AthenaBaseModel):
+class VerifiedTokenClaims(AthenaBaseModel):
     issuer: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
     audience: str = Field(
         ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
@@ -2598,12 +2834,15 @@ class VerifiedEntraClaims(AthenaBaseModel):
     issued_at: datetime = Field(
         ..., alias="issuedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
+    not_before: datetime = Field(
+        ..., alias="notBefore", json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
     expires_at: datetime = Field(
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
     @model_validator(mode="after")
-    def validate_claims(self) -> VerifiedEntraClaims:
+    def validate_claims(self) -> VerifiedTokenClaims:
         if (
             self.tenant_id not in self.issuer
             and self.tenant_id not in self.audience
@@ -2617,13 +2856,18 @@ class VerifiedEntraClaims(AthenaBaseModel):
             and self.tenant_id not in self.issuer
         ):
             raise AthenaValidationError("issuer must contain the tenantId for the MCP host token")
-        if self.expires_at <= self.issued_at:
-            raise AthenaValidationError("Entra token expiry must be later than issuedAt")
+        if not self.issued_at <= self.not_before < self.expires_at:
+            raise AthenaValidationError(
+                "verified token times must satisfy issuedAt <= notBefore < expiresAt"
+            )
         if self.subject not in {self.managed_identity_object_id, self.managed_identity_client_id}:
             raise AthenaValidationError(
                 "subject must match the managed identity object or client id"
             )
         return self
+
+
+VerifiedEntraClaims = VerifiedTokenClaims
 
 
 class TokenVerification(AthenaBaseModel):
@@ -2649,15 +2893,28 @@ class TokenVerification(AthenaBaseModel):
         pattern=r"^[A-Za-z0-9_-]{8,128}$",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+    verified_claims: VerifiedTokenClaims = Field(
+        ..., alias="verifiedClaims", json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    verified_claims_digest: str = Field(
+        ...,
+        alias="verifiedClaimsDigest",
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
     token_verification_digest: str = Field(
         ...,
         alias="tokenVerificationDigest",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-
     @model_validator(mode="after")
     def validate_digest(self) -> TokenVerification:
+        expected_claims_digest = compute_verified_claims_digest(self.verified_claims)
+        if self.verified_claims_digest != expected_claims_digest:
+            raise AthenaValidationError(
+                "TokenVerification.verifiedClaimsDigest mismatched the complete verified claims"
+            )
         if not _is_sha256_digest(self.token_verification_digest):
             raise AthenaValidationError(
                 "TokenVerification.tokenVerificationDigest must be a sha256 digest"
@@ -2878,6 +3135,12 @@ class IngestionDerivation(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+    verified_claims_digest: str = Field(
+        ...,
+        alias="verifiedClaimsDigest",
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
     mcp_host_id: str = Field(
         ...,
         alias="mcpHostId",
@@ -2946,6 +3209,10 @@ class IngestionDerivation(AthenaBaseModel):
         if not _is_sha256_digest(self.token_verification_digest):
             raise AthenaValidationError(
                 "IngestionDerivation.tokenVerificationDigest must be a sha256 digest"
+            )
+        if not _is_sha256_digest(self.verified_claims_digest):
+            raise AthenaValidationError(
+                "IngestionDerivation.verifiedClaimsDigest must be a sha256 digest"
             )
         if not _is_sha256_digest(self.tool_allowlist_digest):
             raise AthenaValidationError(
@@ -3067,7 +3334,7 @@ class CollectorIdentityEvidence(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    verified_claims: VerifiedEntraClaims = Field(
+    verified_claims: VerifiedTokenClaims = Field(
         ..., alias="verifiedClaims", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     token_verification: TokenVerification = Field(
@@ -3109,12 +3376,25 @@ class CollectorIdentityEvidence(AthenaBaseModel):
             raise AthenaValidationError(
                 "tokenVerificationDigest must equal ingestionDerivation.tokenVerificationDigest"
             )
+        expected_claims_digest = compute_verified_claims_digest(self.verified_claims)
+        if self.token_verification.verified_claims != self.verified_claims:
+            raise AthenaValidationError(
+                "tokenVerification.verifiedClaims must equal identityEvidence.verifiedClaims"
+            )
+        if (
+            self.token_verification.verified_claims_digest != expected_claims_digest
+            or self.ingestion_derivation.verified_claims_digest != expected_claims_digest
+        ):
+            raise AthenaValidationError(
+                "complete verified claims digest must match token verification and "
+                "signed ingestion derivation"
+            )
         if self.verified_claims.audience != self.ingestion_derivation.ingestion_audience:
             raise AthenaValidationError(
                 "verifiedClaims.audience must equal ingestionDerivation.ingestionAudience"
             )
         if not (
-            self.verified_claims.issued_at
+            self.verified_claims.not_before
             <= self.token_verification.verified_at
             < self.verified_claims.expires_at
         ):
@@ -3208,7 +3488,7 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
     attempt_type: Literal["successResponse"] = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_id: str = Field(
+    attempt_id: SafeEvidenceText = Field(
         ...,
         alias="attemptId",
         min_length=1,
@@ -3217,13 +3497,13 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
     attempt_started_at: datetime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3244,7 +3524,7 @@ class SuccessResponseCollectorAttempt(_CollectorAttemptDigestBound):
     response_received_at: datetime = Field(
         ..., alias="responseReceivedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3284,7 +3564,7 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
     attempt_type: Literal["failedResponse"] = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_id: str = Field(
+    attempt_id: SafeEvidenceText = Field(
         ...,
         alias="attemptId",
         min_length=1,
@@ -3293,13 +3573,13 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
     attempt_started_at: datetime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3311,13 +3591,13 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_code: str = Field(
+    failure_code: SafeEvidenceText = Field(
         ...,
         alias="failureCode",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    failure_status: str = Field(
+    failure_status: SafeEvidenceText = Field(
         ...,
         alias="failureStatus",
         min_length=1,
@@ -3332,7 +3612,7 @@ class FailedResponseCollectorAttempt(AthenaBaseModel):
     response_received_at: datetime = Field(
         ..., alias="responseReceivedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3372,7 +3652,7 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
     attempt_type: Literal["timeoutNoResponse"] = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_id: str = Field(
+    attempt_id: SafeEvidenceText = Field(
         ...,
         alias="attemptId",
         min_length=1,
@@ -3381,13 +3661,13 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
     attempt_started_at: datetime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3405,7 +3685,7 @@ class TimeoutNoResponseCollectorAttempt(AthenaBaseModel):
     timed_out_at: datetime = Field(
         ..., alias="timedOutAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3443,7 +3723,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
     attempt_type: Literal["authorizationFailure"] = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_id: str = Field(
+    attempt_id: SafeEvidenceText = Field(
         ...,
         alias="attemptId",
         min_length=1,
@@ -3452,13 +3732,13 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
     attempt_started_at: datetime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3483,7 +3763,7 @@ class AuthorizationFailureCollectorAttempt(AthenaBaseModel):
     observed_at: datetime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3519,7 +3799,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
     attempt_type: Literal["toolUnavailable"] = Field(
         ..., alias="attemptType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    attempt_id: str = Field(
+    attempt_id: SafeEvidenceText = Field(
         ...,
         alias="attemptId",
         min_length=1,
@@ -3528,13 +3808,13 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
     attempt_started_at: datetime = Field(
         ..., alias="attemptStartedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3560,7 +3840,7 @@ class ToolUnavailableCollectorAttempt(AthenaBaseModel):
     observed_at: datetime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3603,25 +3883,25 @@ type CollectorAttempt = Annotated[
 
 
 class EvidenceRecordProvenance(AthenaBaseModel):
-    collector_attempt_id: str = Field(
+    collector_attempt_id: SafeEvidenceText = Field(
         ...,
         alias="collectorAttemptId",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_name: str = Field(
+    tool_name: SafeEvidenceText = Field(
         ...,
         alias="toolName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tool_version: str = Field(
+    tool_version: SafeEvidenceText = Field(
         ...,
         alias="toolVersion",
         min_length=1,
@@ -3658,14 +3938,20 @@ class EvidenceRecordProvenance(AthenaBaseModel):
             self.failure_payload_digest
         ):
             raise AthenaValidationError("failurePayloadDigest must be a sha256 digest")
-        if self.source_response_pointer is not None and not _is_valid_json_pointer(
-            self.source_response_pointer
+        if self.source_response_pointer is not None and not _is_allowed_evidence_pointer(
+            self.source_response_pointer,
+            envelope_kind="response",
         ):
-            raise AthenaValidationError("sourceResponsePointer must be a valid JSON Pointer")
-        if self.failure_payload_pointer is not None and not _is_valid_json_pointer(
-            self.failure_payload_pointer
+            raise AthenaValidationError(
+                "sourceResponsePointer must be an approved response envelope path"
+            )
+        if self.failure_payload_pointer is not None and not _is_allowed_evidence_pointer(
+            self.failure_payload_pointer,
+            envelope_kind="failure",
         ):
-            raise AthenaValidationError("failurePayloadPointer must be a valid JSON Pointer")
+            raise AthenaValidationError(
+                "failurePayloadPointer must be an approved failure envelope path"
+            )
         if (self.source_response_digest is None) != (self.source_response_pointer is None):
             raise AthenaValidationError(
                 "source response digest and pointer must appear together"
@@ -3743,6 +4029,69 @@ class SnapshotCollector(AthenaBaseModel):
         return self
 
 
+class ApprovedResourceTags(AthenaBaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        validate_assignment=True,
+        populate_by_name=True,
+        json_schema_extra={
+            "additionalProperties": False,
+            "minProperties": 1,
+            "anyOf": [
+                {
+                    "required": [field_name],
+                    "properties": {field_name: {"type": "string"}},
+                }
+                for field_name in (
+                    "environment",
+                    "workloadRole",
+                    "application",
+                    "component",
+                    "managedBy",
+                )
+            ],
+        },
+    )
+
+    environment: EvidenceEnvironment | None = Field(
+        default=None, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    workload_role: EvidenceWorkloadRole | None = Field(
+        default=None,
+        alias="workloadRole",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    application: ApplicationTagId | None = Field(
+        default=None, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    component: ComponentTagId | None = Field(
+        default=None, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    managed_by: EvidenceManagedBy | None = Field(
+        default=None,
+        alias="managedBy",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+    @model_validator(mode="after")
+    def require_approved_tag(self) -> ApprovedResourceTags:
+        if not any(
+            value is not None
+            for value in (
+                self.environment,
+                self.workload_role,
+                self.application,
+                self.component,
+                self.managed_by,
+            )
+        ):
+            raise AthenaValidationError(
+                "resource tags must contain at least one approved public-safe tag"
+            )
+        return self
+
+
 class ResourceEvidenceRecord(AthenaBaseModel):
     record_type: Literal["resource"] = Field(
         ..., alias="recordType", json_schema_extra={"x-athena-semanticClass": "semantic"}
@@ -3753,24 +4102,24 @@ class ResourceEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    resource_type: str = Field(
+    resource_type: SafeEvidenceText = Field(
         ...,
         alias="resourceType",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    location: str = Field(
+    location: SafeEvidenceText = Field(
         ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    availability_zone: str | None = Field(
+    availability_zone: SafeEvidenceText | None = Field(
         default=None,
         alias="availabilityZone",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    tags: dict[str, str] = Field(
-        default_factory=dict, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    tags: ApprovedResourceTags = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    state: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
+    state: ResourceState = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
@@ -3786,7 +4135,7 @@ class ResourceEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3827,7 +4176,7 @@ class ObservedRelationshipEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3836,6 +4185,19 @@ class ObservedRelationshipEvidenceRecord(AthenaBaseModel):
 
     @model_validator(mode="after")
     def validate_item_digest(self) -> ObservedRelationshipEvidenceRecord:
+        relationship = self.relationship
+        if relationship.relationship_class != "observed":
+            raise AthenaValidationError(
+                "observedRelationship evidence requires an observed relationship"
+            )
+        relationship = cast(ObservedRelationship, relationship)
+        _validate_safe_evidence_text(relationship.relationship_id)
+        _validate_safe_evidence_text(relationship.evidence_item_ref)
+        for endpoint in (relationship.source, relationship.target):
+            if isinstance(endpoint, RoleRef):
+                _validate_safe_evidence_text(endpoint.role_id)
+            elif isinstance(endpoint, ExternalRef):
+                _validate_safe_evidence_text(endpoint.external_id)
         _validate_evidence_record_digest(self)
         return self
 
@@ -3850,14 +4212,14 @@ class MetricAggregateEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    metric_name: str = Field(
+    metric_name: EvidenceMetricName = Field(
         ...,
         alias="metricName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    aggregation: str = Field(
-        ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    aggregation: MetricAggregation = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     window_start: datetime = Field(
         ..., alias="windowStart", json_schema_extra={"x-athena-semanticClass": "semantic"}
@@ -3866,7 +4228,7 @@ class MetricAggregateEvidenceRecord(AthenaBaseModel):
         ..., alias="windowEnd", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     value: float = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    unit: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
+    unit: MetricUnit = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
@@ -3882,7 +4244,7 @@ class MetricAggregateEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3910,21 +4272,20 @@ class HealthEventEvidenceRecord(AthenaBaseModel):
     evidence_scope: EvidenceScope = Field(
         ..., alias="evidenceScope", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    health_kind: str = Field(
+    health_kind: HealthKind = Field(
         ...,
         alias="healthKind",
-        min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    status: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
+    status: HealthStatus = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     started_at: datetime = Field(
         ..., alias="startedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     ended_at: datetime = Field(
         ..., alias="endedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    summary: str = Field(
-        ..., min_length=1, max_length=1000, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    summary_code: HealthSummaryCode = Field(
+        ..., alias="summaryCode", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     provenance: EvidenceRecordProvenance = Field(
         ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
@@ -3941,7 +4302,7 @@ class HealthEventEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -3963,13 +4324,13 @@ class ActivitySummaryEvidenceRecord(AthenaBaseModel):
     evidence_scope: EvidenceScope = Field(
         ..., alias="evidenceScope", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    operation_name: str = Field(
+    operation_name: EvidenceActivityOperation = Field(
         ...,
         alias="operationName",
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    status: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
+    status: ActivityStatus = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     count: int = Field(..., ge=0, json_schema_extra={"x-athena-semanticClass": "semantic"})
     window_start: datetime = Field(
         ..., alias="windowStart", json_schema_extra={"x-athena-semanticClass": "semantic"}
@@ -3992,7 +4353,7 @@ class ActivitySummaryEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -4017,11 +4378,11 @@ class AdvisorRecommendationEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    category: str = Field(
-        ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    category: AdvisorCategory = Field(
+        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    impact: str = Field(..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"})
-    recommendation_code: str = Field(
+    impact: AdvisorImpact = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    recommendation_code: AdvisorRecommendationCode = Field(
         ...,
         alias="recommendationCode",
         min_length=1,
@@ -4042,7 +4403,7 @@ class AdvisorRecommendationEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -4065,7 +4426,7 @@ class EvidenceGapRecord(AthenaBaseModel):
     record_type: Literal["evidenceGap"] = Field(
         ..., alias="recordType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    gap_id: str = Field(
+    gap_id: SafeEvidenceText = Field(
         ..., alias="gapId", min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     evidence_scope: EvidenceScope = Field(
@@ -4089,7 +4450,7 @@ class EvidenceGapRecord(AthenaBaseModel):
     expected_record_type: ExpectedEvidenceRecordType = Field(
         ..., alias="expectedRecordType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_attempt_id: str = Field(
+    collector_attempt_id: SafeEvidenceText = Field(
         ...,
         alias="collectorAttemptId",
         min_length=1,
@@ -4104,7 +4465,7 @@ class EvidenceGapRecord(AthenaBaseModel):
     observed_at: datetime = Field(
         ..., alias="observedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    collector_identity_evidence_ref: str = Field(
+    collector_identity_evidence_ref: SafeEvidenceText = Field(
         ...,
         alias="collectorIdentityEvidenceRef",
         min_length=1,
@@ -4137,11 +4498,12 @@ class EvidenceGapRecord(AthenaBaseModel):
             raise AthenaValidationError(
                 "evidence gap failure payload digest and pointer must appear together"
             )
-        if self.failure_payload_pointer is not None and not _is_valid_json_pointer(
-            self.failure_payload_pointer
+        if self.failure_payload_pointer is not None and not _is_allowed_evidence_pointer(
+            self.failure_payload_pointer,
+            envelope_kind="failure",
         ):
             raise AthenaValidationError(
-                "evidence gap failurePayloadPointer must be a valid JSON Pointer"
+                "evidence gap failurePayloadPointer is not an approved envelope path"
             )
         _validate_evidence_record_digest(self)
         return self
@@ -4729,7 +5091,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                     "and compatibility metadata"
                 )
             if not (
-                attempt_identity.verified_claims.issued_at
+                attempt_identity.verified_claims.not_before
                 <= self.collected_at
                 < attempt_identity.verified_claims.expires_at
             ):
@@ -4998,6 +5360,7 @@ __all__ = [
     "verify_trusted_ingestion_signature",
     "compute_evidence_record_digest",
     "compute_token_verification_digest",
+    "compute_verified_claims_digest",
     "compute_response_envelope_digest",
     "compute_failure_envelope_digest",
     "compute_evidence_snapshot_artifact_digest",
@@ -5068,6 +5431,7 @@ __all__ = [
     "EvidenceReference",
     "ContextRef",
     "JwtHeader",
+    "VerifiedTokenClaims",
     "VerifiedEntraClaims",
     "TokenVerification",
     "AttemptBinding",
@@ -5077,6 +5441,8 @@ __all__ = [
     "CollectorIdentityEvidence",
     "EvidenceRecordProvenance",
     "SnapshotCollector",
+    "ApprovedResourceTags",
+    "SafeEvidenceText",
     "SuccessResponseCollectorAttempt",
     "FailedResponseCollectorAttempt",
     "TimeoutNoResponseCollectorAttempt",

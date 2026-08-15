@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 from athena_context import __version__
 from athena_context.contracts import (
     ActivitySummaryEvidenceRecord,
+    ApprovedResourceTags,
     AthenaValidationError,
     CapabilityRequirement,
     CollectorAttempt,
@@ -60,6 +61,7 @@ from athena_context.contracts import (
     compute_response_envelope_digest,
     compute_semantic_digest,
     compute_token_verification_digest,
+    compute_verified_claims_digest,
 )
 from athena_context.contracts.common import NormalizationCollisionError
 
@@ -384,7 +386,13 @@ def _valid_response_envelope() -> dict[str, object]:
                 "resourceType": "Microsoft.Compute/virtualMachines",
                 "location": "australiaeast",
                 "availabilityZone": "1",
-                "tags": {"env": "prod"},
+                "tags": {
+                    "environment": "production",
+                    "workloadRole": "database",
+                    "application": "app-a1b2c3d4e5f6",
+                    "component": "component-012345abcdef",
+                    "managedBy": "terraform",
+                },
                 "state": "running",
             }
         ]
@@ -513,7 +521,13 @@ def _build_valid_snapshot(
         "resourceType": "Microsoft.Compute/virtualMachines",
         "location": "australiaeast",
         "availabilityZone": "1",
-        "tags": {"env": "prod"},
+        "tags": {
+            "environment": "production",
+            "workloadRole": "database",
+            "application": "app-a1b2c3d4e5f6",
+            "component": "component-012345abcdef",
+            "managedBy": "terraform",
+        },
         "state": "running",
         "provenance": {
             "collectorAttemptId": attempt.attempt_id,
@@ -897,18 +911,35 @@ def _build_valid_identity_evidence(
     claims_audience: str = "api://athena-ingestion",
     ingestion_audience: str = "api://athena-ingestion",
     issued_at: datetime | None = None,
+    not_before: datetime | None = None,
     expires_at: datetime | None = None,
     verified_at: datetime | None = None,
 ) -> CollectorIdentityEvidence:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     issued_at = issued_at or now - timedelta(minutes=5)
+    not_before = not_before or issued_at
     expires_at = expires_at or now + timedelta(minutes=30)
     verified_at = verified_at or now
     token_hash = _sha256("token-1")
+    verified_claims_payload = {
+        "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+        "audience": claims_audience,
+        "tenantId": tenant_id,
+        "managedIdentityObjectId": "object-123",
+        "managedIdentityClientId": "client-123",
+        "subject": "object-123",
+        "jti": "jti-123",
+        "issuedAt": issued_at,
+        "notBefore": not_before,
+        "expiresAt": expires_at,
+    }
+    verified_claims_digest = compute_verified_claims_digest(verified_claims_payload)
     token_verification_payload = {
         "status": "valid",
         "verifiedAt": verified_at,
         "keyId": "abc12345",
+        "verifiedClaims": verified_claims_payload,
+        "verifiedClaimsDigest": verified_claims_digest,
     }
     token_verification_digest = compute_token_verification_digest(
         token_verification_payload
@@ -957,6 +988,7 @@ def _build_valid_identity_evidence(
         "tokenHash": token_hash,
         "tokenVerificationStatus": "valid",
         "tokenVerificationDigest": token_verification_digest,
+        "verifiedClaimsDigest": verified_claims_digest,
         "mcpHostId": "mcp-host-001",
         "mcpHostTenantId": tenant_id,
         "mcpHostManagedIdentityObjectId": "object-123",
@@ -989,17 +1021,7 @@ def _build_valid_identity_evidence(
         "tokenHash": token_hash,
         "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
         "trustAnchorRef": trust_anchor,
-        "verifiedClaims": {
-            "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
-            "audience": claims_audience,
-            "tenantId": tenant_id,
-            "managedIdentityObjectId": "object-123",
-            "managedIdentityClientId": "client-123",
-            "subject": "object-123",
-            "jti": "jti-123",
-            "issuedAt": issued_at,
-            "expiresAt": expires_at,
-        },
+        "verifiedClaims": verified_claims_payload,
         "tokenVerification": {
             **token_verification_payload,
             "tokenVerificationDigest": token_verification_digest,
@@ -1262,10 +1284,8 @@ def test_rfc6901_invalid_escape_remains_rejected() -> None:
     snapshot = _build_valid_snapshot()
     payload = snapshot.evidence_refs[0].model_dump(mode="python", by_alias=True)
     payload["sourceResponsePointer"] = "/properties/~2invalid"
-    with pytest.raises(ValidationError, match="valid JSON Pointer"):
+    with pytest.raises(ValidationError, match="approved response envelope path"):
         EvidenceItemRef.model_validate(payload)
-    payload["sourceResponsePointer"] = "/properties/a*b?"
-    assert EvidenceItemRef.model_validate(payload).source_response_pointer == "/properties/a*b?"
 
 
 def test_resource_scope_rejects_subscription_and_component_prefix_confusion() -> None:
@@ -1347,7 +1367,7 @@ def test_attempt_and_record_chronology_rejects_reverse_time() -> None:
         "toolName": success.tool_name,
         "toolVersion": success.tool_version,
         "sourceResponseDigest": success.response_digest,
-        "sourceResponsePointer": "/properties/vmSize",
+        "sourceResponsePointer": "/items/0",
     }
     base = {
         "collectorAttemptDigest": success.attempt_digest,
@@ -1361,7 +1381,7 @@ def test_attempt_and_record_chronology_rejects_reverse_time() -> None:
             "/subscriptions/11111111-1111-1111-1111-111111111111/"
             "resourceGroups/rg-prod/providers/Microsoft.Compute/virtualMachines/vm-01"
         ),
-        "metricName": "Percentage CPU",
+        "metricName": "percentageCpu",
         "aggregation": "average",
         "windowStart": datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
         "windowEnd": datetime(2025, 1, 2, 12, 4, tzinfo=UTC),
@@ -1384,7 +1404,7 @@ def test_attempt_and_record_chronology_rejects_reverse_time() -> None:
         "status": "available",
         "startedAt": datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
         "endedAt": datetime(2025, 1, 2, 12, 4, tzinfo=UTC),
-        "summary": "Synthetic event",
+        "summaryCode": "configurationIssue",
     }
     health_payload["itemDigest"] = compute_evidence_record_digest(health_payload)
     with pytest.raises(ValidationError, match="startedAt"):
@@ -1394,8 +1414,8 @@ def test_attempt_and_record_chronology_rejects_reverse_time() -> None:
         **base,
         "recordType": "activitySummary",
         "evidenceScope": health_payload["evidenceScope"],
-        "operationName": "Synthetic.Operation",
-        "status": "Succeeded",
+        "operationName": "resourceWrite",
+        "status": "succeeded",
         "count": 1,
         "windowStart": datetime(2025, 1, 2, 12, 5, tzinfo=UTC),
         "windowEnd": datetime(2025, 1, 2, 12, 4, tzinfo=UTC),
@@ -1538,7 +1558,6 @@ def test_snapshot_semantic_digest_is_recomputed() -> None:
 
 def test_pointer_cannot_resolve_digest_excluded_transport_field() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
     source_projection = _valid_response_envelope()["items"][0]
     envelope = {"requestId": source_projection}
     response_digest = compute_response_envelope_digest(envelope)
@@ -1548,16 +1567,11 @@ def test_pointer_cannot_resolve_digest_excluded_transport_field() -> None:
         private_key=private_key,
         collector_attempt=attempt,
     )
-    snapshot = _build_valid_snapshot(
-        attempt=attempt,
-        identity_evidence=identity,
-        source_response_pointer="/requestId",
-    )
-    with pytest.raises(AthenaValidationError, match="does not resolve"):
-        snapshot.validate_for_evaluation(
-            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
-            key_resolver=lambda key_id: public_key,
-            envelope_resolver=lambda attempt_id, kind, digest: envelope,
+    with pytest.raises(ValidationError, match="approved response envelope path"):
+        _build_valid_snapshot(
+            attempt=attempt,
+            identity_evidence=identity,
+            source_response_pointer="/requestId",
         )
 
 
@@ -1587,10 +1601,27 @@ def test_signed_derivation_must_match_snapshot_collector_metadata() -> None:
 
 def test_token_verification_digest_audience_and_collection_lifetime_are_bound() -> None:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
+    claims = {
+        "issuer": (
+            "https://login.microsoftonline.com/"
+            "11111111-1111-1111-1111-111111111111/v2.0"
+        ),
+        "audience": "api://athena-ingestion",
+        "tenantId": "11111111-1111-1111-1111-111111111111",
+        "managedIdentityObjectId": "object-123",
+        "managedIdentityClientId": "client-123",
+        "subject": "object-123",
+        "jti": "jti-123",
+        "issuedAt": now - timedelta(minutes=5),
+        "notBefore": now - timedelta(minutes=5),
+        "expiresAt": now + timedelta(minutes=30),
+    }
     token_payload = {
         "status": "valid",
         "verifiedAt": now,
         "keyId": "abc12345",
+        "verifiedClaims": claims,
+        "verifiedClaimsDigest": compute_verified_claims_digest(claims),
         "tokenVerificationDigest": _sha256("fabricated-token-verification"),
     }
     with pytest.raises(ValidationError, match="canonical preimage"):
@@ -1624,3 +1655,265 @@ def test_token_verification_digest_audience_and_collection_lifetime_are_bound() 
             key_resolver=lambda key_id: private_key.public_key(),
             envelope_resolver=lambda attempt_id, kind, digest: envelope,
         )
+
+
+@pytest.mark.parametrize(
+    ("claim_name", "mutated_value"),
+    [
+        ("expiresAt", datetime(2025, 1, 2, 12, 40, tzinfo=UTC)),
+        (
+            "issuer",
+            "https://sts.windows.net/11111111-1111-1111-1111-111111111111/",
+        ),
+        ("jti", "jti-456"),
+        ("issuedAt", datetime(2025, 1, 2, 11, 50, tzinfo=UTC)),
+        ("subject", "client-123"),
+    ],
+)
+def test_signed_verified_claim_mutation_is_rejected(
+    claim_name: str,
+    mutated_value: object,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    envelope = _valid_response_envelope()
+    attempt = _build_valid_success_attempt(
+        response_digest=compute_response_envelope_digest(envelope)
+    )
+    identity = _build_valid_identity_evidence(
+        private_key=private_key,
+        collector_attempt=attempt,
+    )
+    identity_payload = identity.model_dump(mode="python", by_alias=True)
+    identity_payload["verifiedClaims"][claim_name] = mutated_value
+    token_verification = identity_payload["tokenVerification"]
+    token_verification["verifiedClaims"][claim_name] = mutated_value
+    claims_digest = compute_verified_claims_digest(
+        token_verification["verifiedClaims"]
+    )
+    token_verification["verifiedClaimsDigest"] = claims_digest
+    token_verification["tokenVerificationDigest"] = compute_token_verification_digest(
+        token_verification
+    )
+    derivation = identity.ingestion_derivation.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    identity_payload["ingestionDerivation"] = derivation
+    derivation["verifiedClaimsDigest"] = claims_digest
+    derivation["tokenVerificationDigest"] = token_verification[
+        "tokenVerificationDigest"
+    ]
+    derivation["derivationDigest"] = compute_artifact_digest(
+        {
+            key: value
+            for key, value in derivation.items()
+            if key != "derivationDigest"
+        }
+    )
+    identity_payload["ingestionSignature"]["signedPreimageDigest"] = derivation[
+        "derivationDigest"
+    ]
+    identity_payload["identityEvidenceDigest"] = compute_artifact_digest(
+        {
+            key: value
+            for key, value in identity_payload.items()
+            if key != "identityEvidenceDigest"
+        }
+    )
+    mutated_identity = CollectorIdentityEvidence.model_validate(identity_payload)
+    snapshot = _build_valid_snapshot(
+        attempt=attempt,
+        identity_evidence=mutated_identity,
+    )
+    with pytest.raises(
+        AthenaValidationError,
+        match="identity evidence verification failed",
+    ):
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            key_resolver=lambda key_id: public_key,
+            envelope_resolver=lambda attempt_id, kind, digest: envelope,
+        )
+
+
+def test_approved_resource_tags_are_closed_and_public_safe() -> None:
+    tags = ApprovedResourceTags(
+        environment="production",
+        workloadRole="web-service",
+        application="app-a1b2c3d4e5f6",
+        component="component-012345abcdef",
+        managedBy="terraform",
+    )
+    assert tags.environment == "production"
+    assert tags.workload_role == "web-service"
+
+    invalid_tags = [
+        {"password": "secret"},
+        {"patientName": "Jane Doe"},
+        {"application": "Jane Doe"},
+        {"application": "jane.doe@example.com"},
+        {"application": "bearer-token"},
+        {"application": "password123"},
+        {"application": "john-doe"},
+        {"application": "customer-proprietary-payload"},
+        {"application": "Server=x;Password=y"},
+        {"component": '{"customerProprietary":"payload"}'},
+    ]
+    for payload in invalid_tags:
+        with pytest.raises(ValidationError):
+            ApprovedResourceTags.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "password",
+        "patientName",
+        "Jane Doe",
+        "jane.doe@example.com",
+        "bearer-token",
+        "password123",
+        "john-doe",
+        "customerProprietaryPayload",
+        (
+            "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJzdWIiOiJzeW50aGV0aWMtaWRlbnRpdHkifQ."
+            "abcdefghijklmnopqrstuvwxyz0123456789"
+        ),
+        "Server=x;Password=y",
+        '{"customerProprietary":"payload"}',
+        (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-prod"
+        ),
+        (
+            "subscriptions/11111111-1111-1111-1111-111111111111/"
+            "providers/Microsoft.Compute"
+        ),
+    ],
+)
+def test_evidence_text_rejects_sensitive_or_free_form_payloads(
+    unsafe_text: str,
+) -> None:
+    attempt = _build_valid_success_attempt()
+    scope = {
+        "scopeType": "subscription",
+        "tenantId": "11111111-1111-1111-1111-111111111111",
+        "subscriptionId": "11111111-1111-1111-1111-111111111111",
+    }
+    payload = {
+        "recordType": "activitySummary",
+        "evidenceScope": scope,
+        "operationName": unsafe_text,
+        "status": "succeeded",
+        "count": 1,
+        "windowStart": datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
+        "windowEnd": datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
+        "provenance": {
+            "collectorAttemptId": attempt.attempt_id,
+            "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
+            "toolName": attempt.tool_name,
+            "toolVersion": attempt.tool_version,
+            "sourceResponseDigest": attempt.response_digest,
+            "sourceResponsePointer": "/items/0",
+        },
+        "collectorAttemptDigest": attempt.attempt_digest,
+        "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
+    }
+    payload["itemDigest"] = compute_evidence_record_digest(payload)
+    with pytest.raises(ValidationError):
+        ActivitySummaryEvidenceRecord.model_validate(payload)
+
+
+def test_health_evidence_rejects_legacy_free_form_summary() -> None:
+    attempt = _build_valid_success_attempt()
+    payload = {
+        "recordType": "healthEvent",
+        "evidenceScope": {
+            "scopeType": "subscription",
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+            "subscriptionId": "11111111-1111-1111-1111-111111111111",
+        },
+        "healthKind": "resourceHealth",
+        "status": "available",
+        "startedAt": datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
+        "endedAt": datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
+        "summaryCode": "configurationIssue",
+        "summary": "patientName: Jane Doe; password=secret",
+        "provenance": {
+            "collectorAttemptId": attempt.attempt_id,
+            "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
+            "toolName": attempt.tool_name,
+            "toolVersion": attempt.tool_version,
+            "sourceResponseDigest": attempt.response_digest,
+            "sourceResponsePointer": "/items/0",
+        },
+        "collectorAttemptDigest": attempt.attempt_digest,
+        "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
+    }
+    payload["itemDigest"] = compute_evidence_record_digest(payload)
+    with pytest.raises(ValidationError):
+        HealthEventEvidenceRecord.model_validate(payload)
+
+
+def test_safe_evidence_constraints_are_present_in_generated_schema() -> None:
+    tag_schema = ApprovedResourceTags.model_json_schema()
+    assert tag_schema["additionalProperties"] is False
+    assert tag_schema["minProperties"] == 1
+    assert {tuple(option["required"]) for option in tag_schema["anyOf"]} == {
+        ("environment",),
+        ("workloadRole",),
+        ("application",),
+        ("component",),
+        ("managedBy",),
+    }
+    assert (
+        tag_schema["$defs"]["ApplicationTagId"]["pattern"]
+        == "^app-[a-f0-9]{12}$"
+    )
+    assert (
+        tag_schema["$defs"]["ComponentTagId"]["pattern"]
+        == "^component-[a-f0-9]{12}$"
+    )
+
+    resource_schema = ResourceEvidenceRecord.model_json_schema()
+    safe_text_schema = resource_schema["$defs"]["SafeEvidenceText"]
+    assert safe_text_schema["pattern"] == "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    assert safe_text_schema["minLength"] == 1
+    assert safe_text_schema["maxLength"] == 128
+
+
+def test_evidence_gap_record_rejects_sensitive_payload_pointer() -> None:
+    failure_envelope: dict[str, object] = {"error": {"code": "SchemaMismatch"}}
+    attempt = _build_valid_failed_attempt(failure_envelope)
+    snapshot = _build_valid_gap_snapshot(
+        attempt=attempt,
+        failure_payload_digest=attempt.failure_digest,
+        failure_payload_pointer="/error/code",
+    )
+    payload = snapshot.evidence_records[0].model_dump(mode="python", by_alias=True)
+    payload["failurePayloadPointer"] = "/items/0/password"
+    payload["itemDigest"] = compute_evidence_record_digest(payload)
+    with pytest.raises(ValidationError, match="approved envelope path"):
+        EvidenceGapRecord.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    [
+        "/items/123-45-6789",
+        "/items/customerProprietaryPayload",
+        "/properties/password",
+        "/items/0/email@example.com",
+    ],
+)
+def test_evidence_item_pointer_rejects_arbitrary_persisted_tokens(
+    pointer: str,
+) -> None:
+    snapshot = _build_valid_snapshot()
+    payload = snapshot.evidence_refs[0].model_dump(mode="python", by_alias=True)
+    payload["sourceResponsePointer"] = pointer
+    with pytest.raises(ValidationError, match="approved response envelope path"):
+        EvidenceItemRef.model_validate(payload)

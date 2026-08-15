@@ -362,9 +362,25 @@ Evidence record constraints:
 
 - Resource ids must be normalized and scope-checked.
 - Zones may be `unknown`, but policy then emits `unknown` for zone-dependent proof.
-- Tags are bounded and treated as untrusted evidence.
+- Resource tags are a closed public-safe projection. The only accepted keys are `environment`,
+  `workloadRole`, `application`, `component`, and `managedBy`; at least one non-null value is
+  required. `environment` is `production`, `development`, `training`, `test`,
+  `disaster-recovery`, or `sandbox`. `workloadRole` is one of `database`, `worker`, `web-service`,
+  `load-balancer`, `integration`, `storage`, `network`, `identity`, `observability`, or
+  `external-dependency`. `managedBy` is `terraform`, `bicep`, `arm`, `azure-policy`, `manual`, or
+  `unknown`. Application and component names are not persisted: they are approved registry ids
+  matching `^app-[a-f0-9]{12}$` and `^component-[a-f0-9]{12}$`.
 - Log and metric records persist only aggregate values, query metadata, and evidence references.
 - Raw log bodies, secrets, PHI, PII, credentials, and proprietary payloads are invalid.
+- Evidence text is code-like rather than narrative. Remaining code fields match
+  `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$` and reject email addresses, patient/person-name syntax,
+  password/secret/credential/token/key/connection-string syntax, Azure resource IDs outside typed
+  `resourceId` fields, Key Vault URLs, JWT-shaped values, proprietary-payload markers, and free-form
+  JSON or delimiter payloads. Metric names, activity operations, recommendation codes, resource
+  state, health fields, activity status, Advisor category/impact, and tag classifications use closed
+  enums rather than this fallback code grammar. This validation is a persistence boundary, not a
+  data-loss-prevention guarantee; collectors must project only approved aggregate/configuration
+  fields before contract validation.
 
 ### Evidence record discriminated union
 
@@ -372,13 +388,25 @@ Evidence records use `recordType` as the discriminator and forbid unknown proper
 
 | `recordType` | Required fields | Bound and rule |
 |---|---|---|
-| `resource` | `resourceId`, `resourceType`, `location`, `availabilityZone`, `tags`, `state`, `provenance` | Tags capped at 50; state is a closed enum. |
+| `resource` | `resourceId`, `resourceType`, `location`, `availabilityZone`, `tags`, `state`, `provenance` | `tags` is the closed five-key public-safe projection above; state is `running`, `stopped`, `deallocated`, or `unknown`. |
 | `observedRelationship` | `relationship`, `provenance` | Relationship is the `observed` relationship variant and cites one MCP response item. |
-| `metricAggregate` | `resourceId`, `metricName`, `aggregation`, `windowStart`, `windowEnd`, `value`, `unit`, `provenance` | Aggregation and unit are closed enums; no raw samples. |
-| `healthEvent` | `evidenceScope`, `healthKind`, `status`, `startedAt`, `endedAt`, `summary`, `provenance` | Summary capped at 1,000 chars; no raw incident body. |
-| `activitySummary` | `evidenceScope`, `operationName`, `status`, `count`, `windowStart`, `windowEnd`, `provenance` | Count only; no caller PII or request body. |
-| `advisorRecommendation` | `resourceId`, `category`, `impact`, `recommendationCode`, `provenance` | Recommendation text is capped and treated as advisory only. |
+| `metricAggregate` | `resourceId`, `metricName`, `aggregation`, `windowStart`, `windowEnd`, `value`, `unit`, `provenance` | `metricName` is a public-safe code; aggregation and unit are closed enums; no raw samples. |
+| `healthEvent` | `evidenceScope`, `healthKind`, `status`, `startedAt`, `endedAt`, `summaryCode`, `provenance` | No narrative is retained. `healthKind`, status, and `summaryCode` are closed enums. |
+| `activitySummary` | `evidenceScope`, `operationName`, `status`, `count`, `windowStart`, `windowEnd`, `provenance` | `operationName` is a public-safe code and status is closed; count only, with no caller PII or request body. |
+| `advisorRecommendation` | `resourceId`, `category`, `impact`, `recommendationCode`, `provenance` | Category and impact are closed enums; `recommendationCode` is a public-safe code and no recommendation narrative is retained. |
 | `evidenceGap` | `gapId`, `evidenceScope`, `gapReason`, `expectedRecordType`, `collectorAttemptId`, `collectorAttemptDigest`, `observedAt`, `collectorIdentityEvidenceRef`, conditional `failurePayloadDigest`, conditional `failurePayloadPointer` | Azure evidence-plane gap only; contains no Athena profile, clause, verdict, or policy judgment. |
+
+Closed evidence codes for WC-001 are:
+
+- metric names: `percentageCpu`, `availableMemoryBytes`, `diskReadBytesPerSecond`,
+  `diskWriteBytesPerSecond`, `networkInBytesPerSecond`, `networkOutBytesPerSecond`, and
+  `availability`;
+- activity operations: `resourceWrite`, `resourceDelete`, `roleAssignmentWrite`,
+  `deploymentWrite`, and `maintenanceEvent`;
+- Advisor recommendation codes: `costOptimization`, `availabilityImprovement`,
+  `performanceOptimization`, `securityHardening`, and `operationalExcellence`; and
+- health summary codes: `availabilityImpact`, `serviceDegradation`, `plannedMaintenance`,
+  `configurationIssue`, and `unknown`.
 
 Closed `gapReason` values are `missing`, `stale`, `unauthorized`, `filtered`, `malformed`,
 `collectorUnavailable`, `scopeMismatch`, `responseOversized`, and `unsupportedTool`.
@@ -425,6 +453,13 @@ Each concrete evidence item record contains:
 - `projectionAlgorithm`: stable id and semantic version for the projection logic; and
 - `collectorIdentityEvidenceRef`: reference to the verified Entra token evidence in `collector`.
 
+Persisted envelope pointers are a closed WC-001 subset of RFC 6901 so pointer tokens cannot become a
+side channel for PII or secrets. A successful response pointer is exactly the root `""`,
+`/items/{index}`, or `/value/{index}`, where `index` is canonical decimal `0` through six digits.
+A failure pointer is one of those paths, the root `""`, `/error`, `/error/code`, or
+`/error/status`. Wildcard, property-name, nested arbitrary-token, negative, leading-zero, and
+unbounded-index pointers are invalid even when syntactically valid RFC 6901.
+
 Each `evidenceGap` record contains `gapId`, `evidenceScope`, `gapReason`,
 `expectedRecordType`, `collectorAttemptId`, `collectorAttemptDigest`, `observedAt`, and
 `collectorIdentityEvidenceRef`. It may contain `failurePayloadDigest` and
@@ -470,18 +505,24 @@ properties.
 | `jwtHeader` | object | 1 | Closed fields: `alg`, `kid`, `typ`; `alg` must be `RS256`, `typ` must be `JWT`, and `kid` must match `^[A-Za-z0-9_-]{8,128}$` for WC-001. |
 | `trustAnchorRef` | string | 1 | Grammar `^entra:[0-9a-fA-F-]{36}:[A-Za-z0-9_.:/-]{3,128}$`; resolves to a configured Entra tenant OIDC/JWKS trust anchor. |
 | `verifiedClaims` | object | 1 | Closed Entra claims listed below. |
-| `tokenVerification` | object | 1 | Verification time, key id, and status for the original Entra JWS. |
+| `tokenVerification` | object | 1 | Complete closed verified claims, their digest, verification time, key id, status, and verification digest for the original Entra JWS. |
 | `ingestionDerivation` | object | 1 | Trusted binding from verified token evidence to exactly one MCP host collector attempt. |
 | `ingestionSignature` | object | 1 | Key Vault signature over the normalized attempt-bound verification/derivation preimage. |
 | `identityEvidenceDigest` | digest string | 1 | Digest over the evidence excluding `/identityEvidenceDigest` and token bytes. |
 
 The closed `verifiedClaims` set is `issuer`, `audience`, `tenantId`,
-`managedIdentityObjectId`, `managedIdentityClientId`, `subject`, `issuedAt`, and `expiresAt`.
+`managedIdentityObjectId`, `managedIdentityClientId`, `subject`, `jti`, `issuedAt`, `notBefore`, and
+`expiresAt`. `issuedAt <= notBefore < expiresAt` is mandatory.
 `managedIdentityObjectId` is derived from the Entra `oid` claim; `managedIdentityClientId` is
 derived from `appid` or the configured managed identity mapping. No tool name, tool version, MCP
 host id, or Athena-specific authorization claim is trusted from the JWT.
 
-Token verification is closed and environment-configured: `trustAnchorRef` resolves to the expected
+Token verification is closed and environment-configured. It contains the complete closed
+`verifiedClaims` object, `verifiedClaimsDigest`, verification time, key id, status, and
+`tokenVerificationDigest`. `verifiedClaimsDigest` is SHA-256 over the complete canonical
+`verifiedClaims` object with no exclusions. The copy under `tokenVerification` must equal the
+identity-evidence `verifiedClaims` object byte-for-byte after canonicalization, and the same digest
+must appear in the Key Vault-signed `ingestionDerivation`. `trustAnchorRef` resolves to the expected
 Entra tenant issuer, audience, and JWKS URI for the private Azure MCP deployment. `jwtHeader.kid`
 must match a key in the resolved JWKS at `tokenVerification.verifiedAt`. Verification statuses are
 `valid`, `expired`, `notYetValid`, `badSignature`, `unknownKey`, `untrustedIssuer`,
@@ -490,7 +531,7 @@ require `tokenVerification.status = valid` at the snapshot `collectedAt` time.
 
 The closed `ingestionDerivation` set is `derivationPreimageType`, `derivationPreimageVersion`,
 `schemaVersion`, `semanticContractVersion`, `policyContractVersion`, `identityEvidenceId`,
-`tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`, `mcpHostId`,
+`tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`, `verifiedClaimsDigest`, `mcpHostId`,
 `mcpHostTenantId`, `mcpHostManagedIdentityObjectId`, `mcpHostManagedIdentityClientId`,
 `ingestionServiceId`, `ingestionAudience`, `toolAllowlistDigest`, `derivedCollectorIdentityRef`,
 `attemptBinding`, `derivedAt`, and `derivationDigest`.
@@ -516,6 +557,7 @@ digest-covered `CollectorAttempt`. A mismatch invalidates the snapshot.
 transport-only fields. `derivationDigest` is SHA-256 over the RFC 8785 JCS canonical UTF-8 bytes of
 `ingestionDerivation` after excluding only `/derivationDigest`; it includes the normalized
 `attemptBinding`, `tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`,
+`verifiedClaimsDigest`,
 MCP-host identity and tenant, ingestion audience, contract versions, and `derivedAt`. No field may be
 defaulted or omitted except the conditional attempt fields above. Derivation digest canonicalization
 uses the same duplicate-key rejection, NFC pre-validation, datetime normalization, ordering, and
@@ -1121,6 +1163,7 @@ Self-digest exclusion rules:
 | Artifact `semanticDigest` | Metadata-derived semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, and fields whose schema metadata is not `x-athena-semanticClass = semantic`. |
 | Evidence record `itemDigest` | One evidence record | `/itemDigest` and transport-only envelope fields for that record. |
 | MCP response `responseDigest` or failure `failureDigest` | One canonical MCP response or bounded failure envelope | `/responseDigest`, `/failureDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
+| Verified claims `verifiedClaimsDigest` | The complete closed canonical `VerifiedTokenClaims` object | None. |
 | Collector `identityEvidenceDigest` | One collector identity evidence record | `/identityEvidenceDigest` and token material. |
 | Ingestion `derivationDigest` | One attempt-bound ingestion derivation preimage | `/derivationDigest` only. |
 | Collector attempt `attemptDigest` | One collector attempt | `/attemptDigest` and transport-only envelope fields for that attempt. |
