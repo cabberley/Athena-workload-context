@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import unicodedata
-from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -144,83 +143,12 @@ def sha256_hex(value: str | bytes) -> str:
     return "sha256:" + hashlib.sha256(value_bytes).hexdigest()
 
 
-def canonicalize_for_digest(
-    value: Any, *, exclude_pointer_paths: Iterable[str] | None = None
-) -> str:
-    data = _normalize_json_value(value)
-    if exclude_pointer_paths is not None:
-        data = strip_excluded_paths(data, exclude_pointer_paths)
-    return canonicalize_json(data)
+def canonicalize_for_digest(value: Any) -> str:
+    return canonicalize_json(_normalize_json_value(value))
 
 
-def json_pointer_to_parts(pointer: str) -> tuple[str, ...]:
-    if pointer == "":
-        return ()
-    pointer = pointer.strip()
-    if pointer.startswith("#/"):
-        pointer = pointer[2:]
-    elif pointer.startswith("/"):
-        pointer = pointer[1:]
-    return tuple(part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/") if part)
-
-
-def remove_json_pointer(value: Any, pointer: str) -> Any:
-    parts = json_pointer_to_parts(pointer)
-    if not parts:
-        return value
-
-    def _walk(current: Any, index: int) -> Any:
-        if index == len(parts):
-            return None
-        part = parts[index]
-        if isinstance(current, dict):
-            if part not in current:
-                return current
-            if index == len(parts) - 1:
-                copied_dict: dict[str, Any] = dict(current)
-                del copied_dict[part]
-                return copied_dict
-            next_value = _walk(current[part], index + 1)
-            if next_value is None:
-                copied_dict = dict(current)
-                del copied_dict[part]
-                return copied_dict
-            copied_dict = dict(current)
-            copied_dict[part] = next_value
-            return copied_dict
-        if isinstance(current, list):
-            try:
-                idx = int(part)
-            except ValueError:
-                return current
-            if idx < 0 or idx >= len(current):
-                return current
-            if index == len(parts) - 1:
-                copied_list: list[Any] = list(current)
-                copied_list.pop(idx)
-                return copied_list
-            next_value = _walk(current[idx], index + 1)
-            if next_value is None:
-                copied_list = list(current)
-                copied_list.pop(idx)
-                return copied_list
-            copied_list = list(current)
-            copied_list[idx] = next_value
-            return copied_list
-        return current
-
-    return _walk(value, 0)
-
-
-def strip_excluded_paths(value: Any, exclude_paths: Iterable[str]) -> Any:
-    cleaned = value
-    for path in exclude_paths:
-        cleaned = remove_json_pointer(cleaned, path)
-    return cleaned
-
-
-def compute_artifact_digest(value: Any, *, exclude_paths: Iterable[str] | None = None) -> str:
-    canonical = canonicalize_for_digest(value, exclude_pointer_paths=exclude_paths)
+def compute_artifact_digest(value: Any) -> str:
+    canonical = canonicalize_for_digest(value)
     return sha256_hex(canonical)
 
 

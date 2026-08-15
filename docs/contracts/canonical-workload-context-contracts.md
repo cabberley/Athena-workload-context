@@ -626,7 +626,7 @@ referenced evidence-gap record's `itemDigest`. Its attempt variant rules are clo
 - `timeoutNoResponse`, `authorizationFailure`, and `toolUnavailable`: forbid all response and failure
   payload pointer fields.
 - `failedResponse`: require `failurePayloadDigest`; require `failurePayloadPointer` when the bounded
-  failure envelope has item-level structure, otherwise set it to the root pointer `/`.
+  failure envelope has item-level structure, otherwise set it to the RFC 6901 root pointer `""`.
 - `successResponse`: allowed only for gaps caused by filtered, malformed, stale, scope-mismatched, or
   oversized response items; requires `failurePayloadDigest` and `failurePayloadPointer` to the
   offending response item, but still forbids `sourceResponseDigest` and `sourceResponsePointer`.
