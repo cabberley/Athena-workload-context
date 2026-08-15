@@ -4,7 +4,7 @@ import base64
 import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -239,9 +239,70 @@ def _is_sha256_digest(value: str | None) -> bool:
 def _is_valid_json_pointer(value: str | None) -> bool:
     if value is None:
         return False
-    if value == "/":
+    if value == "":
         return True
-    return value.startswith("/") and "*" not in value and "?" not in value
+    if not value.startswith("/") or "*" in value or "?" in value:
+        return False
+    for token in value.split("/")[1:]:
+        if not token:
+            continue
+        index = 0
+        while index < len(token):
+            if token[index] == "~":
+                if index + 1 >= len(token) or token[index + 1] not in {"0", "1"}:
+                    return False
+                index += 2
+            else:
+                index += 1
+    return True
+
+
+def _scope_contains(container: Any, candidate: Any) -> bool:
+    if container.__class__ is candidate.__class__:
+        container_payload = container.model_dump(mode="json", by_alias=True)
+        candidate_payload = candidate.model_dump(mode="json", by_alias=True)
+        return canonicalize_json(container_payload) == canonicalize_json(candidate_payload)
+    if isinstance(container, SubscriptionScope):
+        if isinstance(candidate, ResourceGroupScope):
+            return (
+                candidate.tenant_id == container.tenant_id
+                and candidate.subscription_id == container.subscription_id
+            )
+        if isinstance(candidate, ResourceIdScope):
+            return candidate.resource_id.startswith(
+                f"/subscriptions/{container.subscription_id}"
+            )
+        if isinstance(candidate, LogAnalyticsWorkspaceScope):
+            return (
+                candidate.tenant_id == container.tenant_id
+                and candidate.subscription_id == container.subscription_id
+            )
+        return False
+    if isinstance(container, ResourceGroupScope):
+        if isinstance(candidate, ResourceIdScope):
+            return (
+                candidate.resource_id.startswith(
+                    f"/subscriptions/{container.subscription_id}/resourceGroups/{container.resource_group_name}"
+                )
+                and candidate.resource_id.count("/resourceGroups/") == 1
+            )
+        return False
+    if isinstance(container, LogAnalyticsWorkspaceScope):
+        if isinstance(candidate, ResourceIdScope):
+            return (
+                candidate.resource_id.startswith(
+                    f"/subscriptions/{container.subscription_id}/resourceGroups/{container.resource_group_name}/providers/Microsoft.OperationalInsights/workspaces/{container.workspace_name}"
+                )
+                and "workspaces/" in candidate.resource_id
+            )
+        return False
+    if isinstance(container, ServiceHealthRegionScope):
+        if isinstance(candidate, ServiceHealthRegionScope):
+            return (
+                candidate.cloud == container.cloud and candidate.region == container.region
+            )
+        return False
+    return False
 
 
 def _is_valid_key_vault_key_id(value: str) -> bool:
@@ -298,6 +359,7 @@ def verify_trusted_ingestion_signature(
     *,
     key_resolver: Callable[[str], Any],
     trust_anchor_ref: str | None = None,
+    attempt: CollectorAttempt | None = None,
 ) -> bool:
     if key_resolver is None:
         return False
@@ -338,6 +400,42 @@ def verify_trusted_ingestion_signature(
         identity_evidence.verified_claims.managed_identity_client_id,
     }:
         return False
+    if (
+        identity_evidence.ingestion_derivation.derived_collector_identity_ref
+        != identity_evidence.identity_evidence_id
+    ):
+        return False
+    if attempt is not None:
+        binding = identity_evidence.ingestion_derivation.attempt_binding
+        if binding.attempt_id != attempt.attempt_id:
+            return False
+        if binding.attempt_digest != attempt.attempt_digest:
+            return False
+        if binding.tool_name != attempt.tool_name:
+            return False
+        if binding.tool_version != attempt.tool_version:
+            return False
+        if binding.request_digest != attempt.request_digest:
+            return False
+        if attempt.attempt_type == "successResponse":
+            if binding.response_digest != attempt.response_digest:
+                return False
+            if binding.response_received_at != attempt.response_received_at:
+                return False
+        elif attempt.attempt_type == "failedResponse":
+            if binding.failure_digest != attempt.failure_digest:
+                return False
+            if binding.response_received_at != attempt.response_received_at:
+                return False
+        elif attempt.attempt_type == "timeoutNoResponse":
+            if binding.deadline_at != attempt.deadline_at:
+                return False
+            if binding.timed_out_at != attempt.timed_out_at:
+                return False
+        elif attempt.attempt_type in {"authorizationFailure", "toolUnavailable"}:
+            observed_at = getattr(attempt, "observed_at", None)
+            if observed_at is not None and binding.observed_at != observed_at:
+                return False
     payload = identity_evidence.ingestion_derivation.model_dump(
         mode="json", by_alias=True, exclude_none=True
     )
@@ -430,6 +528,7 @@ class CompatibilityMetadata(AthenaBaseModel):
     semantic_digest: str = Field(
         ..., alias="semanticDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
+
 
 
 class SubscriptionScope(AthenaBaseModel):
@@ -2760,11 +2859,13 @@ class CollectorIdentityEvidence(AthenaBaseModel):
         *,
         key_resolver: Callable[[str], Any],
         trust_anchor_ref: str | None = None,
+        attempt: CollectorAttempt | None = None,
     ) -> bool:
         return verify_trusted_ingestion_signature(
             self,
             key_resolver=key_resolver,
             trust_anchor_ref=trust_anchor_ref,
+            attempt=attempt,
         )
 
 
@@ -3663,6 +3764,12 @@ class EvidenceSnapshot(AthenaBaseModel):
         max_length=30000,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+    identity_evidence: list[CollectorIdentityEvidence] = Field(
+        default_factory=list,
+        alias="identityEvidence",
+        max_length=500,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> EvidenceSnapshot:
@@ -3675,6 +3782,26 @@ class EvidenceSnapshot(AthenaBaseModel):
             }
         ):
             raise AthenaValidationError("authorizedScopes must not contain duplicates")
+
+        if self.identity_evidence:
+            identity_lookup_by_id: dict[str, CollectorIdentityEvidence] = {}
+            for identity in self.identity_evidence:
+                if identity.identity_evidence_id in identity_lookup_by_id:
+                    raise AthenaValidationError(
+                        "identityEvidence must contain unique identityEvidenceId values"
+                    )
+                identity_lookup_by_id[identity.identity_evidence_id] = identity
+            for attempt in self.collector_attempts:
+                ref = attempt.collector_identity_evidence_ref
+                if ref not in identity_lookup_by_id:
+                    raise AthenaValidationError(
+                        "collectorAttempts must resolve to a trusted identityEvidence record"
+                    )
+            for record in self.evidence_records:
+                if record.collector_identity_evidence_ref not in identity_lookup_by_id:
+                    raise AthenaValidationError(
+                        "evidence records must resolve to a trusted identityEvidence record"
+                    )
 
         attempt_lookup_by_id: dict[str, CollectorAttempt] = {}
         attempt_lookup_by_digest: dict[str, CollectorAttempt] = {}
@@ -3766,7 +3893,8 @@ class EvidenceSnapshot(AthenaBaseModel):
                             "timeout evidence records must not carry failure payload digests"
                         )
             if record.record_type == "evidenceGap":
-                record_key = record.gap_id
+                gap_record = cast(EvidenceGapRecord, record)
+                record_key = gap_record.gap_id
                 if current_attempt.attempt_type not in {
                     "failedResponse",
                     "timeoutNoResponse",
@@ -3776,12 +3904,37 @@ class EvidenceSnapshot(AthenaBaseModel):
                     raise AthenaValidationError(
                         "evidenceGap records must reference failed/no-response attempts only"
                     )
+                if gap_record.evidence_scope not in self.authorized_scopes and not any(
+                    _scope_contains(auth_scope, gap_record.evidence_scope)
+                    for auth_scope in self.authorized_scopes
+                ):
+                    raise AthenaValidationError(
+                        "evidenceGap record scope must be contained by the snapshot "
+                        "authorized scopes"
+                    )
             else:
-                record_key = record.item_digest
+                concrete_record = cast(
+                    ResourceEvidenceRecord
+                    | ObservedRelationshipEvidenceRecord
+                    | MetricAggregateEvidenceRecord
+                    | HealthEventEvidenceRecord
+                    | ActivitySummaryEvidenceRecord
+                    | AdvisorRecommendationEvidenceRecord,
+                    record,
+                )
+                record_key = concrete_record.item_digest
                 if current_attempt.attempt_type != "successResponse":
                     raise AthenaValidationError(
                         "concrete evidence records must reference a "
                         "successResponse collector attempt only"
+                    )
+                if hasattr(concrete_record, "evidence_scope") and not any(
+                    _scope_contains(auth_scope, concrete_record.evidence_scope)
+                    for auth_scope in self.authorized_scopes
+                ):
+                    raise AthenaValidationError(
+                        "concrete evidence record scope must be contained by the snapshot "
+                        "authorized scopes"
                     )
             if record_key in seen_record_ids:
                 raise AthenaValidationError(
@@ -3790,18 +3943,18 @@ class EvidenceSnapshot(AthenaBaseModel):
             seen_record_ids.add(record_key)
 
         seen_refs: set[tuple[str, str, str]] = set()
-        for ref in self.evidence_refs:
-            if ref.ref_type == "evidenceItem":
-                if ref.snapshot_id != self.snapshot_id:
+        for evidence_ref in self.evidence_refs:
+            if evidence_ref.ref_type == "evidenceItem":
+                if evidence_ref.snapshot_id != self.snapshot_id:
                     raise AthenaValidationError(
                         "EvidenceItemRef.snapshotId must match the current snapshot"
                     )
-                if ref.snapshot_artifact_digest != self.compatibility.artifact_digest:
+                if evidence_ref.snapshot_artifact_digest != self.compatibility.artifact_digest:
                     raise AthenaValidationError(
                         "EvidenceItemRef.snapshotArtifactDigest must match the current "
                         "snapshot artifact digest"
                     )
-                if ref.snapshot_semantic_digest != self.compatibility.semantic_digest:
+                if evidence_ref.snapshot_semantic_digest != self.compatibility.semantic_digest:
                     raise AthenaValidationError(
                         "EvidenceItemRef.snapshotSemanticDigest must match the current "
                         "snapshot semantic digest"
@@ -3811,16 +3964,17 @@ class EvidenceSnapshot(AthenaBaseModel):
                         record
                         for record in self.evidence_records
                         if record.record_type != "evidenceGap"
-                        and record.item_digest == ref.item_digest
-                        and record.collector_attempt_digest == ref.collector_attempt_digest
+                        and record.item_digest == evidence_ref.item_digest
+                        and record.collector_attempt_digest
+                        == evidence_ref.collector_attempt_digest
                         and record.collector_identity_evidence_ref
-                        == ref.collector_identity_evidence_ref
+                        == evidence_ref.collector_identity_evidence_ref
                         and record.provenance.collector_attempt_id
-                        == ref.collector_attempt_id
+                        == evidence_ref.collector_attempt_id
                         and record.provenance.source_response_digest
-                        == ref.source_response_digest
+                        == evidence_ref.source_response_digest
                         and record.provenance.source_response_pointer
-                        == ref.source_response_pointer
+                        == evidence_ref.source_response_pointer
                     ),
                     None,
                 )
@@ -3829,22 +3983,50 @@ class EvidenceSnapshot(AthenaBaseModel):
                         "EvidenceItemRef must resolve exactly once to an item in "
                         "the current snapshot"
                     )
+                matching_attempt = attempt_lookup_by_id.get(evidence_ref.collector_attempt_id)
+                if matching_attempt is None:
+                    raise AthenaValidationError(
+                        "EvidenceItemRef must resolve to a current snapshot collector attempt"
+                    )
+                if evidence_ref.collector_tool_name != matching_attempt.tool_name:
+                    raise AthenaValidationError(
+                        "EvidenceItemRef.collectorToolName must match the selected attempt"
+                    )
+                if evidence_ref.collector_tool_version != matching_attempt.tool_version:
+                    raise AthenaValidationError(
+                        "EvidenceItemRef.collectorToolVersion must match the selected attempt"
+                    )
+                expected_attempt_times = {matching_attempt.attempt_started_at}
+                for attr in (
+                    "response_received_at",
+                    "deadline_at",
+                    "timed_out_at",
+                    "observed_at",
+                ):
+                    candidate = getattr(matching_attempt, attr, None)
+                    if candidate is not None:
+                        expected_attempt_times.add(candidate)
+                if evidence_ref.collector_attempt_at not in expected_attempt_times:
+                    raise AthenaValidationError(
+                        "EvidenceItemRef.collectorAttemptAt must match one of the "
+                        "selected attempt timestamps"
+                    )
                 key: tuple[str, str, str] = (
-                    ref.ref_type,
-                    ref.snapshot_id,
-                    ref.collector_attempt_id,
+                    evidence_ref.ref_type,
+                    evidence_ref.snapshot_id,
+                    evidence_ref.collector_attempt_id,
                 )
             else:
-                if ref.snapshot_id != self.snapshot_id:
+                if evidence_ref.snapshot_id != self.snapshot_id:
                     raise AthenaValidationError(
                         "EvidenceGapRef.snapshotId must match the current snapshot"
                     )
-                if ref.snapshot_artifact_digest != self.compatibility.artifact_digest:
+                if evidence_ref.snapshot_artifact_digest != self.compatibility.artifact_digest:
                     raise AthenaValidationError(
                         "EvidenceGapRef.snapshotArtifactDigest must match the current "
                         "snapshot artifact digest"
                     )
-                if ref.snapshot_semantic_digest != self.compatibility.semantic_digest:
+                if evidence_ref.snapshot_semantic_digest != self.compatibility.semantic_digest:
                     raise AthenaValidationError(
                         "EvidenceGapRef.snapshotSemanticDigest must match the current "
                         "snapshot semantic digest"
@@ -3854,18 +4036,60 @@ class EvidenceSnapshot(AthenaBaseModel):
                         record
                         for record in self.evidence_records
                         if record.record_type == "evidenceGap"
-                        and record.gap_id == ref.gap_id
-                        and record.item_digest == ref.gap_record_digest
-                        and record.collector_attempt_id == ref.collector_attempt_id
-                        and record.collector_attempt_digest == ref.collector_attempt_digest
+                        and record.gap_id == evidence_ref.gap_id
+                        and record.item_digest == evidence_ref.gap_record_digest
+                        and record.collector_attempt_id == evidence_ref.collector_attempt_id
+                        and record.collector_attempt_digest
+                        == evidence_ref.collector_attempt_digest
                     ),
                     None,
                 )
                 if matched_gap is None:
                     raise AthenaValidationError(
-                        "EvidenceGapRef must resolve exactly once to a gap in the current snapshot"
+                        "EvidenceGapRef must resolve exactly once to a gap in the current "
+                        "snapshot"
                     )
-                key = (ref.ref_type, ref.snapshot_id, ref.gap_id)
+                matching_attempt = attempt_lookup_by_id.get(evidence_ref.collector_attempt_id)
+                if matching_attempt is None:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef must resolve to a current snapshot collector attempt"
+                    )
+                if evidence_ref.collector_tool_name != matching_attempt.tool_name:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.collectorToolName must match the selected attempt"
+                    )
+                if evidence_ref.collector_tool_version != matching_attempt.tool_version:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.collectorToolVersion must match the selected attempt"
+                    )
+                expected_attempt_times = {matching_attempt.attempt_started_at}
+                for attr in (
+                    "response_received_at",
+                    "deadline_at",
+                    "timed_out_at",
+                    "observed_at",
+                ):
+                    candidate = getattr(matching_attempt, attr, None)
+                    if candidate is not None:
+                        expected_attempt_times.add(candidate)
+                if evidence_ref.collector_attempt_at not in expected_attempt_times:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.collectorAttemptAt must match one of the selected "
+                        "attempt timestamps"
+                    )
+                if matched_gap.evidence_scope != evidence_ref.evidence_scope:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.evidenceScope must match the resolved gap scope"
+                    )
+                if matched_gap.expected_record_type != evidence_ref.expected_record_type:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.expectedRecordType must match the resolved gap"
+                    )
+                if matched_gap.gap_reason != evidence_ref.gap_reason:
+                    raise AthenaValidationError(
+                        "EvidenceGapRef.gapReason must match the resolved gap"
+                    )
+                key = (evidence_ref.ref_type, evidence_ref.snapshot_id, evidence_ref.gap_id)
             if key in seen_refs:
                 raise AthenaValidationError(
                     "EvidenceSnapshot.evidenceRefs must contain each reference exactly once"
@@ -3873,18 +4097,70 @@ class EvidenceSnapshot(AthenaBaseModel):
             seen_refs.add(key)
         return self
 
-    def validate_for_evaluation(self, *, as_of: datetime) -> EvidenceSnapshot:
+    def validate_for_evaluation(
+        self,
+        *,
+        as_of: datetime,
+        identity_evidence: Iterable[CollectorIdentityEvidence] | None = None,
+        identity_resolver: Callable[[str], CollectorIdentityEvidence] | None = None,
+        key_resolver: Callable[[str], Any] | None = None,
+    ) -> EvidenceSnapshot:
         if as_of.tzinfo is None:
             raise AthenaValidationError("as_of must be timezone-aware")
         if as_of < self.collected_at or as_of >= self.expires_at:
             raise AthenaValidationError(
                 "snapshot must be fresh and not expired at the evaluation as_of"
             )
+        if not self.identity_evidence and not identity_resolver and not identity_evidence:
+            raise AthenaValidationError(
+                "snapshot evaluation requires either embedded identityEvidence or an "
+                "explicit trusted identity resolver"
+            )
+        resolution_source = list(identity_evidence or self.identity_evidence)
+        resolved_identity_lookup: dict[str, CollectorIdentityEvidence] = {}
+        for identity in resolution_source:
+            if identity.identity_evidence_id in resolved_identity_lookup:
+                raise AthenaValidationError(
+                    "identityEvidence must contain unique identityEvidenceId values"
+                )
+            resolved_identity_lookup[identity.identity_evidence_id] = identity
+        if identity_resolver is not None:
+            for identity_ref in {
+                attempt.collector_identity_evidence_ref for attempt in self.collector_attempts
+            } | {
+                record.collector_identity_evidence_ref for record in self.evidence_records
+            }:
+                if identity_ref in resolved_identity_lookup:
+                    continue
+                resolved = identity_resolver(identity_ref)
+                if resolved is None:
+                    raise AthenaValidationError(
+                        "snapshot identityEvidenceRef is missing from the trusted resolver"
+                    )
+                if resolved.identity_evidence_id != identity_ref:
+                    raise AthenaValidationError(
+                        "trusted identity resolver must return the exact identityEvidenceId "
+                        "mapping"
+                    )
+                resolved_identity_lookup[identity_ref] = resolved
+        if key_resolver is None:
+            raise AthenaValidationError(
+                "snapshot evaluation requires an explicit key_resolver for cryptographic "
+                "verification"
+            )
+        attempt_lookup_by_id: dict[str, CollectorAttempt] = {}
+        attempt_lookup_by_digest: dict[str, CollectorAttempt] = {}
         for attempt in self.collector_attempts:
-            if (
-                attempt.attempt_started_at < self.collected_at
-                or attempt.attempt_started_at > as_of
-            ):
+            attempt_lookup_by_id[attempt.attempt_id] = attempt
+            attempt_lookup_by_digest[attempt.attempt_digest] = attempt
+            attempt_identity = resolved_identity_lookup.get(attempt.collector_identity_evidence_ref)
+            if attempt_identity is None:
+                raise AthenaValidationError("collector attempt identity evidence was not resolved")
+            if not attempt_identity.verify_signature(key_resolver=key_resolver, attempt=attempt):
+                raise AthenaValidationError(
+                    "collector attempt identity evidence verification failed"
+                )
+            if attempt.attempt_started_at < self.collected_at or attempt.attempt_started_at > as_of:
                 raise AthenaValidationError(
                     "collector attempt timestamps must fall inside the snapshot collection window"
                 )
@@ -3901,12 +4177,25 @@ class EvidenceSnapshot(AthenaBaseModel):
                     "window and before as_of"
                 )
             timed_out_at = getattr(attempt, "timed_out_at", None)
-            if (
-                timed_out_at is not None
-                and (timed_out_at < self.collected_at or timed_out_at > as_of)
+            if timed_out_at is not None and (
+                timed_out_at < self.collected_at or timed_out_at > as_of
             ):
                 raise AthenaValidationError(
                     "timeout timestamps must be inside the collection window and before as_of"
+                )
+            deadline_at = getattr(attempt, "deadline_at", None)
+            if deadline_at is not None and (
+                deadline_at < self.collected_at or deadline_at > as_of
+            ):
+                raise AthenaValidationError(
+                    "deadlineAt must fall inside the collection window and before as_of"
+                )
+            observed_at = getattr(attempt, "observed_at", None)
+            if observed_at is not None and (
+                observed_at < self.collected_at or observed_at > as_of
+            ):
+                raise AthenaValidationError(
+                    "observedAt must fall inside the collection window and before as_of"
                 )
         for record in self.evidence_records:
             if hasattr(record, "observed_at") and (
@@ -3927,13 +4216,75 @@ class EvidenceSnapshot(AthenaBaseModel):
                 raise AthenaValidationError(
                     "evidence record windowEnd must fall inside the snapshot collection window"
                 )
-            if (
-                hasattr(record, "provenance")
-                and record.provenance.source_response_digest is not None
-                and record.provenance.source_response_pointer is None
+            if hasattr(record, "started_at") and (
+                record.started_at < self.collected_at or record.started_at > as_of
             ):
                 raise AthenaValidationError(
-                    "sourceResponsePointer is required when sourceResponseDigest is present"
+                    "health event startedAt must fall inside the snapshot collection window"
+                )
+            if hasattr(record, "ended_at") and (
+                record.ended_at < self.collected_at or record.ended_at > as_of
+            ):
+                raise AthenaValidationError(
+                    "health event endedAt must fall inside the snapshot collection window"
+                )
+            if record.record_type != "evidenceGap":
+                concrete_record = cast(
+                    ResourceEvidenceRecord
+                    | ObservedRelationshipEvidenceRecord
+                    | MetricAggregateEvidenceRecord
+                    | HealthEventEvidenceRecord
+                    | ActivitySummaryEvidenceRecord
+                    | AdvisorRecommendationEvidenceRecord,
+                    record,
+                )
+                if (
+                    concrete_record.provenance.source_response_digest is not None
+                    and concrete_record.provenance.source_response_pointer is None
+                ):
+                    raise AthenaValidationError(
+                        "sourceResponsePointer is required when sourceResponseDigest is present"
+                    )
+                if (
+                    concrete_record.provenance.failure_payload_pointer is not None
+                    and not _is_valid_json_pointer(
+                        concrete_record.provenance.failure_payload_pointer
+                    )
+                ):
+                    raise AthenaValidationError(
+                        "failurePayloadPointer must be a valid RFC 6901 JSON Pointer"
+                    )
+                if (
+                    concrete_record.provenance.source_response_pointer is not None
+                    and not _is_valid_json_pointer(
+                        concrete_record.provenance.source_response_pointer
+                    )
+                ):
+                    raise AthenaValidationError(
+                        "sourceResponsePointer must be a valid RFC 6901 JSON Pointer"
+                    )
+            proof_identity = resolved_identity_lookup.get(record.collector_identity_evidence_ref)
+            if proof_identity is None:
+                raise AthenaValidationError(
+                    "evidence record must resolve to a trusted identityEvidence record"
+                )
+            record_attempt_id = getattr(record, "collector_attempt_id", None)
+            record_attempt_digest = getattr(record, "collector_attempt_digest", None)
+            attempt_for_record: CollectorAttempt | None = None
+            if record_attempt_id is not None:
+                attempt_for_record = attempt_lookup_by_id.get(record_attempt_id)
+            if attempt_for_record is None and record_attempt_digest is not None:
+                attempt_for_record = attempt_lookup_by_digest.get(record_attempt_digest)
+            if attempt_for_record is None:
+                raise AthenaValidationError(
+                    "evidence record must resolve to an attempt in the current snapshot"
+                )
+            if not proof_identity.verify_signature(
+                key_resolver=key_resolver,
+                attempt=attempt_for_record,
+            ):
+                raise AthenaValidationError(
+                    "evidence record identity evidence verification failed"
                 )
         return self
 
