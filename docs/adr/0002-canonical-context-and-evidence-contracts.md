@@ -58,12 +58,15 @@ The canonical contracts are:
    attempt cites verified Entra JWT/token evidence from the MCP-host-to-trusted-ingestion flow, where
    the trusted ingestion service is the audience and the private MCP host managed identity is the
    subject. Trusted ingestion validates the original JWS against Entra issuer/JWKS/audience/time,
-   derives the collector identity, and signs the normalized verification/derivation record with a
-   dedicated non-exportable Key Vault key. The Athena caller token remains separate context-plane
-   audit data and is not the evidence collector identity. Evidence records are profile-neutral and
-   do not contain Athena judgments such as clause paths, verdicts, or profile-specific `not required`
-   statements. They do not contain unrestricted log bodies, secrets, PHI, PII, or customer
-   proprietary payloads.
+   derives the collector identity, and signs a normalized derivation preimage bound to the exact
+   collector attempt id/digest, tool/version, request digest, response or failure digest, attempt
+   timestamps, MCP host identity/tenant, ingestion audience, token verification result/hash,
+   contract versions, and derivation time with a dedicated non-exportable Key Vault key. Reusing
+   that signature or derivation digest for a different attempt is a replay and fails closed. The
+   Athena caller token remains separate context-plane audit data and is not the evidence collector
+   identity. Evidence records are profile-neutral and do not contain Athena judgments such as clause
+   paths, verdicts, or profile-specific `not required` statements. They do not contain unrestricted
+   log bodies, secrets, PHI, PII, or customer proprietary payloads.
 7. **Provenance boundary.** Findings cite both a manifest clause and evidence reference. Context-plane
    provenance and private Azure MCP evidence-plane provenance remain distinct. The Athena context
    identity has no workload Reader role and never becomes the collector of Azure evidence. Findings
@@ -96,10 +99,11 @@ The canonical contracts are:
     contract version. Schema, digest, and compatibility metadata live only under `/compatibility`.
     Digests use pre-validation NFC normalization with collision rejection, then unmodified RFC 8785
     JCS, exclude only their own digest fields and closed transport metadata, and use SHA-256.
-    Semantic digests use closed pointer allowlists. Unknown major versions, unknown required
+    Semantic digests are derived recursively from authoritative field metadata in the closed schemas,
+    not from hand-maintained pointer allowlists. Unknown major versions, unknown required
     capabilities, unknown enum values, malformed extensions, stale evidence, ambiguous selectors, or
     unbounded collections are rejected or evaluated as fail-closed findings before publication or
-    policy use. The semantic projection is a leaf-level allowlist with mutation coverage: any
+    policy use. Every schema leaf is classified exactly once as semantic or presentation; any
     policy-affecting leaf change alters `semanticDigest`, while presentation-only fields do not.
 
 ## Declared-versus-inferred precedence
@@ -153,8 +157,8 @@ This increases governance work but prevents unsafe silent assumptions.
 ## Compatibility and rollback
 
 - Schema major versions are incompatible and rejected unless explicitly supported.
-- Artifact digests cover exact canonical bytes; semantic digests cover policy-affecting normalized
-  fields. Both must be persisted and cited.
+- Artifact digests cover exact canonical bytes; semantic digests cover normalized fields classified
+  as semantic by schema metadata. Both must be persisted and cited.
 - Minor versions may add non-policy optional metadata only when artifact digest changes and semantic
   digest is unchanged. Policy-affecting optional fields or enum members require a declared
   capability, a `minimumReaderVersion`, and negotiation; otherwise they require a major version.

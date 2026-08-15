@@ -399,16 +399,19 @@ it must not fabricate successful response attempts.
 
 | `attemptType` | Required fields | Bound and rule |
 |---|---|---|
-| `successResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `responseEnvelopeDigest`, `responseReceivedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Contains the canonical response envelope digest and can be cited by evidence items. |
-| `failedResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `failureCode`, `failureStatus`, `failureEnvelopeDigest`, `responseReceivedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Represents a tool response that failed schema, size, freshness, or service validation. |
-| `timeoutNoResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `deadlineAt`, `timedOutAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Represents no MCP response; no response envelope is present. |
-| `authorizationFailure` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `authorizationStatus`, `observedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Closed statuses: `denied`, `expiredCredential`, `scopeNotAllowed`, `identityMismatch`. |
-| `toolUnavailable` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `unavailableReason`, `observedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Closed reasons: `notAllowlisted`, `notHosted`, `versionUnavailable`, `networkUnavailable`, `mcpUnavailable`. |
+| `successResponse` | `attemptId`, `attemptStartedAt`, `toolName`, `toolVersion`, `requestDigest`, `responseDigest`, `responseReceivedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Contains the canonical response envelope digest and can be cited by evidence items. |
+| `failedResponse` | `attemptId`, `attemptStartedAt`, `toolName`, `toolVersion`, `requestDigest`, `failureCode`, `failureStatus`, `failureDigest`, `responseReceivedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Represents a tool response that failed schema, size, freshness, or service validation. |
+| `timeoutNoResponse` | `attemptId`, `attemptStartedAt`, `toolName`, `toolVersion`, `requestDigest`, `deadlineAt`, `timedOutAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Represents no MCP response; no response or failure envelope is present. |
+| `authorizationFailure` | `attemptId`, `attemptStartedAt`, `toolName`, `toolVersion`, `requestDigest`, `authorizationStatus`, `observedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Closed statuses: `denied`, `expiredCredential`, `scopeNotAllowed`, `identityMismatch`; no response or failure envelope is present. |
+| `toolUnavailable` | `attemptId`, `attemptStartedAt`, `toolName`, `toolVersion`, `requestDigest`, `unavailableReason`, `observedAt`, `collectorIdentityEvidenceRef`, `attemptDigest` | Closed reasons: `notAllowlisted`, `notHosted`, `versionUnavailable`, `networkUnavailable`, `mcpUnavailable`; no response or failure envelope is present. |
 
 Every collector attempt has an `attemptDigest`: SHA-256 over the canonical attempt after excluding
-only `/attemptDigest` and closed transport-only fields. Successful response attempts also have a
-`responseEnvelopeDigest`, which covers the canonical MCP response after redaction of prohibited raw
-bodies and before projection into evidence records.
+only `/attemptDigest` and closed transport-only fields. `requestDigest` covers the canonical MCP
+tool request shape after bearer-token removal. Successful response attempts also have
+`responseDigest`, which covers the canonical MCP response after redaction of prohibited raw bodies
+and before projection into evidence records. Failed-response attempts have `failureDigest`, which
+covers the bounded failure envelope. No-response attempts must omit both `responseDigest` and
+`failureDigest`.
 
 Each concrete evidence item record contains:
 
@@ -432,7 +435,7 @@ variants.
 
 The snapshot artifact digest covers all collector attempts, evidence records, item digests, and
 collector identity evidence references after excluding the snapshot's own digest fields. The semantic digest covers
-only fields allowed by the artifact kind's semantic projection allowlist. If an evidence item or gap
+only fields derived from schema metadata with `x-athena-semanticClass = semantic`. If an evidence item or gap
 cannot be tied to a digest-covered collector attempt, it is invalid. If a concrete evidence item
 cites a non-`successResponse` attempt, it is invalid; evidence gaps may cite any attempt type.
 
@@ -451,8 +454,9 @@ implementable host-to-ingestion flow:
    MCP-host token to the trusted ingestion service over private authenticated transport.
 4. Trusted ingestion validates the original JWS against the configured Entra issuer, JWKS key id,
    audience, subject/object id, tenant, `iat`/`nbf`/`exp`, and allowed MCP host identity mapping.
-5. Trusted ingestion derives a normalized verification/derivation record and signs that record with a
-   dedicated non-exportable Azure Key Vault key controlled by the ingestion service.
+5. Trusted ingestion derives a normalized verification/derivation record bound to the exact
+   `CollectorAttempt` and signs that record with a dedicated non-exportable Azure Key Vault key
+   controlled by the ingestion service.
 6. Athena persists the token hash, verified claims, trusted derivation, Key Vault signature metadata,
    and verification result, but never persists the bearer token.
 
@@ -467,8 +471,8 @@ properties.
 | `trustAnchorRef` | string | 1 | Grammar `^entra:[0-9a-fA-F-]{36}:[A-Za-z0-9_.:/-]{3,128}$`; resolves to a configured Entra tenant OIDC/JWKS trust anchor. |
 | `verifiedClaims` | object | 1 | Closed Entra claims listed below. |
 | `tokenVerification` | object | 1 | Verification time, key id, and status for the original Entra JWS. |
-| `ingestionDerivation` | object | 1 | Trusted binding from verified token evidence to MCP host/tool invocation. |
-| `ingestionSignature` | object | 1 | Key Vault signature over the normalized verification/derivation record. |
+| `ingestionDerivation` | object | 1 | Trusted binding from verified token evidence to exactly one MCP host collector attempt. |
+| `ingestionSignature` | object | 1 | Key Vault signature over the normalized attempt-bound verification/derivation preimage. |
 | `identityEvidenceDigest` | digest string | 1 | Digest over the evidence excluding `/identityEvidenceDigest` and token bytes. |
 
 The closed `verifiedClaims` set is `issuer`, `audience`, `tenantId`,
@@ -484,29 +488,58 @@ must match a key in the resolved JWKS at `tokenVerification.verifiedAt`. Verific
 `audienceMismatch`, `claimMismatch`, and `trustAnchorUnavailable`. Publication and evaluation
 require `tokenVerification.status = valid` at the snapshot `collectedAt` time.
 
-The closed `ingestionDerivation` set is `mcpHostId`, `ingestionServiceId`,
-`toolAllowlistDigest`, `derivedCollectorIdentityRef`, `derivedAt`, `audience`, and
-`derivationDigest`.
-`derivedCollectorIdentityRef` is calculated from the verified token claims and the configured
-private MCP host identity mapping. Tool name and tool version are derived from the digest-covered
-collector attempt and accepted only when they appear in the trusted `toolAllowlistDigest`; they are
-not trusted from caller-supplied request fields.
+The closed `ingestionDerivation` set is `derivationPreimageType`, `derivationPreimageVersion`,
+`schemaVersion`, `semanticContractVersion`, `policyContractVersion`, `identityEvidenceId`,
+`tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`, `mcpHostId`,
+`mcpHostTenantId`, `mcpHostManagedIdentityObjectId`, `mcpHostManagedIdentityClientId`,
+`ingestionServiceId`, `ingestionAudience`, `toolAllowlistDigest`, `derivedCollectorIdentityRef`,
+`attemptBinding`, `derivedAt`, and `derivationDigest`.
+`derivationPreimageType` is `athena.mcpCollectorAttemptDerivation`; `derivationPreimageVersion` is a
+semantic version. `schemaVersion`, `semanticContractVersion`, and `policyContractVersion` are copied
+from the evidence snapshot `/compatibility` object so the signed derivation cannot be replayed under
+a different contract meaning. `derivedCollectorIdentityRef` is calculated from the verified token
+claims and the configured private MCP host identity mapping. Tool name and tool version are derived
+from the digest-covered collector attempt and accepted only when they appear in the trusted
+`toolAllowlistDigest`; they are not trusted from caller-supplied request fields.
+
+`attemptBinding` is a closed object whose fields are `attemptId`, `attemptType`, `attemptDigest`,
+`toolName`, `toolVersion`, `requestDigest`, conditional `responseDigest`, conditional
+`failureDigest`, `attemptStartedAt`, conditional `responseReceivedAt`, conditional `deadlineAt`,
+conditional `timedOutAt`, and conditional `observedAt`. Exactly one of `responseDigest` or
+`failureDigest` is present for response-bearing attempts; both are absent for `timeoutNoResponse`,
+`authorizationFailure`, and `toolUnavailable`. The timestamp set must exactly match the attempt
+variant. The `collectorIdentityEvidenceRef` in the collector attempt must equal
+`identityEvidenceId`, and every field in `attemptBinding` must equal the corresponding field in the
+digest-covered `CollectorAttempt`. A mismatch invalidates the snapshot.
+
+`tokenVerificationDigest` is SHA-256 over the canonical `tokenVerification` object after excluding
+transport-only fields. `derivationDigest` is SHA-256 over the RFC 8785 JCS canonical UTF-8 bytes of
+`ingestionDerivation` after excluding only `/derivationDigest`; it includes the normalized
+`attemptBinding`, `tokenHash`, `tokenVerificationStatus`, `tokenVerificationDigest`,
+MCP-host identity and tenant, ingestion audience, contract versions, and `derivedAt`. No field may be
+defaulted or omitted except the conditional attempt fields above. Derivation digest canonicalization
+uses the same duplicate-key rejection, NFC pre-validation, datetime normalization, ordering, and
+number rules as artifact digest canonicalization.
 
 The closed `ingestionSignature` set is `signatureAlgorithm`, `keyVaultKeyId`,
 `keyVersion`, `signedPreimageDigest`, `signature`, `signedAt`, `trustAnchorRef`,
 `keyStatusAtSigning`, and `signatureVerification`. `signatureAlgorithm` is `RS256` for WC-001.
 `keyVaultKeyId` grammar is
 `^https://[A-Za-z0-9-]+\\.vault\\.azure\\.net/keys/[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$`.
-The signed preimage is the canonical normalized record containing `identityEvidenceId`,
-`tokenHash`, `jwtHeader`, `verifiedClaims`, `tokenVerification`, and `ingestionDerivation`, excluding
-`ingestionSignature` and `identityEvidenceDigest`.
+`signedPreimageDigest` must equal `ingestionDerivation.derivationDigest`. The Key Vault signed
+preimage is exactly the canonicalized `ingestionDerivation` object excluding `/derivationDigest`;
+it is not a free-form claim set and cannot omit the attempt binding. Signature verification
+recomputes `derivationDigest`, verifies `signedPreimageDigest`, and then verifies the Key Vault
+signature over the same canonical bytes.
 
 The retained proof is the canonical `collectorIdentityEvidence` record: `tokenHash`, `jwtHeader`,
-verified claims, token verification metadata, ingestion derivation, Key Vault signature metadata,
-and signature value. The original bearer token and JWS compact serialization are not retained after
-ingestion. Later readers verify the retained proof by checking the Key Vault signature over the
-signed preimage, the configured trust anchor and key state, the recorded Entra verification status,
-and the token hash reference; they must not reinterpret an Athena caller token as collector proof.
+verified claims, token verification metadata, attempt-bound ingestion derivation, Key Vault
+signature metadata, and signature value. The original bearer token and JWS compact serialization are
+not retained after ingestion. Later readers verify the retained proof by checking the Key Vault
+signature over the attempt-bound signed preimage, the configured trust anchor and key state, the
+recorded Entra verification status, the token hash reference, and exact equality between
+`ingestionDerivation.attemptBinding` and the referenced `CollectorAttempt`; they must not reinterpret
+an Athena caller token as collector proof.
 
 Trusted ingestion key rotation is explicit: each accepted Key Vault key version is in exactly one
 closed state, `active`, `verifyOnly`, or `retired`. New evidence may be signed only by `active`
@@ -522,6 +555,12 @@ A snapshot whose verified collector identity is the Athena context-plane identit
 tool/version is not allowlisted, whose trusted ingestion derivation does not match the verified
 token claims, whose Key Vault signature is not valid, or whose token verification is not `valid` is
 rejected.
+
+Replay protection is mandatory. A `collectorIdentityEvidence` record is valid for exactly one
+`CollectorAttempt` id/digest pair. Reusing the same Key Vault signature, `derivationDigest`, or
+identity evidence record with a different `attemptId`, `attemptDigest`, tool identifier/version,
+request digest, response/failure digest, timestamp, MCP host identity/tenant, ingestion audience, or
+contract version is a replay attempt and fails closed.
 
 ## Provenance references
 
@@ -543,11 +582,11 @@ response. It forbids unknown properties and contains exactly:
 | `itemDigest` | yes | Evidence record `itemDigest`. |
 | `collectorAttemptId` | yes | Attempt id for the producing `successResponse`. |
 | `collectorAttemptDigest` | yes | Digest of that collector attempt. |
-| `collectorToolName` | yes | Tool name derived from the verified attempt. |
-| `collectorToolVersion` | yes | Tool version derived from the verified attempt. |
+| `collectorToolName` | yes | Tool name derived from the verified attempt; must equal the cited collector attempt `toolName`. |
+| `collectorToolVersion` | yes | Tool version derived from the verified attempt; must equal the cited collector attempt `toolVersion`. |
 | `collectorAttemptAt` | yes | `responseReceivedAt` from the `successResponse` attempt. |
 | `collectorIdentityEvidenceRef` | yes | Verified token evidence id used by the attempt. |
-| `sourceResponseDigest` | yes | Digest of the successful MCP response envelope. |
+| `sourceResponseDigest` | yes | Digest of the successful MCP response envelope; must equal the cited collector attempt `responseDigest`. |
 | `sourceResponsePointer` | yes | JSON Pointer to the exact successful response item or aggregate input range. |
 
 ### EvidenceGapRef
@@ -567,12 +606,12 @@ properties and contains exactly:
 | `expectedRecordType` | yes | Closed expected record type copied from the gap evidence record: `resource`, `observedRelationship`, `metricAggregate`, `healthEvent`, `activitySummary`, or `advisorRecommendation`. |
 | `collectorAttemptId` | yes | Attempt id cited by the gap. |
 | `collectorAttemptDigest` | yes | Digest of the cited collector attempt. |
-| `collectorToolName` | yes | Tool name derived from the verified attempt. |
-| `collectorToolVersion` | yes | Tool version derived from the verified attempt. |
+| `collectorToolName` | yes | Tool name derived from the verified attempt; must equal the cited collector attempt `toolName`. |
+| `collectorToolVersion` | yes | Tool version derived from the verified attempt; must equal the cited collector attempt `toolVersion`. |
 | `collectorAttemptAt` | yes | Attempt observation time: `responseReceivedAt`, `timedOutAt`, or `observedAt` depending on attempt variant. |
 | `collectorIdentityEvidenceRef` | yes | Verified token evidence id used by the attempt. |
 | `gapReason` | yes | Closed gap reason from the evidence record. |
-| `failurePayloadDigest` | conditional | Required only when the cited attempt has a failure envelope. |
+| `failurePayloadDigest` | conditional | Required only when the cited attempt has a failure envelope; must equal the cited collector attempt `failureDigest` unless the gap cites a malformed item inside a successful response. |
 | `failurePayloadPointer` | conditional | Required only when `failurePayloadDigest` is present; forbidden for `timeoutNoResponse`. |
 
 `EvidenceGapRef` never contains `sourceResponseDigest` or `sourceResponsePointer` for
@@ -1079,80 +1118,121 @@ Self-digest exclusion rules:
 | Digest | Input | Excluded fields before canonicalization |
 |---|---|---|
 | Artifact `artifactDigest` | Entire artifact | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, transport-only envelope fields. |
-| Artifact `semanticDigest` | Closed semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, and fields outside the artifact kind's semantic pointer allowlist. |
+| Artifact `semanticDigest` | Metadata-derived semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, and fields whose schema metadata is not `x-athena-semanticClass = semantic`. |
 | Evidence record `itemDigest` | One evidence record | `/itemDigest` and transport-only envelope fields for that record. |
-| MCP response `responseEnvelopeDigest` | One canonical MCP response envelope | `/responseEnvelopeDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
+| MCP response `responseDigest` or failure `failureDigest` | One canonical MCP response or bounded failure envelope | `/responseDigest`, `/failureDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
 | Collector `identityEvidenceDigest` | One collector identity evidence record | `/identityEvidenceDigest` and token material. |
+| Ingestion `derivationDigest` | One attempt-bound ingestion derivation preimage | `/derivationDigest` only. |
 | Collector attempt `attemptDigest` | One collector attempt | `/attemptDigest` and transport-only envelope fields for that attempt. |
 
 Transport-only envelope fields are closed: `requestId`, `correlationId`, `retryCount`,
 `transportLatencyMs`, `receivedAt`, and `rawTransportHeaders`. No other field may be excluded
 without a compatibility change. Exclusion happens before sorting and hashing. Hash verification
-recomputes all child item digests first, then response/identity-evidence digests, then artifact and
-semantic digests; cycles are invalid.
+recomputes all child item digests first, then response/failure, attempt, derivation,
+identity-evidence, artifact, and semantic digests; cycles are invalid.
 
-### Semantic projection pointer allowlists
+### Semantic projection metadata
 
-Each artifact has one canonical `/compatibility` object containing schema, digest, and compatibility
-metadata. `artifactDigest` and `semanticDigest` must not appear anywhere else. Duplicating them in
-`audit`, snapshot roots, findings, or generated schemas is invalid rather than reconciled.
+`semanticDigest` is derived from closed contract field metadata, not from a hand-maintained pointer
+allowlist. Every field in every published Pydantic model and generated JSON Schema must carry
+exactly one authoritative `x-athena-semanticClass` value:
 
-`semanticDigest` is calculated from a projection built only from these pointer allowlists. Pointer
-patterns use `*` for one array item or map value and are closed; any policy-affecting field not
-matched by the allowlist requires a compatibility update before publication.
+- `semantic`: the field can affect a verdict, finding kind, proof sufficiency, fail-closed behavior,
+  profile resolution, role/resource binding, relationship applicability, evidence trust or freshness,
+  risk/control status, compatibility negotiation, or policy interpretation. It is included in the
+  semantic projection.
+- `presentation`: the field cannot affect any policy or trust decision. It is excluded from the
+  semantic projection. Presentation fields still affect `artifactDigest` unless another digest rule
+  excludes them from a self-hash.
 
-| Artifact kind | Semantic projection pointer allowlist |
+A field may also carry one non-authoritative digest lifecycle hint, `x-athena-digestRole`, with a
+closed value of `normal`, `selfDigest`, `transportOnly`, or `forbiddenPayload`. This hint controls
+artifact/item self-hash exclusions and payload rejection only; it never overrides
+`x-athena-semanticClass`. Unknown, missing, or conflicting field metadata is a schema publication
+failure. Unknown runtime fields remain invalid because all contracts are closed.
+
+The semantic projection algorithm is deterministic:
+
+1. Validate the artifact against its closed schema and reject unknown properties before projection.
+2. Walk the schema and instance recursively. Include a leaf in the semantic projection only when its
+   field metadata is `x-athena-semanticClass = semantic`.
+3. Preserve explicit `null` for semantic optional leaves; omit absent optional leaves.
+4. Include discriminators for every active union variant as semantic leaves. Non-active variant
+   fields are not projected.
+5. For arrays of scalars, include each semantic item in canonical array order. For keyed arrays or
+   maps, sort entries by the normalized stable key declared in contract metadata, include the key
+   when it is semantic, and then recurse into each value. For order-significant arrays, preserve the
+   declared order and mark that order as semantic in metadata.
+6. For dynamic selectors, proof requirements, controls, relationships, findings, collector attempts,
+   and evidence references, the discriminator and all decision-affecting variant fields are semantic.
+7. For profile overrides, the override target inherits the target field's semantic class after
+   profile resolution. Override metadata that controls applicability or governance (`extends`,
+   `disabledRefs.ref`, rationale, owner, profile id, weakening rationale, and profile applicability)
+   is semantic. Every legal override path must resolve to exactly one classified field.
+8. Timestamps are presentation unless the contract metadata marks them semantic. Timestamps that
+   affect freshness, expiry, review state, acceptance state, control health, evidence trust, or
+   attempt binding are semantic. This explicitly includes evidence snapshot `collectedAt`/`expiresAt`,
+   collector attempt `attemptStartedAt`, `responseReceivedAt`, `deadlineAt`, `timedOutAt`, and
+   `observedAt`, token verification time, ingestion `derivedAt`, signature `signedAt`, risk
+   acceptance `acceptedAt`/`expiresAt`, control review/expiry timestamps including
+   `restoreTest.lastTestedAt`, backup `lastSuccessfulBackupAt`, `nextReviewDueAt`, and objective
+   measurement windows.
+9. Numeric proof thresholds and cardinalities are semantic. This explicitly includes
+   `minimumDistinctZones`, cardinality `minimum`/`maximum`, `maximumAge`, objective thresholds, and
+   control health thresholds.
+10. Digest fields marked `selfDigest`, transport-only metadata, raw bearer tokens, and forbidden
+    payload bodies are excluded according to the digest exclusion table, but the classification test
+    still requires them to have exactly one semantic class.
+11. Canonicalize the projected object with the repository canonicalization pipeline and hash it with
+    SHA-256 to produce `semanticDigest`.
+
+Generated semantic leaf-union tables may be included in documentation for reviewer readability, but
+those tables are generated from the field metadata and are never manually authoritative. If the
+checked-in documentation includes generated leaf unions, CI must regenerate them and fail when the
+generated output differs from the schema metadata. Humans must update field metadata, not edit a
+pointer list, when adding or changing a contract field.
+
+The generated documentation examples below are illustrative of the required generator output only:
+
+| Artifact kind | Generated semantic projection source |
 |---|---|
-| `workloadManifest` | Closed macro expansion: every `CompatibilitySemanticLeaf`, `ManifestIdentitySemanticLeaf`, `ProfileOverrideSemanticLeaf`, `RoleSemanticLeaf`, `RelationshipSemanticLeaf`, `ConstraintProofSemanticLeaf`, `ControlSemanticLeaf`, `RiskAcceptanceSemanticLeaf`, `ObjectiveSemanticLeaf`, and `OwnershipSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/workload`, `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, or `/ownership` is invalid. |
-| `resolvedProfile` | Closed resolved-profile expansion: every `CompatibilitySemanticLeaf`, `/manifestId`, `/manifestVersion`, `/profileId`, `/settings/continuity/zoneLossContinuityRequired`, every `RoleSemanticLeaf`, every `RelationshipSemanticLeaf`, every `ConstraintProofSemanticLeaf`, every `ControlSemanticLeaf`, every `RiskAcceptanceSemanticLeaf`, every `ObjectiveSemanticLeaf`, and every `OwnershipSemanticLeaf` named in the mutation-coverage matrix below, with source-only profile override paths (`/profiles/*`, `/profileApplicability/*`, `/disabledRefs/*`) removed. These names are closed macros expanded by validators before hashing; retaining the macro name or hashing a broad `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, or `/ownership` object pointer is invalid. |
-| `evidenceSnapshot` | Closed macro expansion: every `CompatibilitySemanticLeaf` and every `EvidenceSnapshotSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/collector`, `/collectorAttempts`, or `/evidenceRecords` is invalid. |
-| `contextualFinding` | Closed macro expansion: every `CompatibilitySemanticLeaf`, every `FindingSemanticLeaf`, and every `EvidenceReferenceSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/governanceScope`, `/contextRef`, `/evidenceRefs`, or `/relationshipClassRefs` is invalid. |
-| `generatedJsonSchema` | `/compatibility/semanticContractVersion`, `/$id`, `/type`, `/required`, `/properties/*/type`, `/properties/*/enum`, `/properties/*/const`, `/properties/*/oneOf`, `/properties/*/anyOf`, `/properties/*/required`, `/properties/*/additionalProperties`, `/oneOf`, `/anyOf`, `/additionalProperties`, `/$defs` |
+| `workloadManifest` | Generated by walking manifest schema fields marked `semantic`, including compatibility negotiation fields, workload identity, profile definitions and overrides, role declarations, selectors, relationships, constraints/proof requirements, controls, risk acceptances, objectives, and ownership. |
+| `resolvedProfile` | Generated from the resolved-profile schema after deterministic inheritance/override merge. Source-only profile override metadata is absent; resolved semantic leaves such as `settings.continuity.zoneLossContinuityRequired`, role selectors, proof thresholds, controls, risks, objectives, and ownership remain included. |
+| `evidenceSnapshot` | Generated from snapshot schema fields marked `semantic`, including authorized evidence scope, freshness window, collector trust anchor, collector attempts, collector identity evidence, evidence records, evidence gaps, and digest-covered attempt bindings. |
+| `contextualFinding` | Generated from finding schema fields marked `semantic`, including finding kind, verdict, governance scope, context reference, evidence item/gap references, confidence, relationship classes, and residual risk. |
+| `generatedJsonSchema` | Generated from schema structure fields marked `semantic`, including `$id`, type/required/enum/discriminator/variant/additional-property constraints and Athena field metadata. |
 
-Closed semantic exclusions are only `/compatibility/artifactDigest`, `/compatibility/semanticDigest`,
-`/compatibility/producedBy`, `/audit`, `/displayName`, `/description`, `/documentation`, `/examples`,
-non-semantic `extensions`, and transport-only envelope fields. The previous undefined categories
-from earlier drafts are not valid exclusion rules; implementation must use only the pointer
-allowlists and exclusions above.
+Closed presentation defaults are `displayName`, `description`, `documentation`, `examples`,
+non-decision `audit` notes, and non-semantic namespaced `extensions`. A field is not presentation
+merely because it is human-authored: owner references, rationales, source clauses, acceptance status,
+profile applicability, and control review dates are semantic when they affect publication or
+evaluation. A new enum value, optional field, variant, or timestamp that can affect policy must be
+marked semantic and must participate in capability/minimum-reader negotiation or a major semantic or
+policy contract version.
 
-### Semantic leaf completeness and mutation coverage
+### Semantic classification completeness and mutation coverage
 
-The allowlists above are normative and leaf-level. A validator must expand the named macros below to
-their exact paths before computing `semanticDigest`; a macro is not a JSON pointer and must not be
-hashed as a broad object. The schema publication test suite must mutate every listed policy leaf one
-at a time and prove the `semanticDigest` changes, then mutate every presentation-only exclusion
-(`displayName`, `description`, `documentation`, `examples`, `audit`, non-semantic `extensions`,
-`producedBy`) and prove the `semanticDigest` does not change. Adding any new field that can change a
-verdict, finding kind, proof sufficiency, risk/control status, profile applicability, relationship
-applicability, collector trust, or compatibility negotiation outcome without adding it to this matrix
-is a blocking contract failure.
+Schema publication tests must prove semantic classification is exhaustive and digest behavior follows
+from metadata rather than from a maintained pointer list:
 
-| Semantic macro | Exact policy-affecting leaves that must be covered by mutation tests |
-|---|---|
-| `CompatibilitySemanticLeaf` | `/compatibility/artifactKind`, `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities/*/capabilityId`, `/compatibility/requiresCapabilities/*/minimumVersion`, `/compatibility/requiresCapabilities/*/requiredFor`, `/compatibility/extensionPolicy` |
-| `ManifestIdentitySemanticLeaf` | `/manifestId`, `/manifestVersion`, `/workload/businessCriticality`, `/workload/dataSensitivity`, `/workload/allowedEvidenceScopes/*/scopeType`, `/workload/allowedEvidenceScopes/*/tenantId`, `/workload/allowedEvidenceScopes/*/subscriptionId`, `/workload/allowedEvidenceScopes/*/resourceGroupName`, `/workload/allowedEvidenceScopes/*/resourceId`, `/workload/allowedEvidenceScopes/*/workspaceName`, `/workload/allowedEvidenceScopes/*/cloud`, `/workload/allowedEvidenceScopes/*/region` |
-| `ProfileOverrideSemanticLeaf` | `/profiles/*/profileType`, `/profiles/*/extends`, `/profiles/*/overrides/settings/continuity/zoneLossContinuityRequired`, `/profiles/*/disabledRefs/*/ref`, `/profiles/*/disabledRefs/*/rationale`, `/profiles/*/disabledRefs/*/ownerRef` |
-| `RoleSemanticLeaf` | `/roles/*/roleId`, `/roles/*/kind`, `/roles/*/cardinality/cardinalityKind`, `/roles/*/cardinality/minimum`, `/roles/*/cardinality/maximum`, `/roles/*/selectors/*/selectorType`, `/roles/*/selectors/*/resourceIds/*`, `/roles/*/selectors/*/tagPredicates/*/key`, `/roles/*/selectors/*/tagPredicates/*/value`, `/roles/*/selectors/*/namePattern/prefix`, `/roles/*/selectors/*/namePattern/suffix`, `/roles/*/selectors/*/resourceType`, `/roles/*/selectors/*/location`, `/roles/*/selectors/*/resourceGroupName`, `/roles/*/selectors/*/children/*/selectorRef`, `/roles/*/selectors/*/maxMatches`, `/roles/*/profileApplicability/*`, `/roles/*/ownerRef`, `/roles/*/approvalState` |
-| `RelationshipSemanticLeaf` | `/relationships/declared/*/relationshipClass`, `/relationships/declared/*/relationshipId`, `/relationships/declared/*/kind`, `/relationships/declared/*/from/endpointType`, `/relationships/declared/*/from/roleRef`, `/relationships/declared/*/from/externalRef`, `/relationships/declared/*/to/endpointType`, `/relationships/declared/*/to/roleRef`, `/relationships/declared/*/to/externalRef`, `/relationships/declared/*/profiles/*`, `/relationships/declared/*/ownerRef`, `/relationships/declared/*/sourceClause`, `/relationships/observed/*/relationshipClass`, `/relationships/observed/*/relationshipId`, `/relationships/observed/*/kind`, `/relationships/observed/*/from/endpointType`, `/relationships/observed/*/from/resourceRef`, `/relationships/observed/*/from/externalRef`, `/relationships/observed/*/to/endpointType`, `/relationships/observed/*/to/resourceRef`, `/relationships/observed/*/to/externalRef`, `/relationships/observed/*/evidenceItemRef`, `/relationships/observed/*/observedAt`, `/relationships/inferred/*/relationshipClass`, `/relationships/inferred/*/relationshipId`, `/relationships/inferred/*/kind`, `/relationships/inferred/*/from/endpointType`, `/relationships/inferred/*/from/resourceRef`, `/relationships/inferred/*/from/externalRef`, `/relationships/inferred/*/to/endpointType`, `/relationships/inferred/*/to/resourceRef`, `/relationships/inferred/*/to/externalRef`, `/relationships/inferred/*/confidence`, `/relationships/inferred/*/inputEvidenceRefs/*`, `/relationships/inferred/*/algorithmId`, `/relationships/exceptions/*/relationshipClass`, `/relationships/exceptions/*/exceptionId`, `/relationships/exceptions/*/appliesToRelationshipRef`, `/relationships/exceptions/*/riskAcceptanceRef`, `/relationships/exceptions/*/governanceScope/governanceScopeType`, `/relationships/exceptions/*/governanceScope/manifestId`, `/relationships/exceptions/*/governanceScope/profileId`, `/relationships/exceptions/*/governanceScope/profileIds/*`, `/relationships/exceptions/*/governanceScope/clausePath`, `/relationships/exceptions/*/governanceScope/roleRef`, `/relationships/exceptions/*/governanceScope/resourceId`, `/relationships/exceptions/*/governanceScope/relationshipRef`, `/relationships/exceptions/*/governanceScope/controlRef`, `/relationships/exceptions/*/governanceScope/objectiveRef`, `/relationships/exceptions/*/ownerRef`, `/relationships/exceptions/*/rationale`, `/relationships/exceptions/*/expiresAt` |
-| `ConstraintProofSemanticLeaf` | `/constraints/*/constraintId`, `/constraints/*/type`, `/constraints/*/governanceScope/governanceScopeType`, `/constraints/*/governanceScope/manifestId`, `/constraints/*/governanceScope/profileId`, `/constraints/*/governanceScope/profileIds/*`, `/constraints/*/governanceScope/clausePath`, `/constraints/*/governanceScope/roleRef`, `/constraints/*/governanceScope/resourceId`, `/constraints/*/governanceScope/relationshipRef`, `/constraints/*/governanceScope/controlRef`, `/constraints/*/governanceScope/objectiveRef`, `/constraints/*/appliesToRoleRefs/*`, `/constraints/*/profiles/*`, `/constraints/*/severity`, `/constraints/*/sourceClause`, `/constraints/*/failureMode`, `/constraints/*/proofRequirement/proofKind`, `/constraints/*/proofRequirement/roleRef`, `/constraints/*/proofRequirement/expected`, `/constraints/*/proofRequirement/resourceEvidenceRefs/*`, `/constraints/*/proofRequirement/subjectRoleRef`, `/constraints/*/proofRequirement/anchorRoleRef`, `/constraints/*/proofRequirement/zoneEvidenceRefs/*`, `/constraints/*/proofRequirement/minimumDistinctZones`, `/constraints/*/proofRequirement/declaredRelationshipRef`, `/constraints/*/proofRequirement/observedRelationshipEvidenceRefs/*`, `/constraints/*/proofRequirement/maximumAge`, `/constraints/*/proofRequirement/evidenceRefs/*`, `/constraints/*/proofRequirement/controlRef`, `/constraints/*/proofRequirement/requiredHealth/*`, `/constraints/*/proofRequirement/controlEvidenceRefs/*`, `/constraints/*/proofRequirement/objectiveRef`, `/constraints/*/proofRequirement/metricEvidenceRefs/*`, `/constraints/*/proofRequirement/comparison`, `/constraints/*/proofRequirement/requiredEvidenceRefKinds/*`, `/constraints/*/proofRequirement/onMissingEvidence`, `/constraints/*/proofRequirement/onConflictingEvidence` |
-| `ControlSemanticLeaf` | `/controls/*/controlKind`, `/controls/*/controlId`, `/controls/*/governanceScope/governanceScopeType`, `/controls/*/governanceScope/manifestId`, `/controls/*/governanceScope/profileId`, `/controls/*/governanceScope/profileIds/*`, `/controls/*/governanceScope/clausePath`, `/controls/*/governanceScope/roleRef`, `/controls/*/governanceScope/resourceId`, `/controls/*/governanceScope/relationshipRef`, `/controls/*/governanceScope/controlRef`, `/controls/*/governanceScope/objectiveRef`, `/controls/*/ownerRef`, `/controls/*/backupPolicyRef`, `/controls/*/lastSuccessfulBackupAt`, `/controls/*/testOutcome`, `/controls/*/rtoObserved`, `/controls/*/rpoObserved`, `/controls/*/runbookRef`, `/controls/*/lastReviewedAt`, `/controls/*/alertRuleRef`, `/controls/*/enabledState`, `/controls/*/lastFiredAt`, `/controls/*/cadence`, `/controls/*/nextReviewDueAt`, `/controls/*/lastCompletedAt`, `/controls/*/reviewSystemRef`, `/controls/*/approvalSystemRef`, `/controls/*/requiredForChangeKinds/*`, `/controls/*/supportPlanRef`, `/controls/*/coverageHours`, `/controls/*/expiry`, `/controls/*/evidenceRefs/*` |
-| `RiskAcceptanceSemanticLeaf` | `/riskAcceptances/*/riskAcceptanceId`, `/riskAcceptances/*/governanceScope/governanceScopeType`, `/riskAcceptances/*/governanceScope/manifestId`, `/riskAcceptances/*/governanceScope/profileId`, `/riskAcceptances/*/governanceScope/profileIds/*`, `/riskAcceptances/*/governanceScope/clausePath`, `/riskAcceptances/*/governanceScope/roleRef`, `/riskAcceptances/*/governanceScope/resourceId`, `/riskAcceptances/*/governanceScope/relationshipRef`, `/riskAcceptances/*/governanceScope/controlRef`, `/riskAcceptances/*/governanceScope/objectiveRef`, `/riskAcceptances/*/riskKind`, `/riskAcceptances/*/riskRating`, `/riskAcceptances/*/residualRiskStatement`, `/riskAcceptances/*/rationaleRef`, `/riskAcceptances/*/acceptedBy`, `/riskAcceptances/*/ownedBy`, `/riskAcceptances/*/acceptedAt`, `/riskAcceptances/*/expiresAt`, `/riskAcceptances/*/linkedControlRefs/*`, `/riskAcceptances/*/profiles/*`, `/riskAcceptances/*/status` |
-| `ObjectiveSemanticLeaf` | `/objectives/*/objectiveId`, `/objectives/*/objectiveType`, `/objectives/*/profiles/*`, `/objectives/*/target`, `/objectives/*/window`, `/objectives/*/ownerRef`, `/objectives/*/breachVerdict`, `/objectives/*/measurementEvidenceRefKinds/*` |
-| `OwnershipSemanticLeaf` | `/ownership/*/ownerId`, `/ownership/*/ownerRole`, `/ownership/*/authorityRef`, `/ownership/*/profiles/*`, `/ownership/*/escalationRef` |
-| `EvidenceSnapshotSemanticLeaf` | `/snapshotId`, `/authorizedScopes/*/scopeType`, `/authorizedScopes/*/tenantId`, `/authorizedScopes/*/subscriptionId`, `/authorizedScopes/*/resourceGroupName`, `/authorizedScopes/*/resourceId`, `/authorizedScopes/*/workspaceName`, `/authorizedScopes/*/cloud`, `/authorizedScopes/*/region`, `/collectedAt`, `/expiresAt`, `/collector/trustAnchorRef`, `/collector/identityEvidence/*/identityEvidenceDigest`, `/collectorAttempts/*/attemptDigest`, `/evidenceRecords/*/itemDigest` |
-| `EvidenceReferenceSemanticLeaf` | `/evidenceRefs/*/refType`, `/evidenceRefs/*/snapshotId`, `/evidenceRefs/*/snapshotArtifactDigest`, `/evidenceRefs/*/snapshotSemanticDigest`, `/evidenceRefs/*/itemDigest`, `/evidenceRefs/*/gapId`, `/evidenceRefs/*/gapRecordDigest`, `/evidenceRefs/*/gapReason`, `/evidenceRefs/*/evidenceScope/scopeType`, `/evidenceRefs/*/evidenceScope/tenantId`, `/evidenceRefs/*/evidenceScope/subscriptionId`, `/evidenceRefs/*/evidenceScope/resourceGroupName`, `/evidenceRefs/*/evidenceScope/resourceId`, `/evidenceRefs/*/evidenceScope/workspaceName`, `/evidenceRefs/*/evidenceScope/cloud`, `/evidenceRefs/*/evidenceScope/region`, `/evidenceRefs/*/expectedRecordType`, `/evidenceRefs/*/collectorAttemptId`, `/evidenceRefs/*/collectorAttemptDigest`, `/evidenceRefs/*/collectorToolName`, `/evidenceRefs/*/collectorToolVersion`, `/evidenceRefs/*/collectorAttemptAt`, `/evidenceRefs/*/collectorIdentityEvidenceRef`, `/evidenceRefs/*/sourceResponseDigest`, `/evidenceRefs/*/sourceResponsePointer`, `/evidenceRefs/*/failurePayloadDigest`, `/evidenceRefs/*/failurePayloadPointer` |
-| `FindingSemanticLeaf` | `/findingId`, `/findingKind`, `/verdict`, `/governanceScope/governanceScopeType`, `/governanceScope/manifestId`, `/governanceScope/profileId`, `/governanceScope/profileIds/*`, `/governanceScope/clausePath`, `/governanceScope/roleRef`, `/governanceScope/resourceId`, `/governanceScope/relationshipRef`, `/governanceScope/controlRef`, `/governanceScope/objectiveRef`, `/contextRef/manifestId`, `/contextRef/manifestVersion`, `/contextRef/profileId`, `/contextRef/resolvedProfileDigest`, `/contextRef/clausePath`, `/relationshipClassRefs/*`, `/confidence`, `/residualRisk` |
-
-The `contextualFinding` allowlist is the union of `CompatibilitySemanticLeaf`,
-`FindingSemanticLeaf`, and `EvidenceReferenceSemanticLeaf`. The `evidenceSnapshot` allowlist is the
-union of `CompatibilitySemanticLeaf` and `EvidenceSnapshotSemanticLeaf`. The `workloadManifest`
-allowlist is the union of `CompatibilitySemanticLeaf`, `ManifestIdentitySemanticLeaf`,
-`ProfileOverrideSemanticLeaf`, `RoleSemanticLeaf`, `RelationshipSemanticLeaf`,
-`ConstraintProofSemanticLeaf`, `ControlSemanticLeaf`, `RiskAcceptanceSemanticLeaf`,
-`ObjectiveSemanticLeaf`, and `OwnershipSemanticLeaf`. These union statements define closed macro
-expansions only; they are not permission to hash broad parent objects. Governance-scope leaves are
-conditional on the `governanceScopeType` discriminator; mutation tests cover each valid variant with
-only its required fields present.
+1. Every leaf in every closed contract schema has exactly one `x-athena-semanticClass`; no leaf is
+   unclassified, multiply classified, or reachable only through a documentation table.
+2. Every legal profile override path resolves to a classified target field. Override tests cover
+   Production, Development, and Training, inherited values, weakened values with rationale, disabled
+   references, and illegal override paths.
+3. Every discriminator is classified semantic, and every active variant field is classified exactly
+   once. Variant-specific fields for inactive branches are absent from the instance projection.
+4. Every schema leaf marked semantic is mutated one at a time in a generated fixture and changes
+   `semanticDigest`. This includes `restoreTest.lastTestedAt`, collector attempt timestamps,
+   `derivedAt`, `minimumDistinctZones`, control health thresholds, risk acceptance expiry/status,
+   and compatibility/capability fields.
+5. Every schema leaf marked presentation is mutated one at a time and does not change
+   `semanticDigest`, while still changing `artifactDigest` unless a self-digest exclusion applies.
+6. Every digest lifecycle hint is tested independently from semantic classification: `selfDigest`
+   fields are excluded only from their own digest preimage, `transportOnly` fields are excluded only
+   where the digest table permits, and `forbiddenPayload` fields are rejected before projection.
+7. Generated documentation leaf unions, if present, are regenerated from metadata and compared
+   byte-for-byte against checked-in docs so omissions cannot be introduced by hand.
 
 ## Compatibility and versioning
 
@@ -1162,7 +1242,7 @@ Compatibility metadata is a closed contract, not a free-form map.
 |---|---|---|---|
 | `artifactKind` | enum | 1 | `workloadManifest`, `resolvedProfile`, `evidenceSnapshot`, `contextualFinding`, or `generatedJsonSchema`. |
 | `schemaVersion` | semantic version | 1 | Artifact schema version. |
-| `semanticContractVersion` | semantic version | 1 | Version of semantic leaf meaning and semantic projection allowlist. |
+| `semanticContractVersion` | semantic version | 1 | Version of semantic leaf meaning and field classification metadata. |
 | `policyContractVersion` | semantic version | 1 | Version of evaluator semantics for verdicts, proof kinds, and fail-closed behavior. |
 | `minimumReaderVersion` | semantic version | 1 | Minimum reader contract version required to process this artifact. |
 | `requiresCapabilities` | array of `CapabilityRequirement` | 0-50 | Required for policy-affecting optional fields or enum/union additions. |
@@ -1198,7 +1278,7 @@ Compatibility rules:
 1. `schemaVersion` follows `MAJOR.MINOR.PATCH`.
 2. Unsupported major versions are rejected.
 3. `schemaVersion` is an artifact-shape version and is never included in semantic projection.
-4. `semanticContractVersion` changes when semantic leaf meaning or the semantic pointer allowlist
+4. `semanticContractVersion` changes when semantic leaf meaning or authoritative field metadata
    changes. Patch changes cannot alter semantic meaning. Minor changes can add non-required semantic
    leaves only through capability negotiation. Major changes indicate incompatible semantic meaning.
 5. `policyContractVersion` changes when proof evaluation, verdict mapping, precedence, or fail-closed
@@ -1207,9 +1287,10 @@ Compatibility rules:
 6. Each artifact carries `artifactDigest` and `semanticDigest` only under `/compatibility`.
 7. `artifactDigest` covers exact canonical bytes after key sorting, id normalization, transport
    metadata removal, and preservation of semantically relevant nulls.
-8. `semanticDigest` covers only the artifact kind's closed semantic pointer allowlist. Fields outside
-   that allowlist, such as `/displayName`, `/description`, `/documentation`, and `/examples`, may
-   change artifact digest without changing semantic digest.
+8. `semanticDigest` covers only fields derived from schema metadata with
+   `x-athena-semanticClass = semantic`. Fields marked `presentation`, such as `/displayName`,
+   `/description`, `/documentation`, and `/examples`, may change artifact digest without changing
+   semantic digest.
 9. Minor `schemaVersion` changes may add non-policy optional metadata only when older readers can
    ignore it safely and semantic digest is unchanged.
 10. Policy-affecting optional fields, new proof variants, new control variants, new evidence record
@@ -1239,6 +1320,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ClosedSketch(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+# Every real field uses Field(json_schema_extra={"x-athena-semanticClass": "semantic"})
+# or Field(json_schema_extra={"x-athena-semanticClass": "presentation"}), plus
+# x-athena-digestRole when needed. The sketch omits repetitive annotations below only for
+# readability; generated schemas and tests must not omit them.
 
 Verdict = Literal[
     "pass",
@@ -1440,6 +1526,85 @@ class WorkloadRoleSketch(ClosedSketch):
     cardinality: CardinalitySketch
     owner_ref: str
 
+class SuccessCollectorAttemptSketch(ClosedSketch):
+    attempt_type: Literal["successResponse"]
+    attempt_id: str
+    attempt_started_at: datetime
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    response_digest: str
+    response_received_at: datetime
+    collector_identity_evidence_ref: str
+    attempt_digest: str
+
+class FailedCollectorAttemptSketch(ClosedSketch):
+    attempt_type: Literal["failedResponse"]
+    attempt_id: str
+    attempt_started_at: datetime
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    failure_code: str
+    failure_status: str
+    failure_digest: str
+    response_received_at: datetime
+    collector_identity_evidence_ref: str
+    attempt_digest: str
+
+class TimeoutCollectorAttemptSketch(ClosedSketch):
+    attempt_type: Literal["timeoutNoResponse"]
+    attempt_id: str
+    attempt_started_at: datetime
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    deadline_at: datetime
+    timed_out_at: datetime
+    collector_identity_evidence_ref: str
+    attempt_digest: str
+
+class AuthorizationFailureCollectorAttemptSketch(ClosedSketch):
+    attempt_type: Literal["authorizationFailure"]
+    attempt_id: str
+    attempt_started_at: datetime
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    authorization_status: Literal["denied", "expiredCredential", "scopeNotAllowed", "identityMismatch"]
+    observed_at: datetime
+    collector_identity_evidence_ref: str
+    attempt_digest: str
+
+class ToolUnavailableCollectorAttemptSketch(ClosedSketch):
+    attempt_type: Literal["toolUnavailable"]
+    attempt_id: str
+    attempt_started_at: datetime
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    unavailable_reason: Literal[
+        "notAllowlisted",
+        "notHosted",
+        "versionUnavailable",
+        "networkUnavailable",
+        "mcpUnavailable",
+    ]
+    observed_at: datetime
+    collector_identity_evidence_ref: str
+    attempt_digest: str
+
+CollectorAttemptSketch = Annotated[
+    Union[
+        SuccessCollectorAttemptSketch,
+        FailedCollectorAttemptSketch,
+        TimeoutCollectorAttemptSketch,
+        AuthorizationFailureCollectorAttemptSketch,
+        ToolUnavailableCollectorAttemptSketch,
+    ],
+    Field(discriminator="attempt_type"),
+]
+
 class TokenVerificationSketch(ClosedSketch):
     verified_at: datetime
     jwks_kid: str
@@ -1454,6 +1619,49 @@ class TokenVerificationSketch(ClosedSketch):
         "claimMismatch",
         "trustAnchorUnavailable",
     ]
+
+class AttemptBindingSketch(ClosedSketch):
+    attempt_id: str
+    attempt_type: Literal[
+        "successResponse",
+        "failedResponse",
+        "timeoutNoResponse",
+        "authorizationFailure",
+        "toolUnavailable",
+    ]
+    attempt_digest: str
+    tool_name: str
+    tool_version: str
+    request_digest: str
+    response_digest: str | None = None
+    failure_digest: str | None = None
+    attempt_started_at: datetime
+    response_received_at: datetime | None = None
+    deadline_at: datetime | None = None
+    timed_out_at: datetime | None = None
+    observed_at: datetime | None = None
+
+class IngestionDerivationSketch(ClosedSketch):
+    derivation_preimage_type: Literal["athena.mcpCollectorAttemptDerivation"]
+    derivation_preimage_version: str
+    schema_version: str
+    semantic_contract_version: str
+    policy_contract_version: str
+    identity_evidence_id: str
+    token_hash: str
+    token_verification_status: str
+    token_verification_digest: str
+    mcp_host_id: str
+    mcp_host_tenant_id: str
+    mcp_host_managed_identity_object_id: str
+    mcp_host_managed_identity_client_id: str
+    ingestion_service_id: str
+    ingestion_audience: str
+    tool_allowlist_digest: str
+    derived_collector_identity_ref: str
+    attempt_binding: AttemptBindingSketch
+    derived_at: datetime
+    derivation_digest: str
 
 class SignatureVerificationSketch(ClosedSketch):
     verified_at: datetime
@@ -1484,7 +1692,7 @@ class CollectorIdentityEvidenceSketch(ClosedSketch):
     token_hash: str
     trust_anchor_ref: str
     token_verification: TokenVerificationSketch
-    ingestion_derivation_digest: str
+    ingestion_derivation: IngestionDerivationSketch
     ingestion_signature: IngestionSignatureSketch
     identity_evidence_digest: str
 
@@ -1636,8 +1844,9 @@ false`, string length limits, capability metadata, and cross-reference validatio
 14. Collector identity evidence tests verify the original MCP host managed-identity Entra JWT
    `RS256` signature through tenant JWKS, ingestion-service audience, token hash persistence,
    trust-anchor resolution, trusted ingestion derivation, non-exportable Key Vault signature
-   verification, key rotation state, verification time/status, retained proof fields, and fail
-   closed for every non-`valid` status.
+   verification, key rotation state, verification time/status, retained proof fields, exact
+   `CollectorAttempt` id/digest/tool/request/response/failure/timestamp binding, and fail closed for
+   every non-`valid` status or replay mismatch.
 15. Evidence gap records are profile-neutral and contain no `neededForClauseRef`, profile id,
    verdict, or `notRequiredByProfile` judgment.
 16. Evidence collected by the Athena context identity for Azure resources is rejected; only the
@@ -1663,14 +1872,15 @@ false`, string length limits, capability metadata, and cross-reference validatio
 25. Capability negotiation tests cover `supported`, `readerTooOld`, `unknownCapability`, and
    `versionTooLow` outcomes.
 26. Compatibility placement tests prove schema, digest, and compatibility metadata appear only under
-   `/compatibility`, semantic projection uses only closed pointer allowlists, and validators expand
-   every named semantic macro to exact leaf pointers before hashing.
+   `/compatibility`, and semantic projection is derived recursively from authoritative field
+   metadata rather than hand-maintained pointer allowlists.
 27. Canonicalization tests prove NFC pre-validation with collision rejection followed by unmodified
    RFC 8785 JCS, and prove artifact/item/response/identity-evidence/attempt digests exclude only their own
    digest fields and the closed transport metadata fields, avoiding recursive self-hashing.
-28. Mutation-coverage tests mutate every `*SemanticLeaf` path in the matrix and prove
-   `semanticDigest` changes; mutations to presentation-only exclusions do not change
-   `semanticDigest`.
+28. Classification and mutation-coverage tests prove every schema leaf is classified exactly once,
+   every legal profile override target is covered, every semantic leaf mutation changes
+   `semanticDigest`, every presentation leaf mutation leaves `semanticDigest` unchanged, and any
+   generated documentation leaf-union table matches metadata output byte-for-byte.
 29. EvidenceGapRef tests prove the prose/table/Pydantic shape is authoritative: exactly one
    `evidenceScope`, one `expectedRecordType`, one `collectorAttemptId`, one
    `collectorAttemptDigest`, gap digest equal to the referenced evidence-gap item digest, no
@@ -1699,8 +1909,9 @@ false`, string length limits, capability metadata, and cross-reference validatio
   enough for implementation?
 - Does the exception model correctly require an active risk acceptance before any
   `acceptedResidualRisk` verdict?
-- Does cryptographic item-to-collector-attempt provenance and verified Entra token identity evidence
-  preserve the evidence-plane boundary without inventing managed-identity-signed custom claims?
+- Does cryptographic item-to-collector-attempt provenance and attempt-bound trusted-ingestion
+  identity evidence preserve the evidence-plane boundary without inventing managed-identity-signed
+  custom claims or allowing replay across attempts?
 - Are evidence gaps profile-neutral, and do Development oracle observations cite actual database
   evidence rather than profile judgments embedded in evidence?
 - Are selector and evidence bounds measurable and safe for the first 1,000-resource synthetic test?
