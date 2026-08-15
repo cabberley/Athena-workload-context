@@ -1,0 +1,537 @@
+# NON-RUNTIME RESEARCH DRAFT ONLY.
+# This file is a synthetic workload-context research draft for GitHub issue #4.
+# It is not a WC-001 schema instance, is not signed, must not be loaded by runtime code,
+# and must be reviewed by humans before conversion to any approved manifest schema.
+# Detailed provenance remains in an approved private evidence system and is not committed here.
+
+schemaStatus: draft-pre-wc-001
+runtimeUse: prohibited
+loadPolicy: never-load
+classification: public-safe-synthetic-draft
+createdForIssue: 4
+sourceDossier: docs/research/epic-on-azure-source-dossier.md
+researchDraftLocation: docs/research/drafts/epic-on-azure.draft.yaml
+
+redactionRules:
+  prohibitedContent:
+    - PHI or PII
+    - customer names or customer-specific designs
+    - tenant, subscription, resource, workspace, cluster, host, IP, or endpoint identifiers
+    - credentials, secrets, certificates, keys, or connection strings
+    - sizing, quota, SKU, capacity, threshold, or sensitive operational values
+    - proprietary schemas, commands, ports, procedures, or activation steps
+    - raw internal document prose, diagrams, or collaboration excerpts
+    - internal URLs, GUIDs, document titles, private source-history metadata, or planning names
+  permittedContent:
+    - abstract workload and environment semantics
+    - generic role and dependency categories
+    - opaque sanitized source-category labels
+    - TODO(human) markers for unsupported or customer-specific claims
+
+workloadContextDraft:
+  id: synthetic-epic-on-azure-workload-context
+  displayName: Epic on Azure workload context research draft
+  workloadFamily: epic-on-azure
+  description: >-
+    Generic, non-runtime research draft for Epic on Azure workload context. It captures
+    only public-safe abstract roles, environment questions, dependency categories,
+    placement questions, monitoring semantics, ownership categories, recovery concepts,
+    and relationship hypotheses reduced from approved private evidence.
+  provenanceRefs:
+    - SRC-A
+    - SRC-B
+    - SRC-C
+    - SRC-D
+    - SRC-E
+    - SRC-F
+    - SRC-G
+    - SRC-H
+  authorityCaveat: >-
+    This draft is not authoritative. Human owners must choose the canonical private
+    source baseline and convert any approved content into the future WC-001 contract.
+  assumptionGuardrail: >-
+    This draft intentionally does not set required, optional, failover, prohibited,
+    criticality, region, zone, parity, data-class, or dependency-completeness defaults.
+    Those values must be declared and approved per environment before runtime use.
+
+  objectives:
+    reliability: declare and validate recovery intent without inventing targets
+    security: declare segmentation and least-privilege intent without exposing flows
+    operationalExcellence: declare ownership, evidence, support, and change semantics
+    performanceEfficiency: declare capacity as a dependency without embedding sizing
+    costOptimization: declare environment purpose and lifecycle without usage values
+
+  dataBoundary:
+    inBoundaryOnly: true
+    noDataEgress: true
+    defaultDataRisk: unknown-until-declared
+    environmentNameDoesNotProveDataClass: true
+    declarationRequired:
+      - data classification for every environment
+      - evidence boundary for every source category
+      - human approval before any manifest publication
+
+  environments:
+    Production:
+      declarationRequired: true
+      objective: TODO(human) declare production objective and service hours
+      criticality: TODO(human) declare criticality; no default is encoded here
+      recoveryPosture: TODO(human) declare region, zone, and alternate-environment posture
+      dependencyCompleteness: TODO(human) declare included and excluded critical dependencies
+      dataRisk: TODO(human) declare data class; environment name is insufficient
+      monitoringSemantics:
+        - TODO(human) declare impact model and alerting intent
+        - TODO(human) declare platform and application signal categories
+      ownership:
+        accountable: TODO(human) declare workload owner
+        consulted: TODO(human) declare platform and application owner categories
+      supportedBy:
+        - SRC-A
+        - SRC-B
+        - SRC-D
+      unknowns:
+        - SLO/RTO/RPO values
+        - region and zone posture
+        - dependency inventory and parity
+        - escalation contacts
+        - scale and sizing
+
+    DR:
+      declarationRequired: true
+      objective: TODO(human) declare recovery objective and activation conditions
+      criticality: TODO(human) declare criticality; no default is encoded here
+      recoveryPosture: TODO(human) declare alignment, drill, and failover expectations
+      dependencyCompleteness: TODO(human) declare recovery dependency scope; parity is unknown
+      dataRisk: TODO(human) declare data class; replication assumptions are not encoded
+      monitoringSemantics:
+        - TODO(human) declare readiness and recovery evidence semantics
+        - TODO(human) declare breach indicators without embedding numeric values
+      ownership:
+        accountable: TODO(human) declare recovery owner
+        consulted: TODO(human) declare platform and application owner categories
+      supportedBy:
+        - SRC-A
+        - SRC-D
+        - SRC-E
+        - SRC-F
+      unknowns:
+        - recovery operating mode
+        - recovery runbook and validation checklist
+        - dependency parity rules
+        - capacity and readiness evidence
+
+    Development:
+      declarationRequired: true
+      objective: TODO(human) declare development purpose and lifecycle
+      criticality: TODO(human) declare criticality; do not infer lower criticality
+      recoveryPosture: TODO(human) declare recovery expectation or accepted absence of one
+      dependencyCompleteness: TODO(human) declare dependency scope; do not assume partial parity
+      dataRisk: TODO(human) declare synthetic, scrubbed, transformed, regulated, or other class
+      monitoringSemantics:
+        - TODO(human) declare engineering feedback and support expectations
+      ownership:
+        accountable: TODO(human) declare platform or application owner
+      supportedBy:
+        - SRC-A
+        - SRC-B
+        - SRC-F
+      unknowns:
+        - dependency parity
+        - data classification
+        - lifecycle and refresh/reset behavior
+        - paging and support expectations
+
+    Test:
+      declarationRequired: true
+      objective: TODO(human) declare validation purpose and release-gate role
+      criticality: TODO(human) declare criticality; no default is encoded here
+      recoveryPosture: TODO(human) declare recovery expectation or accepted absence of one
+      dependencyCompleteness: TODO(human) declare dependency scope and parity expectations
+      dataRisk: TODO(human) declare synthetic, scrubbed, transformed, regulated, or other class
+      monitoringSemantics:
+        - TODO(human) declare regression, validation, and support semantics
+      ownership:
+        accountable: TODO(human) declare platform or release owner
+      supportedBy:
+        - SRC-B
+        - SRC-D
+        - SRC-F
+      unknowns:
+        - validation scope
+        - data classification
+        - dependency parity
+        - monitoring criticality
+
+    Training:
+      declarationRequired: true
+      objective: TODO(human) declare training or readiness purpose
+      criticality: TODO(human) declare criticality; no default is encoded here
+      recoveryPosture: TODO(human) declare recovery expectation or accepted absence of one
+      dependencyCompleteness: TODO(human) declare training dependency scope and parity expectations
+      dataRisk: TODO(human) declare synthetic, scrubbed, transformed, regulated, or other class
+      monitoringSemantics:
+        - TODO(human) declare readiness and support semantics
+      ownership:
+        accountable: TODO(human) declare training, platform, or application owner
+      supportedBy:
+        - SRC-A
+        - SRC-B
+        - SRC-F
+      unknowns:
+        - data classification
+        - refresh/reset behavior
+        - dependency parity
+        - recovery posture
+
+  abstractRoles:
+    clientPresentation:
+      purpose: user access and presentation category
+      examplesAreIllustrativeOnly: true
+      discoveryHints:
+        tags: optional hypothesis; exact catalog TODO(human)
+      supportedBy:
+        - SRC-A
+        - SRC-B
+    webAndApplicationServices:
+      purpose: application-facing service and request-handling category
+      placementIntent: TODO(human) declare zone distribution; no two-zone default is encoded
+      supportedBy:
+        - SRC-A
+        - SRC-C
+    operationalDatabase:
+      purpose: primary transactional data role category
+      acceptedConstraint: TODO(human) declare whether any singleton or constrained placement applies
+      requiredRiskRecordIfConstrained:
+        - residual risk owner
+        - rationale
+        - compensating controls
+        - co-location expectation if any
+        - recovery evidence
+      supportedBy:
+        - SRC-A
+        - SRC-H
+    analyticsAndReporting:
+      purpose: reporting, analytics, or downstream read-oriented category
+      dependencySemantics: TODO(human) declare data movement and freshness intent
+      supportedBy:
+        - SRC-A
+        - SRC-B
+    sharedServices:
+      purpose: workload-adjacent service category
+      dependencySemantics: TODO(human) declare which shared services apply per environment
+      supportedBy:
+        - SRC-A
+        - SRC-B
+    integrationAndConnectivity:
+      purpose: inbound, outbound, private, and partner connectivity category
+      prohibitedDetail: exact flows, ports, addresses, certificates, and firewall rules
+      supportedBy:
+        - SRC-C
+    monitoringAndOperations:
+      purpose: platform health plus application health signal category
+      prohibitedDetail: raw queries, thresholds, workspace IDs, alert routes, and on-call identities
+      supportedBy:
+        - SRC-D
+        - SRC-G
+        - SRC-H
+    backupAndRecovery:
+      purpose: backup, restore, failover, drill, and alternate-environment readiness category
+      prohibitedDetail: exact recovery commands or activation procedures
+      supportedBy:
+        - SRC-D
+        - SRC-E
+
+  dependencyCategories:
+    identityAndAccess:
+      status: candidate-category
+      declarationRequired: true
+      semantics: access control and administrative boundary intent
+      exactProviders: TODO(human)
+    networkAndConnectivity:
+      status: candidate-category
+      declarationRequired: true
+      semantics: source/destination intent, segmentation, private/public delivery category
+      exactFlows: prohibited
+    computeAndPlacement:
+      status: candidate-category
+      declarationRequired: true
+      semantics: role placement, zone/region intent, and fleet-distribution expectations
+      exactSkuOrSize: prohibited
+    storageAndDataProtection:
+      status: candidate-category
+      declarationRequired: true
+      semantics: persistence, backup, restore, replication, and protective-copy intent
+      exactSizing: prohibited
+    monitoringAndObservability:
+      status: candidate-category
+      declarationRequired: true
+      semantics: signal meaning, evidence category, freshness, and response intent
+      rawTelemetryValues: prohibited
+    supportAndEscalation:
+      status: candidate-category
+      declarationRequired: true
+      semantics: accountable owner, consulted owner, and review cadence
+      personalContacts: TODO(human)
+    applicationDelivery:
+      status: candidate-category
+      declarationRequired: true
+      semantics: persistence, health, maintenance, and availability behavior expectations
+      implementationSettings: prohibited
+
+  placementConstraints:
+    primaryPlacement:
+      declarationRequired: true
+      regionIntent: TODO(human) declare primary region criteria; no default region posture is encoded
+      zoneIntent: TODO(human) declare zone posture; no default zone posture is encoded
+      supportedBy:
+        - SRC-A
+        - SRC-G
+    alternatePlacement:
+      declarationRequired: true
+      regionIntent: TODO(human) declare whether alternate placement applies
+      zoneIntent: TODO(human) declare zone posture if alternate placement applies
+      supportedBy:
+        - SRC-A
+        - SRC-G
+    rolePlacement:
+      webAndApplicationServices: TODO(human) declare zone distribution; no two-zone default
+      operationalDatabase: TODO(human) declare placement and residual risk if constrained
+      workersOrDependentRoles: TODO(human) declare co-location or distribution rules if any
+      supportedBy:
+        - SRC-A
+        - SRC-H
+    networkSegmentation:
+      declarationRequired: true
+      intent: TODO(human) declare role-specific connectivity and segmentation intent
+      exactRoutesAndRules: prohibited
+      supportedBy:
+        - SRC-C
+
+  relationshipHypotheses:
+    guardrail: >-
+      These are abstract hypotheses for later WC-001 mapping. They do not assert required,
+      optional, failover, or prohibited semantics. Each relationship must be validated by a
+      human owner before it can become an approved manifest relationship.
+    items:
+      - id: rel-hypothesis-client-to-app
+        sourceRole: clientPresentation
+        targetRole: webAndApplicationServices
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: traffic-flow-hypothesis
+        intent: user access may traverse presentation and application-service categories
+        provenanceCategory: SRC-A
+        confidence: hypothesis-unvalidated
+        unknownState: direction, protocol, scope, and requirement level are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-app-to-database
+        sourceRole: webAndApplicationServices
+        targetRole: operationalDatabase
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: data-access-hypothesis
+        intent: application-service categories may depend on transactional data categories
+        provenanceCategory: SRC-A
+        confidence: hypothesis-unvalidated
+        unknownState: dependency requirement, read/write behavior, and recovery behavior are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-app-to-shared-services
+        sourceRole: webAndApplicationServices
+        targetRole: sharedServices
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: support-service-hypothesis
+        intent: application roles may use declared shared-service categories
+        provenanceCategory: SRC-B
+        confidence: hypothesis-unvalidated
+        unknownState: included services and requirement level are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-reporting-to-data
+        sourceRole: analyticsAndReporting
+        targetRole: operationalDatabase
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: data-freshness-hypothesis
+        intent: reporting or analytics roles may depend on declared data-source freshness
+        provenanceCategory: SRC-B
+        confidence: hypothesis-unvalidated
+        unknownState: freshness target, source path, and requirement level are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-connectivity-to-app
+        sourceRole: integrationAndConnectivity
+        targetRole: webAndApplicationServices
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: connectivity-boundary-hypothesis
+        intent: connectivity categories may mediate inbound, outbound, private, or partner access
+        provenanceCategory: SRC-C
+        confidence: hypothesis-unvalidated
+        unknownState: flow direction, trust boundary, and requirement level are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-client-presentation
+        sourceRole: monitoringAndOperations
+        targetRole: clientPresentation
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for presentation-category health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-app-services
+        sourceRole: monitoringAndOperations
+        targetRole: webAndApplicationServices
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for application-service health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-database
+        sourceRole: monitoringAndOperations
+        targetRole: operationalDatabase
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for data-role health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-analytics
+        sourceRole: monitoringAndOperations
+        targetRole: analyticsAndReporting
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for analytics-role health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-shared-services
+        sourceRole: monitoringAndOperations
+        targetRole: sharedServices
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for shared-service health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-connectivity
+        sourceRole: monitoringAndOperations
+        targetRole: integrationAndConnectivity
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for connectivity-boundary health and readiness
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-monitoring-to-recovery
+        sourceRole: monitoringAndOperations
+        targetRole: backupAndRecovery
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: observability-evidence-hypothesis
+        intent: monitoring categories may provide evidence for recovery-readiness signal categories
+        provenanceCategory: SRC-D
+        confidence: hypothesis-unvalidated
+        unknownState: signal list, thresholds, and response semantics are unknown
+        humanValidationRequired: true
+      - id: rel-hypothesis-recovery-to-data
+        sourceRole: backupAndRecovery
+        targetRole: operationalDatabase
+        environmentScope: TODO(human) declare applicable environments
+        relationshipCategory: recovery-evidence-hypothesis
+        intent: recovery categories may provide backup, restore, drill, or readiness evidence
+        provenanceCategory: SRC-E
+        confidence: hypothesis-unvalidated
+        unknownState: coverage, cadence, activation behavior, and requirement level are unknown
+        humanValidationRequired: true
+
+  monitoringSemantics:
+    signalIntentOnly: true
+    platformEvidenceCategories:
+      - resource configuration and inventory from approved evidence plane
+      - platform metrics, logs, and alerts as permitted by customer boundary
+      - health, change, and advisory evidence categories
+    workloadEvidenceCategories:
+      - application health signal categories TODO(human)
+      - backup and restore success semantics
+      - replication and recovery-readiness semantics
+      - workflow readiness semantics by declared environment
+    prohibitedValues:
+      - raw queries or clusters
+      - workspace IDs
+      - exact alert thresholds
+      - notification routing
+      - incident/customer identifiers
+    supportedBy:
+      - SRC-D
+      - SRC-G
+      - SRC-H
+
+  ownershipModel:
+    roles:
+      workloadOwner: TODO(human) declare accountable owner for workload intent
+      applicationOwner: TODO(human) declare accountable or consulted owner category
+      platformOwner: TODO(human) declare accountable or consulted owner category
+      monitoringOwner: TODO(human) declare owner for monitoring semantics and evidence freshness
+      recoveryOwner: TODO(human) declare owner for drills and failover readiness
+      changeApprover: human owner for manifest approval and publication
+    personalIdentifiers: prohibited in reusable template
+    supportedBy:
+      - SRC-D
+      - SRC-H
+
+  recoveryModel:
+    concepts:
+      - RTO and RPO are declared objectives, not inferred from environment name
+      - failover readiness must be declared and evidenced by approved validation records
+      - backup and restore expectations must be declared for roles and environments
+      - alternate-environment capacity is unknown until declared
+      - specialized isolated recovery patterns remain TODO(human) for exact behavior
+    supportedBy:
+      - SRC-D
+      - SRC-E
+      - SRC-F
+
+  acceptedArchitecturalConstraints:
+    singletonOrConstrainedDatabase:
+      allowedOnlyWhenDeclared: true
+      requiredFieldsIfDeclared:
+        - owner
+        - rationale
+        - residualRisk
+        - compensatingControls
+        - recoveryExpectation
+        - expiryOrReviewCadence
+      supportedBy:
+        - SRC-H
+    nonProductionParity:
+      allowedOnlyWhenDeclared: true
+      defaultState: unknown-not-partial
+      requiredFieldsIfDeclared:
+        - environmentPurpose
+        - dependenciesIncluded
+        - dependenciesExcluded
+        - validationLimitations
+        - dataClassification
+      supportedBy:
+        - SRC-F
+    tagBasedDiscoveryHints:
+      allowedOnlyAsHints: true
+      requiredFieldsIfDeclared:
+        - privateSourceReviewState
+        - confidence
+        - humanReviewState
+      supportedBy:
+        - SRC-B
+    unknownOrLowConfidenceBinding:
+      failClosed: true
+      action: surfaceForHumanReview
+      supportedBy:
+        - SRC-H
+
+  conversionNotesForWc001:
+    - Replace provisional keys with WC-001 contract names once available.
+    - Convert opaque source-category labels into formal private provenance references outside this
+      public repository.
+    - Add schema validation for TODO(human), unknown, prohibited, and synthetic value markers.
+    - Require a human approval state before any manifest is publishable.
+    - Keep this research draft out of runtime pack loading until signed and approved.
