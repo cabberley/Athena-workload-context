@@ -132,7 +132,6 @@ Required top-level fields:
 
 | Field | Type | Bound | Notes |
 |---|---|---|---|
-| `schemaVersion` | semantic version string | exactly one | Unknown major versions are rejected. |
 | `manifestId` | stable id | 1 | Does not encode customer names or secrets. |
 | `manifestVersion` | semantic version string | 1 | Immutable publication version. |
 | `workload` | object | 1 | Workload metadata and classification. |
@@ -144,14 +143,13 @@ Required top-level fields:
 | `riskAcceptances` | array | 0-200 | Time-bound human risk decisions. |
 | `objectives` | array | 0-200 | SLO, RTO, RPO, capacity, and service-hour objectives. |
 | `ownership` | object | 1 | Operational and escalation ownership. |
-| `compatibility` | object | 1 | Compatibility and extension declarations. |
+| `compatibility` | `CompatibilityMetadata` | 1 | Single canonical location for schema, digest, and compatibility metadata. |
 | `audit` | object | 1 | Publication metadata and hash inputs. |
 
 ### JSON shape sketch
 
 ```json
 {
-  "schemaVersion": "1.0.0",
   "manifestId": "wl-synthetic-clinical-platform",
   "manifestVersion": "0.1.0",
   "workload": {
@@ -179,11 +177,17 @@ Required top-level fields:
   "riskAcceptances": [],
   "objectives": [],
   "ownership": {},
-  "compatibility": { "extensionPolicy": "rejectUnknownDecisionFields" },
-  "audit": {
-    "publishedBy": "human-approved-context-api",
+  "compatibility": {
+    "artifactKind": "workloadManifest",
+    "schemaVersion": "1.0.0",
+    "minimumReaderVersion": "1.0.0",
+    "requiresCapabilities": [],
+    "extensionPolicy": "rejectUnknownDecisionFields",
     "artifactDigest": "sha256:...",
     "semanticDigest": "sha256:..."
+  },
+  "audit": {
+    "publishedBy": "human-approved-context-api"
   }
 }
 ```
@@ -344,15 +348,13 @@ Required fields:
 | Field | Type | Bound | Notes |
 |---|---|---|---|
 | `snapshotId` | id | 1 | Stable immutable id. |
-| `snapshotSchemaVersion` | semantic version | 1 | Unknown major versions fail closed. |
+| `compatibility` | `CompatibilityMetadata` | 1 | Single canonical location for schema, digest, and compatibility metadata. |
 | `authorizedScopes` | `EvidenceScope` union array | 1-100 | Evidence-scope discriminated union; must be allowed by manifest. |
 | `collectedAt` | datetime | 1 | UTC. |
 | `expiresAt` | datetime | 1 | Must be after `collectedAt` and policy freshness threshold. |
 | `collector` | Azure MCP provenance | 1 | Tool names, versions, allowlist hash, MCP identity attestation. |
-| `mcpResponses` | array | 1-500 | Canonical response envelopes from approved MCP tools. |
+| `collectorAttempts` | `CollectorAttempt` union array | 1-500 | Digest-covered attempts, including failures and no-response outcomes. |
 | `evidenceRecords` | `EvidenceRecord` union array | 0-30,000 | Bounded evidence records with digest-covered provenance. |
-| `artifactDigest` | sha256 string | 1 | Digest of exact canonical snapshot bytes. |
-| `semanticDigest` | sha256 string | 1 | Digest of policy-affecting normalized fields. |
 
 Evidence record constraints:
 
@@ -389,29 +391,76 @@ or unusable.
 
 ### Cryptographic MCP provenance
 
-Each `mcpResponses` entry records the approved tool name, tool version, request shape digest,
-response envelope digest, collected time, and collector identity attestation. The response envelope
-digest covers the canonical MCP response after redaction of prohibited raw bodies and before
-projection into evidence records.
+Collector attempts use `attemptType` as the discriminator and forbid unknown properties. A snapshot
+with only failed attempts can still be valid when it contains profile-neutral `evidenceGap` records;
+it must not fabricate successful response attempts.
+
+| `attemptType` | Required fields | Bound and rule |
+|---|---|---|
+| `successResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `responseEnvelopeDigest`, `responseReceivedAt`, `collectorIdentityAttestationRef`, `attemptDigest` | Contains the canonical response envelope digest and can be cited by evidence items. |
+| `failedResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `failureCode`, `failureStatus`, `failureEnvelopeDigest`, `responseReceivedAt`, `collectorIdentityAttestationRef`, `attemptDigest` | Represents a tool response that failed schema, size, freshness, or service validation. |
+| `timeoutNoResponse` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `deadlineAt`, `timedOutAt`, `collectorIdentityAttestationRef`, `attemptDigest` | Represents no MCP response; no response envelope is present. |
+| `authorizationFailure` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `authorizationStatus`, `observedAt`, `collectorIdentityAttestationRef`, `attemptDigest` | Closed statuses: `denied`, `expiredCredential`, `scopeNotAllowed`, `identityMismatch`. |
+| `toolUnavailable` | `attemptId`, `toolName`, `toolVersion`, `requestShapeDigest`, `unavailableReason`, `observedAt`, `collectorIdentityAttestationRef`, `attemptDigest` | Closed reasons: `notAllowlisted`, `notHosted`, `versionUnavailable`, `networkUnavailable`, `mcpUnavailable`. |
+
+Every collector attempt has an `attemptDigest`: SHA-256 over the canonical attempt after excluding
+only `/attemptDigest` and closed transport-only fields. Successful response attempts also have a
+`responseEnvelopeDigest`, which covers the canonical MCP response after redaction of prohibited raw
+bodies and before projection into evidence records.
 
 Each evidence record contains:
 
 - `itemDigest`: SHA-256 over the canonical evidence record excluding only its own `itemDigest`
   field and non-semantic transport metadata listed in the canonicalization rules;
+- `collectorAttemptDigest`: SHA-256 of the collector attempt that produced the item or gap;
 - `sourceResponseDigest`: SHA-256 of the canonical MCP response envelope that produced the item;
-- `sourceResponsePointer`: JSON Pointer to the exact response item or aggregate input range;
+  required only when the cited collector attempt is `successResponse`;
+- `sourceResponsePointer`: JSON Pointer to the exact response item or aggregate input range; required
+  only when the cited collector attempt is `successResponse`;
 - `projectionAlgorithm`: stable id and semantic version for the projection logic; and
 - `collectorIdentityAttestationRef`: reference to the collector attestation in `collector`.
 
-The snapshot `artifactDigest` covers all `mcpResponses`, evidence records, item digests, and
-attestation references after excluding the snapshot's own digest fields. The `semanticDigest` covers
-only policy-affecting normalized fields and item digests. If an evidence item cannot be tied to a
-digest-covered MCP response item, it is invalid.
+The snapshot artifact digest covers all collector attempts, evidence records, item digests, and
+attestation references after excluding the snapshot's own digest fields. The semantic digest covers
+only fields allowed by the artifact kind's semantic projection allowlist. If an evidence item or gap
+cannot be tied to a digest-covered collector attempt, it is invalid. If a concrete evidence item
+cites a non-`successResponse` attempt, it is invalid; evidence gaps may cite any attempt type.
 
-The collector identity attestation stores no token. It records the authenticated private Azure MCP
-managed identity subject, tenant, issuer, audience, issued/expiry times, attestation digest, and the
-MCP host allowlist digest. A snapshot whose collector identity is the Athena context-plane identity
-or whose attestation cannot be verified is rejected.
+### Verifiable collector identity attestation
+
+The collector identity attestation stores no bearer token. It uses `attestationType =
+signedCollectorIdentity` and forbids unknown properties.
+
+| Field | Type | Bound | Notes |
+|---|---|---|---|
+| `attestationId` | id | 1 | Referenced by collector attempts and evidence records. |
+| `algorithm` | enum | 1 | Allowed value for WC-001: `RS256`. |
+| `keyId` | string | 1 | Grammar: `^entra:[0-9a-fA-F-]{36}:[A-Za-z0-9_-]{8,128}$`. |
+| `trustAnchorRef` | string | 1 | References a configured Entra tenant OIDC/JWKS trust anchor. |
+| `signedClaims` | object | 1 | Closed claims listed below. |
+| `signature` | base64url string | 1 | Detached JWS signature over the canonical preimage. |
+| `verification` | object | 1 | Verification time and status. |
+| `attestationDigest` | digest string | 1 | Digest over the attestation excluding digest/signature fields. |
+
+The signed claim set is closed: `issuer`, `audience`, `tenantId`, `managedIdentityObjectId`,
+`managedIdentityClientId`, `subject`, `mcpHostId`, `toolAllowlistDigest`, `toolName`,
+`toolVersion`, `issuedAt`, `expiresAt`, and `nonce`. The signed preimage is the RFC 8785 JCS
+canonical form of `{ "attestationId": ..., "algorithm": ..., "keyId": ..., "trustAnchorRef": ...,
+"signedClaims": ... }` after the repository's pre-validation string normalization step.
+
+Trust-anchor resolution is closed and environment-configured: `trustAnchorRef` must resolve to the
+expected Entra tenant issuer, audience, and JWKS URI for the private Azure MCP deployment. The
+`keyId` tenant component must match `signedClaims.tenantId`, and the key must be present in the
+resolved JWKS at verification time. Verification statuses are `valid`, `expired`, `notYetValid`,
+`badSignature`, `unknownKey`, `untrustedIssuer`, `audienceMismatch`, `claimMismatch`, and
+`trustAnchorUnavailable`. Publication and evaluation require `verification.status = valid` at the
+snapshot `collectedAt` time.
+
+Collector identity, tool name, and tool version used by evidence records are derived only from the
+verified signed claims plus the digest-covered collector attempt. They are not trusted from
+caller-supplied request fields. A snapshot whose collector identity is the Athena context-plane
+identity, whose tool/version is not allowlisted, or whose attestation is not verifiably `valid` is
+rejected.
 
 ## Provenance references
 
@@ -435,6 +484,7 @@ Every policy finding carries structured provenance:
     "mcpTool": "azure.resourceInventory.read",
     "mcpToolVersion": "1.0.0",
     "collectorIdentityRef": "mi-private-azure-mcp-readonly",
+    "collectorAttemptDigest": "sha256:...",
     "sourceResponseDigest": "sha256:...",
     "sourceResponsePointer": "/value/0"
   }
@@ -460,7 +510,8 @@ Findings may not be evidence-free. When the finding is about missing evidence, i
     "resourceGroupName": "rg-athena-fixture"
   },
   "expectedRecordType": "resource",
-  "collectorAttemptRef": "mcp-response-attempt-001"
+  "collectorAttemptRef": "attempt-worker-zone-001",
+  "collectorAttemptDigest": "sha256:..."
 }
 ```
 
@@ -862,32 +913,37 @@ Digests must be implementable without recursion and must be language-independent
 
 Canonicalization standard:
 
-1. Encode canonical documents as UTF-8 JSON with no byte order mark.
-2. Use RFC 8785 JSON Canonicalization Scheme rules for object property sorting, string escaping, and
-   whitespace removal.
-3. Sort object members lexicographically by Unicode code point after NFC normalization.
-4. Preserve array order only where order is semantically meaningful. For keyed collections, sort by
-   normalized stable id before serialization.
-5. Normalize strings to Unicode NFC, trim no characters implicitly, and reject unpaired surrogates.
-6. Normalize datetimes to UTC RFC 3339 with exactly millisecond precision and `Z`, for example
-   `2026-08-15T00:00:00.000Z`. Leap seconds are rejected.
-7. Numbers use RFC 8785 shortest round-trippable JSON form. NaN, infinity, negative zero, and numbers
-   outside IEEE-754 safe integer range are rejected unless the schema declares the field as a string.
-8. Booleans and null retain JSON native forms. Semantically relevant nulls are preserved.
-9. Hash algorithm is SHA-256 over the canonical UTF-8 byte sequence. Digest strings use lowercase
+1. Parse JSON and reject duplicate object member names before any normalization.
+2. Pre-validate and normalize every object member name and string value to Unicode NFC. If two member
+   names in the same object normalize to the same string, reject the artifact as
+   `normalizationCollision`. No trimming, case-folding, or semantic string rewriting is allowed.
+3. Normalize datetimes to UTC RFC 3339 with exactly millisecond precision and `Z`, for example
+   `2026-08-15T00:00:00.000Z`, before JSON serialization. Leap seconds are rejected.
+4. Reject unpaired surrogates, NaN, infinity, negative zero, and numbers outside IEEE-754 safe
+   integer range unless the schema declares the field as a string.
+5. Sort keyed collections by their normalized stable id before serialization; preserve array order
+   for arrays whose order is semantically meaningful.
+6. After those pre-validation transformations, apply RFC 8785 JSON Canonicalization Scheme
+   unmodified, including JCS object member ordering, string escaping, whitespace removal, and number
+   serialization. Do not add custom code-point sorting after JCS.
+7. Encode the JCS output as UTF-8 with no byte order mark.
+8. Hash algorithm is SHA-256 over the canonical UTF-8 byte sequence. Digest strings use lowercase
    `sha256:<64 lowercase hex characters>`.
+
+Canonicalization tests must include composed/decomposed Unicode equivalence, normalized-key
+collision rejection, JCS ordering using UTF-16 code-unit semantics, datetime normalization, numeric
+edge rejection, keyed collection sorting, and byte-for-byte cross-language digest fixtures.
 
 Self-digest exclusion rules:
 
 | Digest | Input | Excluded fields before canonicalization |
 |---|---|---|
-| Manifest `artifactDigest` | Entire manifest artifact | `/audit/artifactDigest`, `/audit/semanticDigest`, transport-only envelope fields. |
-| Manifest `semanticDigest` | Resolved policy-affecting manifest projection | `/audit/artifactDigest`, `/audit/semanticDigest`, documentation-only metadata, non-semantic `extensions`, and transport-only envelope fields. |
-| Snapshot `artifactDigest` | Entire evidence snapshot artifact | `/artifactDigest`, `/semanticDigest`, transport-only envelope fields. |
-| Snapshot `semanticDigest` | Evidence snapshot policy projection | `/artifactDigest`, `/semanticDigest`, non-policy collector diagnostics, and transport-only envelope fields. |
+| Artifact `artifactDigest` | Entire artifact | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, transport-only envelope fields. |
+| Artifact `semanticDigest` | Closed semantic projection for the artifact kind | `/compatibility/artifactDigest`, `/compatibility/semanticDigest`, and fields outside the artifact kind's semantic pointer allowlist. |
 | Evidence record `itemDigest` | One evidence record | `/itemDigest` and transport-only envelope fields for that record. |
 | MCP response `responseEnvelopeDigest` | One canonical MCP response envelope | `/responseEnvelopeDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
 | Collector `attestationDigest` | One collector identity attestation | `/attestationDigest`, `/signature`, and token material. |
+| Collector attempt `attemptDigest` | One collector attempt | `/attemptDigest` and transport-only envelope fields for that attempt. |
 
 Transport-only envelope fields are closed: `requestId`, `correlationId`, `retryCount`,
 `transportLatencyMs`, `receivedAt`, and `rawTransportHeaders`. No other field may be excluded
@@ -895,16 +951,42 @@ without a compatibility change. Exclusion happens before sorting and hashing. Ha
 recomputes all child item digests first, then response/attestation digests, then artifact and
 semantic digests; cycles are invalid.
 
+### Semantic projection pointer allowlists
+
+Each artifact has one canonical `/compatibility` object containing schema, digest, and compatibility
+metadata. `artifactDigest` and `semanticDigest` must not appear anywhere else. Duplicating them in
+`audit`, snapshot roots, findings, or generated schemas is invalid rather than reconciled.
+
+`semanticDigest` is calculated from a projection built only from these pointer allowlists. Pointer
+patterns use `*` for one array item or map value and are closed; any policy-affecting field not
+matched by the allowlist requires a compatibility update before publication.
+
+| Artifact kind | Semantic projection pointer allowlist |
+|---|---|
+| `workloadManifest` | `/compatibility/schemaVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities`, `/manifestId`, `/manifestVersion`, `/workload`, `/profiles`, `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, `/ownership` |
+| `resolvedProfile` | `/compatibility/schemaVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities`, `/manifestId`, `/manifestVersion`, `/profileId`, `/settings`, `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, `/ownership` |
+| `evidenceSnapshot` | `/compatibility/schemaVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities`, `/snapshotId`, `/authorizedScopes`, `/collectedAt`, `/expiresAt`, `/collector/trustAnchorRef`, `/collector/attestations/*/attestationDigest`, `/collectorAttempts/*/attemptDigest`, `/evidenceRecords/*/itemDigest` |
+| `contextualFinding` | `/compatibility/schemaVersion`, `/findingId`, `/findingKind`, `/verdict`, `/governanceScope`, `/contextRef`, `/evidenceRefs`, `/relationshipClassRefs`, `/confidence`, `/residualRisk`, `/nextActions` |
+| `generatedJsonSchema` | `/compatibility/schemaVersion`, `/$id`, `/type`, `/required`, `/properties`, `/oneOf`, `/anyOf`, `/additionalProperties`, `/definitions`, `/$defs` |
+
+Closed semantic exclusions are only `/compatibility/artifactDigest`, `/compatibility/semanticDigest`,
+`/compatibility/producedBy`, `/audit`, `/displayName`, `/description`, `/documentation`, `/examples`,
+non-semantic `extensions`, and transport-only envelope fields. The previous undefined categories
+from earlier drafts are not valid exclusion rules; implementation must use only the pointer
+allowlists and exclusions above.
+
 ## Compatibility and versioning
 
 Compatibility metadata is a closed contract, not a free-form map.
 
 | Field | Type | Bound | Notes |
 |---|---|---|---|
+| `artifactKind` | enum | 1 | `workloadManifest`, `resolvedProfile`, `evidenceSnapshot`, `contextualFinding`, or `generatedJsonSchema`. |
 | `schemaVersion` | semantic version | 1 | Artifact schema version. |
 | `minimumReaderVersion` | semantic version | 1 | Minimum reader contract version required to process this artifact. |
 | `requiresCapabilities` | array of `CapabilityRequirement` | 0-50 | Required for policy-affecting optional fields or enum/union additions. |
 | `producedBy` | `ProducerInfo` | 1 | Tool name/version that produced the artifact. |
+| `extensionPolicy` | enum | 1 | `rejectUnknownDecisionFields` for WC-001. |
 | `artifactDigest` | digest string | 1 | Exact canonical bytes digest. |
 | `semanticDigest` | digest string | 1 | Policy semantics digest. |
 
@@ -934,12 +1016,12 @@ Compatibility rules:
 
 1. `schemaVersion` follows `MAJOR.MINOR.PATCH`.
 2. Unsupported major versions are rejected.
-3. Each artifact carries `artifactDigest` and `semanticDigest`.
+3. Each artifact carries `artifactDigest` and `semanticDigest` only under `/compatibility`.
 4. `artifactDigest` covers exact canonical bytes after key sorting, id normalization, transport
    metadata removal, and preservation of semantically relevant nulls.
-5. `semanticDigest` covers policy-affecting normalized fields, resolved references, discriminators,
-   and evidence item digests. Non-policy documentation metadata may change artifact digest without
-   changing semantic digest.
+5. `semanticDigest` covers only the artifact kind's closed semantic pointer allowlist. Fields outside
+   that allowlist, such as `/displayName`, `/description`, `/documentation`, and `/examples`, may
+   change artifact digest without changing semantic digest.
 6. Minor versions may add non-policy optional metadata only when older readers can ignore it safely
    and semantic digest is unchanged.
 7. Policy-affecting optional fields, new proof variants, new control variants, new evidence record
@@ -1065,6 +1147,7 @@ class EvidenceItemRefSketch(ClosedSketch):
     snapshot_artifact_digest: str
     snapshot_semantic_digest: str
     evidence_item_digest: str
+    collector_attempt_digest: str
     source_response_digest: str
     source_response_pointer: str
 
@@ -1075,6 +1158,7 @@ class EvidenceGapRefSketch(ClosedSketch):
     gap_reason: str
     evidence_scope: EvidenceScopeSketch
     expected_record_type: str
+    collector_attempt_digest: str
 
 EvidenceReferenceSketch = Annotated[
     Union[EvidenceItemRefSketch, EvidenceGapRefSketch],
@@ -1083,14 +1167,13 @@ EvidenceReferenceSketch = Annotated[
 
 class EvidenceSnapshotSketch(ClosedSketch):
     snapshot_id: str
-    snapshot_schema_version: str
+    compatibility: CompatibilityMetadataSketch
     collected_at: datetime
     expires_at: datetime
     collector: AzureMcpCollectorProvenanceSketch
     authorized_scopes: list[EvidenceScopeSketch]  # min 1, max 100
+    collector_attempts: list[CollectorAttemptSketch]  # discriminated union, min 1, max 500
     evidence_records: list[EvidenceRecordSketch]  # discriminated union, max 30_000
-    artifact_digest: str
-    semantic_digest: str
 
 class ContextualFindingSketch(ClosedSketch):
     finding_id: str
@@ -1124,13 +1207,15 @@ Generated JSON Schemas must exist for at least:
 - immutable evidence snapshot;
 - evidence record union and every record variant;
 - evidence reference union, including evidence gap references;
+- collector attempt union and every attempt variant;
+- signed collector identity attestation and verification status;
 - contextual finding, finding kind, and verdict;
 - architecture constraint and proof requirement union;
 - compensating control union and every control variant;
 - risk acceptance;
 - objective;
 - operational ownership reference; and
-- compatibility metadata.
+- closed compatibility metadata and capability negotiation outcome.
 
 Schemas must include `$id`, schema version, required properties, enum values, discriminators,
 `oneOf`/`anyOf` structure where appropriate, min/max collection bounds, `additionalProperties:
@@ -1164,40 +1249,49 @@ false`, string length limits, capability metadata, and cross-reference validatio
    across key ordering differences, with both artifact and semantic digests verified.
 12. Evidence records include digest-covered item-to-MCP-response provenance and authenticated
     collector identity attestation.
-13. Evidence gap records are profile-neutral and contain no `neededForClauseRef`, profile id,
-    verdict, or `notRequiredByProfile` judgment.
-14. Evidence collected by the Athena context identity for Azure resources is rejected; only the
-    private Azure MCP collector identity reference is valid for Azure evidence.
-15. Selector tests cover exact ids, tag predicates, type scope, composites, over-broad matches,
-    out-of-scope matches, and low-confidence ambiguous matches.
-16. The exact three-profile oracle evaluates `snap-wc001-canonical-001` under Production,
-    Development, and Training through one code path and matches every verdict in the expected
-    matrix.
-17. Development profile SPOF observations cite the actual `athena-db-01` evidence item and the
-    resolved `zoneLossContinuityRequired = false` context path; no evidence-gap record is emitted for
-    this case.
-18. Active database singleton risk acceptance produces `acceptedResidualRisk` as a separate finding
-    and never converts the singleton constraint to `pass`.
-19. Distinct `technologyConstraint`, `actualSpof`, `controlHealth`, and `riskAcceptance` finding
-    kinds are emitted for the singleton database risk model.
-20. Expired risk acceptance, stale control evidence, missing owner, and absent rationale fail closed.
-21. Unknown schema major version, unknown required capability, unknown enum value, unknown
-    discriminator, oversized collection, unsupported extension, malformed digest, stale evidence,
-    and unapproved Azure MCP tool all fail closed.
-22. Policy-affecting optional fields or enum additions require capability/minimum-reader negotiation
-    or a major version; older readers cannot silently ignore them.
-23. Capability negotiation tests cover `supported`, `readerTooOld`, `unknownCapability`, and
-    `versionTooLow` outcomes.
-24. Canonicalization tests prove artifact/item/response/attestation digests exclude only their own
-    digest fields and the closed transport metadata fields, avoiding recursive self-hashing.
-25. Context API publication tests prove agents and Context MCP proposal paths cannot publish
-    authoritative manifests.
-26. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
-    alter semantic digest, patch versions preserve semantics, and incompatible major versions reject.
-27. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
-    payload fields are accepted in manifests or evidence snapshots.
-28. Repository validation, lint, type checks, and unit tests pass after implementation; this design
-    change itself requires repository markdown/customization validation only.
+13. Collector-attempt tests cover `successResponse`, `failedResponse`, `timeoutNoResponse`,
+   `authorizationFailure`, and `toolUnavailable`; collector-unavailable snapshots can contain valid
+   evidence gaps without successful MCP responses.
+14. Collector identity attestation tests verify `RS256` signature, key id grammar, trust-anchor
+   resolution, claim derivation, verification time/status, and fail closed for every non-`valid`
+   status.
+15. Evidence gap records are profile-neutral and contain no `neededForClauseRef`, profile id,
+   verdict, or `notRequiredByProfile` judgment.
+16. Evidence collected by the Athena context identity for Azure resources is rejected; only the
+   private Azure MCP collector identity reference is valid for Azure evidence.
+17. Selector tests cover exact ids, tag predicates, type scope, composites, over-broad matches,
+   out-of-scope matches, and low-confidence ambiguous matches.
+18. The exact three-profile oracle evaluates `snap-wc001-canonical-001` under Production,
+   Development, and Training through one code path and matches every verdict in the expected
+   matrix.
+19. Development profile SPOF observations cite the actual `athena-db-01` evidence item and the
+   resolved `zoneLossContinuityRequired = false` context path; no evidence-gap record is emitted for
+   this case.
+20. Active database singleton risk acceptance produces `acceptedResidualRisk` as a separate finding
+   and never converts the singleton constraint to `pass`.
+21. Distinct `technologyConstraint`, `actualSpof`, `controlHealth`, and `riskAcceptance` finding
+   kinds are emitted for the singleton database risk model.
+22. Expired risk acceptance, stale control evidence, missing owner, and absent rationale fail closed.
+23. Unknown schema major version, unknown required capability, unknown enum value, unknown
+   discriminator, oversized collection, unsupported extension, malformed digest, stale evidence,
+   and unapproved Azure MCP tool all fail closed.
+24. Policy-affecting optional fields or enum additions require capability/minimum-reader negotiation
+   or a major version; older readers cannot silently ignore them.
+25. Capability negotiation tests cover `supported`, `readerTooOld`, `unknownCapability`, and
+   `versionTooLow` outcomes.
+26. Compatibility placement tests prove schema, digest, and compatibility metadata appear only under
+   `/compatibility`, and semantic projection uses only closed pointer allowlists.
+27. Canonicalization tests prove NFC pre-validation with collision rejection followed by unmodified
+   RFC 8785 JCS, and prove artifact/item/response/attestation/attempt digests exclude only their own
+   digest fields and the closed transport metadata fields, avoiding recursive self-hashing.
+28. Context API publication tests prove agents and Context MCP proposal paths cannot publish
+   authoritative manifests.
+29. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
+   alter semantic digest, patch versions preserve semantics, and incompatible major versions reject.
+30. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
+   payload fields are accepted in manifests or evidence snapshots.
+31. Repository validation, lint, type checks, and unit tests pass after implementation; this design
+   change itself requires repository markdown/customization validation only.
 
 ## Architecture-review questions for GPT-5.6 Sol
 

@@ -52,10 +52,13 @@ The canonical contracts are:
    semantics apply.
 6. **Immutable evidence snapshots.** Evidence snapshots are canonicalized, hashed, freshness-bound,
    scope-bound, and immutable. Each evidence item carries digest-covered provenance back to a
-   specific MCP response item and an authenticated collector identity attestation for the private
-   Azure MCP managed identity. Evidence records are profile-neutral and do not contain Athena
-   judgments such as clause paths, verdicts, or profile-specific `not required` statements. They do
-   not contain unrestricted log bodies, secrets, PHI, PII, or customer proprietary payloads.
+   specific digest-covered collector attempt. Collector attempts are closed variants for successful
+   response, failed response, timeout/no-response, authorization failure, and tool-unavailable
+   outcomes, so collector-unavailable snapshots can be valid without fabricated MCP responses. Every
+   attempt cites a verifiable signed collector identity attestation for the private Azure MCP
+   managed identity. Evidence records are profile-neutral and do not contain Athena judgments such
+   as clause paths, verdicts, or profile-specific `not required` statements. They do not contain
+   unrestricted log bodies, secrets, PHI, PII, or customer proprietary payloads.
 7. **Provenance boundary.** Findings cite both a manifest clause and evidence reference. Context-plane
    provenance and private Azure MCP evidence-plane provenance remain distinct. The Athena context
    identity has no workload Reader role and never becomes the collector of Azure evidence. Findings
@@ -84,11 +87,13 @@ The canonical contracts are:
 13. **Compatibility.** Contract schema versions use semantic versioning and include separate
     artifact and semantic digests. Policy-affecting optional fields and enum additions require
     closed `requiresCapabilities` and `minimumReaderVersion` metadata plus deterministic negotiation,
-    or a major version. Digests use language-independent canonical JSON, exclude only their own
-    digest fields and closed transport metadata, and use SHA-256. Unknown major versions, unknown
-    required capabilities, unknown enum values, malformed extensions, stale evidence, ambiguous
-    selectors, or unbounded collections are rejected or evaluated as fail-closed findings before
-    publication or policy use.
+    or a major version. Schema, digest, and compatibility metadata live only under `/compatibility`.
+    Digests use pre-validation NFC normalization with collision rejection, then unmodified RFC 8785
+    JCS, exclude only their own digest fields and closed transport metadata, and use SHA-256.
+    Semantic digests use closed pointer allowlists. Unknown major versions, unknown required
+    capabilities, unknown enum values, malformed extensions, stale evidence, ambiguous selectors, or
+    unbounded collections are rejected or evaluated as fail-closed findings before publication or
+    policy use.
 
 ## Declared-versus-inferred precedence
 
@@ -178,7 +183,7 @@ recreate generic Azure MCP capability. Narrow direct-read exceptions require a f
 The implementation phase must satisfy the measurable acceptance criteria in the design
 specification, including generated JSON Schemas with `additionalProperties: false`, discriminated
 union tests, closed enum tests, bounded collection tests, deterministic merge/cross-reference tests,
-distinct provenance tests, cryptographic MCP response provenance tests, evidence freshness and scope
-tests, the exact three-profile oracle, and compatibility/fail-closed tests. Implementation must not
-begin until the GPT-5.6 Sol Architecture Reviewer returns `approved-for-implementation` or this ADR
-is corrected.
+distinct provenance tests, collector-attempt and signed-attestation tests, canonicalization/digest
+fixture tests, evidence freshness and scope tests, the exact three-profile oracle, and
+compatibility/fail-closed tests. Implementation must not begin until the GPT-5.6 Sol Architecture
+Reviewer returns `approved-for-implementation` or this ADR is corrected.
