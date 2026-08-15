@@ -1262,7 +1262,9 @@ Canonicalization standard:
    names in the same object normalize to the same string, reject the artifact as
    `normalizationCollision`. No trimming, case-folding, or semantic string rewriting is allowed.
 3. Normalize datetimes to UTC RFC 3339 with exactly millisecond precision and `Z`, for example
-   `2026-08-15T00:00:00.000Z`, before JSON serialization. Leap seconds are rejected.
+   `2026-08-15T00:00:00.000Z`, before JSON serialization. Reject timestamps that are not exactly
+   representable at millisecond precision; never truncate or round submillisecond values. Leap
+   seconds are rejected.
 4. Reject unpaired surrogates, NaN, infinity, negative zero, and numbers outside IEEE-754 safe
    integer range unless the schema declares the field as a string.
 5. Sort keyed collections by their normalized stable id before serialization; preserve array order

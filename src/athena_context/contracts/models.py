@@ -95,9 +95,14 @@ class AthenaBaseModel(BaseModel):
     def validate_timezone_aware_datetimes(self) -> AthenaBaseModel:
         for field_name in self.__class__.model_fields:
             value = getattr(self, field_name)
-            if isinstance(value, datetime) and value.tzinfo is None:
+            if isinstance(value, datetime):
                 alias = self.__class__.model_fields[field_name].alias or field_name
-                raise AthenaValidationError(f"{alias} must be timezone-aware")
+                if value.tzinfo is None:
+                    raise AthenaValidationError(f"{alias} must be timezone-aware")
+                if value.microsecond % 1000:
+                    raise AthenaValidationError(
+                        f"{alias} precision must be exactly representable in milliseconds"
+                    )
         return self
 
 
@@ -668,7 +673,7 @@ type Sha256Digest = Annotated[
 ]
 _UTC_DATETIME_PATTERN = (
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:"
-    r"[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+    r"[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?(?:Z|\+00:00)$"
 )
 _UTC_DATETIME_RE = re.compile(_UTC_DATETIME_PATTERN)
 
@@ -684,6 +689,10 @@ def _validate_utc_lexical_value(value: Any) -> Any:
 def _validate_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
         raise AthenaValidationError("timestamp must be UTC")
+    if value.microsecond % 1000:
+        raise AthenaValidationError(
+            "timestamp precision must be exactly representable in milliseconds"
+        )
     return value
 
 

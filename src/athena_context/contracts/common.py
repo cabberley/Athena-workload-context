@@ -45,6 +45,10 @@ def _normalize_datetime_string(value: str) -> str:
     except ValueError:
         return value
     utc_value = parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    if utc_value.microsecond % 1000:
+        raise AthenaValidationError(
+            "timestamp precision must be exactly representable in milliseconds"
+        )
     if utc_value.microsecond:
         return utc_value.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     return utc_value.strftime("%Y-%m-%dT%H:%M:%S") + ".000Z"
@@ -76,6 +80,10 @@ def _normalize_json_value(value: Any) -> Any:
         return value
     if isinstance(value, datetime):
         utc_value = value.astimezone(UTC)
+        if utc_value.microsecond % 1000:
+            raise AthenaValidationError(
+                "timestamp precision must be exactly representable in milliseconds"
+            )
         if utc_value.microsecond:
             iso = utc_value.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         else:

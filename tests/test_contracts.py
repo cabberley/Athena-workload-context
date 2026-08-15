@@ -117,6 +117,11 @@ _DEFAULT_ATTESTATION_PRIVATE_KEY = rsa.generate_private_key(
 )
 
 
+def _utc_ms_now() -> datetime:
+    now = datetime.now(tz=UTC)
+    return now.replace(microsecond=(now.microsecond // 1000) * 1000)
+
+
 def build_manifest() -> WorkloadManifest:
     roles = [
         WorkloadRole(
@@ -287,7 +292,22 @@ def test_datetime_string_normalization_matches_datetime_object_digest() -> None:
     assert compute_artifact_digest(payload_string) == compute_artifact_digest(payload_datetime)
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        datetime(2025, 1, 2, 13, 0, 0, 999, tzinfo=UTC),
+        "2025-01-02T13:00:00.000999Z",
+    ],
+)
+def test_digest_canonicalization_rejects_submillisecond_timestamps(
+    timestamp: datetime | str,
+) -> None:
+    with pytest.raises(AthenaValidationError, match="milliseconds"):
+        compute_artifact_digest({"expiresAt": timestamp})
+
+
 def test_risk_acceptance_and_finding_valid() -> None:
+    now = _utc_ms_now()
     acceptance = RiskAcceptance(
         riskAcceptanceId="ra-db-zone-loss-prod",
         governanceScope=GovernanceProfileScope(
@@ -297,8 +317,8 @@ def test_risk_acceptance_and_finding_valid() -> None:
         ),
         ownerRef="technical-owner",
         rationale="Accept singleton database zone-loss risk for the approved production profile.",
-        acceptedAt=datetime.now(tz=UTC),
-        expiresAt=datetime.now(tz=UTC) + timedelta(days=30),
+        acceptedAt=now,
+        expiresAt=now + timedelta(days=30),
         active=True,
         appliesToClausePath="/constraints/db-zone-loss-spof",
     )
@@ -329,7 +349,7 @@ def test_risk_acceptance_and_finding_valid() -> None:
             collectorAttemptDigest="sha256:" + "d" * 64,
             collectorToolName="azure.resourceInventory.read",
             collectorToolVersion="1.0.0",
-            collectorAttemptAt=datetime.now(tz=UTC),
+            collectorAttemptAt=now,
             collectorIdentityEvidenceRef="identity-111111111111",
             sourceResponseDigest="sha256:" + "e" * 64,
             sourceResponsePointer="/value/0",
@@ -356,6 +376,7 @@ def test_capability_and_scope_variants_are_valid() -> None:
 
 
 def test_evidence_reference_and_gap_models_validate() -> None:
+    now = _utc_ms_now()
     item_ref = EvidenceItemRef(
         refType="evidenceItem",
         snapshotId="snap-222222222222",
@@ -366,7 +387,7 @@ def test_evidence_reference_and_gap_models_validate() -> None:
         collectorAttemptDigest="sha256:" + "d" * 64,
         collectorToolName="azure.resourceInventory.read",
         collectorToolVersion="1.0.0",
-        collectorAttemptAt=datetime.now(tz=UTC),
+        collectorAttemptAt=now,
         collectorIdentityEvidenceRef="identity-111111111111",
         sourceResponseDigest="sha256:" + "e" * 64,
         sourceResponsePointer="/value/0",
@@ -390,7 +411,7 @@ def test_evidence_reference_and_gap_models_validate() -> None:
         collectorAttemptDigest="sha256:" + "d" * 64,
         collectorToolName="azure.resourceInventory.read",
         collectorToolVersion="1.0.0",
-        collectorAttemptAt=datetime.now(tz=UTC),
+        collectorAttemptAt=now,
         collectorIdentityEvidenceRef="identity-111111111111",
         gapReason="missing",
     )
