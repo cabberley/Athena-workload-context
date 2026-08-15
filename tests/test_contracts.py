@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import TypeAdapter, ValidationError
 
 from athena_context import __version__
 from athena_context.contracts import (
+    AthenaValidationError,
     CapabilityRequirement,
     CollectorIdentityEvidence,
     CompatibilityMetadata,
@@ -32,6 +36,7 @@ from athena_context.contracts import (
     RoleCardinalityBoundedRange,
     RoleCardinalityExactlyOne,
     Selector,
+    ServiceHealthRegionScope,
     SnapshotCollector,
     SubscriptionScope,
     SuccessResponseCollectorAttempt,
@@ -433,7 +438,7 @@ def _build_valid_snapshot() -> EvidenceSnapshot:
             "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
             "toolName": attempt.tool_name,
             "toolVersion": attempt.tool_version,
-            "sourceResponseDigest": _sha256("source-response"),
+            "sourceResponseDigest": attempt.response_digest,
             "sourceResponsePointer": "/properties/vmSize",
         },
         itemDigest=_sha256("resource-item"),
@@ -452,7 +457,7 @@ def _build_valid_snapshot() -> EvidenceSnapshot:
         collectorToolVersion=attempt.tool_version,
         collectorAttemptAt=attempt.response_received_at,
         collectorIdentityEvidenceRef=collector.collector_identity_evidence_ref,
-        sourceResponseDigest=_sha256("source-response"),
+        sourceResponseDigest=attempt.response_digest,
         sourceResponsePointer="/properties/vmSize",
     )
     snapshot = EvidenceSnapshot(
@@ -670,3 +675,246 @@ def test_ingestion_signature_rejects_fabricated_or_none_algorithm() -> None:
                 keyVersion="0123456789abcdef0123456789abcdef",
             ),
         )
+
+    with pytest.raises(ValidationError):
+        IngestionSignature(
+            signatureAlgorithm="RS256",
+            keyVaultKeyId="https://contoso.vault.azure.net\\keys\\athena-key\\0123456789abcdef0123456789abcdef",
+            keyVersion="0123456789abcdef0123456789abcdef",
+            signedPreimageDigest=_sha256("payload"),
+            signature="AQID",
+            signedAt=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
+            trustAnchorRef="https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
+            keyStatusAtSigning="active",
+            signatureVerification=IngestionSignatureVerification(
+                status="valid",
+                verifiedAt=datetime(2025, 1, 2, 12, 1, tzinfo=UTC),
+                keyVersion="0123456789abcdef0123456789abcdef",
+            ),
+        )
+
+
+def _build_valid_identity_evidence(
+    *,
+    private_key: rsa.RSAPrivateKey,
+    tenant_id: str = "11111111-1111-1111-1111-111111111111",
+    trust_anchor: str = "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef",
+) -> CollectorIdentityEvidence:
+    now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
+    token_hash = _sha256("token-1")
+    token_verification_digest = _sha256("token-verification")
+    attempt = {
+        "attemptType": "successResponse",
+        "attemptId": "attempt-success-identity-evidence",
+        "attemptStartedAt": now.isoformat(),
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0",
+        "requestDigest": _sha256("req-identity"),
+        "responseDigest": _sha256("resp-identity"),
+        "responseReceivedAt": (now + timedelta(seconds=5)).isoformat(),
+        "collectorIdentityEvidenceRef": "identity-evidence-private-azure-mcp",
+    }
+    attempt_payload = attempt.copy()
+    attempt["attemptDigest"] = compute_artifact_digest(attempt_payload)
+    attempt_binding_payload = {
+        key: value for key, value in attempt.items() if key != "collectorIdentityEvidenceRef"
+    }
+    derivation_payload = {
+        "derivationPreimageType": "athena.mcpCollectorAttemptDerivation",
+        "derivationPreimageVersion": "1.0.0",
+        "schemaVersion": "1.0.0",
+        "semanticContractVersion": "1.0.0",
+        "policyContractVersion": "1.0.0",
+        "identityEvidenceId": "identity-evidence-private-azure-mcp",
+        "tokenHash": token_hash,
+        "tokenVerificationStatus": "valid",
+        "tokenVerificationDigest": token_verification_digest,
+        "mcpHostId": "mcp-host-001",
+        "mcpHostTenantId": tenant_id,
+        "mcpHostManagedIdentityObjectId": "object-123",
+        "mcpHostManagedIdentityClientId": "client-123",
+        "ingestionServiceId": "azure-mcp-ingestion",
+        "ingestionAudience": "api://athena-ingestion",
+        "toolAllowlistDigest": _sha256("allowlist"),
+        "derivedCollectorIdentityRef": "identity-evidence-private-azure-mcp",
+        "attemptBinding": {
+            **attempt_binding_payload,
+            "attemptStartedAt": datetime.fromisoformat(
+                attempt_binding_payload["attemptStartedAt"]
+            ),
+            "responseReceivedAt": datetime.fromisoformat(
+                attempt_binding_payload["responseReceivedAt"]
+            ),
+            "attemptDigest": attempt_binding_payload["attemptDigest"],
+        },
+        "derivedAt": now,
+    }
+    derivation_payload["derivationDigest"] = compute_artifact_digest(
+        {**derivation_payload, "derivedAt": now.isoformat()}
+    )
+    canonical_preimage = canonicalize_json(
+        {
+            key: value
+            for key, value in derivation_payload.items()
+            if key != "derivationDigest"
+        }
+    )
+    signature = base64.b64encode(
+        private_key.sign(
+            canonical_preimage.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    ).decode("ascii")
+    identity_payload = {
+        "identityEvidenceId": "identity-evidence-private-azure-mcp",
+        "identityEvidenceType": "entraJwtTokenEvidence",
+        "tokenHash": token_hash,
+        "jwtHeader": {"alg": "RS256", "kid": "abc12345", "typ": "JWT"},
+        "trustAnchorRef": trust_anchor,
+        "verifiedClaims": {
+            "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+            "audience": "api://athena-ingestion",
+            "tenantId": tenant_id,
+            "managedIdentityObjectId": "object-123",
+            "managedIdentityClientId": "client-123",
+            "subject": "object-123",
+            "jti": "jti-123",
+            "issuedAt": now - timedelta(minutes=5),
+            "expiresAt": now + timedelta(minutes=30),
+        },
+        "tokenVerification": {
+            "status": "valid",
+            "verifiedAt": now,
+            "keyId": "abc12345",
+            "tokenVerificationDigest": token_verification_digest,
+        },
+        "ingestionDerivation": {
+            **derivation_payload,
+            "attemptBinding": {
+                **attempt_binding_payload,
+                "attemptStartedAt": datetime.fromisoformat(
+                    attempt_binding_payload["attemptStartedAt"]
+                ),
+                "responseReceivedAt": datetime.fromisoformat(
+                    attempt_binding_payload["responseReceivedAt"]
+                ),
+                "attemptDigest": attempt_binding_payload["attemptDigest"],
+            },
+            "derivedAt": now,
+        },
+        "ingestionSignature": {
+            "signatureAlgorithm": "RS256",
+            "keyVaultKeyId": trust_anchor,
+            "keyVersion": "0123456789abcdef0123456789abcdef",
+            "signedPreimageDigest": derivation_payload["derivationDigest"],
+            "signature": signature,
+            "signedAt": now,
+            "trustAnchorRef": trust_anchor,
+            "keyStatusAtSigning": "active",
+            "signatureVerification": {
+                "status": "valid",
+                "verifiedAt": now + timedelta(seconds=1),
+                "keyVersion": "0123456789abcdef0123456789abcdef",
+            },
+        },
+    }
+    identity_payload["identityEvidenceDigest"] = compute_artifact_digest(
+        {
+            key: value
+            for key, value in identity_payload.items()
+            if key != "identityEvidenceDigest"
+        }
+    )
+    return CollectorIdentityEvidence.model_validate(identity_payload)
+
+
+def test_key_vault_signature_verifies_and_rejects_forgery() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    evidence = _build_valid_identity_evidence(private_key=private_key)
+    assert evidence.verify_signature(
+        key_resolver=lambda key_id: public_key,
+        trust_anchor_ref=evidence.trust_anchor_ref,
+    )
+
+    forged = evidence.model_copy(
+        deep=True,
+        update={
+            "ingestion_signature": evidence.ingestion_signature.model_copy(
+                update={
+                    "signature": base64.b64encode(
+                        private_key.sign(
+                            b"forged-preimage",
+                            padding.PKCS1v15(),
+                            hashes.SHA256(),
+                        )
+                    ).decode("ascii")
+                }
+            )
+        },
+    )
+    assert not forged.verify_signature(
+        key_resolver=lambda key_id: public_key,
+        trust_anchor_ref=evidence.trust_anchor_ref,
+    )
+
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    assert not evidence.verify_signature(
+        key_resolver=lambda key_id: other_key.public_key(),
+        trust_anchor_ref=evidence.trust_anchor_ref,
+    )
+    assert not evidence.verify_signature(
+        key_resolver=lambda key_id: public_key,
+        trust_anchor_ref=(
+            "https://different.vault.azure.net/keys/athena-key/"
+            "0123456789abcdef0123456789abcdef"
+        ),
+    )
+
+
+def test_service_health_region_scope_rejects_wildcards_and_invalid_cloud() -> None:
+    with pytest.raises(ValidationError):
+        ServiceHealthRegionScope(
+            scopeType="serviceHealthRegion",
+            cloud="azureCloud",
+            region="eastus*",
+        )
+    with pytest.raises(ValidationError):
+        ServiceHealthRegionScope(
+            scopeType="serviceHealthRegion",
+            cloud="azureCloud",
+            region="*",
+        )
+    with pytest.raises(ValidationError):
+        ServiceHealthRegionScope(
+            scopeType="serviceHealthRegion",
+            cloud="notAzure",
+            region="australiaeast",
+        )
+
+
+def test_snapshot_evaluation_rejects_expired_and_out_of_window_values() -> None:
+    snapshot = _build_valid_snapshot()
+    snapshot.expires_at = datetime(2025, 1, 31, tzinfo=UTC)
+    with pytest.raises(AthenaValidationError):
+        snapshot.validate_for_evaluation(as_of=datetime(2026, 8, 15, tzinfo=UTC))
+
+    stale = _build_valid_snapshot()
+    stale.expires_at = datetime(2025, 1, 20, tzinfo=UTC)
+    stale.collected_at = datetime(2025, 1, 10, tzinfo=UTC)
+    with pytest.raises(AthenaValidationError):
+        stale.validate_for_evaluation(as_of=datetime(2025, 1, 9, tzinfo=UTC))
+
+
+def test_snapshot_rejects_cross_snapshot_and_missing_refs() -> None:
+    snapshot = _build_valid_snapshot()
+    payload = snapshot.model_dump(mode="json", by_alias=True)
+    payload["evidenceRefs"][0]["snapshotId"] = "snapshot-evidence-999"
+    with pytest.raises(ValidationError):
+        EvidenceSnapshot.model_validate(payload)
+
+    payload = snapshot.model_dump(mode="json", by_alias=True)
+    payload["evidenceRefs"][0]["itemDigest"] = _sha256("totally-fabricated")
+    with pytest.raises(ValidationError):
+        EvidenceSnapshot.model_validate(payload)
