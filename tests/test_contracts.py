@@ -297,6 +297,8 @@ def test_datetime_string_normalization_matches_datetime_object_digest() -> None:
     [
         datetime(2025, 1, 2, 13, 0, 0, 999, tzinfo=UTC),
         "2025-01-02T13:00:00.000999Z",
+        "2025-01-02T13:00:00.0000009Z",
+        "2025-01-02T13:00:00.0000009+10:00",
     ],
 )
 def test_digest_canonicalization_rejects_submillisecond_timestamps(
@@ -304,6 +306,45 @@ def test_digest_canonicalization_rejects_submillisecond_timestamps(
 ) -> None:
     with pytest.raises(AthenaValidationError, match="milliseconds"):
         compute_artifact_digest({"expiresAt": timestamp})
+
+
+def test_utc_datetime_runtime_and_schema_reject_submillisecond_precision() -> None:
+    adapter = TypeAdapter(UtcDateTime)
+    for timestamp in (
+        "2025-01-02T13:00:00.000999Z",
+        "2025-01-02T13:00:00.0000009Z",
+        "2025-01-02T13:00:00.0000009+10:00",
+    ):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(timestamp)
+        assert list(
+            Draft202012Validator(
+                adapter.json_schema(),
+                format_checker=FormatChecker(),
+            ).iter_errors(timestamp)
+        )
+
+
+def test_trusted_records_reject_submillisecond_datetime_objects() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    anchor = _trusted_key_anchor(public_key)
+    with pytest.raises(AthenaValidationError, match="milliseconds"):
+        TrustedKeyRecord(
+            anchor=anchor,
+            public_key=public_key,
+            enabled=True,
+            activated_at=datetime(2025, 1, 1, 0, 0, 0, 999, tzinfo=UTC),
+        )
+    with pytest.raises(AthenaValidationError, match="milliseconds"):
+        SnapshotPublicationRecord(
+            snapshot_id="snap-111111111111",
+            artifact_digest=_sha256("artifact"),
+            semantic_digest=_sha256("semantic"),
+            schema_version="1.0.0",
+            semantic_contract_version="1.0.0",
+            published_at=datetime(2025, 1, 1, 0, 0, 0, 999, tzinfo=UTC),
+        )
 
 
 def test_risk_acceptance_and_finding_valid() -> None:
@@ -2996,6 +3037,19 @@ def test_valid_snapshot_attestation_and_publication_record_are_required() -> Non
         snapshot.snapshot_attestation.artifact_digest
         == snapshot.compatibility.artifact_digest
     )
+
+
+def test_snapshot_evaluation_rejects_submillisecond_trusted_time() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    with pytest.raises(AthenaValidationError, match="milliseconds"):
+        _evaluate_attested_snapshot(
+            snapshot,
+            private_key=private_key,
+            envelope=envelope,
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_snapshot=snapshot,
+            as_of=datetime(2025, 1, 2, 13, 0, 0, 500, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize(

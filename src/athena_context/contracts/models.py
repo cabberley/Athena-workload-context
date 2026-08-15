@@ -397,6 +397,19 @@ _TRANSPORT_ONLY_ENVELOPE_FIELDS = frozenset(
 type EvidenceEnvelopeResolver = Callable[[str, Literal["response", "failure"], str], Any]
 
 
+def _require_utc_millisecond_datetime(
+    value: datetime,
+    *,
+    field_name: str,
+) -> None:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise AthenaValidationError(f"{field_name} must be UTC")
+    if value.microsecond % 1000:
+        raise AthenaValidationError(
+            f"{field_name} precision must be exactly representable in milliseconds"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TrustedKeyAnchor:
     key_vault_key_id: str
@@ -438,9 +451,10 @@ class TrustedKeyRecord:
     def __post_init__(self) -> None:
         for field_name in ("activated_at", "retired_at", "expires_at"):
             value = getattr(self, field_name)
-            if value is not None and value.tzinfo is None:
-                raise AthenaValidationError(
-                    f"TrustedKeyRecord.{field_name} must be timezone-aware"
+            if value is not None:
+                _require_utc_millisecond_datetime(
+                    value,
+                    field_name=f"TrustedKeyRecord.{field_name}",
                 )
         if self.retired_at is not None and self.retired_at <= self.activated_at:
             raise AthenaValidationError("trusted key retirement must follow activation")
@@ -465,12 +479,10 @@ class SnapshotPublicationRecord:
     published_at: datetime
 
     def __post_init__(self) -> None:
-        if self.published_at.tzinfo is None or self.published_at.utcoffset() != UTC.utcoffset(
-            self.published_at
-        ):
-            raise AthenaValidationError(
-                "SnapshotPublicationRecord.published_at must be UTC"
-            )
+        _require_utc_millisecond_datetime(
+            self.published_at,
+            field_name="SnapshotPublicationRecord.published_at",
+        )
 
 
 type SnapshotPublicationResolver = Callable[
@@ -1210,7 +1222,11 @@ def verify_trusted_ingestion_signature(
     as_of: datetime,
     attempt: CollectorAttempt | None = None,
 ) -> bool:
-    if key_resolver is None or as_of.tzinfo is None:
+    if key_resolver is None:
+        return False
+    try:
+        _require_utc_millisecond_datetime(as_of, field_name="as_of")
+    except AthenaValidationError:
         return False
     signature = identity_evidence.ingestion_signature
     if identity_evidence.trust_anchor_ref != signature.trust_anchor_ref:
@@ -1853,7 +1869,7 @@ class ManifestAudit(AthenaBaseModel):
         max_length=128,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    published_at: datetime | None = Field(
+    published_at: UtcDateTime | None = Field(
         default=None,
         alias="publishedAt",
         json_schema_extra={"x-athena-semanticClass": "semantic"},
@@ -2473,7 +2489,7 @@ class ExceptionRelationship(AthenaBaseModel):
     rationale: str = Field(
         ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    expires_at: datetime = Field(
+    expires_at: UtcDateTime = Field(
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
@@ -2783,10 +2799,10 @@ class RiskAcceptance(AthenaBaseModel):
     rationale: str = Field(
         ..., min_length=1, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    accepted_at: datetime = Field(
+    accepted_at: UtcDateTime = Field(
         ..., alias="acceptedAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
-    expires_at: datetime = Field(
+    expires_at: UtcDateTime = Field(
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     active: bool = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
@@ -5702,8 +5718,7 @@ class EvidenceSnapshot(AthenaBaseModel):
         trusted_key_anchor: TrustedKeyAnchor | None = None,
         envelope_resolver: EvidenceEnvelopeResolver | None = None,
     ) -> EvidenceSnapshot:
-        if as_of.tzinfo is None:
-            raise AthenaValidationError("as_of must be timezone-aware")
+        _require_utc_millisecond_datetime(as_of, field_name="as_of")
         recomputed_artifact_digest = compute_evidence_snapshot_artifact_digest(self)
         recomputed_semantic_digest = compute_evidence_snapshot_semantic_digest(self)
         if self.compatibility.artifact_digest != recomputed_artifact_digest:

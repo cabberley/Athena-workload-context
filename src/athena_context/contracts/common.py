@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import unicodedata
 from datetime import UTC, datetime
 from typing import Any
@@ -12,6 +13,10 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 _MAX_SAFE_INT = 9007199254740991
+_ISO_DATETIME_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.([0-9]+))?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
 
 
 class AthenaValidationError(ValueError):
@@ -34,6 +39,13 @@ def _contains_unpaired_surrogate(value: str) -> bool:
 
 
 def _normalize_datetime_string(value: str) -> str:
+    lexical_match = _ISO_DATETIME_RE.fullmatch(value)
+    if lexical_match is not None:
+        fractional_seconds = lexical_match.group(1)
+        if fractional_seconds is not None and len(fractional_seconds) > 3:
+            raise AthenaValidationError(
+                "timestamp precision must be exactly representable in milliseconds"
+            )
     if value.endswith("Z"):
         candidate = value[:-1] + "+00:00"
     elif "T" not in value:
