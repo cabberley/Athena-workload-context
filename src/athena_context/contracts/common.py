@@ -17,6 +17,9 @@ _ISO_DATETIME_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.([0-9]+))?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+_ISO_DATETIME_PREFIX_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+)
 
 
 class AthenaValidationError(ValueError):
@@ -40,18 +43,18 @@ def _contains_unpaired_surrogate(value: str) -> bool:
 
 def _normalize_datetime_string(value: str) -> str:
     lexical_match = _ISO_DATETIME_RE.fullmatch(value)
-    if lexical_match is not None:
-        fractional_seconds = lexical_match.group(1)
-        if fractional_seconds is not None and len(fractional_seconds) > 3:
+    if lexical_match is None:
+        if _ISO_DATETIME_PREFIX_RE.match(value):
             raise AthenaValidationError(
-                "timestamp precision must be exactly representable in milliseconds"
+                "timestamp text must use RFC 3339 with Z or an ±HH:MM offset"
             )
-    if value.endswith("Z"):
-        candidate = value[:-1] + "+00:00"
-    elif "T" not in value:
         return value
-    else:
-        candidate = value
+    fractional_seconds = lexical_match.group(1)
+    if fractional_seconds is not None and len(fractional_seconds) > 3:
+        raise AthenaValidationError(
+            "timestamp precision must be exactly representable in milliseconds"
+        )
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
         parsed = datetime.fromisoformat(candidate)
     except ValueError:

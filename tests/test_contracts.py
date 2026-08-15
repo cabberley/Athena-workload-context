@@ -108,6 +108,7 @@ from athena_context.contracts import (
     compute_verified_claims_digest,
     sha256_hex,
     snapshot_attestation_preimage,
+    verify_snapshot_attestation_signature,
 )
 from athena_context.contracts.common import NormalizationCollisionError
 
@@ -299,12 +300,16 @@ def test_datetime_string_normalization_matches_datetime_object_digest() -> None:
         "2025-01-02T13:00:00.000999Z",
         "2025-01-02T13:00:00.0000009Z",
         "2025-01-02T13:00:00.0000009+10:00",
+        "2025-01-02T13:00:00.0000009+10",
+        "2025-01-02T13:00:00.0000009+1000",
+        "2025-01-02T13:00:00.0000009+10:00:00",
+        "2025-01-02T13:00:00.0000009",
     ],
 )
 def test_digest_canonicalization_rejects_submillisecond_timestamps(
     timestamp: datetime | str,
 ) -> None:
-    with pytest.raises(AthenaValidationError, match="milliseconds"):
+    with pytest.raises(AthenaValidationError, match="milliseconds|RFC 3339"):
         compute_artifact_digest({"expiresAt": timestamp})
 
 
@@ -3050,6 +3055,17 @@ def test_snapshot_evaluation_rejects_submillisecond_trusted_time() -> None:
             publication_snapshot=snapshot,
             as_of=datetime(2025, 1, 2, 13, 0, 0, 500, tzinfo=UTC),
         )
+
+
+def test_snapshot_attestation_verifier_rejects_submillisecond_trusted_time() -> None:
+    snapshot, private_key, _ = _build_attested_evaluation_fixture()
+    public_key = private_key.public_key()
+    assert not verify_snapshot_attestation_signature(
+        snapshot.snapshot_attestation,
+        key_resolver=_trusted_key_resolver(public_key),
+        trusted_key_anchor=_trusted_key_anchor(public_key),
+        as_of=datetime(2025, 1, 2, 13, 0, 0, 999, tzinfo=UTC),
+    )
 
 
 @pytest.mark.parametrize(

@@ -5140,6 +5140,10 @@ def verify_snapshot_attestation_signature(
     trusted_key_anchor: TrustedKeyAnchor,
     as_of: datetime,
 ) -> bool:
+    try:
+        _require_utc_millisecond_datetime(as_of, field_name="as_of")
+    except AthenaValidationError:
+        return False
     if (
         attestation.trust_anchor_ref != attestation.key_vault_key_id
         or attestation.attested_at > as_of
