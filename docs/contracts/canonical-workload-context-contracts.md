@@ -378,7 +378,7 @@ Evidence records use `recordType` as the discriminator and forbid unknown proper
 | `healthEvent` | `evidenceScope`, `healthKind`, `status`, `startedAt`, `endedAt`, `summary`, `provenance` | Summary capped at 1,000 chars; no raw incident body. |
 | `activitySummary` | `evidenceScope`, `operationName`, `status`, `count`, `windowStart`, `windowEnd`, `provenance` | Count only; no caller PII or request body. |
 | `advisorRecommendation` | `resourceId`, `category`, `impact`, `recommendationCode`, `provenance` | Recommendation text is capped and treated as advisory only. |
-| `evidenceGap` | `gapId`, `evidenceScope`, `gapReason`, `expectedRecordType`, `collectorAttemptId`, `collectorAttemptDigest`, `observedAt` | Azure evidence-plane gap only; contains no Athena profile, clause, verdict, or policy judgment. |
+| `evidenceGap` | `gapId`, `evidenceScope`, `gapReason`, `expectedRecordType`, `collectorAttemptId`, `collectorAttemptDigest`, `observedAt`, `collectorIdentityEvidenceRef`, conditional `failurePayloadDigest`, conditional `failurePayloadPointer` | Azure evidence-plane gap only; contains no Athena profile, clause, verdict, or policy judgment. |
 
 Closed `gapReason` values are `missing`, `stale`, `unauthorized`, `filtered`, `malformed`,
 `collectorUnavailable`, `scopeMismatch`, `responseOversized`, and `unsupportedTool`.
@@ -410,7 +410,7 @@ only `/attemptDigest` and closed transport-only fields. Successful response atte
 `responseEnvelopeDigest`, which covers the canonical MCP response after redaction of prohibited raw
 bodies and before projection into evidence records.
 
-Each evidence record contains:
+Each concrete evidence item record contains:
 
 - `itemDigest`: SHA-256 over the canonical evidence record excluding only its own `itemDigest`
   field and non-semantic transport metadata listed in the canonicalization rules;
@@ -422,6 +422,14 @@ Each evidence record contains:
 - `projectionAlgorithm`: stable id and semantic version for the projection logic; and
 - `collectorIdentityEvidenceRef`: reference to the verified Entra token evidence in `collector`.
 
+Each `evidenceGap` record contains `gapId`, `evidenceScope`, `gapReason`,
+`expectedRecordType`, `collectorAttemptId`, `collectorAttemptDigest`, `observedAt`, and
+`collectorIdentityEvidenceRef`. It may contain `failurePayloadDigest` and
+`failurePayloadPointer` only when the cited collector attempt variant has a bounded failure envelope
+under the closed `EvidenceGapRef` rules. It never contains Athena profile/clause/verdict fields and
+does not fabricate a successful `sourceResponseDigest` or `sourceResponsePointer` for no-response
+variants.
+
 The snapshot artifact digest covers all collector attempts, evidence records, item digests, and
 collector identity evidence references after excluding the snapshot's own digest fields. The semantic digest covers
 only fields allowed by the artifact kind's semantic projection allowlist. If an evidence item or gap
@@ -431,10 +439,22 @@ cites a non-`successResponse` attempt, it is invalid; evidence gaps may cite any
 ### Verifiable collector identity evidence
 
 Athena does not claim that a managed identity signs custom Athena claims with Entra private keys.
-Collector identity is verified from the original Entra-signed access token presented to the private
-Azure MCP endpoint, plus a digest-covered trusted ingestion derivation that binds that verified
-identity to the private MCP host and allowlisted tool invocation. The bearer token itself is never
-stored.
+The Athena caller token used to call the private MCP host identifies the caller and is not evidence
+of the MCP host's Azure evidence-plane identity. Collector identity is established by this
+implementable host-to-ingestion flow:
+
+1. The Athena caller authenticates to the private MCP host. That caller identity remains
+   context-plane audit data and is not used as the evidence collector identity.
+2. The private MCP host obtains an Entra-signed managed identity access token with the trusted
+   ingestion service as the audience and the MCP host managed identity as the subject/object id.
+3. The private MCP host sends the collector attempt, bounded response/failure payload, and original
+   MCP-host token to the trusted ingestion service over private authenticated transport.
+4. Trusted ingestion validates the original JWS against the configured Entra issuer, JWKS key id,
+   audience, subject/object id, tenant, `iat`/`nbf`/`exp`, and allowed MCP host identity mapping.
+5. Trusted ingestion derives a normalized verification/derivation record and signs that record with a
+   dedicated non-exportable Azure Key Vault key controlled by the ingestion service.
+6. Athena persists the token hash, verified claims, trusted derivation, Key Vault signature metadata,
+   and verification result, but never persists the bearer token.
 
 `collectorIdentityEvidence` uses `identityEvidenceType = entraJwtTokenEvidence` and forbids unknown
 properties.
@@ -446,8 +466,9 @@ properties.
 | `jwtHeader` | object | 1 | Closed fields: `alg`, `kid`, `typ`; `alg` must be `RS256`, `typ` must be `JWT`, and `kid` must match `^[A-Za-z0-9_-]{8,128}$` for WC-001. |
 | `trustAnchorRef` | string | 1 | Grammar `^entra:[0-9a-fA-F-]{36}:[A-Za-z0-9_.:/-]{3,128}$`; resolves to a configured Entra tenant OIDC/JWKS trust anchor. |
 | `verifiedClaims` | object | 1 | Closed Entra claims listed below. |
-| `tokenVerification` | object | 1 | Verification time, key id, and status. |
+| `tokenVerification` | object | 1 | Verification time, key id, and status for the original Entra JWS. |
 | `ingestionDerivation` | object | 1 | Trusted binding from verified token evidence to MCP host/tool invocation. |
+| `ingestionSignature` | object | 1 | Key Vault signature over the normalized verification/derivation record. |
 | `identityEvidenceDigest` | digest string | 1 | Digest over the evidence excluding `/identityEvidenceDigest` and token bytes. |
 
 The closed `verifiedClaims` set is `issuer`, `audience`, `tenantId`,
@@ -464,15 +485,43 @@ must match a key in the resolved JWKS at `tokenVerification.verifiedAt`. Verific
 require `tokenVerification.status = valid` at the snapshot `collectedAt` time.
 
 The closed `ingestionDerivation` set is `mcpHostId`, `ingestionServiceId`,
-`toolAllowlistDigest`, `derivedCollectorIdentityRef`, `derivedAt`, and `derivationDigest`.
+`toolAllowlistDigest`, `derivedCollectorIdentityRef`, `derivedAt`, `audience`, and
+`derivationDigest`.
 `derivedCollectorIdentityRef` is calculated from the verified token claims and the configured
 private MCP host identity mapping. Tool name and tool version are derived from the digest-covered
 collector attempt and accepted only when they appear in the trusted `toolAllowlistDigest`; they are
 not trusted from caller-supplied request fields.
 
+The closed `ingestionSignature` set is `signatureAlgorithm`, `keyVaultKeyId`,
+`keyVersion`, `signedPreimageDigest`, `signature`, `signedAt`, `trustAnchorRef`,
+`keyStatusAtSigning`, and `signatureVerification`. `signatureAlgorithm` is `RS256` for WC-001.
+`keyVaultKeyId` grammar is
+`^https://[A-Za-z0-9-]+\\.vault\\.azure\\.net/keys/[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$`.
+The signed preimage is the canonical normalized record containing `identityEvidenceId`,
+`tokenHash`, `jwtHeader`, `verifiedClaims`, `tokenVerification`, and `ingestionDerivation`, excluding
+`ingestionSignature` and `identityEvidenceDigest`.
+
+The retained proof is the canonical `collectorIdentityEvidence` record: `tokenHash`, `jwtHeader`,
+verified claims, token verification metadata, ingestion derivation, Key Vault signature metadata,
+and signature value. The original bearer token and JWS compact serialization are not retained after
+ingestion. Later readers verify the retained proof by checking the Key Vault signature over the
+signed preimage, the configured trust anchor and key state, the recorded Entra verification status,
+and the token hash reference; they must not reinterpret an Athena caller token as collector proof.
+
+Trusted ingestion key rotation is explicit: each accepted Key Vault key version is in exactly one
+closed state, `active`, `verifyOnly`, or `retired`. New evidence may be signed only by `active`
+versions. `verifyOnly` versions remain trusted for previously published artifacts until all
+referencing snapshots expire or are superseded. `retired` versions fail verification unless an
+operator-published emergency trust record explicitly references the affected artifact digests.
+Signature verification statuses are `valid`, `badSignature`, `unknownKey`, `retiredKey`,
+`trustAnchorUnavailable`, `preimageMismatch`, and `expiredVerification`. Publication and evaluation
+require both `tokenVerification.status = valid` and
+`ingestionSignature.signatureVerification.status = valid`.
+
 A snapshot whose verified collector identity is the Athena context-plane identity, whose
 tool/version is not allowlisted, whose trusted ingestion derivation does not match the verified
-token claims, or whose token verification is not `valid` is rejected.
+token claims, whose Key Vault signature is not valid, or whose token verification is not `valid` is
+rejected.
 
 ## Provenance references
 
@@ -514,6 +563,8 @@ properties and contains exactly:
 | `snapshotSemanticDigest` | yes | Snapshot `/compatibility/semanticDigest`. |
 | `gapId` | yes | Evidence gap id. |
 | `gapRecordDigest` | yes | Same value as the gap evidence record `itemDigest`. |
+| `evidenceScope` | yes | One `EvidenceScope` union instance copied from the gap evidence record. |
+| `expectedRecordType` | yes | Closed expected record type copied from the gap evidence record: `resource`, `observedRelationship`, `metricAggregate`, `healthEvent`, `activitySummary`, or `advisorRecommendation`. |
 | `collectorAttemptId` | yes | Attempt id cited by the gap. |
 | `collectorAttemptDigest` | yes | Digest of the cited collector attempt. |
 | `collectorToolName` | yes | Tool name derived from the verified attempt. |
@@ -528,6 +579,18 @@ properties and contains exactly:
 `timeoutNoResponse`, `authorizationFailure`, or `toolUnavailable` attempts. A `failedResponse` gap
 may contain `failurePayloadDigest` and `failurePayloadPointer` when the failed response has a bounded
 failure envelope. A no-response gap has no response pointer.
+
+`EvidenceGapRef` has exactly one `evidenceScope`, exactly one `expectedRecordType`, exactly one
+`collectorAttemptId`, and exactly one `collectorAttemptDigest`. The `gapRecordDigest` must equal the
+referenced evidence-gap record's `itemDigest`. Its attempt variant rules are closed:
+
+- `timeoutNoResponse`, `authorizationFailure`, and `toolUnavailable`: forbid all response and failure
+  payload pointer fields.
+- `failedResponse`: require `failurePayloadDigest`; require `failurePayloadPointer` when the bounded
+  failure envelope has item-level structure, otherwise set it to the root pointer `/`.
+- `successResponse`: allowed only for gaps caused by filtered, malformed, stale, scope-mismatched, or
+  oversized response items; requires `failurePayloadDigest` and `failurePayloadPointer` to the
+  offending response item, but still forbids `sourceResponseDigest` and `sourceResponsePointer`.
 
 Example concrete evidence provenance:
 
@@ -572,6 +635,13 @@ Example evidence-gap provenance:
   "gapId": "gap-worker-zone-missing",
   "gapRecordDigest": "sha256:...",
   "gapReason": "missing",
+  "evidenceScope": {
+    "scopeType": "resourceGroup",
+    "tenantId": "00000000-0000-0000-0000-000000000000",
+    "subscriptionId": "00000000-0000-0000-0000-000000000000",
+    "resourceGroupName": "rg-athena-fixture"
+  },
+  "expectedRecordType": "resource",
   "collectorAttemptId": "attempt-worker-zone-001",
   "collectorAttemptDigest": "sha256:...",
   "collectorToolName": "azure.resourceInventory.read",
@@ -650,8 +720,8 @@ Evaluation returns `unknown` or `conflicting` and blocks automated pass when:
 - evidence is missing, stale, out of scope, malformed, or oversized;
 - Azure MCP provenance is missing or comes from an unapproved tool;
 - an evidence item lacks a digest-covered pointer to an MCP response item;
-- collector identity token evidence is absent, expired, unverifiable, or not the approved private Azure
-  MCP identity;
+- collector identity evidence lacks a valid MCP-host Entra token verification, trusted-ingestion
+  derivation, or Key Vault signature for the approved private Azure MCP identity;
 - the Athena context identity appears as the Azure evidence collector;
 - dynamic selector output is ambiguous or over-broad;
 - zone, dependency, health, or metric evidence needed for a proof is unavailable;
@@ -917,13 +987,17 @@ Required fields:
 |---|---|---|---|
 | `riskAcceptanceId` | id | 1 | Stable id. |
 | `governanceScope` | `GovernanceScope` union | 1 | Must be narrow and resolvable. |
+| `riskKind` | enum | 1 | `availability`, `resilience`, `operational`, `security`, or `compliance`. |
+| `riskRating` | enum | 1 | `low`, `medium`, `high`, or `critical`. |
 | `residualRiskStatement` | string | 1-2,000 chars | States retained risk. |
+| `rationaleRef` | URI/id | 1 | Bounded reference to the approval rationale; no embedded sensitive body. |
 | `acceptedBy` | human approval reference | 1 | No secrets; auditable principal reference. |
 | `ownedBy` | ownership ref | 1 | Team accountable for review. |
 | `acceptedAt` | datetime | 1 | UTC. |
 | `expiresAt` | datetime | 1 | Required; no indefinite acceptance. |
 | `linkedControlRefs` | array | 0-50 | Controls that mitigate but do not erase risk. |
 | `profiles` | array | 1-25 | Environments where acceptance applies. |
+| `status` | enum | 1 | `active`, `expired`, `revoked`, or `superseded`; only `active` can affect verdicts. |
 
 Expired, ownerless, rationale-free, or over-broad governance-scope acceptances are invalid at
 publication. An active acceptance changes applicable findings to `acceptedResidualRisk`; it does not
@@ -1029,10 +1103,10 @@ matched by the allowlist requires a compatibility update before publication.
 
 | Artifact kind | Semantic projection pointer allowlist |
 |---|---|
-| `workloadManifest` | Compatibility leaves: `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities/*/capabilityId`, `/compatibility/requiresCapabilities/*/minimumVersion`, `/compatibility/requiresCapabilities/*/requiredFor`.<br>Workload leaves: `/manifestId`, `/manifestVersion`, `/workload/businessCriticality`, `/workload/dataSensitivity`, `/workload/allowedEvidenceScopes/*/scopeType`, `/workload/allowedEvidenceScopes/*/tenantId`, `/workload/allowedEvidenceScopes/*/subscriptionId`, `/workload/allowedEvidenceScopes/*/resourceGroupName`, `/workload/allowedEvidenceScopes/*/resourceId`, `/workload/allowedEvidenceScopes/*/workspaceName`, `/workload/allowedEvidenceScopes/*/cloud`, `/workload/allowedEvidenceScopes/*/region`.<br>Profile leaves: `/profiles/*/profileType`, `/profiles/*/extends`, `/profiles/*/overrides/settings/continuity/zoneLossContinuityRequired`, `/profiles/*/disabledRefs/*/ref`, `/profiles/*/disabledRefs/*/rationale`, `/profiles/*/disabledRefs/*/ownerRef`.<br>Role leaves: `/roles/*/roleId`, `/roles/*/kind`, `/roles/*/cardinality/cardinalityKind`, `/roles/*/cardinality/minimum`, `/roles/*/cardinality/maximum`, `/roles/*/selectors/*/selectorType`, `/roles/*/selectors/*/resourceIds/*`, `/roles/*/selectors/*/tagPredicates/*/key`, `/roles/*/selectors/*/tagPredicates/*/value`, `/roles/*/selectors/*/namePattern/prefix`, `/roles/*/selectors/*/namePattern/suffix`, `/roles/*/selectors/*/resourceType`, `/roles/*/selectors/*/location`, `/roles/*/selectors/*/resourceGroupName`, `/roles/*/selectors/*/children/*/selectorRef`, `/roles/*/selectors/*/maxMatches`, `/roles/*/profileApplicability/*`, `/roles/*/ownerRef`, `/roles/*/approvalState`.<br>Relationship leaves: `/relationships/declared/*/relationshipClass`, `/relationships/declared/*/relationshipId`, `/relationships/declared/*/kind`, `/relationships/declared/*/from/endpointType`, `/relationships/declared/*/from/roleRef`, `/relationships/declared/*/from/externalRef`, `/relationships/declared/*/to/endpointType`, `/relationships/declared/*/to/roleRef`, `/relationships/declared/*/to/externalRef`, `/relationships/declared/*/profiles/*`, `/relationships/declared/*/ownerRef`, `/relationships/declared/*/sourceClause`, `/relationships/exceptions/*/relationshipClass`, `/relationships/exceptions/*/exceptionId`, `/relationships/exceptions/*/appliesToRelationshipRef`, `/relationships/exceptions/*/riskAcceptanceRef`, `/relationships/exceptions/*/governanceScope/governanceScopeType`, `/relationships/exceptions/*/governanceScope/manifestId`, `/relationships/exceptions/*/governanceScope/profileIds/*`, `/relationships/exceptions/*/governanceScope/clausePath`, `/relationships/exceptions/*/governanceScope/roleRef`, `/relationships/exceptions/*/governanceScope/resourceId`, `/relationships/exceptions/*/ownerRef`, `/relationships/exceptions/*/expiresAt`.<br>Constraint/control/risk/objective/ownership leaves: `/constraints/*/constraintId`, `/constraints/*/type`, `/constraints/*/governanceScope/governanceScopeType`, `/constraints/*/governanceScope/manifestId`, `/constraints/*/governanceScope/profileIds/*`, `/constraints/*/governanceScope/clausePath`, `/constraints/*/governanceScope/roleRef`, `/constraints/*/governanceScope/resourceId`, `/constraints/*/appliesToRoleRefs/*`, `/constraints/*/profiles/*`, `/constraints/*/severity`, `/constraints/*/proofRequirement/proofKind`, `/constraints/*/proofRequirement/roleRef`, `/constraints/*/proofRequirement/expected`, `/constraints/*/proofRequirement/subjectRoleRef`, `/constraints/*/proofRequirement/anchorRoleRef`, `/constraints/*/proofRequirement/minimumDistinctZones`, `/constraints/*/proofRequirement/declaredRelationshipRef`, `/constraints/*/proofRequirement/maximumAge`, `/constraints/*/proofRequirement/controlRef`, `/constraints/*/proofRequirement/requiredHealth/*`, `/constraints/*/proofRequirement/objectiveRef`, `/constraints/*/proofRequirement/comparison`, `/constraints/*/sourceClause`, `/constraints/*/failureMode`, `/controls/*/controlKind`, `/controls/*/controlId`, `/controls/*/governanceScope/governanceScopeType`, `/controls/*/governanceScope/manifestId`, `/controls/*/governanceScope/profileIds/*`, `/controls/*/governanceScope/clausePath`, `/controls/*/governanceScope/roleRef`, `/controls/*/governanceScope/resourceId`, `/controls/*/ownerRef`, `/controls/*/evidenceRefs/*`, `/controls/*/expiry`, `/controls/*/nextReviewDueAt`, `/riskAcceptances/*/riskAcceptanceId`, `/riskAcceptances/*/governanceScope/governanceScopeType`, `/riskAcceptances/*/governanceScope/manifestId`, `/riskAcceptances/*/governanceScope/profileIds/*`, `/riskAcceptances/*/governanceScope/clausePath`, `/riskAcceptances/*/governanceScope/roleRef`, `/riskAcceptances/*/governanceScope/resourceId`, `/riskAcceptances/*/residualRiskStatement`, `/riskAcceptances/*/acceptedBy`, `/riskAcceptances/*/ownedBy`, `/riskAcceptances/*/acceptedAt`, `/riskAcceptances/*/expiresAt`, `/riskAcceptances/*/linkedControlRefs/*`, `/riskAcceptances/*/profiles/*`, `/objectives/*/objectiveId`, `/objectives/*/objectiveType`, `/objectives/*/profiles/*`, `/objectives/*/target`, `/objectives/*/window`, `/objectives/*/ownerRef`, `/objectives/*/breachVerdict`, `/ownership/*/ownerId`, `/ownership/*/ownerRole`, `/ownership/*/authorityRef` |
-| `resolvedProfile` | Same leaf set as `workloadManifest`, but rooted at resolved profile fields: `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities/*/capabilityId`, `/compatibility/requiresCapabilities/*/minimumVersion`, `/compatibility/requiresCapabilities/*/requiredFor`, `/manifestId`, `/manifestVersion`, `/profileId`, `/settings/continuity/zoneLossContinuityRequired`, plus the `roles`, `relationships`, `constraints`, `controls`, `riskAcceptances`, `objectives`, and `ownership` leaf paths listed above without `/profiles/*` source override paths. |
-| `evidenceSnapshot` | `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities/*/capabilityId`, `/compatibility/requiresCapabilities/*/minimumVersion`, `/compatibility/requiresCapabilities/*/requiredFor`, `/snapshotId`, `/authorizedScopes/*/scopeType`, `/authorizedScopes/*/tenantId`, `/authorizedScopes/*/subscriptionId`, `/authorizedScopes/*/resourceGroupName`, `/authorizedScopes/*/resourceId`, `/authorizedScopes/*/workspaceName`, `/authorizedScopes/*/cloud`, `/authorizedScopes/*/region`, `/collectedAt`, `/expiresAt`, `/collector/trustAnchorRef`, `/collector/identityEvidence/*/identityEvidenceDigest`, `/collectorAttempts/*/attemptDigest`, `/evidenceRecords/*/itemDigest` |
-| `contextualFinding` | `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/findingId`, `/findingKind`, `/verdict`, `/governanceScope/governanceScopeType`, `/governanceScope/manifestId`, `/governanceScope/profileIds/*`, `/governanceScope/clausePath`, `/governanceScope/roleRef`, `/governanceScope/resourceId`, `/contextRef/manifestId`, `/contextRef/manifestVersion`, `/contextRef/profileId`, `/contextRef/resolvedProfileDigest`, `/contextRef/clausePath`, `/evidenceRefs/*/refType`, `/evidenceRefs/*/snapshotId`, `/evidenceRefs/*/snapshotArtifactDigest`, `/evidenceRefs/*/snapshotSemanticDigest`, `/evidenceRefs/*/itemDigest`, `/evidenceRefs/*/gapRecordDigest`, `/evidenceRefs/*/collectorAttemptDigest`, `/evidenceRefs/*/collectorToolName`, `/evidenceRefs/*/collectorToolVersion`, `/evidenceRefs/*/collectorAttemptAt`, `/evidenceRefs/*/sourceResponseDigest`, `/evidenceRefs/*/sourceResponsePointer`, `/evidenceRefs/*/failurePayloadDigest`, `/evidenceRefs/*/failurePayloadPointer`, `/relationshipClassRefs/*`, `/confidence`, `/residualRisk` |
+| `workloadManifest` | Closed macro expansion: every `CompatibilitySemanticLeaf`, `ManifestIdentitySemanticLeaf`, `ProfileOverrideSemanticLeaf`, `RoleSemanticLeaf`, `RelationshipSemanticLeaf`, `ConstraintProofSemanticLeaf`, `ControlSemanticLeaf`, `RiskAcceptanceSemanticLeaf`, `ObjectiveSemanticLeaf`, and `OwnershipSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/workload`, `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, or `/ownership` is invalid. |
+| `resolvedProfile` | Closed resolved-profile expansion: every `CompatibilitySemanticLeaf`, `/manifestId`, `/manifestVersion`, `/profileId`, `/settings/continuity/zoneLossContinuityRequired`, every `RoleSemanticLeaf`, every `RelationshipSemanticLeaf`, every `ConstraintProofSemanticLeaf`, every `ControlSemanticLeaf`, every `RiskAcceptanceSemanticLeaf`, every `ObjectiveSemanticLeaf`, and every `OwnershipSemanticLeaf` named in the mutation-coverage matrix below, with source-only profile override paths (`/profiles/*`, `/profileApplicability/*`, `/disabledRefs/*`) removed. These names are closed macros expanded by validators before hashing; retaining the macro name or hashing a broad `/roles`, `/relationships`, `/constraints`, `/controls`, `/riskAcceptances`, `/objectives`, or `/ownership` object pointer is invalid. |
+| `evidenceSnapshot` | Closed macro expansion: every `CompatibilitySemanticLeaf` and every `EvidenceSnapshotSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/collector`, `/collectorAttempts`, or `/evidenceRecords` is invalid. |
+| `contextualFinding` | Closed macro expansion: every `CompatibilitySemanticLeaf`, every `FindingSemanticLeaf`, and every `EvidenceReferenceSemanticLeaf` named in the mutation-coverage matrix below. Validators must expand these names to exact leaf pointers before hashing; hashing broad parent pointers such as `/governanceScope`, `/contextRef`, `/evidenceRefs`, or `/relationshipClassRefs` is invalid. |
 | `generatedJsonSchema` | `/compatibility/semanticContractVersion`, `/$id`, `/type`, `/required`, `/properties/*/type`, `/properties/*/enum`, `/properties/*/const`, `/properties/*/oneOf`, `/properties/*/anyOf`, `/properties/*/required`, `/properties/*/additionalProperties`, `/oneOf`, `/anyOf`, `/additionalProperties`, `/$defs` |
 
 Closed semantic exclusions are only `/compatibility/artifactDigest`, `/compatibility/semanticDigest`,
@@ -1040,6 +1114,45 @@ Closed semantic exclusions are only `/compatibility/artifactDigest`, `/compatibi
 non-semantic `extensions`, and transport-only envelope fields. The previous undefined categories
 from earlier drafts are not valid exclusion rules; implementation must use only the pointer
 allowlists and exclusions above.
+
+### Semantic leaf completeness and mutation coverage
+
+The allowlists above are normative and leaf-level. A validator must expand the named macros below to
+their exact paths before computing `semanticDigest`; a macro is not a JSON pointer and must not be
+hashed as a broad object. The schema publication test suite must mutate every listed policy leaf one
+at a time and prove the `semanticDigest` changes, then mutate every presentation-only exclusion
+(`displayName`, `description`, `documentation`, `examples`, `audit`, non-semantic `extensions`,
+`producedBy`) and prove the `semanticDigest` does not change. Adding any new field that can change a
+verdict, finding kind, proof sufficiency, risk/control status, profile applicability, relationship
+applicability, collector trust, or compatibility negotiation outcome without adding it to this matrix
+is a blocking contract failure.
+
+| Semantic macro | Exact policy-affecting leaves that must be covered by mutation tests |
+|---|---|
+| `CompatibilitySemanticLeaf` | `/compatibility/artifactKind`, `/compatibility/semanticContractVersion`, `/compatibility/policyContractVersion`, `/compatibility/minimumReaderVersion`, `/compatibility/requiresCapabilities/*/capabilityId`, `/compatibility/requiresCapabilities/*/minimumVersion`, `/compatibility/requiresCapabilities/*/requiredFor`, `/compatibility/extensionPolicy` |
+| `ManifestIdentitySemanticLeaf` | `/manifestId`, `/manifestVersion`, `/workload/businessCriticality`, `/workload/dataSensitivity`, `/workload/allowedEvidenceScopes/*/scopeType`, `/workload/allowedEvidenceScopes/*/tenantId`, `/workload/allowedEvidenceScopes/*/subscriptionId`, `/workload/allowedEvidenceScopes/*/resourceGroupName`, `/workload/allowedEvidenceScopes/*/resourceId`, `/workload/allowedEvidenceScopes/*/workspaceName`, `/workload/allowedEvidenceScopes/*/cloud`, `/workload/allowedEvidenceScopes/*/region` |
+| `ProfileOverrideSemanticLeaf` | `/profiles/*/profileType`, `/profiles/*/extends`, `/profiles/*/overrides/settings/continuity/zoneLossContinuityRequired`, `/profiles/*/disabledRefs/*/ref`, `/profiles/*/disabledRefs/*/rationale`, `/profiles/*/disabledRefs/*/ownerRef` |
+| `RoleSemanticLeaf` | `/roles/*/roleId`, `/roles/*/kind`, `/roles/*/cardinality/cardinalityKind`, `/roles/*/cardinality/minimum`, `/roles/*/cardinality/maximum`, `/roles/*/selectors/*/selectorType`, `/roles/*/selectors/*/resourceIds/*`, `/roles/*/selectors/*/tagPredicates/*/key`, `/roles/*/selectors/*/tagPredicates/*/value`, `/roles/*/selectors/*/namePattern/prefix`, `/roles/*/selectors/*/namePattern/suffix`, `/roles/*/selectors/*/resourceType`, `/roles/*/selectors/*/location`, `/roles/*/selectors/*/resourceGroupName`, `/roles/*/selectors/*/children/*/selectorRef`, `/roles/*/selectors/*/maxMatches`, `/roles/*/profileApplicability/*`, `/roles/*/ownerRef`, `/roles/*/approvalState` |
+| `RelationshipSemanticLeaf` | `/relationships/declared/*/relationshipClass`, `/relationships/declared/*/relationshipId`, `/relationships/declared/*/kind`, `/relationships/declared/*/from/endpointType`, `/relationships/declared/*/from/roleRef`, `/relationships/declared/*/from/externalRef`, `/relationships/declared/*/to/endpointType`, `/relationships/declared/*/to/roleRef`, `/relationships/declared/*/to/externalRef`, `/relationships/declared/*/profiles/*`, `/relationships/declared/*/ownerRef`, `/relationships/declared/*/sourceClause`, `/relationships/observed/*/relationshipClass`, `/relationships/observed/*/relationshipId`, `/relationships/observed/*/kind`, `/relationships/observed/*/from/endpointType`, `/relationships/observed/*/from/resourceRef`, `/relationships/observed/*/from/externalRef`, `/relationships/observed/*/to/endpointType`, `/relationships/observed/*/to/resourceRef`, `/relationships/observed/*/to/externalRef`, `/relationships/observed/*/evidenceItemRef`, `/relationships/observed/*/observedAt`, `/relationships/inferred/*/relationshipClass`, `/relationships/inferred/*/relationshipId`, `/relationships/inferred/*/kind`, `/relationships/inferred/*/from/endpointType`, `/relationships/inferred/*/from/resourceRef`, `/relationships/inferred/*/from/externalRef`, `/relationships/inferred/*/to/endpointType`, `/relationships/inferred/*/to/resourceRef`, `/relationships/inferred/*/to/externalRef`, `/relationships/inferred/*/confidence`, `/relationships/inferred/*/inputEvidenceRefs/*`, `/relationships/inferred/*/algorithmId`, `/relationships/exceptions/*/relationshipClass`, `/relationships/exceptions/*/exceptionId`, `/relationships/exceptions/*/appliesToRelationshipRef`, `/relationships/exceptions/*/riskAcceptanceRef`, `/relationships/exceptions/*/governanceScope/governanceScopeType`, `/relationships/exceptions/*/governanceScope/manifestId`, `/relationships/exceptions/*/governanceScope/profileId`, `/relationships/exceptions/*/governanceScope/profileIds/*`, `/relationships/exceptions/*/governanceScope/clausePath`, `/relationships/exceptions/*/governanceScope/roleRef`, `/relationships/exceptions/*/governanceScope/resourceId`, `/relationships/exceptions/*/governanceScope/relationshipRef`, `/relationships/exceptions/*/governanceScope/controlRef`, `/relationships/exceptions/*/governanceScope/objectiveRef`, `/relationships/exceptions/*/ownerRef`, `/relationships/exceptions/*/rationale`, `/relationships/exceptions/*/expiresAt` |
+| `ConstraintProofSemanticLeaf` | `/constraints/*/constraintId`, `/constraints/*/type`, `/constraints/*/governanceScope/governanceScopeType`, `/constraints/*/governanceScope/manifestId`, `/constraints/*/governanceScope/profileId`, `/constraints/*/governanceScope/profileIds/*`, `/constraints/*/governanceScope/clausePath`, `/constraints/*/governanceScope/roleRef`, `/constraints/*/governanceScope/resourceId`, `/constraints/*/governanceScope/relationshipRef`, `/constraints/*/governanceScope/controlRef`, `/constraints/*/governanceScope/objectiveRef`, `/constraints/*/appliesToRoleRefs/*`, `/constraints/*/profiles/*`, `/constraints/*/severity`, `/constraints/*/sourceClause`, `/constraints/*/failureMode`, `/constraints/*/proofRequirement/proofKind`, `/constraints/*/proofRequirement/roleRef`, `/constraints/*/proofRequirement/expected`, `/constraints/*/proofRequirement/resourceEvidenceRefs/*`, `/constraints/*/proofRequirement/subjectRoleRef`, `/constraints/*/proofRequirement/anchorRoleRef`, `/constraints/*/proofRequirement/zoneEvidenceRefs/*`, `/constraints/*/proofRequirement/minimumDistinctZones`, `/constraints/*/proofRequirement/declaredRelationshipRef`, `/constraints/*/proofRequirement/observedRelationshipEvidenceRefs/*`, `/constraints/*/proofRequirement/maximumAge`, `/constraints/*/proofRequirement/evidenceRefs/*`, `/constraints/*/proofRequirement/controlRef`, `/constraints/*/proofRequirement/requiredHealth/*`, `/constraints/*/proofRequirement/controlEvidenceRefs/*`, `/constraints/*/proofRequirement/objectiveRef`, `/constraints/*/proofRequirement/metricEvidenceRefs/*`, `/constraints/*/proofRequirement/comparison`, `/constraints/*/proofRequirement/requiredEvidenceRefKinds/*`, `/constraints/*/proofRequirement/onMissingEvidence`, `/constraints/*/proofRequirement/onConflictingEvidence` |
+| `ControlSemanticLeaf` | `/controls/*/controlKind`, `/controls/*/controlId`, `/controls/*/governanceScope/governanceScopeType`, `/controls/*/governanceScope/manifestId`, `/controls/*/governanceScope/profileId`, `/controls/*/governanceScope/profileIds/*`, `/controls/*/governanceScope/clausePath`, `/controls/*/governanceScope/roleRef`, `/controls/*/governanceScope/resourceId`, `/controls/*/governanceScope/relationshipRef`, `/controls/*/governanceScope/controlRef`, `/controls/*/governanceScope/objectiveRef`, `/controls/*/ownerRef`, `/controls/*/backupPolicyRef`, `/controls/*/lastSuccessfulBackupAt`, `/controls/*/testOutcome`, `/controls/*/rtoObserved`, `/controls/*/rpoObserved`, `/controls/*/runbookRef`, `/controls/*/lastReviewedAt`, `/controls/*/alertRuleRef`, `/controls/*/enabledState`, `/controls/*/lastFiredAt`, `/controls/*/cadence`, `/controls/*/nextReviewDueAt`, `/controls/*/lastCompletedAt`, `/controls/*/reviewSystemRef`, `/controls/*/approvalSystemRef`, `/controls/*/requiredForChangeKinds/*`, `/controls/*/supportPlanRef`, `/controls/*/coverageHours`, `/controls/*/expiry`, `/controls/*/evidenceRefs/*` |
+| `RiskAcceptanceSemanticLeaf` | `/riskAcceptances/*/riskAcceptanceId`, `/riskAcceptances/*/governanceScope/governanceScopeType`, `/riskAcceptances/*/governanceScope/manifestId`, `/riskAcceptances/*/governanceScope/profileId`, `/riskAcceptances/*/governanceScope/profileIds/*`, `/riskAcceptances/*/governanceScope/clausePath`, `/riskAcceptances/*/governanceScope/roleRef`, `/riskAcceptances/*/governanceScope/resourceId`, `/riskAcceptances/*/governanceScope/relationshipRef`, `/riskAcceptances/*/governanceScope/controlRef`, `/riskAcceptances/*/governanceScope/objectiveRef`, `/riskAcceptances/*/riskKind`, `/riskAcceptances/*/riskRating`, `/riskAcceptances/*/residualRiskStatement`, `/riskAcceptances/*/rationaleRef`, `/riskAcceptances/*/acceptedBy`, `/riskAcceptances/*/ownedBy`, `/riskAcceptances/*/acceptedAt`, `/riskAcceptances/*/expiresAt`, `/riskAcceptances/*/linkedControlRefs/*`, `/riskAcceptances/*/profiles/*`, `/riskAcceptances/*/status` |
+| `ObjectiveSemanticLeaf` | `/objectives/*/objectiveId`, `/objectives/*/objectiveType`, `/objectives/*/profiles/*`, `/objectives/*/target`, `/objectives/*/window`, `/objectives/*/ownerRef`, `/objectives/*/breachVerdict`, `/objectives/*/measurementEvidenceRefKinds/*` |
+| `OwnershipSemanticLeaf` | `/ownership/*/ownerId`, `/ownership/*/ownerRole`, `/ownership/*/authorityRef`, `/ownership/*/profiles/*`, `/ownership/*/escalationRef` |
+| `EvidenceSnapshotSemanticLeaf` | `/snapshotId`, `/authorizedScopes/*/scopeType`, `/authorizedScopes/*/tenantId`, `/authorizedScopes/*/subscriptionId`, `/authorizedScopes/*/resourceGroupName`, `/authorizedScopes/*/resourceId`, `/authorizedScopes/*/workspaceName`, `/authorizedScopes/*/cloud`, `/authorizedScopes/*/region`, `/collectedAt`, `/expiresAt`, `/collector/trustAnchorRef`, `/collector/identityEvidence/*/identityEvidenceDigest`, `/collectorAttempts/*/attemptDigest`, `/evidenceRecords/*/itemDigest` |
+| `EvidenceReferenceSemanticLeaf` | `/evidenceRefs/*/refType`, `/evidenceRefs/*/snapshotId`, `/evidenceRefs/*/snapshotArtifactDigest`, `/evidenceRefs/*/snapshotSemanticDigest`, `/evidenceRefs/*/itemDigest`, `/evidenceRefs/*/gapId`, `/evidenceRefs/*/gapRecordDigest`, `/evidenceRefs/*/gapReason`, `/evidenceRefs/*/evidenceScope/scopeType`, `/evidenceRefs/*/evidenceScope/tenantId`, `/evidenceRefs/*/evidenceScope/subscriptionId`, `/evidenceRefs/*/evidenceScope/resourceGroupName`, `/evidenceRefs/*/evidenceScope/resourceId`, `/evidenceRefs/*/evidenceScope/workspaceName`, `/evidenceRefs/*/evidenceScope/cloud`, `/evidenceRefs/*/evidenceScope/region`, `/evidenceRefs/*/expectedRecordType`, `/evidenceRefs/*/collectorAttemptId`, `/evidenceRefs/*/collectorAttemptDigest`, `/evidenceRefs/*/collectorToolName`, `/evidenceRefs/*/collectorToolVersion`, `/evidenceRefs/*/collectorAttemptAt`, `/evidenceRefs/*/collectorIdentityEvidenceRef`, `/evidenceRefs/*/sourceResponseDigest`, `/evidenceRefs/*/sourceResponsePointer`, `/evidenceRefs/*/failurePayloadDigest`, `/evidenceRefs/*/failurePayloadPointer` |
+| `FindingSemanticLeaf` | `/findingId`, `/findingKind`, `/verdict`, `/governanceScope/governanceScopeType`, `/governanceScope/manifestId`, `/governanceScope/profileId`, `/governanceScope/profileIds/*`, `/governanceScope/clausePath`, `/governanceScope/roleRef`, `/governanceScope/resourceId`, `/governanceScope/relationshipRef`, `/governanceScope/controlRef`, `/governanceScope/objectiveRef`, `/contextRef/manifestId`, `/contextRef/manifestVersion`, `/contextRef/profileId`, `/contextRef/resolvedProfileDigest`, `/contextRef/clausePath`, `/relationshipClassRefs/*`, `/confidence`, `/residualRisk` |
+
+The `contextualFinding` allowlist is the union of `CompatibilitySemanticLeaf`,
+`FindingSemanticLeaf`, and `EvidenceReferenceSemanticLeaf`. The `evidenceSnapshot` allowlist is the
+union of `CompatibilitySemanticLeaf` and `EvidenceSnapshotSemanticLeaf`. The `workloadManifest`
+allowlist is the union of `CompatibilitySemanticLeaf`, `ManifestIdentitySemanticLeaf`,
+`ProfileOverrideSemanticLeaf`, `RoleSemanticLeaf`, `RelationshipSemanticLeaf`,
+`ConstraintProofSemanticLeaf`, `ControlSemanticLeaf`, `RiskAcceptanceSemanticLeaf`,
+`ObjectiveSemanticLeaf`, and `OwnershipSemanticLeaf`. These union statements define closed macro
+expansions only; they are not permission to hash broad parent objects. Governance-scope leaves are
+conditional on the `governanceScopeType` discriminator; mutation tests cover each valid variant with
+only its required fields present.
 
 ## Compatibility and versioning
 
@@ -1168,14 +1281,46 @@ class ResourceGroupScopeSketch(ClosedSketch):
     subscription_id: str
     resource_group_name: str
 
+class SubscriptionScopeSketch(ClosedSketch):
+    scope_type: Literal["subscription"]
+    tenant_id: str
+    subscription_id: str
+
 class ResourceIdScopeSketch(ClosedSketch):
     scope_type: Literal["resourceId"]
     resource_id: str
 
+class LogAnalyticsWorkspaceScopeSketch(ClosedSketch):
+    scope_type: Literal["logAnalyticsWorkspace"]
+    tenant_id: str
+    subscription_id: str
+    resource_group_name: str
+    workspace_name: str
+
+class ServiceHealthRegionScopeSketch(ClosedSketch):
+    scope_type: Literal["serviceHealthRegion"]
+    cloud: Literal["AzurePublic", "AzureGovernment", "AzureChina"]
+    region: str
+
 EvidenceScopeSketch = Annotated[
-    Union[ResourceGroupScopeSketch, ResourceIdScopeSketch],
+    Union[
+        SubscriptionScopeSketch,
+        ResourceGroupScopeSketch,
+        ResourceIdScopeSketch,
+        LogAnalyticsWorkspaceScopeSketch,
+        ServiceHealthRegionScopeSketch,
+    ],
     Field(discriminator="scope_type"),
 ]
+
+class ManifestGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["manifest"]
+    manifest_id: str
+
+class ProfileGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["profile"]
+    manifest_id: str
+    profile_id: str
 
 class ClauseGovernanceScopeSketch(ClosedSketch):
     governance_scope_type: Literal["clause"]
@@ -1189,8 +1334,42 @@ class RoleGovernanceScopeSketch(ClosedSketch):
     profile_ids: list[str]
     role_ref: str
 
+class ResourceBindingGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["resourceBinding"]
+    manifest_id: str
+    profile_ids: list[str]
+    role_ref: str
+    resource_id: str
+
+class RelationshipGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["relationship"]
+    manifest_id: str
+    profile_ids: list[str]
+    relationship_ref: str
+
+class ControlGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["control"]
+    manifest_id: str
+    profile_ids: list[str]
+    control_ref: str
+
+class ObjectiveGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["objective"]
+    manifest_id: str
+    profile_ids: list[str]
+    objective_ref: str
+
 GovernanceScopeSketch = Annotated[
-    Union[ClauseGovernanceScopeSketch, RoleGovernanceScopeSketch],
+    Union[
+        ManifestGovernanceScopeSketch,
+        ProfileGovernanceScopeSketch,
+        ClauseGovernanceScopeSketch,
+        RoleGovernanceScopeSketch,
+        ResourceBindingGovernanceScopeSketch,
+        RelationshipGovernanceScopeSketch,
+        ControlGovernanceScopeSketch,
+        ObjectiveGovernanceScopeSketch,
+    ],
     Field(discriminator="governance_scope_type"),
 ]
 
@@ -1209,12 +1388,105 @@ ProofRequirementSketch = Annotated[
     Field(discriminator="proof_kind"),
 ]
 
+class CardinalitySketch(ClosedSketch):
+    cardinality_kind: Literal["exactlyOne", "oneOrMore", "zeroOrMore", "boundedRange"]
+    minimum: int | None = None
+    maximum: int | None = None
+
+class ResourceIdSelectorSketch(ClosedSketch):
+    selector_type: Literal["resourceIdList"]
+    resource_ids: list[str]
+    max_matches: int
+
+class TagPredicateSelectorSketch(ClosedSketch):
+    selector_type: Literal["tagPredicate"]
+    key: str
+    value: str
+    max_matches: int
+
+class NamePatternSelectorSketch(ClosedSketch):
+    selector_type: Literal["namePattern"]
+    prefix: str | None = None
+    suffix: str | None = None
+    max_matches: int
+
+class ResourceTypeScopeSelectorSketch(ClosedSketch):
+    selector_type: Literal["resourceTypeScope"]
+    resource_type: str
+    location: str | None = None
+    resource_group_name: str | None = None
+    max_matches: int
+
+class CompositeSelectorSketch(ClosedSketch):
+    selector_type: Literal["compositeAll", "compositeAny"]
+    children: list[str]
+    max_matches: int
+
+DynamicSelectorSketch = Annotated[
+    Union[
+        ResourceIdSelectorSketch,
+        TagPredicateSelectorSketch,
+        NamePatternSelectorSketch,
+        ResourceTypeScopeSelectorSketch,
+        CompositeSelectorSketch,
+    ],
+    Field(discriminator="selector_type"),
+]
+
 class WorkloadRoleSketch(ClosedSketch):
     role_id: str
     kind: RoleKind
     selectors: list[DynamicSelectorSketch]  # min 1, max 20
     cardinality: CardinalitySketch
     owner_ref: str
+
+class TokenVerificationSketch(ClosedSketch):
+    verified_at: datetime
+    jwks_kid: str
+    status: Literal[
+        "valid",
+        "expired",
+        "notYetValid",
+        "badSignature",
+        "unknownKey",
+        "untrustedIssuer",
+        "audienceMismatch",
+        "claimMismatch",
+        "trustAnchorUnavailable",
+    ]
+
+class SignatureVerificationSketch(ClosedSketch):
+    verified_at: datetime
+    status: Literal[
+        "valid",
+        "badSignature",
+        "unknownKey",
+        "retiredKey",
+        "trustAnchorUnavailable",
+        "preimageMismatch",
+        "expiredVerification",
+    ]
+
+class IngestionSignatureSketch(ClosedSketch):
+    signature_algorithm: Literal["RS256"]
+    key_vault_key_id: str
+    key_version: str
+    signed_preimage_digest: str
+    signature: str
+    signed_at: datetime
+    trust_anchor_ref: str
+    key_status_at_signing: Literal["active", "verifyOnly", "retired"]
+    signature_verification: SignatureVerificationSketch
+
+class CollectorIdentityEvidenceSketch(ClosedSketch):
+    identity_evidence_type: Literal["entraJwtTokenEvidence"]
+    identity_evidence_id: str
+    token_hash: str
+    trust_anchor_ref: str
+    token_verification: TokenVerificationSketch
+    ingestion_derivation_digest: str
+    ingestion_signature: IngestionSignatureSketch
+    identity_evidence_digest: str
 
 class EvidenceItemRefSketch(ClosedSketch):
     ref_type: Literal["evidenceItem"]
@@ -1238,15 +1510,34 @@ class EvidenceGapRefSketch(ClosedSketch):
     snapshot_semantic_digest: str
     gap_id: str
     gap_record_digest: str
-    gap_reason: str
+    gap_reason: Literal[
+        "missing",
+        "stale",
+        "unauthorized",
+        "filtered",
+        "malformed",
+        "collectorUnavailable",
+        "scopeMismatch",
+        "responseOversized",
+        "unsupportedTool",
+    ]
     evidence_scope: EvidenceScopeSketch
-    expected_record_type: str
+    expected_record_type: Literal[
+        "resource",
+        "observedRelationship",
+        "metricAggregate",
+        "healthEvent",
+        "activitySummary",
+        "advisorRecommendation",
+    ]
     collector_attempt_id: str
     collector_attempt_digest: str
     collector_tool_name: str
     collector_tool_version: str
     collector_attempt_at: datetime
     collector_identity_evidence_ref: str
+    failure_payload_digest: str | None = None
+    failure_payload_pointer: str | None = None
 
 EvidenceReferenceSketch = Annotated[
     Union[EvidenceItemRefSketch, EvidenceGapRefSketch],
@@ -1296,7 +1587,8 @@ Generated JSON Schemas must exist for at least:
 - evidence record union and every record variant;
 - evidence reference union, including evidence gap references;
 - collector attempt union and every attempt variant;
-- Entra token collector identity evidence, trusted ingestion derivation, and verification status;
+- MCP-host managed-identity token evidence, trusted ingestion derivation, Key Vault signature, and
+  verification status;
 - contextual finding, finding kind, and verdict;
 - architecture constraint and proof requirement union;
 - compensating control union and every control variant;
@@ -1335,14 +1627,17 @@ false`, string length limits, capability metadata, and cross-reference validatio
    reference; missing either produces `unknown` and a blocking validation error.
 11. Evidence snapshots are immutable, freshness-bound, scope-checked, canonicalized, and hash-stable
    across key ordering differences, with both artifact and semantic digests verified.
-12. Evidence records include digest-covered collector-attempt provenance and verified Entra token
-    collector identity evidence.
+12. Evidence records include digest-covered collector-attempt provenance and verified
+   MCP-host-to-trusted-ingestion collector identity evidence; the Athena caller token is stored only
+   as context-plane audit data and never satisfies Azure evidence identity.
 13. Collector-attempt tests cover `successResponse`, `failedResponse`, `timeoutNoResponse`,
    `authorizationFailure`, and `toolUnavailable`; collector-unavailable snapshots can contain valid
    evidence gaps without successful MCP responses.
-14. Collector identity evidence tests verify the original Entra JWT `RS256` signature through
-   tenant JWKS, token hash persistence, trust-anchor resolution, trusted ingestion derivation,
-   verification time/status, and fail closed for every non-`valid` status.
+14. Collector identity evidence tests verify the original MCP host managed-identity Entra JWT
+   `RS256` signature through tenant JWKS, ingestion-service audience, token hash persistence,
+   trust-anchor resolution, trusted ingestion derivation, non-exportable Key Vault signature
+   verification, key rotation state, verification time/status, retained proof fields, and fail
+   closed for every non-`valid` status.
 15. Evidence gap records are profile-neutral and contain no `neededForClauseRef`, profile id,
    verdict, or `notRequiredByProfile` judgment.
 16. Evidence collected by the Athena context identity for Azure resources is rejected; only the
@@ -1368,17 +1663,26 @@ false`, string length limits, capability metadata, and cross-reference validatio
 25. Capability negotiation tests cover `supported`, `readerTooOld`, `unknownCapability`, and
    `versionTooLow` outcomes.
 26. Compatibility placement tests prove schema, digest, and compatibility metadata appear only under
-   `/compatibility`, and semantic projection uses only closed pointer allowlists.
+   `/compatibility`, semantic projection uses only closed pointer allowlists, and validators expand
+   every named semantic macro to exact leaf pointers before hashing.
 27. Canonicalization tests prove NFC pre-validation with collision rejection followed by unmodified
    RFC 8785 JCS, and prove artifact/item/response/identity-evidence/attempt digests exclude only their own
    digest fields and the closed transport metadata fields, avoiding recursive self-hashing.
-28. Context API publication tests prove agents and Context MCP proposal paths cannot publish
+28. Mutation-coverage tests mutate every `*SemanticLeaf` path in the matrix and prove
+   `semanticDigest` changes; mutations to presentation-only exclusions do not change
+   `semanticDigest`.
+29. EvidenceGapRef tests prove the prose/table/Pydantic shape is authoritative: exactly one
+   `evidenceScope`, one `expectedRecordType`, one `collectorAttemptId`, one
+   `collectorAttemptDigest`, gap digest equal to the referenced evidence-gap item digest, no
+   response pointer on no-response variants, and failure payload pointers only where the closed
+   variant rules allow them.
+30. Context API publication tests prove agents and Context MCP proposal paths cannot publish
    authoritative manifests.
-29. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
+31. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
    alter semantic digest, patch versions preserve semantics, and incompatible major versions reject.
-30. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
+32. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
    payload fields are accepted in manifests or evidence snapshots.
-31. Repository validation, lint, type checks, and unit tests pass after implementation; this design
+33. Repository validation, lint, type checks, and unit tests pass after implementation; this design
    change itself requires repository markdown/customization validation only.
 
 ## Architecture-review questions for GPT-5.6 Sol
