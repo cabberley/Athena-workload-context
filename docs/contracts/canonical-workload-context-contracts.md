@@ -77,17 +77,16 @@ Athena has two distinct provenance planes:
 Every finding must cite both:
 
 1. an Athena context reference: manifest id, manifest version, profile id, clause path; and
-2. an Azure MCP evidence reference: snapshot id, snapshot digest, MCP tool name/version, collected
-   time, evidence item path.
+2. an Azure MCP evidence reference: snapshot id, artifact/semantic digests, evidence item digest,
+   MCP tool name/version, collected time, and source response pointer.
 
 If either citation is missing, stale, out of scope, or malformed, the finding verdict is `unknown`
 and the publication/evaluation path fails closed.
 
-## Scope discriminated union
+## Evidence scope discriminated union
 
-Scopes are not opaque strings. Manifest allowed-evidence scopes, snapshot scopes, selector scopes,
-and risk/control scopes use the same bounded discriminated union with `scopeType` as the
-discriminator:
+Azure evidence scopes are not opaque strings. Manifest allowed-evidence scopes, snapshot scopes, and
+selector scopes use the same bounded discriminated union with `scopeType` as the discriminator:
 
 | `scopeType` | Required fields | Bounds and validation |
 |---|---|---|
@@ -97,9 +96,32 @@ discriminator:
 | `logAnalyticsWorkspace` | `tenantId`, `subscriptionId`, `resourceGroupName`, `workspaceName` | Workspace name length 4-63; query evidence still stores summaries only. |
 | `serviceHealthRegion` | `cloud`, `region` | Closed `cloud` enum and Azure region id; no broad global default. |
 
-Collections containing scopes are capped at 100 entries per artifact. Overlapping scopes are
+Collections containing evidence scopes are capped at 100 entries per artifact. Overlapping scopes are
 canonicalized from broad to narrow but do not grant broader evidence access. A child scope outside
 the manifest `allowedEvidenceScopes` fails closed.
+
+## Governance scope discriminated union
+
+Governance scope is separate from Azure evidence scope. It scopes human decisions, controls,
+constraints, exceptions, and findings to Athena context entities rather than Azure RBAC boundaries.
+It uses `governanceScopeType` as the discriminator and forbids unknown properties.
+
+| `governanceScopeType` | Required fields | Bounds and validation |
+|---|---|---|
+| `manifest` | `manifestId` | Whole manifest scope; allowed only for ownership metadata, not risk acceptance. |
+| `profile` | `manifestId`, `profileId` | Profile id must resolve after inheritance. |
+| `clause` | `manifestId`, `profileIds`, `clausePath` | Clause path is a canonical JSON Pointer to a constraint, control, objective, relationship, or risk acceptance. |
+| `role` | `manifestId`, `profileIds`, `roleRef` | Role must exist in every listed profile. |
+| `resourceBinding` | `manifestId`, `profileIds`, `roleRef`, `resourceId` | Resource id must be selected for the role in the cited snapshot before evaluation can use it. |
+| `relationship` | `manifestId`, `profileIds`, `relationshipRef` | Relationship ref must resolve to a declared or exception relationship in every listed profile. |
+| `control` | `manifestId`, `profileIds`, `controlRef` | Control ref must resolve in every listed profile. |
+| `objective` | `manifestId`, `profileIds`, `objectiveRef` | Objective ref must resolve in every listed profile. |
+
+Governance scopes are capped at 50 per artifact field. A risk acceptance, control, architecture
+constraint, exception, or contextual finding uses `GovernanceScope`, never the Azure
+`EvidenceScope`, for its contextual scope. Evidence references remain separate and cite
+snapshot/evidence item digests. A governance scope with unresolved profile, clause, role,
+relationship, control, objective, or resource binding fails closed.
 
 ## Canonical workload manifest
 
@@ -287,7 +309,7 @@ Variants are:
 | `declared` | `relationshipId`, `kind`, `from`, `to`, `profiles`, `ownerRef`, `sourceClause` | Endpoints are role refs or declared external dependency refs only. |
 | `observed` | `relationshipId`, `kind`, `from`, `to`, `evidenceItemRef`, `observedAt` | Endpoints are resource refs or external evidence refs from the same snapshot. |
 | `inferred` | `relationshipId`, `kind`, `from`, `to`, `confidence`, `inputEvidenceRefs`, `algorithmId` | Confidence is 0.0-1.0 and input evidence refs are capped at 20. |
-| `exception` | `exceptionId`, `appliesToRelationshipRef`, `riskAcceptanceRef`, `scope`, `ownerRef`, `rationale`, `expiresAt` | Requires a matching active risk acceptance; does not itself accept risk. |
+| `exception` | `exceptionId`, `appliesToRelationshipRef`, `riskAcceptanceRef`, `governanceScope`, `ownerRef`, `rationale`, `expiresAt` | Uses `GovernanceScope`; requires a matching active risk acceptance; does not itself accept risk. |
 
 Relationship endpoints are also discriminated unions:
 
@@ -302,8 +324,10 @@ Relationship precedence:
 
 1. Declared relationships define intended semantics.
 2. Observed relationships prove or disprove current state.
-3. Inferred relationships may explain patterns but cannot satisfy a declared requirement unless a
-   policy explicitly says inference is acceptable and cites its confidence threshold.
+3. Inferred relationships may explain patterns but are prohibited from satisfying declared or other
+   normative requirements in WC-001. Any proof that depends on inferred relationships returns
+   `unknown` until fresh observed evidence or declared intent is available. A future inference-use
+   contract would require a separate ADR and major/minimum-reader compatibility gate.
 4. Exception relationships can explain an approved deviation only when their `riskAcceptanceRef`
    resolves to an active acceptance with matching scope. The exception never directly changes a
    verdict to `acceptedResidualRisk` and never alters the declared relationship.
@@ -321,7 +345,7 @@ Required fields:
 |---|---|---|---|
 | `snapshotId` | id | 1 | Stable immutable id. |
 | `snapshotSchemaVersion` | semantic version | 1 | Unknown major versions fail closed. |
-| `authorizedScopes` | `Scope` union array | 1-100 | Scope discriminated union; must be allowed by manifest. |
+| `authorizedScopes` | `EvidenceScope` union array | 1-100 | Evidence-scope discriminated union; must be allowed by manifest. |
 | `collectedAt` | datetime | 1 | UTC. |
 | `expiresAt` | datetime | 1 | Must be after `collectedAt` and policy freshness threshold. |
 | `collector` | Azure MCP provenance | 1 | Tool names, versions, allowlist hash, MCP identity attestation. |
@@ -347,14 +371,21 @@ Evidence records use `recordType` as the discriminator and forbid unknown proper
 | `resource` | `resourceId`, `resourceType`, `location`, `availabilityZone`, `tags`, `state`, `provenance` | Tags capped at 50; state is a closed enum. |
 | `observedRelationship` | `relationship`, `provenance` | Relationship is the `observed` relationship variant and cites one MCP response item. |
 | `metricAggregate` | `resourceId`, `metricName`, `aggregation`, `windowStart`, `windowEnd`, `value`, `unit`, `provenance` | Aggregation and unit are closed enums; no raw samples. |
-| `healthEvent` | `scope`, `healthKind`, `status`, `startedAt`, `endedAt`, `summary`, `provenance` | Summary capped at 1,000 chars; no raw incident body. |
-| `activitySummary` | `scope`, `operationName`, `status`, `count`, `windowStart`, `windowEnd`, `provenance` | Count only; no caller PII or request body. |
+| `healthEvent` | `evidenceScope`, `healthKind`, `status`, `startedAt`, `endedAt`, `summary`, `provenance` | Summary capped at 1,000 chars; no raw incident body. |
+| `activitySummary` | `evidenceScope`, `operationName`, `status`, `count`, `windowStart`, `windowEnd`, `provenance` | Count only; no caller PII or request body. |
 | `advisorRecommendation` | `resourceId`, `category`, `impact`, `recommendationCode`, `provenance` | Recommendation text is capped and treated as advisory only. |
-| `evidenceGap` | `gapId`, `scope`, `gapReason`, `neededForClauseRef`, `collectorAttemptRef` | Used when absence of evidence itself is the cited fact. |
+| `evidenceGap` | `gapId`, `evidenceScope`, `gapReason`, `expectedRecordType`, `collectorAttemptRef`, `observedAt` | Azure evidence-plane gap only; contains no Athena profile, clause, verdict, or policy judgment. |
 
 Closed `gapReason` values are `missing`, `stale`, `unauthorized`, `filtered`, `malformed`,
-`collectorUnavailable`, `scopeMismatch`, `responseOversized`, `unsupportedTool`, and
-`notRequiredByProfile`.
+`collectorUnavailable`, `scopeMismatch`, `responseOversized`, and `unsupportedTool`.
+Closed `expectedRecordType` values are `resource`, `observedRelationship`, `metricAggregate`,
+`healthEvent`, `activitySummary`, and `advisorRecommendation`.
+
+An `evidenceGap` record is profile-neutral immutable evidence. It must never contain
+`neededForClauseRef`, `profileId`, `findingKind`, `verdict`, `notRequiredByProfile`, or any other
+Athena judgment. The contextual finding supplies the manifest clause through `contextRef`; the
+evidence gap supplies only what the evidence collector attempted and what Azure evidence was absent
+or unusable.
 
 ### Cryptographic MCP provenance
 
@@ -365,15 +396,17 @@ projection into evidence records.
 
 Each evidence record contains:
 
-- `itemDigest`: SHA-256 over the canonical evidence record excluding transport metadata;
+- `itemDigest`: SHA-256 over the canonical evidence record excluding only its own `itemDigest`
+  field and non-semantic transport metadata listed in the canonicalization rules;
 - `sourceResponseDigest`: SHA-256 of the canonical MCP response envelope that produced the item;
 - `sourceResponsePointer`: JSON Pointer to the exact response item or aggregate input range;
 - `projectionAlgorithm`: stable id and semantic version for the projection logic; and
 - `collectorIdentityAttestationRef`: reference to the collector attestation in `collector`.
 
 The snapshot `artifactDigest` covers all `mcpResponses`, evidence records, item digests, and
-attestation references. The `semanticDigest` covers only policy-affecting normalized fields and item
-digests. If an evidence item cannot be tied to a digest-covered MCP response item, it is invalid.
+attestation references after excluding the snapshot's own digest fields. The `semanticDigest` covers
+only policy-affecting normalized fields and item digests. If an evidence item cannot be tied to a
+digest-covered MCP response item, it is invalid.
 
 The collector identity attestation stores no token. It records the authenticated private Azure MCP
 managed identity subject, tenant, issuer, audience, issued/expiry times, attestation digest, and the
@@ -420,7 +453,13 @@ Findings may not be evidence-free. When the finding is about missing evidence, i
   "snapshotId": "snap-wc001-canonical-001",
   "gapId": "gap-worker-zone-missing",
   "gapReason": "missing",
-  "neededForClauseRef": "/constraints/worker-db-zone-colocation",
+  "evidenceScope": {
+    "scopeType": "resourceGroup",
+    "tenantId": "00000000-0000-0000-0000-000000000000",
+    "subscriptionId": "00000000-0000-0000-0000-000000000000",
+    "resourceGroupName": "rg-athena-fixture"
+  },
+  "expectedRecordType": "resource",
   "collectorAttemptRef": "mcp-response-attempt-001"
 }
 ```
@@ -447,6 +486,11 @@ Finding kind determines which contract is being judged. Verdict determines the o
 the same singleton database can yield a `technologyConstraint` finding with `expectedConstraint`, an
 `actualSpof` finding with `acceptedResidualRisk`, and a `controlHealth` finding with `pass` or
 `unknown`.
+
+Every contextual finding includes exactly one `governanceScope` that identifies the profile, clause,
+role, resource binding, relationship, control, objective, or risk acceptance being judged. This
+governance scope is part of the semantic digest for persisted findings. Evidence references remain
+separate and must never be used as a substitute for governance scope.
 
 ## Closed verdict vocabulary
 
@@ -481,7 +525,7 @@ Publication fails when:
 - profile inheritance is circular or unresolved;
 - role, relationship, constraint, objective, ownership, control, or risk references are unresolved;
 - canonicalization or digest verification fails;
-- an exception or risk acceptance lacks owner, rationale, scope, or expiry; or
+- an exception or risk acceptance lacks owner, rationale, governance scope, or expiry; or
 - a selector grammar is unsupported or unbounded.
 
 Evaluation returns `unknown` or `conflicting` and blocks automated pass when:
@@ -522,6 +566,7 @@ Constraint fields:
 |---|---|---|---|
 | `constraintId` | id | 1 | Stable within manifest. |
 | `type` | enum | 1 | Closed constraint type. |
+| `governanceScope` | `GovernanceScope` union | 1 | Context scope for the clause. |
 | `appliesToRoleRefs` | array | 1-50 | Role ids must resolve. |
 | `profiles` | array | 1-25 | Profiles where constraint applies. |
 | `severity` | enum | 1 | `critical`, `high`, `medium`, `low`, `informational`. |
@@ -546,6 +591,43 @@ Constraint fields:
 Every proof requirement includes `requiredEvidenceRefKinds`, `onMissingEvidence`, and
 `onConflictingEvidence`. These outcomes are closed to `unknown`, `conflicting`, or `violation`.
 Proof requirements never embed free-form code, query text, or direct Azure client configuration.
+
+## Profile continuity settings
+
+`zoneLossContinuityRequired` is an Athena profile setting, not Azure evidence. It lives in the
+closed `ProfileContinuitySettings` object:
+
+```json
+{
+  "settings": {
+    "continuity": {
+      "zoneLossContinuityRequired": true
+    }
+  }
+}
+```
+
+The canonical JSON Pointer for a resolved profile is:
+
+```text
+/resolvedProfiles/{profileId}/settings/continuity/zoneLossContinuityRequired
+```
+
+The source manifest path for a profile override is:
+
+```text
+/profiles/{profileId}/overrides/settings/continuity/zoneLossContinuityRequired
+```
+
+Rules:
+
+- The field is required in every resolved profile and is a strict boolean.
+- Missing, null, string, numeric, or inherited-ambiguous values fail profile resolution.
+- `true` means the profile claims continuity through a zone loss and therefore requires a matching
+  active database zone-loss risk acceptance for the canonical singleton database SPOF.
+- `false` means the profile does not claim zone-loss continuity. The actual database SPOF is still
+  observed using concrete database evidence, but absence of a risk acceptance is not a gap and does
+  not require an Azure evidence-gap record.
 
 ## Three-profile oracle
 
@@ -604,14 +686,15 @@ The same snapshot must be evaluated through one policy path and produce exactly 
 | Clause id | Finding kind | Production | Development | Training |
 |---|---|---|---|---|
 | `db-singleton-supported` | `technologyConstraint` | `expectedConstraint` | `expectedConstraint` | `expectedConstraint` |
-| `db-zone-loss-spof` | `actualSpof` | `acceptedResidualRisk` via `ra-db-zone-loss-prod` | `observation` with evidence item refs | `acceptedResidualRisk` via `ra-db-zone-loss-training` |
-| `db-zone-loss-acceptance` | `riskAcceptance` | `acceptedResidualRisk` | `observation` with typed evidence-gap ref `notRequiredByProfile` | `acceptedResidualRisk` |
+| `db-zone-loss-spof` | `actualSpof` | `acceptedResidualRisk` via `ra-db-zone-loss-prod` | `observation` citing the `athena-db-01` resource evidence item and resolved `zoneLossContinuityRequired = false` context path | `acceptedResidualRisk` via `ra-db-zone-loss-training` |
+| `db-zone-loss-acceptance` | `riskAcceptance` | `acceptedResidualRisk` | `observation` citing the `athena-db-01` resource evidence item and resolved `zoneLossContinuityRequired = false` context path; no evidence-gap record is emitted | `acceptedResidualRisk` |
 | `worker-db-zone-colocation` | `architectureConstraint` | `pass` | `pass` | `pass` |
 | `web-zone-distribution` | `architectureConstraint` | `pass` because 2 >= 2 | `pass` because 2 >= 1 | `violation` because 2 < 3 |
 
-No exception record may alter this matrix unless it references an active risk acceptance whose scope
-matches the exact clause, profile, and resource set. A missing acceptance for `db-zone-loss-spof` in
-a profile that requires zone-loss continuity yields `violation`, not `acceptedResidualRisk`.
+No exception record may alter this matrix unless it references an active risk acceptance whose
+governance scope matches the exact clause, profile, and resource binding. A missing acceptance for
+`db-zone-loss-spof` in a profile that requires zone-loss continuity yields `violation`, not
+`acceptedResidualRisk`.
 
 ## Canonical constrained-topology proof requirements
 
@@ -642,7 +725,8 @@ The prototype's canonical topology must be represented by these constraints.
   - all workers in the database zone yields `pass`;
   - any worker in another known zone yields `violation`;
   - missing zone evidence for database or any worker yields `unknown`;
-  - an exception must identify the exact worker scope, expiry, and active `riskAcceptanceRef`;
+  - an exception must identify the exact worker governance scope, expiry, and active
+    `riskAcceptanceRef`;
     without that acceptance it is explanatory only and the worker finding remains `violation` or
     `unknown`.
 
@@ -685,7 +769,7 @@ Closed control health values:
 - `expired`
 - `notApplicable`
 
-A control has owner, scope, evidence references, review cadence, last-tested time, expiry or next
+A control has owner, governance scope, evidence references, review cadence, last-tested time, expiry or next
 review time, and profile applicability. Missing or stale control evidence yields a separate control
 finding and does not turn the related architecture finding into `pass`.
 
@@ -693,14 +777,14 @@ Controls use `controlKind` as a discriminator and forbid unknown properties:
 
 | `controlKind` | Required fields | Bound and rule |
 |---|---|---|
-| `backup` | `controlId`, `scope`, `backupPolicyRef`, `lastSuccessfulBackupAt`, `evidenceRefs` | Backup policy ref is bounded text, not a secret. |
-| `restoreTest` | `controlId`, `scope`, `lastTestedAt`, `testOutcome`, `rtoObserved`, `evidenceRefs` | `testOutcome` is `passed`, `failed`, `partial`, or `unknown`. |
-| `manualFailoverRunbook` | `controlId`, `scope`, `runbookRef`, `lastReviewedAt`, `ownerRef` | Runbook ref is URI/id only; no embedded procedure body required. |
-| `monitoringAlert` | `controlId`, `scope`, `alertRuleRef`, `enabledState`, `lastFiredAt`, `evidenceRefs` | `enabledState` is closed enum. |
-| `capacityReview` | `controlId`, `scope`, `cadence`, `lastReviewedAt`, `nextReviewDueAt` | Cadence is closed enum and max 180 days. |
-| `accessReview` | `controlId`, `scope`, `cadence`, `lastCompletedAt`, `reviewSystemRef` | No user lists or PII payloads. |
-| `changeApproval` | `controlId`, `scope`, `approvalSystemRef`, `requiredForChangeKinds` | Change kinds are closed enum values. |
-| `vendorSupport` | `controlId`, `scope`, `supportPlanRef`, `coverageHours`, `expiry` | Support plan ref is bounded metadata only. |
+| `backup` | `controlId`, `governanceScope`, `backupPolicyRef`, `lastSuccessfulBackupAt`, `evidenceRefs` | Backup policy ref is bounded text, not a secret. |
+| `restoreTest` | `controlId`, `governanceScope`, `lastTestedAt`, `testOutcome`, `rtoObserved`, `evidenceRefs` | `testOutcome` is `passed`, `failed`, `partial`, or `unknown`. |
+| `manualFailoverRunbook` | `controlId`, `governanceScope`, `runbookRef`, `lastReviewedAt`, `ownerRef` | Runbook ref is URI/id only; no embedded procedure body required. |
+| `monitoringAlert` | `controlId`, `governanceScope`, `alertRuleRef`, `enabledState`, `lastFiredAt`, `evidenceRefs` | `enabledState` is closed enum. |
+| `capacityReview` | `controlId`, `governanceScope`, `cadence`, `lastReviewedAt`, `nextReviewDueAt` | Cadence is closed enum and max 180 days. |
+| `accessReview` | `controlId`, `governanceScope`, `cadence`, `lastCompletedAt`, `reviewSystemRef` | No user lists or PII payloads. |
+| `changeApproval` | `controlId`, `governanceScope`, `approvalSystemRef`, `requiredForChangeKinds` | Change kinds are closed enum values. |
+| `vendorSupport` | `controlId`, `governanceScope`, `supportPlanRef`, `coverageHours`, `expiry` | Support plan ref is bounded metadata only. |
 
 Control health evaluation produces `findingKind = controlHealth`. It cannot produce
 `acceptedResidualRisk`; only a risk acceptance finding can do that.
@@ -715,7 +799,7 @@ Required fields:
 | Field | Type | Bound | Notes |
 |---|---|---|---|
 | `riskAcceptanceId` | id | 1 | Stable id. |
-| `scope` | role/constraint/profile refs | 1 | Must be narrow and resolvable. |
+| `governanceScope` | `GovernanceScope` union | 1 | Must be narrow and resolvable. |
 | `residualRiskStatement` | string | 1-2,000 chars | States retained risk. |
 | `acceptedBy` | human approval reference | 1 | No secrets; auditable principal reference. |
 | `ownedBy` | ownership ref | 1 | Team accountable for review. |
@@ -724,8 +808,9 @@ Required fields:
 | `linkedControlRefs` | array | 0-50 | Controls that mitigate but do not erase risk. |
 | `profiles` | array | 1-25 | Environments where acceptance applies. |
 
-Expired, ownerless, rationale-free, or scope-broad acceptances are invalid at publication. An active
-acceptance changes applicable findings to `acceptedResidualRisk`; it does not produce `pass`.
+Expired, ownerless, rationale-free, or over-broad governance-scope acceptances are invalid at
+publication. An active acceptance changes applicable findings to `acceptedResidualRisk`; it does not
+produce `pass`.
 
 Risk acceptances are the only contract that can produce a `riskAcceptance` finding with
 `acceptedResidualRisk`. Exception records, control health, and technology constraints may reference a
@@ -771,7 +856,79 @@ and approval authority. They must not include passwords, tokens, private keys, u
 PHI/PII payloads. A missing owner for a constraint, control, risk acceptance, role, or objective is a
 publication failure.
 
+## Canonicalization and digest rules
+
+Digests must be implementable without recursion and must be language-independent.
+
+Canonicalization standard:
+
+1. Encode canonical documents as UTF-8 JSON with no byte order mark.
+2. Use RFC 8785 JSON Canonicalization Scheme rules for object property sorting, string escaping, and
+   whitespace removal.
+3. Sort object members lexicographically by Unicode code point after NFC normalization.
+4. Preserve array order only where order is semantically meaningful. For keyed collections, sort by
+   normalized stable id before serialization.
+5. Normalize strings to Unicode NFC, trim no characters implicitly, and reject unpaired surrogates.
+6. Normalize datetimes to UTC RFC 3339 with exactly millisecond precision and `Z`, for example
+   `2026-08-15T00:00:00.000Z`. Leap seconds are rejected.
+7. Numbers use RFC 8785 shortest round-trippable JSON form. NaN, infinity, negative zero, and numbers
+   outside IEEE-754 safe integer range are rejected unless the schema declares the field as a string.
+8. Booleans and null retain JSON native forms. Semantically relevant nulls are preserved.
+9. Hash algorithm is SHA-256 over the canonical UTF-8 byte sequence. Digest strings use lowercase
+   `sha256:<64 lowercase hex characters>`.
+
+Self-digest exclusion rules:
+
+| Digest | Input | Excluded fields before canonicalization |
+|---|---|---|
+| Manifest `artifactDigest` | Entire manifest artifact | `/audit/artifactDigest`, `/audit/semanticDigest`, transport-only envelope fields. |
+| Manifest `semanticDigest` | Resolved policy-affecting manifest projection | `/audit/artifactDigest`, `/audit/semanticDigest`, documentation-only metadata, non-semantic `extensions`, and transport-only envelope fields. |
+| Snapshot `artifactDigest` | Entire evidence snapshot artifact | `/artifactDigest`, `/semanticDigest`, transport-only envelope fields. |
+| Snapshot `semanticDigest` | Evidence snapshot policy projection | `/artifactDigest`, `/semanticDigest`, non-policy collector diagnostics, and transport-only envelope fields. |
+| Evidence record `itemDigest` | One evidence record | `/itemDigest` and transport-only envelope fields for that record. |
+| MCP response `responseEnvelopeDigest` | One canonical MCP response envelope | `/responseEnvelopeDigest`, bearer tokens, request correlation ids, and transport retry metadata. |
+| Collector `attestationDigest` | One collector identity attestation | `/attestationDigest`, `/signature`, and token material. |
+
+Transport-only envelope fields are closed: `requestId`, `correlationId`, `retryCount`,
+`transportLatencyMs`, `receivedAt`, and `rawTransportHeaders`. No other field may be excluded
+without a compatibility change. Exclusion happens before sorting and hashing. Hash verification
+recomputes all child item digests first, then response/attestation digests, then artifact and
+semantic digests; cycles are invalid.
+
 ## Compatibility and versioning
+
+Compatibility metadata is a closed contract, not a free-form map.
+
+| Field | Type | Bound | Notes |
+|---|---|---|---|
+| `schemaVersion` | semantic version | 1 | Artifact schema version. |
+| `minimumReaderVersion` | semantic version | 1 | Minimum reader contract version required to process this artifact. |
+| `requiresCapabilities` | array of `CapabilityRequirement` | 0-50 | Required for policy-affecting optional fields or enum/union additions. |
+| `producedBy` | `ProducerInfo` | 1 | Tool name/version that produced the artifact. |
+| `artifactDigest` | digest string | 1 | Exact canonical bytes digest. |
+| `semanticDigest` | digest string | 1 | Policy semantics digest. |
+
+Identifier and version grammar:
+
+- Capability identifiers match `^athena\\.[a-z][a-z0-9-]{1,31}(\\.[a-z][a-z0-9-]{1,31}){1,5}$`.
+- Producer identifiers match the same grammar.
+- Versions match semantic version `MAJOR.MINOR.PATCH` with numeric non-negative components and no
+  build metadata. Pre-release versions are allowed only in non-published drafts.
+- Capability requirements use `{ "capabilityId": "...", "minimumVersion": "MAJOR.MINOR.PATCH",
+  "requiredFor": "read|publish|evaluate|render" }` and forbid unknown properties.
+
+Capability negotiation is deterministic:
+
+1. Reader advertises `readerVersion` and a sorted map of `{capabilityId: supportedVersion}`.
+2. Artifact requirements are sorted by `capabilityId`, then `requiredFor`.
+3. If `readerVersion < minimumReaderVersion`, outcome is `readerTooOld`.
+4. For each requirement, missing `capabilityId` yields `unknownCapability`.
+5. A supported version lower than `minimumVersion` yields `versionTooLow`.
+6. If all requirements are satisfied, outcome is `supported`.
+
+Closed negotiation outcomes are `supported`, `readerTooOld`, `unknownCapability`, and
+`versionTooLow`. Publication and evaluation require `supported`. Rendering may display a fail-closed
+message for any other outcome but must not treat the artifact as policy-valid.
 
 Compatibility rules:
 
@@ -858,9 +1015,26 @@ class ResourceIdScopeSketch(ClosedSketch):
     scope_type: Literal["resourceId"]
     resource_id: str
 
-ScopeSketch = Annotated[
+EvidenceScopeSketch = Annotated[
     Union[ResourceGroupScopeSketch, ResourceIdScopeSketch],
     Field(discriminator="scope_type"),
+]
+
+class ClauseGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["clause"]
+    manifest_id: str
+    profile_ids: list[str]
+    clause_path: str
+
+class RoleGovernanceScopeSketch(ClosedSketch):
+    governance_scope_type: Literal["role"]
+    manifest_id: str
+    profile_ids: list[str]
+    role_ref: str
+
+GovernanceScopeSketch = Annotated[
+    Union[ClauseGovernanceScopeSketch, RoleGovernanceScopeSketch],
+    Field(discriminator="governance_scope_type"),
 ]
 
 class CardinalityProofSketch(ClosedSketch):
@@ -899,7 +1073,8 @@ class EvidenceGapRefSketch(ClosedSketch):
     snapshot_id: str
     gap_id: str
     gap_reason: str
-    needed_for_clause_ref: str
+    evidence_scope: EvidenceScopeSketch
+    expected_record_type: str
 
 EvidenceReferenceSketch = Annotated[
     Union[EvidenceItemRefSketch, EvidenceGapRefSketch],
@@ -912,7 +1087,7 @@ class EvidenceSnapshotSketch(ClosedSketch):
     collected_at: datetime
     expires_at: datetime
     collector: AzureMcpCollectorProvenanceSketch
-    authorized_scopes: list[ScopeSketch]  # min 1, max 100
+    authorized_scopes: list[EvidenceScopeSketch]  # min 1, max 100
     evidence_records: list[EvidenceRecordSketch]  # discriminated union, max 30_000
     artifact_digest: str
     semantic_digest: str
@@ -921,6 +1096,7 @@ class ContextualFindingSketch(ClosedSketch):
     finding_id: str
     finding_kind: FindingKind
     verdict: Verdict
+    governance_scope: GovernanceScopeSketch
     context_ref: ManifestClauseRefSketch
     evidence_refs: list[EvidenceReferenceSketch]  # min 1; gaps are explicit refs
     relationship_class_refs: list[RelationshipClass]
@@ -941,7 +1117,8 @@ Generated JSON Schemas must exist for at least:
 - resolved environment profile;
 - workload role;
 - dynamic selector;
-- scope union and every scope variant;
+- evidence scope union and every evidence scope variant;
+- governance scope union and every governance scope variant;
 - relationship union and every declared, observed, inferred, and exception variant;
 - relationship endpoint union;
 - immutable evidence snapshot;
@@ -966,47 +1143,60 @@ false`, string length limits, capability metadata, and cross-reference validatio
    owner roles, and gap reasons.
 2. Generated JSON Schemas include required properties, discriminators, `additionalProperties: false`,
    and bounded collection constraints for every contract listed above.
-3. A manifest with Production, Development, and Training profiles resolves deterministically and
+3. Governance-scope tests prove risk acceptances, controls, constraints, exceptions, and findings use
+   `GovernanceScope`, while Azure evidence snapshots and selectors use `EvidenceScope`.
+4. A manifest with Production, Development, and Training profiles resolves deterministically and
    emits a stable resolved-profile digest.
-4. Circular profile inheritance, missing parent profile, unresolved role reference, duplicate role id,
+5. Circular profile inheritance, missing parent profile, unresolved role reference, duplicate role id,
    ambiguous override, and weakening override without rationale all fail publication.
-5. Deterministic merge tests prove keyed collections merge by id, discriminator variants cannot be
+6. Deterministic merge tests prove keyed collections merge by id, discriminator variants cannot be
    changed by override, `disabledRefs` require owner/rationale, and all cross-references resolve
    exactly once after profile resolution.
-6. Declared, observed, inferred, and exception relationships serialize as distinct discriminated
+7. Declared, observed, inferred, and exception relationships serialize as distinct discriminated
    collections and cannot be silently merged by validation or canonicalization.
-7. Exception records without a matching active `riskAcceptanceRef` never produce
+8. Inferred relationships cannot satisfy declared or normative requirements in WC-001; attempted
+   inference-only proof yields `unknown`.
+9. Exception records without a matching active `riskAcceptanceRef` never produce
    `acceptedResidualRisk`.
-8. Policy findings cite both a manifest clause and an Azure MCP evidence item or typed evidence-gap
+10. Policy findings cite both a manifest clause and an Azure MCP evidence item or typed evidence-gap
    reference; missing either produces `unknown` and a blocking validation error.
-9. Evidence snapshots are immutable, freshness-bound, scope-checked, canonicalized, and hash-stable
+11. Evidence snapshots are immutable, freshness-bound, scope-checked, canonicalized, and hash-stable
    across key ordering differences, with both artifact and semantic digests verified.
-10. Evidence records include digest-covered item-to-MCP-response provenance and authenticated
+12. Evidence records include digest-covered item-to-MCP-response provenance and authenticated
     collector identity attestation.
-11. Evidence collected by the Athena context identity for Azure resources is rejected; only the
+13. Evidence gap records are profile-neutral and contain no `neededForClauseRef`, profile id,
+    verdict, or `notRequiredByProfile` judgment.
+14. Evidence collected by the Athena context identity for Azure resources is rejected; only the
     private Azure MCP collector identity reference is valid for Azure evidence.
-12. Selector tests cover exact ids, tag predicates, type scope, composites, over-broad matches,
+15. Selector tests cover exact ids, tag predicates, type scope, composites, over-broad matches,
     out-of-scope matches, and low-confidence ambiguous matches.
-13. The exact three-profile oracle evaluates `snap-wc001-canonical-001` under Production,
+16. The exact three-profile oracle evaluates `snap-wc001-canonical-001` under Production,
     Development, and Training through one code path and matches every verdict in the expected
     matrix.
-14. Active database singleton risk acceptance produces `acceptedResidualRisk` as a separate finding
+17. Development profile SPOF observations cite the actual `athena-db-01` evidence item and the
+    resolved `zoneLossContinuityRequired = false` context path; no evidence-gap record is emitted for
+    this case.
+18. Active database singleton risk acceptance produces `acceptedResidualRisk` as a separate finding
     and never converts the singleton constraint to `pass`.
-15. Distinct `technologyConstraint`, `actualSpof`, `controlHealth`, and `riskAcceptance` finding
+19. Distinct `technologyConstraint`, `actualSpof`, `controlHealth`, and `riskAcceptance` finding
     kinds are emitted for the singleton database risk model.
-16. Expired risk acceptance, stale control evidence, missing owner, and absent rationale fail closed.
-17. Unknown schema major version, unknown required capability, unknown enum value, unknown
+20. Expired risk acceptance, stale control evidence, missing owner, and absent rationale fail closed.
+21. Unknown schema major version, unknown required capability, unknown enum value, unknown
     discriminator, oversized collection, unsupported extension, malformed digest, stale evidence,
     and unapproved Azure MCP tool all fail closed.
-18. Policy-affecting optional fields or enum additions require capability/minimum-reader negotiation
+22. Policy-affecting optional fields or enum additions require capability/minimum-reader negotiation
     or a major version; older readers cannot silently ignore them.
-19. Context API publication tests prove agents and Context MCP proposal paths cannot publish
+23. Capability negotiation tests cover `supported`, `readerTooOld`, `unknownCapability`, and
+    `versionTooLow` outcomes.
+24. Canonicalization tests prove artifact/item/response/attestation digests exclude only their own
+    digest fields and the closed transport metadata fields, avoiding recursive self-hashing.
+25. Context API publication tests prove agents and Context MCP proposal paths cannot publish
     authoritative manifests.
-20. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
+26. Compatibility tests prove non-policy metadata changes alter only artifact digest, policy changes
     alter semantic digest, patch versions preserve semantics, and incompatible major versions reject.
-21. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
+27. Security tests prove no raw log bodies, secrets, PHI, PII, credentials, or customer proprietary
     payload fields are accepted in manifests or evidence snapshots.
-22. Repository validation, lint, type checks, and unit tests pass after implementation; this design
+28. Repository validation, lint, type checks, and unit tests pass after implementation; this design
     change itself requires repository markdown/customization validation only.
 
 ## Architecture-review questions for GPT-5.6 Sol
@@ -1015,6 +1205,7 @@ false`, string length limits, capability metadata, and cross-reference validatio
 - Are any fields likely to recreate generic Azure MCP discovery or monitoring inside Athena?
 - Are scope, proof requirement, relationship, control, evidence record, and evidence reference
   unions closed and bounded enough for implementation?
+- Are Azure `EvidenceScope` and Athena `GovernanceScope` distinct and used consistently?
 - Are closed verdicts sufficient for UI, policy, and review gates without creating hidden pass states?
 - Are finding kinds separated enough to prevent technology constraints, actual SPOFs, control health,
   and risk acceptance from being conflated?
@@ -1024,9 +1215,12 @@ false`, string length limits, capability metadata, and cross-reference validatio
   `acceptedResidualRisk` verdict?
 - Does cryptographic item-to-MCP-response provenance and collector identity attestation preserve the
   evidence-plane boundary?
+- Are evidence gaps profile-neutral, and do Development oracle observations cite actual database
+  evidence rather than profile judgments embedded in evidence?
 - Are selector and evidence bounds measurable and safe for the first 1,000-resource synthetic test?
 - Is declared-versus-inferred precedence explicit enough to prevent silent drift acceptance?
 - Is the three-profile oracle exact enough for a future implementation to produce deterministic
   Production, Development, and Training results?
 - Are artifact/semantic digest and capability/minimum-reader rules strict enough to prevent older
   readers from silently ignoring policy-affecting changes?
+- Does WC-001 fully prohibit inference from satisfying normative requirements?

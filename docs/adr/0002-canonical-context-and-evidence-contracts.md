@@ -31,6 +31,7 @@ The canonical contracts are:
    namespaced `extensions` object that has no policy semantics. Scope, proof requirement,
    relationship, control, evidence record, and provenance shapes are bounded discriminated unions,
    not opaque objects.
+   Azure evidence scope and Athena governance scope are separate closed unions.
 2. **Workload manifest.** A human-approved, versioned, immutable publication containing workload
    identity, profile definitions, role declarations, dynamic selectors, declared relationships,
    constraints, controls, risk acceptances, objectives, operational ownership, and compatibility
@@ -39,6 +40,8 @@ The canonical contracts are:
    deterministic, explicit, provenance-preserving, and fail-closed for circular inheritance,
    unresolved references, ambiguous overrides, unknown enum values, or policy-weakening changes
    without an explicit profile-scoped rationale.
+   `zoneLossContinuityRequired` is a strict boolean at
+   `/resolvedProfiles/{profileId}/settings/continuity/zoneLossContinuityRequired`.
 4. **Workload roles and dynamic selectors.** Roles define workload meaning. Selectors bind Azure MCP
    evidence to roles through a bounded, reviewed predicate grammar. Selector matches are proposals
    until approved by the Context API; ambiguous or over-broad selectors fail closed.
@@ -50,8 +53,9 @@ The canonical contracts are:
 6. **Immutable evidence snapshots.** Evidence snapshots are canonicalized, hashed, freshness-bound,
    scope-bound, and immutable. Each evidence item carries digest-covered provenance back to a
    specific MCP response item and an authenticated collector identity attestation for the private
-   Azure MCP managed identity. They do not contain unrestricted log bodies, secrets, PHI, PII, or
-   customer proprietary payloads.
+   Azure MCP managed identity. Evidence records are profile-neutral and do not contain Athena
+   judgments such as clause paths, verdicts, or profile-specific `not required` statements. They do
+   not contain unrestricted log bodies, secrets, PHI, PII, or customer proprietary payloads.
 7. **Provenance boundary.** Findings cite both a manifest clause and evidence reference. Context-plane
    provenance and private Azure MCP evidence-plane provenance remain distinct. The Athena context
    identity has no workload Reader role and never becomes the collector of Azure evidence. Findings
@@ -79,7 +83,9 @@ The canonical contracts are:
    singleton risk acceptance is `acceptedResidualRisk` or `expectedConstraint`, never `pass`.
 13. **Compatibility.** Contract schema versions use semantic versioning and include separate
     artifact and semantic digests. Policy-affecting optional fields and enum additions require
-    capability/minimum-reader negotiation or a major version. Unknown major versions, unknown
+    closed `requiresCapabilities` and `minimumReaderVersion` metadata plus deterministic negotiation,
+    or a major version. Digests use language-independent canonical JSON, exclude only their own
+    digest fields and closed transport metadata, and use SHA-256. Unknown major versions, unknown
     required capabilities, unknown enum values, malformed extensions, stale evidence, ambiguous
     selectors, or unbounded collections are rejected or evaluated as fail-closed findings before
     publication or policy use.
@@ -89,17 +95,19 @@ The canonical contracts are:
 Declared manifest intent is authoritative for policy semantics after human publication. Observed
 Azure MCP evidence is authoritative only for current Azure state. Inferred relationships are
 Athena-generated interpretations with confidence and cannot weaken, replace, or silently amend a
-declared relationship or constraint. Exceptions document scoped deviations only. A finding can become
+declared relationship or constraint. WC-001 prohibits inferred relationships from satisfying
+normative requirements. Exceptions document scoped deviations only. A finding can become
 `acceptedResidualRisk` only when the applicable exception or SPOF condition references a currently
-active risk acceptance with matching scope, owner, rationale, expiry, and provenance.
+active risk acceptance with matching governance scope, owner, rationale, expiry, and provenance.
 
 Precedence during evaluation is:
 
 1. validate manifest and profile resolution;
 2. validate evidence scope, freshness, hash, and provenance;
 3. evaluate declared constraints against observed evidence;
-4. include inferred relationships only as non-authoritative context unless a policy explicitly
-   references them;
+4. treat inferred relationships as explanatory context only; WC-001 prohibits them from satisfying
+   normative requirements, and any proof that needs inference returns fail-closed `unknown` until
+   declared intent or observed evidence is available;
 5. apply active exceptions as scoped explanatory overlays, then apply matching active risk
    acceptances as the only source of `acceptedResidualRisk`; and
 6. surface conflicts between sources as `conflicting` rather than reconciling them silently.
