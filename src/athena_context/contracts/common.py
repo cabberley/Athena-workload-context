@@ -34,6 +34,23 @@ def _contains_unpaired_surrogate(value: str) -> bool:
     return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
 
 
+def _normalize_datetime_string(value: str) -> str:
+    if value.endswith("Z"):
+        candidate = value[:-1] + "+00:00"
+    elif "T" not in value:
+        return value
+    else:
+        candidate = value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return value
+    utc_value = parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    if utc_value.microsecond:
+        return utc_value.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return utc_value.strftime("%Y-%m-%dT%H:%M:%S") + ".000Z"
+
+
 def _utf16_sort_key(value: str) -> tuple[int, ...]:
     return tuple(value.encode("utf-16-le"))
 
@@ -42,7 +59,10 @@ def _normalize_json_value(value: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return normalize_nfc_text(value)
+        normalized_text = normalize_nfc_text(value)
+        if "T" in normalized_text:
+            return _normalize_datetime_string(normalized_text)
+        return normalized_text
     if isinstance(value, int):
         if abs(value) > _MAX_SAFE_INT:
             raise AthenaValidationError("numeric value exceeds IEEE-754 safe integer range")
@@ -65,13 +85,13 @@ def _normalize_json_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_normalize_json_value(item) for item in value]
     if isinstance(value, dict):
-        normalized: dict[str, Any] = {}
+        normalized_map: dict[str, Any] = {}
         for key, item in value.items():
             key_text = normalize_nfc_text(str(key))
-            if key_text in normalized:
+            if key_text in normalized_map:
                 raise NormalizationCollisionError(f"duplicate normalized object key: {key_text!r}")
-            normalized[key_text] = _normalize_json_value(item)
-        return normalized
+            normalized_map[key_text] = _normalize_json_value(item)
+        return normalized_map
     raise TypeError(f"unsupported JSON value type: {type(value)!r}")
 
 
