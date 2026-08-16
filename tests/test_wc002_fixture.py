@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from importlib.resources import files
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,7 @@ from athena_context.contracts import (
 )
 from athena_context.contracts.manifest import resolve_manifest_profile
 from athena_context.fixtures import (
+    _resource_id,
     make_canonical_fixture,
     make_conflicting_evidence_fixture,
     make_missing_evidence_fixture,
@@ -131,3 +133,26 @@ def test_package_fixture_resources_are_loaded_via_importlib_resources() -> None:
     assert fixture_data["snapshot"]["snapshotId"] == snapshot_data["snapshotId"]
     assert snapshot_data["snapshotId"] == "snap-111111111111"
     assert manifest_data["manifestId"] == "wl-athena-wc002-canonical"
+
+
+def test_no_stale_non_package_canonical_assets_exist() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    for base in (repo_root / "content", repo_root / "src" / "content"):
+        assert list(base.glob("**/canonical-*.json")) == []
+
+
+def test_load_balancer_topology_uses_network_resource_path() -> None:
+    bundle = make_canonical_fixture()
+    lb_id = _resource_id("athena-lb-01", resource_type="Microsoft.Network/loadBalancers")
+    lb_record = next(
+        record
+        for record in bundle.canonical_snapshot.evidence_records
+        if getattr(record, "resource_id", None) == lb_id
+    )
+    assert lb_record.resource_type == "Microsoft.Network/loadBalancers"
+    assert lb_record.resource_id.startswith(
+        "/subscriptions/11111111-1111-1111-1111-111111111111/"
+        "resourceGroups/rg-athena-fixture/providers/"
+        "Microsoft.Network/loadBalancers/athena-lb-01"
+    )
+    assert "Microsoft.Compute/virtualMachines" not in lb_record.resource_id

@@ -93,11 +93,14 @@ def _published_at() -> datetime:
     return datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
 
 
-def _resource_id(resource_name: str) -> str:
+def _resource_id(
+    resource_name: str, *,
+    resource_type: str = "Microsoft.Compute/virtualMachines",
+) -> str:
     return (
         "/subscriptions/11111111-1111-1111-1111-111111111111/"
-        f"resourceGroups/{_CANONICAL_RESOURCE_GROUP_NAME}/providers/Microsoft.Compute/"
-        f"virtualMachines/{resource_name}"
+        f"resourceGroups/{_CANONICAL_RESOURCE_GROUP_NAME}/providers/{resource_type}/"
+        f"{resource_name}"
     )
 
 
@@ -337,7 +340,10 @@ def _build_response_envelope() -> dict[str, Any]:
             },
             {
                 "recordType": "resource",
-                "resourceId": _resource_id("athena-lb-01"),
+                "resourceId": _resource_id(
+                    "athena-lb-01",
+                    resource_type="Microsoft.Network/loadBalancers",
+                ),
                 "resourceType": "Microsoft.Network/loadBalancers",
                 "location": "australiaeast",
                 "availabilityZone": "1",
@@ -374,7 +380,10 @@ def _build_response_envelope() -> dict[str, Any]:
                     },
                     "target": {
                         "refKind": "resourceRef",
-                        "resourceId": _resource_id("athena-lb-01"),
+                        "resourceId": _resource_id(
+                            "athena-lb-01",
+                            resource_type="Microsoft.Network/loadBalancers",
+                        ),
                     },
                     "evidenceItemRef": "item-222222222222",
                     "observedAt": received_at,
@@ -548,7 +557,10 @@ def _canonical_snapshot_payload(
             },
             {
                 "recordType": "resource",
-                "resourceId": _resource_id("athena-lb-01"),
+                "resourceId": _resource_id(
+                    "athena-lb-01",
+                    resource_type="Microsoft.Network/loadBalancers",
+                ),
                 "resourceType": "Microsoft.Network/loadBalancers",
                 "location": "australiaeast",
                 "availabilityZone": "1",
@@ -605,7 +617,10 @@ def _canonical_snapshot_payload(
                     },
                     "target": {
                         "refKind": "resourceRef",
-                        "resourceId": _resource_id("athena-lb-01"),
+                        "resourceId": _resource_id(
+                            "athena-lb-01",
+                            resource_type="Microsoft.Network/loadBalancers",
+                        ),
                     },
                     "evidenceItemRef": "item-222222222222",
                     "observedAt": collected_at,
