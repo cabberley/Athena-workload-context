@@ -21,6 +21,7 @@ from athena_context.fixtures import (
     _resource_id,
     load_canonical_fixture_resource,
     load_canonical_manifest_resource,
+    load_canonical_snapshot_resource,
     make_canonical_fixture,
     make_canonical_fixture_from_resources,
     make_conflicting_evidence_fixture,
@@ -180,6 +181,39 @@ def test_make_canonical_fixture_from_resources_round_trips_valid_bundle() -> Non
     round_tripped = json.loads(json.dumps(fixture_data))
     reloaded = CanonicalWorkloadManifest.model_validate(round_tripped["manifest"])
     assert reloaded.compatibility.artifact_digest == expected_digest
+
+
+def test_embedded_combined_snapshot_is_valid_and_matches_packaged_and_runtime_snapshot() -> None:
+    bundle = make_canonical_fixture()
+    fixture_data = load_canonical_fixture_resource()
+    packaged_snapshot = load_canonical_snapshot_resource()
+    embedded_snapshot_data = fixture_data["snapshot"]
+
+    reloaded_snapshot = EvidenceSnapshot.model_validate(embedded_snapshot_data)
+    round_tripped = json.loads(json.dumps(embedded_snapshot_data))
+    reloaded_round_trip = EvidenceSnapshot.model_validate(round_tripped)
+    embedded_dump = reloaded_snapshot.model_dump(mode="json", by_alias=True)
+    canonical_dump = bundle.canonical_snapshot.model_dump(mode="json", by_alias=True)
+    expected_artifact_digest = packaged_snapshot["compatibility"]["artifactDigest"]
+    expected_semantic_digest = packaged_snapshot["compatibility"]["semanticDigest"]
+
+    assert embedded_dump == packaged_snapshot
+    assert embedded_dump == canonical_dump
+    assert reloaded_round_trip.model_dump(mode="json", by_alias=True) == embedded_dump
+    assert reloaded_snapshot.compatibility.artifact_digest == expected_artifact_digest
+    assert reloaded_snapshot.compatibility.artifact_digest == bundle.snapshot_artifact_digest
+    assert reloaded_snapshot.compatibility.semantic_digest == expected_semantic_digest
+    assert reloaded_snapshot.compatibility.semantic_digest == bundle.snapshot_semantic_digest
+
+    reloaded_snapshot.validate_for_evaluation(
+        as_of=_as_of(),
+        expected_artifact_digest=reloaded_snapshot.compatibility.artifact_digest,
+        publication_resolver=bundle.publication_resolver,
+        key_resolver=bundle.key_resolver,
+        trusted_key_anchor=bundle.trusted_key_anchor,
+        envelope_resolver=bundle.envelope_resolver,
+        identity_evidence=reloaded_snapshot.identity_evidence,
+    )
 
 
 def test_no_stale_non_package_canonical_assets_exist() -> None:
