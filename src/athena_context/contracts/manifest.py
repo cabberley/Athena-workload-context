@@ -844,7 +844,8 @@ class GovernedWeakeningOverride(AthenaBaseModel):
         return (
             self.status == "approved"
             and self.accepted_at <= as_of < self.expires_at
-            and profile_id in self.profiles
+            and _normalized_id(profile_id)
+            in {_normalized_id(item) for item in self.profiles}
             and self.target_path == target_path
             and _normalized_id(self.target_ref) == _normalized_id(target_ref)
             and self.reason == reason
@@ -1343,10 +1344,12 @@ def _selector_tree(selector: ManifestSelector) -> Iterable[ManifestSelector | At
         yield from selector.children
 
 
-def _selector_fingerprint(selector: ManifestSelector) -> str:
+def _selector_semantic_payload(
+    selector: ManifestSelector | AtomicSelector,
+) -> dict[str, Any]:
     payload = selector.model_dump(mode="json", by_alias=True, exclude_none=True)
 
-    def remove_identity(value: Any) -> None:
+    def normalize(value: Any) -> None:
         if not isinstance(value, dict):
             return
         value.pop("selectorId", None)
@@ -1371,18 +1374,16 @@ def _selector_fingerprint(selector: ManifestSelector) -> str:
             )
         children = value.get("children")
         if isinstance(children, list):
-            children.sort(
-                key=lambda item: (
-                    _normalized_id(str(item.get("selectorId", "")))
-                    if isinstance(item, dict)
-                    else ""
-                )
-            )
             for child in children:
-                remove_identity(child)
+                normalize(child)
+            children.sort(key=compute_artifact_digest)
 
-    remove_identity(payload)
-    return compute_artifact_digest(payload)
+    normalize(payload)
+    return payload
+
+
+def _selector_fingerprint(selector: ManifestSelector | AtomicSelector) -> str:
+    return compute_artifact_digest(_selector_semantic_payload(selector))
 
 
 def _normalized_filter_is_narrower(previous: list[str], current: list[str]) -> bool:
@@ -1397,7 +1398,10 @@ def _selector_override_is_narrower(
     previous: ManifestSelector | AtomicSelector,
     current: ManifestSelector | AtomicSelector,
 ) -> bool:
-    if previous.selector_type != current.selector_type or current.max_matches > previous.max_matches:
+    if (
+        previous.selector_type != current.selector_type
+        or current.max_matches > previous.max_matches
+    ):
         return False
     if isinstance(previous, ResourceIdListSelector) and isinstance(
         current, ResourceIdListSelector
@@ -1416,7 +1420,10 @@ def _selector_override_is_narrower(
             _normalized_id(item.key): normalize_nfc_text(item.value)
             for item in current.predicates
         }
-        return all(current_predicates.get(key) == value for key, value in previous_predicates.items())
+        return all(
+            current_predicates.get(key) == value
+            for key, value in previous_predicates.items()
+        )
     if isinstance(previous, NamePredicateSelector) and isinstance(
         current, NamePredicateSelector
     ):
@@ -1510,7 +1517,18 @@ def _normalized_filters_overlap(left: list[str], right: list[str]) -> bool:
     )
 
 
-def _selectors_may_overlap(left: ManifestSelector, right: ManifestSelector) -> bool:
+def _selectors_may_overlap(
+    left: ManifestSelector | AtomicSelector,
+    right: ManifestSelector | AtomicSelector,
+) -> bool:
+    if isinstance(left, CompositeAnySelector):
+        return any(_selectors_may_overlap(child, right) for child in left.children)
+    if isinstance(right, CompositeAnySelector):
+        return any(_selectors_may_overlap(left, child) for child in right.children)
+    if isinstance(left, CompositeAllSelector):
+        return all(_selectors_may_overlap(child, right) for child in left.children)
+    if isinstance(right, CompositeAllSelector):
+        return all(_selectors_may_overlap(left, child) for child in right.children)
     if isinstance(left, ResourceIdListSelector) and isinstance(
         right, ResourceIdListSelector
     ):
@@ -1597,7 +1615,7 @@ def _selectors_may_overlap(left: ManifestSelector, right: ManifestSelector) -> b
             and _normalized_id(left.identity_evidence_ref)
             == _normalized_id(right.identity_evidence_ref)
         )
-    return False
+    return left.selector_type != right.selector_type
 
 
 def _validate_resolved_selectors(roles: list[ManifestRole]) -> None:
@@ -1632,6 +1650,35 @@ def _validate_resolved_selectors(roles: list[ManifestRole]) -> None:
                         "ambiguous selectors may bind one resource to multiple roles"
                     )
             selectors.append((role.role_id, selector))
+
+
+_CONTROL_COMMON_FIELDS = frozenset(
+    {
+        "controlId",
+        "controlKind",
+        "governanceScope",
+        "ownerRef",
+        "profiles",
+        "health",
+    }
+)
+
+
+def _control_variant_payload(control: ManifestControl) -> dict[str, Any]:
+    payload = control.model_dump(mode="json", by_alias=True, exclude_none=False)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _CONTROL_COMMON_FIELDS
+    }
+
+
+def _normalized_optional_ref_list(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise AthenaValidationError("control evidenceRefs must be a list")
+    return tuple(sorted(_normalized_id(str(item)) for item in value))
 
 
 def _validate_inherited_semantics(
@@ -1746,11 +1793,13 @@ def _validate_inherited_semantics(
         "notApplicable": 1,
     }
     for control in controls:
-        previous = inherited_controls_by_id.get(_normalized_id(control.control_id))
+        previous_control = inherited_controls_by_id.get(
+            _normalized_id(control.control_id)
+        )
         if (
-            previous is not None
+            previous_control is not None
             and control_health_strength[control.health]
-            < control_health_strength[previous.health]
+            < control_health_strength[previous_control.health]
         ):
             _find_override(
                 child.weakening_overrides,
@@ -1763,15 +1812,43 @@ def _validate_inherited_semantics(
                 target_ref=control.control_id,
                 reason="controlRequirementRelaxation",
             )
+        if previous_control is None:
+            continue
+        previous_variant = _control_variant_payload(previous_control)
+        current_variant = _control_variant_payload(control)
+        previous_evidence_refs = _normalized_optional_ref_list(
+            previous_variant.pop("evidenceRefs", None)
+        )
+        current_evidence_refs = _normalized_optional_ref_list(
+            current_variant.pop("evidenceRefs", None)
+        )
+        if previous_evidence_refs != current_evidence_refs:
+            raise AthenaValidationError(
+                "inherited control evidenceRefs are immutable; use a new controlId"
+            )
+        for field_name in sorted(previous_variant.keys() | current_variant.keys()):
+            if previous_variant.get(field_name) == current_variant.get(field_name):
+                continue
+            _find_override(
+                child.weakening_overrides,
+                as_of=as_of,
+                profile_id=child.profile_id,
+                target_path=(
+                    f"/resolvedProfiles/{child.profile_id}/controls/"
+                    f"{control.control_id}/{field_name}"
+                ),
+                target_ref=control.control_id,
+                reason="controlRequirementRelaxation",
+            )
 
     inherited_risks_by_id = {
         _normalized_id(item.risk_acceptance_id): item for item in inherited_risks
     }
     for risk in child.risk_acceptances:
-        previous = inherited_risks_by_id.get(
+        previous_risk = inherited_risks_by_id.get(
             _normalized_id(risk.risk_acceptance_id)
         )
-        if previous is not None and previous.model_dump(
+        if previous_risk is not None and previous_risk.model_dump(
             mode="json", by_alias=True, exclude_none=True
         ) != risk.model_dump(mode="json", by_alias=True, exclude_none=True):
             raise AthenaValidationError(
@@ -2337,13 +2414,13 @@ def _validate_contradictory_requirements(profile: ResolvedManifestProfile) -> No
             relationship_requirements.setdefault(relationship_id, set()).add(
                 constraint.constraint_type
             )
-            relationship = declared_relationships[relationship_id]
+            referenced_relationship = declared_relationships[relationship_id]
             if (
                 constraint.constraint_type == "dependencyRequired"
-                and relationship.kind == "prohibited"
+                and referenced_relationship.kind == "prohibited"
             ) or (
                 constraint.constraint_type == "dependencyProhibited"
-                and relationship.kind != "prohibited"
+                and referenced_relationship.kind != "prohibited"
             ):
                 raise AthenaValidationError(
                     "relationship kind contradicts its presence requirement"
@@ -2398,11 +2475,14 @@ def _validate_contradictory_requirements(profile: ResolvedManifestProfile) -> No
             return "role:" + _normalized_id(endpoint.role_ref)
         return "external:" + _normalized_id(endpoint.external_ref)
 
-    for relationship in profile.relationships:
-        if not isinstance(relationship, DeclaredManifestRelationship):
+    for declared_relationship in profile.relationships:
+        if not isinstance(declared_relationship, DeclaredManifestRelationship):
             continue
-        edge = (endpoint_key(relationship.source), endpoint_key(relationship.target))
-        if relationship.kind == "prohibited":
+        edge = (
+            endpoint_key(declared_relationship.source),
+            endpoint_key(declared_relationship.target),
+        )
+        if declared_relationship.kind == "prohibited":
             prohibited_edges.add(edge)
         else:
             positive_edges.add(edge)

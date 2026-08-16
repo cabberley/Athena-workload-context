@@ -21,6 +21,7 @@ from athena_context.contracts.manifest import (
 from athena_context.contracts.manifest import (
     ControlProofFact,
     EvidenceReferenceContext,
+    GovernedWeakeningOverride,
     ManifestControl,
     ManifestRiskAcceptance,
     ManifestSelector,
@@ -761,35 +762,38 @@ def test_governed_weakening_resolves_and_digest_is_order_stable() -> None:
     assert reordered.resolved_profile_digest == resolved.resolved_profile_digest
 
     composite_payload = manifest.model_dump(mode="json", by_alias=True)
-    composite_payload["profiles"]["production"]["roles"] = [
+    composite_web = next(
+        item for item in composite_payload["roles"] if item["roleId"] == "web"
+    )
+    composite_web["selectors"] = [
         {
-            **_role("web", "webService", "oneOrMore", "unused-"),
-            "selectors": [
+            "selectorType": "compositeAll",
+            "selectorId": "web-composite",
+            "children": [
                 {
-                    "selectorType": "compositeAll",
-                    "selectorId": "web-composite",
-                    "children": [
-                        {
-                            "selectorType": "namePredicate",
-                            "selectorId": "child-b",
-                            "suffix": "-02",
-                            "maxMatches": 10,
-                        },
-                        {
-                            "selectorType": "namePredicate",
-                            "selectorId": "child-a",
-                            "suffix": "-01",
-                            "maxMatches": 10,
-                        },
+                    "selectorType": "tagPredicate",
+                    "selectorId": "child-b",
+                    "predicates": [
+                        {"key": "purpose", "value": "synthetic-web"}
                     ],
                     "maxMatches": 10,
-                }
+                },
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "child-a",
+                    "prefix": "athena-web-",
+                    "maxMatches": 10,
+                },
             ],
+            "maxMatches": 10,
         }
     ]
     composite = CanonicalWorkloadManifest.model_validate(composite_payload)
     reversed_payload = composite.model_dump(mode="json", by_alias=True, exclude_unset=True)
-    reversed_payload["profiles"]["production"]["roles"][0]["selectors"][0]["children"].reverse()
+    reversed_web = next(
+        item for item in reversed_payload["roles"] if item["roleId"] == "web"
+    )
+    reversed_web["selectors"][0]["children"].reverse()
     reversed_composite = CanonicalWorkloadManifest.model_validate(reversed_payload)
     assert (
         composite.compute_semantic_digest_value()
@@ -1018,7 +1022,10 @@ def test_nested_selector_variant_changes_are_rejected() -> None:
         "resourceIds": ["/synthetic/web/1"],
         "maxMatches": 1,
     }
-    payload["profiles"]["production"]["roles"] = [production_web]
+    inherited_web = next(
+        item for item in payload["roles"] if item["roleId"] == "web"
+    )
+    inherited_web["selectors"] = production_web["selectors"]
     payload["profiles"]["development"]["roles"] = [development_web]
     with pytest.raises(AthenaValidationError, match="illegal discriminator"):
         resolve_manifest_profile(
@@ -1557,6 +1564,114 @@ def test_ambiguous_selectors_and_normalized_duplicates_fail_closed() -> None:
         CanonicalWorkloadManifest.model_validate(payload)
 
 
+def test_composite_selector_ambiguity_ignores_child_identity_and_recurses() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    web = next(item for item in payload["roles"] if item["roleId"] == "web")
+    worker = next(item for item in payload["roles"] if item["roleId"] == "worker")
+    web["selectors"] = [
+        {
+            "selectorType": "compositeAny",
+            "selectorId": "synthetic-web-composite",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "synthetic-web-alpha",
+                    "prefix": "synthetic-alpha-",
+                    "maxMatches": 10,
+                },
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "synthetic-web-beta",
+                    "prefix": "synthetic-beta-",
+                    "maxMatches": 10,
+                },
+            ],
+            "maxMatches": 10,
+        }
+    ]
+    worker["selectors"] = [
+        {
+            "selectorType": "compositeAny",
+            "selectorId": "synthetic-worker-composite",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "renamed-worker-beta",
+                    "prefix": "synthetic-beta-",
+                    "maxMatches": 10,
+                },
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "renamed-worker-alpha",
+                    "prefix": "synthetic-alpha-",
+                    "maxMatches": 10,
+                },
+            ],
+            "maxMatches": 10,
+        }
+    ]
+    with pytest.raises(AthenaValidationError, match="identical semantics"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    web = next(item for item in payload["roles"] if item["roleId"] == "web")
+    worker = next(item for item in payload["roles"] if item["roleId"] == "worker")
+    web["selectors"] = [
+        {
+            "selectorType": "compositeAny",
+            "selectorId": "synthetic-web-overlap",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "synthetic-shared-prefix",
+                    "prefix": "synthetic-shared-",
+                    "maxMatches": 10,
+                },
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "synthetic-web-only",
+                    "prefix": "synthetic-web-only-",
+                    "maxMatches": 10,
+                },
+            ],
+            "maxMatches": 10,
+        }
+    ]
+    worker["selectors"] = [
+        {
+            "selectorType": "compositeAll",
+            "selectorId": "synthetic-worker-overlap",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "synthetic-worker-shared-prefix",
+                    "prefix": "synthetic-shared-resource-",
+                    "maxMatches": 10,
+                },
+                {
+                    "selectorType": "tagPredicate",
+                    "selectorId": "synthetic-worker-tag",
+                    "predicates": [
+                        {"key": "purpose", "value": "synthetic-regression"}
+                    ],
+                    "maxMatches": 10,
+                },
+            ],
+            "maxMatches": 10,
+        }
+    ]
+    with pytest.raises(AthenaValidationError, match="ambiguous selectors"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
 def test_direct_selector_control_and_applicability_weakening_fail_closed() -> None:
     payload = build_manifest().model_dump(mode="json", by_alias=True)
     weakened_role = deepcopy(payload["roles"][2])
@@ -1613,6 +1728,100 @@ def test_direct_selector_control_and_applicability_weakening_fail_closed() -> No
             "development",
             as_of=AS_OF,
         )
+
+
+def test_inherited_control_fields_require_exact_governance_and_keep_provenance() -> None:
+    def development_backup() -> dict[str, object]:
+        control = _control_payload("backup")
+        control["profiles"] = ["development"]
+        control["governanceScope"] = _scope(
+            "development", "db-zone-loss-spof"
+        )
+        return control
+
+    def control_override(field_name: str) -> dict[str, object]:
+        return {
+            "overrideId": f"synthetic-control-{field_name}",
+            "reason": "controlRequirementRelaxation",
+            "targetPath": (
+                "/resolvedProfiles/development/controls/"
+                f"control-backup/{field_name}"
+            ),
+            "targetRef": "control-backup",
+            "ownerRef": "ops-owner",
+            "rationale": "Synthetic governed control override regression.",
+            "approvedBy": "synthetic-approver",
+            "status": "approved",
+            "acceptedAt": ACCEPTED_AT,
+            "expiresAt": EXPIRES_AT,
+            "profiles": ["development"],
+        }
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["controls"] = [development_backup()]
+    changed_control = development_backup()
+    changed_control["backupPolicyRef"] = "synthetic://backup/replacement"
+    payload["profiles"]["development"]["controls"] = [changed_control]
+    with pytest.raises(AthenaValidationError, match="exactly one active governed override"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+    payload["profiles"]["development"]["weakeningOverrides"].append(
+        control_override("backupPolicyRef")
+    )
+    resolved = resolve_manifest_profile(
+        CanonicalWorkloadManifest.model_validate(payload),
+        "development",
+        as_of=AS_OF,
+    )
+    assert resolved.controls[0].control_id == "control-backup"
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["controls"] = [development_backup()]
+    changed_control = development_backup()
+    changed_control["evidenceRefs"] = ["synthetic-replacement-evidence"]
+    payload["profiles"]["development"]["controls"] = [changed_control]
+    payload["profiles"]["development"]["weakeningOverrides"].append(
+        control_override("evidenceRefs")
+    )
+    with pytest.raises(AthenaValidationError, match="evidenceRefs are immutable"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+
+def test_governed_override_profile_matching_is_normalized() -> None:
+    target_path = (
+        "/resolvedProfiles/DEVELOPMENT/settings/continuity/"
+        "zoneLossContinuityRequired"
+    )
+    override = GovernedWeakeningOverride.model_validate(
+        {
+            "overrideId": "synthetic-normalized-profile",
+            "reason": "continuityRelaxation",
+            "targetPath": target_path,
+            "targetRef": "zoneLossContinuityRequired",
+            "ownerRef": "ops-owner",
+            "rationale": "Synthetic case-normalization regression.",
+            "approvedBy": "synthetic-approver",
+            "status": "approved",
+            "acceptedAt": ACCEPTED_AT,
+            "expiresAt": EXPIRES_AT,
+            "profiles": ["development"],
+        }
+    )
+    assert override.authorizes(
+        as_of=AS_OF,
+        profile_id="DEVELOPMENT",
+        target_path=target_path,
+        target_ref="ZONELOSSCONTINUITYREQUIRED",
+        reason="continuityRelaxation",
+    )
 
 
 def test_inherited_risk_acceptance_mutation_is_invalid() -> None:
