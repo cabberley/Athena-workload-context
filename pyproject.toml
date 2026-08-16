@@ -22,13 +22,20 @@ dev = [
   "pytest>=8.4",
   "pytest-cov>=6.2",
   "ruff>=0.12",
+  "types-jsonschema>=4.26",
 ]
 
 [project.scripts]
 athena-context = "athena_context.cli:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+athena_context = ["data/fixtures/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
