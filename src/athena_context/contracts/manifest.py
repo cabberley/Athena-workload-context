@@ -2753,6 +2753,15 @@ def _validate_canonical_protected_constraints(
             ZoneDistributionProof,
         ),
     }
+    present_constraint_ids = {
+        _normalized_id(constraint.constraint_id) for constraint in profile.constraints
+    }
+    missing_constraint_ids = set(expected_semantics) - present_constraint_ids
+    if missing_constraint_ids:
+        raise AthenaValidationError(
+            "resolved profile is missing mandatory protected canonical constraints: "
+            f"{', '.join(sorted(missing_constraint_ids))}"
+        )
     for constraint in profile.constraints:
         constraint_id = _normalized_id(constraint.constraint_id)
         expected = expected_semantics.get(constraint_id)

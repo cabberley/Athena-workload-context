@@ -98,6 +98,7 @@ def _constraint(
     success_verdict: str,
     *,
     risk_acceptance_ref: str | None = None,
+    risk_acceptance_clause_ref: str | None = None,
 ) -> ManifestConstraint:
     payload: dict[str, object] = {
         "constraintId": clause_id,
@@ -113,12 +114,15 @@ def _constraint(
         in {
             "db-singleton-supported",
             "db-zone-loss-spof",
+            "db-zone-loss-acceptance",
             "worker-db-zone-colocation",
             "web-zone-distribution",
         },
     }
     if risk_acceptance_ref is not None:
         payload["riskAcceptanceRef"] = risk_acceptance_ref
+    if risk_acceptance_clause_ref is not None:
+        payload["riskAcceptanceClauseRef"] = risk_acceptance_clause_ref
     return ManifestConstraint.model_validate(payload)
 
 
@@ -288,6 +292,22 @@ def _profile_payload(profile_id: str) -> dict[str, object]:
             },
             "observation",
             risk_acceptance_ref=acceptance_ref,
+        ),
+        _constraint(
+            profile_id,
+            "db-zone-loss-acceptance",
+            "supportedSingleton",
+            "riskAcceptance",
+            {
+                "proofKind": "cardinalityProof",
+                "roleRef": "database-primary",
+                "expected": {"cardinalityKind": "exactlyOne"},
+            },
+            "observation",
+            risk_acceptance_ref=acceptance_ref,
+            risk_acceptance_clause_ref=(
+                "db-zone-loss-spof" if acceptance_ref is not None else None
+            ),
         ),
         _constraint(
             profile_id,
@@ -683,14 +703,17 @@ def _verify_unit_evidence(
 def test_same_policy_path_evaluates_all_three_environments() -> None:
     expected = {
         "production": {
+            "db-zone-loss-acceptance": "acceptedResidualRisk",
             "db-zone-loss-spof": "acceptedResidualRisk",
             "web-zone-distribution": "pass",
         },
         "development": {
+            "db-zone-loss-acceptance": "observation",
             "db-zone-loss-spof": "observation",
             "web-zone-distribution": "pass",
         },
         "training": {
+            "db-zone-loss-acceptance": "acceptedResidualRisk",
             "db-zone-loss-spof": "acceptedResidualRisk",
             "web-zone-distribution": "violation",
         },
@@ -1061,7 +1084,7 @@ def test_policy_boundary_rejects_recomputed_invalid_resolved_references(
         )
 
 
-def test_controls_and_technology_constraints_never_become_accepted_risk() -> None:
+def test_controls_and_renamed_technology_constraints_never_become_accepted_risk() -> None:
     profile = _resolved_profile("production")
     control_acceptance = _clause_acceptance(
         "production",
@@ -1090,10 +1113,11 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
 
     profile = _resolved_profile("production")
     second_database_id = RESOURCE_PREFIX + "synthetic-db-02"
+    renamed_constraint_id = "renamed-singleton-supported"
     technology_acceptance = _clause_acceptance(
         "production",
         "ra-singleton-technology",
-        "db-singleton-supported",
+        renamed_constraint_id,
         [
             ("database-primary", RESOURCE_IDS["database-primary"][0]),
             ("database-primary", second_database_id),
@@ -1104,6 +1128,10 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
         constraint
         for constraint in profile.constraints
         if constraint.constraint_id == "db-singleton-supported"
+    )
+    technology_constraint.constraint_id = renamed_constraint_id
+    technology_constraint.governance_scope.clause_path = (
+        f"/constraints/{renamed_constraint_id}"
     )
     technology_constraint.risk_acceptance_ref = "ra-singleton-technology"
     technology_constraint.finding_kind = "architectureConstraint"
@@ -1129,7 +1157,7 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
     )
     with pytest.raises(
         AthenaValidationError,
-        match="protected canonical constraint semantics are invalid",
+        match="missing mandatory protected canonical constraints: db-singleton-supported",
     ):
         evaluate_profile(
             profile,
