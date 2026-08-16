@@ -822,7 +822,11 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     },
                     "failureVerdict": "violation",
                     "successVerdict": "observation",
-                    "riskAcceptanceRef": "ra-db-zone-loss",
+                    "riskAcceptanceRef": {
+                        "production": "ra-db-zone-loss-production",
+                        "development": "ra-db-zone-loss-development",
+                        "training": "ra-db-zone-loss-training",
+                    }[profile_id],
                     "protected": True,
                 },
                 {
@@ -845,7 +849,11 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     },
                     "failureVerdict": "violation",
                     "successVerdict": "observation",
-                    "riskAcceptanceRef": "ra-db-zone-loss",
+                    "riskAcceptanceRef": {
+                        "production": "ra-db-zone-loss-production",
+                        "development": "ra-db-zone-loss-development",
+                        "training": "ra-db-zone-loss-training",
+                    }[profile_id],
                     "riskAcceptanceClauseRef": "db-zone-loss-spof",
                     "protected": True,
                 },
@@ -898,7 +906,11 @@ def _canonical_manifest_payload() -> dict[str, Any]:
             ],
             "riskAcceptances": [
                 {
-                    "riskAcceptanceId": "ra-db-zone-loss",
+                    "riskAcceptanceId": {
+                        "production": "ra-db-zone-loss-production",
+                        "development": "ra-db-zone-loss-development",
+                        "training": "ra-db-zone-loss-training",
+                    }[profile_id],
                     "governanceScope": {
                         "governanceScopeType": "clause",
                         "manifestId": _CANONICAL_MANIFEST_ID,
@@ -917,7 +929,13 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     "ownedBy": "ops-owner",
                     "acceptedAt": "2025-01-01T00:00:00.000Z",
                     "expiresAt": "2025-12-31T00:00:00.000Z",
-                    "linkedControlRefs": ["control-db-failover-runbook"],
+                    "linkedControlRefs": [
+                        {
+                            "production": "control-db-failover-runbook-production",
+                            "development": "control-db-failover-runbook-development",
+                            "training": "control-db-failover-runbook-training",
+                        }[profile_id]
+                    ],
                     "acceptedResourceBindings": [
                         {"roleRef": "database-primary", "resourceId": _resource_id("athena-db-01")}
                     ],
@@ -928,7 +946,11 @@ def _canonical_manifest_payload() -> dict[str, Any]:
             "controls": [
                 {
                     "controlKind": "manualFailoverRunbook",
-                    "controlId": "control-db-failover-runbook",
+                    "controlId": {
+                        "production": "control-db-failover-runbook-production",
+                        "development": "control-db-failover-runbook-development",
+                        "training": "control-db-failover-runbook-training",
+                    }[profile_id],
                     "governanceScope": {
                         "governanceScopeType": "clause",
                         "manifestId": _CANONICAL_MANIFEST_ID,
@@ -1190,53 +1212,6 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                 "successVerdict": "pass",
                 "protected": True,
             },
-        ],
-        "controls": [
-            {
-                "controlKind": "manualFailoverRunbook",
-                "controlId": "control-db-failover-runbook",
-                "governanceScope": {
-                    "governanceScopeType": "clause",
-                    "manifestId": _CANONICAL_MANIFEST_ID,
-                    "profileId": "production",
-                    "clausePath": "/constraints/db-zone-loss-spof",
-                    "ownerRef": "ops-owner",
-                },
-                "ownerRef": "ops-owner",
-                "profiles": ["production", "development", "training"],
-                "health": "effective",
-                "runbookRef": "synthetic://runbooks/db-failover",
-                "lastReviewedAt": "2025-01-01T00:00:00.000Z",
-            }
-        ],
-        "riskAcceptances": [
-            {
-                "riskAcceptanceId": "ra-db-zone-loss",
-                "governanceScope": {
-                    "governanceScopeType": "clause",
-                    "manifestId": _CANONICAL_MANIFEST_ID,
-                    "profileId": "production",
-                    "clausePath": "/constraints/db-zone-loss-spof",
-                    "ownerRef": "ops-owner",
-                },
-                "riskKind": "availability",
-                "riskRating": "high",
-                "residualRiskStatement": (
-                    "Synthetic singleton database zone loss stays as an explicit "
-                    "residual risk."
-                ),
-                "rationaleRef": "synthetic://risk/db-zone-loss",
-                "acceptedBy": "synthetic-approver",
-                "ownedBy": "ops-owner",
-                "acceptedAt": "2025-01-01T00:00:00.000Z",
-                "expiresAt": "2025-12-31T00:00:00.000Z",
-                "linkedControlRefs": ["control-db-failover-runbook"],
-                "acceptedResourceBindings": [
-                    {"roleRef": "database-primary", "resourceId": _resource_id("athena-db-01")}
-                ],
-                "profiles": ["production", "development", "training"],
-                "status": "approved",
-            }
         ],
         "objectives": [],
         "ownership": [

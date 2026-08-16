@@ -6,7 +6,7 @@
   },
   "cloud": "azureCloud",
   "compatibility": {
-    "artifactDigest": "sha256:2613ca170fcb46f2dda0a0453e38eef4279101fc7135689b5797fdd8a9c05ef0",
+    "artifactDigest": "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6",
     "artifactKind": "workloadManifest",
     "extensionPolicy": "rejectUnknownDecisionFields",
     "minimumReaderVersion": "1.0.0",
@@ -18,7 +18,7 @@
     "requiresCapabilities": [],
     "schemaVersion": "1.0.0",
     "semanticContractVersion": "1.0.0",
-    "semanticDigest": "sha256:f61d59814c041ce0fddc68715d50ea7deb3435f5974cf0ade93f2b594f4e5580"
+    "semanticDigest": "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
   },
   "constraints": [
     {
@@ -168,28 +168,7 @@
       "successVerdict": "pass"
     }
   ],
-  "controls": [
-    {
-      "controlId": "control-db-failover-runbook",
-      "controlKind": "manualFailoverRunbook",
-      "governanceScope": {
-        "clausePath": "/constraints/db-zone-loss-spof",
-        "governanceScopeType": "clause",
-        "manifestId": "wl-athena-wc002-canonical",
-        "ownerRef": "ops-owner",
-        "profileId": "production"
-      },
-      "health": "effective",
-      "lastReviewedAt": "2025-01-01T00:00:00Z",
-      "ownerRef": "ops-owner",
-      "profiles": [
-        "production",
-        "development",
-        "training"
-      ],
-      "runbookRef": "synthetic://runbooks/db-failover"
-    }
-  ],
+  "controls": [],
   "manifestId": "wl-athena-wc002-canonical",
   "manifestVersion": "1.0.0",
   "objectives": [],
@@ -256,7 +235,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": "db-zone-loss-spof",
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-development",
           "successVerdict": "observation"
         },
         {
@@ -284,7 +263,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": null,
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-development",
           "successVerdict": "observation"
         },
         {
@@ -342,7 +321,7 @@
       ],
       "controls": [
         {
-          "controlId": "control-db-failover-runbook",
+          "controlId": "control-db-failover-runbook-development",
           "controlKind": "manualFailoverRunbook",
           "governanceScope": {
             "clausePath": "/constraints/db-zone-loss-spof",
@@ -441,7 +420,7 @@
             "profileId": "development"
           },
           "linkedControlRefs": [
-            "control-db-failover-runbook"
+            "control-db-failover-runbook-development"
           ],
           "ownedBy": "ops-owner",
           "profiles": [
@@ -449,7 +428,7 @@
           ],
           "rationaleRef": "synthetic://risk/db-zone-loss",
           "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-          "riskAcceptanceId": "ra-db-zone-loss",
+          "riskAcceptanceId": "ra-db-zone-loss-development",
           "riskKind": "availability",
           "riskRating": "high",
           "status": "approved"
@@ -549,7 +528,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": "db-zone-loss-spof",
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-production",
           "successVerdict": "observation"
         },
         {
@@ -577,7 +556,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": null,
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-production",
           "successVerdict": "observation"
         },
         {
@@ -635,7 +614,7 @@
       ],
       "controls": [
         {
-          "controlId": "control-db-failover-runbook",
+          "controlId": "control-db-failover-runbook-production",
           "controlKind": "manualFailoverRunbook",
           "governanceScope": {
             "clausePath": "/constraints/db-zone-loss-spof",
@@ -734,7 +713,7 @@
             "profileId": "production"
           },
           "linkedControlRefs": [
-            "control-db-failover-runbook"
+            "control-db-failover-runbook-production"
           ],
           "ownedBy": "ops-owner",
           "profiles": [
@@ -742,7 +721,7 @@
           ],
           "rationaleRef": "synthetic://risk/db-zone-loss",
           "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-          "riskAcceptanceId": "ra-db-zone-loss",
+          "riskAcceptanceId": "ra-db-zone-loss-production",
           "riskKind": "availability",
           "riskRating": "high",
           "status": "approved"
@@ -811,7 +790,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": "db-zone-loss-spof",
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-training",
           "successVerdict": "observation"
         },
         {
@@ -839,7 +818,7 @@
           },
           "protected": true,
           "riskAcceptanceClauseRef": null,
-          "riskAcceptanceRef": "ra-db-zone-loss",
+          "riskAcceptanceRef": "ra-db-zone-loss-training",
           "successVerdict": "observation"
         },
         {
@@ -897,7 +876,7 @@
       ],
       "controls": [
         {
-          "controlId": "control-db-failover-runbook",
+          "controlId": "control-db-failover-runbook-training",
           "controlKind": "manualFailoverRunbook",
           "governanceScope": {
             "clausePath": "/constraints/db-zone-loss-spof",
@@ -996,7 +975,7 @@
             "profileId": "training"
           },
           "linkedControlRefs": [
-            "control-db-failover-runbook"
+            "control-db-failover-runbook-training"
           ],
           "ownedBy": "ops-owner",
           "profiles": [
@@ -1004,7 +983,7 @@
           ],
           "rationaleRef": "synthetic://risk/db-zone-loss",
           "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-          "riskAcceptanceId": "ra-db-zone-loss",
+          "riskAcceptanceId": "ra-db-zone-loss-training",
           "riskKind": "availability",
           "riskRating": "high",
           "status": "approved"
@@ -1061,41 +1040,7 @@
       }
     }
   ],
-  "riskAcceptances": [
-    {
-      "acceptedAt": "2025-01-01T00:00:00Z",
-      "acceptedBy": "synthetic-approver",
-      "acceptedResourceBindings": [
-        {
-          "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
-          "roleRef": "database-primary"
-        }
-      ],
-      "expiresAt": "2025-12-31T00:00:00Z",
-      "governanceScope": {
-        "clausePath": "/constraints/db-zone-loss-spof",
-        "governanceScopeType": "clause",
-        "manifestId": "wl-athena-wc002-canonical",
-        "ownerRef": "ops-owner",
-        "profileId": "production"
-      },
-      "linkedControlRefs": [
-        "control-db-failover-runbook"
-      ],
-      "ownedBy": "ops-owner",
-      "profiles": [
-        "production",
-        "development",
-        "training"
-      ],
-      "rationaleRef": "synthetic://risk/db-zone-loss",
-      "residualRiskStatement": "Synthetic singleton database zone loss stays as an explicit residual risk.",
-      "riskAcceptanceId": "ra-db-zone-loss",
-      "riskKind": "availability",
-      "riskRating": "high",
-      "status": "approved"
-    }
-  ],
+  "riskAcceptances": [],
   "roles": [
     {
       "cardinality": {

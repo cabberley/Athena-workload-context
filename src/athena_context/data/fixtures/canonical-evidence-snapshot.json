@@ -33,7 +33,7 @@
     }
   ],
   "compatibility": {
-    "artifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+    "artifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
     "artifactKind": "evidenceSnapshot",
     "extensionPolicy": "rejectUnknownDecisionFields",
     "minimumReaderVersion": "1.0.0",
@@ -45,7 +45,7 @@
     "requiresCapabilities": [],
     "schemaVersion": "1.0.0",
     "semanticContractVersion": "1.0.0",
-    "semanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29"
+    "semanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304"
   },
   "evidenceRecords": [
     {
@@ -317,9 +317,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:c05a0dea648d6a4d28d3b7d4ac29d46d47af134bfb7bd798e7e89b2e4a837237",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/0"
     },
@@ -332,9 +332,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:27fdb27f9ed518058ecfc412ad0dd84e2a847c9bdf886c9bb539bdaeeb779629",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/1"
     },
@@ -347,9 +347,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:0ac1a6317760eeb1d176277736233848793a300306aac4609f1c8eb29e1b4fc8",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/2"
     },
@@ -362,9 +362,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:69a208bf4360f644651e0f35c65ad4ba56304325911c042378923dbf75508335",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/3"
     },
@@ -377,9 +377,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:2cd35535a8dfd3ec289ad4475891073fdc29e15d08ba28cbc0c61a07ae2d4f21",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/4"
     },
@@ -392,9 +392,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:3a49e4efaa944aa549046b56182a12d6d7a42ed2bb0546acbecb7120fe88bb2b",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/5"
     },
@@ -407,9 +407,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:ca5ab079f4b045367754de803f37d8b03447d8ae90ca7b1195ad4d7e0d052b93",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/6"
     },
@@ -422,9 +422,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:676f7015599ff8544c45fd6f03906299161a4b017c964fb09af567313499310e",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/7"
     },
@@ -437,9 +437,9 @@
       "collectorToolVersion": "1.0.0",
       "itemDigest": "sha256:d7f881b72d2816e4976557b1c6c68e95cba6a7d7b140b802ad1f5d92a5221573",
       "refType": "evidenceItem",
-      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotArtifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "snapshotId": "snap-111111111111",
-      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotSemanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
       "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
       "sourceResponsePointer": "/items/8"
     }
@@ -540,7 +540,7 @@
     }
   ],
   "snapshotAttestation": {
-    "artifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+    "artifactDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
     "artifactKind": "evidenceSnapshot",
     "attestationType": "trustedSnapshotPublication",
     "attestationVersion": "1.0.0",
@@ -549,7 +549,7 @@
     "collectedAt": "2025-06-01T11:45:00Z",
     "collectorAttemptSetDigest": "sha256:8b772013f0ec9dc78db201e0f093634328138f075ad670ee1b3e0492a384b874",
     "evidenceRecordSetDigest": "sha256:f36a106e7ed5fdc51bd448b7ad4cc6ac25725266f693235c05800a0ed67567e6",
-    "evidenceReferenceSetDigest": "sha256:0cf892009cae1a6ab90dcc0983d481e781a6fe88bc048312644fcd2887772853",
+    "evidenceReferenceSetDigest": "sha256:c9aa60b6cc45eca2d9deaf557109c20be9203d0226e00e7134c2fd185ac3fbab",
     "expiresAt": "2025-06-02T00:00:00Z",
     "identityEvidenceDigests": [
       "sha256:d37175061b83aa8d05894d83147036e969e92622dff4a5da35fcb69581e42b35"
@@ -561,10 +561,10 @@
     "policyContractVersion": "1.0.0",
     "schemaVersion": "1.0.0",
     "semanticContractVersion": "1.0.0",
-    "semanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
-    "signature": "P3Gdo9A/SS3prRd93x3PExET5C4jTrdvxkRZvfIbQ9BVCna9huCyDDvhv8nJfXMDk24oIyiN+zrsxrVehZepFf7+0/Eqzyd6W7MOAcMiocxjJOr63JAtKnk2Bvm2E+ghyeyVSw9uYgcBop3eJI3jjRdAAaxg+kOHLYKuO8sBvC4Y5ijCRNu6qGNgpz+ywWPa7XVvZ8Cn+RDat+Evbq0U0/ZLAI6hNy9kiBXzVckVaWxoR5KQnouY5XMojrFVK8zzVn2ucmcOmDgKR2reQoiX0JW/Xnz/u15dYTOfHRa5+YwjEevr7M9yP6pRY/ywdNLQ6JQwWjNiquO6LpGiej+ezw==",
+    "semanticDigest": "sha256:20d6acf1266dc87b573e40ca779ec1e980b76bc50ae9548e29ee2f25dc7a6304",
+    "signature": "iTAJZQrV8VMcR40rLXBHxFOkeC7kW/YlWsvSETxEwPqXsjPac49d+Yjdk3yIvAlrcvB9DlOSkyYL/1aH1f3F0fwpahwkkhZ4CDjwBofvYczGJ6V/KNCKcshE6Cj0E6RkTyS31LP7hDFLo7OZlP+xqt+ij6xONYyvuNx1PH2KoJR5Y8dNPXtsiyTA7MNPHHi5H0HxuvxBMq0JKqKh3l9ncWR99Ob+rj2QjZM8txBgvl30L9dXSDVrkliEvJoNDYdIY+n+d6oLZqHuxfXak3xfVTfLPtfbV3gN98S+E/EBQwKJh3OKXecgkXQFNe8Sj1q8n7bcAiZZLYg5r/znXFOVmQ==",
     "signatureAlgorithm": "RS256",
-    "signedPreimageDigest": "sha256:bb3f1ee598ebae0fec20ce6b9d2f2fbf28ade94fb78e0871461a0eb9ff66c064",
+    "signedPreimageDigest": "sha256:ff59495ecad8f069606f5cd5e39509c15fbf54fd85c641339113b365cde82214",
     "snapshotId": "snap-111111111111",
     "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
   },
