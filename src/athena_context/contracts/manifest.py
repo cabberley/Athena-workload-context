@@ -1814,6 +1814,20 @@ def _validate_inherited_semantics(
             )
         if previous_control is None:
             continue
+        if _normalized_id(previous_control.owner_ref) != _normalized_id(
+            control.owner_ref
+        ):
+            raise AthenaValidationError(
+                "inherited control ownerRef is immutable; use a new controlId"
+            )
+        if previous_control.governance_scope.model_dump(
+            mode="json", by_alias=True, exclude_none=False
+        ) != control.governance_scope.model_dump(
+            mode="json", by_alias=True, exclude_none=False
+        ):
+            raise AthenaValidationError(
+                "inherited control governanceScope is immutable; use a new controlId"
+            )
         previous_variant = _control_variant_payload(previous_control)
         current_variant = _control_variant_payload(control)
         previous_evidence_refs = _normalized_optional_ref_list(

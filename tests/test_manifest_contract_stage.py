@@ -1794,6 +1794,42 @@ def test_inherited_control_fields_require_exact_governance_and_keep_provenance()
             as_of=AS_OF,
         )
 
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["controls"] = [development_backup()]
+    retargeted_control = development_backup()
+    retargeted_control["governanceScope"] = _scope(
+        "development", "web-zone-distribution"
+    )
+    payload["profiles"]["development"]["controls"] = [retargeted_control]
+    with pytest.raises(AthenaValidationError, match="governanceScope is immutable"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["ownership"].append(
+        {
+            "ownerRef": "synthetic-alternate-owner",
+            "ownerRole": "technicalOwner",
+            "authorityRef": "synthetic://teams/alternate-control-owner",
+        }
+    )
+    payload["controls"] = [development_backup()]
+    reassigned_control = development_backup()
+    reassigned_control["ownerRef"] = "synthetic-alternate-owner"
+    reassigned_control["governanceScope"]["ownerRef"] = (
+        "synthetic-alternate-owner"
+    )
+    payload["profiles"]["development"]["controls"] = [reassigned_control]
+    with pytest.raises(AthenaValidationError, match="ownerRef is immutable"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
 
 def test_governed_override_profile_matching_is_normalized() -> None:
     target_path = (
