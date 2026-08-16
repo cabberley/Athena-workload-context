@@ -41,6 +41,7 @@ athena-context golden-proof --format json
 ```
 
 The command returns zero only when the golden runner reports an exact oracle match.
+The approved proof requires two web zones in Production and one in Development and Training.
 
 ## Repository status
 

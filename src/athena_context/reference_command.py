@@ -3,70 +3,33 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
-from importlib import import_module
+from collections.abc import Callable, Mapping
 from json import JSONDecodeError
-from typing import Literal, Protocol, TextIO, cast
+from typing import Literal, TextIO
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import ValidationError
 
 from athena_context.contracts import AthenaValidationError
-from athena_context.contracts.manifest import FindingVerdict
+from athena_context.golden import (
+    GoldenProfileResult,
+    GoldenProofMismatchError,
+    GoldenProofResult,
+    run_golden_proof,
+)
 
 EXIT_ORACLE_MISMATCH = 1
 EXIT_EXECUTION_FAILURE = 2
 
 
-class GoldenProfileResultView(Protocol):
-    """Read-only WC-005 per-profile result surface used by text presentation."""
-
-    @property
-    def profile_id(self) -> str: ...
-
-    @property
-    def verdicts(self) -> Sequence[tuple[str, FindingVerdict]]: ...
-
-    @property
-    def findings(self) -> Sequence[str]: ...
-
-
-class GoldenProofResultView(Protocol):
-    """WC-005 result seam consumed by the command without evaluating policy."""
-
-    @property
-    def snapshot_artifact_digest(self) -> str: ...
-
-    @property
-    def snapshot_semantic_digest(self) -> str: ...
-
-    @property
-    def profiles(self) -> Sequence[GoldenProfileResultView]: ...
-
-    def canonical_json(self) -> str: ...
-
-
-class GoldenOracleMismatchError(Exception):
-    """Normalized mismatch raised by the WC-005 API adapter."""
-
-
-type GoldenProofRunner = Callable[[], GoldenProofResultView]
+type GoldenProofRunner = Callable[[], GoldenProofResult]
 type OutputFormat = Literal["json", "text"]
 
 
-def run_agreed_golden_api() -> GoldenProofResultView:
-    """Call ``athena_context.golden.run_golden_proof`` through a lazy seam."""
+def run_agreed_golden_api() -> GoldenProofResult:
+    """Call the agreed WC-005 public API without adding evaluation logic."""
 
-    golden_module = import_module("athena_context.golden")
-    candidate: object = golden_module.run_golden_proof
-    mismatch_type = cast(type[Exception], golden_module.GoldenProofMismatchError)
-    if not callable(candidate):
-        raise TypeError("athena_context.golden.run_golden_proof is not callable")
-    runner = cast(GoldenProofRunner, candidate)
-    try:
-        return runner()
-    except mismatch_type as exc:
-        raise GoldenOracleMismatchError(str(exc)) from exc
+    return run_golden_proof()
 
 
 def _required_string(payload: Mapping[str, object], key: str) -> str:
@@ -76,7 +39,7 @@ def _required_string(payload: Mapping[str, object], key: str) -> str:
     return value
 
 
-def _finding_payloads(profile: GoldenProfileResultView) -> dict[str, Mapping[str, object]]:
+def _finding_payloads(profile: GoldenProfileResult) -> dict[str, Mapping[str, object]]:
     findings: dict[str, Mapping[str, object]] = {}
     for serialized in profile.findings:
         payload = json.loads(serialized)
@@ -119,7 +82,7 @@ def _finding_references(payload: Mapping[str, object]) -> str:
     )
 
 
-def format_golden_proof_text(result: GoldenProofResultView) -> str:
+def format_golden_proof_text(result: GoldenProofResult) -> str:
     """Render a concise report; the runner remains the sole oracle evaluator."""
 
     lines = [
@@ -149,7 +112,7 @@ def format_golden_proof_text(result: GoldenProofResultView) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_golden_proof_json(result: GoldenProofResultView) -> str:
+def format_golden_proof_json(result: GoldenProofResult) -> str:
     """Serialize the typed WC-005 result as stable canonical JSON."""
 
     return result.canonical_json() + "\n"
@@ -166,7 +129,7 @@ def run_reference_command(
 
     try:
         result = runner()
-    except GoldenOracleMismatchError as exc:
+    except GoldenProofMismatchError as exc:
         detail = str(exc).strip() or exc.__class__.__name__
         stderr.write(f"golden-proof mismatch: {detail}\n")
         return EXIT_ORACLE_MISMATCH
@@ -181,6 +144,10 @@ def run_reference_command(
         stderr.write(f"golden-proof failed ({exc.__class__.__name__}): {detail}\n")
         return EXIT_EXECUTION_FAILURE
 
+    if result.oracle_status != "complete":
+        stderr.write(f"golden-proof mismatch: oracle status is {result.oracle_status}\n")
+        return EXIT_ORACLE_MISMATCH
+
     if output_format == "json":
         stdout.write(format_golden_proof_json(result))
     elif output_format == "text":
@@ -193,8 +160,6 @@ def run_reference_command(
 __all__ = [
     "EXIT_EXECUTION_FAILURE",
     "EXIT_ORACLE_MISMATCH",
-    "GoldenOracleMismatchError",
-    "GoldenProofResultView",
     "GoldenProofRunner",
     "format_golden_proof_json",
     "format_golden_proof_text",
