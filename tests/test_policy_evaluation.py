@@ -4,6 +4,15 @@ from datetime import UTC, datetime
 
 import pytest
 
+from athena_context import (
+    evaluate_manifest_profile as evaluate_root_profile,
+)
+from athena_context import (
+    evaluate_policy as evaluate_root_policy,
+)
+from athena_context import (
+    evaluate_profile as evaluate_root_profile_alias,
+)
 from athena_context.contracts import (
     AthenaValidationError,
     CompatibilityMetadata,
@@ -11,8 +20,8 @@ from athena_context.contracts import (
 )
 from athena_context.contracts.manifest import (
     BackupControl,
+    CanonicalWorkloadManifest,
     ClauseScope,
-    ContinuitySettings,
     ControlProofFact,
     DeclaredManifestRelationship,
     EvidenceReferenceContext,
@@ -20,7 +29,6 @@ from athena_context.contracts.manifest import (
     ManifestConstraint,
     ManifestObjective,
     ManifestOwner,
-    ManifestProfileSettings,
     ManifestRiskAcceptance,
     ManifestRole,
     ObjectiveProofFact,
@@ -28,6 +36,11 @@ from athena_context.contracts.manifest import (
     ResolvedManifestProfile,
     ResourceProofFact,
     RoleBindingProof,
+    canonicalize_manifest_payload,
+    resolve_manifest_profile,
+)
+from athena_context.contracts.manifest import (
+    evaluate_manifest_profile as evaluate_contract_profile,
 )
 from athena_context.contracts.models import (
     EvidenceGapRef,
@@ -35,7 +48,13 @@ from athena_context.contracts.models import (
     ProducerInfo,
     ResourceGroupScope,
 )
-from athena_context.policy import evaluate_policy, evaluate_profile
+from athena_context.policy import (
+    evaluate_manifest_profile as evaluate_policy_profile,
+)
+from athena_context.policy import (
+    evaluate_policy,
+    evaluate_profile,
+)
 
 AS_OF = datetime(2026, 8, 16, tzinfo=UTC)
 MANIFEST_ID = "wl-synthetic-policy-unit"
@@ -125,7 +144,7 @@ def _role(role_id: str, kind: str, cardinality: str) -> ManifestRole:
 
 def _compatibility() -> CompatibilityMetadata:
     return CompatibilityMetadata(
-        artifactKind="resolvedProfile",
+        artifactKind="workloadManifest",
         schemaVersion="1.0.0",
         semanticContractVersion="1.0.0",
         policyContractVersion="1.0.0",
@@ -220,7 +239,7 @@ def _clause_acceptance(
     )
 
 
-def _resolved_profile(profile_id: str) -> ResolvedManifestProfile:
+def _profile_payload(profile_id: str) -> dict[str, object]:
     web_zones = {"production": 2, "development": 1, "training": 3}[profile_id]
     continuity_required = profile_id != "development"
     acceptance_ref = (
@@ -376,45 +395,99 @@ def _resolved_profile(profile_id: str) -> ResolvedManifestProfile:
             target=99.9,
         )
     ]
-    draft = ResolvedManifestProfile.model_construct(
-        manifest_id=MANIFEST_ID,
-        manifest_version="1.0.0",
-        profile_id=profile_id,
-        profile_type=profile_id,
-        allowed_evidence_scopes=[_evidence_scope()],
-        compatibility=_compatibility(),
-        inheritance_chain=[profile_id],
-        settings=ManifestProfileSettings(
-            continuity=ContinuitySettings(
-                zoneLossContinuityRequired=continuity_required
-            )
-        ),
-        roles=[
-            _role("database-primary", "singletonDatabase", "exactlyOne"),
-            _role("worker", "worker", "oneOrMore"),
-            _role("web", "webService", "oneOrMore"),
+    return {
+        "profileId": profile_id,
+        "profileType": profile_id,
+        "settings": {
+            "continuity": {
+                "zoneLossContinuityRequired": continuity_required,
+            }
+        },
+        "relationships": [
+            relationship.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for relationship in relationships
         ],
-        relationships=relationships,
-        constraints=constraints,
-        controls=controls,
-        risk_acceptances=(
-            [_acceptance(profile_id)] if continuity_required else []
-        ),
-        objectives=objectives,
-        ownership=[
+        "constraints": [
+            constraint.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for constraint in constraints
+        ],
+        "controls": [
+            control.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for control in controls
+        ],
+        "riskAcceptances": [
+            acceptance.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for acceptance in (
+                [_acceptance(profile_id)] if continuity_required else []
+            )
+        ],
+        "objectives": [
+            objective.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for objective in objectives
+        ],
+    }
+
+
+def _canonical_manifest_payload() -> dict[str, object]:
+    return {
+        "manifestId": MANIFEST_ID,
+        "manifestVersion": "1.0.0",
+        "cloud": "azureCloud",
+        "workload": {
+            "displayName": "Synthetic policy unit workload",
+            "environments": ["production", "development", "training"],
+            "allowedEvidenceScopes": [
+                _evidence_scope().model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            ],
+        },
+        "profiles": {
+            profile_id: _profile_payload(profile_id)
+            for profile_id in ("production", "development", "training")
+        },
+        "roles": [
+            role.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for role in (
+                _role("database-primary", "singletonDatabase", "exactlyOne"),
+                _role("worker", "worker", "oneOrMore"),
+                _role("web", "webService", "oneOrMore"),
+            )
+        ],
+        "ownership": [
             ManifestOwner(
                 ownerRef="owner-operations",
                 ownerRole="operationsOwner",
                 authorityRef="synthetic://team/operations",
-            )
+            ).model_dump(mode="json", by_alias=True, exclude_none=True)
         ],
-        resolved_profile_digest="sha256:" + "0" * 64,
+        "compatibility": _compatibility().model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+        "audit": {
+            "publishedBy": "human-approved-context-api",
+            "publishedAt": "2026-01-01T00:00:00.000Z",
+            "approvalStatus": "approved",
+        },
+    }
+
+
+def _resolve_payload(
+    payload: dict[str, object],
+    profile_id: str,
+) -> ResolvedManifestProfile:
+    manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
     )
-    payload = draft.model_dump(mode="json", by_alias=True, exclude_none=True)
-    payload["compatibility"]["artifactDigest"] = draft.recompute_artifact_digest()
-    payload["compatibility"]["semanticDigest"] = draft.recompute_semantic_digest()
-    payload["resolvedProfileDigest"] = draft.recompute_semantic_digest()
-    return ResolvedManifestProfile.model_validate(payload)
+    return resolve_manifest_profile(manifest, profile_id, as_of=AS_OF)
+
+
+def _resolved_profile(profile_id: str) -> ResolvedManifestProfile:
+    return _resolve_payload(_canonical_manifest_payload(), profile_id)
 
 
 def _evidence_scope() -> ResourceGroupScope:
@@ -653,6 +726,35 @@ def test_same_policy_path_evaluates_all_three_environments() -> None:
             assert finding.evidence_refs
 
 
+def test_all_public_evaluator_apis_route_to_authoritative_policy() -> None:
+    assert evaluate_profile is evaluate_policy_profile
+    assert evaluate_policy is evaluate_policy_profile
+    assert evaluate_root_profile is evaluate_policy_profile
+    assert evaluate_root_policy is evaluate_policy_profile
+    assert evaluate_root_profile_alias is evaluate_policy_profile
+    profile = _resolved_profile("production")
+    evidence = _evidence(profile)
+    policy_findings = evaluate_policy_profile(
+        profile,
+        evidence,
+        as_of=AS_OF,
+        verify_evidence_context=_verify_unit_evidence,
+    )
+    contract_findings = evaluate_contract_profile(
+        profile,
+        evidence,
+        as_of=AS_OF,
+        verify_evidence_context=_verify_unit_evidence,
+    )
+    assert {
+        clause_id: finding.canonical_json()
+        for clause_id, finding in contract_findings.items()
+    } == {
+        clause_id: finding.canonical_json()
+        for clause_id, finding in policy_findings.items()
+    }
+
+
 def test_policy_results_are_deterministic_and_evidence_citations_are_relevant() -> None:
     profile = _resolved_profile("production")
     evidence = _evidence(profile)
@@ -715,6 +817,14 @@ def test_inference_conflict_and_incomplete_selectors_fail_closed(
     )
     assert findings[clause_id].verdict == expected_verdict
     assert findings[clause_id].evidence_refs
+    if mutation == "incompleteBinding":
+        contract_findings = evaluate_contract_profile(
+            profile,
+            evidence,
+            as_of=AS_OF,
+            verify_evidence_context=_verify_unit_evidence,
+        )
+        assert contract_findings[clause_id].verdict == "unknown"
 
 
 def test_topology_relationship_control_objective_and_freshness_failures_are_explicit() -> None:
@@ -834,6 +944,123 @@ def test_validated_exception_requires_exact_active_resource_acceptance() -> None
     assert mismatched_findings["web-zone-distribution"].risk_acceptance_ref is None
 
 
+def test_relationship_exception_applies_only_to_exact_source_clause() -> None:
+    payload = _canonical_manifest_payload()
+    production = payload["profiles"]["production"]
+    production["constraints"].append(
+        _constraint(
+            "production",
+            "worker-database-secondary",
+            "dependencyRequired",
+            "architectureConstraint",
+            {
+                "proofKind": "relationshipPresenceProof",
+                "declaredRelationshipRef": "worker-requires-database",
+            },
+            "pass",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+    production["riskAcceptances"].append(
+        _clause_acceptance(
+            "production",
+            "ra-worker-relationship",
+            "worker-database-required",
+            [
+                *[
+                    ("worker", resource_id)
+                    for resource_id in RESOURCE_IDS["worker"]
+                ],
+                (
+                    "database-primary",
+                    RESOURCE_IDS["database-primary"][0],
+                ),
+            ],
+        ).model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+    production["relationships"].append(
+        ExceptionManifestRelationship.model_validate(
+            {
+                "relationshipClass": "exception",
+                "exceptionId": "exception-worker-relationship",
+                "appliesToRelationshipRef": "worker-requires-database",
+                "riskAcceptanceRef": "ra-worker-relationship",
+                "governanceScope": _scope(
+                    "production",
+                    "worker-database-required",
+                ),
+                "ownerRef": "owner-operations",
+                "rationale": "Synthetic exact relationship exception.",
+                "expiresAt": "2027-01-01T00:00:00.000Z",
+            }
+        ).model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+    profile = _resolve_payload(payload, "production")
+    evidence = _evidence(profile)
+    evidence.relationships[0].presence = "absent"
+
+    findings = evaluate_contract_profile(
+        profile,
+        evidence,
+        as_of=AS_OF,
+        verify_evidence_context=_verify_unit_evidence,
+    )
+    assert findings["worker-database-required"].verdict == "acceptedResidualRisk"
+    assert findings["worker-database-secondary"].verdict == "violation"
+    assert findings["worker-database-secondary"].risk_acceptance_ref is None
+
+
+@pytest.mark.parametrize(
+    ("clause_id", "attribute", "missing_ref", "error"),
+    [
+        (
+            "worker-db-zone-colocation",
+            "subject_role_ref",
+            "missing-role",
+            "unresolved constraint roleRef",
+        ),
+        (
+            "backup-control-health",
+            "control_ref",
+            "missing-control",
+            "unresolved control proof ref",
+        ),
+        (
+            "availability-objective",
+            "objective_ref",
+            "missing-objective",
+            "unresolved objective proof ref",
+        ),
+        (
+            "worker-database-required",
+            "declared_relationship_ref",
+            "missing-relationship",
+            "unresolved declared relationship proof ref",
+        ),
+    ],
+)
+def test_policy_boundary_rejects_recomputed_invalid_resolved_references(
+    clause_id: str,
+    attribute: str,
+    missing_ref: str,
+    error: str,
+) -> None:
+    profile = _resolved_profile("production")
+    constraint = next(
+        item for item in profile.constraints if item.constraint_id == clause_id
+    )
+    setattr(constraint.proof_requirement, attribute, missing_ref)
+    profile = _resign_profile(profile)
+    evidence = _evidence(profile)
+
+    with pytest.raises(AthenaValidationError, match=error):
+        evaluate_policy_profile(
+            profile,
+            evidence,
+            as_of=AS_OF,
+            verify_evidence_context=_verify_unit_evidence,
+        )
+
+
 def test_controls_and_technology_constraints_never_become_accepted_risk() -> None:
     profile = _resolved_profile("production")
     control_acceptance = _clause_acceptance(
@@ -912,7 +1139,7 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
 def test_stale_context_and_missing_typed_gap_citations_fail_closed() -> None:
     profile = _resolved_profile("production")
     evidence = _evidence(profile)
-    with pytest.raises(AthenaValidationError, match="not verified"):
+    with pytest.raises(AthenaValidationError, match="stale at trusted as_of"):
         evaluate_profile(
             profile,
             evidence,

@@ -1976,13 +1976,14 @@ def test_relationship_acceptance_requires_exact_endpoint_bindings() -> None:
         item for item in missing_binding.role_bindings if item.role_ref != "database-primary"
     ]
     missing_binding.relationships = evidence.relationships
-    with pytest.raises(AthenaValidationError, match="requires typed evidence"):
-        evaluate_manifest_profile(
-            profile,
-            missing_binding,
-            as_of=AS_OF,
-            verify_evidence_context=_verify_fixture_context,
-        )
+    missing_binding_findings = evaluate_manifest_profile(
+        profile,
+        missing_binding,
+        as_of=AS_OF,
+        verify_evidence_context=_verify_fixture_context,
+    )
+    assert missing_binding_findings["web-db-call-prohibited"].verdict == "unknown"
+    assert missing_binding_findings["web-db-call-prohibited"].evidence_refs
 
 
 def test_acceptance_scope_and_finding_kind_cannot_be_redirected() -> None:

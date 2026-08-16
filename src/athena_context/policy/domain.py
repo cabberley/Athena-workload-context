@@ -451,6 +451,11 @@ def _validated_exception_refs(
     as_of: datetime,
 ) -> set[str]:
     proof = constraint.proof_requirement
+    proof_relationship = (
+        _declared_relationship(profile, proof.declared_relationship_ref)
+        if isinstance(proof, RelationshipPresenceProof)
+        else None
+    )
     result: set[str] = set()
     for relationship in profile.relationships:
         if not isinstance(relationship, ExceptionManifestRelationship):
@@ -461,10 +466,12 @@ def _validated_exception_refs(
             == normalized_id(constraint.constraint_id)
         )
         applies_to_relationship = (
-            isinstance(proof, RelationshipPresenceProof)
+            proof_relationship is not None
             and relationship.applies_to_relationship_ref is not None
             and normalized_id(relationship.applies_to_relationship_ref)
-            == normalized_id(proof.declared_relationship_ref)
+            == normalized_id(proof_relationship.relationship_id)
+            and constraint.governance_scope.clause_path
+            == proof_relationship.source_clause
         )
         if not applies_to_clause and not applies_to_relationship:
             continue

@@ -1787,7 +1787,12 @@ def _validate_override_owners(
             )
 
 
-def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: datetime) -> None:
+def _resolve_cross_references(
+    profile: ResolvedManifestProfile,
+    *,
+    as_of: datetime,
+    require_active_governance: bool,
+) -> None:
     owners = {_normalized_id(item.owner_ref) for item in profile.ownership}
     roles = {_normalized_id(item.role_id) for item in profile.roles}
     relationships = {
@@ -1822,7 +1827,7 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
                         f"unresolved relationship roleRef: {endpoint.role_ref}"
                     )
         else:
-            if relationship.expires_at <= as_of:
+            if require_active_governance and relationship.expires_at <= as_of:
                 raise AthenaValidationError("exception relationship is expired")
             if (
                 relationship.applies_to_relationship_ref is not None
@@ -1865,7 +1870,11 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
                 ),
                 None,
             )
-            if acceptance is None or not acceptance.is_active(
+            if acceptance is None:
+                raise AthenaValidationError(
+                    "exception requires a matching scoped risk acceptance"
+                )
+            if require_active_governance and not acceptance.is_active(
                 as_of=as_of,
                 manifest_id=profile.manifest_id,
                 profile_id=profile.profile_id,
@@ -1976,6 +1985,49 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
             )
     for objective in profile.objectives:
         require_owner(objective.owner_ref)
+
+
+def validate_resolved_manifest_profile(
+    profile: ResolvedManifestProfile,
+    *,
+    as_of: datetime,
+    require_active_governance: bool = False,
+) -> None:
+    """Validate digest integrity and the complete resolved-profile reference graph."""
+
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise AthenaValidationError("trusted as_of must be timezone-aware")
+    semantic_digest = profile.recompute_semantic_digest()
+    artifact_digest = profile.recompute_artifact_digest()
+    if (
+        profile.resolved_profile_digest != semantic_digest
+        or profile.compatibility.semantic_digest != semantic_digest
+        or profile.compatibility.artifact_digest != artifact_digest
+    ):
+        raise AthenaValidationError("resolved profile changed after digest validation")
+    _require_supported_compatibility(
+        profile.compatibility,
+        artifact_kind="resolvedProfile",
+    )
+    for items, attribute, label in (
+        (list(profile.roles), "role_id", "role id"),
+        (list(profile.relationships), "relationship_id", "relationship id"),
+        (list(profile.constraints), "constraint_id", "constraint id"),
+        (list(profile.controls), "control_id", "control id"),
+        (
+            list(profile.risk_acceptances),
+            "risk_acceptance_id",
+            "risk acceptance id",
+        ),
+        (list(profile.objectives), "objective_id", "objective id"),
+        (list(profile.ownership), "owner_ref", "owner ref"),
+    ):
+        _require_unique(items, attribute, label)
+    _resolve_cross_references(
+        profile,
+        as_of=as_of,
+        require_active_governance=require_active_governance,
+    )
 
 
 def resolve_manifest_profile(
@@ -2231,7 +2283,11 @@ def resolve_manifest_profile(
 
     if parent_resolved is None:
         raise AthenaValidationError("profile resolution produced no profile")
-    _resolve_cross_references(parent_resolved, as_of=as_of)
+    validate_resolved_manifest_profile(
+        parent_resolved,
+        as_of=as_of,
+        require_active_governance=True,
+    )
     return parent_resolved
 
 
@@ -2520,214 +2576,6 @@ def verified_snapshot_context_verifier(
     return verify
 
 
-def _evidence_gate(
-    resources: list[ResourceProofFact],
-    *,
-    missing_verdict: FailureVerdict,
-) -> FindingVerdict | None:
-    if not resources:
-        return "unknown"
-    if any(item.state == "conflicting" for item in resources):
-        return "conflicting"
-    if any(item.state != "complete" for item in resources):
-        return "unknown"
-    if any(item.proof_source == "inferred" for item in resources):
-        return "unknown"
-    return None
-
-
-def _matching_acceptance(
-    profile: ResolvedManifestProfile,
-    constraint: ManifestConstraint,
-    evidence: EvidenceReferenceContext,
-    *,
-    as_of: datetime,
-) -> ManifestRiskAcceptance | None:
-    acceptance_refs: set[str] = set()
-    if constraint.risk_acceptance_ref is not None:
-        acceptance_refs.add(_normalized_id(constraint.risk_acceptance_ref))
-    proof = constraint.proof_requirement
-    for relationship in profile.relationships:
-        if not isinstance(relationship, ExceptionManifestRelationship):
-            continue
-        if relationship.expires_at <= as_of:
-            continue
-        applies_to_constraint = relationship.applies_to_clause_ref is not None and _normalized_id(
-            relationship.applies_to_clause_ref
-        ) == _normalized_id(constraint.constraint_id)
-        applies_to_relationship = (
-            isinstance(proof, RelationshipPresenceProof)
-            and relationship.applies_to_relationship_ref is not None
-            and _normalized_id(relationship.applies_to_relationship_ref)
-            == _normalized_id(proof.declared_relationship_ref)
-        )
-        if applies_to_constraint or applies_to_relationship:
-            acceptance_refs.add(_normalized_id(relationship.risk_acceptance_ref))
-    if not acceptance_refs:
-        return None
-    acceptance_clause_id = (
-        constraint.risk_acceptance_clause_ref
-        if constraint.finding_kind == "riskAcceptance"
-        and constraint.risk_acceptance_clause_ref is not None
-        else constraint.constraint_id
-    )
-    proof_role_refs: set[str] = set()
-    if isinstance(proof, (CardinalityProof, ZoneDistributionProof)):
-        proof_role_refs.add(_normalized_id(proof.role_ref))
-    elif isinstance(proof, ZoneColocationProof):
-        proof_role_refs.update(
-            {
-                _normalized_id(proof.subject_role_ref),
-                _normalized_id(proof.anchor_role_ref),
-            }
-        )
-    elif isinstance(proof, RelationshipPresenceProof):
-        declared_relationship = next(
-            (
-                item
-                for item in profile.relationships
-                if isinstance(item, DeclaredManifestRelationship)
-                and _normalized_id(item.relationship_id)
-                == _normalized_id(proof.declared_relationship_ref)
-            ),
-            None,
-        )
-        if declared_relationship is None:
-            return None
-        for endpoint in (
-            declared_relationship.source,
-            declared_relationship.target,
-        ):
-            if isinstance(endpoint, RoleEndpoint):
-                proof_role_refs.add(_normalized_id(endpoint.role_ref))
-        if not proof_role_refs:
-            return None
-    bindings_by_role = {
-        role_ref: [
-            binding
-            for binding in evidence.role_bindings
-            if _normalized_id(binding.role_ref) == role_ref
-        ]
-        for role_ref in proof_role_refs
-    }
-    if any(
-        len(bindings) != 1 or bindings[0].state != "complete"
-        for bindings in bindings_by_role.values()
-    ):
-        return None
-    if isinstance(proof, RelationshipPresenceProof) and any(
-        not bindings[0].selected_resource_ids
-        for bindings in bindings_by_role.values()
-    ):
-        return None
-    required_bindings = {
-        (
-            _normalized_id(binding.role_ref),
-            _normalized_id(resource_id),
-        )
-        for bindings in bindings_by_role.values()
-        for binding in bindings
-        for resource_id in binding.selected_resource_ids
-    }
-    matches: list[ManifestRiskAcceptance] = []
-    for acceptance in profile.risk_acceptances:
-        accepted_bindings = {
-            (
-                _normalized_id(binding.role_ref),
-                _normalized_id(binding.resource_id),
-            )
-            for binding in acceptance.accepted_resource_bindings
-        }
-        if (
-            _normalized_id(acceptance.risk_acceptance_id) in acceptance_refs
-            and acceptance.is_active(
-                as_of=as_of,
-                manifest_id=profile.manifest_id,
-                profile_id=profile.profile_id,
-                clause_path=f"/constraints/{acceptance_clause_id}",
-                owner_ref=constraint.owner_ref,
-            )
-            and (not proof_role_refs or accepted_bindings == required_bindings)
-        ):
-            matches.append(acceptance)
-    if len(matches) > 1:
-        raise AthenaValidationError("riskAcceptanceRef resolved ambiguously")
-    return matches[0] if matches else None
-
-
-def _bounded_evidence_refs(
-    references: list[EvidenceReference],
-) -> tuple[list[EvidenceReference], bool]:
-    ordered = sorted(references, key=lambda reference: reference.canonical_json())
-    return ordered[:1000], len(ordered) > 1000
-
-
-def _comparison_matches(actual: float, comparison: str, threshold: float) -> bool:
-    if comparison == "lt":
-        return actual < threshold
-    if comparison == "lte":
-        return actual <= threshold
-    if comparison == "gt":
-        return actual > threshold
-    if comparison == "gte":
-        return actual >= threshold
-    return actual == threshold
-
-
-def _scope_contains(allowed: EvidenceScope, authorized: EvidenceScope) -> bool:
-    if allowed.canonical_json() == authorized.canonical_json():
-        return True
-    if allowed.scope_type == "subscription" and authorized.scope_type in {
-        "resourceGroup",
-        "logAnalyticsWorkspace",
-    }:
-        return (
-            allowed.tenant_id == authorized.tenant_id
-            and allowed.subscription_id == authorized.subscription_id
-        )
-    if allowed.scope_type == "subscription" and authorized.scope_type == "resourceId":
-        prefix = f"/subscriptions/{allowed.subscription_id}/"
-        return authorized.resource_id.casefold().startswith(prefix.casefold())
-    if allowed.scope_type == "resourceGroup" and authorized.scope_type == "resourceId":
-        prefix = (
-            f"/subscriptions/{allowed.subscription_id}/resourceGroups/"
-            f"{allowed.resource_group_name}/"
-        )
-        return authorized.resource_id.casefold().startswith(prefix.casefold())
-    if allowed.scope_type == "resourceId" and authorized.scope_type == "resourceId":
-        allowed_id = allowed.resource_id.rstrip("/").casefold()
-        authorized_id = authorized.resource_id.rstrip("/").casefold()
-        return authorized_id == allowed_id or authorized_id.startswith(allowed_id + "/")
-    return False
-
-
-def _bound_role_resources(
-    evidence: EvidenceReferenceContext,
-    role_ref: str,
-) -> tuple[list[ResourceProofFact], FindingVerdict | None]:
-    bindings = [
-        binding
-        for binding in evidence.role_bindings
-        if _normalized_id(binding.role_ref) == _normalized_id(role_ref)
-    ]
-    if len(bindings) != 1:
-        return ([], "unknown")
-    binding = bindings[0]
-    if binding.state == "conflicting":
-        return ([], "conflicting")
-    if binding.state != "complete":
-        return ([], "unknown")
-    resources = [
-        item
-        for item in evidence.resources
-        if _normalized_id(item.role_ref) == _normalized_id(role_ref)
-    ]
-    selected = {_normalized_id(item) for item in binding.selected_resource_ids}
-    actual = {_normalized_id(item.resource_id) for item in resources}
-    if selected != actual:
-        return (resources, "unknown")
-    return (resources, None)
-
 
 def evaluate_manifest_profile(
     profile: ResolvedManifestProfile,
@@ -2736,242 +2584,18 @@ def evaluate_manifest_profile(
     as_of: datetime,
     verify_evidence_context: EvidenceContextVerifier,
 ) -> dict[str, ManifestFinding]:
-    if (
-        profile.resolved_profile_digest != profile.recompute_semantic_digest()
-        or profile.compatibility.artifact_digest != profile.recompute_artifact_digest()
-    ):
-        raise AthenaValidationError("resolved profile changed after digest validation")
-    verify_evidence_context(evidence, as_of)
-    if (
-        evidence.manifest_id != profile.manifest_id
-        or _normalized_id(evidence.profile_id) != _normalized_id(profile.profile_id)
-        or evidence.resolved_profile_digest != profile.resolved_profile_digest
-    ):
-        raise AthenaValidationError("evidence reference context does not match resolved profile")
-    if any(
-        not any(
-            _scope_contains(allowed_scope, authorized_scope)
-            for allowed_scope in profile.allowed_evidence_scopes
-        )
-        for authorized_scope in evidence.authorized_scopes
-    ):
-        raise AthenaValidationError(
-            "evidence reference context exceeds manifest allowedEvidenceScopes"
-        )
-    if not (evidence.collected_at <= as_of < evidence.expires_at):
-        raise AthenaValidationError("evidence reference context is stale at trusted as_of")
+    """Compatibility entry point routed to the authoritative policy evaluator."""
 
-    findings: dict[str, ManifestFinding] = {}
-    for constraint in profile.constraints:
-        proof = constraint.proof_requirement
-        verdict: FindingVerdict
-        proof_references: list[EvidenceReference]
-        if isinstance(proof, CardinalityProof):
-            resources, binding_verdict = _bound_role_resources(evidence, proof.role_ref)
-            proof_references = [item.evidence_ref for item in resources]
-            gate = binding_verdict or _evidence_gate(
-                resources, missing_verdict=constraint.failure_verdict
-            )
-            if gate is not None:
-                verdict = gate
-            elif any(item.availability_zone == "unknown" for item in resources):
-                verdict = "unknown"
-            else:
-                minimum, maximum = _cardinality_bounds(proof.expected)
-                matches = len(resources)
-                if constraint.finding_kind in {"actualSpof", "riskAcceptance"}:
-                    if not profile.settings.continuity.zone_loss_continuity_required:
-                        verdict = "observation"
-                    elif minimum <= matches <= maximum:
-                        verdict = "violation"
-                    else:
-                        verdict = constraint.failure_verdict
-                else:
-                    verdict = (
-                        constraint.success_verdict
-                        if minimum <= matches <= maximum
-                        else constraint.failure_verdict
-                    )
-        elif isinstance(proof, ZoneColocationProof):
-            subjects, subject_binding_verdict = _bound_role_resources(
-                evidence, proof.subject_role_ref
-            )
-            anchors, anchor_binding_verdict = _bound_role_resources(evidence, proof.anchor_role_ref)
-            proof_references = [item.evidence_ref for item in [*subjects, *anchors]]
-            gate = (
-                subject_binding_verdict
-                or anchor_binding_verdict
-                or _evidence_gate(
-                    [*subjects, *anchors],
-                    missing_verdict=constraint.failure_verdict,
-                )
-            )
-            if gate is not None or not subjects or not anchors:
-                verdict = gate or "unknown"
-            elif any(item.availability_zone == "unknown" for item in [*subjects, *anchors]):
-                verdict = "unknown"
-            else:
-                anchor_zones = {item.availability_zone for item in anchors}
-                subject_zones = {item.availability_zone for item in subjects}
-                verdict = (
-                    constraint.success_verdict
-                    if len(anchor_zones) == 1 and subject_zones == anchor_zones
-                    else constraint.failure_verdict
-                )
-        elif isinstance(proof, ZoneDistributionProof):
-            resources, binding_verdict = _bound_role_resources(evidence, proof.role_ref)
-            proof_references = [item.evidence_ref for item in resources]
-            gate = binding_verdict or _evidence_gate(
-                resources, missing_verdict=constraint.failure_verdict
-            )
-            if gate is not None or not resources:
-                verdict = gate or "unknown"
-            elif any(item.availability_zone == "unknown" for item in resources):
-                verdict = "unknown"
-            else:
-                zones = {item.availability_zone for item in resources}
-                verdict = (
-                    constraint.success_verdict
-                    if len(zones) >= proof.minimum_distinct_zones
-                    else constraint.failure_verdict
-                )
-        elif isinstance(proof, RelationshipPresenceProof):
-            relationship_facts = [
-                item
-                for item in evidence.relationships
-                if _normalized_id(item.relationship_ref)
-                == _normalized_id(proof.declared_relationship_ref)
-            ]
-            proof_references = [item.evidence_ref for item in relationship_facts]
-            if any(item.state == "conflicting" for item in relationship_facts):
-                verdict = "conflicting"
-            elif (
-                not relationship_facts
-                or any(item.state != "complete" for item in relationship_facts)
-                or all(item.proof_source == "inferred" for item in relationship_facts)
-            ):
-                verdict = "unknown"
-            else:
-                relationship_present = any(
-                    item.presence == "present" for item in relationship_facts
-                )
-                if constraint.constraint_type == "dependencyProhibited":
-                    verdict = (
-                        constraint.failure_verdict
-                        if relationship_present
-                        else constraint.success_verdict
-                    )
-                else:
-                    verdict = (
-                        constraint.success_verdict
-                        if relationship_present
-                        else constraint.failure_verdict
-                    )
-        elif isinstance(proof, ControlHealthProof):
-            control_facts = [
-                item
-                for item in evidence.controls
-                if _normalized_id(item.control_ref) == _normalized_id(proof.control_ref)
-            ]
-            proof_references = [item.evidence_ref for item in control_facts]
-            if any(item.state == "conflicting" for item in control_facts):
-                verdict = "conflicting"
-            elif len(control_facts) != 1 or control_facts[0].state != "complete":
-                verdict = "unknown"
-            elif control_facts[0].health != proof.required_health:
-                verdict = constraint.failure_verdict
-            else:
-                verdict = constraint.success_verdict
-        elif isinstance(proof, EvidenceFreshnessProof):
-            proof_references = [
-                *[item.evidence_ref for item in evidence.resources],
-                *[item.evidence_ref for item in evidence.relationships],
-                *[item.evidence_ref for item in evidence.controls],
-                *[item.evidence_ref for item in evidence.objectives],
-            ]
-            states = [
-                *[item.state for item in evidence.resources],
-                *[item.state for item in evidence.relationships],
-                *[item.state for item in evidence.controls],
-                *[item.state for item in evidence.objectives],
-            ]
-            inferred = any(item.proof_source == "inferred" for item in evidence.resources) or any(
-                item.proof_source == "inferred" for item in evidence.relationships
-            )
-            if "conflicting" in states:
-                verdict = "conflicting"
-            elif not states or any(state != "complete" for state in states) or inferred:
-                verdict = "unknown"
-            else:
-                verdict = (
-                    constraint.success_verdict
-                    if (as_of - evidence.collected_at).total_seconds() <= proof.maximum_age_seconds
-                    else constraint.failure_verdict
-                )
-        elif isinstance(proof, ObjectiveThresholdProof):
-            objective_facts = [
-                item
-                for item in evidence.objectives
-                if _normalized_id(item.objective_ref) == _normalized_id(proof.objective_ref)
-            ]
-            proof_references = [item.evidence_ref for item in objective_facts]
-            if any(item.state == "conflicting" for item in objective_facts):
-                verdict = "conflicting"
-            elif len(objective_facts) != 1 or objective_facts[0].state != "complete":
-                verdict = "unknown"
-            else:
-                verdict = (
-                    constraint.success_verdict
-                    if _comparison_matches(
-                        objective_facts[0].current_value,
-                        proof.comparison,
-                        proof.threshold,
-                    )
-                    else constraint.failure_verdict
-                )
-        else:
-            raise AthenaValidationError(f"unsupported proof variant: {proof.proof_kind}")
+    from athena_context.policy.evaluator import (
+        evaluate_manifest_profile as evaluate_policy_profile,
+    )
 
-        if not proof_references:
-            raise AthenaValidationError(
-                f"constraint {constraint.constraint_id} requires typed evidence or gap references"
-            )
-        proof_references, over_broad = _bounded_evidence_refs(proof_references)
-        if over_broad and verdict != "conflicting":
-            verdict = "unknown"
-
-        acceptance = _matching_acceptance(profile, constraint, evidence, as_of=as_of)
-        risk_ref: str | None = None
-        if (
-            verdict == "violation"
-            and acceptance is not None
-            and constraint.finding_kind
-            in {
-                "actualSpof",
-                "riskAcceptance",
-                "architectureConstraint",
-                "relationshipConflict",
-            }
-        ):
-            verdict = "acceptedResidualRisk"
-            risk_ref = acceptance.risk_acceptance_id
-        if verdict == "acceptedResidualRisk" and acceptance is None:
-            raise AthenaValidationError(
-                "acceptedResidualRisk requires a verified active risk acceptance"
-            )
-        findings[constraint.constraint_id] = ManifestFinding(
-            clauseId=constraint.constraint_id,
-            findingKind=constraint.finding_kind,
-            verdict=verdict,
-            manifestId=profile.manifest_id,
-            manifestVersion=profile.manifest_version,
-            profileId=profile.profile_id,
-            resolvedProfileDigest=profile.resolved_profile_digest,
-            governanceScope=constraint.governance_scope,
-            evidenceRefs=proof_references,
-            riskAcceptanceRef=risk_ref,
-        )
-    return findings
+    return evaluate_policy_profile(
+        profile,
+        evidence,
+        as_of=as_of,
+        verify_evidence_context=verify_evidence_context,
+    )
 
 
 __all__ = [
@@ -3018,5 +2642,6 @@ __all__ = [
     "evaluate_manifest_profile",
     "canonicalize_manifest_payload",
     "resolve_manifest_profile",
+    "validate_resolved_manifest_profile",
     "verified_snapshot_context_verifier",
 ]
