@@ -1,0 +1,1115 @@
+{
+  "manifestId": "wl-athena-wc002-canonical",
+  "manifestVersion": "1.1.0",
+  "cloud": "azureCloud",
+  "workload": {
+    "displayName": "Synthetic WC-002 canonical workload",
+    "environments": [
+      "production",
+      "development",
+      "training"
+    ],
+    "allowedEvidenceScopes": [
+      {
+        "scopeType": "resourceGroup",
+        "tenantId": "11111111-1111-1111-1111-111111111111",
+        "subscriptionId": "11111111-1111-1111-1111-111111111111",
+        "resourceGroupName": "rg-athena-fixture"
+      }
+    ]
+  },
+  "profiles": {
+    "development": {
+      "profileId": "development",
+      "profileType": "development",
+      "settings": {
+        "continuity": {
+          "zoneLossContinuityRequired": false
+        }
+      },
+      "roles": [],
+      "relationships": [
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "development-web-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "development-web-protected-by-lb",
+          "kind": "protectedBy",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "load-balancer"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "development-worker-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "worker"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "sourceClause": "/constraints/worker-db-zone-colocation"
+        }
+      ],
+      "constraints": [
+        {
+          "constraintId": "db-singleton-supported",
+          "constraintType": "supportedSingleton",
+          "findingKind": "technologyConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/db-singleton-supported",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "expectedConstraint",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-acceptance",
+          "constraintType": "supportedSingleton",
+          "findingKind": "riskAcceptance",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/db-zone-loss-acceptance",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-development",
+          "riskAcceptanceClauseRef": "db-zone-loss-spof",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-spof",
+          "constraintType": "supportedSingleton",
+          "findingKind": "actualSpof",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-development",
+          "protected": true
+        },
+        {
+          "constraintId": "web-zone-distribution",
+          "constraintType": "zoneDistribution",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/web-zone-distribution",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneDistributionProof",
+            "roleRef": "web",
+            "minimumDistinctZones": 1
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        },
+        {
+          "constraintId": "worker-db-zone-colocation",
+          "constraintType": "zoneColocation",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/worker-db-zone-colocation",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneColocationProof",
+            "subjectRoleRef": "worker",
+            "anchorRoleRef": "database-primary"
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        }
+      ],
+      "controls": [
+        {
+          "controlId": "control-db-failover-runbook-development",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "development"
+          ],
+          "health": "effective",
+          "controlKind": "manualFailoverRunbook",
+          "runbookRef": "synthetic://runbooks/db-failover",
+          "lastReviewedAt": "2025-01-01T00:00:00Z"
+        }
+      ],
+      "riskAcceptances": [
+        {
+          "riskAcceptanceId": "ra-db-zone-loss-development",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "development",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "riskKind": "availability",
+          "riskRating": "high",
+          "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+          "rationaleRef": "synthetic://risk/db-zone-loss",
+          "acceptedBy": "synthetic-approver",
+          "ownedBy": "ops-owner",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "linkedControlRefs": [
+            "control-db-failover-runbook-development"
+          ],
+          "acceptedResourceBindings": [
+            {
+              "roleRef": "database-primary",
+              "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+            }
+          ],
+          "profiles": [
+            "development"
+          ],
+          "status": "approved"
+        }
+      ],
+      "objectives": [],
+      "ownership": [],
+      "weakeningOverrides": [
+        {
+          "overrideId": "dev-continuity",
+          "reason": "continuityRelaxation",
+          "targetPath": "/resolvedProfiles/development/settings/continuity/zoneLossContinuityRequired",
+          "targetRef": "zoneLossContinuityRequired",
+          "ownerRef": "ops-owner",
+          "rationale": "Development does not claim continuity through zone loss.",
+          "approvedBy": "synthetic-approver",
+          "status": "approved",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "profiles": [
+            "development"
+          ]
+        },
+        {
+          "overrideId": "dev-web-zones",
+          "reason": "zoneRequirementRelaxation",
+          "targetPath": "/resolvedProfiles/development/constraints/web-zone-distribution/proofRequirement/minimumDistinctZones",
+          "targetRef": "web-zone-distribution",
+          "ownerRef": "ops-owner",
+          "rationale": "One web zone is sufficient for synthetic development.",
+          "approvedBy": "synthetic-approver",
+          "status": "approved",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "profiles": [
+            "development"
+          ]
+        }
+      ],
+      "disabledRefs": []
+    },
+    "production": {
+      "profileId": "production",
+      "profileType": "production",
+      "settings": {
+        "continuity": {
+          "zoneLossContinuityRequired": true
+        }
+      },
+      "roles": [],
+      "relationships": [
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "production-web-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "production-web-protected-by-lb",
+          "kind": "protectedBy",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "load-balancer"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "production-worker-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "worker"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "sourceClause": "/constraints/worker-db-zone-colocation"
+        }
+      ],
+      "constraints": [
+        {
+          "constraintId": "db-singleton-supported",
+          "constraintType": "supportedSingleton",
+          "findingKind": "technologyConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/db-singleton-supported",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "expectedConstraint",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-acceptance",
+          "constraintType": "supportedSingleton",
+          "findingKind": "riskAcceptance",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/db-zone-loss-acceptance",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-production",
+          "riskAcceptanceClauseRef": "db-zone-loss-spof",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-spof",
+          "constraintType": "supportedSingleton",
+          "findingKind": "actualSpof",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-production",
+          "protected": true
+        },
+        {
+          "constraintId": "web-zone-distribution",
+          "constraintType": "zoneDistribution",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/web-zone-distribution",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneDistributionProof",
+            "roleRef": "web",
+            "minimumDistinctZones": 2
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        },
+        {
+          "constraintId": "worker-db-zone-colocation",
+          "constraintType": "zoneColocation",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/worker-db-zone-colocation",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneColocationProof",
+            "subjectRoleRef": "worker",
+            "anchorRoleRef": "database-primary"
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        }
+      ],
+      "controls": [
+        {
+          "controlId": "control-db-failover-runbook-production",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "production"
+          ],
+          "health": "effective",
+          "controlKind": "manualFailoverRunbook",
+          "runbookRef": "synthetic://runbooks/db-failover",
+          "lastReviewedAt": "2025-01-01T00:00:00Z"
+        }
+      ],
+      "riskAcceptances": [
+        {
+          "riskAcceptanceId": "ra-db-zone-loss-production",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "production",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "riskKind": "availability",
+          "riskRating": "high",
+          "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+          "rationaleRef": "synthetic://risk/db-zone-loss",
+          "acceptedBy": "synthetic-approver",
+          "ownedBy": "ops-owner",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "linkedControlRefs": [
+            "control-db-failover-runbook-production"
+          ],
+          "acceptedResourceBindings": [
+            {
+              "roleRef": "database-primary",
+              "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+            }
+          ],
+          "profiles": [
+            "production"
+          ],
+          "status": "approved"
+        }
+      ],
+      "objectives": [],
+      "ownership": [],
+      "weakeningOverrides": [],
+      "disabledRefs": []
+    },
+    "training": {
+      "profileId": "training",
+      "profileType": "training",
+      "settings": {
+        "continuity": {
+          "zoneLossContinuityRequired": true
+        }
+      },
+      "roles": [],
+      "relationships": [
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "training-web-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "training-web-protected-by-lb",
+          "kind": "protectedBy",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "web"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "load-balancer"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "sourceClause": "/constraints/web-zone-distribution"
+        },
+        {
+          "relationshipClass": "declared",
+          "relationshipId": "training-worker-depends-db",
+          "kind": "dependsOn",
+          "source": {
+            "endpointType": "role",
+            "roleRef": "worker"
+          },
+          "target": {
+            "endpointType": "role",
+            "roleRef": "database-primary"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "sourceClause": "/constraints/worker-db-zone-colocation"
+        }
+      ],
+      "constraints": [
+        {
+          "constraintId": "db-singleton-supported",
+          "constraintType": "supportedSingleton",
+          "findingKind": "technologyConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/db-singleton-supported",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "expectedConstraint",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-acceptance",
+          "constraintType": "supportedSingleton",
+          "findingKind": "riskAcceptance",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/db-zone-loss-acceptance",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-training",
+          "riskAcceptanceClauseRef": "db-zone-loss-spof",
+          "protected": true
+        },
+        {
+          "constraintId": "db-zone-loss-spof",
+          "constraintType": "supportedSingleton",
+          "findingKind": "actualSpof",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "proofRequirement": {
+            "proofKind": "cardinalityProof",
+            "roleRef": "database-primary",
+            "expected": {
+              "cardinalityKind": "exactlyOne"
+            }
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "observation",
+          "riskAcceptanceRef": "ra-db-zone-loss-training",
+          "protected": true
+        },
+        {
+          "constraintId": "web-zone-distribution",
+          "constraintType": "zoneDistribution",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/web-zone-distribution",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneDistributionProof",
+            "roleRef": "web",
+            "minimumDistinctZones": 1
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        },
+        {
+          "constraintId": "worker-db-zone-colocation",
+          "constraintType": "zoneColocation",
+          "findingKind": "architectureConstraint",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/worker-db-zone-colocation",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "proofRequirement": {
+            "proofKind": "zoneColocationProof",
+            "subjectRoleRef": "worker",
+            "anchorRoleRef": "database-primary"
+          },
+          "failureVerdict": "violation",
+          "successVerdict": "pass",
+          "protected": true
+        }
+      ],
+      "controls": [
+        {
+          "controlId": "control-db-failover-runbook-training",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "ownerRef": "ops-owner",
+          "profiles": [
+            "training"
+          ],
+          "health": "effective",
+          "controlKind": "manualFailoverRunbook",
+          "runbookRef": "synthetic://runbooks/db-failover",
+          "lastReviewedAt": "2025-01-01T00:00:00Z"
+        }
+      ],
+      "riskAcceptances": [
+        {
+          "riskAcceptanceId": "ra-db-zone-loss-training",
+          "governanceScope": {
+            "governanceScopeType": "clause",
+            "manifestId": "wl-athena-wc002-canonical",
+            "profileId": "training",
+            "clausePath": "/constraints/db-zone-loss-spof",
+            "ownerRef": "ops-owner"
+          },
+          "riskKind": "availability",
+          "riskRating": "high",
+          "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+          "rationaleRef": "synthetic://risk/db-zone-loss",
+          "acceptedBy": "synthetic-approver",
+          "ownedBy": "ops-owner",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "linkedControlRefs": [
+            "control-db-failover-runbook-training"
+          ],
+          "acceptedResourceBindings": [
+            {
+              "roleRef": "database-primary",
+              "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+            }
+          ],
+          "profiles": [
+            "training"
+          ],
+          "status": "approved"
+        }
+      ],
+      "objectives": [],
+      "ownership": [],
+      "weakeningOverrides": [
+        {
+          "overrideId": "training-web-zones",
+          "reason": "zoneRequirementRelaxation",
+          "targetPath": "/resolvedProfiles/training/constraints/web-zone-distribution/proofRequirement/minimumDistinctZones",
+          "targetRef": "web-zone-distribution",
+          "ownerRef": "ops-owner",
+          "rationale": "One web zone is sufficient for synthetic training.",
+          "approvedBy": "synthetic-approver",
+          "status": "approved",
+          "acceptedAt": "2025-01-01T00:00:00Z",
+          "expiresAt": "2025-12-31T00:00:00Z",
+          "profiles": [
+            "training"
+          ]
+        }
+      ],
+      "disabledRefs": []
+    }
+  },
+  "roles": [
+    {
+      "roleId": "database-primary",
+      "kind": "singletonDatabase",
+      "cardinality": {
+        "cardinalityKind": "exactlyOne"
+      },
+      "selectors": [
+        {
+          "selectorType": "namePredicate",
+          "selectorId": "database-name",
+          "prefix": "athena-db-",
+          "maxMatches": 10
+        }
+      ],
+      "ownerRef": "ops-owner",
+      "status": "approved"
+    },
+    {
+      "roleId": "load-balancer",
+      "kind": "loadBalancer",
+      "cardinality": {
+        "cardinalityKind": "exactlyOne"
+      },
+      "selectors": [
+        {
+          "selectorType": "namePredicate",
+          "selectorId": "load-balancer-name",
+          "prefix": "athena-lb-",
+          "maxMatches": 10
+        }
+      ],
+      "ownerRef": "ops-owner",
+      "status": "approved"
+    },
+    {
+      "roleId": "web",
+      "kind": "webService",
+      "cardinality": {
+        "cardinalityKind": "oneOrMore"
+      },
+      "selectors": [
+        {
+          "selectorType": "namePredicate",
+          "selectorId": "web-name",
+          "prefix": "athena-web-",
+          "maxMatches": 20
+        }
+      ],
+      "ownerRef": "ops-owner",
+      "status": "approved"
+    },
+    {
+      "roleId": "worker",
+      "kind": "worker",
+      "cardinality": {
+        "cardinalityKind": "oneOrMore"
+      },
+      "selectors": [
+        {
+          "selectorType": "namePredicate",
+          "selectorId": "worker-name",
+          "prefix": "athena-worker-",
+          "maxMatches": 20
+        }
+      ],
+      "ownerRef": "ops-owner",
+      "status": "approved"
+    }
+  ],
+  "relationships": [
+    {
+      "relationshipClass": "declared",
+      "relationshipId": "web-protected-by-lb",
+      "kind": "protectedBy",
+      "source": {
+        "endpointType": "role",
+        "roleRef": "web"
+      },
+      "target": {
+        "endpointType": "role",
+        "roleRef": "load-balancer"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "sourceClause": "/constraints/web-zone-distribution"
+    },
+    {
+      "relationshipClass": "declared",
+      "relationshipId": "worker-depends-db",
+      "kind": "dependsOn",
+      "source": {
+        "endpointType": "role",
+        "roleRef": "worker"
+      },
+      "target": {
+        "endpointType": "role",
+        "roleRef": "database-primary"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "sourceClause": "/constraints/worker-db-zone-colocation"
+    }
+  ],
+  "constraints": [
+    {
+      "constraintId": "db-singleton-supported",
+      "constraintType": "supportedSingleton",
+      "findingKind": "technologyConstraint",
+      "governanceScope": {
+        "governanceScopeType": "clause",
+        "manifestId": "wl-athena-wc002-canonical",
+        "profileId": "production",
+        "clausePath": "/constraints/db-singleton-supported",
+        "ownerRef": "ops-owner"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "proofRequirement": {
+        "proofKind": "cardinalityProof",
+        "roleRef": "database-primary",
+        "expected": {
+          "cardinalityKind": "exactlyOne"
+        }
+      },
+      "failureVerdict": "violation",
+      "successVerdict": "expectedConstraint",
+      "protected": true
+    },
+    {
+      "constraintId": "db-zone-loss-acceptance",
+      "constraintType": "supportedSingleton",
+      "findingKind": "riskAcceptance",
+      "governanceScope": {
+        "governanceScopeType": "clause",
+        "manifestId": "wl-athena-wc002-canonical",
+        "profileId": "production",
+        "clausePath": "/constraints/db-zone-loss-acceptance",
+        "ownerRef": "ops-owner"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "proofRequirement": {
+        "proofKind": "cardinalityProof",
+        "roleRef": "database-primary",
+        "expected": {
+          "cardinalityKind": "exactlyOne"
+        }
+      },
+      "failureVerdict": "violation",
+      "successVerdict": "observation",
+      "riskAcceptanceRef": "ra-db-zone-loss",
+      "riskAcceptanceClauseRef": "db-zone-loss-spof",
+      "protected": true
+    },
+    {
+      "constraintId": "db-zone-loss-spof",
+      "constraintType": "supportedSingleton",
+      "findingKind": "actualSpof",
+      "governanceScope": {
+        "governanceScopeType": "clause",
+        "manifestId": "wl-athena-wc002-canonical",
+        "profileId": "production",
+        "clausePath": "/constraints/db-zone-loss-spof",
+        "ownerRef": "ops-owner"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "proofRequirement": {
+        "proofKind": "cardinalityProof",
+        "roleRef": "database-primary",
+        "expected": {
+          "cardinalityKind": "exactlyOne"
+        }
+      },
+      "failureVerdict": "violation",
+      "successVerdict": "observation",
+      "riskAcceptanceRef": "ra-db-zone-loss",
+      "protected": true
+    },
+    {
+      "constraintId": "web-zone-distribution",
+      "constraintType": "zoneDistribution",
+      "findingKind": "architectureConstraint",
+      "governanceScope": {
+        "governanceScopeType": "clause",
+        "manifestId": "wl-athena-wc002-canonical",
+        "profileId": "production",
+        "clausePath": "/constraints/web-zone-distribution",
+        "ownerRef": "ops-owner"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "proofRequirement": {
+        "proofKind": "zoneDistributionProof",
+        "roleRef": "web",
+        "minimumDistinctZones": 2
+      },
+      "failureVerdict": "violation",
+      "successVerdict": "pass",
+      "protected": true
+    },
+    {
+      "constraintId": "worker-db-zone-colocation",
+      "constraintType": "zoneColocation",
+      "findingKind": "architectureConstraint",
+      "governanceScope": {
+        "governanceScopeType": "clause",
+        "manifestId": "wl-athena-wc002-canonical",
+        "profileId": "production",
+        "clausePath": "/constraints/worker-db-zone-colocation",
+        "ownerRef": "ops-owner"
+      },
+      "ownerRef": "ops-owner",
+      "profiles": [
+        "production",
+        "development",
+        "training"
+      ],
+      "proofRequirement": {
+        "proofKind": "zoneColocationProof",
+        "subjectRoleRef": "worker",
+        "anchorRoleRef": "database-primary"
+      },
+      "failureVerdict": "violation",
+      "successVerdict": "pass",
+      "protected": true
+    }
+  ],
+  "controls": [],
+  "riskAcceptances": [],
+  "objectives": [],
+  "ownership": [
+    {
+      "ownerRef": "ops-owner",
+      "ownerRole": "operationsOwner",
+      "authorityRef": "synthetic://teams/operations"
+    }
+  ],
+  "compatibility": {
+    "artifactKind": "workloadManifest",
+    "schemaVersion": "1.0.0",
+    "semanticContractVersion": "1.0.0",
+    "policyContractVersion": "1.0.0",
+    "minimumReaderVersion": "1.0.0",
+    "requiresCapabilities": [],
+    "producedBy": {
+      "producerId": "athena.contracts",
+      "version": "1.0.0"
+    },
+    "extensionPolicy": "rejectUnknownDecisionFields",
+    "artifactDigest": "sha256:8caf0c329053f4032a5c9d620cd135315fe4d96af03c06e96f0578be2780bb19",
+    "semanticDigest": "sha256:b4bfd3debffe8fd150312f32ff54a7e0a25b2ffe3772d10dc9131b749a674796"
+  },
+  "audit": {
+    "publishedBy": "human-approved-context-api",
+    "publishedAt": "2025-06-01T00:05:00Z",
+    "approvalStatus": "approved"
+  }
+}
