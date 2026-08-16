@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, Literal, cast
+from importlib.resources import files
+from typing import Any, Final, Literal, cast
 
 from athena_context.contracts import (
     AthenaValidationError,
+    CanonicalWorkloadManifest,
     EvidenceContextVerifier,
     EvidenceItemRef,
     EvidenceRecord,
@@ -19,6 +22,7 @@ from athena_context.contracts import (
     ResourceProofFact,
     RoleBindingProof,
     canonicalize_json,
+    canonicalize_manifest_payload,
     compute_artifact_digest,
     compute_evidence_reference_set_digest,
     resolve_manifest_profile,
@@ -35,6 +39,7 @@ from athena_context.policy import evaluate_manifest_profile
 
 type GoldenProfileId = Literal["production", "development", "training"]
 type GoldenOracleStatus = Literal["complete", "pending"]
+type GoldenWebPolicyProfile = GoldenProfileId | Literal["disasterRecovery"]
 
 GOLDEN_PROOF_AS_OF: Final = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
 WC002_MANIFEST_ID: Final = "wl-athena-wc002-canonical"
@@ -50,23 +55,26 @@ WC002_SNAPSHOT_ARTIFACT_DIGEST: Final = (
     "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
 )
 WC002_SNAPSHOT_SEMANTIC_DIGEST: Final = WC002_SNAPSHOT_ARTIFACT_DIGEST
+GOLDEN_MANIFEST_VERSION: Final = "1.1.0"
+GOLDEN_MANIFEST_ARTIFACT_DIGEST: Final = (
+    "sha256:8caf0c329053f4032a5c9d620cd135315fe4d96af03c06e96f0578be2780bb19"
+)
+GOLDEN_MANIFEST_SEMANTIC_DIGEST: Final = (
+    "sha256:b4bfd3debffe8fd150312f32ff54a7e0a25b2ffe3772d10dc9131b749a674796"
+)
+GOLDEN_WEB_MINIMUM_DISTINCT_ZONES: Final[tuple[tuple[GoldenProfileId, int], ...]] = (
+    ("production", 2),
+    ("development", 1),
+    ("training", 1),
+)
+GOLDEN_DISASTER_RECOVERY_WEB_MINIMUM_DISTINCT_ZONES: Final = 2
 GOLDEN_PROFILE_IDS: Final[tuple[GoldenProfileId, ...]] = (
     "production",
     "development",
     "training",
 )
 GOLDEN_VERDICT_MATRIX: Final[
-    tuple[
-        tuple[
-            str,
-            tuple[
-                FindingVerdict | None,
-                FindingVerdict | None,
-                FindingVerdict | None,
-            ],
-        ],
-        ...,
-    ]
+    tuple[tuple[str, tuple[FindingVerdict, FindingVerdict, FindingVerdict]], ...]
 ] = (
     (
         "db-singleton-supported",
@@ -81,7 +89,7 @@ GOLDEN_VERDICT_MATRIX: Final[
         ("acceptedResidualRisk", "observation", "acceptedResidualRisk"),
     ),
     ("worker-db-zone-colocation", ("pass", "pass", "pass")),
-    ("web-zone-distribution", ("pass", "pass", None)),
+    ("web-zone-distribution", ("pass", "pass", "pass")),
 )
 
 _GOLDEN_CLAUSE_IDS = tuple(row[0] for row in GOLDEN_VERDICT_MATRIX)
@@ -104,6 +112,16 @@ _RISK_ACCEPTANCE_BY_PROFILE: Final[dict[GoldenProfileId, str | None]] = {
     "development": None,
     "training": "ra-db-zone-loss-training",
 }
+
+
+def golden_web_minimum_distinct_zones(
+    profile: GoldenWebPolicyProfile,
+) -> int:
+    """Return the approved web-zone minimum without introducing a DR topology."""
+
+    if profile == "disasterRecovery":
+        return GOLDEN_DISASTER_RECOVERY_WEB_MINIMUM_DISTINCT_ZONES
+    return dict(GOLDEN_WEB_MINIMUM_DISTINCT_ZONES)[profile]
 
 
 class GoldenProofMismatchError(AthenaValidationError):
@@ -261,6 +279,86 @@ def _resource_name(resource_id: str) -> str:
     if not resource_name:
         raise AthenaValidationError("canonical resource id has no resource name")
     return resource_name
+
+
+def _set_web_zone_minimum(
+    constraints: list[dict[str, Any]],
+    minimum_distinct_zones: int,
+) -> None:
+    matches = [
+        constraint
+        for constraint in constraints
+        if constraint.get("constraintId") == "web-zone-distribution"
+    ]
+    if len(matches) != 1:
+        raise AthenaValidationError(
+            "golden manifest derivation requires one web-zone-distribution constraint"
+        )
+    proof = matches[0].get("proofRequirement")
+    if not isinstance(proof, dict) or proof.get("proofKind") != "zoneDistributionProof":
+        raise AthenaValidationError("golden manifest web-zone-distribution proof is invalid")
+    proof["minimumDistinctZones"] = minimum_distinct_zones
+
+
+def _derive_golden_manifest(
+    wc002_manifest: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = deepcopy(
+        wc002_manifest.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=False,
+            exclude_unset=True,
+        )
+    )
+    payload["manifestVersion"] = GOLDEN_MANIFEST_VERSION
+    payload["audit"] = {
+        "publishedBy": "human-approved-context-api",
+        "publishedAt": "2025-06-01T00:05:00.000Z",
+        "approvalStatus": "approved",
+    }
+    _set_web_zone_minimum(cast(list[dict[str, Any]], payload["constraints"]), 2)
+    profiles = cast(dict[str, dict[str, Any]], payload["profiles"])
+    for profile_id in GOLDEN_PROFILE_IDS:
+        profile = profiles[profile_id]
+        _set_web_zone_minimum(
+            cast(list[dict[str, Any]], profile["constraints"]),
+            golden_web_minimum_distinct_zones(profile_id),
+        )
+    training_overrides = cast(
+        list[dict[str, Any]],
+        profiles["training"]["weakeningOverrides"],
+    )
+    training_overrides.append(
+        {
+            "overrideId": "training-web-zones",
+            "reason": "zoneRequirementRelaxation",
+            "targetPath": (
+                "/resolvedProfiles/training/constraints/web-zone-distribution/"
+                "proofRequirement/minimumDistinctZones"
+            ),
+            "targetRef": "web-zone-distribution",
+            "ownerRef": "ops-owner",
+            "rationale": "One web zone is sufficient for synthetic training.",
+            "approvedBy": "synthetic-approver",
+            "status": "approved",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "profiles": ["training"],
+        }
+    )
+    return CanonicalWorkloadManifest.model_validate(canonicalize_manifest_payload(payload))
+
+
+def load_golden_manifest() -> CanonicalWorkloadManifest:
+    """Load the packaged, human-approved WC-005 manifest artifact."""
+
+    payload = json.loads(
+        files("athena_context.data.fixtures")
+        .joinpath("wc005-golden-manifest.json")
+        .read_text(encoding="utf-8")
+    )
+    return CanonicalWorkloadManifest.model_validate(payload)
 
 
 def _selector_matches(
@@ -474,10 +572,41 @@ def _validate_approved_wc002_fixture(bundle: FixtureBundle) -> None:
         )
 
 
+def _validate_approved_golden_manifest(
+    manifest: CanonicalWorkloadManifest,
+    wc002_manifest: CanonicalWorkloadManifest,
+) -> None:
+    observed = (
+        manifest.manifest_id,
+        manifest.manifest_version,
+        manifest.compatibility.artifact_digest,
+        manifest.compatibility.semantic_digest,
+        manifest.compute_artifact_digest_value(),
+        manifest.compute_semantic_digest_value(),
+    )
+    approved = (
+        WC002_MANIFEST_ID,
+        GOLDEN_MANIFEST_VERSION,
+        GOLDEN_MANIFEST_ARTIFACT_DIGEST,
+        GOLDEN_MANIFEST_SEMANTIC_DIGEST,
+        GOLDEN_MANIFEST_ARTIFACT_DIGEST,
+        GOLDEN_MANIFEST_SEMANTIC_DIGEST,
+    )
+    if observed != approved:
+        raise GoldenProofMismatchError(
+            "manifest does not match the approved WC-005 golden identity and digests"
+        )
+    derived = _derive_golden_manifest(wc002_manifest)
+    if manifest.canonical_json() != derived.canonical_json():
+        raise GoldenProofMismatchError(
+            "golden manifest is not the approved derivation of immutable WC-002"
+        )
+
+
 def _expected_verdict(
     profile_id: GoldenProfileId,
     clause_id: str,
-) -> FindingVerdict | None:
+) -> FindingVerdict:
     profile_index = GOLDEN_PROFILE_IDS.index(profile_id)
     return next(
         verdicts[profile_index]
@@ -511,7 +640,6 @@ def _validate_finding_projection(
             f"{profile_id} finding clauses do not match the golden oracle"
         )
 
-    pending: list[GoldenPendingDecision] = []
     for clause_id in _GOLDEN_CLAUSE_IDS:
         finding = findings[clause_id]
         expected_verdict = _expected_verdict(profile_id, clause_id)
@@ -535,7 +663,7 @@ def _validate_finding_projection(
             finding.clause_id == clause_id
             and finding.finding_kind == _FINDING_KIND_BY_CLAUSE[clause_id]
             and finding.manifest_id == WC002_MANIFEST_ID
-            and finding.manifest_version == WC002_MANIFEST_VERSION
+            and finding.manifest_version == GOLDEN_MANIFEST_VERSION
             and finding.profile_id == profile_id
             and finding.resolved_profile_digest == profile.resolved_profile_digest
             and finding.governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -547,28 +675,17 @@ def _validate_finding_projection(
             raise GoldenProofMismatchError(
                 f"{profile_id}/{clause_id} finding projection does not match the golden oracle"
             )
-        if expected_verdict is None:
-            pending.append(
-                GoldenPendingDecision(
-                    profile_id=profile_id,
-                    clause_id=clause_id,
-                    observed_verdict=finding.verdict,
-                    reason=(
-                        "expected verdict awaits a decision because immutable WC-002 "
-                        "contains web zones 1, 2, and 3 and Training requires 3"
-                    ),
-                )
-            )
-        elif finding.verdict != expected_verdict:
+        if finding.verdict != expected_verdict:
             raise GoldenProofMismatchError(
                 f"{profile_id}/{clause_id} verdict does not match the golden oracle"
             )
-    return tuple(pending)
+    return ()
 
 
 def run_golden_proof(
     *,
     fixture: FixtureBundle | None = None,
+    manifest: CanonicalWorkloadManifest | None = None,
     as_of: datetime = GOLDEN_PROOF_AS_OF,
 ) -> GoldenProofResult:
     """Verify and evaluate the packaged canonical snapshot against the exact oracle."""
@@ -577,7 +694,8 @@ def run_golden_proof(
         raise AthenaValidationError("golden proof as_of must be timezone-aware")
     bundle = fixture if fixture is not None else make_canonical_fixture_from_resources()
     _validate_approved_wc002_fixture(bundle)
-    manifest = bundle.canonical_manifest
+    golden_manifest = manifest if manifest is not None else load_golden_manifest()
+    _validate_approved_golden_manifest(golden_manifest, bundle.canonical_manifest)
     snapshot = bundle.canonical_snapshot
 
     immutable_snapshot = snapshot.canonical_json()
@@ -587,7 +705,7 @@ def run_golden_proof(
     baseline_finding_references: dict[str, tuple[str, ...]] | None = None
 
     for profile_id in GOLDEN_PROFILE_IDS:
-        profile = resolve_manifest_profile(manifest, profile_id, as_of=as_of)
+        profile = resolve_manifest_profile(golden_manifest, profile_id, as_of=as_of)
         evidence = _build_evidence_context(profile, snapshot)
         verifier = _make_context_verifier(bundle, profile, as_of=as_of)
         findings = evaluate_manifest_profile(
@@ -630,10 +748,10 @@ def run_golden_proof(
 
     return GoldenProofResult(
         as_of=as_of,
-        manifest_id=manifest.manifest_id,
-        manifest_version=manifest.manifest_version,
-        manifest_artifact_digest=manifest.compatibility.artifact_digest,
-        manifest_semantic_digest=manifest.compatibility.semantic_digest,
+        manifest_id=golden_manifest.manifest_id,
+        manifest_version=golden_manifest.manifest_version,
+        manifest_artifact_digest=golden_manifest.compatibility.artifact_digest,
+        manifest_semantic_digest=golden_manifest.compatibility.semantic_digest,
         snapshot_id=snapshot.snapshot_id,
         snapshot_artifact_digest=snapshot.compatibility.artifact_digest,
         snapshot_semantic_digest=snapshot.compatibility.semantic_digest,
@@ -644,9 +762,14 @@ def run_golden_proof(
 
 
 __all__ = [
+    "GOLDEN_DISASTER_RECOVERY_WEB_MINIMUM_DISTINCT_ZONES",
+    "GOLDEN_MANIFEST_ARTIFACT_DIGEST",
+    "GOLDEN_MANIFEST_SEMANTIC_DIGEST",
+    "GOLDEN_MANIFEST_VERSION",
     "GOLDEN_PROFILE_IDS",
     "GOLDEN_PROOF_AS_OF",
     "GOLDEN_VERDICT_MATRIX",
+    "GOLDEN_WEB_MINIMUM_DISTINCT_ZONES",
     "WC002_MANIFEST_ARTIFACT_DIGEST",
     "WC002_MANIFEST_ID",
     "WC002_MANIFEST_SEMANTIC_DIGEST",
@@ -658,5 +781,7 @@ __all__ = [
     "GoldenProfileResult",
     "GoldenProofMismatchError",
     "GoldenProofResult",
+    "golden_web_minimum_distinct_zones",
+    "load_golden_manifest",
     "run_golden_proof",
 ]

@@ -4,11 +4,12 @@ import json
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 import pytest
 
+import athena_context.fixtures as fixture_factory
 import athena_context.golden as golden
 from athena_context import run_golden_proof as run_root_golden_proof
 from athena_context.contracts import (
@@ -16,10 +17,13 @@ from athena_context.contracts import (
     CanonicalWorkloadManifest,
     EvidenceContextVerifier,
     EvidenceReferenceContext,
+    EvidenceSnapshot,
     ResolvedManifestProfile,
     ResourceProofFact,
+    SnapshotPublicationRecord,
     canonicalize_manifest_payload,
     compute_artifact_digest,
+    compute_response_envelope_digest,
     resolve_manifest_profile,
 )
 from athena_context.fixtures import (
@@ -32,14 +36,23 @@ from athena_context.fixtures import (
 )
 from athena_context.policy import evaluate_manifest_profile
 
-EXPECTED_MANIFEST_DIGEST = "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6"
-EXPECTED_MANIFEST_SEMANTIC_DIGEST = (
+EXPECTED_WC002_MANIFEST_DIGEST = (
+    "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6"
+)
+EXPECTED_WC002_MANIFEST_SEMANTIC_DIGEST = (
     "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
+)
+EXPECTED_GOLDEN_MANIFEST_DIGEST = (
+    "sha256:8caf0c329053f4032a5c9d620cd135315fe4d96af03c06e96f0578be2780bb19"
+)
+EXPECTED_GOLDEN_MANIFEST_SEMANTIC_DIGEST = (
+    "sha256:b4bfd3debffe8fd150312f32ff54a7e0a25b2ffe3772d10dc9131b749a674796"
 )
 EXPECTED_SNAPSHOT_DIGEST = "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
 EXPECTED_SNAPSHOT_REFERENCE_SET_DIGEST = (
     "sha256:ce17a211904ff0dd4bbe6359e74c427799227b2d99ff1fcb2a27f2c598b6dc9c"
 )
+EXPECTED_PROOF_DIGEST = "sha256:b59ff0414e1bb1f6add7a22a0c6e7807e13fc89094ed4cbe11754bcbfa7c7174"
 EXPECTED_OBSERVED_BY_PROFILE = {
     "production": {
         "db-singleton-supported": "expectedConstraint",
@@ -79,6 +92,19 @@ def _fixture_with_manifest(
     )
 
 
+def _golden_manifest_with(
+    mutate: Callable[[dict[str, Any]], None],
+) -> CanonicalWorkloadManifest:
+    payload = golden.load_golden_manifest().model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=False,
+        exclude_unset=True,
+    )
+    mutate(payload)
+    return CanonicalWorkloadManifest.model_validate(canonicalize_manifest_payload(payload))
+
+
 def _verified_production_boundary() -> tuple[
     FixtureBundle,
     ResolvedManifestProfile,
@@ -87,7 +113,7 @@ def _verified_production_boundary() -> tuple[
 ]:
     bundle = make_canonical_fixture_from_resources()
     profile = resolve_manifest_profile(
-        bundle.canonical_manifest,
+        golden.load_golden_manifest(),
         "production",
         as_of=golden.GOLDEN_PROOF_AS_OF,
     )
@@ -100,35 +126,107 @@ def _verified_production_boundary() -> tuple[
     return bundle, profile, evidence, verifier
 
 
+def _collapsed_web_snapshot_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> FixtureBundle:
+    bundle = make_canonical_fixture_from_resources()
+    collapsed_envelope = fixture_factory._build_response_envelope()
+    for item in collapsed_envelope["items"]:
+        if "athena-web-" in item.get("resourceId", ""):
+            item["availabilityZone"] = "1"
+    response_digest = compute_response_envelope_digest(collapsed_envelope)
+    original_attempt = bundle.canonical_snapshot.collector_attempts[0]
+    attempt_payload = original_attempt.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    attempt_payload["responseDigest"] = response_digest
+    attempt_payload.pop("attemptDigest")
+    attempt_digest = compute_artifact_digest(attempt_payload)
+
+    record_materials: list[dict[str, Any]] = []
+    for record in bundle.canonical_snapshot.evidence_records:
+        material = record.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_none=True,
+        )
+        material.pop("itemDigest")
+        material["collectorAttemptDigest"] = attempt_digest
+        material["provenance"]["sourceResponseDigest"] = response_digest
+        if "athena-web-" in material.get("resourceId", ""):
+            material["availabilityZone"] = "1"
+        record_materials.append(material)
+
+    monkeypatch.setattr(
+        fixture_factory,
+        "_build_response_envelope",
+        lambda: deepcopy(collapsed_envelope),
+    )
+    snapshot = EvidenceSnapshot.model_validate(
+        fixture_factory._canonical_snapshot_payload(record_materials=record_materials)
+    )
+    publication = SnapshotPublicationRecord(
+        snapshot_id=snapshot.snapshot_id,
+        artifact_digest=snapshot.compatibility.artifact_digest,
+        semantic_digest=snapshot.compatibility.semantic_digest,
+        schema_version=snapshot.compatibility.schema_version,
+        semantic_contract_version=snapshot.compatibility.semantic_contract_version,
+        published_at=snapshot.snapshot_attestation.attested_at + timedelta(seconds=1),
+    )
+
+    def publication_resolver(snapshot_id: str) -> SnapshotPublicationRecord | None:
+        return publication if snapshot_id == publication.snapshot_id else None
+
+    def envelope_resolver(
+        attempt_id: str,
+        kind: Literal["response", "failure"],
+        digest: str,
+    ) -> dict[str, Any] | None:
+        if (
+            attempt_id == snapshot.collector_attempts[0].attempt_id
+            and kind == "response"
+            and digest == response_digest
+        ):
+            return deepcopy(collapsed_envelope)
+        return None
+
+    return replace(
+        bundle,
+        canonical_snapshot=snapshot,
+        publication_record=publication,
+        publication_resolver=publication_resolver,
+        envelope_resolver=envelope_resolver,
+        snapshot_artifact_digest=snapshot.compatibility.artifact_digest,
+        snapshot_semantic_digest=snapshot.compatibility.semantic_digest,
+    )
+
+
 def test_public_runner_emits_exact_immutable_release_evidence() -> None:
     manifest_before = load_canonical_manifest_resource()
     packaged_before = load_canonical_snapshot_resource()
     combined_before = load_canonical_fixture_resource()
     result = golden.run_golden_proof()
+    source_manifest = make_canonical_fixture_from_resources().canonical_manifest
 
     assert run_root_golden_proof is golden.run_golden_proof
     assert result.manifest_id == golden.WC002_MANIFEST_ID
-    assert result.manifest_artifact_digest == EXPECTED_MANIFEST_DIGEST
-    assert result.manifest_semantic_digest == EXPECTED_MANIFEST_SEMANTIC_DIGEST
+    assert result.manifest_version == golden.GOLDEN_MANIFEST_VERSION
+    assert result.manifest_artifact_digest == EXPECTED_GOLDEN_MANIFEST_DIGEST
+    assert result.manifest_semantic_digest == EXPECTED_GOLDEN_MANIFEST_SEMANTIC_DIGEST
+    assert source_manifest.compatibility.artifact_digest == EXPECTED_WC002_MANIFEST_DIGEST
+    assert source_manifest.compatibility.semantic_digest == EXPECTED_WC002_MANIFEST_SEMANTIC_DIGEST
     assert result.snapshot_id == golden.WC002_SNAPSHOT_ID
     assert result.snapshot_artifact_digest == EXPECTED_SNAPSHOT_DIGEST
     assert result.snapshot_semantic_digest == EXPECTED_SNAPSHOT_DIGEST
     assert result.snapshot_evidence_reference_set_digest == EXPECTED_SNAPSHOT_REFERENCE_SET_DIGEST
-    assert result.oracle_status == "pending"
-    assert result.pending_decisions == (
-        golden.GoldenPendingDecision(
-            profile_id="training",
-            clause_id="web-zone-distribution",
-            observed_verdict="pass",
-            reason=(
-                "expected verdict awaits a decision because immutable WC-002 "
-                "contains web zones 1, 2, and 3 and Training requires 3"
-            ),
-        ),
-    )
+    assert result.proof_digest == EXPECTED_PROOF_DIGEST
+    assert result.oracle_status == "complete"
+    assert result.pending_decisions == ()
     assert golden.GOLDEN_VERDICT_MATRIX[-1] == (
         "web-zone-distribution",
-        ("pass", "pass", None),
+        ("pass", "pass", "pass"),
     )
     assert tuple(profile.profile_id for profile in result.profiles) == golden.GOLDEN_PROFILE_IDS
     assert {
@@ -144,9 +242,81 @@ def test_public_runner_emits_exact_immutable_release_evidence() -> None:
     assert json.loads(result.canonical_json()) == payload
     rendered = result.render_text()
     assert f"Proof digest: `{result.proof_digest}`" in rendered
-    assert "| web-zone-distribution | pass | pass | pending (observed: pass) |" in rendered
+    assert "| web-zone-distribution | pass | pass | pass |" in rendered
     with pytest.raises(FrozenInstanceError):
         result.snapshot_id = "snap-mutated"  # type: ignore[misc]
+
+
+def test_versioned_golden_manifest_is_exact_approved_wc002_derivation() -> None:
+    manifest = golden.load_golden_manifest()
+    source = make_canonical_fixture_from_resources().canonical_manifest
+
+    assert manifest.manifest_id == source.manifest_id
+    assert manifest.manifest_version == "1.1.0"
+    assert manifest.workload == source.workload
+    assert manifest.audit.model_dump(mode="json", by_alias=True) == {
+        "publishedBy": "human-approved-context-api",
+        "publishedAt": "2025-06-01T00:05:00Z",
+        "approvalStatus": "approved",
+    }
+    assert manifest.compatibility.artifact_digest == EXPECTED_GOLDEN_MANIFEST_DIGEST
+    assert manifest.compatibility.semantic_digest == EXPECTED_GOLDEN_MANIFEST_SEMANTIC_DIGEST
+    assert manifest.canonical_json() == golden._derive_golden_manifest(source).canonical_json()
+
+    for profile_id, expected_minimum in golden.GOLDEN_WEB_MINIMUM_DISTINCT_ZONES:
+        profile = resolve_manifest_profile(
+            manifest,
+            profile_id,
+            as_of=golden.GOLDEN_PROOF_AS_OF,
+        )
+        constraint = next(
+            item for item in profile.constraints if item.constraint_id == "web-zone-distribution"
+        )
+        assert constraint.proof_requirement.minimum_distinct_zones == expected_minimum
+        assert golden.golden_web_minimum_distinct_zones(profile_id) == expected_minimum
+
+    assert "disasterRecovery" not in manifest.profiles
+    assert golden.golden_web_minimum_distinct_zones("disasterRecovery") == 2
+    assert golden.GOLDEN_DISASTER_RECOVERY_WEB_MINIMUM_DISTINCT_ZONES == 2
+    assert [
+        override.override_id for override in manifest.profiles["training"].weakening_overrides
+    ] == ["training-web-zones"]
+
+
+def test_one_zone_web_topology_violates_only_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _collapsed_web_snapshot_fixture(monkeypatch)
+    manifest = golden.load_golden_manifest()
+    observed: dict[str, str] = {}
+
+    for profile_id in golden.GOLDEN_PROFILE_IDS:
+        profile = resolve_manifest_profile(
+            manifest,
+            profile_id,
+            as_of=golden.GOLDEN_PROOF_AS_OF,
+        )
+        evidence = golden._build_evidence_context(
+            profile,
+            bundle.canonical_snapshot,
+        )
+        findings = evaluate_manifest_profile(
+            profile,
+            evidence,
+            as_of=golden.GOLDEN_PROOF_AS_OF,
+            verify_evidence_context=golden._make_context_verifier(
+                bundle,
+                profile,
+                as_of=golden.GOLDEN_PROOF_AS_OF,
+            ),
+        )
+        observed[profile_id] = findings["web-zone-distribution"].verdict
+
+    assert observed == {
+        "production": "violation",
+        "development": "pass",
+        "training": "pass",
+    }
 
 
 def test_every_profile_reuses_identical_snapshot_and_finding_evidence_refs() -> None:
@@ -199,7 +369,7 @@ def test_full_finding_projection_is_exact_for_every_profile() -> None:
             assert finding["findingKind"] == expected_kinds[clause_id]
             assert finding["verdict"] == EXPECTED_OBSERVED_BY_PROFILE[profile.profile_id][clause_id]
             assert finding["manifestId"] == golden.WC002_MANIFEST_ID
-            assert finding["manifestVersion"] == golden.WC002_MANIFEST_VERSION
+            assert finding["manifestVersion"] == golden.GOLDEN_MANIFEST_VERSION
             assert finding["profileId"] == profile.profile_id
             assert finding["resolvedProfileDigest"] == profile.resolved_profile_digest
             assert finding["governanceScope"] == {
@@ -263,12 +433,12 @@ def test_renamed_acceptances_are_rejected_even_when_manifest_graph_is_consistent
                 if constraint.get("riskAcceptanceRef") == old_id:
                     constraint["riskAcceptanceRef"] = new_id
 
-    fixture = _fixture_with_manifest(rename_acceptances)
+    manifest = _golden_manifest_with(rename_acceptances)
     with pytest.raises(
         golden.GoldenProofMismatchError,
-        match="approved immutable WC-002",
+        match="approved WC-005 golden",
     ):
-        golden.run_golden_proof(fixture=fixture)
+        golden.run_golden_proof(manifest=manifest)
 
 
 def test_finding_projection_rejects_renamed_acceptance_id(
@@ -329,12 +499,12 @@ def test_removing_required_constraint_fails_closed() -> None:
                 if item["constraintId"] != "worker-db-zone-colocation"
             ]
 
-    fixture = _fixture_with_manifest(remove_constraint)
+    manifest = _golden_manifest_with(remove_constraint)
     with pytest.raises(
         golden.GoldenProofMismatchError,
-        match="approved immutable WC-002",
+        match="approved WC-005 golden",
     ):
-        golden.run_golden_proof(fixture=fixture)
+        golden.run_golden_proof(manifest=manifest)
 
 
 def test_expired_risk_acceptance_cannot_match_the_oracle() -> None:
@@ -343,12 +513,12 @@ def test_expired_risk_acceptance_cannot_match_the_oracle() -> None:
             for acceptance in profile["riskAcceptances"]:
                 acceptance["expiresAt"] = "2025-05-31T00:00:00.000Z"
 
-    fixture = _fixture_with_manifest(expire_acceptances)
+    manifest = _golden_manifest_with(expire_acceptances)
     with pytest.raises(
         golden.GoldenProofMismatchError,
-        match="approved immutable WC-002",
+        match="approved WC-005 golden",
     ):
-        golden.run_golden_proof(fixture=fixture)
+        golden.run_golden_proof(manifest=manifest)
 
 
 @pytest.mark.parametrize(
