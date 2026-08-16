@@ -6,6 +6,12 @@ from athena_context.contracts import (
     ProfileDefinition,
     ResolvedProfile,
 )
+from athena_context.golden_proof import (
+    GoldenProfileResult,
+    GoldenProofMismatchError,
+    GoldenProofResult,
+    run_golden_proof,
+)
 from athena_context.policy import (
     evaluate_manifest_profile,
     evaluate_policy,
@@ -18,12 +24,16 @@ __all__ = [
     "__version__",
     "CompatibilityMetadata",
     "CanonicalWorkloadManifest",
+    "GoldenProfileResult",
+    "GoldenProofMismatchError",
+    "GoldenProofResult",
     "ProfileDefinition",
     "ResolvedProfile",
     "WorkloadManifest",
     "evaluate_manifest_profile",
     "evaluate_policy",
     "evaluate_profile",
+    "run_golden_proof",
 ]
 
 WorkloadManifest = CanonicalWorkloadManifest

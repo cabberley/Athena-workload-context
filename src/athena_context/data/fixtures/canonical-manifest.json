@@ -468,7 +468,7 @@
           "proofRequirement": {
             "proofKind": "zoneDistributionProof",
             "roleRef": "web",
-            "minimumDistinctZones": 3
+            "minimumDistinctZones": 2
           },
           "failureVerdict": "violation",
           "successVerdict": "pass",
@@ -1033,7 +1033,7 @@
       "proofRequirement": {
         "proofKind": "zoneDistributionProof",
         "roleRef": "web",
-        "minimumDistinctZones": 3
+        "minimumDistinctZones": 2
       },
       "failureVerdict": "violation",
       "successVerdict": "pass",
@@ -1086,8 +1086,8 @@
       "version": "1.0.0"
     },
     "extensionPolicy": "rejectUnknownDecisionFields",
-    "artifactDigest": "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6",
-    "semanticDigest": "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
+    "artifactDigest": "sha256:48ce3405aa547ae6df3180223b0a99bc5fa70a848d3a7be48f507ab0ffadc9f8",
+    "semanticDigest": "sha256:2cb14f0917c842903399973ff8d106531ee7f88438f7a5eab76179a024479143"
   },
   "audit": {
     "publishedBy": "human-approved-context-api",

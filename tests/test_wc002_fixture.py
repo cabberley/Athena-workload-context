@@ -79,24 +79,20 @@ def test_all_profiles_resolve_with_exact_active_governed_overrides() -> None:
         assert resolved.profile_id == profile_id
         if profile_id == "development":
             assert resolved.settings.continuity.zone_loss_continuity_required is False
-            web_constraint = next(
-                item
-                for item in resolved.constraints
-                if item.constraint_id == "web-zone-distribution"
-            )
-            proof = web_constraint.proof_requirement
-            assert proof.proof_kind == "zoneDistributionProof"
-            assert proof.minimum_distinct_zones == 1
         else:
             assert resolved.settings.continuity.zone_loss_continuity_required is True
-            web_constraint = next(
-                item
-                for item in resolved.constraints
-                if item.constraint_id == "web-zone-distribution"
-            )
-            proof = web_constraint.proof_requirement
-            assert proof.proof_kind == "zoneDistributionProof"
-            assert proof.minimum_distinct_zones == 3
+        web_constraint = next(
+            item
+            for item in resolved.constraints
+            if item.constraint_id == "web-zone-distribution"
+        )
+        proof = web_constraint.proof_requirement
+        assert proof.proof_kind == "zoneDistributionProof"
+        assert proof.minimum_distinct_zones == {
+            "production": 2,
+            "development": 1,
+            "training": 3,
+        }[profile_id]
 
 
 def test_negative_fixture_constructors_are_isolated_and_tampered_objects_fail_later() -> None:

@@ -334,7 +334,7 @@ def _build_response_envelope() -> dict[str, Any]:
                 "resourceId": _resource_id("athena-web-03"),
                 "resourceType": "Microsoft.Compute/virtualMachines",
                 "location": "australiaeast",
-                "availabilityZone": "3",
+                "availabilityZone": "2",
                 "tags": {"environment": "production", "workloadRole": "web-service"},
                 "state": "running",
             },
@@ -541,7 +541,7 @@ def _canonical_snapshot_payload(
                 "resourceId": _resource_id("athena-web-03"),
                 "resourceType": "Microsoft.Compute/virtualMachines",
                 "location": "australiaeast",
-                "availabilityZone": "3",
+                "availabilityZone": "2",
                 "tags": {"environment": "production", "workloadRole": "web-service"},
                 "state": "running",
                 "provenance": {
@@ -910,9 +910,11 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     "proofRequirement": {
                         "proofKind": "zoneDistributionProof",
                         "roleRef": "web",
-                        "minimumDistinctZones": (
-                            3 if profile_id in {"production", "training"} else 1
-                        ),
+                        "minimumDistinctZones": {
+                            "production": 2,
+                            "development": 1,
+                            "training": 3,
+                        }[profile_id],
                     },
                     "failureVerdict": "violation",
                     "successVerdict": "pass",
@@ -1221,7 +1223,7 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                 "proofRequirement": {
                     "proofKind": "zoneDistributionProof",
                     "roleRef": "web",
-                    "minimumDistinctZones": 3,
+                    "minimumDistinctZones": 2,
                 },
                 "failureVerdict": "violation",
                 "successVerdict": "pass",

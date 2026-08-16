@@ -469,7 +469,7 @@
             "proofRequirement": {
               "proofKind": "zoneDistributionProof",
               "roleRef": "web",
-              "minimumDistinctZones": 3
+              "minimumDistinctZones": 2
             },
             "failureVerdict": "violation",
             "successVerdict": "pass",
@@ -1034,7 +1034,7 @@
         "proofRequirement": {
           "proofKind": "zoneDistributionProof",
           "roleRef": "web",
-          "minimumDistinctZones": 3
+          "minimumDistinctZones": 2
         },
         "failureVerdict": "violation",
         "successVerdict": "pass",
@@ -1087,8 +1087,8 @@
         "version": "1.0.0"
       },
       "extensionPolicy": "rejectUnknownDecisionFields",
-      "artifactDigest": "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6",
-      "semanticDigest": "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
+      "artifactDigest": "sha256:48ce3405aa547ae6df3180223b0a99bc5fa70a848d3a7be48f507ab0ffadc9f8",
+      "semanticDigest": "sha256:2cb14f0917c842903399973ff8d106531ee7f88438f7a5eab76179a024479143"
     },
     "audit": {
       "publishedBy": "human-approved-context-api",
@@ -1112,8 +1112,8 @@
         "version": "1.0.0"
       },
       "extensionPolicy": "rejectUnknownDecisionFields",
-      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-      "semanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
+      "artifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+      "semanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79"
     },
     "authorizedScopes": [
       {
@@ -1137,14 +1137,14 @@
     },
     "collectorAttempts": [
       {
-        "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "attemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "attemptType": "successResponse",
         "attemptId": "attempt-111111111111",
         "attemptStartedAt": "2025-06-01T11:45:00Z",
         "toolName": "azure.resourceInventory.read",
         "toolVersion": "1.0.0",
         "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
-        "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "responseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "responseReceivedAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       }
@@ -1169,13 +1169,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/0",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:40310d3fcb9a6bda4439cc17eddddbe51e61cf08f98f964345ea9dd2143aa928",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1197,13 +1197,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/1",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:75519434b4b0e1caecd6b8757d372af0ce701c174b5db66ce1daf83239d372c9",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1225,13 +1225,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/2",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:8db1e0b226f7c2640b715a79ae70ddeb667f3a4dff240a92331d87128847408d",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1253,13 +1253,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/3",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:fcecf9e53721045a0b7af1fc51a217c843c5223043eb74b957368ff21a8f126c",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1281,13 +1281,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/4",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:86ae930ff0cd94f5c571623aedc56fb78525f798a5a4091f20e1b395368d2d7e",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1295,7 +1295,7 @@
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-03",
         "resourceType": "Microsoft.Compute/virtualMachines",
         "location": "australiaeast",
-        "availabilityZone": "3",
+        "availabilityZone": "2",
         "tags": {
           "environment": "production",
           "workloadRole": "web-service",
@@ -1309,13 +1309,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/5",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:1e18ac37a7100e33cd4f1b5ddac5c2abad1b4cd9db7b08e2725727d21d63a9fc",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1337,13 +1337,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/6",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:b4b2deded128b461270c5cca4265320f9276ee2caa76a27adb0b54f440644b05",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1368,13 +1368,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/7",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:2daae24120658ebdf1fe342fe129798081aaf914e9fdddfabf89b1dc9eae6d0d",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       },
       {
@@ -1399,13 +1399,13 @@
           "collectorIdentityEvidenceRef": "identity-111111111111",
           "toolName": "azure.resourceInventory.read",
           "toolVersion": "1.0.0",
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
           "sourceResponsePointer": "/items/8",
           "failurePayloadDigest": null,
           "failurePayloadPointer": null
         },
-        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "itemDigest": "sha256:5fb8e262d2a66382e66d6e6cd6f2fa04d94b1a0af26362dd66fff19bab071d6c",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorIdentityEvidenceRef": "identity-111111111111"
       }
     ],
@@ -1413,136 +1413,136 @@
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:40310d3fcb9a6bda4439cc17eddddbe51e61cf08f98f964345ea9dd2143aa928",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/0"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:75519434b4b0e1caecd6b8757d372af0ce701c174b5db66ce1daf83239d372c9",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/1"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:8db1e0b226f7c2640b715a79ae70ddeb667f3a4dff240a92331d87128847408d",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/2"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:fcecf9e53721045a0b7af1fc51a217c843c5223043eb74b957368ff21a8f126c",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/3"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:86ae930ff0cd94f5c571623aedc56fb78525f798a5a4091f20e1b395368d2d7e",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/4"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:1e18ac37a7100e33cd4f1b5ddac5c2abad1b4cd9db7b08e2725727d21d63a9fc",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/5"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:b4b2deded128b461270c5cca4265320f9276ee2caa76a27adb0b54f440644b05",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/6"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:2daae24120658ebdf1fe342fe129798081aaf914e9fdddfabf89b1dc9eae6d0d",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/7"
       },
       {
         "refType": "evidenceItem",
         "snapshotId": "snap-111111111111",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
+        "snapshotArtifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "snapshotSemanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+        "itemDigest": "sha256:5fb8e262d2a66382e66d6e6cd6f2fa04d94b1a0af26362dd66fff19bab071d6c",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorAttemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
         "collectorAttemptAt": "2025-06-01T11:46:00Z",
         "collectorIdentityEvidenceRef": "identity-111111111111",
-        "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "sourceResponseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
         "sourceResponsePointer": "/items/8"
       }
     ],
@@ -1612,11 +1612,11 @@
           "attemptBinding": {
             "attemptId": "attempt-111111111111",
             "attemptType": "successResponse",
-            "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+            "attemptDigest": "sha256:24d4f0e0e3bc817206def85eee30a1de2b9b3a07c76705239e7c04cea1137812",
             "toolName": "azure.resourceInventory.read",
             "toolVersion": "1.0.0",
             "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
-            "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+            "responseDigest": "sha256:6d7f3087d96ba5a518dbc15a8083f45d86172d5f1d58344fc56e0277bba7f063",
             "failureDigest": null,
             "attemptStartedAt": "2025-06-01T11:45:00Z",
             "responseReceivedAt": "2025-06-01T11:46:00Z",
@@ -1625,19 +1625,19 @@
             "observedAt": null
           },
           "derivedAt": "2025-06-01T11:47:00Z",
-          "derivationDigest": "sha256:beef1f2c6fbfeff1b0c30316e12431062585166eb5277bca4acd5a5c6b8ac156"
+          "derivationDigest": "sha256:f99452706757eb669b104df308b6a2548a048b16d3989e5f527c406a94e0b58e"
         },
         "ingestionSignature": {
           "signatureAlgorithm": "RS256",
           "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
           "keyName": "athena-fixture",
           "keyVersion": "0123456789abcdef0123456789abcdef",
-          "signedPreimageDigest": "sha256:602984d83fc56146afc449a29bdb89984a6c41a19069a396508812179ca5ea0f",
-          "signature": "nGNZ9OWywWosjEumpXmWr4ns7Omz+p2NhaSkYzeLd/Su+MWmIfRiFfVW0K8cBCqZnjYyNltoA2H+c8d2r7z3Qh+H2W8ucYq/Pf34KYYVRc+heOLmSRpkuEj54OXAI5jsvMsmn89pfb+dQ1mzv99Vlk3Zpi70R2Bd7iFlyMSYzvBJ5f/guxcfF6dwIWqqhSOv+VhxtuyFOuMy9JNYGaL6jUEjQRPQ67G07IdnCCwAI1GP2E+KEtGDE85hoFWkvMD5sz83yLg76xVlRpb644C6Tha7luiCoLAxHZxFgUrmHQhTcbG+2DQjudJfdh0rtTHirDgTIrxo6H12SHl1oo0Wwg==",
+          "signedPreimageDigest": "sha256:299295971854d690997671c1abab6e38e29cb45093785d1a884594c2cfb5b5f7",
+          "signature": "INuy+PCuHUvnb4abHkYXvoUCNGrfQFE78LJwNKZ72mdJpoEfwFqnB2o/kh+76vSmZNZJneIGTe0FVjigRHlKGX6lakhgwahKL3OZK/o5vrSM47LLqCzBl/bbjJpD4hx3r0QKx6fEC7Y7DpXjWiCdQY0JJWgzA9kX4N05IoYVWYEl7YxdfcYZnru1Ycfgtf9Bcnc1IZCokj7XwrT+tNx4MC2GLMJEB8m+doXRojl3aBPBgni8TUzTCIxrUYuHmhqe0oalOoGRgtqvr40ksNFn6O0NqUyCoeBHBK8MZsk0YLMZ9EpgsXmCvMrjuvBuxC0BeQ2PP9Dw7lNn0wHmRiVBLQ==",
           "signedAt": "2025-06-01T11:48:00Z",
           "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
         },
-        "identityEvidenceDigest": "sha256:4c9f6b8896686a377ee8e2da0d6267d5562b1fc5c906f11691867f3ba4bb40a8"
+        "identityEvidenceDigest": "sha256:ff5fc226bde91823fcb24d27f6e6d2f113e1ec7c43b768006080ebcbac0f9086"
       }
     ],
     "snapshotAttestation": {
@@ -1648,26 +1648,26 @@
       "semanticContractVersion": "1.0.0",
       "policyContractVersion": "1.0.0",
       "snapshotId": "snap-111111111111",
-      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-      "semanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+      "artifactDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
+      "semanticDigest": "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79",
       "identityEvidenceDigests": [
-        "sha256:4c9f6b8896686a377ee8e2da0d6267d5562b1fc5c906f11691867f3ba4bb40a8"
+        "sha256:ff5fc226bde91823fcb24d27f6e6d2f113e1ec7c43b768006080ebcbac0f9086"
       ],
-      "identityEvidenceSetDigest": "sha256:06c059e8659428823487e631d0249072fd8fb28d5a4da41746647a32a0f207f9",
+      "identityEvidenceSetDigest": "sha256:5ceb5953b9f7b21d4d0d9823aae165e3d029e315673803f44e16001dd367bd92",
       "collectedAt": "2025-06-01T11:45:00Z",
       "expiresAt": "2025-06-02T00:00:00Z",
       "authorizedScopesDigest": "sha256:a85690fe763d273f004da00b5c3866c81aa3a2af1e2180bc7b9126c23d88a021",
-      "collectorAttemptSetDigest": "sha256:2b99882555cd2a48c15e011c3752e1fab80de0ffd8fae06f0f29d1b51162e55e",
-      "evidenceRecordSetDigest": "sha256:8c4bcf753ead30719ab45f8ec34787648f4a9aee3a3f33dd1b1f8def2ffffdcd",
-      "evidenceReferenceSetDigest": "sha256:ce17a211904ff0dd4bbe6359e74c427799227b2d99ff1fcb2a27f2c598b6dc9c",
+      "collectorAttemptSetDigest": "sha256:a8faf39017f6b9b67560cfbb815516119e40ffb8c0e8fa5c29f5d4f5484dc0f6",
+      "evidenceRecordSetDigest": "sha256:8318502684513d7b23bb55ffa9ee00d8e8c08d78a4b4dafba039c6877a53ba73",
+      "evidenceReferenceSetDigest": "sha256:1b19ac486a4d26a8594a035ffa619589301d1cf048be2cb0c5f053908767e953",
       "attestedAt": "2025-06-01T11:49:00Z",
       "signatureAlgorithm": "RS256",
       "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
       "keyName": "athena-fixture",
       "keyVersion": "0123456789abcdef0123456789abcdef",
       "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
-      "signedPreimageDigest": "sha256:e4b046d711d10be19024d5bea2637c29fa5bdf77641431e18a8eb536312b68e8",
-      "signature": "lbwnkDvkh6yFn9zCYcYUYZw1DQBlz38s0B64PqHFGoKbrH4aGDjrwGS/7mpVD+38RLMlKmEHiWacj3LCWwc1EDfJab0RUv9aQ3dtdilASlIVyw1jQXfZjPIvlkaRP4XpU7diP1tHhq4iUbHK7fGwNVr1afUau1Kmgj459A+3pjD4mtTRPASGdmLbFEchC1uQU0PkPiss+J1QoBF0nLJC9kevAADv9RkXQNXOr/KzQ2G+Jm1a/lGgxxlsauzXce81FyOlfaFeLEcrFumBqhUag9YsujohdkiGccf+RpBEvJXpVcWvOX+q8yvdPEFZs3Syvw9cWwt+aloxelDRjvm8QA=="
+      "signedPreimageDigest": "sha256:d21eb5cfafe15565897dcc03cd6d9e348afd691ba9134ba33bbd4daa88822afa",
+      "signature": "NVPCRqtqF9qslDcgDSMxxUB4WOCuH0msSW4VfktpN0MBJI8k64qIrNbd0nMtPzNA3IfsxJRJ05TJUscChboaOLLqrACzOtTiKR1w5wjV8zcKkPnSblDLZd4++jqYTLmr26V+yW7O0MEO0cEsF54oy1TU0l5Vma4Sp/6mcXkI7Sy/L5zLQeNvwE8X8p+rpaOfBKjZaQB3/RzTDIqYP4GmWTc95c4TMatePjCmQbcahBu6Fb2lfPSG1KZYluiRRxsngS8yjoa9craDjdVj2LL69FOjOiHn1SU6+Zq5V/S8Vbxx0E5VvQk7ZxLeT2iXzRwgU8GlDQR3/EINcCcawSJlwA=="
     }
   }
 }
