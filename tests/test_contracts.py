@@ -36,6 +36,7 @@ from athena_context.contracts import (
     EvidenceGapRef,
     EvidenceItemIdentifier,
     EvidenceItemRef,
+    EvidenceReferenceContext,
     EvidenceRelationshipIdentifier,
     EvidenceResourceRef,
     EvidenceRoleIdentifier,
@@ -66,6 +67,7 @@ from athena_context.contracts import (
     ResourceEvidenceRecord,
     ResourceGroupName,
     ResourceGroupScope,
+    ResourceProofFact,
     ResponseEvidencePointer,
     RiskAcceptance,
     RoleCardinalityBoundedRange,
@@ -86,7 +88,6 @@ from athena_context.contracts import (
     TrustedKeyRecord,
     UtcDateTime,
     VersionedKeyVaultKeyId,
-    WorkloadManifest,
     WorkloadRole,
     WorkspaceName,
     canonicalize_json,
@@ -108,7 +109,11 @@ from athena_context.contracts import (
     compute_verified_claims_digest,
     sha256_hex,
     snapshot_attestation_preimage,
+    verified_snapshot_context_verifier,
     verify_snapshot_attestation_signature,
+)
+from athena_context.contracts import (
+    LegacyWorkloadManifest as WorkloadManifest,
 )
 from athena_context.contracts.common import NormalizationCollisionError
 
@@ -733,8 +738,7 @@ def _build_valid_gap_snapshot(
         mcpHostId="mcp-111111111111",
         tenantId=tenant_id,
         trustAnchorRef=(
-            "https://contoso.vault.azure.net/keys/athena-key/"
-            "0123456789abcdef0123456789abcdef"
+            "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
         ),
         ingestionServiceId="ingestion-111111111111",
         ingestionAudience="api://athena-ingestion",
@@ -1065,9 +1069,7 @@ def _build_valid_identity_evidence(
         "verifiedClaimsDigest": verified_claims_digest,
         "jtiDigest": verified_claims_payload["jtiDigest"],
     }
-    token_verification_digest = compute_token_verification_digest(
-        token_verification_payload
-    )
+    token_verification_digest = compute_token_verification_digest(token_verification_payload)
     if collector_attempt is None:
         attempt = {
             "attemptType": "successResponse",
@@ -1137,9 +1139,7 @@ def _build_valid_identity_evidence(
     }
     derivation_payload["derivationDigest"] = compute_artifact_digest(derivation_payload)
     derivation_preimage = {
-        key: value
-        for key, value in derivation_payload.items()
-        if key != "derivationDigest"
+        key: value for key, value in derivation_payload.items() if key != "derivationDigest"
     }
     signature_preimage = {
         "signaturePreimageType": "athena.trustedIngestionSignature",
@@ -1193,11 +1193,7 @@ def _build_valid_identity_evidence(
         },
     }
     identity_payload["identityEvidenceDigest"] = compute_artifact_digest(
-        {
-            key: value
-            for key, value in identity_payload.items()
-            if key != "identityEvidenceDigest"
-        }
+        {key: value for key, value in identity_payload.items() if key != "identityEvidenceDigest"}
     )
     return CollectorIdentityEvidence.model_validate(identity_payload)
 
@@ -1206,8 +1202,7 @@ def _trusted_key_resolver(
     public_key: object,
     *,
     key_vault_key_id: str = (
-        "https://contoso.vault.azure.net/keys/athena-key/"
-        "0123456789abcdef0123456789abcdef"
+        "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
     ),
     enabled: bool = True,
     activated_at: datetime = datetime(2025, 1, 1, tzinfo=UTC),
@@ -1234,8 +1229,7 @@ def _trusted_key_anchor(
     public_key: object,
     *,
     key_vault_key_id: str = (
-        "https://contoso.vault.azure.net/keys/athena-key/"
-        "0123456789abcdef0123456789abcdef"
+        "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
     ),
 ) -> TrustedKeyAnchor:
     assert hasattr(public_key, "public_bytes")
@@ -1313,13 +1307,11 @@ def _attest_snapshot_payload(
         "keyVersion": anchor.key_version,
         "trustAnchorRef": anchor.key_vault_key_id,
     }
-    attestation_payload["signedPreimageDigest"] = (
-        compute_snapshot_attestation_preimage_digest(attestation_payload)
+    attestation_payload["signedPreimageDigest"] = compute_snapshot_attestation_preimage_digest(
+        attestation_payload
     )
     signature = private_key.sign(
-        canonicalize_json(snapshot_attestation_preimage(attestation_payload)).encode(
-            "utf-8"
-        ),
+        canonicalize_json(snapshot_attestation_preimage(attestation_payload)).encode("utf-8"),
         padding.PKCS1v15(),
         hashes.SHA256(),
     )
@@ -1387,15 +1379,13 @@ def test_key_vault_signature_verifies_and_rejects_forgery() -> None:
         key_resolver=_trusted_key_resolver(
             public_key,
             key_vault_key_id=(
-                "https://different.vault.azure.net/keys/athena-key/"
-                "0123456789abcdef0123456789abcdef"
+                "https://different.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
             ),
         ),
         trusted_key_anchor=_trusted_key_anchor(
             public_key,
             key_vault_key_id=(
-                "https://different.vault.azure.net/keys/athena-key/"
-                "0123456789abcdef0123456789abcdef"
+                "https://different.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
             ),
         ),
         as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
@@ -1438,6 +1428,21 @@ def test_snapshot_evaluation_rejects_expired_and_out_of_window_values() -> None:
             as_of=datetime(2025, 1, 1, tzinfo=UTC),
             expected_artifact_digest=stale.compatibility.artifact_digest,
             publication_resolver=_snapshot_publication_resolver(stale),
+        )
+
+
+def test_snapshot_evaluation_rejects_unsupported_compatibility() -> None:
+    snapshot = _build_valid_snapshot()
+    object.__setattr__(
+        snapshot.compatibility,
+        "minimum_reader_version",
+        "99.0.0",
+    )
+    with pytest.raises(AthenaValidationError, match="not supported"):
+        snapshot.validate_for_evaluation(
+            as_of=datetime(2025, 1, 2, 12, 10, tzinfo=UTC),
+            expected_artifact_digest=snapshot.compatibility.artifact_digest,
+            publication_resolver=_snapshot_publication_resolver(snapshot),
         )
 
 
@@ -1752,9 +1757,7 @@ def test_exact_signed_attempt_binding_and_utc_timestamps_are_required() -> None:
     evidence = _build_valid_identity_evidence(
         private_key=private_key,
         collector_attempt=attempt,
-        binding_overrides={
-            "attemptStartedAt": attempt.attempt_started_at + timedelta(seconds=1)
-        },
+        binding_overrides={"attemptStartedAt": attempt.attempt_started_at + timedelta(seconds=1)},
     )
     assert not evidence.verify_signature(
         key_resolver=_trusted_key_resolver(private_key.public_key()),
@@ -1776,9 +1779,7 @@ def test_resource_id_scope_requires_tenant_bound_parent() -> None:
     snapshot = _build_valid_snapshot()
     payload = snapshot.model_dump(mode="python", by_alias=True)
     resource_id = payload["evidenceRecords"][0]["resourceId"]
-    payload["authorizedScopes"] = [
-        {"scopeType": "resourceId", "resourceId": resource_id}
-    ]
+    payload["authorizedScopes"] = [{"scopeType": "resourceId", "resourceId": resource_id}]
     _refresh_snapshot_digest(payload)
     with pytest.raises(ValidationError, match="tenant-bound parent"):
         EvidenceSnapshot.model_validate(payload)
@@ -1858,12 +1859,8 @@ def test_resolved_source_rejects_recomputed_local_mutation() -> None:
 
 
 def test_envelope_digest_preserves_explicit_nulls() -> None:
-    assert compute_failure_envelope_digest({}) != compute_failure_envelope_digest(
-        {"error": None}
-    )
-    assert compute_response_envelope_digest({}) != compute_response_envelope_digest(
-        {"value": None}
-    )
+    assert compute_failure_envelope_digest({}) != compute_failure_envelope_digest({"error": None})
+    assert compute_response_envelope_digest({}) != compute_response_envelope_digest({"value": None})
 
 
 def test_gap_rejects_fabricated_attempt_digest_even_when_rehashed() -> None:
@@ -1945,10 +1942,7 @@ def test_signed_derivation_must_match_snapshot_collector_metadata() -> None:
 def test_token_verification_digest_audience_and_collection_lifetime_are_bound() -> None:
     now = datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
     claims = {
-        "issuer": (
-            "https://login.microsoftonline.com/"
-            "11111111-1111-1111-1111-111111111111/v2.0"
-        ),
+        "issuer": ("https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0"),
         "audience": "api://athena-ingestion",
         "tenantId": "11111111-1111-1111-1111-111111111111",
         "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
@@ -2036,9 +2030,7 @@ def test_signed_verified_claim_mutation_is_rejected(
     identity_payload["verifiedClaims"][claim_name] = mutated_value
     token_verification = identity_payload["tokenVerification"]
     token_verification["verifiedClaims"][claim_name] = mutated_value
-    claims_digest = compute_verified_claims_digest(
-        token_verification["verifiedClaims"]
-    )
+    claims_digest = compute_verified_claims_digest(token_verification["verifiedClaims"])
     token_verification["verifiedClaimsDigest"] = claims_digest
     token_verification["jtiDigest"] = token_verification["verifiedClaims"]["jtiDigest"]
     token_verification["tokenVerificationDigest"] = compute_token_verification_digest(
@@ -2052,25 +2044,13 @@ def test_signed_verified_claim_mutation_is_rejected(
     identity_payload["ingestionDerivation"] = derivation
     derivation["verifiedClaimsDigest"] = claims_digest
     derivation["jtiDigest"] = token_verification["verifiedClaims"]["jtiDigest"]
-    derivation["tokenVerificationDigest"] = token_verification[
-        "tokenVerificationDigest"
-    ]
+    derivation["tokenVerificationDigest"] = token_verification["tokenVerificationDigest"]
     derivation["derivationDigest"] = compute_artifact_digest(
-        {
-            key: value
-            for key, value in derivation.items()
-            if key != "derivationDigest"
-        }
+        {key: value for key, value in derivation.items() if key != "derivationDigest"}
     )
-    identity_payload["ingestionSignature"]["signedPreimageDigest"] = derivation[
-        "derivationDigest"
-    ]
+    identity_payload["ingestionSignature"]["signedPreimageDigest"] = derivation["derivationDigest"]
     identity_payload["identityEvidenceDigest"] = compute_artifact_digest(
-        {
-            key: value
-            for key, value in identity_payload.items()
-            if key != "identityEvidenceDigest"
-        }
+        {key: value for key, value in identity_payload.items() if key != "identityEvidenceDigest"}
     )
     mutated_identity = CollectorIdentityEvidence.model_validate(identity_payload)
     snapshot = _build_valid_snapshot(
@@ -2138,14 +2118,8 @@ def test_approved_resource_tags_are_closed_and_public_safe() -> None:
         ),
         "Server=x;Password=y",
         '{"customerProprietary":"payload"}',
-        (
-            "/subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-prod"
-        ),
-        (
-            "subscriptions/11111111-1111-1111-1111-111111111111/"
-            "providers/Microsoft.Compute"
-        ),
+        ("/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-prod"),
+        ("subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.Compute"),
     ],
 )
 def test_evidence_text_rejects_sensitive_or_free_form_payloads(
@@ -2223,14 +2197,8 @@ def test_safe_evidence_constraints_are_present_in_generated_schema() -> None:
         ("component",),
         ("managedBy",),
     }
-    assert (
-        tag_schema["$defs"]["ApplicationTagId"]["pattern"]
-        == "^app-[a-f0-9]{12}$"
-    )
-    assert (
-        tag_schema["$defs"]["ComponentTagId"]["pattern"]
-        == "^component-[a-f0-9]{12}$"
-    )
+    assert tag_schema["$defs"]["ApplicationTagId"]["pattern"] == "^app-[a-f0-9]{12}$"
+    assert tag_schema["$defs"]["ComponentTagId"]["pattern"] == "^component-[a-f0-9]{12}$"
 
     resource_schema = ResourceEvidenceRecord.model_json_schema()
     assert (
@@ -2244,10 +2212,7 @@ def test_safe_evidence_constraints_are_present_in_generated_schema() -> None:
         if "SnapshotIdentifier" in name
     ]
     assert snapshot_id_defs
-    assert all(
-        definition["pattern"] == "^snap-[a-f0-9]{12}$"
-        for definition in snapshot_id_defs
-    )
+    assert all(definition["pattern"] == "^snap-[a-f0-9]{12}$" for definition in snapshot_id_defs)
 
 
 def test_evidence_gap_record_rejects_sensitive_payload_pointer() -> None:
@@ -2288,12 +2253,10 @@ def test_configured_trust_anchor_rejects_attacker_key_resolution() -> None:
     trusted_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     attacker_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     contoso_anchor = (
-        "https://contoso.vault.azure.net/keys/athena-key/"
-        "0123456789abcdef0123456789abcdef"
+        "https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
     )
     attacker_anchor = (
-        "https://attacker.vault.azure.net/keys/athena-key/"
-        "fedcba9876543210fedcba9876543210"
+        "https://attacker.vault.azure.net/keys/athena-key/fedcba9876543210fedcba9876543210"
     )
     attacker_evidence = _build_valid_identity_evidence(
         private_key=attacker_private_key,
@@ -2577,9 +2540,7 @@ def test_observed_relationship_resource_endpoints_are_scope_checked() -> None:
         "collectorAttemptDigest": attempt.attempt_digest,
         "collectorIdentityEvidenceRef": attempt.collector_identity_evidence_ref,
     }
-    relationship_record["itemDigest"] = compute_evidence_record_digest(
-        relationship_record
-    )
+    relationship_record["itemDigest"] = compute_evidence_record_digest(relationship_record)
     payload["evidenceRecords"] = [relationship_record]
     payload["evidenceRefs"][0]["itemDigest"] = relationship_record["itemDigest"]
     _refresh_snapshot_digest(payload)
@@ -2604,9 +2565,7 @@ def test_raw_jti_is_never_persisted_and_jti_digest_is_canonical() -> None:
     payload["verifiedClaims"]["jti"] = "jti-123"
     payload["tokenVerification"]["verifiedClaims"]["jti"] = "jti-123"
     schema = CollectorIdentityEvidence.model_json_schema()
-    assert CollectorIdentityEvidence.model_validate_json(
-        evidence.model_dump_json(by_alias=True)
-    )
+    assert CollectorIdentityEvidence.model_validate_json(evidence.model_dump_json(by_alias=True))
     assert list(Draft202012Validator(schema).iter_errors(payload))
     with pytest.raises(ValidationError):
         CollectorIdentityEvidence.model_validate_json(json.dumps(payload))
@@ -2657,10 +2616,7 @@ def test_all_provenance_primitive_definitions_have_runtime_schema_parity() -> No
         (
             "VersionedKeyVaultKeyId",
             VersionedKeyVaultKeyId,
-            (
-                "https://contoso.vault.azure.net/keys/athena-key/"
-                "0123456789abcdef0123456789abcdef"
-            ),
+            ("https://contoso.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"),
             ("password123",),
         ),
         ("KeyVaultKeyVersion", KeyVaultKeyVersion, "0123456789abcdef0123456789abcdef", ("bad",)),
@@ -2762,8 +2718,7 @@ def test_all_provenance_primitive_definitions_have_runtime_schema_parity() -> No
     def walk_schema(node: object, path: str = "") -> None:
         if isinstance(node, dict):
             if node.get("type") == "string" and not any(
-                keyword in node
-                for keyword in ("pattern", "enum", "format", "const", "$ref")
+                keyword in node for keyword in ("pattern", "enum", "format", "const", "$ref")
             ):
                 unconstrained_string_paths.append(path)
             for key, value in node.items():
@@ -2827,9 +2782,7 @@ def test_utc_timestamp_alias_has_runtime_schema_parity() -> None:
         "2025-01-02 12:00:00Z",
     ):
         assert list(validator.iter_errors(invalid_value))
-    assert TypeAdapter(UtcDateTime).validate_python(
-        datetime(2025, 1, 2, 12, 0, tzinfo=UTC)
-    )
+    assert TypeAdapter(UtcDateTime).validate_python(datetime(2025, 1, 2, 12, 0, tzinfo=UTC))
     with pytest.raises(ValidationError):
         TypeAdapter(UtcDateTime).validate_python(datetime(2025, 1, 2, 12, 0))
 
@@ -2878,15 +2831,9 @@ def test_utc_timestamp_alias_has_runtime_schema_parity() -> None:
 
 
 def test_deployment_and_azure_identifier_grammars_accept_valid_shapes() -> None:
-    assert TypeAdapter(JwtKeyIdentifier).validate_python(
-        "-KI3Q9nNR7bRofxmeZoXqbHZGew"
-    )
-    assert TypeAdapter(IngestionAudience).validate_python(
-        "api://prod-ingestion"
-    )
-    assert TypeAdapter(KeyVaultKeyName).validate_python(
-        "prod-ingestion-signing"
-    )
+    assert TypeAdapter(JwtKeyIdentifier).validate_python("-KI3Q9nNR7bRofxmeZoXqbHZGew")
+    assert TypeAdapter(IngestionAudience).validate_python("api://prod-ingestion")
+    assert TypeAdapter(KeyVaultKeyName).validate_python("prod-ingestion-signing")
     assert TypeAdapter(ResourceGroupName).validate_python("rg-athena-fixture")
     assert TypeAdapter(WorkspaceName).validate_python("athena-logs-prod")
     assert TypeAdapter(AzureRegionCode).validate_python("uksouth")
@@ -3020,10 +2967,69 @@ def _evaluate_attested_snapshot(
         expected_artifact_digest=expected_artifact_digest,
         publication_resolver=_snapshot_publication_resolver(publication_snapshot),
         key_resolver=key_resolver or _trusted_key_resolver(private_key.public_key()),
-        trusted_key_anchor=trusted_key_anchor
-        or _trusted_key_anchor(private_key.public_key()),
+        trusted_key_anchor=trusted_key_anchor or _trusted_key_anchor(private_key.public_key()),
         envelope_resolver=lambda attempt_id, kind, digest: envelope,
     )
+
+
+def test_verified_snapshot_context_authenticates_fact_records_and_references() -> None:
+    snapshot, private_key, envelope = _build_attested_evaluation_fixture()
+    as_of = datetime(2025, 1, 2, 12, 10, tzinfo=UTC)
+    verifier = verified_snapshot_context_verifier(
+        snapshot,
+        as_of=as_of,
+        expected_artifact_digest=snapshot.compatibility.artifact_digest,
+        publication_resolver=_snapshot_publication_resolver(snapshot),
+        key_resolver=_trusted_key_resolver(private_key.public_key()),
+        trusted_key_anchor=_trusted_key_anchor(private_key.public_key()),
+        envelope_resolver=lambda attempt_id, kind, digest: envelope,
+        fact_validator=lambda fact, record: (
+            isinstance(fact, ResourceProofFact)
+            and fact.role_ref == "database-primary"
+            and isinstance(record, ResourceEvidenceRecord)
+        ),
+        role_binding_validator=lambda binding, verified_snapshot: (
+            binding.role_ref == "database-primary"
+            and binding.selected_resource_ids == [record.resource_id]
+        ),
+    )
+    record = snapshot.evidence_records[0]
+    assert isinstance(record, ResourceEvidenceRecord)
+    context = EvidenceReferenceContext(
+        snapshotId=snapshot.snapshot_id,
+        snapshotArtifactDigest=snapshot.compatibility.artifact_digest,
+        snapshotSemanticDigest=snapshot.compatibility.semantic_digest,
+        collectedAt=snapshot.collected_at,
+        expiresAt=snapshot.expires_at,
+        authorizedScopes=snapshot.authorized_scopes,
+        manifestId="wl-synthetic-verified",
+        profileId="production",
+        resolvedProfileDigest=_sha256("resolved-profile"),
+        roleBindings=[
+            {
+                "roleRef": "database-primary",
+                "selectedResourceIds": [record.resource_id],
+                "selectorResultDigest": _sha256("selector-result"),
+                "state": "complete",
+            }
+        ],
+        resources=[
+            {
+                "resourceId": record.resource_id,
+                "roleRef": "database-primary",
+                "availabilityZone": record.availability_zone,
+                "state": "complete",
+                "proofSource": "observed",
+                "evidenceRef": snapshot.evidence_refs[0],
+            }
+        ],
+    )
+    verifier(context, as_of)
+
+    fabricated = context.model_dump(mode="json", by_alias=True)
+    fabricated["resources"][0]["evidenceRef"]["itemDigest"] = _sha256("fabricated-item")
+    with pytest.raises(AthenaValidationError, match="does not resolve"):
+        verifier(EvidenceReferenceContext.model_validate(fabricated), as_of)
 
 
 def test_valid_snapshot_attestation_and_publication_record_are_required() -> None:
@@ -3038,10 +3044,7 @@ def test_valid_snapshot_attestation_and_publication_record_are_required() -> Non
         )
         is snapshot
     )
-    assert (
-        snapshot.snapshot_attestation.artifact_digest
-        == snapshot.compatibility.artifact_digest
-    )
+    assert snapshot.snapshot_attestation.artifact_digest == snapshot.compatibility.artifact_digest
 
 
 def test_snapshot_evaluation_rejects_submillisecond_trusted_time() -> None:
@@ -3157,8 +3160,7 @@ def test_snapshot_attestation_rejects_wrong_key_anchor_and_retired_key() -> None
         )
 
     other_anchor_url = (
-        "https://different.vault.azure.net/keys/athena-key/"
-        "0123456789abcdef0123456789abcdef"
+        "https://different.vault.azure.net/keys/athena-key/0123456789abcdef0123456789abcdef"
     )
     with pytest.raises(AthenaValidationError, match="attestation cryptographic"):
         _evaluate_attested_snapshot(
@@ -3222,10 +3224,7 @@ def test_resolved_identity_must_match_attested_identity_digest_set() -> None:
         collector_attempt=snapshot.collector_attempts[0],
         jti="replacement-jti",
     )
-    assert (
-        replacement.identity_evidence_id
-        == snapshot.identity_evidence[0].identity_evidence_id
-    )
+    assert replacement.identity_evidence_id == snapshot.identity_evidence[0].identity_evidence_id
     assert (
         replacement.identity_evidence_digest
         != snapshot.identity_evidence[0].identity_evidence_digest

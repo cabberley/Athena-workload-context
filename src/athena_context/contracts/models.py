@@ -375,9 +375,7 @@ _AZURE_REGION_RE = re.compile(r"^(?!.*[*?])(?:[a-z0-9]+(?:-[a-z0-9]+)*)$")
 _KEY_VAULT_KEY_ID_RE = re.compile(
     r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
 )
-_RESPONSE_EVIDENCE_POINTER_RE = re.compile(
-    r"^(?:|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"
-)
+_RESPONSE_EVIDENCE_POINTER_RE = re.compile(r"^(?:|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$")
 _FAILURE_EVIDENCE_POINTER_RE = re.compile(
     r"^(?:|/error(?:/(?:code|status))?|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"
 )
@@ -485,9 +483,7 @@ class SnapshotPublicationRecord:
         )
 
 
-type SnapshotPublicationResolver = Callable[
-    [SnapshotIdentifier], SnapshotPublicationRecord | None
-]
+type SnapshotPublicationResolver = Callable[[SnapshotIdentifier], SnapshotPublicationRecord | None]
 
 
 def _is_valid_guid(value: str) -> bool:
@@ -538,11 +534,7 @@ def _json_digest_payload(value: Any) -> Any:
     if isinstance(value, AthenaBaseModel):
         return value.model_dump(mode="json", by_alias=True, exclude_none=True)
     if isinstance(value, dict):
-        return {
-            key: _json_digest_payload(item)
-            for key, item in value.items()
-            if item is not None
-        }
+        return {key: _json_digest_payload(item) for key, item in value.items() if item is not None}
     if isinstance(value, list):
         return [_json_digest_payload(item) for item in value]
     return value
@@ -602,9 +594,7 @@ type SemanticVersionText = Annotated[
 ]
 type AthenaCapabilityIdentifier = Annotated[
     str,
-    StringConstraints(
-        pattern=r"^athena\.[a-z][a-z0-9-]{1,31}(?:\.[a-z][a-z0-9-]{1,31}){0,4}$"
-    ),
+    StringConstraints(pattern=r"^athena\.[a-z][a-z0-9-]{1,31}(?:\.[a-z][a-z0-9-]{1,31}){0,4}$"),
 ]
 type AthenaProducerIdentifier = AthenaCapabilityIdentifier
 type ApplicationTagId = Annotated[
@@ -617,9 +607,7 @@ type ComponentTagId = Annotated[
 ]
 type ResponseEvidencePointer = Annotated[
     str,
-    StringConstraints(
-        pattern=r"^(?:|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"
-    ),
+    StringConstraints(pattern=r"^(?:|/(?:items|value)/(?:0|[1-9][0-9]{0,5}))$"),
 ]
 type FailureEvidencePointer = Annotated[
     str,
@@ -846,9 +834,7 @@ def compute_evidence_snapshot_artifact_digest(value: Any) -> str:
 
 
 def compute_evidence_snapshot_semantic_digest(value: Any) -> str:
-    return compute_semantic_digest(
-        _snapshot_digest_preimage(value)
-    )
+    return compute_semantic_digest(_snapshot_digest_preimage(value))
 
 
 def _canonical_set_digest(values: Iterable[Any]) -> str:
@@ -885,9 +871,7 @@ def compute_identity_evidence_set_digest(value: Any) -> str:
     payload = _json_digest_payload(value)
     identities = payload.get("identityEvidence", []) if isinstance(payload, dict) else value
     digests = sorted(
-        identity["identityEvidenceDigest"]
-        for identity in identities
-        if isinstance(identity, dict)
+        identity["identityEvidenceDigest"] for identity in identities if isinstance(identity, dict)
     )
     return compute_artifact_digest(digests)
 
@@ -1017,9 +1001,7 @@ def _scope_contains(container: Any, candidate: Any) -> bool:
         return False
     if isinstance(container, ServiceHealthRegionScope):
         if isinstance(candidate, ServiceHealthRegionScope):
-            return (
-                candidate.cloud == container.cloud and candidate.region == container.region
-            )
+            return candidate.cloud == container.cloud and candidate.region == container.region
         return False
     return False
 
@@ -1056,8 +1038,7 @@ def _validate_evidence_record_digest(record: AthenaBaseModel) -> None:
     expected = compute_evidence_record_digest(record)
     if item_digest != expected:
         raise AthenaValidationError(
-            "evidence record itemDigest mismatched the canonical record "
-            "without its own digest"
+            "evidence record itemDigest mismatched the canonical record without its own digest"
         )
 
 
@@ -1150,14 +1131,14 @@ def verify_key_vault_signature(
         return False
     try:
         signature_bytes = base64.b64decode(raw_signature, validate=True)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     if not signature_bytes:
         return False
     if isinstance(public_key, (bytes, bytearray)):
         try:
             public_key = serialization.load_pem_public_key(bytes(public_key))
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return False
     payload = preimage.encode("utf-8") if isinstance(preimage, str) else preimage
     try:
@@ -1168,7 +1149,7 @@ def verify_key_vault_signature(
             hashes.SHA256(),
         )
         return True
-    except (AttributeError, TypeError, ValueError, InvalidSignature):
+    except AttributeError, TypeError, ValueError, InvalidSignature:
         return False
 
 
@@ -1276,10 +1257,8 @@ def verify_trusted_ingestion_signature(
     if identity_evidence.token_verification.verified_claims != identity_evidence.verified_claims:
         return False
     if (
-        identity_evidence.token_verification.verified_claims_digest
-        != expected_claims_digest
-        or identity_evidence.ingestion_derivation.verified_claims_digest
-        != expected_claims_digest
+        identity_evidence.token_verification.verified_claims_digest != expected_claims_digest
+        or identity_evidence.ingestion_derivation.verified_claims_digest != expected_claims_digest
     ):
         return False
     if (
@@ -1315,10 +1294,7 @@ def verify_trusted_ingestion_signature(
     )
     derivation_payload.pop("derivationDigest", None)
     expected_derivation_digest = compute_artifact_digest(derivation_payload)
-    if (
-        identity_evidence.ingestion_derivation.derivation_digest
-        != expected_derivation_digest
-    ):
+    if identity_evidence.ingestion_derivation.derivation_digest != expected_derivation_digest:
         return False
     signature_preimage = {
         "signaturePreimageType": "athena.trustedIngestionSignature",
@@ -1424,6 +1400,22 @@ class CompatibilityMetadata(AthenaBaseModel):
         ..., alias="semanticDigest", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
+
+def _require_supported_evaluation_compatibility(
+    compatibility: CompatibilityMetadata,
+) -> None:
+    def version_tuple(value: str) -> tuple[int, int, int]:
+        major, minor, patch = value.split(".")
+        return (int(major), int(minor), int(patch))
+
+    if (
+        version_tuple(compatibility.schema_version)[0] != 1
+        or compatibility.semantic_contract_version != "1.0.0"
+        or compatibility.policy_contract_version != "1.0.0"
+        or version_tuple(compatibility.minimum_reader_version) > (1, 0, 0)
+        or compatibility.requires_capabilities
+    ):
+        raise AthenaValidationError("artifact compatibility negotiation outcome is not supported")
 
 
 class SubscriptionScope(AthenaBaseModel):
@@ -1556,9 +1548,7 @@ class ServiceHealthRegionScope(AthenaBaseModel):
         ..., alias="scopeType", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
     cloud: AzureCloud = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
-    region: AzureRegionCode = Field(
-        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
-    )
+    region: AzureRegionCode = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
 
     @field_validator("region")
     @classmethod
@@ -1883,6 +1873,10 @@ class ManifestAudit(AthenaBaseModel):
     )
 
 
+def _normalize_identifier(value: str) -> str:
+    return normalize_nfc_text(value).casefold()
+
+
 class ProfileOverride(AthenaBaseModel):
     profile_id: str = Field(
         ...,
@@ -1905,11 +1899,66 @@ class ProfileOverride(AthenaBaseModel):
     owner_ref: str | None = Field(
         default=None, alias="ownerRef", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
+    approval_state: Literal["draft", "approved", "deprecated"] | None = Field(
+        default=None,
+        alias="approvalState",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    approved_by: str | None = Field(
+        default=None,
+        alias="approvedBy",
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    approved_at: UtcDateTime | None = Field(
+        default=None,
+        alias="approvedAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    expires_at: UtcDateTime | None = Field(
+        default=None,
+        alias="expiresAt",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    target_ref: str | None = Field(
+        default=None,
+        alias="targetRef",
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    profile_scope: GovernanceProfileScope | None = Field(
+        default=None,
+        alias="profileScope",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
 
     @model_validator(mode="after")
     def validate_disabled_refs(self) -> ProfileOverride:
         if self.disabled_refs and (not self.owner_ref or not self.rationale):
             raise AthenaValidationError("disabledRefs requires both ownerRef and rationale")
+        if any(not ref or not ref.strip() for ref in self.disabled_refs):
+            raise AthenaValidationError("disabledRefs entries must be non-empty stable ids")
+        if self.disabled_refs:
+            if self.approval_state != "approved":
+                raise AthenaValidationError("disabledRefs overrides require approved state")
+            if not self.approved_by or not self.profile_scope:
+                raise AthenaValidationError(
+                    "disabledRefs requires approval metadata and a profile-scoped governance scope"
+                )
+            if (
+                self.expires_at is not None
+                and self.approved_at is not None
+                and self.approved_at > self.expires_at
+            ):
+                raise AthenaValidationError(
+                    "disabledRefs approvedAt must be earlier than or equal to expiresAt"
+                )
+        if (
+            self.target_ref is not None
+            and self.disabled_refs
+            and self.target_ref in self.disabled_refs
+        ):
+            raise AthenaValidationError("targetRef cannot also be listed as a disabled ref")
         return self
 
 
@@ -1945,8 +1994,119 @@ class ProfileDefinition(AthenaBaseModel):
     overrides: list[ProfileOverride] = Field(
         default_factory=list, json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
+    roles: list[WorkloadRole] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    relationships: list[Relationship] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    constraints: list[Constraint] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    controls: list[Control] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    risk_acceptances: list[RiskAcceptance] = Field(
+        default_factory=list,
+        alias="riskAcceptances",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    objectives: list[Objective] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    ownership_refs: list[OwnershipReference] = Field(
+        default_factory=list,
+        alias="ownershipRefs",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
 
-    def resolve(self, registry: dict[str, ProfileDefinition]) -> ProfileDefinition:
+    @staticmethod
+    def _canonical_item_dump(item: Any) -> str:
+        if hasattr(item, "model_dump"):
+            return canonicalize_json(item.model_dump(mode="json", by_alias=True, exclude_none=True))
+        return canonicalize_json(item)
+
+    @staticmethod
+    def _key_from_item(item: Any, default_key: str) -> str | None:
+        for candidate_key in (
+            default_key,
+            "role_id",
+            "relationship_id",
+            "exception_id",
+            "constraint_id",
+            "control_id",
+            "risk_acceptance_id",
+            "objective_id",
+            "owner_ref",
+            "profile_id",
+        ):
+            if hasattr(item, candidate_key):
+                value = getattr(item, candidate_key)
+                if value is not None:
+                    return _normalize_identifier(str(value))
+        return None
+
+    @staticmethod
+    def _merge_keyed_collection(
+        base: list[Any],
+        extra: list[Any],
+        *,
+        key_name: str,
+    ) -> list[Any]:
+        merged: dict[str, Any] = {}
+        for item in [*base, *extra]:
+            if item is None:
+                continue
+            item_key = ProfileDefinition._key_from_item(item, key_name)
+            if item_key is None:
+                continue
+            existing = merged.get(item_key)
+            if existing is None:
+                merged[item_key] = item
+                continue
+            if ProfileDefinition._canonical_item_dump(
+                existing
+            ) != ProfileDefinition._canonical_item_dump(item):
+                raise AthenaValidationError(
+                    f"ambiguous duplicate key in profile merge for {key_name!r}: {item_key!r}"
+                )
+        return [merged[key] for key in sorted(merged)]
+
+    @staticmethod
+    def _apply_disabled_refs(
+        items: list[Any],
+        disabled_refs: list[str],
+        *,
+        key_name: str,
+    ) -> list[Any]:
+        if not disabled_refs:
+            return items
+        disabled_keys = {_normalize_identifier(str(ref)) for ref in disabled_refs}
+        filtered: list[Any] = []
+        for item in items:
+            item_key = ProfileDefinition._key_from_item(item, key_name)
+            if item_key is not None and item_key in disabled_keys:
+                continue
+            filtered.append(item)
+        return filtered
+
+    def resolve(
+        self,
+        registry: dict[str, ProfileDefinition],
+        *,
+        as_of: datetime,
+    ) -> ResolvedProfile:
+        _require_utc_millisecond_datetime(as_of, field_name="as_of")
+        normalized_registry: dict[str, ProfileDefinition] = {
+            _normalize_identifier(profile_id): profile for profile_id, profile in registry.items()
+        }
+        if len(normalized_registry) != len(registry):
+            raise AthenaValidationError("duplicate profile ids after NFC+casefold normalization")
         visited: set[str] = set()
         resolved_settings = ProfileSettings.model_validate(
             {"continuity": {"zoneLossContinuityRequired": False}}
@@ -1955,17 +2115,104 @@ class ProfileDefinition(AthenaBaseModel):
         current_id: str | None = self.profile_id
 
         while current_id is not None:
-            if current_id in visited:
+            normalized_id = _normalize_identifier(current_id)
+            if normalized_id in visited:
                 raise AthenaValidationError(f"profile inheritance cycle detected: {current_id!r}")
-            visited.add(current_id)
-            current = registry.get(current_id)
+            visited.add(normalized_id)
+            current = normalized_registry.get(normalized_id)
             if current is None:
                 raise AthenaValidationError(f"profile reference not found: {current_id!r}")
             inherited_chain.append(current)
             current_id = current.extends
 
+        parent_continuity: bool | None = None
         for profile in reversed(inherited_chain):
+            if profile.overrides:
+                raise AthenaValidationError(
+                    "legacy profile overrides are unsupported; use resolve_manifest_profile"
+                )
+            current_continuity = profile.settings.continuity.zone_loss_continuity_required
+            if parent_continuity is True and current_continuity is False:
+                raise AthenaValidationError(
+                    "legacy profile weakening is unsupported; use resolve_manifest_profile"
+                )
             resolved_settings = _merge_profile_settings(resolved_settings, profile.settings)
+            parent_continuity = current_continuity
+
+        merged_roles: list[Any] = []
+        merged_relationships: list[Any] = []
+        merged_constraints: list[Any] = []
+        merged_controls: list[Any] = []
+        merged_risk_acceptances: list[Any] = []
+        merged_objectives: list[Any] = []
+        merged_ownership_refs: list[Any] = []
+
+        for profile in reversed(inherited_chain):
+            merged_roles = self._merge_keyed_collection(
+                merged_roles, profile.roles, key_name="role_id"
+            )
+            merged_relationships = self._merge_keyed_collection(
+                merged_relationships,
+                profile.relationships,
+                key_name="relationship_id",
+            )
+            merged_constraints = self._merge_keyed_collection(
+                merged_constraints,
+                profile.constraints,
+                key_name="constraint_id",
+            )
+            merged_controls = self._merge_keyed_collection(
+                merged_controls,
+                profile.controls,
+                key_name="control_id",
+            )
+            merged_risk_acceptances = self._merge_keyed_collection(
+                merged_risk_acceptances,
+                profile.risk_acceptances,
+                key_name="risk_acceptance_id",
+            )
+            merged_objectives = self._merge_keyed_collection(
+                merged_objectives,
+                profile.objectives,
+                key_name="objective_id",
+            )
+            merged_ownership_refs = self._merge_keyed_collection(
+                merged_ownership_refs,
+                profile.ownership_refs,
+                key_name="owner_ref",
+            )
+
+        merged_roles = self._merge_keyed_collection(merged_roles, self.roles, key_name="role_id")
+        merged_relationships = self._merge_keyed_collection(
+            merged_relationships,
+            self.relationships,
+            key_name="relationship_id",
+        )
+        merged_constraints = self._merge_keyed_collection(
+            merged_constraints,
+            self.constraints,
+            key_name="constraint_id",
+        )
+        merged_controls = self._merge_keyed_collection(
+            merged_controls,
+            self.controls,
+            key_name="control_id",
+        )
+        merged_risk_acceptances = self._merge_keyed_collection(
+            merged_risk_acceptances,
+            self.risk_acceptances,
+            key_name="risk_acceptance_id",
+        )
+        merged_objectives = self._merge_keyed_collection(
+            merged_objectives,
+            self.objectives,
+            key_name="objective_id",
+        )
+        merged_ownership_refs = self._merge_keyed_collection(
+            merged_ownership_refs,
+            self.ownership_refs,
+            key_name="owner_ref",
+        )
 
         resolved_override_settings: dict[str, Any] = {
             "continuity": {
@@ -1974,35 +2221,150 @@ class ProfileDefinition(AthenaBaseModel):
                 )
             }
         }
-        return ProfileDefinition(
+        return ResolvedProfile(
             profileId=self.profile_id,
             profileType=self.profile_type,
             extends=self.extends,
             settings=ProfileSettings.model_validate(resolved_override_settings),
-            overrides=self.overrides,
+            roles=[item for item in merged_roles],
+            relationships=[item for item in merged_relationships],
+            constraints=[item for item in merged_constraints],
+            controls=[item for item in merged_controls],
+            riskAcceptances=[item for item in merged_risk_acceptances],
+            objectives=[item for item in merged_objectives],
+            ownershipRefs=[item for item in merged_ownership_refs],
+            disabledRefs=[],
         )
 
     @classmethod
     def validate_profile_hierarchy(cls, profiles: dict[str, ProfileDefinition]) -> None:
         seen: set[str] = set()
         stack: set[str] = set()
+        normalized_keys: set[str] = set()
+        for profile_id in profiles:
+            normalized_id = _normalize_identifier(profile_id)
+            if normalized_id in normalized_keys:
+                raise AthenaValidationError(
+                    f"duplicate profile id after NFC+casefold normalization: {profile_id!r}"
+                )
+            normalized_keys.add(normalized_id)
 
         def walk(profile_id: str) -> None:
-            if profile_id in stack:
+            normalized_id = _normalize_identifier(profile_id)
+            if normalized_id in stack:
                 raise AthenaValidationError(f"profile inheritance cycle detected: {profile_id!r}")
-            if profile_id in seen:
+            if normalized_id in seen:
                 return
-            seen.add(profile_id)
-            stack.add(profile_id)
+            seen.add(normalized_id)
+            stack.add(normalized_id)
             profile = profiles.get(profile_id)
             if profile is None:
-                raise AthenaValidationError(f"profile reference not found: {profile_id!r}")
+                profile = next(
+                    (
+                        candidate_profile
+                        for candidate_key, candidate_profile in profiles.items()
+                        if _normalize_identifier(candidate_key) == normalized_id
+                    ),
+                    None,
+                )
+                if profile is None:
+                    raise AthenaValidationError(f"profile reference not found: {profile_id!r}")
             if profile.extends is not None:
                 walk(profile.extends)
-            stack.remove(profile_id)
+            stack.remove(normalized_id)
 
-        for profile_id in profiles:
+        for profile_id in list(profiles):
             walk(profile_id)
+
+
+class ResolvedProfile(AthenaBaseModel):
+    profile_id: str = Field(
+        ...,
+        alias="profileId",
+        min_length=1,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    profile_type: ProfileType = Field(
+        ..., alias="profileType", json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    extends: str | None = Field(
+        default=None, json_schema_extra={"x-athena-semanticClass": "semantic"}
+    )
+    settings: ProfileSettings = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
+    roles: list[WorkloadRole] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    relationships: list[Relationship] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    constraints: list[Constraint] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    controls: list[Control] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    risk_acceptances: list[RiskAcceptance] = Field(
+        default_factory=list,
+        alias="riskAcceptances",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    objectives: list[Objective] = Field(
+        default_factory=list,
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    ownership_refs: list[OwnershipReference] = Field(
+        default_factory=list,
+        alias="ownershipRefs",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+    disabled_refs: list[str] = Field(
+        default_factory=list,
+        alias="disabledRefs",
+        json_schema_extra={"x-athena-semanticClass": "semantic"},
+    )
+
+    @property
+    def digest(self) -> str:
+        return compute_artifact_digest(
+            self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> ResolvedProfile:
+        seen: set[str] = set()
+        for collection_name, key_name in (
+            ("roles", "role_id"),
+            ("relationships", "relationship_id"),
+            ("constraints", "constraint_id"),
+            ("controls", "control_id"),
+            ("risk_acceptances", "risk_acceptance_id"),
+            ("objectives", "objective_id"),
+            ("ownership_refs", "owner_ref"),
+        ):
+            for item in getattr(self, collection_name):
+                item_key = ProfileDefinition._key_from_item(item, key_name)
+                if item_key is None:
+                    continue
+                if item_key in seen:
+                    raise AthenaValidationError(
+                        f"duplicate resolved item key after final merge: {item_key!r}"
+                    )
+                seen.add(item_key)
+        return self
+
+    @classmethod
+    def from_profile_definition(
+        cls,
+        profile: ProfileDefinition,
+        *,
+        registry: dict[str, ProfileDefinition],
+        as_of: datetime,
+    ) -> ResolvedProfile:
+        return profile.resolve(registry, as_of=as_of)
 
 
 def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -2493,6 +2855,32 @@ class ExceptionRelationship(AthenaBaseModel):
         ..., alias="expiresAt", json_schema_extra={"x-athena-semanticClass": "semantic"}
     )
 
+    def is_active(
+        self,
+        *,
+        as_of: datetime,
+        risk_acceptance: RiskAcceptance | None = None,
+        owner_ref: str | None = None,
+        governance_scope: GovernanceScope | None = None,
+    ) -> bool:
+        if self.expires_at <= as_of:
+            return False
+        if owner_ref is not None and self.owner_ref != owner_ref:
+            return False
+        if governance_scope is not None and canonicalize_json(
+            self.governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+        ) != canonicalize_json(
+            governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+        ):
+            return False
+        if risk_acceptance is not None:
+            if self.risk_acceptance_ref != risk_acceptance.risk_acceptance_id:
+                return False
+            return risk_acceptance.is_active(
+                as_of=as_of, governance_scope=self.governance_scope, owner_ref=self.owner_ref
+            )
+        return True
+
 
 type Relationship = Annotated[
     DeclaredRelationship | ObservedRelationship | InferredRelationship | ExceptionRelationship,
@@ -2816,9 +3204,26 @@ class RiskAcceptance(AthenaBaseModel):
     def validate_risk_acceptance(self) -> RiskAcceptance:
         if self.accepted_at > self.expires_at:
             raise AthenaValidationError("acceptedAt must be earlier than or equal to expiresAt")
-        if self.active and self.expires_at <= datetime.now(tz=UTC):
-            raise AthenaValidationError("active risk acceptance cannot already be expired")
         return self
+
+    def is_active(
+        self,
+        *,
+        as_of: datetime,
+        governance_scope: GovernanceScope | None = None,
+        owner_ref: str | None = None,
+    ) -> bool:
+        if not self.active:
+            return False
+        if not (self.accepted_at <= as_of < self.expires_at):
+            return False
+        if owner_ref is not None and self.owner_ref != owner_ref:
+            return False
+        return governance_scope is None or canonicalize_json(
+            self.governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+        ) == canonicalize_json(
+            governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
 
 
 class Control(AthenaBaseModel):
@@ -2946,11 +3351,11 @@ class WorkloadManifest(AthenaBaseModel):
             raise AthenaValidationError("manifest requires at least one profile")
         normalized: set[str] = set()
         for profile_key, profile_def in profiles.items():
-            key_normalized = normalize_nfc_text(profile_key)
+            key_normalized = _normalize_identifier(profile_key)
             if key_normalized in normalized:
                 raise AthenaValidationError(f"duplicate profile id: {profile_key!r}")
             normalized.add(key_normalized)
-            if profile_def.profile_id != profile_key:
+            if _normalize_identifier(profile_def.profile_id) != key_normalized:
                 raise AthenaValidationError("profiles must use stable id keys matching profileId")
         return profiles
 
@@ -2970,10 +3375,10 @@ class WorkloadManifest(AthenaBaseModel):
         ProfileDefinition.validate_profile_hierarchy(self.profiles)
         return self
 
-    def resolved_profiles(self) -> dict[str, ProfileDefinition]:
-        resolved: dict[str, ProfileDefinition] = {}
+    def resolved_profiles(self, *, as_of: datetime) -> dict[str, ResolvedProfile]:
+        resolved: dict[str, ResolvedProfile] = {}
         for profile_id, profile in self.profiles.items():
-            resolved[profile_id] = profile.resolve(self.profiles)
+            resolved[profile_id] = profile.resolve(self.profiles, as_of=as_of)
         return resolved
 
 
@@ -3357,6 +3762,7 @@ class TokenVerification(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
+
     @model_validator(mode="after")
     def validate_digest(self) -> TokenVerification:
         expected_claims_digest = compute_verified_claims_digest(self.verified_claims)
@@ -4402,13 +4808,9 @@ class EvidenceRecordProvenance(AthenaBaseModel):
                 "failurePayloadPointer must be an approved failure envelope path"
             )
         if (self.source_response_digest is None) != (self.source_response_pointer is None):
-            raise AthenaValidationError(
-                "source response digest and pointer must appear together"
-            )
+            raise AthenaValidationError("source response digest and pointer must appear together")
         if (self.failure_payload_digest is None) != (self.failure_payload_pointer is None):
-            raise AthenaValidationError(
-                "failure payload digest and pointer must appear together"
-            )
+            raise AthenaValidationError("failure payload digest and pointer must appear together")
         if self.source_response_digest is not None and self.failure_payload_digest is not None:
             raise AthenaValidationError(
                 "record provenance cannot contain both response and failure payload fields"
@@ -4819,9 +5221,7 @@ class AdvisorRecommendationEvidenceRecord(AthenaBaseModel):
         min_length=1,
         json_schema_extra={"x-athena-semanticClass": "semantic"},
     )
-    category: AdvisorCategory = Field(
-        ..., json_schema_extra={"x-athena-semanticClass": "semantic"}
-    )
+    category: AdvisorCategory = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     impact: AdvisorImpact = Field(..., json_schema_extra={"x-athena-semanticClass": "semantic"})
     recommendation_code: AdvisorRecommendationCode = Field(
         ...,
@@ -5091,16 +5491,12 @@ class SnapshotAttestation(AthenaBaseModel):
 
     @model_validator(mode="after")
     def validate_attestation(self) -> SnapshotAttestation:
-        if self.identity_evidence_digests != sorted(
-            set(self.identity_evidence_digests)
-        ):
+        if self.identity_evidence_digests != sorted(set(self.identity_evidence_digests)):
             raise AthenaValidationError(
                 "snapshot attestation identityEvidenceDigests must be unique and sorted"
             )
         if self.collected_at >= self.expires_at:
-            raise AthenaValidationError(
-                "snapshot attestation collectedAt must precede expiresAt"
-            )
+            raise AthenaValidationError("snapshot attestation collectedAt must precede expiresAt")
         if self.attested_at < self.collected_at or self.attested_at >= self.expires_at:
             raise AthenaValidationError(
                 "snapshot attestation attestedAt must be inside the snapshot lifetime"
@@ -5185,8 +5581,7 @@ def _snapshot_attestation_matches_components(
         and attestation.schema_version == snapshot.compatibility.schema_version
         and attestation.semantic_contract_version
         == snapshot.compatibility.semantic_contract_version
-        and attestation.policy_contract_version
-        == snapshot.compatibility.policy_contract_version
+        and attestation.policy_contract_version == snapshot.compatibility.policy_contract_version
         and attestation.snapshot_id == snapshot.snapshot_id
         and attestation.artifact_digest == artifact_digest
         and attestation.semantic_digest == semantic_digest
@@ -5195,12 +5590,10 @@ def _snapshot_attestation_matches_components(
         == compute_artifact_digest(attestation.identity_evidence_digests)
         and attestation.collected_at == snapshot.collected_at
         and attestation.expires_at == snapshot.expires_at
-        and attestation.authorized_scopes_digest
-        == compute_authorized_scopes_digest(snapshot)
+        and attestation.authorized_scopes_digest == compute_authorized_scopes_digest(snapshot)
         and attestation.collector_attempt_set_digest
         == compute_collector_attempt_set_digest(snapshot)
-        and attestation.evidence_record_set_digest
-        == compute_evidence_record_set_digest(snapshot)
+        and attestation.evidence_record_set_digest == compute_evidence_record_set_digest(snapshot)
         and attestation.evidence_reference_set_digest
         == compute_evidence_reference_set_digest(snapshot)
     )
@@ -5335,8 +5728,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                 != self.collector.collector_identity_evidence_ref
             ):
                 raise AthenaValidationError(
-                    "collectorAttempts must reference the snapshot "
-                    "collectorIdentityEvidenceRef"
+                    "collectorAttempts must reference the snapshot collectorIdentityEvidenceRef"
                 )
             if attempt.attempt_id in attempt_lookup_by_id:
                 raise AthenaValidationError("collectorAttempts must have unique attemptId values")
@@ -5534,20 +5926,18 @@ class EvidenceSnapshot(AthenaBaseModel):
                         "snapshot semantic digest"
                     )
                 matched_records = [
-                        record
-                        for record in self.evidence_records
-                        if record.record_type != "evidenceGap"
-                        and record.item_digest == evidence_ref.item_digest
-                        and record.collector_attempt_digest
-                        == evidence_ref.collector_attempt_digest
-                        and record.collector_identity_evidence_ref
-                        == evidence_ref.collector_identity_evidence_ref
-                        and record.provenance.collector_attempt_id
-                        == evidence_ref.collector_attempt_id
-                        and record.provenance.source_response_digest
-                        == evidence_ref.source_response_digest
-                        and record.provenance.source_response_pointer
-                        == evidence_ref.source_response_pointer
+                    record
+                    for record in self.evidence_records
+                    if record.record_type != "evidenceGap"
+                    and record.item_digest == evidence_ref.item_digest
+                    and record.collector_attempt_digest == evidence_ref.collector_attempt_digest
+                    and record.collector_identity_evidence_ref
+                    == evidence_ref.collector_identity_evidence_ref
+                    and record.provenance.collector_attempt_id == evidence_ref.collector_attempt_id
+                    and record.provenance.source_response_digest
+                    == evidence_ref.source_response_digest
+                    and record.provenance.source_response_pointer
+                    == evidence_ref.source_response_pointer
                 ]
                 if len(matched_records) != 1:
                     raise AthenaValidationError(
@@ -5567,9 +5957,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                     raise AthenaValidationError(
                         "EvidenceItemRef.collectorToolVersion must match the selected attempt"
                     )
-                if evidence_ref.collector_attempt_at != _attempt_observation_time(
-                    matching_attempt
-                ):
+                if evidence_ref.collector_attempt_at != _attempt_observation_time(matching_attempt):
                     raise AthenaValidationError(
                         "EvidenceItemRef.collectorAttemptAt must equal the selected "
                         "attempt response time"
@@ -5596,19 +5984,17 @@ class EvidenceSnapshot(AthenaBaseModel):
                         "snapshot semantic digest"
                     )
                 matched_gaps = [
-                        record
-                        for record in self.evidence_records
-                        if record.record_type == "evidenceGap"
-                        and record.gap_id == evidence_ref.gap_id
-                        and record.item_digest == evidence_ref.gap_record_digest
-                        and record.collector_attempt_id == evidence_ref.collector_attempt_id
-                        and record.collector_attempt_digest
-                        == evidence_ref.collector_attempt_digest
+                    record
+                    for record in self.evidence_records
+                    if record.record_type == "evidenceGap"
+                    and record.gap_id == evidence_ref.gap_id
+                    and record.item_digest == evidence_ref.gap_record_digest
+                    and record.collector_attempt_id == evidence_ref.collector_attempt_id
+                    and record.collector_attempt_digest == evidence_ref.collector_attempt_digest
                 ]
                 if len(matched_gaps) != 1:
                     raise AthenaValidationError(
-                        "EvidenceGapRef must resolve exactly once to a gap in the current "
-                        "snapshot"
+                        "EvidenceGapRef must resolve exactly once to a gap in the current snapshot"
                     )
                 matched_gap = cast(EvidenceGapRecord, matched_gaps[0])
                 matching_attempt = attempt_lookup_by_id.get(evidence_ref.collector_attempt_id)
@@ -5624,9 +6010,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                     raise AthenaValidationError(
                         "EvidenceGapRef.collectorToolVersion must match the selected attempt"
                     )
-                if evidence_ref.collector_attempt_at != _attempt_observation_time(
-                    matching_attempt
-                ):
+                if evidence_ref.collector_attempt_at != _attempt_observation_time(matching_attempt):
                     raise AthenaValidationError(
                         "EvidenceGapRef.collectorAttemptAt must equal the selected "
                         "attempt observation time"
@@ -5651,10 +6035,8 @@ class EvidenceSnapshot(AthenaBaseModel):
                         "EvidenceGapRef.collectorIdentityEvidenceRef must match the resolved gap"
                     )
                 if (
-                    matched_gap.failure_payload_digest
-                    != evidence_ref.failure_payload_digest
-                    or matched_gap.failure_payload_pointer
-                    != evidence_ref.failure_payload_pointer
+                    matched_gap.failure_payload_digest != evidence_ref.failure_payload_digest
+                    or matched_gap.failure_payload_pointer != evidence_ref.failure_payload_pointer
                 ):
                     raise AthenaValidationError(
                         "EvidenceGapRef failure payload fields must match the resolved gap"
@@ -5695,10 +6077,7 @@ class EvidenceSnapshot(AthenaBaseModel):
             _attempt_observation_time(attempt) for attempt in self.collector_attempts
         )
         latest_identity_signature = max(
-            (
-                identity.ingestion_signature.signed_at
-                for identity in self.identity_evidence
-            ),
+            (identity.ingestion_signature.signed_at for identity in self.identity_evidence),
             default=self.collected_at,
         )
         if attestation.attested_at < max(
@@ -5723,32 +6102,26 @@ class EvidenceSnapshot(AthenaBaseModel):
         envelope_resolver: EvidenceEnvelopeResolver | None = None,
     ) -> EvidenceSnapshot:
         _require_utc_millisecond_datetime(as_of, field_name="as_of")
+        _require_supported_evaluation_compatibility(self.compatibility)
         recomputed_artifact_digest = compute_evidence_snapshot_artifact_digest(self)
         recomputed_semantic_digest = compute_evidence_snapshot_semantic_digest(self)
         if self.compatibility.artifact_digest != recomputed_artifact_digest:
-            raise AthenaValidationError(
-                "snapshot artifact digest must be valid at evaluation time"
-            )
+            raise AthenaValidationError("snapshot artifact digest must be valid at evaluation time")
         if self.compatibility.semantic_digest != recomputed_semantic_digest:
-            raise AthenaValidationError(
-                "snapshot semantic digest must be valid at evaluation time"
-            )
+            raise AthenaValidationError("snapshot semantic digest must be valid at evaluation time")
         if expected_artifact_digest != recomputed_artifact_digest:
             raise AthenaValidationError(
                 "trusted expected_artifact_digest must equal the recomputed snapshot digest"
             )
         publication = publication_resolver(self.snapshot_id)
         if publication is None:
-            raise AthenaValidationError(
-                "snapshot is missing from the trusted publication registry"
-            )
+            raise AthenaValidationError("snapshot is missing from the trusted publication registry")
         if (
             publication.snapshot_id != self.snapshot_id
             or publication.artifact_digest != expected_artifact_digest
             or publication.semantic_digest != recomputed_semantic_digest
             or publication.schema_version != self.compatibility.schema_version
-            or publication.semantic_contract_version
-            != self.compatibility.semantic_contract_version
+            or publication.semantic_contract_version != self.compatibility.semantic_contract_version
             or publication.published_at < self.snapshot_attestation.attested_at
             or publication.published_at > as_of
         ):
@@ -5772,15 +6145,11 @@ class EvidenceSnapshot(AthenaBaseModel):
                 "snapshot evaluation requires either embedded identityEvidence or an "
                 "explicit trusted identity resolver"
             )
-        referenced_identity_ids = {
-            self.collector.collector_identity_evidence_ref
-        } | {
-            attempt.collector_identity_evidence_ref
-            for attempt in self.collector_attempts
-        } | {
-            record.collector_identity_evidence_ref
-            for record in self.evidence_records
-        }
+        referenced_identity_ids = (
+            {self.collector.collector_identity_evidence_ref}
+            | {attempt.collector_identity_evidence_ref for attempt in self.collector_attempts}
+            | {record.collector_identity_evidence_ref for record in self.evidence_records}
+        )
         resolution_source = list(identity_evidence or self.identity_evidence)
         resolved_identity_lookup: dict[str, CollectorIdentityEvidence] = {}
         for identity in resolution_source:
@@ -5804,8 +6173,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                     )
                 if resolved.identity_evidence_id != identity_ref:
                     raise AthenaValidationError(
-                        "trusted identity resolver must return the exact identityEvidenceId "
-                        "mapping"
+                        "trusted identity resolver must return the exact identityEvidenceId mapping"
                     )
                 resolved_identity_lookup[identity_ref] = resolved
         if set(resolved_identity_lookup) != referenced_identity_ids:
@@ -5813,20 +6181,17 @@ class EvidenceSnapshot(AthenaBaseModel):
                 "every referenced snapshot identity must resolve exactly once"
             )
         for identity in resolved_identity_lookup.values():
-            if (
-                identity.identity_evidence_digest
-                != compute_collector_identity_evidence_digest(identity)
+            if identity.identity_evidence_digest != compute_collector_identity_evidence_digest(
+                identity
             ):
                 raise AthenaValidationError(
                     "resolved identityEvidenceDigest mismatched the canonical identity proof"
                 )
         resolved_identity_digests = sorted(
-            identity.identity_evidence_digest
-            for identity in resolved_identity_lookup.values()
+            identity.identity_evidence_digest for identity in resolved_identity_lookup.values()
         )
         if (
-            resolved_identity_digests
-            != self.snapshot_attestation.identity_evidence_digests
+            resolved_identity_digests != self.snapshot_attestation.identity_evidence_digests
             or compute_artifact_digest(resolved_identity_digests)
             != self.snapshot_attestation.identity_evidence_set_digest
         ):
@@ -5834,8 +6199,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                 "resolved identity evidence digest set must exactly match the snapshot attestation"
             )
         if any(
-            identity.ingestion_signature.signed_at
-            > self.snapshot_attestation.attested_at
+            identity.ingestion_signature.signed_at > self.snapshot_attestation.attested_at
             for identity in resolved_identity_lookup.values()
         ):
             raise AthenaValidationError(
@@ -5852,9 +6216,7 @@ class EvidenceSnapshot(AthenaBaseModel):
             trusted_key_anchor=trusted_key_anchor,
             as_of=as_of,
         ):
-            raise AthenaValidationError(
-                "snapshot attestation cryptographic verification failed"
-            )
+            raise AthenaValidationError("snapshot attestation cryptographic verification failed")
         for identity in resolved_identity_lookup.values():
             if not identity.verify_signature(
                 key_resolver=key_resolver,
@@ -5892,8 +6254,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                 or derivation.schema_version != self.compatibility.schema_version
                 or derivation.semantic_contract_version
                 != self.compatibility.semantic_contract_version
-                or derivation.policy_contract_version
-                != self.compatibility.policy_contract_version
+                or derivation.policy_contract_version != self.compatibility.policy_contract_version
             ):
                 raise AthenaValidationError(
                     "signed ingestion derivation must exactly match snapshot collector "
@@ -5904,20 +6265,14 @@ class EvidenceSnapshot(AthenaBaseModel):
                 <= self.collected_at
                 < attempt_identity.verified_claims.expires_at
             ):
-                raise AthenaValidationError(
-                    "collector token must be valid at snapshot collectedAt"
-                )
+                raise AthenaValidationError("collector token must be valid at snapshot collectedAt")
             if attempt.attempt_started_at < self.collected_at or attempt.attempt_started_at > as_of:
                 raise AthenaValidationError(
                     "collector attempt timestamps must fall inside the snapshot collection window"
                 )
             response_received_at = getattr(attempt, "response_received_at", None)
-            if (
-                response_received_at is not None
-                and (
-                    response_received_at < self.collected_at
-                    or response_received_at > as_of
-                )
+            if response_received_at is not None and (
+                response_received_at < self.collected_at or response_received_at > as_of
             ):
                 raise AthenaValidationError(
                     "attempt response timestamps must be inside the collection "
@@ -5931,16 +6286,12 @@ class EvidenceSnapshot(AthenaBaseModel):
                     "timeout timestamps must be inside the collection window and before as_of"
                 )
             deadline_at = getattr(attempt, "deadline_at", None)
-            if deadline_at is not None and (
-                deadline_at < self.collected_at or deadline_at > as_of
-            ):
+            if deadline_at is not None and (deadline_at < self.collected_at or deadline_at > as_of):
                 raise AthenaValidationError(
                     "deadlineAt must fall inside the collection window and before as_of"
                 )
             observed_at = getattr(attempt, "observed_at", None)
-            if observed_at is not None and (
-                observed_at < self.collected_at or observed_at > as_of
-            ):
+            if observed_at is not None and (observed_at < self.collected_at or observed_at > as_of):
                 raise AthenaValidationError(
                     "observedAt must fall inside the collection window and before as_of"
                 )
@@ -6019,10 +6370,7 @@ class EvidenceSnapshot(AthenaBaseModel):
             if isinstance(record, ObservedRelationshipEvidenceRecord):
                 relationship = cast(ObservedRelationship, record.relationship)
                 relationship_observed_at = relationship.observed_at
-                if (
-                    relationship_observed_at < self.collected_at
-                    or relationship_observed_at > as_of
-                ):
+                if relationship_observed_at < self.collected_at or relationship_observed_at > as_of:
                     raise AthenaValidationError(
                         "observed relationship observedAt must fall inside the snapshot "
                         "collection window"
@@ -6091,9 +6439,7 @@ class EvidenceSnapshot(AthenaBaseModel):
                 as_of=as_of,
                 attempt=attempt_for_record,
             ):
-                raise AthenaValidationError(
-                    "evidence record identity evidence verification failed"
-                )
+                raise AthenaValidationError("evidence record identity evidence verification failed")
             if record.record_type == "evidenceGap":
                 gap_record = cast(EvidenceGapRecord, record)
                 if (
@@ -6244,6 +6590,7 @@ __all__ = [
     "GovernanceObjectiveScope",
     "GovernanceScope",
     "ProfileDefinition",
+    "ResolvedProfile",
     "ProfileOverride",
     "ProfileContinuitySettings",
     "ProfileSettings",
