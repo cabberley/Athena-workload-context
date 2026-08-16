@@ -7,6 +7,7 @@ from athena_context.contracts import (
     ResolvedProfile,
 )
 from athena_context.golden import (
+    GoldenPendingDecision,
     GoldenProfileResult,
     GoldenProofMismatchError,
     GoldenProofResult,
@@ -24,6 +25,7 @@ __all__ = [
     "__version__",
     "CompatibilityMetadata",
     "CanonicalWorkloadManifest",
+    "GoldenPendingDecision",
     "GoldenProfileResult",
     "GoldenProofMismatchError",
     "GoldenProofResult",

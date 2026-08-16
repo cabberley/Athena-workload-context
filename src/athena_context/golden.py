@@ -25,20 +25,48 @@ from athena_context.contracts import (
     verified_snapshot_context_verifier,
 )
 from athena_context.contracts.common import normalize_nfc_text
-from athena_context.contracts.manifest import FindingVerdict, ProofFact
+from athena_context.contracts.manifest import (
+    FindingVerdict,
+    ManifestFindingKind,
+    ProofFact,
+)
 from athena_context.fixtures import FixtureBundle, make_canonical_fixture_from_resources
 from athena_context.policy import evaluate_manifest_profile
 
 type GoldenProfileId = Literal["production", "development", "training"]
+type GoldenOracleStatus = Literal["complete", "pending"]
 
 GOLDEN_PROOF_AS_OF: Final = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
+WC002_MANIFEST_ID: Final = "wl-athena-wc002-canonical"
+WC002_MANIFEST_VERSION: Final = "1.0.0"
+WC002_MANIFEST_ARTIFACT_DIGEST: Final = (
+    "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6"
+)
+WC002_MANIFEST_SEMANTIC_DIGEST: Final = (
+    "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
+)
+WC002_SNAPSHOT_ID: Final = "snap-111111111111"
+WC002_SNAPSHOT_ARTIFACT_DIGEST: Final = (
+    "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
+)
+WC002_SNAPSHOT_SEMANTIC_DIGEST: Final = WC002_SNAPSHOT_ARTIFACT_DIGEST
 GOLDEN_PROFILE_IDS: Final[tuple[GoldenProfileId, ...]] = (
     "production",
     "development",
     "training",
 )
 GOLDEN_VERDICT_MATRIX: Final[
-    tuple[tuple[str, tuple[FindingVerdict, FindingVerdict, FindingVerdict]], ...]
+    tuple[
+        tuple[
+            str,
+            tuple[
+                FindingVerdict | None,
+                FindingVerdict | None,
+                FindingVerdict | None,
+            ],
+        ],
+        ...,
+    ]
 ] = (
     (
         "db-singleton-supported",
@@ -53,14 +81,51 @@ GOLDEN_VERDICT_MATRIX: Final[
         ("acceptedResidualRisk", "observation", "acceptedResidualRisk"),
     ),
     ("worker-db-zone-colocation", ("pass", "pass", "pass")),
-    ("web-zone-distribution", ("pass", "pass", "violation")),
+    ("web-zone-distribution", ("pass", "pass", None)),
 )
 
 _GOLDEN_CLAUSE_IDS = tuple(row[0] for row in GOLDEN_VERDICT_MATRIX)
+_FINDING_KIND_BY_CLAUSE: Final[dict[str, ManifestFindingKind]] = {
+    "db-singleton-supported": "technologyConstraint",
+    "db-zone-loss-spof": "actualSpof",
+    "db-zone-loss-acceptance": "riskAcceptance",
+    "worker-db-zone-colocation": "architectureConstraint",
+    "web-zone-distribution": "architectureConstraint",
+}
+_EVIDENCE_ROLES_BY_CLAUSE: Final[dict[str, tuple[str, ...]]] = {
+    "db-singleton-supported": ("database-primary",),
+    "db-zone-loss-spof": ("database-primary",),
+    "db-zone-loss-acceptance": ("database-primary",),
+    "worker-db-zone-colocation": ("worker", "database-primary"),
+    "web-zone-distribution": ("web",),
+}
+_RISK_ACCEPTANCE_BY_PROFILE: Final[dict[GoldenProfileId, str | None]] = {
+    "production": "ra-db-zone-loss-production",
+    "development": None,
+    "training": "ra-db-zone-loss-training",
+}
 
 
 class GoldenProofMismatchError(AthenaValidationError):
     """Raised when verified canonical inputs do not match the golden oracle."""
+
+
+@dataclass(frozen=True, slots=True)
+class GoldenPendingDecision:
+    """An observed outcome whose expected oracle verdict is not yet approved."""
+
+    profile_id: GoldenProfileId
+    clause_id: str
+    observed_verdict: FindingVerdict
+    reason: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "profileId": self.profile_id,
+            "clauseId": self.clause_id,
+            "observedVerdict": self.observed_verdict,
+            "reason": self.reason,
+        }
 
 
 def _utc_millisecond(value: datetime) -> str:
@@ -99,25 +164,34 @@ class GoldenProofResult:
     manifest_id: str
     manifest_version: str
     manifest_artifact_digest: str
+    manifest_semantic_digest: str
     snapshot_id: str
     snapshot_artifact_digest: str
     snapshot_semantic_digest: str
     snapshot_evidence_reference_set_digest: str
     profiles: tuple[GoldenProfileResult, ...]
+    pending_decisions: tuple[GoldenPendingDecision, ...]
+
+    @property
+    def oracle_status(self) -> GoldenOracleStatus:
+        return "pending" if self.pending_decisions else "complete"
 
     def _digest_payload(self) -> dict[str, object]:
         return {
             "artifactKind": "athenaGoldenProof",
             "artifactVersion": "1.0.0",
+            "oracleStatus": self.oracle_status,
             "asOf": _utc_millisecond(self.as_of),
             "manifestId": self.manifest_id,
             "manifestVersion": self.manifest_version,
             "manifestArtifactDigest": self.manifest_artifact_digest,
+            "manifestSemanticDigest": self.manifest_semantic_digest,
             "snapshotId": self.snapshot_id,
             "snapshotArtifactDigest": self.snapshot_artifact_digest,
             "snapshotSemanticDigest": self.snapshot_semantic_digest,
             "snapshotEvidenceReferenceSetDigest": self.snapshot_evidence_reference_set_digest,
             "profiles": [profile.to_payload() for profile in self.profiles],
+            "pendingDecisions": [decision.to_payload() for decision in self.pending_decisions],
         }
 
     @property
@@ -139,7 +213,10 @@ class GoldenProofResult:
         lines = [
             "# Athena golden proof",
             "",
+            f"- Oracle status: `{self.oracle_status}`",
             f"- Proof digest: `{self.proof_digest}`",
+            f"- Manifest artifact digest: `{self.manifest_artifact_digest}`",
+            f"- Manifest semantic digest: `{self.manifest_semantic_digest}`",
             f"- Snapshot: `{self.snapshot_id}`",
             f"- Snapshot artifact digest: `{self.snapshot_artifact_digest}`",
             f"- Snapshot semantic digest: `{self.snapshot_semantic_digest}`",
@@ -147,19 +224,27 @@ class GoldenProofResult:
             "| Clause | Production | Development | Training |",
             "|---|---|---|---|",
         ]
-        lines.extend(
-            "| "
-            + " | ".join(
-                (
-                    clause_id,
-                    verdicts_by_profile["production"][clause_id],
-                    verdicts_by_profile["development"][clause_id],
-                    verdicts_by_profile["training"][clause_id],
+        pending_cells = {
+            (decision.profile_id, decision.clause_id): decision
+            for decision in self.pending_decisions
+        }
+        for clause_id in _GOLDEN_CLAUSE_IDS:
+            cells = [clause_id]
+            for profile_id in GOLDEN_PROFILE_IDS:
+                pending = pending_cells.get((profile_id, clause_id))
+                cells.append(
+                    f"pending (observed: {pending.observed_verdict})"
+                    if pending is not None
+                    else verdicts_by_profile[profile_id][clause_id]
                 )
+            lines.append("| " + " | ".join(cells) + " |")
+        if self.pending_decisions:
+            lines.extend(("", "## Pending oracle decisions", ""))
+            lines.extend(
+                f"- `{decision.profile_id}/{decision.clause_id}`: "
+                f"{decision.reason} (observed `{decision.observed_verdict}`)"
+                for decision in self.pending_decisions
             )
-            + " |"
-            for clause_id in _GOLDEN_CLAUSE_IDS
-        )
         return "\n".join(lines)
 
 
@@ -352,12 +437,133 @@ def _finding_references(
     }
 
 
-def _expected_verdicts(
-    profile_index: int,
-) -> tuple[tuple[str, FindingVerdict], ...]:
-    return tuple(
-        (clause_id, verdicts[profile_index]) for clause_id, verdicts in GOLDEN_VERDICT_MATRIX
+def _validate_approved_wc002_fixture(bundle: FixtureBundle) -> None:
+    manifest = bundle.canonical_manifest
+    snapshot = bundle.canonical_snapshot
+    observed = (
+        manifest.manifest_id,
+        manifest.manifest_version,
+        manifest.compatibility.artifact_digest,
+        manifest.compatibility.semantic_digest,
+        manifest.compute_artifact_digest_value(),
+        manifest.compute_semantic_digest_value(),
+        bundle.manifest_digest,
+        snapshot.snapshot_id,
+        snapshot.compatibility.artifact_digest,
+        snapshot.compatibility.semantic_digest,
+        bundle.snapshot_artifact_digest,
+        bundle.snapshot_semantic_digest,
     )
+    approved = (
+        WC002_MANIFEST_ID,
+        WC002_MANIFEST_VERSION,
+        WC002_MANIFEST_ARTIFACT_DIGEST,
+        WC002_MANIFEST_SEMANTIC_DIGEST,
+        WC002_MANIFEST_ARTIFACT_DIGEST,
+        WC002_MANIFEST_SEMANTIC_DIGEST,
+        WC002_MANIFEST_ARTIFACT_DIGEST,
+        WC002_SNAPSHOT_ID,
+        WC002_SNAPSHOT_ARTIFACT_DIGEST,
+        WC002_SNAPSHOT_SEMANTIC_DIGEST,
+        WC002_SNAPSHOT_ARTIFACT_DIGEST,
+        WC002_SNAPSHOT_SEMANTIC_DIGEST,
+    )
+    if observed != approved:
+        raise GoldenProofMismatchError(
+            "fixture does not match the approved immutable WC-002 identities and digests"
+        )
+
+
+def _expected_verdict(
+    profile_id: GoldenProfileId,
+    clause_id: str,
+) -> FindingVerdict | None:
+    profile_index = GOLDEN_PROFILE_IDS.index(profile_id)
+    return next(
+        verdicts[profile_index]
+        for candidate_clause_id, verdicts in GOLDEN_VERDICT_MATRIX
+        if candidate_clause_id == clause_id
+    )
+
+
+def _expected_evidence_references(
+    evidence: EvidenceReferenceContext,
+    clause_id: str,
+) -> tuple[str, ...]:
+    expected_roles = {_normalized(role_ref) for role_ref in _EVIDENCE_ROLES_BY_CLAUSE[clause_id]}
+    return tuple(
+        sorted(
+            resource.evidence_ref.canonical_json()
+            for resource in evidence.resources
+            if _normalized(resource.role_ref) in expected_roles
+        )
+    )
+
+
+def _validate_finding_projection(
+    profile: ResolvedManifestProfile,
+    evidence: EvidenceReferenceContext,
+    findings: dict[str, ManifestFinding],
+) -> tuple[GoldenPendingDecision, ...]:
+    profile_id = cast(GoldenProfileId, profile.profile_id)
+    if set(findings) != set(_GOLDEN_CLAUSE_IDS):
+        raise GoldenProofMismatchError(
+            f"{profile_id} finding clauses do not match the golden oracle"
+        )
+
+    pending: list[GoldenPendingDecision] = []
+    for clause_id in _GOLDEN_CLAUSE_IDS:
+        finding = findings[clause_id]
+        expected_verdict = _expected_verdict(profile_id, clause_id)
+        expected_risk_acceptance = (
+            _RISK_ACCEPTANCE_BY_PROFILE[profile_id]
+            if clause_id in {"db-zone-loss-spof", "db-zone-loss-acceptance"}
+            else None
+        )
+        expected_scope = {
+            "governanceScopeType": "clause",
+            "manifestId": WC002_MANIFEST_ID,
+            "profileId": profile_id,
+            "clausePath": f"/constraints/{clause_id}",
+            "ownerRef": "ops-owner",
+        }
+        observed_references = tuple(
+            reference.canonical_json() for reference in finding.evidence_refs
+        )
+        expected_references = _expected_evidence_references(evidence, clause_id)
+        exact_projection_matches = (
+            finding.clause_id == clause_id
+            and finding.finding_kind == _FINDING_KIND_BY_CLAUSE[clause_id]
+            and finding.manifest_id == WC002_MANIFEST_ID
+            and finding.manifest_version == WC002_MANIFEST_VERSION
+            and finding.profile_id == profile_id
+            and finding.resolved_profile_digest == profile.resolved_profile_digest
+            and finding.governance_scope.model_dump(mode="json", by_alias=True, exclude_none=True)
+            == expected_scope
+            and observed_references == expected_references
+            and finding.risk_acceptance_ref == expected_risk_acceptance
+        )
+        if not exact_projection_matches:
+            raise GoldenProofMismatchError(
+                f"{profile_id}/{clause_id} finding projection does not match the golden oracle"
+            )
+        if expected_verdict is None:
+            pending.append(
+                GoldenPendingDecision(
+                    profile_id=profile_id,
+                    clause_id=clause_id,
+                    observed_verdict=finding.verdict,
+                    reason=(
+                        "expected verdict awaits a decision because immutable WC-002 "
+                        "contains web zones 1, 2, and 3 and Training requires 3"
+                    ),
+                )
+            )
+        elif finding.verdict != expected_verdict:
+            raise GoldenProofMismatchError(
+                f"{profile_id}/{clause_id} verdict does not match the golden oracle"
+            )
+    return tuple(pending)
 
 
 def run_golden_proof(
@@ -370,21 +576,17 @@ def run_golden_proof(
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise AthenaValidationError("golden proof as_of must be timezone-aware")
     bundle = fixture if fixture is not None else make_canonical_fixture_from_resources()
+    _validate_approved_wc002_fixture(bundle)
     manifest = bundle.canonical_manifest
     snapshot = bundle.canonical_snapshot
-    if (
-        bundle.manifest_digest != manifest.compatibility.artifact_digest
-        or bundle.snapshot_artifact_digest != snapshot.compatibility.artifact_digest
-        or bundle.snapshot_semantic_digest != snapshot.compatibility.semantic_digest
-    ):
-        raise AthenaValidationError("golden fixture digest metadata is stale")
 
     immutable_snapshot = snapshot.canonical_json()
     profile_results: list[GoldenProfileResult] = []
+    pending_decisions: list[GoldenPendingDecision] = []
     baseline_context_references: tuple[str, ...] | None = None
     baseline_finding_references: dict[str, tuple[str, ...]] | None = None
 
-    for profile_index, profile_id in enumerate(GOLDEN_PROFILE_IDS):
+    for profile_id in GOLDEN_PROFILE_IDS:
         profile = resolve_manifest_profile(manifest, profile_id, as_of=as_of)
         evidence = _build_evidence_context(profile, snapshot)
         verifier = _make_context_verifier(bundle, profile, as_of=as_of)
@@ -394,14 +596,8 @@ def run_golden_proof(
             as_of=as_of,
             verify_evidence_context=verifier,
         )
-        expected = _expected_verdicts(profile_index)
-        actual = tuple(
-            (clause_id, findings[clause_id].verdict)
-            for clause_id in _GOLDEN_CLAUSE_IDS
-            if clause_id in findings
-        )
-        if set(findings) != set(_GOLDEN_CLAUSE_IDS) or actual != expected:
-            raise GoldenProofMismatchError(f"{profile_id} verdicts do not match the golden oracle")
+        pending_decisions.extend(_validate_finding_projection(profile, evidence, findings))
+        actual = tuple((clause_id, findings[clause_id].verdict) for clause_id in _GOLDEN_CLAUSE_IDS)
 
         context_references = _canonical_references(evidence)
         finding_references = _finding_references(findings)
@@ -437,11 +633,13 @@ def run_golden_proof(
         manifest_id=manifest.manifest_id,
         manifest_version=manifest.manifest_version,
         manifest_artifact_digest=manifest.compatibility.artifact_digest,
+        manifest_semantic_digest=manifest.compatibility.semantic_digest,
         snapshot_id=snapshot.snapshot_id,
         snapshot_artifact_digest=snapshot.compatibility.artifact_digest,
         snapshot_semantic_digest=snapshot.compatibility.semantic_digest,
         snapshot_evidence_reference_set_digest=compute_evidence_reference_set_digest(snapshot),
         profiles=tuple(profile_results),
+        pending_decisions=tuple(pending_decisions),
     )
 
 
@@ -449,6 +647,14 @@ __all__ = [
     "GOLDEN_PROFILE_IDS",
     "GOLDEN_PROOF_AS_OF",
     "GOLDEN_VERDICT_MATRIX",
+    "WC002_MANIFEST_ARTIFACT_DIGEST",
+    "WC002_MANIFEST_ID",
+    "WC002_MANIFEST_SEMANTIC_DIGEST",
+    "WC002_MANIFEST_VERSION",
+    "WC002_SNAPSHOT_ARTIFACT_DIGEST",
+    "WC002_SNAPSHOT_ID",
+    "WC002_SNAPSHOT_SEMANTIC_DIGEST",
+    "GoldenPendingDecision",
     "GoldenProfileResult",
     "GoldenProofMismatchError",
     "GoldenProofResult",

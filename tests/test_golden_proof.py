@@ -24,6 +24,7 @@ from athena_context.contracts import (
 )
 from athena_context.fixtures import (
     FixtureBundle,
+    load_canonical_fixture_resource,
     load_canonical_manifest_resource,
     load_canonical_snapshot_resource,
     make_canonical_fixture_from_resources,
@@ -31,13 +32,15 @@ from athena_context.fixtures import (
 )
 from athena_context.policy import evaluate_manifest_profile
 
-EXPECTED_MANIFEST_DIGEST = "sha256:48ce3405aa547ae6df3180223b0a99bc5fa70a848d3a7be48f507ab0ffadc9f8"
-EXPECTED_SNAPSHOT_DIGEST = "sha256:2a8a6a0e946d01944a1e262d1448bda53ddbd3e06a77a788ab791d99f35dda79"
-EXPECTED_SNAPSHOT_REFERENCE_SET_DIGEST = (
-    "sha256:1b19ac486a4d26a8594a035ffa619589301d1cf048be2cb0c5f053908767e953"
+EXPECTED_MANIFEST_DIGEST = "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6"
+EXPECTED_MANIFEST_SEMANTIC_DIGEST = (
+    "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
 )
-EXPECTED_PROOF_DIGEST = "sha256:8b542d40a4a1666c9eed6b345e31c0dc5dd1a46a1637ba3eaa66df0473d6104e"
-EXPECTED_BY_PROFILE = {
+EXPECTED_SNAPSHOT_DIGEST = "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
+EXPECTED_SNAPSHOT_REFERENCE_SET_DIGEST = (
+    "sha256:ce17a211904ff0dd4bbe6359e74c427799227b2d99ff1fcb2a27f2c598b6dc9c"
+)
+EXPECTED_OBSERVED_BY_PROFILE = {
     "production": {
         "db-singleton-supported": "expectedConstraint",
         "db-zone-loss-spof": "acceptedResidualRisk",
@@ -57,7 +60,7 @@ EXPECTED_BY_PROFILE = {
         "db-zone-loss-spof": "acceptedResidualRisk",
         "db-zone-loss-acceptance": "acceptedResidualRisk",
         "worker-db-zone-colocation": "pass",
-        "web-zone-distribution": "violation",
+        "web-zone-distribution": "pass",
     },
 }
 
@@ -98,28 +101,50 @@ def _verified_production_boundary() -> tuple[
 
 
 def test_public_runner_emits_exact_immutable_release_evidence() -> None:
+    manifest_before = load_canonical_manifest_resource()
     packaged_before = load_canonical_snapshot_resource()
+    combined_before = load_canonical_fixture_resource()
     result = golden.run_golden_proof()
 
     assert run_root_golden_proof is golden.run_golden_proof
+    assert result.manifest_id == golden.WC002_MANIFEST_ID
     assert result.manifest_artifact_digest == EXPECTED_MANIFEST_DIGEST
+    assert result.manifest_semantic_digest == EXPECTED_MANIFEST_SEMANTIC_DIGEST
+    assert result.snapshot_id == golden.WC002_SNAPSHOT_ID
     assert result.snapshot_artifact_digest == EXPECTED_SNAPSHOT_DIGEST
     assert result.snapshot_semantic_digest == EXPECTED_SNAPSHOT_DIGEST
     assert result.snapshot_evidence_reference_set_digest == EXPECTED_SNAPSHOT_REFERENCE_SET_DIGEST
-    assert result.proof_digest == EXPECTED_PROOF_DIGEST
+    assert result.oracle_status == "pending"
+    assert result.pending_decisions == (
+        golden.GoldenPendingDecision(
+            profile_id="training",
+            clause_id="web-zone-distribution",
+            observed_verdict="pass",
+            reason=(
+                "expected verdict awaits a decision because immutable WC-002 "
+                "contains web zones 1, 2, and 3 and Training requires 3"
+            ),
+        ),
+    )
+    assert golden.GOLDEN_VERDICT_MATRIX[-1] == (
+        "web-zone-distribution",
+        ("pass", "pass", None),
+    )
     assert tuple(profile.profile_id for profile in result.profiles) == golden.GOLDEN_PROFILE_IDS
     assert {
         profile.profile_id: dict(profile.verdicts) for profile in result.profiles
-    } == EXPECTED_BY_PROFILE
+    } == EXPECTED_OBSERVED_BY_PROFILE
+    assert load_canonical_manifest_resource() == manifest_before
     assert load_canonical_snapshot_resource() == packaged_before
+    assert load_canonical_fixture_resource() == combined_before
 
     payload = result.to_payload()
     digest_payload = {key: value for key, value in payload.items() if key != "proofDigest"}
     assert compute_artifact_digest(digest_payload) == result.proof_digest
     assert json.loads(result.canonical_json()) == payload
     rendered = result.render_text()
-    assert f"Proof digest: `{EXPECTED_PROOF_DIGEST}`" in rendered
-    assert "| web-zone-distribution | pass | pass | violation |" in rendered
+    assert f"Proof digest: `{result.proof_digest}`" in rendered
+    assert "| web-zone-distribution | pass | pass | pending (observed: pass) |" in rendered
     with pytest.raises(FrozenInstanceError):
         result.snapshot_id = "snap-mutated"  # type: ignore[misc]
 
@@ -145,12 +170,149 @@ def test_every_profile_reuses_identical_snapshot_and_finding_evidence_refs() -> 
             assert json.loads(profile.findings[finding_index])["evidenceRefs"] == expected_refs
 
 
+def test_full_finding_projection_is_exact_for_every_profile() -> None:
+    result = golden.run_golden_proof()
+    expected_kinds = {
+        "db-singleton-supported": "technologyConstraint",
+        "db-zone-loss-spof": "actualSpof",
+        "db-zone-loss-acceptance": "riskAcceptance",
+        "worker-db-zone-colocation": "architectureConstraint",
+        "web-zone-distribution": "architectureConstraint",
+    }
+    expected_pointers = {
+        "db-singleton-supported": ["/items/0"],
+        "db-zone-loss-spof": ["/items/0"],
+        "db-zone-loss-acceptance": ["/items/0"],
+        "worker-db-zone-colocation": ["/items/1", "/items/0", "/items/2"],
+        "web-zone-distribution": ["/items/5", "/items/3", "/items/4"],
+    }
+    expected_acceptances = {
+        "production": "ra-db-zone-loss-production",
+        "development": None,
+        "training": "ra-db-zone-loss-training",
+    }
+
+    for profile in result.profiles:
+        for finding_text in profile.findings:
+            finding = json.loads(finding_text)
+            clause_id = finding["clauseId"]
+            assert finding["findingKind"] == expected_kinds[clause_id]
+            assert finding["verdict"] == EXPECTED_OBSERVED_BY_PROFILE[profile.profile_id][clause_id]
+            assert finding["manifestId"] == golden.WC002_MANIFEST_ID
+            assert finding["manifestVersion"] == golden.WC002_MANIFEST_VERSION
+            assert finding["profileId"] == profile.profile_id
+            assert finding["resolvedProfileDigest"] == profile.resolved_profile_digest
+            assert finding["governanceScope"] == {
+                "governanceScopeType": "clause",
+                "manifestId": golden.WC002_MANIFEST_ID,
+                "profileId": profile.profile_id,
+                "clausePath": f"/constraints/{clause_id}",
+                "ownerRef": "ops-owner",
+            }
+            assert [
+                reference["sourceResponsePointer"] for reference in finding["evidenceRefs"]
+            ] == expected_pointers[clause_id]
+            assert all(
+                reference["snapshotArtifactDigest"] == EXPECTED_SNAPSHOT_DIGEST
+                and reference["snapshotSemanticDigest"] == EXPECTED_SNAPSHOT_DIGEST
+                for reference in finding["evidenceRefs"]
+            )
+            expected_acceptance = (
+                expected_acceptances[profile.profile_id]
+                if clause_id in {"db-zone-loss-spof", "db-zone-loss-acceptance"}
+                else None
+            )
+            assert finding.get("riskAcceptanceRef") == expected_acceptance
+
+
 def test_golden_artifact_is_byte_deterministic() -> None:
     first = golden.run_golden_proof()
     second = golden.run_golden_proof()
 
     assert first.canonical_json() == second.canonical_json()
     assert first.proof_digest == second.proof_digest
+
+
+def test_internally_consistent_non_wc002_fixture_is_rejected() -> None:
+    def mutate_display_name(payload: dict[str, Any]) -> None:
+        payload["workload"]["displayName"] = "Synthetic non-approved consistent workload"
+
+    fixture = _fixture_with_manifest(mutate_display_name)
+    assert (
+        fixture.canonical_manifest.compatibility.artifact_digest
+        == fixture.canonical_manifest.compute_artifact_digest_value()
+    )
+    assert (
+        fixture.canonical_manifest.compatibility.semantic_digest
+        == fixture.canonical_manifest.compute_semantic_digest_value()
+    )
+    with pytest.raises(
+        golden.GoldenProofMismatchError,
+        match="approved immutable WC-002",
+    ):
+        golden.run_golden_proof(fixture=fixture)
+
+
+def test_renamed_acceptances_are_rejected_even_when_manifest_graph_is_consistent() -> None:
+    def rename_acceptances(payload: dict[str, Any]) -> None:
+        for profile in payload["profiles"].values():
+            old_id = profile["riskAcceptances"][0]["riskAcceptanceId"]
+            new_id = old_id + "-renamed"
+            profile["riskAcceptances"][0]["riskAcceptanceId"] = new_id
+            for constraint in profile["constraints"]:
+                if constraint.get("riskAcceptanceRef") == old_id:
+                    constraint["riskAcceptanceRef"] = new_id
+
+    fixture = _fixture_with_manifest(rename_acceptances)
+    with pytest.raises(
+        golden.GoldenProofMismatchError,
+        match="approved immutable WC-002",
+    ):
+        golden.run_golden_proof(fixture=fixture)
+
+
+def test_finding_projection_rejects_renamed_acceptance_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authoritative_evaluator = golden.evaluate_manifest_profile
+
+    def renamed_acceptance(*args: Any, **kwargs: Any) -> Any:
+        findings = authoritative_evaluator(*args, **kwargs)
+        findings["db-zone-loss-spof"].risk_acceptance_ref = "renamed-acceptance"
+        return findings
+
+    monkeypatch.setattr(golden, "evaluate_manifest_profile", renamed_acceptance)
+    with pytest.raises(
+        golden.GoldenProofMismatchError,
+        match="production/db-zone-loss-spof finding projection",
+    ):
+        golden.run_golden_proof()
+
+
+@pytest.mark.parametrize("mutation", ["finding-kind", "scope", "evidence-refs"])
+def test_finding_projection_rejects_non_verdict_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    authoritative_evaluator = golden.evaluate_manifest_profile
+
+    def drifted_projection(*args: Any, **kwargs: Any) -> Any:
+        findings = authoritative_evaluator(*args, **kwargs)
+        finding = findings["db-singleton-supported"]
+        if mutation == "finding-kind":
+            finding.finding_kind = "architectureConstraint"
+        elif mutation == "scope":
+            finding.governance_scope.owner_ref = "renamed-owner"
+        else:
+            finding.evidence_refs = findings["web-zone-distribution"].evidence_refs
+        return findings
+
+    monkeypatch.setattr(golden, "evaluate_manifest_profile", drifted_projection)
+    with pytest.raises(
+        golden.GoldenProofMismatchError,
+        match="production/db-singleton-supported finding projection",
+    ):
+        golden.run_golden_proof()
 
 
 def test_removing_required_constraint_fails_closed() -> None:
@@ -169,8 +331,8 @@ def test_removing_required_constraint_fails_closed() -> None:
 
     fixture = _fixture_with_manifest(remove_constraint)
     with pytest.raises(
-        AthenaValidationError,
-        match="unresolved relationship sourceClause|missing mandatory protected",
+        golden.GoldenProofMismatchError,
+        match="approved immutable WC-002",
     ):
         golden.run_golden_proof(fixture=fixture)
 
@@ -183,8 +345,8 @@ def test_expired_risk_acceptance_cannot_match_the_oracle() -> None:
 
     fixture = _fixture_with_manifest(expire_acceptances)
     with pytest.raises(
-        AthenaValidationError,
-        match="active|golden oracle",
+        golden.GoldenProofMismatchError,
+        match="approved immutable WC-002",
     ):
         golden.run_golden_proof(fixture=fixture)
 
