@@ -185,6 +185,14 @@ def _require_unique(items: Iterable[AthenaBaseModel], attribute: str, label: str
         seen.add(key)
 
 
+def _require_unique_text(values: Iterable[str], label: str) -> None:
+    normalized = [_normalized_id(value) for value in values]
+    if len(normalized) != len(set(normalized)):
+        raise AthenaValidationError(
+            f"duplicate {label} after NFC+casefold normalization"
+        )
+
+
 class TagEquals(AthenaBaseModel):
     key: str = Field(..., min_length=1, max_length=128)
     value: str = Field(..., min_length=1, max_length=256)
@@ -196,12 +204,25 @@ class ResourceIdListSelector(AthenaBaseModel):
     resource_ids: list[str] = Field(..., alias="resourceIds", min_length=1, max_length=200)
     max_matches: int = Field(..., alias="maxMatches", ge=1, le=1000)
 
+    @model_validator(mode="after")
+    def validate_resource_ids(self) -> ResourceIdListSelector:
+        _require_unique_text(self.resource_ids, "selector resource id")
+        return self
+
 
 class TagPredicateSelector(AthenaBaseModel):
     selector_type: Literal["tagPredicate"] = Field(..., alias="selectorType")
     selector_id: str = Field(..., alias="selectorId", min_length=1, max_length=128)
     predicates: list[TagEquals] = Field(..., min_length=1, max_length=20)
     max_matches: int = Field(..., alias="maxMatches", ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def validate_predicates(self) -> TagPredicateSelector:
+        _require_unique_text(
+            (predicate.key for predicate in self.predicates),
+            "tag predicate key",
+        )
+        return self
 
 
 class NamePredicateSelector(AthenaBaseModel):
@@ -237,6 +258,12 @@ class ResourceTypeSelector(AthenaBaseModel):
     resource_groups: list[str] = Field(default_factory=list, alias="resourceGroups", max_length=20)
     max_matches: int = Field(..., alias="maxMatches", ge=1, le=1000)
 
+    @model_validator(mode="after")
+    def validate_filters(self) -> ResourceTypeSelector:
+        _require_unique_text(self.locations, "selector location")
+        _require_unique_text(self.resource_groups, "selector resource group")
+        return self
+
 
 class VmssSelector(AthenaBaseModel):
     selector_type: Literal["vmScaleSet"] = Field(..., alias="selectorType")
@@ -246,6 +273,11 @@ class VmssSelector(AthenaBaseModel):
     )
     instance_ids: list[str] = Field(default_factory=list, alias="instanceIds", max_length=200)
     max_matches: int = Field(..., alias="maxMatches", ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def validate_instance_ids(self) -> VmssSelector:
+        _require_unique_text(self.instance_ids, "VM scale set instance id")
+        return self
 
 
 class LoadBalancerBackendSelector(AthenaBaseModel):
@@ -1109,6 +1141,7 @@ class CanonicalWorkloadManifest(AthenaBaseModel):
     @model_validator(mode="after")
     def validate_manifest_ids(self) -> CanonicalWorkloadManifest:
         _require_supported_compatibility(self.compatibility, artifact_kind="workloadManifest")
+        _require_unique_text(self.workload.environments, "workload environment")
         normalized_profiles: set[str] = set()
         for key, profile in self.profiles.items():
             normalized = _normalized_id(key)
@@ -1175,6 +1208,7 @@ class CanonicalWorkloadManifest(AthenaBaseModel):
             ],
         ]
         for item in applicable_items:
+            _require_unique_text(item.profiles, "profile applicability reference")
             for applicable_profile in item.profiles:
                 if _normalized_id(applicable_profile) not in normalized_profiles:
                     raise AthenaValidationError("profile applicability reference is unresolved")
@@ -1184,11 +1218,42 @@ class CanonicalWorkloadManifest(AthenaBaseModel):
         ]
         for relationship in applicable_relationships:
             if isinstance(relationship, DeclaredManifestRelationship):
+                _require_unique_text(
+                    relationship.profiles,
+                    "relationship profile applicability reference",
+                )
                 for applicable_profile in relationship.profiles:
                     if _normalized_id(applicable_profile) not in normalized_profiles:
                         raise AthenaValidationError(
                             "relationship profile applicability is unresolved"
                         )
+        risks = [
+            *self.risk_acceptances,
+            *[
+                risk
+                for profile in self.profiles.values()
+                for risk in profile.risk_acceptances
+            ],
+        ]
+        for risk in risks:
+            _require_unique_text(risk.linked_control_refs, "linked control reference")
+        for profile in self.profiles.values():
+            for override in profile.weakening_overrides:
+                _require_unique_text(
+                    override.profiles,
+                    "weakening override profile applicability reference",
+                )
+                for applicable_profile in override.profiles:
+                    if _normalized_id(applicable_profile) not in normalized_profiles:
+                        raise AthenaValidationError(
+                            "weakening override profile applicability is unresolved"
+                        )
+            disabled_keys = [
+                f"{item.target_kind}\0{_normalized_id(item.target_ref)}"
+                for item in profile.disabled_refs
+            ]
+            if len(disabled_keys) != len(set(disabled_keys)):
+                raise AthenaValidationError("duplicate normalized disabled reference")
         return self
 
     def compute_artifact_digest_value(self) -> str:
@@ -1271,6 +1336,447 @@ def _variant(item: AthenaBaseModel) -> tuple[str, ...]:
         )
     return values
 
+
+def _selector_tree(selector: ManifestSelector) -> Iterable[ManifestSelector | AtomicSelector]:
+    yield selector
+    if isinstance(selector, (CompositeAllSelector, CompositeAnySelector)):
+        yield from selector.children
+
+
+def _selector_fingerprint(selector: ManifestSelector) -> str:
+    payload = selector.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    def remove_identity(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        value.pop("selectorId", None)
+        value.pop("maxMatches", None)
+        for field_name in (
+            "resourceIds",
+            "locations",
+            "resourceGroups",
+            "instanceIds",
+        ):
+            items = value.get(field_name)
+            if isinstance(items, list):
+                items.sort(key=lambda item: _normalized_id(str(item)))
+        predicates = value.get("predicates")
+        if isinstance(predicates, list):
+            predicates.sort(
+                key=lambda item: (
+                    _normalized_id(str(item.get("key", "")))
+                    if isinstance(item, dict)
+                    else ""
+                )
+            )
+        children = value.get("children")
+        if isinstance(children, list):
+            children.sort(
+                key=lambda item: (
+                    _normalized_id(str(item.get("selectorId", "")))
+                    if isinstance(item, dict)
+                    else ""
+                )
+            )
+            for child in children:
+                remove_identity(child)
+
+    remove_identity(payload)
+    return compute_artifact_digest(payload)
+
+
+def _normalized_filter_is_narrower(previous: list[str], current: list[str]) -> bool:
+    previous_values = {_normalized_id(value) for value in previous}
+    current_values = {_normalized_id(value) for value in current}
+    if not previous_values:
+        return True
+    return bool(current_values) and current_values.issubset(previous_values)
+
+
+def _selector_override_is_narrower(
+    previous: ManifestSelector | AtomicSelector,
+    current: ManifestSelector | AtomicSelector,
+) -> bool:
+    if previous.selector_type != current.selector_type or current.max_matches > previous.max_matches:
+        return False
+    if isinstance(previous, ResourceIdListSelector) and isinstance(
+        current, ResourceIdListSelector
+    ):
+        return {
+            _normalized_id(value) for value in current.resource_ids
+        }.issubset({_normalized_id(value) for value in previous.resource_ids})
+    if isinstance(previous, TagPredicateSelector) and isinstance(
+        current, TagPredicateSelector
+    ):
+        previous_predicates = {
+            _normalized_id(item.key): normalize_nfc_text(item.value)
+            for item in previous.predicates
+        }
+        current_predicates = {
+            _normalized_id(item.key): normalize_nfc_text(item.value)
+            for item in current.predicates
+        }
+        return all(current_predicates.get(key) == value for key, value in previous_predicates.items())
+    if isinstance(previous, NamePredicateSelector) and isinstance(
+        current, NamePredicateSelector
+    ):
+        prefix_is_narrower = previous.prefix is None or (
+            current.prefix is not None
+            and normalize_nfc_text(current.prefix).startswith(normalize_nfc_text(previous.prefix))
+        )
+        suffix_is_narrower = previous.suffix is None or (
+            current.suffix is not None
+            and normalize_nfc_text(current.suffix).endswith(normalize_nfc_text(previous.suffix))
+        )
+        return prefix_is_narrower and suffix_is_narrower
+    if isinstance(previous, ResourceTypeSelector) and isinstance(
+        current, ResourceTypeSelector
+    ):
+        return (
+            _normalized_id(previous.resource_type) == _normalized_id(current.resource_type)
+            and _normalized_filter_is_narrower(previous.locations, current.locations)
+            and _normalized_filter_is_narrower(
+                previous.resource_groups, current.resource_groups
+            )
+        )
+    if isinstance(previous, VmssSelector) and isinstance(current, VmssSelector):
+        return (
+            _normalized_id(previous.scale_set_resource_id)
+            == _normalized_id(current.scale_set_resource_id)
+            and _normalized_filter_is_narrower(
+                previous.instance_ids,
+                current.instance_ids,
+            )
+        )
+    if isinstance(previous, LoadBalancerBackendSelector) and isinstance(
+        current, LoadBalancerBackendSelector
+    ):
+        return (
+            _normalized_id(previous.load_balancer_resource_id)
+            == _normalized_id(current.load_balancer_resource_id)
+            and _normalized_id(previous.backend_pool_name)
+            == _normalized_id(current.backend_pool_name)
+        )
+    if isinstance(previous, SubnetSelector) and isinstance(current, SubnetSelector):
+        return _normalized_id(previous.subnet_resource_id) == _normalized_id(
+            current.subnet_resource_id
+        )
+    if isinstance(previous, ImageSelector) and isinstance(current, ImageSelector):
+        same_image = (
+            _normalized_id(previous.publisher) == _normalized_id(current.publisher)
+            and _normalized_id(previous.offer) == _normalized_id(current.offer)
+            and _normalized_id(previous.sku) == _normalized_id(current.sku)
+        )
+        version_is_narrower = previous.version is None or (
+            current.version is not None
+            and _normalized_id(previous.version) == _normalized_id(current.version)
+        )
+        return same_image and version_is_narrower
+    if isinstance(previous, ProvenanceSelector) and isinstance(
+        current, ProvenanceSelector
+    ):
+        return (
+            _normalized_id(previous.collector_tool_name)
+            == _normalized_id(current.collector_tool_name)
+            and previous.collector_tool_version == current.collector_tool_version
+            and _normalized_id(previous.identity_evidence_ref)
+            == _normalized_id(current.identity_evidence_ref)
+        )
+    if isinstance(previous, (CompositeAllSelector, CompositeAnySelector)) and isinstance(
+        current, (CompositeAllSelector, CompositeAnySelector)
+    ):
+        previous_children = {
+            _normalized_id(child.selector_id): child for child in previous.children
+        }
+        current_children = {
+            _normalized_id(child.selector_id): child for child in current.children
+        }
+        return previous_children.keys() == current_children.keys() and all(
+            _selector_override_is_narrower(
+                previous_children[child_id],
+                current_children[child_id],
+            )
+            for child_id in previous_children
+        )
+    return False
+
+
+def _normalized_filters_overlap(left: list[str], right: list[str]) -> bool:
+    if not left or not right:
+        return True
+    return bool(
+        {_normalized_id(value) for value in left}
+        & {_normalized_id(value) for value in right}
+    )
+
+
+def _selectors_may_overlap(left: ManifestSelector, right: ManifestSelector) -> bool:
+    if isinstance(left, ResourceIdListSelector) and isinstance(
+        right, ResourceIdListSelector
+    ):
+        return bool(
+            {_normalized_id(value) for value in left.resource_ids}
+            & {_normalized_id(value) for value in right.resource_ids}
+        )
+    if isinstance(left, TagPredicateSelector) and isinstance(
+        right, TagPredicateSelector
+    ):
+        left_predicates = {
+            _normalized_id(item.key): normalize_nfc_text(item.value)
+            for item in left.predicates
+        }
+        right_predicates = {
+            _normalized_id(item.key): normalize_nfc_text(item.value)
+            for item in right.predicates
+        }
+        return not any(
+            key in right_predicates and right_predicates[key] != value
+            for key, value in left_predicates.items()
+        )
+    if isinstance(left, NamePredicateSelector) and isinstance(
+        right, NamePredicateSelector
+    ):
+        prefixes_overlap = (
+            left.prefix is None
+            or right.prefix is None
+            or normalize_nfc_text(left.prefix).startswith(normalize_nfc_text(right.prefix))
+            or normalize_nfc_text(right.prefix).startswith(normalize_nfc_text(left.prefix))
+        )
+        suffixes_overlap = (
+            left.suffix is None
+            or right.suffix is None
+            or normalize_nfc_text(left.suffix).endswith(normalize_nfc_text(right.suffix))
+            or normalize_nfc_text(right.suffix).endswith(normalize_nfc_text(left.suffix))
+        )
+        return prefixes_overlap and suffixes_overlap
+    if isinstance(left, ResourceTypeSelector) and isinstance(
+        right, ResourceTypeSelector
+    ):
+        return (
+            _normalized_id(left.resource_type) == _normalized_id(right.resource_type)
+            and _normalized_filters_overlap(left.locations, right.locations)
+            and _normalized_filters_overlap(left.resource_groups, right.resource_groups)
+        )
+    if isinstance(left, VmssSelector) and isinstance(right, VmssSelector):
+        return (
+            _normalized_id(left.scale_set_resource_id)
+            == _normalized_id(right.scale_set_resource_id)
+            and _normalized_filters_overlap(left.instance_ids, right.instance_ids)
+        )
+    if isinstance(left, LoadBalancerBackendSelector) and isinstance(
+        right, LoadBalancerBackendSelector
+    ):
+        return (
+            _normalized_id(left.load_balancer_resource_id)
+            == _normalized_id(right.load_balancer_resource_id)
+            and _normalized_id(left.backend_pool_name)
+            == _normalized_id(right.backend_pool_name)
+        )
+    if isinstance(left, SubnetSelector) and isinstance(right, SubnetSelector):
+        return _normalized_id(left.subnet_resource_id) == _normalized_id(
+            right.subnet_resource_id
+        )
+    if isinstance(left, ImageSelector) and isinstance(right, ImageSelector):
+        return (
+            _normalized_id(left.publisher) == _normalized_id(right.publisher)
+            and _normalized_id(left.offer) == _normalized_id(right.offer)
+            and _normalized_id(left.sku) == _normalized_id(right.sku)
+            and (
+                left.version is None
+                or right.version is None
+                or _normalized_id(left.version) == _normalized_id(right.version)
+            )
+        )
+    if isinstance(left, ProvenanceSelector) and isinstance(
+        right, ProvenanceSelector
+    ):
+        return (
+            _normalized_id(left.collector_tool_name)
+            == _normalized_id(right.collector_tool_name)
+            and left.collector_tool_version == right.collector_tool_version
+            and _normalized_id(left.identity_evidence_ref)
+            == _normalized_id(right.identity_evidence_ref)
+        )
+    return False
+
+
+def _validate_resolved_selectors(roles: list[ManifestRole]) -> None:
+    selector_ids: dict[str, str] = {}
+    selector_fingerprints: dict[str, str] = {}
+    selectors: list[tuple[str, ManifestSelector]] = []
+    for role in roles:
+        for selector in role.selectors:
+            for nested in _selector_tree(selector):
+                selector_id = _normalized_id(nested.selector_id)
+                previous_role = selector_ids.get(selector_id)
+                if previous_role is not None:
+                    raise AthenaValidationError(
+                        "selector refs must resolve exactly once; "
+                        f"{nested.selector_id!r} is used by {previous_role!r} and {role.role_id!r}"
+                    )
+                selector_ids[selector_id] = role.role_id
+            fingerprint = _selector_fingerprint(selector)
+            previous_role = selector_fingerprints.get(fingerprint)
+            if previous_role is not None:
+                raise AthenaValidationError(
+                    "ambiguous selectors have identical semantics for roles "
+                    f"{previous_role!r} and {role.role_id!r}"
+                )
+            selector_fingerprints[fingerprint] = role.role_id
+            for previous_role, previous_selector in selectors:
+                if (
+                    _normalized_id(previous_role) != _normalized_id(role.role_id)
+                    and _selectors_may_overlap(previous_selector, selector)
+                ):
+                    raise AthenaValidationError(
+                        "ambiguous selectors may bind one resource to multiple roles"
+                    )
+            selectors.append((role.role_id, selector))
+
+
+def _validate_inherited_semantics(
+    *,
+    child: ManifestProfile,
+    inherited_roles: list[ManifestRole],
+    roles: list[ManifestRole],
+    inherited_relationships: list[ManifestRelationship],
+    relationships: list[ManifestRelationship],
+    inherited_constraints: list[ManifestConstraint],
+    constraints: list[ManifestConstraint],
+    inherited_controls: list[ManifestControl],
+    controls: list[ManifestControl],
+    inherited_risks: list[ManifestRiskAcceptance],
+    risks: list[ManifestRiskAcceptance],
+    as_of: datetime,
+) -> None:
+    inherited_roles_by_id = {
+        _normalized_id(item.role_id): item for item in inherited_roles
+    }
+    roles_by_id = {_normalized_id(item.role_id): item for item in roles}
+    child_role_ids = {_normalized_id(item.role_id) for item in child.roles}
+    for role_id in child_role_ids & inherited_roles_by_id.keys():
+        previous = inherited_roles_by_id[role_id]
+        current = roles_by_id[role_id]
+        previous_selectors = {
+            _normalized_id(item.selector_id): item for item in previous.selectors
+        }
+        current_selectors = {
+            _normalized_id(item.selector_id): item for item in current.selectors
+        }
+        if current_selectors.keys() != previous_selectors.keys():
+            raise AthenaValidationError(
+                f"direct selector set expansion is ambiguous for inherited role {current.role_id}"
+            )
+        for selector_id, previous_selector in previous_selectors.items():
+            current_selector = current_selectors[selector_id]
+            if (
+                previous_selector.model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                )
+                != current_selector.model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                )
+                and not _selector_override_is_narrower(
+                    previous_selector,
+                    current_selector,
+                )
+            ):
+                raise AthenaValidationError(
+                    "direct selector weakening or ambiguous selector override "
+                    f"requires a new selector id: {current_selector.selector_id}"
+                )
+
+    def reject_applicability_removal(
+        inherited: Iterable[AthenaBaseModel],
+        resolved: Iterable[AthenaBaseModel],
+        *,
+        key_attribute: str,
+    ) -> None:
+        inherited_by_id = {
+            _normalized_id(_item_key(item, key_attribute)): item for item in inherited
+        }
+        for item in resolved:
+            previous = inherited_by_id.get(
+                _normalized_id(_item_key(item, key_attribute))
+            )
+            if previous is None or not hasattr(previous, "profiles") or not hasattr(
+                item, "profiles"
+            ):
+                continue
+            previous_profiles = {
+                _normalized_id(value) for value in previous.profiles
+            }
+            current_profiles = {_normalized_id(value) for value in item.profiles}
+            child_id = _normalized_id(child.profile_id)
+            if child_id in previous_profiles and child_id not in current_profiles:
+                raise AthenaValidationError(
+                    "direct applicability weakening requires an explicit disabledRef"
+                )
+
+    reject_applicability_removal(
+        inherited_relationships,
+        relationships,
+        key_attribute="relationship_id",
+    )
+    reject_applicability_removal(
+        inherited_constraints,
+        constraints,
+        key_attribute="constraint_id",
+    )
+    reject_applicability_removal(
+        inherited_controls,
+        controls,
+        key_attribute="control_id",
+    )
+    reject_applicability_removal(
+        inherited_risks,
+        risks,
+        key_attribute="risk_acceptance_id",
+    )
+
+    inherited_controls_by_id = {
+        _normalized_id(item.control_id): item for item in inherited_controls
+    }
+    control_health_strength = {
+        "effective": 5,
+        "degraded": 4,
+        "unknown": 3,
+        "missing": 2,
+        "expired": 2,
+        "notApplicable": 1,
+    }
+    for control in controls:
+        previous = inherited_controls_by_id.get(_normalized_id(control.control_id))
+        if (
+            previous is not None
+            and control_health_strength[control.health]
+            < control_health_strength[previous.health]
+        ):
+            _find_override(
+                child.weakening_overrides,
+                as_of=as_of,
+                profile_id=child.profile_id,
+                target_path=(
+                    f"/resolvedProfiles/{child.profile_id}/controls/"
+                    f"{control.control_id}/health"
+                ),
+                target_ref=control.control_id,
+                reason="controlRequirementRelaxation",
+            )
+
+    inherited_risks_by_id = {
+        _normalized_id(item.risk_acceptance_id): item for item in inherited_risks
+    }
+    for risk in child.risk_acceptances:
+        previous = inherited_risks_by_id.get(
+            _normalized_id(risk.risk_acceptance_id)
+        )
+        if previous is not None and previous.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        ) != risk.model_dump(mode="json", by_alias=True, exclude_none=True):
+            raise AthenaValidationError(
+                "inherited risk acceptances are immutable; use a new riskAcceptanceId"
+            )
 
 def _merge_keyed[T: AthenaBaseModel](
     current: list[T],
@@ -1779,6 +2285,17 @@ def _validate_override_owners(
             target_owners = [
                 item.owner_ref for item in objectives if _normalized_id(item.objective_id) == target
             ]
+        continuity_path = (
+            f"/resolvedProfiles/{profile.profile_id}/settings/continuity/"
+            "zoneLossContinuityRequired"
+        )
+        if not target_owners and not (
+            path == continuity_path
+            and override.target_ref == "zoneLossContinuityRequired"
+        ):
+            raise AthenaValidationError(
+                f"unresolved governed override targetRef: {override.target_ref}"
+            )
         if len(target_owners) > 1:
             raise AthenaValidationError("governed override target is ambiguous")
         if target_owners and _normalized_id(target_owners[0]) != _normalized_id(override.owner_ref):
@@ -1787,7 +2304,116 @@ def _validate_override_owners(
             )
 
 
+def _validate_contradictory_requirements(profile: ResolvedManifestProfile) -> None:
+    cardinality_bounds = {
+        _normalized_id(role.role_id): _cardinality_bounds(role.cardinality)
+        for role in profile.roles
+    }
+    relationship_requirements: dict[str, set[str]] = {}
+    objective_bounds: dict[str, tuple[float | None, bool, float | None, bool]] = {}
+    declared_relationships = {
+        _normalized_id(item.relationship_id): item
+        for item in profile.relationships
+        if isinstance(item, DeclaredManifestRelationship)
+    }
+
+    for constraint in profile.constraints:
+        proof = constraint.proof_requirement
+        if isinstance(proof, CardinalityProof):
+            role_id = _normalized_id(proof.role_ref)
+            current_minimum, current_maximum = cardinality_bounds[role_id]
+            required_minimum, required_maximum = _cardinality_bounds(proof.expected)
+            intersection = (
+                max(current_minimum, required_minimum),
+                min(current_maximum, required_maximum),
+            )
+            if intersection[0] > intersection[1]:
+                raise AthenaValidationError(
+                    f"contradictory cardinality requirements for role {proof.role_ref}"
+                )
+            cardinality_bounds[role_id] = intersection
+        elif isinstance(proof, RelationshipPresenceProof):
+            relationship_id = _normalized_id(proof.declared_relationship_ref)
+            relationship_requirements.setdefault(relationship_id, set()).add(
+                constraint.constraint_type
+            )
+            relationship = declared_relationships[relationship_id]
+            if (
+                constraint.constraint_type == "dependencyRequired"
+                and relationship.kind == "prohibited"
+            ) or (
+                constraint.constraint_type == "dependencyProhibited"
+                and relationship.kind != "prohibited"
+            ):
+                raise AthenaValidationError(
+                    "relationship kind contradicts its presence requirement"
+                )
+        elif isinstance(proof, ObjectiveThresholdProof):
+            objective_id = _normalized_id(proof.objective_ref)
+            lower, lower_inclusive, upper, upper_inclusive = objective_bounds.get(
+                objective_id,
+                (None, True, None, True),
+            )
+            if proof.comparison in {"gt", "gte", "eq"} and (
+                lower is None or proof.threshold > lower
+            ):
+                lower = proof.threshold
+                lower_inclusive = proof.comparison in {"gte", "eq"}
+            elif proof.comparison in {"gt", "gte", "eq"} and proof.threshold == lower:
+                lower_inclusive = lower_inclusive and proof.comparison in {"gte", "eq"}
+            if proof.comparison in {"lt", "lte", "eq"} and (
+                upper is None or proof.threshold < upper
+            ):
+                upper = proof.threshold
+                upper_inclusive = proof.comparison in {"lte", "eq"}
+            elif proof.comparison in {"lt", "lte", "eq"} and proof.threshold == upper:
+                upper_inclusive = upper_inclusive and proof.comparison in {"lte", "eq"}
+            if lower is not None and upper is not None and (
+                lower > upper
+                or (lower == upper and not (lower_inclusive and upper_inclusive))
+            ):
+                raise AthenaValidationError(
+                    f"contradictory objective requirements for {proof.objective_ref}"
+                )
+            objective_bounds[objective_id] = (
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+            )
+
+    if any(
+        {"dependencyRequired", "dependencyProhibited"}.issubset(requirements)
+        for requirements in relationship_requirements.values()
+    ):
+        raise AthenaValidationError(
+            "contradictory required and prohibited relationship requirements"
+        )
+
+    positive_edges: set[tuple[str, str]] = set()
+    prohibited_edges: set[tuple[str, str]] = set()
+
+    def endpoint_key(endpoint: ManifestEndpoint) -> str:
+        if isinstance(endpoint, RoleEndpoint):
+            return "role:" + _normalized_id(endpoint.role_ref)
+        return "external:" + _normalized_id(endpoint.external_ref)
+
+    for relationship in profile.relationships:
+        if not isinstance(relationship, DeclaredManifestRelationship):
+            continue
+        edge = (endpoint_key(relationship.source), endpoint_key(relationship.target))
+        if relationship.kind == "prohibited":
+            prohibited_edges.add(edge)
+        else:
+            positive_edges.add(edge)
+    if positive_edges & prohibited_edges:
+        raise AthenaValidationError(
+            "contradictory declared and prohibited relationship requirements"
+        )
+
+
 def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: datetime) -> None:
+    _validate_resolved_selectors(profile.roles)
     owners = {_normalized_id(item.owner_ref) for item in profile.ownership}
     roles = {_normalized_id(item.role_id) for item in profile.roles}
     relationships = {
@@ -1799,6 +2425,9 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
     controls = {_normalized_id(item.control_id) for item in profile.controls}
     risks = {_normalized_id(item.risk_acceptance_id) for item in profile.risk_acceptances}
     objectives = {_normalized_id(item.objective_id) for item in profile.objectives}
+    clause_paths = {
+        f"/constraints/{item.constraint_id}" for item in profile.constraints
+    }
 
     def require_owner(owner_ref: str) -> None:
         if _normalized_id(owner_ref) not in owners:
@@ -1821,6 +2450,10 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
                     raise AthenaValidationError(
                         f"unresolved relationship roleRef: {endpoint.role_ref}"
                     )
+            if relationship.source_clause not in clause_paths:
+                raise AthenaValidationError(
+                    f"unresolved relationship sourceClause: {relationship.source_clause}"
+                )
         else:
             if relationship.expires_at <= as_of:
                 raise AthenaValidationError("exception relationship is expired")
@@ -1976,6 +2609,7 @@ def _resolve_cross_references(profile: ResolvedManifestProfile, *, as_of: dateti
             )
     for objective in profile.objectives:
         require_owner(objective.owner_ref)
+    _validate_contradictory_requirements(profile)
 
 
 def resolve_manifest_profile(
@@ -2040,7 +2674,10 @@ def resolve_manifest_profile(
 
     for profile in lineage:
         inherited_roles = list(roles)
+        inherited_relationships = list(relationships)
         inherited_constraints = list(constraints)
+        inherited_controls = list(controls)
+        inherited_risks = list(risks)
         roles = _merge_keyed(roles, list(profile.roles), key_attribute="role_id")
         _validate_role_requirement_weakening(
             inherited_roles,
@@ -2074,6 +2711,20 @@ def resolve_manifest_profile(
             objectives, list(profile.objectives), key_attribute="objective_id"
         )
         owners = _merge_keyed(owners, list(profile.ownership), key_attribute="owner_ref")
+        _validate_inherited_semantics(
+            child=profile,
+            inherited_roles=inherited_roles,
+            roles=roles,
+            inherited_relationships=inherited_relationships,
+            relationships=relationships,
+            inherited_constraints=inherited_constraints,
+            constraints=constraints,
+            inherited_controls=inherited_controls,
+            controls=controls,
+            inherited_risks=inherited_risks,
+            risks=risks,
+            as_of=as_of,
+        )
         _validate_override_owners(
             profile,
             roles=roles,

@@ -1305,6 +1305,333 @@ def test_unresolved_owner_and_relationship_refs_fail_resolution() -> None:
         )
 
 
+def test_all_semantic_reference_kinds_fail_closed() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    control_requirement = _constraint(
+        "production",
+        "synthetic-control-requirement",
+        "controlRequired",
+        "controlHealth",
+        {
+            "proofKind": "controlHealthProof",
+            "controlRef": "missing-synthetic-control",
+            "requiredHealth": "effective",
+        },
+        "pass",
+    )
+    control_requirement["protected"] = False
+    payload["profiles"]["production"]["constraints"].append(control_requirement)
+    with pytest.raises(AthenaValidationError, match="unresolved control proof ref"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["profiles"]["production"]["constraints"][0][
+        "riskAcceptanceRef"
+    ] = "missing-synthetic-risk"
+    with pytest.raises(AthenaValidationError, match="unresolved constraint riskAcceptanceRef"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    objective_requirement = _constraint(
+        "production",
+        "synthetic-objective-requirement",
+        "objectiveRequired",
+        "objective",
+        {
+            "proofKind": "objectiveThresholdProof",
+            "objectiveRef": "missing-synthetic-objective",
+            "comparison": "gte",
+            "threshold": 99.0,
+        },
+        "pass",
+    )
+    objective_requirement["protected"] = False
+    payload["profiles"]["production"]["constraints"].append(objective_requirement)
+    with pytest.raises(AthenaValidationError, match="unresolved objective proof ref"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["profiles"]["production"]["relationships"] = [
+        {
+            "relationshipClass": "declared",
+            "relationshipId": "synthetic-unresolved-clause",
+            "kind": "dependsOn",
+            "source": {"endpointType": "role", "roleRef": "worker"},
+            "target": {"endpointType": "role", "roleRef": "database-primary"},
+            "ownerRef": "ops-owner",
+            "profiles": ["production"],
+            "sourceClause": "/constraints/missing-synthetic-clause",
+        }
+    ]
+    with pytest.raises(AthenaValidationError, match="unresolved relationship sourceClause"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["profiles"]["production"]["constraints"][0]["profiles"] = ["sandbox"]
+    with pytest.raises(ValidationError, match="profile applicability reference is unresolved"):
+        CanonicalWorkloadManifest.model_validate(payload)
+
+
+def test_whole_manifest_validation_checks_contradictions_in_every_profile() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["profiles"]["sandbox"] = {
+        "profileId": "sandbox",
+        "profileType": "sandbox",
+        "settings": {"continuity": {"zoneLossContinuityRequired": False}},
+        "relationships": [
+            {
+                "relationshipClass": "declared",
+                "relationshipId": "synthetic-sandbox-dependency",
+                "kind": "dependsOn",
+                "source": {"endpointType": "role", "roleRef": "worker"},
+                "target": {
+                    "endpointType": "role",
+                    "roleRef": "database-primary",
+                },
+                "ownerRef": "ops-owner",
+                "profiles": ["sandbox"],
+                "sourceClause": "/constraints/synthetic-sandbox-required",
+            }
+        ],
+        "constraints": [
+            {
+                **_constraint(
+                    "sandbox",
+                    "synthetic-sandbox-required",
+                    "dependencyRequired",
+                    "architectureConstraint",
+                    {
+                        "proofKind": "relationshipPresenceProof",
+                        "declaredRelationshipRef": "synthetic-sandbox-dependency",
+                    },
+                    "pass",
+                ),
+                "protected": False,
+            },
+            {
+                **_constraint(
+                    "sandbox",
+                    "synthetic-sandbox-prohibited",
+                    "dependencyProhibited",
+                    "architectureConstraint",
+                    {
+                        "proofKind": "relationshipPresenceProof",
+                        "declaredRelationshipRef": "synthetic-sandbox-dependency",
+                    },
+                    "pass",
+                ),
+                "protected": False,
+            },
+        ],
+    }
+    with pytest.raises(AthenaValidationError, match="contradict"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
+def test_cardinality_and_objective_contradictions_fail_closed() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    cardinality = _constraint(
+        "production",
+        "synthetic-worker-cardinality",
+        "cardinality",
+        "architectureConstraint",
+        {
+            "proofKind": "cardinalityProof",
+            "roleRef": "worker",
+            "expected": {
+                "cardinalityKind": "boundedRange",
+                "minimum": 0,
+                "maximum": 0,
+            },
+        },
+        "pass",
+    )
+    cardinality["protected"] = False
+    payload["profiles"]["production"]["constraints"].append(cardinality)
+    with pytest.raises(AthenaValidationError, match="contradictory cardinality"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["objectives"] = [
+        {
+            "objectiveId": "synthetic-availability-objective",
+            "objectiveType": "availabilitySlo",
+            "ownerRef": "ops-owner",
+            "target": 99.0,
+        }
+    ]
+    for constraint_id, comparison in (
+        ("synthetic-objective-lower-bound", "gte"),
+        ("synthetic-objective-upper-bound", "lt"),
+    ):
+        requirement = _constraint(
+            "production",
+            constraint_id,
+            "objectiveRequired",
+            "objective",
+            {
+                "proofKind": "objectiveThresholdProof",
+                "objectiveRef": "synthetic-availability-objective",
+                "comparison": comparison,
+                "threshold": 99.0,
+            },
+            "pass",
+        )
+        requirement["protected"] = False
+        payload["profiles"]["production"]["constraints"].append(requirement)
+    with pytest.raises(AthenaValidationError, match="contradictory objective"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
+def test_ambiguous_selectors_and_normalized_duplicates_fail_closed() -> None:
+    selector_adapter: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
+    with pytest.raises(ValidationError, match="duplicate selector resource id"):
+        selector_adapter.validate_python(
+            {
+                "selectorType": "resourceIdList",
+                "selectorId": "synthetic-duplicate-resources",
+                "resourceIds": ["/synthetic/resource-a", "/SYNTHETIC/RESOURCE-A"],
+                "maxMatches": 2,
+            }
+        )
+    with pytest.raises(ValidationError, match="duplicate tag predicate key"):
+        selector_adapter.validate_python(
+            {
+                "selectorType": "tagPredicate",
+                "selectorId": "synthetic-duplicate-tags",
+                "predicates": [
+                    {"key": "environment", "value": "development"},
+                    {"key": "ENVIRONMENT", "value": "training"},
+                ],
+                "maxMatches": 2,
+            }
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["roles"][1]["selectors"] = deepcopy(payload["roles"][2]["selectors"])
+    payload["roles"][1]["selectors"][0]["selectorId"] = (
+        "synthetic-worker-overlap"
+    )
+    payload["roles"][1]["selectors"][0]["prefix"] = "athena-"
+    with pytest.raises(AthenaValidationError, match="ambiguous selectors"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    payload["profiles"]["production"]["constraints"][0]["profiles"] = [
+        "production",
+        "production",
+    ]
+    with pytest.raises(ValidationError, match="duplicate profile applicability"):
+        CanonicalWorkloadManifest.model_validate(payload)
+
+
+def test_direct_selector_control_and_applicability_weakening_fail_closed() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    weakened_role = deepcopy(payload["roles"][2])
+    weakened_role["selectors"][0]["prefix"] = "athena-"
+    payload["profiles"]["development"]["roles"] = [weakened_role]
+    with pytest.raises(AthenaValidationError, match="direct selector weakening"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    development_control = _control_payload("backup")
+    development_control["profiles"] = ["development"]
+    development_control["governanceScope"] = _scope(
+        "development", "db-zone-loss-spof"
+    )
+    payload["controls"] = [development_control]
+    weakened_control = deepcopy(development_control)
+    weakened_control["health"] = "missing"
+    payload["profiles"]["development"]["controls"] = [weakened_control]
+    with pytest.raises(AthenaValidationError, match="exactly one active governed override"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    inherited = _constraint(
+        "development",
+        "synthetic-inherited-applicability",
+        "cardinality",
+        "architectureConstraint",
+        {
+            "proofKind": "cardinalityProof",
+            "roleRef": "worker",
+            "expected": {"cardinalityKind": "oneOrMore"},
+        },
+        "pass",
+    )
+    inherited["protected"] = False
+    payload["constraints"] = [inherited]
+    hidden = deepcopy(inherited)
+    hidden["profiles"] = ["training"]
+    hidden["governanceScope"] = _scope(
+        "training", "synthetic-inherited-applicability"
+    )
+    payload["profiles"]["development"]["constraints"].append(hidden)
+    with pytest.raises(AthenaValidationError, match="direct applicability weakening"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "development",
+            as_of=AS_OF,
+        )
+
+
+def test_inherited_risk_acceptance_mutation_is_invalid() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    inherited = deepcopy(
+        payload["profiles"]["production"]["riskAcceptances"][0]
+    )
+    inherited["expiresAt"] = "2026-12-31T00:00:00.000Z"
+    inherited["profiles"] = ["training"]
+    inherited["governanceScope"] = _scope("training", "db-zone-loss-spof")
+    payload["profiles"]["training"]["riskAcceptances"] = [inherited]
+    with pytest.raises(AthenaValidationError, match="risk acceptances are immutable"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "training",
+            as_of=AS_OF,
+        )
+
+
 def test_expired_or_scope_mismatched_acceptance_cannot_accept_risk() -> None:
     payload = build_manifest().model_dump(mode="json", by_alias=True)
     acceptance = payload["profiles"]["production"]["riskAcceptances"][0]
