@@ -22,6 +22,7 @@ dev = [
   "pytest>=8.4",
   "pytest-cov>=6.2",
   "ruff>=0.12",
+  "types-jsonschema>=4.26",
 ]
 
 [project.scripts]

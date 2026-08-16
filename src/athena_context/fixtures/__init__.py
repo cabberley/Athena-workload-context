@@ -1513,6 +1513,24 @@ def load_canonical_fixture_resource() -> dict[str, Any]:
     return _load_fixture_resource("canonical-fixture.json")
 
 
+def _canonical_manifest_resource_payload() -> dict[str, Any]:
+    return _canonical_manifest_payload()
+
+
+def _canonical_fixture_resource_payload(
+    bundle: FixtureBundle | None = None,
+) -> dict[str, Any]:
+    resolved = bundle if bundle is not None else make_canonical_fixture()
+    return {
+        "manifest": _canonical_manifest_resource_payload(),
+        "snapshot": resolved.canonical_snapshot.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=False,
+        ),
+    }
+
+
 def make_canonical_fixture_from_resources() -> FixtureBundle:
     manifest = CanonicalWorkloadManifest.model_validate(load_canonical_manifest_resource())
     snapshot = EvidenceSnapshot.model_validate(load_canonical_snapshot_resource())

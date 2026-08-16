@@ -9,6 +9,7 @@ import pytest
 
 from athena_context.contracts import (
     AthenaValidationError,
+    CanonicalWorkloadManifest,
     EvidenceSnapshot,
     compute_evidence_record_set_digest,
     compute_evidence_reference_set_digest,
@@ -16,8 +17,12 @@ from athena_context.contracts import (
 )
 from athena_context.contracts.manifest import resolve_manifest_profile
 from athena_context.fixtures import (
+    _canonical_manifest_payload,
     _resource_id,
+    load_canonical_fixture_resource,
+    load_canonical_manifest_resource,
     make_canonical_fixture,
+    make_canonical_fixture_from_resources,
     make_conflicting_evidence_fixture,
     make_missing_evidence_fixture,
     make_mutation_fixture,
@@ -36,6 +41,7 @@ def test_canonical_fixture_real_verification_and_digest_order_stability() -> Non
     assert snapshot.compatibility.semantic_digest == bundle.snapshot_semantic_digest
 
     attempt = snapshot.collector_attempts[0]
+    assert attempt.attempt_type == "successResponse"
     envelope = bundle.envelope_resolver(attempt.attempt_id, "response", attempt.response_digest)
     assert envelope is not None
     assert attempt.response_digest == compute_response_envelope_digest(envelope)
@@ -77,7 +83,9 @@ def test_all_profiles_resolve_with_exact_active_governed_overrides() -> None:
                 for item in resolved.constraints
                 if item.constraint_id == "web-zone-distribution"
             )
-            assert web_constraint.proof_requirement.minimum_distinct_zones == 1
+            proof = web_constraint.proof_requirement
+            assert proof.proof_kind == "zoneDistributionProof"
+            assert proof.minimum_distinct_zones == 1
         else:
             assert resolved.settings.continuity.zone_loss_continuity_required is True
             web_constraint = next(
@@ -85,7 +93,9 @@ def test_all_profiles_resolve_with_exact_active_governed_overrides() -> None:
                 for item in resolved.constraints
                 if item.constraint_id == "web-zone-distribution"
             )
-            assert web_constraint.proof_requirement.minimum_distinct_zones == 3
+            proof = web_constraint.proof_requirement
+            assert proof.proof_kind == "zoneDistributionProof"
+            assert proof.minimum_distinct_zones == 3
 
 
 def test_negative_fixture_constructors_are_isolated_and_tampered_objects_fail_later() -> None:
@@ -133,6 +143,43 @@ def test_package_fixture_resources_are_loaded_via_importlib_resources() -> None:
     assert fixture_data["snapshot"]["snapshotId"] == snapshot_data["snapshotId"]
     assert snapshot_data["snapshotId"] == "snap-111111111111"
     assert manifest_data["manifestId"] == "wl-athena-wc002-canonical"
+
+
+def test_packaged_manifest_resource_is_valid_and_matches_runtime_canonical_payload() -> None:
+    runtime_manifest = _canonical_manifest_payload()
+    packaged_manifest = load_canonical_manifest_resource()
+    expected_digest = runtime_manifest["compatibility"]["artifactDigest"]
+
+    assert packaged_manifest == runtime_manifest
+    validated = CanonicalWorkloadManifest.model_validate(packaged_manifest)
+    assert validated.compatibility.artifact_digest == expected_digest
+
+    round_tripped = json.loads(json.dumps(packaged_manifest))
+    reloaded = CanonicalWorkloadManifest.model_validate(round_tripped)
+    assert reloaded.compatibility.artifact_digest == expected_digest
+
+
+def test_make_canonical_fixture_from_resources_round_trips_valid_bundle() -> None:
+    runtime_manifest = _canonical_manifest_payload()
+    expected_digest = runtime_manifest["compatibility"]["artifactDigest"]
+    fixture_data = load_canonical_fixture_resource()
+    bundled_manifest = fixture_data["manifest"]
+
+    assert bundled_manifest == runtime_manifest
+    assert (
+        CanonicalWorkloadManifest.model_validate(bundled_manifest).compatibility.artifact_digest
+        == expected_digest
+    )
+
+    from_resources = make_canonical_fixture_from_resources()
+    assert from_resources.manifest_digest == expected_digest
+    snapshot_digest = fixture_data["snapshot"]["compatibility"]["artifactDigest"]
+    assert from_resources.snapshot_artifact_digest == snapshot_digest
+    assert from_resources.canonical_manifest.compatibility.artifact_digest == expected_digest
+
+    round_tripped = json.loads(json.dumps(fixture_data))
+    reloaded = CanonicalWorkloadManifest.model_validate(round_tripped["manifest"])
+    assert reloaded.compatibility.artifact_digest == expected_digest
 
 
 def test_no_stale_non_package_canonical_assets_exist() -> None:

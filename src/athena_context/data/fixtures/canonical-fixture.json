@@ -1,1405 +1,1357 @@
 {
   "manifest": {
-    "audit": {
-      "approvalStatus": "approved",
-      "publishedAt": "2025-06-01T00:00:00Z",
-      "publishedBy": "human-approved-context-api"
-    },
-    "cloud": "azureCloud",
-    "compatibility": {
-      "artifactDigest": "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6",
-      "artifactKind": "workloadManifest",
-      "extensionPolicy": "rejectUnknownDecisionFields",
-      "minimumReaderVersion": "1.0.0",
-      "policyContractVersion": "1.0.0",
-      "producedBy": {
-        "producerId": "athena.contracts",
-        "version": "1.0.0"
-      },
-      "requiresCapabilities": [],
-      "schemaVersion": "1.0.0",
-      "semanticContractVersion": "1.0.0",
-      "semanticDigest": "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
-    },
-    "constraints": [
-      {
-        "constraintId": "db-singleton-supported",
-        "constraintType": "supportedSingleton",
-        "failureVerdict": "violation",
-        "findingKind": "technologyConstraint",
-        "governanceScope": {
-          "clausePath": "/constraints/db-singleton-supported",
-          "governanceScopeType": "clause",
-          "manifestId": "wl-athena-wc002-canonical",
-          "ownerRef": "ops-owner",
-          "profileId": "production"
-        },
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "proofRequirement": {
-          "expected": {
-            "cardinalityKind": "exactlyOne"
-          },
-          "proofKind": "cardinalityProof",
-          "roleRef": "database-primary"
-        },
-        "protected": true,
-        "riskAcceptanceClauseRef": null,
-        "riskAcceptanceRef": null,
-        "successVerdict": "expectedConstraint"
-      },
-      {
-        "constraintId": "db-zone-loss-acceptance",
-        "constraintType": "supportedSingleton",
-        "failureVerdict": "violation",
-        "findingKind": "riskAcceptance",
-        "governanceScope": {
-          "clausePath": "/constraints/db-zone-loss-acceptance",
-          "governanceScopeType": "clause",
-          "manifestId": "wl-athena-wc002-canonical",
-          "ownerRef": "ops-owner",
-          "profileId": "production"
-        },
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "proofRequirement": {
-          "expected": {
-            "cardinalityKind": "exactlyOne"
-          },
-          "proofKind": "cardinalityProof",
-          "roleRef": "database-primary"
-        },
-        "protected": true,
-        "riskAcceptanceClauseRef": "db-zone-loss-spof",
-        "riskAcceptanceRef": "ra-db-zone-loss",
-        "successVerdict": "observation"
-      },
-      {
-        "constraintId": "db-zone-loss-spof",
-        "constraintType": "supportedSingleton",
-        "failureVerdict": "violation",
-        "findingKind": "actualSpof",
-        "governanceScope": {
-          "clausePath": "/constraints/db-zone-loss-spof",
-          "governanceScopeType": "clause",
-          "manifestId": "wl-athena-wc002-canonical",
-          "ownerRef": "ops-owner",
-          "profileId": "production"
-        },
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "proofRequirement": {
-          "expected": {
-            "cardinalityKind": "exactlyOne"
-          },
-          "proofKind": "cardinalityProof",
-          "roleRef": "database-primary"
-        },
-        "protected": true,
-        "riskAcceptanceClauseRef": null,
-        "riskAcceptanceRef": "ra-db-zone-loss",
-        "successVerdict": "observation"
-      },
-      {
-        "constraintId": "web-zone-distribution",
-        "constraintType": "zoneDistribution",
-        "failureVerdict": "violation",
-        "findingKind": "architectureConstraint",
-        "governanceScope": {
-          "clausePath": "/constraints/web-zone-distribution",
-          "governanceScopeType": "clause",
-          "manifestId": "wl-athena-wc002-canonical",
-          "ownerRef": "ops-owner",
-          "profileId": "production"
-        },
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "proofRequirement": {
-          "minimumDistinctZones": 3,
-          "proofKind": "zoneDistributionProof",
-          "roleRef": "web"
-        },
-        "protected": true,
-        "riskAcceptanceClauseRef": null,
-        "riskAcceptanceRef": null,
-        "successVerdict": "pass"
-      },
-      {
-        "constraintId": "worker-db-zone-colocation",
-        "constraintType": "zoneColocation",
-        "failureVerdict": "violation",
-        "findingKind": "architectureConstraint",
-        "governanceScope": {
-          "clausePath": "/constraints/worker-db-zone-colocation",
-          "governanceScopeType": "clause",
-          "manifestId": "wl-athena-wc002-canonical",
-          "ownerRef": "ops-owner",
-          "profileId": "production"
-        },
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "proofRequirement": {
-          "anchorRoleRef": "database-primary",
-          "proofKind": "zoneColocationProof",
-          "subjectRoleRef": "worker"
-        },
-        "protected": true,
-        "riskAcceptanceClauseRef": null,
-        "riskAcceptanceRef": null,
-        "successVerdict": "pass"
-      }
-    ],
-    "controls": [],
     "manifestId": "wl-athena-wc002-canonical",
     "manifestVersion": "1.0.0",
-    "objectives": [],
-    "ownership": [
-      {
-        "authorityRef": "synthetic://teams/operations",
-        "ownerRef": "ops-owner",
-        "ownerRole": "operationsOwner"
-      }
-    ],
-    "profiles": {
-      "development": {
-        "constraints": [
-          {
-            "constraintId": "db-singleton-supported",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "technologyConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/db-singleton-supported",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "expectedConstraint"
-          },
-          {
-            "constraintId": "db-zone-loss-acceptance",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "riskAcceptance",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-acceptance",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": "db-zone-loss-spof",
-            "riskAcceptanceRef": "ra-db-zone-loss-development",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "db-zone-loss-spof",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "actualSpof",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": "ra-db-zone-loss-development",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "web-zone-distribution",
-            "constraintType": "zoneDistribution",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/web-zone-distribution",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "proofRequirement": {
-              "minimumDistinctZones": 1,
-              "proofKind": "zoneDistributionProof",
-              "roleRef": "web"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          },
-          {
-            "constraintId": "worker-db-zone-colocation",
-            "constraintType": "zoneColocation",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/worker-db-zone-colocation",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "proofRequirement": {
-              "anchorRoleRef": "database-primary",
-              "proofKind": "zoneColocationProof",
-              "subjectRoleRef": "worker"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          }
-        ],
-        "controls": [
-          {
-            "controlId": "control-db-failover-runbook-development",
-            "controlKind": "manualFailoverRunbook",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "health": "effective",
-            "lastReviewedAt": "2025-01-01T00:00:00Z",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "runbookRef": "synthetic://runbooks/db-failover"
-          }
-        ],
-        "disabledRefs": [],
-        "extends": null,
-        "objectives": [],
-        "ownership": [],
-        "profileId": "development",
-        "profileType": "development",
-        "relationships": [
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "development-web-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          },
-          {
-            "kind": "protectedBy",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "development-web-protected-by-lb",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "load-balancer"
-            }
-          },
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "development-worker-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "worker"
-            },
-            "sourceClause": "/constraints/worker-db-zone-colocation",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          }
-        ],
-        "riskAcceptances": [
-          {
-            "acceptedAt": "2025-01-01T00:00:00Z",
-            "acceptedBy": "synthetic-approver",
-            "acceptedResourceBindings": [
-              {
-                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
-                "roleRef": "database-primary"
-              }
-            ],
-            "expiresAt": "2025-12-31T00:00:00Z",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "development"
-            },
-            "linkedControlRefs": [
-              "control-db-failover-runbook-development"
-            ],
-            "ownedBy": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "rationaleRef": "synthetic://risk/db-zone-loss",
-            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-            "riskAcceptanceId": "ra-db-zone-loss-development",
-            "riskKind": "availability",
-            "riskRating": "high",
-            "status": "approved"
-          }
-        ],
-        "roles": [],
-        "settings": {
-          "continuity": {
-            "zoneLossContinuityRequired": false
-          }
-        },
-        "weakeningOverrides": [
-          {
-            "acceptedAt": "2025-01-01T00:00:00Z",
-            "approvedBy": "synthetic-approver",
-            "expiresAt": "2025-12-31T00:00:00Z",
-            "overrideId": "dev-continuity",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "rationale": "Development does not claim continuity through zone loss.",
-            "reason": "continuityRelaxation",
-            "status": "approved",
-            "targetPath": "/resolvedProfiles/development/settings/continuity/zoneLossContinuityRequired",
-            "targetRef": "zoneLossContinuityRequired"
-          },
-          {
-            "acceptedAt": "2025-01-01T00:00:00Z",
-            "approvedBy": "synthetic-approver",
-            "expiresAt": "2025-12-31T00:00:00Z",
-            "overrideId": "dev-web-zones",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "development"
-            ],
-            "rationale": "One web zone is sufficient for synthetic development.",
-            "reason": "zoneRequirementRelaxation",
-            "status": "approved",
-            "targetPath": "/resolvedProfiles/development/constraints/web-zone-distribution/proofRequirement/minimumDistinctZones",
-            "targetRef": "web-zone-distribution"
-          }
-        ]
-      },
-      "production": {
-        "constraints": [
-          {
-            "constraintId": "db-singleton-supported",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "technologyConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/db-singleton-supported",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "expectedConstraint"
-          },
-          {
-            "constraintId": "db-zone-loss-acceptance",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "riskAcceptance",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-acceptance",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": "db-zone-loss-spof",
-            "riskAcceptanceRef": "ra-db-zone-loss-production",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "db-zone-loss-spof",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "actualSpof",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": "ra-db-zone-loss-production",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "web-zone-distribution",
-            "constraintType": "zoneDistribution",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/web-zone-distribution",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "proofRequirement": {
-              "minimumDistinctZones": 3,
-              "proofKind": "zoneDistributionProof",
-              "roleRef": "web"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          },
-          {
-            "constraintId": "worker-db-zone-colocation",
-            "constraintType": "zoneColocation",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/worker-db-zone-colocation",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "proofRequirement": {
-              "anchorRoleRef": "database-primary",
-              "proofKind": "zoneColocationProof",
-              "subjectRoleRef": "worker"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          }
-        ],
-        "controls": [
-          {
-            "controlId": "control-db-failover-runbook-production",
-            "controlKind": "manualFailoverRunbook",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "health": "effective",
-            "lastReviewedAt": "2025-01-01T00:00:00Z",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "runbookRef": "synthetic://runbooks/db-failover"
-          }
-        ],
-        "disabledRefs": [],
-        "extends": null,
-        "objectives": [],
-        "ownership": [],
-        "profileId": "production",
-        "profileType": "production",
-        "relationships": [
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "production-web-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          },
-          {
-            "kind": "protectedBy",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "production-web-protected-by-lb",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "load-balancer"
-            }
-          },
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "production-worker-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "worker"
-            },
-            "sourceClause": "/constraints/worker-db-zone-colocation",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          }
-        ],
-        "riskAcceptances": [
-          {
-            "acceptedAt": "2025-01-01T00:00:00Z",
-            "acceptedBy": "synthetic-approver",
-            "acceptedResourceBindings": [
-              {
-                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
-                "roleRef": "database-primary"
-              }
-            ],
-            "expiresAt": "2025-12-31T00:00:00Z",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "production"
-            },
-            "linkedControlRefs": [
-              "control-db-failover-runbook-production"
-            ],
-            "ownedBy": "ops-owner",
-            "profiles": [
-              "production"
-            ],
-            "rationaleRef": "synthetic://risk/db-zone-loss",
-            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-            "riskAcceptanceId": "ra-db-zone-loss-production",
-            "riskKind": "availability",
-            "riskRating": "high",
-            "status": "approved"
-          }
-        ],
-        "roles": [],
-        "settings": {
-          "continuity": {
-            "zoneLossContinuityRequired": true
-          }
-        },
-        "weakeningOverrides": []
-      },
-      "training": {
-        "constraints": [
-          {
-            "constraintId": "db-singleton-supported",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "technologyConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/db-singleton-supported",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "expectedConstraint"
-          },
-          {
-            "constraintId": "db-zone-loss-acceptance",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "riskAcceptance",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-acceptance",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": "db-zone-loss-spof",
-            "riskAcceptanceRef": "ra-db-zone-loss-training",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "db-zone-loss-spof",
-            "constraintType": "supportedSingleton",
-            "failureVerdict": "violation",
-            "findingKind": "actualSpof",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "proofRequirement": {
-              "expected": {
-                "cardinalityKind": "exactlyOne"
-              },
-              "proofKind": "cardinalityProof",
-              "roleRef": "database-primary"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": "ra-db-zone-loss-training",
-            "successVerdict": "observation"
-          },
-          {
-            "constraintId": "web-zone-distribution",
-            "constraintType": "zoneDistribution",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/web-zone-distribution",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "proofRequirement": {
-              "minimumDistinctZones": 3,
-              "proofKind": "zoneDistributionProof",
-              "roleRef": "web"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          },
-          {
-            "constraintId": "worker-db-zone-colocation",
-            "constraintType": "zoneColocation",
-            "failureVerdict": "violation",
-            "findingKind": "architectureConstraint",
-            "governanceScope": {
-              "clausePath": "/constraints/worker-db-zone-colocation",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "proofRequirement": {
-              "anchorRoleRef": "database-primary",
-              "proofKind": "zoneColocationProof",
-              "subjectRoleRef": "worker"
-            },
-            "protected": true,
-            "riskAcceptanceClauseRef": null,
-            "riskAcceptanceRef": null,
-            "successVerdict": "pass"
-          }
-        ],
-        "controls": [
-          {
-            "controlId": "control-db-failover-runbook-training",
-            "controlKind": "manualFailoverRunbook",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "health": "effective",
-            "lastReviewedAt": "2025-01-01T00:00:00Z",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "runbookRef": "synthetic://runbooks/db-failover"
-          }
-        ],
-        "disabledRefs": [],
-        "extends": null,
-        "objectives": [],
-        "ownership": [],
-        "profileId": "training",
-        "profileType": "training",
-        "relationships": [
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "training-web-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          },
-          {
-            "kind": "protectedBy",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "training-web-protected-by-lb",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "web"
-            },
-            "sourceClause": "/constraints/web-zone-distribution",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "load-balancer"
-            }
-          },
-          {
-            "kind": "dependsOn",
-            "ownerRef": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "relationshipClass": "declared",
-            "relationshipId": "training-worker-depends-db",
-            "source": {
-              "endpointType": "role",
-              "roleRef": "worker"
-            },
-            "sourceClause": "/constraints/worker-db-zone-colocation",
-            "target": {
-              "endpointType": "role",
-              "roleRef": "database-primary"
-            }
-          }
-        ],
-        "riskAcceptances": [
-          {
-            "acceptedAt": "2025-01-01T00:00:00Z",
-            "acceptedBy": "synthetic-approver",
-            "acceptedResourceBindings": [
-              {
-                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
-                "roleRef": "database-primary"
-              }
-            ],
-            "expiresAt": "2025-12-31T00:00:00Z",
-            "governanceScope": {
-              "clausePath": "/constraints/db-zone-loss-spof",
-              "governanceScopeType": "clause",
-              "manifestId": "wl-athena-wc002-canonical",
-              "ownerRef": "ops-owner",
-              "profileId": "training"
-            },
-            "linkedControlRefs": [
-              "control-db-failover-runbook-training"
-            ],
-            "ownedBy": "ops-owner",
-            "profiles": [
-              "training"
-            ],
-            "rationaleRef": "synthetic://risk/db-zone-loss",
-            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
-            "riskAcceptanceId": "ra-db-zone-loss-training",
-            "riskKind": "availability",
-            "riskRating": "high",
-            "status": "approved"
-          }
-        ],
-        "roles": [],
-        "settings": {
-          "continuity": {
-            "zoneLossContinuityRequired": true
-          }
-        },
-        "weakeningOverrides": []
-      }
-    },
-    "relationships": [
-      {
-        "kind": "protectedBy",
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "relationshipClass": "declared",
-        "relationshipId": "web-protected-by-lb",
-        "source": {
-          "endpointType": "role",
-          "roleRef": "web"
-        },
-        "sourceClause": "/constraints/web-zone-distribution",
-        "target": {
-          "endpointType": "role",
-          "roleRef": "load-balancer"
-        }
-      },
-      {
-        "kind": "dependsOn",
-        "ownerRef": "ops-owner",
-        "profiles": [
-          "production",
-          "development",
-          "training"
-        ],
-        "relationshipClass": "declared",
-        "relationshipId": "worker-depends-db",
-        "source": {
-          "endpointType": "role",
-          "roleRef": "worker"
-        },
-        "sourceClause": "/constraints/worker-db-zone-colocation",
-        "target": {
-          "endpointType": "role",
-          "roleRef": "database-primary"
-        }
-      }
-    ],
-    "riskAcceptances": [],
-    "roles": [
-      {
-        "cardinality": {
-          "cardinalityKind": "exactlyOne"
-        },
-        "kind": "singletonDatabase",
-        "ownerRef": "ops-owner",
-        "roleId": "database-primary",
-        "selectors": [
-          {
-            "maxMatches": 10,
-            "prefix": "athena-db-",
-            "selectorId": "database-name",
-            "selectorType": "namePredicate",
-            "suffix": null
-          }
-        ],
-        "status": "approved"
-      },
-      {
-        "cardinality": {
-          "cardinalityKind": "exactlyOne"
-        },
-        "kind": "loadBalancer",
-        "ownerRef": "ops-owner",
-        "roleId": "load-balancer",
-        "selectors": [
-          {
-            "maxMatches": 10,
-            "prefix": "athena-lb-",
-            "selectorId": "load-balancer-name",
-            "selectorType": "namePredicate",
-            "suffix": null
-          }
-        ],
-        "status": "approved"
-      },
-      {
-        "cardinality": {
-          "cardinalityKind": "oneOrMore"
-        },
-        "kind": "webService",
-        "ownerRef": "ops-owner",
-        "roleId": "web",
-        "selectors": [
-          {
-            "maxMatches": 20,
-            "prefix": "athena-web-",
-            "selectorId": "web-name",
-            "selectorType": "namePredicate",
-            "suffix": null
-          }
-        ],
-        "status": "approved"
-      },
-      {
-        "cardinality": {
-          "cardinalityKind": "oneOrMore"
-        },
-        "kind": "worker",
-        "ownerRef": "ops-owner",
-        "roleId": "worker",
-        "selectors": [
-          {
-            "maxMatches": 20,
-            "prefix": "athena-worker-",
-            "selectorId": "worker-name",
-            "selectorType": "namePredicate",
-            "suffix": null
-          }
-        ],
-        "status": "approved"
-      }
-    ],
+    "cloud": "azureCloud",
     "workload": {
-      "allowedEvidenceScopes": [
-        {
-          "resourceGroupName": "rg-athena-fixture",
-          "scopeType": "resourceGroup",
-          "subscriptionId": "11111111-1111-1111-1111-111111111111",
-          "tenantId": "11111111-1111-1111-1111-111111111111"
-        }
-      ],
       "displayName": "Synthetic WC-002 canonical workload",
       "environments": [
         "production",
         "development",
         "training"
+      ],
+      "allowedEvidenceScopes": [
+        {
+          "scopeType": "resourceGroup",
+          "tenantId": "11111111-1111-1111-1111-111111111111",
+          "subscriptionId": "11111111-1111-1111-1111-111111111111",
+          "resourceGroupName": "rg-athena-fixture"
+        }
       ]
-    }
-  },
-  "snapshot": {
-    "authorizedScopes": [
+    },
+    "profiles": {
+      "development": {
+        "profileId": "development",
+        "profileType": "development",
+        "settings": {
+          "continuity": {
+            "zoneLossContinuityRequired": false
+          }
+        },
+        "relationships": [
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "development-web-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "development-web-protected-by-lb",
+            "kind": "protectedBy",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "load-balancer"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "development-worker-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "worker"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "sourceClause": "/constraints/worker-db-zone-colocation"
+          }
+        ],
+        "constraints": [
+          {
+            "constraintId": "db-singleton-supported",
+            "constraintType": "supportedSingleton",
+            "findingKind": "technologyConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/db-singleton-supported",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "expectedConstraint",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-acceptance",
+            "constraintType": "supportedSingleton",
+            "findingKind": "riskAcceptance",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/db-zone-loss-acceptance",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-development",
+            "riskAcceptanceClauseRef": "db-zone-loss-spof",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-spof",
+            "constraintType": "supportedSingleton",
+            "findingKind": "actualSpof",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-development",
+            "protected": true
+          },
+          {
+            "constraintId": "web-zone-distribution",
+            "constraintType": "zoneDistribution",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/web-zone-distribution",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneDistributionProof",
+              "roleRef": "web",
+              "minimumDistinctZones": 1
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          },
+          {
+            "constraintId": "worker-db-zone-colocation",
+            "constraintType": "zoneColocation",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/worker-db-zone-colocation",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneColocationProof",
+              "subjectRoleRef": "worker",
+              "anchorRoleRef": "database-primary"
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          }
+        ],
+        "riskAcceptances": [
+          {
+            "riskAcceptanceId": "ra-db-zone-loss-development",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "riskKind": "availability",
+            "riskRating": "high",
+            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+            "rationaleRef": "synthetic://risk/db-zone-loss",
+            "acceptedBy": "synthetic-approver",
+            "ownedBy": "ops-owner",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "linkedControlRefs": [
+              "control-db-failover-runbook-development"
+            ],
+            "acceptedResourceBindings": [
+              {
+                "roleRef": "database-primary",
+                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+              }
+            ],
+            "profiles": [
+              "development"
+            ],
+            "status": "approved"
+          }
+        ],
+        "controls": [
+          {
+            "controlKind": "manualFailoverRunbook",
+            "controlId": "control-db-failover-runbook-development",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "development",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "development"
+            ],
+            "health": "effective",
+            "runbookRef": "synthetic://runbooks/db-failover",
+            "lastReviewedAt": "2025-01-01T00:00:00.000Z"
+          }
+        ],
+        "weakeningOverrides": [
+          {
+            "overrideId": "dev-continuity",
+            "reason": "continuityRelaxation",
+            "targetPath": "/resolvedProfiles/development/settings/continuity/zoneLossContinuityRequired",
+            "targetRef": "zoneLossContinuityRequired",
+            "ownerRef": "ops-owner",
+            "rationale": "Development does not claim continuity through zone loss.",
+            "approvedBy": "synthetic-approver",
+            "status": "approved",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "profiles": [
+              "development"
+            ]
+          },
+          {
+            "overrideId": "dev-web-zones",
+            "reason": "zoneRequirementRelaxation",
+            "targetPath": "/resolvedProfiles/development/constraints/web-zone-distribution/proofRequirement/minimumDistinctZones",
+            "targetRef": "web-zone-distribution",
+            "ownerRef": "ops-owner",
+            "rationale": "One web zone is sufficient for synthetic development.",
+            "approvedBy": "synthetic-approver",
+            "status": "approved",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "profiles": [
+              "development"
+            ]
+          }
+        ],
+        "roles": [],
+        "objectives": [],
+        "ownership": [],
+        "disabledRefs": []
+      },
+      "production": {
+        "profileId": "production",
+        "profileType": "production",
+        "settings": {
+          "continuity": {
+            "zoneLossContinuityRequired": true
+          }
+        },
+        "relationships": [
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "production-web-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "production-web-protected-by-lb",
+            "kind": "protectedBy",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "load-balancer"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "production-worker-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "worker"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "sourceClause": "/constraints/worker-db-zone-colocation"
+          }
+        ],
+        "constraints": [
+          {
+            "constraintId": "db-singleton-supported",
+            "constraintType": "supportedSingleton",
+            "findingKind": "technologyConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/db-singleton-supported",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "expectedConstraint",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-acceptance",
+            "constraintType": "supportedSingleton",
+            "findingKind": "riskAcceptance",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/db-zone-loss-acceptance",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-production",
+            "riskAcceptanceClauseRef": "db-zone-loss-spof",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-spof",
+            "constraintType": "supportedSingleton",
+            "findingKind": "actualSpof",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-production",
+            "protected": true
+          },
+          {
+            "constraintId": "web-zone-distribution",
+            "constraintType": "zoneDistribution",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/web-zone-distribution",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneDistributionProof",
+              "roleRef": "web",
+              "minimumDistinctZones": 3
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          },
+          {
+            "constraintId": "worker-db-zone-colocation",
+            "constraintType": "zoneColocation",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/worker-db-zone-colocation",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneColocationProof",
+              "subjectRoleRef": "worker",
+              "anchorRoleRef": "database-primary"
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          }
+        ],
+        "riskAcceptances": [
+          {
+            "riskAcceptanceId": "ra-db-zone-loss-production",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "riskKind": "availability",
+            "riskRating": "high",
+            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+            "rationaleRef": "synthetic://risk/db-zone-loss",
+            "acceptedBy": "synthetic-approver",
+            "ownedBy": "ops-owner",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "linkedControlRefs": [
+              "control-db-failover-runbook-production"
+            ],
+            "acceptedResourceBindings": [
+              {
+                "roleRef": "database-primary",
+                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+              }
+            ],
+            "profiles": [
+              "production"
+            ],
+            "status": "approved"
+          }
+        ],
+        "controls": [
+          {
+            "controlKind": "manualFailoverRunbook",
+            "controlId": "control-db-failover-runbook-production",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "production",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "production"
+            ],
+            "health": "effective",
+            "runbookRef": "synthetic://runbooks/db-failover",
+            "lastReviewedAt": "2025-01-01T00:00:00.000Z"
+          }
+        ],
+        "weakeningOverrides": [],
+        "roles": [],
+        "objectives": [],
+        "ownership": [],
+        "disabledRefs": []
+      },
+      "training": {
+        "profileId": "training",
+        "profileType": "training",
+        "settings": {
+          "continuity": {
+            "zoneLossContinuityRequired": true
+          }
+        },
+        "relationships": [
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "training-web-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "training-web-protected-by-lb",
+            "kind": "protectedBy",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "web"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "load-balancer"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "sourceClause": "/constraints/web-zone-distribution"
+          },
+          {
+            "relationshipClass": "declared",
+            "relationshipId": "training-worker-depends-db",
+            "kind": "dependsOn",
+            "source": {
+              "endpointType": "role",
+              "roleRef": "worker"
+            },
+            "target": {
+              "endpointType": "role",
+              "roleRef": "database-primary"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "sourceClause": "/constraints/worker-db-zone-colocation"
+          }
+        ],
+        "constraints": [
+          {
+            "constraintId": "db-singleton-supported",
+            "constraintType": "supportedSingleton",
+            "findingKind": "technologyConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/db-singleton-supported",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "expectedConstraint",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-acceptance",
+            "constraintType": "supportedSingleton",
+            "findingKind": "riskAcceptance",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/db-zone-loss-acceptance",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-training",
+            "riskAcceptanceClauseRef": "db-zone-loss-spof",
+            "protected": true
+          },
+          {
+            "constraintId": "db-zone-loss-spof",
+            "constraintType": "supportedSingleton",
+            "findingKind": "actualSpof",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "proofRequirement": {
+              "proofKind": "cardinalityProof",
+              "roleRef": "database-primary",
+              "expected": {
+                "cardinalityKind": "exactlyOne"
+              }
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "observation",
+            "riskAcceptanceRef": "ra-db-zone-loss-training",
+            "protected": true
+          },
+          {
+            "constraintId": "web-zone-distribution",
+            "constraintType": "zoneDistribution",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/web-zone-distribution",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneDistributionProof",
+              "roleRef": "web",
+              "minimumDistinctZones": 3
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          },
+          {
+            "constraintId": "worker-db-zone-colocation",
+            "constraintType": "zoneColocation",
+            "findingKind": "architectureConstraint",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/worker-db-zone-colocation",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "proofRequirement": {
+              "proofKind": "zoneColocationProof",
+              "subjectRoleRef": "worker",
+              "anchorRoleRef": "database-primary"
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+            "protected": true
+          }
+        ],
+        "riskAcceptances": [
+          {
+            "riskAcceptanceId": "ra-db-zone-loss-training",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "riskKind": "availability",
+            "riskRating": "high",
+            "residualRiskStatement": "A single-zone database failure remains an accepted residual risk for synthetic evaluation.",
+            "rationaleRef": "synthetic://risk/db-zone-loss",
+            "acceptedBy": "synthetic-approver",
+            "ownedBy": "ops-owner",
+            "acceptedAt": "2025-01-01T00:00:00.000Z",
+            "expiresAt": "2025-12-31T00:00:00.000Z",
+            "linkedControlRefs": [
+              "control-db-failover-runbook-training"
+            ],
+            "acceptedResourceBindings": [
+              {
+                "roleRef": "database-primary",
+                "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+              }
+            ],
+            "profiles": [
+              "training"
+            ],
+            "status": "approved"
+          }
+        ],
+        "controls": [
+          {
+            "controlKind": "manualFailoverRunbook",
+            "controlId": "control-db-failover-runbook-training",
+            "governanceScope": {
+              "governanceScopeType": "clause",
+              "manifestId": "wl-athena-wc002-canonical",
+              "profileId": "training",
+              "clausePath": "/constraints/db-zone-loss-spof",
+              "ownerRef": "ops-owner"
+            },
+            "ownerRef": "ops-owner",
+            "profiles": [
+              "training"
+            ],
+            "health": "effective",
+            "runbookRef": "synthetic://runbooks/db-failover",
+            "lastReviewedAt": "2025-01-01T00:00:00.000Z"
+          }
+        ],
+        "weakeningOverrides": [],
+        "roles": [],
+        "objectives": [],
+        "ownership": [],
+        "disabledRefs": []
+      }
+    },
+    "roles": [
       {
-        "resourceGroupName": "rg-athena-fixture",
-        "scopeType": "resourceGroup",
-        "subscriptionId": "11111111-1111-1111-1111-111111111111",
-        "tenantId": "11111111-1111-1111-1111-111111111111"
+        "roleId": "database-primary",
+        "kind": "singletonDatabase",
+        "cardinality": {
+          "cardinalityKind": "exactlyOne"
+        },
+        "selectors": [
+          {
+            "selectorType": "namePredicate",
+            "selectorId": "database-name",
+            "prefix": "athena-db-",
+            "maxMatches": 10
+          }
+        ],
+        "ownerRef": "ops-owner",
+        "status": "approved"
+      },
+      {
+        "roleId": "load-balancer",
+        "kind": "loadBalancer",
+        "cardinality": {
+          "cardinalityKind": "exactlyOne"
+        },
+        "selectors": [
+          {
+            "selectorType": "namePredicate",
+            "selectorId": "load-balancer-name",
+            "prefix": "athena-lb-",
+            "maxMatches": 10
+          }
+        ],
+        "ownerRef": "ops-owner",
+        "status": "approved"
+      },
+      {
+        "roleId": "web",
+        "kind": "webService",
+        "cardinality": {
+          "cardinalityKind": "oneOrMore"
+        },
+        "selectors": [
+          {
+            "selectorType": "namePredicate",
+            "selectorId": "web-name",
+            "prefix": "athena-web-",
+            "maxMatches": 20
+          }
+        ],
+        "ownerRef": "ops-owner",
+        "status": "approved"
+      },
+      {
+        "roleId": "worker",
+        "kind": "worker",
+        "cardinality": {
+          "cardinalityKind": "oneOrMore"
+        },
+        "selectors": [
+          {
+            "selectorType": "namePredicate",
+            "selectorId": "worker-name",
+            "prefix": "athena-worker-",
+            "maxMatches": 20
+          }
+        ],
+        "ownerRef": "ops-owner",
+        "status": "approved"
       }
     ],
-    "collectedAt": "2025-06-01T11:45:00Z",
-    "collector": {
-      "collectorIdentityEvidenceRef": "identity-111111111111",
-      "collectorType": "azureMcpHost",
-      "ingestionAudience": "api://athena-ingestion",
-      "ingestionServiceId": "ingestion-111111111111",
-      "mcpHostId": "mcp-111111111111",
-      "tenantId": "11111111-1111-1111-1111-111111111111",
-      "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9",
-      "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
-    },
-    "collectorAttempts": [
+    "relationships": [
       {
-        "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "attemptId": "attempt-111111111111",
-        "attemptStartedAt": "2025-06-01T11:45:00Z",
-        "attemptType": "successResponse",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
-        "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-        "responseReceivedAt": "2025-06-01T11:46:00Z",
-        "toolName": "azure.resourceInventory.read",
-        "toolVersion": "1.0.0"
+        "relationshipClass": "declared",
+        "relationshipId": "web-protected-by-lb",
+        "kind": "protectedBy",
+        "source": {
+          "endpointType": "role",
+          "roleRef": "web"
+        },
+        "target": {
+          "endpointType": "role",
+          "roleRef": "load-balancer"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "sourceClause": "/constraints/web-zone-distribution"
+      },
+      {
+        "relationshipClass": "declared",
+        "relationshipId": "worker-depends-db",
+        "kind": "dependsOn",
+        "source": {
+          "endpointType": "role",
+          "roleRef": "worker"
+        },
+        "target": {
+          "endpointType": "role",
+          "roleRef": "database-primary"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "sourceClause": "/constraints/worker-db-zone-colocation"
+      }
+    ],
+    "constraints": [
+      {
+        "constraintId": "db-singleton-supported",
+        "constraintType": "supportedSingleton",
+        "findingKind": "technologyConstraint",
+        "governanceScope": {
+          "governanceScopeType": "clause",
+          "manifestId": "wl-athena-wc002-canonical",
+          "profileId": "production",
+          "clausePath": "/constraints/db-singleton-supported",
+          "ownerRef": "ops-owner"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "proofRequirement": {
+          "proofKind": "cardinalityProof",
+          "roleRef": "database-primary",
+          "expected": {
+            "cardinalityKind": "exactlyOne"
+          }
+        },
+        "failureVerdict": "violation",
+        "successVerdict": "expectedConstraint",
+        "protected": true
+      },
+      {
+        "constraintId": "db-zone-loss-acceptance",
+        "constraintType": "supportedSingleton",
+        "findingKind": "riskAcceptance",
+        "governanceScope": {
+          "governanceScopeType": "clause",
+          "manifestId": "wl-athena-wc002-canonical",
+          "profileId": "production",
+          "clausePath": "/constraints/db-zone-loss-acceptance",
+          "ownerRef": "ops-owner"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "proofRequirement": {
+          "proofKind": "cardinalityProof",
+          "roleRef": "database-primary",
+          "expected": {
+            "cardinalityKind": "exactlyOne"
+          }
+        },
+        "failureVerdict": "violation",
+        "successVerdict": "observation",
+        "riskAcceptanceRef": "ra-db-zone-loss",
+        "riskAcceptanceClauseRef": "db-zone-loss-spof",
+        "protected": true
+      },
+      {
+        "constraintId": "db-zone-loss-spof",
+        "constraintType": "supportedSingleton",
+        "findingKind": "actualSpof",
+        "governanceScope": {
+          "governanceScopeType": "clause",
+          "manifestId": "wl-athena-wc002-canonical",
+          "profileId": "production",
+          "clausePath": "/constraints/db-zone-loss-spof",
+          "ownerRef": "ops-owner"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "proofRequirement": {
+          "proofKind": "cardinalityProof",
+          "roleRef": "database-primary",
+          "expected": {
+            "cardinalityKind": "exactlyOne"
+          }
+        },
+        "failureVerdict": "violation",
+        "successVerdict": "observation",
+        "riskAcceptanceRef": "ra-db-zone-loss",
+        "protected": true
+      },
+      {
+        "constraintId": "web-zone-distribution",
+        "constraintType": "zoneDistribution",
+        "findingKind": "architectureConstraint",
+        "governanceScope": {
+          "governanceScopeType": "clause",
+          "manifestId": "wl-athena-wc002-canonical",
+          "profileId": "production",
+          "clausePath": "/constraints/web-zone-distribution",
+          "ownerRef": "ops-owner"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "proofRequirement": {
+          "proofKind": "zoneDistributionProof",
+          "roleRef": "web",
+          "minimumDistinctZones": 3
+        },
+        "failureVerdict": "violation",
+        "successVerdict": "pass",
+        "protected": true
+      },
+      {
+        "constraintId": "worker-db-zone-colocation",
+        "constraintType": "zoneColocation",
+        "findingKind": "architectureConstraint",
+        "governanceScope": {
+          "governanceScopeType": "clause",
+          "manifestId": "wl-athena-wc002-canonical",
+          "profileId": "production",
+          "clausePath": "/constraints/worker-db-zone-colocation",
+          "ownerRef": "ops-owner"
+        },
+        "ownerRef": "ops-owner",
+        "profiles": [
+          "production",
+          "development",
+          "training"
+        ],
+        "proofRequirement": {
+          "proofKind": "zoneColocationProof",
+          "subjectRoleRef": "worker",
+          "anchorRoleRef": "database-primary"
+        },
+        "failureVerdict": "violation",
+        "successVerdict": "pass",
+        "protected": true
+      }
+    ],
+    "objectives": [],
+    "ownership": [
+      {
+        "ownerRef": "ops-owner",
+        "ownerRole": "operationsOwner",
+        "authorityRef": "synthetic://teams/operations"
       }
     ],
     "compatibility": {
-      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-      "artifactKind": "evidenceSnapshot",
-      "extensionPolicy": "rejectUnknownDecisionFields",
-      "minimumReaderVersion": "1.0.0",
+      "artifactKind": "workloadManifest",
+      "schemaVersion": "1.0.0",
+      "semanticContractVersion": "1.0.0",
       "policyContractVersion": "1.0.0",
+      "minimumReaderVersion": "1.0.0",
+      "requiresCapabilities": [],
       "producedBy": {
         "producerId": "athena.contracts",
         "version": "1.0.0"
       },
-      "requiresCapabilities": [],
+      "extensionPolicy": "rejectUnknownDecisionFields",
+      "artifactDigest": "sha256:b6623ba1d2102223b27597f9ae64c1a83769fa4665fb86d9580492ff0bc25ab6",
+      "semanticDigest": "sha256:4cb99758a49d39da2191ddaa583cd00b43c504d1cf0dad3b636fcda9468e7ec0"
+    },
+    "audit": {
+      "publishedBy": "human-approved-context-api",
+      "publishedAt": "2025-06-01T00:00:00.000Z",
+      "approvalStatus": "approved"
+    },
+    "controls": [],
+    "riskAcceptances": []
+  },
+  "snapshot": {
+    "snapshotId": "snap-111111111111",
+    "compatibility": {
+      "artifactKind": "evidenceSnapshot",
       "schemaVersion": "1.0.0",
       "semanticContractVersion": "1.0.0",
+      "policyContractVersion": "1.0.0",
+      "minimumReaderVersion": "1.0.0",
+      "requiresCapabilities": [],
+      "producedBy": {
+        "producerId": "athena.contracts",
+        "version": "1.0.0"
+      },
+      "extensionPolicy": "rejectUnknownDecisionFields",
+      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
       "semanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2"
     },
+    "authorizedScopes": [
+      {
+        "scopeType": "resourceGroup",
+        "tenantId": "11111111-1111-1111-1111-111111111111",
+        "subscriptionId": "11111111-1111-1111-1111-111111111111",
+        "resourceGroupName": "rg-athena-fixture"
+      }
+    ],
+    "collectedAt": "2025-06-01T11:45:00Z",
+    "expiresAt": "2025-06-02T00:00:00Z",
+    "collector": {
+      "collectorType": "azureMcpHost",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "mcpHostId": "mcp-111111111111",
+      "tenantId": "11111111-1111-1111-1111-111111111111",
+      "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+      "ingestionServiceId": "ingestion-111111111111",
+      "ingestionAudience": "api://athena-ingestion",
+      "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9"
+    },
+    "collectorAttempts": [
+      {
+        "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "attemptType": "successResponse",
+        "attemptId": "attempt-111111111111",
+        "attemptStartedAt": "2025-06-01T11:45:00Z",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0",
+        "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
+        "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+        "responseReceivedAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      }
+    ],
     "evidenceRecords": [
       {
-        "availabilityZone": "1",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
-        "location": "australiaeast",
-        "provenance": {
-          "collectorAttemptId": "attempt-111111111111",
-          "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/0",
-          "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
-        },
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "1",
         "tags": {
+          "environment": "production",
+          "workloadRole": "database",
           "application": "app-111111111111",
           "component": "component-222222222222",
-          "environment": "production",
-          "managedBy": "manual",
-          "workloadRole": "database"
-        }
-      },
-      {
-        "availabilityZone": "1",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
-        "location": "australiaeast",
+          "managedBy": "manual"
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/1",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/0",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-01",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "1",
         "tags": {
+          "environment": "production",
+          "workloadRole": "worker",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "worker"
-        }
-      },
-      {
-        "availabilityZone": "1",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
-        "location": "australiaeast",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/2",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/1",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-02",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "1",
         "tags": {
+          "environment": "production",
+          "workloadRole": "worker",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "worker"
-        }
-      },
-      {
-        "availabilityZone": "1",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
-        "location": "australiaeast",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/3",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/2",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-01",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "1",
         "tags": {
+          "environment": "production",
+          "workloadRole": "web-service",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "web-service"
-        }
-      },
-      {
-        "availabilityZone": "2",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
-        "location": "australiaeast",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/4",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/3",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-02",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "2",
         "tags": {
+          "environment": "production",
+          "workloadRole": "web-service",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "web-service"
-        }
-      },
-      {
-        "availabilityZone": "3",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
-        "location": "australiaeast",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/5",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/4",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-03",
         "resourceType": "Microsoft.Compute/virtualMachines",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "3",
         "tags": {
+          "environment": "production",
+          "workloadRole": "web-service",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "web-service"
-        }
-      },
-      {
-        "availabilityZone": "1",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
-        "location": "australiaeast",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/6",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/5",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "resource",
         "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Network/loadBalancers/athena-lb-01",
         "resourceType": "Microsoft.Network/loadBalancers",
-        "state": "running",
+        "location": "australiaeast",
+        "availabilityZone": "1",
         "tags": {
+          "environment": "production",
+          "workloadRole": "load-balancer",
           "application": null,
           "component": null,
-          "environment": "production",
-          "managedBy": null,
-          "workloadRole": "load-balancer"
-        }
-      },
-      {
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
+          "managedBy": null
+        },
+        "state": "running",
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/7",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/6",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "observedRelationship",
         "relationship": {
-          "evidenceItemRef": "item-111111111111",
-          "kind": "dependsOn",
-          "observedAt": "2025-06-01T11:45:00Z",
           "relationshipClass": "observed",
           "relationshipId": "relationship-111111111111",
+          "kind": "dependsOn",
           "source": {
             "refKind": "resourceRef",
             "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-01"
@@ -1407,30 +1359,30 @@
           "target": {
             "refKind": "resourceRef",
             "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
-          }
-        }
-      },
-      {
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
-        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
+          },
+          "evidenceItemRef": "item-111111111111",
+          "observedAt": "2025-06-01T11:45:00Z"
+        },
         "provenance": {
           "collectorAttemptId": "attempt-111111111111",
           "collectorIdentityEvidenceRef": "identity-111111111111",
-          "failurePayloadDigest": null,
-          "failurePayloadPointer": null,
-          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-          "sourceResponsePointer": "/items/8",
           "toolName": "azure.resourceInventory.read",
-          "toolVersion": "1.0.0"
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/7",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
         },
+        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
+      },
+      {
         "recordType": "observedRelationship",
         "relationship": {
-          "evidenceItemRef": "item-222222222222",
-          "kind": "calls",
-          "observedAt": "2025-06-01T11:45:00Z",
           "relationshipClass": "observed",
           "relationshipId": "relationship-222222222222",
+          "kind": "calls",
           "source": {
             "refKind": "resourceRef",
             "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-01"
@@ -1438,271 +1390,284 @@
           "target": {
             "refKind": "resourceRef",
             "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Network/loadBalancers/athena-lb-01"
-          }
-        }
+          },
+          "evidenceItemRef": "item-222222222222",
+          "observedAt": "2025-06-01T11:45:00Z"
+        },
+        "provenance": {
+          "collectorAttemptId": "attempt-111111111111",
+          "collectorIdentityEvidenceRef": "identity-111111111111",
+          "toolName": "azure.resourceInventory.read",
+          "toolVersion": "1.0.0",
+          "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+          "sourceResponsePointer": "/items/8",
+          "failurePayloadDigest": null,
+          "failurePayloadPointer": null
+        },
+        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "collectorIdentityEvidenceRef": "identity-111111111111"
       }
     ],
     "evidenceRefs": [
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:c1b757dc1a903f3464b925b85526f8a6992ea8e9122c781318d3b3b2bcd41a95",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/0"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:4aa013db362d8a8897d36d26e87996c7c3b63eff91e395fc4708de7122b3eb30",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/1"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:fa659bb855d4228f93a0051133fcaf2dde2a1bc33456e80deb86f8d968996f2e",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/2"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:42299fcb6fb526bd31c2565caab8736ac6ce51254be28b18bb145d2c44c84f55",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/3"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:e04961591a8e3ec678c4a6e48afe936ed05a62673bc31618c502d65bd9db48ab",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/4"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:066d0119edff99f9f9bc4fa8b5fd17165f5fe36cf0c22580b22903aa8597b149",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/5"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:779de648c9d32d912db992b9a490a6265ca484f2a1f25357c4fa30f9f40f217e",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/6"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:2b65c2ec51726b6c57d1b68325b204c17c61f0157e3cfe35250ed612e7501a05",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/7"
       },
       {
-        "collectorAttemptAt": "2025-06-01T11:46:00Z",
-        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+        "refType": "evidenceItem",
+        "snapshotId": "snap-111111111111",
+        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
         "collectorAttemptId": "attempt-111111111111",
-        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "collectorAttemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
         "collectorToolName": "azure.resourceInventory.read",
         "collectorToolVersion": "1.0.0",
-        "itemDigest": "sha256:74e4473b1116ad0acad2a32145e8a0b02a001331a1430493452705c1e5f403d9",
-        "refType": "evidenceItem",
-        "snapshotArtifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-        "snapshotId": "snap-111111111111",
-        "snapshotSemanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+        "collectorAttemptAt": "2025-06-01T11:46:00Z",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
         "sourceResponseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
         "sourceResponsePointer": "/items/8"
       }
     ],
-    "expiresAt": "2025-06-02T00:00:00Z",
     "identityEvidence": [
       {
-        "identityEvidenceDigest": "sha256:4c9f6b8896686a377ee8e2da0d6267d5562b1fc5c906f11691867f3ba4bb40a8",
         "identityEvidenceId": "identity-111111111111",
         "identityEvidenceType": "entraJwtTokenEvidence",
-        "ingestionDerivation": {
-          "attemptBinding": {
-            "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
-            "attemptId": "attempt-111111111111",
-            "attemptStartedAt": "2025-06-01T11:45:00Z",
-            "attemptType": "successResponse",
-            "deadlineAt": null,
-            "failureDigest": null,
-            "observedAt": null,
-            "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
-            "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
-            "responseReceivedAt": "2025-06-01T11:46:00Z",
-            "timedOutAt": null,
-            "toolName": "azure.resourceInventory.read",
-            "toolVersion": "1.0.0"
-          },
-          "derivationDigest": "sha256:beef1f2c6fbfeff1b0c30316e12431062585166eb5277bca4acd5a5c6b8ac156",
-          "derivationPreimageType": "athena.mcpCollectorAttemptDerivation",
-          "derivationPreimageVersion": "1.0.0",
-          "derivedAt": "2025-06-01T11:47:00Z",
-          "derivedCollectorIdentityRef": "identity-111111111111",
-          "identityEvidenceId": "identity-111111111111",
-          "ingestionAudience": "api://athena-ingestion",
-          "ingestionServiceId": "ingestion-111111111111",
-          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
-          "mcpHostId": "mcp-111111111111",
-          "mcpHostManagedIdentityClientId": "33333333-3333-3333-3333-333333333333",
-          "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
-          "mcpHostTenantId": "11111111-1111-1111-1111-111111111111",
-          "policyContractVersion": "1.0.0",
-          "schemaVersion": "1.0.0",
-          "semanticContractVersion": "1.0.0",
-          "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
-          "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f",
-          "tokenVerificationStatus": "valid",
-          "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9",
-          "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd"
-        },
-        "ingestionSignature": {
-          "keyName": "athena-fixture",
-          "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
-          "keyVersion": "0123456789abcdef0123456789abcdef",
-          "signature": "nGNZ9OWywWosjEumpXmWr4ns7Omz+p2NhaSkYzeLd/Su+MWmIfRiFfVW0K8cBCqZnjYyNltoA2H+c8d2r7z3Qh+H2W8ucYq/Pf34KYYVRc+heOLmSRpkuEj54OXAI5jsvMsmn89pfb+dQ1mzv99Vlk3Zpi70R2Bd7iFlyMSYzvBJ5f/guxcfF6dwIWqqhSOv+VhxtuyFOuMy9JNYGaL6jUEjQRPQ67G07IdnCCwAI1GP2E+KEtGDE85hoFWkvMD5sz83yLg76xVlRpb644C6Tha7luiCoLAxHZxFgUrmHQhTcbG+2DQjudJfdh0rtTHirDgTIrxo6H12SHl1oo0Wwg==",
-          "signatureAlgorithm": "RS256",
-          "signedAt": "2025-06-01T11:48:00Z",
-          "signedPreimageDigest": "sha256:602984d83fc56146afc449a29bdb89984a6c41a19069a396508812179ca5ea0f",
-          "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
-        },
+        "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
         "jwtHeader": {
           "alg": "RS256",
           "kid": "kid-athena-fixture",
           "typ": "JWT"
         },
-        "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
-        "tokenVerification": {
-          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
-          "keyId": "kid-athena-fixture",
-          "status": "valid",
-          "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f",
-          "verifiedAt": "2025-06-01T11:30:00Z",
-          "verifiedClaims": {
-            "audience": "api://athena-ingestion",
-            "expiresAt": "2025-06-01T13:00:00Z",
-            "issuedAt": "2025-06-01T11:00:00Z",
-            "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
-            "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
-            "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
-            "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
-            "notBefore": "2025-06-01T11:00:00Z",
-            "subject": "22222222-2222-2222-2222-222222222222",
-            "tenantId": "11111111-1111-1111-1111-111111111111"
-          },
-          "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd"
-        },
         "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
         "verifiedClaims": {
-          "audience": "api://athena-ingestion",
-          "expiresAt": "2025-06-01T13:00:00Z",
-          "issuedAt": "2025-06-01T11:00:00Z",
           "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
-          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
-          "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+          "audience": "api://athena-ingestion",
+          "tenantId": "11111111-1111-1111-1111-111111111111",
           "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
-          "notBefore": "2025-06-01T11:00:00Z",
+          "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
           "subject": "22222222-2222-2222-2222-222222222222",
-          "tenantId": "11111111-1111-1111-1111-111111111111"
-        }
+          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+          "issuedAt": "2025-06-01T11:00:00Z",
+          "notBefore": "2025-06-01T11:00:00Z",
+          "expiresAt": "2025-06-01T13:00:00Z"
+        },
+        "tokenVerification": {
+          "status": "valid",
+          "verifiedAt": "2025-06-01T11:30:00Z",
+          "keyId": "kid-athena-fixture",
+          "verifiedClaims": {
+            "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+            "audience": "api://athena-ingestion",
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+            "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+            "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+            "subject": "22222222-2222-2222-2222-222222222222",
+            "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+            "issuedAt": "2025-06-01T11:00:00Z",
+            "notBefore": "2025-06-01T11:00:00Z",
+            "expiresAt": "2025-06-01T13:00:00Z"
+          },
+          "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd",
+          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+          "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f"
+        },
+        "ingestionDerivation": {
+          "derivationPreimageType": "athena.mcpCollectorAttemptDerivation",
+          "derivationPreimageVersion": "1.0.0",
+          "schemaVersion": "1.0.0",
+          "semanticContractVersion": "1.0.0",
+          "policyContractVersion": "1.0.0",
+          "identityEvidenceId": "identity-111111111111",
+          "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
+          "tokenVerificationStatus": "valid",
+          "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f",
+          "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd",
+          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+          "mcpHostId": "mcp-111111111111",
+          "mcpHostTenantId": "11111111-1111-1111-1111-111111111111",
+          "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+          "mcpHostManagedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+          "ingestionServiceId": "ingestion-111111111111",
+          "ingestionAudience": "api://athena-ingestion",
+          "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9",
+          "derivedCollectorIdentityRef": "identity-111111111111",
+          "attemptBinding": {
+            "attemptId": "attempt-111111111111",
+            "attemptType": "successResponse",
+            "attemptDigest": "sha256:86ac5fa298056f25245a3b45afcdefb5d8434ecd9a2c6996d7420dd320ce0024",
+            "toolName": "azure.resourceInventory.read",
+            "toolVersion": "1.0.0",
+            "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
+            "responseDigest": "sha256:a8b154f2e2d8048172b25617f7827abceb017da1e517decc4741154908e3c4ef",
+            "failureDigest": null,
+            "attemptStartedAt": "2025-06-01T11:45:00Z",
+            "responseReceivedAt": "2025-06-01T11:46:00Z",
+            "deadlineAt": null,
+            "timedOutAt": null,
+            "observedAt": null
+          },
+          "derivedAt": "2025-06-01T11:47:00Z",
+          "derivationDigest": "sha256:beef1f2c6fbfeff1b0c30316e12431062585166eb5277bca4acd5a5c6b8ac156"
+        },
+        "ingestionSignature": {
+          "signatureAlgorithm": "RS256",
+          "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+          "keyName": "athena-fixture",
+          "keyVersion": "0123456789abcdef0123456789abcdef",
+          "signedPreimageDigest": "sha256:602984d83fc56146afc449a29bdb89984a6c41a19069a396508812179ca5ea0f",
+          "signature": "nGNZ9OWywWosjEumpXmWr4ns7Omz+p2NhaSkYzeLd/Su+MWmIfRiFfVW0K8cBCqZnjYyNltoA2H+c8d2r7z3Qh+H2W8ucYq/Pf34KYYVRc+heOLmSRpkuEj54OXAI5jsvMsmn89pfb+dQ1mzv99Vlk3Zpi70R2Bd7iFlyMSYzvBJ5f/guxcfF6dwIWqqhSOv+VhxtuyFOuMy9JNYGaL6jUEjQRPQ67G07IdnCCwAI1GP2E+KEtGDE85hoFWkvMD5sz83yLg76xVlRpb644C6Tha7luiCoLAxHZxFgUrmHQhTcbG+2DQjudJfdh0rtTHirDgTIrxo6H12SHl1oo0Wwg==",
+          "signedAt": "2025-06-01T11:48:00Z",
+          "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
+        },
+        "identityEvidenceDigest": "sha256:4c9f6b8896686a377ee8e2da0d6267d5562b1fc5c906f11691867f3ba4bb40a8"
       }
     ],
     "snapshotAttestation": {
-      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-      "artifactKind": "evidenceSnapshot",
       "attestationType": "trustedSnapshotPublication",
       "attestationVersion": "1.0.0",
-      "attestedAt": "2025-06-01T11:49:00Z",
-      "authorizedScopesDigest": "sha256:a85690fe763d273f004da00b5c3866c81aa3a2af1e2180bc7b9126c23d88a021",
-      "collectedAt": "2025-06-01T11:45:00Z",
-      "collectorAttemptSetDigest": "sha256:2b99882555cd2a48c15e011c3752e1fab80de0ffd8fae06f0f29d1b51162e55e",
-      "evidenceRecordSetDigest": "sha256:8c4bcf753ead30719ab45f8ec34787648f4a9aee3a3f33dd1b1f8def2ffffdcd",
-      "evidenceReferenceSetDigest": "sha256:ce17a211904ff0dd4bbe6359e74c427799227b2d99ff1fcb2a27f2c598b6dc9c",
-      "expiresAt": "2025-06-02T00:00:00Z",
+      "artifactKind": "evidenceSnapshot",
+      "schemaVersion": "1.0.0",
+      "semanticContractVersion": "1.0.0",
+      "policyContractVersion": "1.0.0",
+      "snapshotId": "snap-111111111111",
+      "artifactDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
+      "semanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
       "identityEvidenceDigests": [
         "sha256:4c9f6b8896686a377ee8e2da0d6267d5562b1fc5c906f11691867f3ba4bb40a8"
       ],
       "identityEvidenceSetDigest": "sha256:06c059e8659428823487e631d0249072fd8fb28d5a4da41746647a32a0f207f9",
-      "keyName": "athena-fixture",
-      "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
-      "keyVersion": "0123456789abcdef0123456789abcdef",
-      "policyContractVersion": "1.0.0",
-      "schemaVersion": "1.0.0",
-      "semanticContractVersion": "1.0.0",
-      "semanticDigest": "sha256:eebe798248175c34217cda5d602ee7c6341aa312a1305c9879291b45345dfad2",
-      "signature": "lbwnkDvkh6yFn9zCYcYUYZw1DQBlz38s0B64PqHFGoKbrH4aGDjrwGS/7mpVD+38RLMlKmEHiWacj3LCWwc1EDfJab0RUv9aQ3dtdilASlIVyw1jQXfZjPIvlkaRP4XpU7diP1tHhq4iUbHK7fGwNVr1afUau1Kmgj459A+3pjD4mtTRPASGdmLbFEchC1uQU0PkPiss+J1QoBF0nLJC9kevAADv9RkXQNXOr/KzQ2G+Jm1a/lGgxxlsauzXce81FyOlfaFeLEcrFumBqhUag9YsujohdkiGccf+RpBEvJXpVcWvOX+q8yvdPEFZs3Syvw9cWwt+aloxelDRjvm8QA==",
+      "collectedAt": "2025-06-01T11:45:00Z",
+      "expiresAt": "2025-06-02T00:00:00Z",
+      "authorizedScopesDigest": "sha256:a85690fe763d273f004da00b5c3866c81aa3a2af1e2180bc7b9126c23d88a021",
+      "collectorAttemptSetDigest": "sha256:2b99882555cd2a48c15e011c3752e1fab80de0ffd8fae06f0f29d1b51162e55e",
+      "evidenceRecordSetDigest": "sha256:8c4bcf753ead30719ab45f8ec34787648f4a9aee3a3f33dd1b1f8def2ffffdcd",
+      "evidenceReferenceSetDigest": "sha256:ce17a211904ff0dd4bbe6359e74c427799227b2d99ff1fcb2a27f2c598b6dc9c",
+      "attestedAt": "2025-06-01T11:49:00Z",
       "signatureAlgorithm": "RS256",
+      "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+      "keyName": "athena-fixture",
+      "keyVersion": "0123456789abcdef0123456789abcdef",
+      "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
       "signedPreimageDigest": "sha256:e4b046d711d10be19024d5bea2637c29fa5bdf77641431e18a8eb536312b68e8",
-      "snapshotId": "snap-111111111111",
-      "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
-    },
-    "snapshotId": "snap-111111111111"
+      "signature": "lbwnkDvkh6yFn9zCYcYUYZw1DQBlz38s0B64PqHFGoKbrH4aGDjrwGS/7mpVD+38RLMlKmEHiWacj3LCWwc1EDfJab0RUv9aQ3dtdilASlIVyw1jQXfZjPIvlkaRP4XpU7diP1tHhq4iUbHK7fGwNVr1afUau1Kmgj459A+3pjD4mtTRPASGdmLbFEchC1uQU0PkPiss+J1QoBF0nLJC9kevAADv9RkXQNXOr/KzQ2G+Jm1a/lGgxxlsauzXce81FyOlfaFeLEcrFumBqhUag9YsujohdkiGccf+RpBEvJXpVcWvOX+q8yvdPEFZs3Syvw9cWwt+aloxelDRjvm8QA=="
+    }
   }
 }
