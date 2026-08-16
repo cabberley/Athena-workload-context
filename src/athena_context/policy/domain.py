@@ -586,15 +586,28 @@ def evaluate_constraint(
         verdict = "unknown"
 
     acceptance: ManifestRiskAcceptance | None = None
+    acceptance_semantics_are_eligible = (
+        constraint.finding_kind in {"actualSpof", "riskAcceptance"}
+        and constraint.constraint_type == "supportedSingleton"
+    ) or (
+        constraint.finding_kind == "architectureConstraint"
+        and constraint.constraint_type
+        in {
+            "cardinality",
+            "zoneColocation",
+            "zoneDistribution",
+            "dependencyRequired",
+            "dependencyProhibited",
+        }
+    ) or (
+        constraint.finding_kind == "relationshipConflict"
+        and constraint.constraint_type
+        in {"dependencyRequired", "dependencyProhibited"}
+    )
     acceptance_eligible = (
         verdict == "violation"
-        and constraint.finding_kind
-        in {
-            "actualSpof",
-            "riskAcceptance",
-            "architectureConstraint",
-            "relationshipConflict",
-        }
+        and normalized_id(constraint.constraint_id) != "db-singleton-supported"
+        and acceptance_semantics_are_eligible
         and not isinstance(proof, EvidenceFreshnessProof)
     )
     if acceptance_eligible:

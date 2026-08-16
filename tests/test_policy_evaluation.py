@@ -1106,6 +1106,7 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
         if constraint.constraint_id == "db-singleton-supported"
     )
     technology_constraint.risk_acceptance_ref = "ra-singleton-technology"
+    technology_constraint.finding_kind = "architectureConstraint"
     profile = _resign_profile(profile)
     evidence = _evidence(profile)
     evidence.resources.append(
@@ -1126,14 +1127,52 @@ def test_controls_and_technology_constraints_never_become_accepted_risk() -> Non
     database_binding.selector_result_digest = compute_artifact_digest(
         sorted(database_binding.selected_resource_ids, key=str.casefold)
     )
-    findings = evaluate_profile(
-        profile,
-        evidence,
-        as_of=AS_OF,
-        verify_evidence_context=_verify_unit_evidence,
+    with pytest.raises(
+        AthenaValidationError,
+        match="protected canonical constraint semantics are invalid",
+    ):
+        evaluate_profile(
+            profile,
+            evidence,
+            as_of=AS_OF,
+            verify_evidence_context=_verify_unit_evidence,
+        )
+
+
+@pytest.mark.parametrize(
+    ("clause_id", "attribute", "value"),
+    [
+        ("db-zone-loss-spof", "finding_kind", "architectureConstraint"),
+        (
+            "worker-db-zone-colocation",
+            "finding_kind",
+            "relationshipConflict",
+        ),
+        ("web-zone-distribution", "success_verdict", "expectedConstraint"),
+    ],
+)
+def test_policy_boundary_enforces_other_protected_canonical_semantics(
+    clause_id: str,
+    attribute: str,
+    value: str,
+) -> None:
+    profile = _resolved_profile("production")
+    constraint = next(
+        item for item in profile.constraints if item.constraint_id == clause_id
     )
-    assert findings["db-singleton-supported"].verdict == "violation"
-    assert findings["db-singleton-supported"].risk_acceptance_ref is None
+    setattr(constraint, attribute, value)
+    profile = _resign_profile(profile)
+
+    with pytest.raises(
+        AthenaValidationError,
+        match="protected canonical constraint semantics are invalid",
+    ):
+        evaluate_policy_profile(
+            profile,
+            _evidence(profile),
+            as_of=AS_OF,
+            verify_evidence_context=_verify_unit_evidence,
+        )
 
 
 def test_stale_context_and_missing_typed_gap_citations_fail_closed() -> None:

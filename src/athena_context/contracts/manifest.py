@@ -1987,6 +1987,96 @@ def _resolve_cross_references(
         require_owner(objective.owner_ref)
 
 
+def _validate_canonical_protected_constraints(
+    profile: ResolvedManifestProfile,
+) -> None:
+    expected_semantics: dict[
+        str,
+        tuple[str, ManifestFindingKind, str, type[AthenaBaseModel]],
+    ] = {
+        "db-singleton-supported": (
+            "supportedSingleton",
+            "technologyConstraint",
+            "expectedConstraint",
+            CardinalityProof,
+        ),
+        "db-zone-loss-spof": (
+            "supportedSingleton",
+            "actualSpof",
+            "observation",
+            CardinalityProof,
+        ),
+        "db-zone-loss-acceptance": (
+            "supportedSingleton",
+            "riskAcceptance",
+            "observation",
+            CardinalityProof,
+        ),
+        "worker-db-zone-colocation": (
+            "zoneColocation",
+            "architectureConstraint",
+            "pass",
+            ZoneColocationProof,
+        ),
+        "web-zone-distribution": (
+            "zoneDistribution",
+            "architectureConstraint",
+            "pass",
+            ZoneDistributionProof,
+        ),
+    }
+    for constraint in profile.constraints:
+        constraint_id = _normalized_id(constraint.constraint_id)
+        expected = expected_semantics.get(constraint_id)
+        if expected is None:
+            continue
+        constraint_type, finding_kind, success_verdict, proof_type = expected
+        proof = constraint.proof_requirement
+        valid = (
+            constraint.protected
+            and constraint.constraint_type == constraint_type
+            and constraint.finding_kind == finding_kind
+            and constraint.failure_verdict == "violation"
+            and constraint.success_verdict == success_verdict
+            and isinstance(proof, proof_type)
+        )
+        if constraint_id in {
+            "db-singleton-supported",
+            "db-zone-loss-spof",
+            "db-zone-loss-acceptance",
+        }:
+            valid = (
+                valid
+                and isinstance(proof, CardinalityProof)
+                and _normalized_id(proof.role_ref) == "database-primary"
+                and isinstance(proof.expected, ExactlyOneCardinality)
+            )
+        elif constraint_id == "worker-db-zone-colocation":
+            valid = (
+                valid
+                and isinstance(proof, ZoneColocationProof)
+                and _normalized_id(proof.subject_role_ref) == "worker"
+                and _normalized_id(proof.anchor_role_ref) == "database-primary"
+            )
+        elif constraint_id == "web-zone-distribution":
+            valid = (
+                valid
+                and isinstance(proof, ZoneDistributionProof)
+                and _normalized_id(proof.role_ref) == "web"
+            )
+        if constraint_id == "db-singleton-supported":
+            valid = (
+                valid
+                and constraint.risk_acceptance_ref is None
+                and constraint.risk_acceptance_clause_ref is None
+            )
+        if not valid:
+            raise AthenaValidationError(
+                "protected canonical constraint semantics are invalid: "
+                f"{constraint.constraint_id}"
+            )
+
+
 def validate_resolved_manifest_profile(
     profile: ResolvedManifestProfile,
     *,
@@ -2028,6 +2118,7 @@ def validate_resolved_manifest_profile(
         as_of=as_of,
         require_active_governance=require_active_governance,
     )
+    _validate_canonical_protected_constraints(profile)
 
 
 def resolve_manifest_profile(
