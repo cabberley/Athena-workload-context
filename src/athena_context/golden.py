@@ -130,6 +130,38 @@ class GoldenProofResult:
     def canonical_json(self) -> str:
         return canonicalize_json(self.to_payload())
 
+    def render_text(self) -> str:
+        """Render a deterministic Markdown summary for release evidence."""
+
+        verdicts_by_profile = {
+            profile.profile_id: dict(profile.verdicts) for profile in self.profiles
+        }
+        lines = [
+            "# Athena golden proof",
+            "",
+            f"- Proof digest: `{self.proof_digest}`",
+            f"- Snapshot: `{self.snapshot_id}`",
+            f"- Snapshot artifact digest: `{self.snapshot_artifact_digest}`",
+            f"- Snapshot semantic digest: `{self.snapshot_semantic_digest}`",
+            "",
+            "| Clause | Production | Development | Training |",
+            "|---|---|---|---|",
+        ]
+        lines.extend(
+            "| "
+            + " | ".join(
+                (
+                    clause_id,
+                    verdicts_by_profile["production"][clause_id],
+                    verdicts_by_profile["development"][clause_id],
+                    verdicts_by_profile["training"][clause_id],
+                )
+            )
+            + " |"
+            for clause_id in _GOLDEN_CLAUSE_IDS
+        )
+        return "\n".join(lines)
+
 
 def _normalized(value: str) -> str:
     return normalize_nfc_text(value).casefold()

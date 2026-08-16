@@ -6,7 +6,7 @@ from athena_context.contracts import (
     ProfileDefinition,
     ResolvedProfile,
 )
-from athena_context.golden_proof import (
+from athena_context.golden import (
     GoldenProfileResult,
     GoldenProofMismatchError,
     GoldenProofResult,

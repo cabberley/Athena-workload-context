@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-import athena_context.golden_proof as golden
+import athena_context.golden as golden
 from athena_context import run_golden_proof as run_root_golden_proof
 from athena_context.contracts import (
     AthenaValidationError,
@@ -117,6 +117,9 @@ def test_public_runner_emits_exact_immutable_release_evidence() -> None:
     digest_payload = {key: value for key, value in payload.items() if key != "proofDigest"}
     assert compute_artifact_digest(digest_payload) == result.proof_digest
     assert json.loads(result.canonical_json()) == payload
+    rendered = result.render_text()
+    assert f"Proof digest: `{EXPECTED_PROOF_DIGEST}`" in rendered
+    assert "| web-zone-distribution | pass | pass | violation |" in rendered
     with pytest.raises(FrozenInstanceError):
         result.snapshot_id = "snap-mutated"  # type: ignore[misc]
 
