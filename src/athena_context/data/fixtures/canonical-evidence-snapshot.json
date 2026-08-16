@@ -1,0 +1,572 @@
+{
+  "authorizedScopes": [
+    {
+      "resourceGroupName": "rg-athena-fixture",
+      "scopeType": "resourceGroup",
+      "subscriptionId": "11111111-1111-1111-1111-111111111111",
+      "tenantId": "11111111-1111-1111-1111-111111111111"
+    }
+  ],
+  "collectedAt": "2025-06-01T11:45:00Z",
+  "collector": {
+    "collectorIdentityEvidenceRef": "identity-111111111111",
+    "collectorType": "azureMcpHost",
+    "ingestionAudience": "api://athena-ingestion",
+    "ingestionServiceId": "ingestion-111111111111",
+    "mcpHostId": "mcp-111111111111",
+    "tenantId": "11111111-1111-1111-1111-111111111111",
+    "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9",
+    "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
+  },
+  "collectorAttempts": [
+    {
+      "attemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "attemptId": "attempt-111111111111",
+      "attemptStartedAt": "2025-06-01T11:45:00Z",
+      "attemptType": "successResponse",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
+      "responseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "responseReceivedAt": "2025-06-01T11:46:00Z",
+      "toolName": "azure.resourceInventory.read",
+      "toolVersion": "1.0.0"
+    }
+  ],
+  "compatibility": {
+    "artifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+    "artifactKind": "evidenceSnapshot",
+    "extensionPolicy": "rejectUnknownDecisionFields",
+    "minimumReaderVersion": "1.0.0",
+    "policyContractVersion": "1.0.0",
+    "producedBy": {
+      "producerId": "athena.contracts",
+      "version": "1.0.0"
+    },
+    "requiresCapabilities": [],
+    "schemaVersion": "1.0.0",
+    "semanticContractVersion": "1.0.0",
+    "semanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29"
+  },
+  "evidenceRecords": [
+    {
+      "availabilityZone": "1",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:c05a0dea648d6a4d28d3b7d4ac29d46d47af134bfb7bd798e7e89b2e4a837237",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/0",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": "app-111111111111",
+        "component": "component-222222222222",
+        "environment": "production",
+        "managedBy": "manual",
+        "workloadRole": "database"
+      }
+    },
+    {
+      "availabilityZone": "1",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:27fdb27f9ed518058ecfc412ad0dd84e2a847c9bdf886c9bb539bdaeeb779629",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/1",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-01",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "worker"
+      }
+    },
+    {
+      "availabilityZone": "1",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:0ac1a6317760eeb1d176277736233848793a300306aac4609f1c8eb29e1b4fc8",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/2",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-02",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "worker"
+      }
+    },
+    {
+      "availabilityZone": "1",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:69a208bf4360f644651e0f35c65ad4ba56304325911c042378923dbf75508335",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/3",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-01",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "web-service"
+      }
+    },
+    {
+      "availabilityZone": "2",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:2cd35535a8dfd3ec289ad4475891073fdc29e15d08ba28cbc0c61a07ae2d4f21",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/4",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-02",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "web-service"
+      }
+    },
+    {
+      "availabilityZone": "3",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:3a49e4efaa944aa549046b56182a12d6d7a42ed2bb0546acbecb7120fe88bb2b",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/5",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-03",
+      "resourceType": "Microsoft.Compute/virtualMachines",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "web-service"
+      }
+    },
+    {
+      "availabilityZone": "1",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:ca5ab079f4b045367754de803f37d8b03447d8ae90ca7b1195ad4d7e0d052b93",
+      "location": "australiaeast",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/6",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "resource",
+      "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-lb-01",
+      "resourceType": "Microsoft.Network/loadBalancers",
+      "state": "running",
+      "tags": {
+        "application": null,
+        "component": null,
+        "environment": "production",
+        "managedBy": null,
+        "workloadRole": "load-balancer"
+      }
+    },
+    {
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:676f7015599ff8544c45fd6f03906299161a4b017c964fb09af567313499310e",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/7",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "observedRelationship",
+      "relationship": {
+        "evidenceItemRef": "item-111111111111",
+        "kind": "dependsOn",
+        "observedAt": "2025-06-01T11:45:00Z",
+        "relationshipClass": "observed",
+        "relationshipId": "relationship-111111111111",
+        "source": {
+          "refKind": "resourceRef",
+          "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-worker-01"
+        },
+        "target": {
+          "refKind": "resourceRef",
+          "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-db-01"
+        }
+      }
+    },
+    {
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "itemDigest": "sha256:d7f881b72d2816e4976557b1c6c68e95cba6a7d7b140b802ad1f5d92a5221573",
+      "provenance": {
+        "collectorAttemptId": "attempt-111111111111",
+        "collectorIdentityEvidenceRef": "identity-111111111111",
+        "failurePayloadDigest": null,
+        "failurePayloadPointer": null,
+        "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+        "sourceResponsePointer": "/items/8",
+        "toolName": "azure.resourceInventory.read",
+        "toolVersion": "1.0.0"
+      },
+      "recordType": "observedRelationship",
+      "relationship": {
+        "evidenceItemRef": "item-222222222222",
+        "kind": "calls",
+        "observedAt": "2025-06-01T11:45:00Z",
+        "relationshipClass": "observed",
+        "relationshipId": "relationship-222222222222",
+        "source": {
+          "refKind": "resourceRef",
+          "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-web-01"
+        },
+        "target": {
+          "refKind": "resourceRef",
+          "resourceId": "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-athena-fixture/providers/Microsoft.Compute/virtualMachines/athena-lb-01"
+        }
+      }
+    }
+  ],
+  "evidenceRefs": [
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:c05a0dea648d6a4d28d3b7d4ac29d46d47af134bfb7bd798e7e89b2e4a837237",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/0"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:27fdb27f9ed518058ecfc412ad0dd84e2a847c9bdf886c9bb539bdaeeb779629",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/1"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:0ac1a6317760eeb1d176277736233848793a300306aac4609f1c8eb29e1b4fc8",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/2"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:69a208bf4360f644651e0f35c65ad4ba56304325911c042378923dbf75508335",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/3"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:2cd35535a8dfd3ec289ad4475891073fdc29e15d08ba28cbc0c61a07ae2d4f21",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/4"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:3a49e4efaa944aa549046b56182a12d6d7a42ed2bb0546acbecb7120fe88bb2b",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/5"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:ca5ab079f4b045367754de803f37d8b03447d8ae90ca7b1195ad4d7e0d052b93",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/6"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:676f7015599ff8544c45fd6f03906299161a4b017c964fb09af567313499310e",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/7"
+    },
+    {
+      "collectorAttemptAt": "2025-06-01T11:46:00Z",
+      "collectorAttemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+      "collectorAttemptId": "attempt-111111111111",
+      "collectorIdentityEvidenceRef": "identity-111111111111",
+      "collectorToolName": "azure.resourceInventory.read",
+      "collectorToolVersion": "1.0.0",
+      "itemDigest": "sha256:d7f881b72d2816e4976557b1c6c68e95cba6a7d7b140b802ad1f5d92a5221573",
+      "refType": "evidenceItem",
+      "snapshotArtifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "snapshotId": "snap-111111111111",
+      "snapshotSemanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+      "sourceResponseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+      "sourceResponsePointer": "/items/8"
+    }
+  ],
+  "expiresAt": "2025-06-02T00:00:00Z",
+  "identityEvidence": [
+    {
+      "identityEvidenceDigest": "sha256:d37175061b83aa8d05894d83147036e969e92622dff4a5da35fcb69581e42b35",
+      "identityEvidenceId": "identity-111111111111",
+      "identityEvidenceType": "entraJwtTokenEvidence",
+      "ingestionDerivation": {
+        "attemptBinding": {
+          "attemptDigest": "sha256:1d7e5d228ffd2dffc5ea42873e952ca6ff9534922229aba773cb175ed7960c26",
+          "attemptId": "attempt-111111111111",
+          "attemptStartedAt": "2025-06-01T11:45:00Z",
+          "attemptType": "successResponse",
+          "deadlineAt": null,
+          "failureDigest": null,
+          "observedAt": null,
+          "requestDigest": "sha256:99df5b981f8037caf519e6398dc8728631465d8e238e2453b4230d2987c790c2",
+          "responseDigest": "sha256:c0ca221848bb60d6aece399aa7782da82bac09645f9e36fd45e91f3e475ea1b5",
+          "responseReceivedAt": "2025-06-01T11:46:00Z",
+          "timedOutAt": null,
+          "toolName": "azure.resourceInventory.read",
+          "toolVersion": "1.0.0"
+        },
+        "derivationDigest": "sha256:636fa33e1928c7a81f01cf424369d89318f21afc5151713345a7c816d24338c0",
+        "derivationPreimageType": "athena.mcpCollectorAttemptDerivation",
+        "derivationPreimageVersion": "1.0.0",
+        "derivedAt": "2025-06-01T11:47:00Z",
+        "derivedCollectorIdentityRef": "identity-111111111111",
+        "identityEvidenceId": "identity-111111111111",
+        "ingestionAudience": "api://athena-ingestion",
+        "ingestionServiceId": "ingestion-111111111111",
+        "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+        "mcpHostId": "mcp-111111111111",
+        "mcpHostManagedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+        "mcpHostManagedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+        "mcpHostTenantId": "11111111-1111-1111-1111-111111111111",
+        "policyContractVersion": "1.0.0",
+        "schemaVersion": "1.0.0",
+        "semanticContractVersion": "1.0.0",
+        "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
+        "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f",
+        "tokenVerificationStatus": "valid",
+        "toolAllowlistDigest": "sha256:5c5b08558a80e40a36c29132de9a33a66f999f8250d804eb78a9c6d22342e8d9",
+        "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd"
+      },
+      "ingestionSignature": {
+        "keyName": "athena-fixture",
+        "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+        "keyVersion": "0123456789abcdef0123456789abcdef",
+        "signature": "W99NQOwzSfNQHofW2Z6gvLPc7H3NXxn2gr1++yu4NhqMdg2Ds9ZkHNNh7WUJ9VEMOjHtoxiVYJtSlDjZBoPGpBUOJSlAJywiqlIyjSPpbwZedvGlLXYjgN4k1XBykyKUBtgkYJzjyQNBTIFvda2DudHT2Oyf1J6MaDyXBQtNZ3Zh+gAFY3f/OvtdlVY+HiRVUOa819n/gmTQbA5p3rjhOXUbhQVn8iWFVP70xESOUFj5uX5iMmLqbsqodSd91ilXe0c9y2htc6IuEKeA5Ms3cTndo8eXSfwoy3+8pet8y35ifajWMFAdQ6plpMsnd7GZsE8UsLCUtGhmUfhb2ITrzg==",
+        "signatureAlgorithm": "RS256",
+        "signedAt": "2025-06-01T11:48:00Z",
+        "signedPreimageDigest": "sha256:17dfe6f4dfd8e4b99f768d60c00db5f7f5a22af953fce0cae51f499186a822aa",
+        "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
+      },
+      "jwtHeader": {
+        "alg": "RS256",
+        "kid": "kid-athena-fixture",
+        "typ": "JWT"
+      },
+      "tokenHash": "sha256:ce5c48cfecbbf944e75cefe4b8440ed2f2ec49902b3bb49af61a07bd76aad59b",
+      "tokenVerification": {
+        "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+        "keyId": "kid-athena-fixture",
+        "status": "valid",
+        "tokenVerificationDigest": "sha256:fdc08c90c97060d082262464a31c7a0a03b675f2481e30de020c030f4342e83f",
+        "verifiedAt": "2025-06-01T11:30:00Z",
+        "verifiedClaims": {
+          "audience": "api://athena-ingestion",
+          "expiresAt": "2025-06-01T13:00:00Z",
+          "issuedAt": "2025-06-01T11:00:00Z",
+          "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+          "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+          "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+          "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+          "notBefore": "2025-06-01T11:00:00Z",
+          "subject": "22222222-2222-2222-2222-222222222222",
+          "tenantId": "11111111-1111-1111-1111-111111111111"
+        },
+        "verifiedClaimsDigest": "sha256:4a597697828d23a39424f8d66e34940702894f686457bc82cf3c6915ab800dfd"
+      },
+      "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+      "verifiedClaims": {
+        "audience": "api://athena-ingestion",
+        "expiresAt": "2025-06-01T13:00:00Z",
+        "issuedAt": "2025-06-01T11:00:00Z",
+        "issuer": "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+        "jtiDigest": "sha256:211d46e4c0b0a65892935209f28ab6abf899c021445adcc917cfe23b56d0f7da",
+        "managedIdentityClientId": "33333333-3333-3333-3333-333333333333",
+        "managedIdentityObjectId": "22222222-2222-2222-2222-222222222222",
+        "notBefore": "2025-06-01T11:00:00Z",
+        "subject": "22222222-2222-2222-2222-222222222222",
+        "tenantId": "11111111-1111-1111-1111-111111111111"
+      }
+    }
+  ],
+  "snapshotAttestation": {
+    "artifactDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+    "artifactKind": "evidenceSnapshot",
+    "attestationType": "trustedSnapshotPublication",
+    "attestationVersion": "1.0.0",
+    "attestedAt": "2025-06-01T11:49:00Z",
+    "authorizedScopesDigest": "sha256:a85690fe763d273f004da00b5c3866c81aa3a2af1e2180bc7b9126c23d88a021",
+    "collectedAt": "2025-06-01T11:45:00Z",
+    "collectorAttemptSetDigest": "sha256:8b772013f0ec9dc78db201e0f093634328138f075ad670ee1b3e0492a384b874",
+    "evidenceRecordSetDigest": "sha256:f36a106e7ed5fdc51bd448b7ad4cc6ac25725266f693235c05800a0ed67567e6",
+    "evidenceReferenceSetDigest": "sha256:0cf892009cae1a6ab90dcc0983d481e781a6fe88bc048312644fcd2887772853",
+    "expiresAt": "2025-06-02T00:00:00Z",
+    "identityEvidenceDigests": [
+      "sha256:d37175061b83aa8d05894d83147036e969e92622dff4a5da35fcb69581e42b35"
+    ],
+    "identityEvidenceSetDigest": "sha256:84c0bfe85b42f7a874d044c840efb6d98c1af6fb1ea2398617206cfe550f4bb5",
+    "keyName": "athena-fixture",
+    "keyVaultKeyId": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef",
+    "keyVersion": "0123456789abcdef0123456789abcdef",
+    "policyContractVersion": "1.0.0",
+    "schemaVersion": "1.0.0",
+    "semanticContractVersion": "1.0.0",
+    "semanticDigest": "sha256:ff08b4a1471588521100059e123ffaa82c371bd61bcb0a47d736a2a271d28e29",
+    "signature": "P3Gdo9A/SS3prRd93x3PExET5C4jTrdvxkRZvfIbQ9BVCna9huCyDDvhv8nJfXMDk24oIyiN+zrsxrVehZepFf7+0/Eqzyd6W7MOAcMiocxjJOr63JAtKnk2Bvm2E+ghyeyVSw9uYgcBop3eJI3jjRdAAaxg+kOHLYKuO8sBvC4Y5ijCRNu6qGNgpz+ywWPa7XVvZ8Cn+RDat+Evbq0U0/ZLAI6hNy9kiBXzVckVaWxoR5KQnouY5XMojrFVK8zzVn2ucmcOmDgKR2reQoiX0JW/Xnz/u15dYTOfHRa5+YwjEevr7M9yP6pRY/ywdNLQ6JQwWjNiquO6LpGiej+ezw==",
+    "signatureAlgorithm": "RS256",
+    "signedPreimageDigest": "sha256:bb3f1ee598ebae0fec20ce6b9d2f2fbf28ade94fb78e0871461a0eb9ff66c064",
+    "snapshotId": "snap-111111111111",
+    "trustAnchorRef": "https://athena-fixture.vault.azure.net/keys/athena-fixture/0123456789abcdef0123456789abcdef"
+  },
+  "snapshotId": "snap-111111111111"
+}

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from importlib.resources import files
 from typing import Any, Literal, cast
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -35,6 +35,7 @@ from athena_context.contracts import (
     compute_evidence_snapshot_artifact_digest,
     compute_evidence_snapshot_semantic_digest,
     compute_jti_digest,
+    compute_response_envelope_digest,
     compute_snapshot_attestation_preimage_digest,
     compute_token_verification_digest,
     compute_verified_claims_digest,
@@ -150,12 +151,15 @@ def _make_trusted_key_record() -> TrustedKeyRecord:
 def _make_identity_evidence(
     *,
     attempt: SuccessResponseCollectorAttempt,
+    derived_at: datetime | None = None,
+    signed_at: datetime | None = None,
 ) -> CollectorIdentityEvidence:
     tenant_id = _CANONICAL_TENANT_ID
     trust_anchor = _CANONICAL_KEY_VAULT_KEY_ID
     issued_at = datetime(2025, 6, 1, 11, 0, tzinfo=UTC)
     verified_at = datetime(2025, 6, 1, 11, 30, tzinfo=UTC)
-    derived_at = datetime(2025, 6, 1, 11, 31, tzinfo=UTC)
+    derived_at = derived_at or datetime(2025, 6, 1, 11, 47, tzinfo=UTC)
+    signed_at = signed_at or derived_at + timedelta(minutes=1)
     signing_anchor = _trusted_key_anchor()
     token_hash = _sha256("synthetic-token-01")
     verified_claims_payload = {
@@ -222,7 +226,7 @@ def _make_identity_evidence(
         "keyVaultKeyId": trust_anchor,
         "keyName": signing_anchor.key_name,
         "keyVersion": signing_anchor.key_version,
-        "signedAt": derived_at + timedelta(seconds=1),
+        "signedAt": signed_at,
         "trustAnchorRef": trust_anchor,
         "derivation": {
             key: value for key, value in derivation_payload.items() if key != "derivationDigest"
@@ -252,7 +256,7 @@ def _make_identity_evidence(
             "keyVersion": signing_anchor.key_version,
             "signedPreimageDigest": signed_preimage_digest,
             "signature": _sign_payload(signature_preimage),
-            "signedAt": derived_at + timedelta(seconds=1),
+            "signedAt": signed_at,
             "trustAnchorRef": trust_anchor,
         },
     }
@@ -263,100 +267,152 @@ def _make_identity_evidence(
 
 
 def _build_response_envelope() -> dict[str, Any]:
-    resources = [
-        {
-            "resourceId": _resource_id("athena-db-01"),
-            "availabilityZone": "1",
-            "role": "database-primary",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-worker-01"),
-            "availabilityZone": "1",
-            "role": "worker",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-worker-02"),
-            "availabilityZone": "1",
-            "role": "worker",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-web-01"),
-            "availabilityZone": "1",
-            "role": "web",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-web-02"),
-            "availabilityZone": "2",
-            "role": "web",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-web-03"),
-            "availabilityZone": "3",
-            "role": "web",
-            "kind": "resource",
-        },
-        {
-            "resourceId": _resource_id("athena-lb-01"),
-            "availabilityZone": "1",
-            "role": "load-balancer",
-            "kind": "resource",
-        },
-        {
-                    "relationshipId": "obs-worker-db-depends-on",
-                    "kind": "dependsOn",
-                    "source": {
-            "refKind": "resourceRef",
-            "resourceId": _resource_id("athena-worker-01"),
-                    },
-                    "target": {
-            "refKind": "resourceRef",
-            "resourceId": _resource_id("athena-db-01"),
-                    },
-                    "kindType": "observed",
-        },
-        {
-            "relationshipId": "obs-web-lb-traffic",
-            "kind": "calls",
-            "source": {"refKind": "resourceRef", "resourceId": _resource_id("athena-web-01")},
-            "target": {"refKind": "resourceRef", "resourceId": _resource_id("athena-lb-01")},
-            "kindType": "observed",
-        },
-    ]
+    received_at = "2025-06-01T11:45:00.000Z"
     return {
         "requestId": "req-wc002-canonical",
         "correlationId": "corr-wc002-canonical",
         "retryCount": 0,
         "transportLatencyMs": 42,
-        "receivedAt": "2025-06-01T11:45:00.000Z",
-        "items": resources,
+        "receivedAt": received_at,
+        "items": [
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-db-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {
+                    "environment": "production",
+                    "workloadRole": "database",
+                    "application": "app-111111111111",
+                    "component": "component-222222222222",
+                    "managedBy": "manual",
+                },
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-worker-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "worker"},
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-worker-02"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "worker"},
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-02"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "2",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-03"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "3",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-lb-01"),
+                "resourceType": "Microsoft.Network/loadBalancers",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "load-balancer"},
+                "state": "running",
+            },
+            {
+                "recordType": "observedRelationship",
+                "relationship": {
+                    "relationshipClass": "observed",
+                    "relationshipId": "relationship-111111111111",
+                    "kind": "dependsOn",
+                    "source": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-worker-01"),
+                    },
+                    "target": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-db-01"),
+                    },
+                    "evidenceItemRef": "item-111111111111",
+                    "observedAt": received_at,
+                },
+            },
+            {
+                "recordType": "observedRelationship",
+                "relationship": {
+                    "relationshipClass": "observed",
+                    "relationshipId": "relationship-222222222222",
+                    "kind": "calls",
+                    "source": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-web-01"),
+                    },
+                    "target": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-lb-01"),
+                    },
+                    "evidenceItemRef": "item-222222222222",
+                    "observedAt": received_at,
+                },
+            },
+        ],
     }
 
 
-def _canonical_snapshot_payload() -> dict[str, Any]:
+def _canonical_snapshot_payload(
+    *,
+    record_materials: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     collected_at = datetime(2025, 6, 1, 11, 45, tzinfo=UTC)
     expires_at = datetime(2025, 6, 2, 0, 0, tzinfo=UTC)
     scope = _resource_group_scope()
     response_envelope = _build_response_envelope()
-    response_digest = compute_artifact_digest(response_envelope)
+    response_digest = compute_response_envelope_digest(response_envelope)
+    attempt_started_at = collected_at
+    response_received_at = collected_at + timedelta(minutes=1)
     attempt_payload = {
         "attemptType": "successResponse",
         "attemptId": "attempt-111111111111",
-        "attemptStartedAt": collected_at - timedelta(minutes=1),
+        "attemptStartedAt": attempt_started_at,
         "toolName": "azure.resourceInventory.read",
         "toolVersion": "1.0.0",
         "requestDigest": _sha256("req-wc002-canonical"),
         "responseDigest": response_digest,
-        "responseReceivedAt": collected_at,
+        "responseReceivedAt": response_received_at,
         "collectorIdentityEvidenceRef": "identity-111111111111",
     }
     attempt_payload["attemptDigest"] = compute_artifact_digest(attempt_payload)
     attempt = SuccessResponseCollectorAttempt.model_validate(attempt_payload)
-    identity_evidence = _make_identity_evidence(attempt=attempt)
+    identity_evidence = _make_identity_evidence(
+        attempt=attempt,
+        derived_at=collected_at + timedelta(minutes=2),
+        signed_at=collected_at + timedelta(minutes=3),
+    )
     collector = SnapshotCollector(
         collectorType="azureMcpHost",
         collectorIdentityEvidenceRef="identity-111111111111",
@@ -368,208 +424,210 @@ def _canonical_snapshot_payload() -> dict[str, Any]:
         toolAllowlistDigest=_sha256("tool-allowlist"),
     )
 
-    record_materials = [
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-db-01"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "1",
-            "tags": {
-                "environment": "production",
-                "workloadRole": "database",
-                "application": "app-111111111111",
-                "component": "component-222222222222",
-                "managedBy": "manual",
-            },
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/0",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-worker-01"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "1",
-            "tags": {"environment": "production", "workloadRole": "worker"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/1",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-worker-02"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "1",
-            "tags": {"environment": "production", "workloadRole": "worker"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/2",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-web-01"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "1",
-            "tags": {"environment": "production", "workloadRole": "web-service"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/3",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-web-02"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "2",
-            "tags": {"environment": "production", "workloadRole": "web-service"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/4",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-web-03"),
-            "resourceType": "Microsoft.Compute/virtualMachines",
-            "location": "australiaeast",
-            "availabilityZone": "3",
-            "tags": {"environment": "production", "workloadRole": "web-service"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/5",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "resource",
-            "resourceId": _resource_id("athena-lb-01"),
-            "resourceType": "Microsoft.Network/loadBalancers",
-            "location": "australiaeast",
-            "availabilityZone": "1",
-            "tags": {"environment": "production", "workloadRole": "load-balancer"},
-            "state": "running",
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
-                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/6",
-            },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "observedRelationship",
-            "relationship": {
-                "relationshipClass": "observed",
-                "relationshipId": "relationship-111111111111",
-                "kind": "dependsOn",
-                "source": {
-                    "refKind": "resourceRef",
-                    "resourceId": _resource_id("athena-worker-01"),
+    if record_materials is None:
+        record_materials = [
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-db-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {
+                    "environment": "production",
+                    "workloadRole": "database",
+                    "application": "app-111111111111",
+                    "component": "component-222222222222",
+                    "managedBy": "manual",
                 },
-                "target": {
-                    "refKind": "resourceRef",
-                    "resourceId": _resource_id("athena-db-01"),
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/0",
                 },
-                "evidenceItemRef": "item-111111111111",
-                "observedAt": collected_at,
-            },
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
+                "collectorAttemptDigest": attempt.attempt_digest,
                 "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/7",
             },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-        {
-            "recordType": "observedRelationship",
-            "relationship": {
-                "relationshipClass": "observed",
-                "relationshipId": "relationship-222222222222",
-                "kind": "calls",
-                "source": {
-                    "refKind": "resourceRef",
-                    "resourceId": _resource_id("athena-web-01"),
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-worker-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "worker"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/1",
                 },
-                "target": {
-                    "refKind": "resourceRef",
-                    "resourceId": _resource_id("athena-lb-01"),
-                },
-                "evidenceItemRef": "item-222222222222",
-                "observedAt": collected_at,
-            },
-            "provenance": {
-                "collectorAttemptId": attempt.attempt_id,
+                "collectorAttemptDigest": attempt.attempt_digest,
                 "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-                "toolName": attempt.tool_name,
-                "toolVersion": attempt.tool_version,
-                "sourceResponseDigest": attempt.response_digest,
-                "sourceResponsePointer": "/items/8",
             },
-            "collectorAttemptDigest": attempt.attempt_digest,
-            "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
-        },
-    ]
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-worker-02"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "worker"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/2",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-01"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/3",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-02"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "2",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/4",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-web-03"),
+                "resourceType": "Microsoft.Compute/virtualMachines",
+                "location": "australiaeast",
+                "availabilityZone": "3",
+                "tags": {"environment": "production", "workloadRole": "web-service"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/5",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "resource",
+                "resourceId": _resource_id("athena-lb-01"),
+                "resourceType": "Microsoft.Network/loadBalancers",
+                "location": "australiaeast",
+                "availabilityZone": "1",
+                "tags": {"environment": "production", "workloadRole": "load-balancer"},
+                "state": "running",
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/6",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "observedRelationship",
+                "relationship": {
+                    "relationshipClass": "observed",
+                    "relationshipId": "relationship-111111111111",
+                    "kind": "dependsOn",
+                    "source": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-worker-01"),
+                    },
+                    "target": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-db-01"),
+                    },
+                    "evidenceItemRef": "item-111111111111",
+                    "observedAt": collected_at,
+                },
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/7",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+            {
+                "recordType": "observedRelationship",
+                "relationship": {
+                    "relationshipClass": "observed",
+                    "relationshipId": "relationship-222222222222",
+                    "kind": "calls",
+                    "source": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-web-01"),
+                    },
+                    "target": {
+                        "refKind": "resourceRef",
+                        "resourceId": _resource_id("athena-lb-01"),
+                    },
+                    "evidenceItemRef": "item-222222222222",
+                    "observedAt": collected_at,
+                },
+                "provenance": {
+                    "collectorAttemptId": attempt.attempt_id,
+                    "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+                    "toolName": attempt.tool_name,
+                    "toolVersion": attempt.tool_version,
+                    "sourceResponseDigest": attempt.response_digest,
+                    "sourceResponsePointer": "/items/8",
+                },
+                "collectorAttemptDigest": attempt.attempt_digest,
+                "collectorIdentityEvidenceRef": collector.collector_identity_evidence_ref,
+            },
+        ]
 
     evidence_records: list[dict[str, Any]] = []
     for material in record_materials:
-        material["itemDigest"] = compute_evidence_record_digest(material)
-        evidence_records.append(material)
+        material_copy = deepcopy(material)
+        material_copy["itemDigest"] = compute_evidence_record_digest(material_copy)
+        evidence_records.append(material_copy)
 
     evidence_refs: list[dict[str, Any]] = []
     for material in evidence_records:
@@ -652,7 +710,7 @@ def _canonical_snapshot_payload() -> dict[str, Any]:
         "collectorAttemptSetDigest": compute_collector_attempt_set_digest(payload),
         "evidenceRecordSetDigest": compute_evidence_record_set_digest(payload),
         "evidenceReferenceSetDigest": compute_evidence_reference_set_digest(payload),
-        "attestedAt": collected_at + timedelta(minutes=5),
+        "attestedAt": collected_at + timedelta(minutes=4),
         "signatureAlgorithm": "RS256",
         "keyVaultKeyId": _CANONICAL_KEY_VAULT_KEY_ID,
         "keyName": "athena-fixture",
@@ -829,7 +887,9 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     "proofRequirement": {
                         "proofKind": "zoneDistributionProof",
                         "roleRef": "web",
-                        "minimumDistinctZones": 3 if profile_id == "production" else 2,
+                        "minimumDistinctZones": (
+                            3 if profile_id in {"production", "training"} else 1
+                        ),
                     },
                     "failureVerdict": "violation",
                     "successVerdict": "pass",
@@ -883,6 +943,43 @@ def _canonical_manifest_payload() -> dict[str, Any]:
                     "lastReviewedAt": "2025-01-01T00:00:00.000Z",
                 }
             ],
+            "weakeningOverrides": [
+                {
+                    "overrideId": "dev-continuity",
+                    "reason": "continuityRelaxation",
+                    "targetPath": (
+                        "/resolvedProfiles/development/settings/continuity/"
+                        "zoneLossContinuityRequired"
+                    ),
+                    "targetRef": "zoneLossContinuityRequired",
+                    "ownerRef": "ops-owner",
+                    "rationale": "Development does not claim continuity through zone loss.",
+                    "approvedBy": "synthetic-approver",
+                    "status": "approved",
+                    "acceptedAt": "2025-01-01T00:00:00.000Z",
+                    "expiresAt": "2025-12-31T00:00:00.000Z",
+                    "profiles": ["development"],
+                },
+                {
+                    "overrideId": "dev-web-zones",
+                    "reason": "zoneRequirementRelaxation",
+                    "targetPath": (
+                        "/resolvedProfiles/development/constraints/"
+                        "web-zone-distribution/proofRequirement/"
+                        "minimumDistinctZones"
+                    ),
+                    "targetRef": "web-zone-distribution",
+                    "ownerRef": "ops-owner",
+                    "rationale": "One web zone is sufficient for synthetic development.",
+                    "approvedBy": "synthetic-approver",
+                    "status": "approved",
+                    "acceptedAt": "2025-01-01T00:00:00.000Z",
+                    "expiresAt": "2025-12-31T00:00:00.000Z",
+                    "profiles": ["development"],
+                },
+            ]
+            if profile_id == "development"
+            else [],
         }
 
     payload: dict[str, Any] = {
@@ -1223,7 +1320,7 @@ def _make_fixture_bundle() -> FixtureBundle:
         digest: str,
     ) -> dict[str, Any] | None:
         response_envelope = _build_response_envelope()
-        if kind == "response" and digest == compute_artifact_digest(response_envelope):
+        if kind == "response" and digest == compute_response_envelope_digest(response_envelope):
             return response_envelope
         if kind == "failure":
             return {"error": {"code": "notFound", "status": "404"}}
@@ -1263,20 +1360,28 @@ def load_fixture() -> FixtureBundle:
     return make_canonical_fixture()
 
 
-def _deepcopy_fixtured_bundle() -> FixtureBundle:
-    return deepcopy(_CANONICAL_FIXTURE)
-
-
 def make_mutation_fixture() -> FixtureBundle:
     bundle = _deepcopy_fixtured_bundle()
-    resource = next(
-        item
-        for item in bundle.canonical_snapshot.evidence_records
-        if getattr(item, "record_type", None) == "resource"
+    snapshot = EvidenceSnapshot.model_validate(bundle.canonical_snapshot.model_dump(mode="json"))
+    target = next(
+        record
+        for record in snapshot.evidence_records
+        if getattr(record, "resource_id", None) == _resource_id("athena-db-01")
     )
-    if hasattr(resource, "resource_id"):
-        resource.resource_id = _resource_id("athena-db-02")
-    return bundle
+    object.__setattr__(target, "resource_id", _resource_id("athena-db-02"))
+    return FixtureBundle(
+        canonical_manifest=bundle.canonical_manifest,
+        canonical_snapshot=snapshot,
+        trusted_key_anchor=bundle.trusted_key_anchor,
+        trusted_key_record=bundle.trusted_key_record,
+        publication_record=bundle.publication_record,
+        key_resolver=bundle.key_resolver,
+        publication_resolver=bundle.publication_resolver,
+        envelope_resolver=bundle.envelope_resolver,
+        manifest_digest=bundle.manifest_digest,
+        snapshot_artifact_digest=bundle.snapshot_artifact_digest,
+        snapshot_semantic_digest=bundle.snapshot_semantic_digest,
+    )
 
 
 def mutation_fixture() -> FixtureBundle:
@@ -1285,12 +1390,29 @@ def mutation_fixture() -> FixtureBundle:
 
 def make_missing_evidence_fixture() -> FixtureBundle:
     bundle = _deepcopy_fixtured_bundle()
-    bundle.canonical_snapshot.evidence_records = [
-        record
-        for record in bundle.canonical_snapshot.evidence_records
-        if getattr(record, "resource_id", None) != _resource_id("athena-web-03")
-    ]
-    return bundle
+    snapshot = EvidenceSnapshot.model_validate(bundle.canonical_snapshot.model_dump(mode="json"))
+    object.__setattr__(
+        snapshot,
+        "evidence_records",
+        [
+            record
+            for record in snapshot.evidence_records
+            if getattr(record, "resource_id", None) != _resource_id("athena-web-03")
+        ],
+    )
+    return FixtureBundle(
+        canonical_manifest=bundle.canonical_manifest,
+        canonical_snapshot=snapshot,
+        trusted_key_anchor=bundle.trusted_key_anchor,
+        trusted_key_record=bundle.trusted_key_record,
+        publication_record=bundle.publication_record,
+        key_resolver=bundle.key_resolver,
+        publication_resolver=bundle.publication_resolver,
+        envelope_resolver=bundle.envelope_resolver,
+        manifest_digest=bundle.manifest_digest,
+        snapshot_artifact_digest=bundle.snapshot_artifact_digest,
+        snapshot_semantic_digest=bundle.snapshot_semantic_digest,
+    )
 
 
 def missing_evidence_fixture() -> FixtureBundle:
@@ -1299,18 +1421,81 @@ def missing_evidence_fixture() -> FixtureBundle:
 
 def make_conflicting_evidence_fixture() -> FixtureBundle:
     bundle = _deepcopy_fixtured_bundle()
-    resource = next(
-        item
-        for item in bundle.canonical_snapshot.evidence_records
-        if getattr(item, "resource_id", None) == _resource_id("athena-web-02")
+    snapshot = EvidenceSnapshot.model_validate(bundle.canonical_snapshot.model_dump(mode="json"))
+    target = next(
+        record
+        for record in snapshot.evidence_records
+        if getattr(record, "resource_id", None) == _resource_id("athena-web-02")
     )
-    if hasattr(resource, "availability_zone"):
-        resource.availability_zone = "3"
-    return bundle
+    object.__setattr__(target, "availability_zone", "3")
+    return FixtureBundle(
+        canonical_manifest=bundle.canonical_manifest,
+        canonical_snapshot=snapshot,
+        trusted_key_anchor=bundle.trusted_key_anchor,
+        trusted_key_record=bundle.trusted_key_record,
+        publication_record=bundle.publication_record,
+        key_resolver=bundle.key_resolver,
+        publication_resolver=bundle.publication_resolver,
+        envelope_resolver=bundle.envelope_resolver,
+        manifest_digest=bundle.manifest_digest,
+        snapshot_artifact_digest=bundle.snapshot_artifact_digest,
+        snapshot_semantic_digest=bundle.snapshot_semantic_digest,
+    )
 
 
 def conflicting_evidence_fixture() -> FixtureBundle:
     return make_conflicting_evidence_fixture()
+
+
+def make_tampered_fixture(*, kind: str = "resource-zone") -> FixtureBundle:
+    bundle = _deepcopy_fixtured_bundle()
+    snapshot = EvidenceSnapshot.model_validate(bundle.canonical_snapshot.model_dump(mode="json"))
+    if kind == "resource-zone":
+        target = next(
+            record
+            for record in snapshot.evidence_records
+            if getattr(record, "resource_id", None) == _resource_id("athena-web-02")
+        )
+        object.__setattr__(target, "availability_zone", "3")
+    elif kind == "missing-record":
+        object.__setattr__(
+            snapshot,
+            "evidence_records",
+            [
+                record
+                for record in snapshot.evidence_records
+                if getattr(record, "resource_id", None) != _resource_id("athena-web-03")
+            ],
+        )
+    elif kind == "attestation":
+        object.__setattr__(
+            snapshot.snapshot_attestation,
+            "attested_at",
+            snapshot.snapshot_attestation.attested_at - timedelta(minutes=1),
+        )
+    else:
+        object.__setattr__(snapshot.compatibility, "artifact_digest", "sha256:" + "9" * 64)
+    return FixtureBundle(
+        canonical_manifest=bundle.canonical_manifest,
+        canonical_snapshot=snapshot,
+        trusted_key_anchor=bundle.trusted_key_anchor,
+        trusted_key_record=bundle.trusted_key_record,
+        publication_record=bundle.publication_record,
+        key_resolver=bundle.key_resolver,
+        publication_resolver=bundle.publication_resolver,
+        envelope_resolver=bundle.envelope_resolver,
+        manifest_digest=bundle.manifest_digest,
+        snapshot_artifact_digest=bundle.snapshot_artifact_digest,
+        snapshot_semantic_digest=bundle.snapshot_semantic_digest,
+    )
+
+
+def tampered_fixture(*, kind: str = "resource-zone") -> FixtureBundle:
+    return make_tampered_fixture(kind=kind)
+
+
+def unsafe_fixture(*, kind: str = "resource-zone") -> FixtureBundle:
+    return make_tampered_fixture(kind=kind)
 
 
 def load_canonical_manifest() -> CanonicalWorkloadManifest:
@@ -1321,37 +1506,73 @@ def load_canonical_snapshot() -> EvidenceSnapshot:
     return make_canonical_fixture().canonical_snapshot
 
 
-def _write_static_fixtures() -> None:
-    content_dir = Path(__file__).resolve().parents[2] / "content" / "fixtures"
-    content_dir.mkdir(parents=True, exist_ok=True)
-    bundle = make_canonical_fixture()
-    manifest_data = bundle.canonical_manifest.model_dump(mode="json", by_alias=True)
-    snapshot_data = bundle.canonical_snapshot.model_dump(mode="json", by_alias=True)
-    (content_dir / "canonical-manifest.json").write_text(
-        json.dumps(manifest_data, indent=2, sort_keys=True),
-        encoding="utf-8",
+def _load_fixture_resource(name: str) -> dict[str, Any]:
+    package = files("athena_context.data.fixtures")
+    return json.loads(package.joinpath(name).read_text(encoding="utf-8"))
+
+
+def load_canonical_manifest_resource() -> dict[str, Any]:
+    return _load_fixture_resource("canonical-manifest.json")
+
+
+def load_canonical_snapshot_resource() -> dict[str, Any]:
+    return _load_fixture_resource("canonical-evidence-snapshot.json")
+
+
+def load_canonical_fixture_resource() -> dict[str, Any]:
+    return _load_fixture_resource("canonical-fixture.json")
+
+
+def make_canonical_fixture_from_resources() -> FixtureBundle:
+    manifest = CanonicalWorkloadManifest.model_validate(load_canonical_manifest_resource())
+    snapshot = EvidenceSnapshot.model_validate(load_canonical_snapshot_resource())
+    trusted_key_anchor = _trusted_key_anchor()
+    trusted_key_record = _make_trusted_key_record()
+    publication_record = SnapshotPublicationRecord(
+        snapshot_id=snapshot.snapshot_id,
+        artifact_digest=snapshot.compatibility.artifact_digest,
+        semantic_digest=snapshot.compatibility.semantic_digest,
+        schema_version=snapshot.compatibility.schema_version,
+        semantic_contract_version=snapshot.compatibility.semantic_contract_version,
+        published_at=snapshot.snapshot_attestation.attested_at + timedelta(seconds=1),
     )
-    (content_dir / "canonical-evidence-snapshot.json").write_text(
-        json.dumps(snapshot_data, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    (content_dir / "canonical-fixture.json").write_text(
-        json.dumps(
-            {
-                "manifest": manifest_data,
-                "snapshot": snapshot_data,
-                "manifestDigest": bundle.manifest_digest,
-                "snapshotArtifactDigest": bundle.snapshot_artifact_digest,
-                "snapshotSemanticDigest": bundle.snapshot_semantic_digest,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+
+    def key_resolver(resolved_anchor: TrustedKeyAnchor) -> TrustedKeyRecord | None:
+        return trusted_key_record if resolved_anchor == trusted_key_anchor else None
+
+    def publication_resolver(snapshot_id: str) -> SnapshotPublicationRecord | None:
+        return publication_record if snapshot_id == publication_record.snapshot_id else None
+
+    def envelope_resolver(
+        attempt_id: str,
+        kind: Literal["response", "failure"],
+        digest: str,
+    ) -> dict[str, Any] | None:
+        response_envelope = _build_response_envelope()
+        if kind == "response" and digest == compute_response_envelope_digest(response_envelope):
+            return response_envelope
+        if kind == "failure":
+            return {"error": {"code": "notFound", "status": "404"}}
+        return None
+
+    return FixtureBundle(
+        canonical_manifest=manifest,
+        canonical_snapshot=snapshot,
+        trusted_key_anchor=trusted_key_anchor,
+        trusted_key_record=trusted_key_record,
+        publication_record=publication_record,
+        key_resolver=key_resolver,
+        publication_resolver=publication_resolver,
+        envelope_resolver=envelope_resolver,
+        manifest_digest=manifest.compute_artifact_digest_value(),
+        snapshot_artifact_digest=snapshot.compatibility.artifact_digest,
+        snapshot_semantic_digest=snapshot.compatibility.semantic_digest,
     )
 
 
-_write_static_fixtures()
+def _deepcopy_fixtured_bundle() -> FixtureBundle:
+    return deepcopy(_CANONICAL_FIXTURE)
+
 
 __all__ = [
     "FixtureBundle",
@@ -1359,15 +1580,21 @@ __all__ = [
     "conflicting_evidence_fixture",
     "load_canonical_fixture",
     "load_canonical_manifest",
+    "load_canonical_manifest_resource",
     "load_canonical_snapshot",
+    "load_canonical_snapshot_resource",
+    "load_canonical_fixture_resource",
     "load_fixture",
     "make_canonical_fixture",
+    "make_canonical_fixture_from_resources",
     "make_conflicting_evidence_fixture",
     "make_missing_evidence_fixture",
     "make_mutation_fixture",
-    "make_missing_evidence_fixture",
+    "make_tampered_fixture",
     "missing_evidence_fixture",
     "mutation_fixture",
+    "tampered_fixture",
+    "unsafe_fixture",
     "_CANONICAL_MANIFEST_ID",
     "_CANONICAL_SNAPSHOT_ID",
     "_CANONICAL_KEY_VAULT_KEY_ID",

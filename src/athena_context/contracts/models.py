@@ -886,6 +886,15 @@ def _snapshot_digest_preimage(value: Any) -> dict[str, Any]:
     compatibility.pop("artifactDigest", None)
     compatibility.pop("semanticDigest", None)
     payload["compatibility"] = compatibility
+    for field_name in (
+        "authorizedScopes",
+        "collectorAttempts",
+        "evidenceRecords",
+        "identityEvidence",
+    ):
+        values = payload.get(field_name, [])
+        if isinstance(values, list):
+            payload[field_name] = sorted(values, key=canonicalize_json)
     evidence_refs = payload.get("evidenceRefs", [])
     if not isinstance(evidence_refs, list):
         raise AthenaValidationError("snapshot digest preimage requires an evidenceRefs array")
@@ -897,7 +906,7 @@ def _snapshot_digest_preimage(value: Any) -> dict[str, Any]:
         sanitized_ref.pop("snapshotArtifactDigest", None)
         sanitized_ref.pop("snapshotSemanticDigest", None)
         sanitized_refs.append(sanitized_ref)
-    payload["evidenceRefs"] = sanitized_refs
+    payload["evidenceRefs"] = sorted(sanitized_refs, key=canonicalize_json)
     return payload
 
 
@@ -5519,10 +5528,14 @@ class SnapshotAttestation(AthenaBaseModel):
 
 
 def snapshot_attestation_preimage(value: Any) -> dict[str, Any]:
-    return _without_root_fields(
+    payload = _without_root_fields(
         value,
         frozenset({"signedPreimageDigest", "signature"}),
     )
+    identity_digests = payload.get("identityEvidenceDigests")
+    if isinstance(identity_digests, list):
+        payload["identityEvidenceDigests"] = sorted(identity_digests)
+    return payload
 
 
 def compute_snapshot_attestation_preimage_digest(value: Any) -> str:

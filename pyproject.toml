@@ -27,8 +27,14 @@ dev = [
 [project.scripts]
 athena-context = "athena_context.cli:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+athena_context = ["data/fixtures/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
