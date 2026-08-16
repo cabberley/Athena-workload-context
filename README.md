@@ -31,6 +31,17 @@ See:
 - [Initial build plan](docs/planning/initial-build-plan.md)
 - [Copilot model allocation](docs/planning/model-allocation.md)
 
+## Local reference proof
+
+Run the packaged three-profile oracle locally, with no Azure connection:
+
+```text
+athena-context golden-proof --format text
+athena-context golden-proof --format json
+```
+
+The command returns zero only when the golden runner reports an exact oracle match.
+
 ## Repository status
 
 This repository is locally initialized and intentionally has no remote. Add the GitHub remote only
