@@ -15,7 +15,7 @@ from athena_context.api.domain import (
 )
 from athena_context.api.errors import AuthenticationError, AuthorizationError
 from athena_context.api.evaluation_domain import AuthorizationGrantToken
-from athena_context.api.memory import InMemoryTransactionLock
+from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.contracts import compute_artifact_digest
 
 _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -21,7 +25,7 @@ from athena_context.api import (
     RoleGrant,
     Wc008DeploymentOutputAssertion,
 )
-from athena_context.api.domain import Permission
+from athena_context.api.domain import Permission, Supersession
 from athena_context.api.errors import (
     AuthorizationError,
     DemoEvaluationApprovalError,
@@ -34,8 +38,8 @@ from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
 from athena_context.api.evaluation_ports import (
-    EvaluationAuthorityUnitOfWorkPort,
     EvaluationCommitCandidate,
+    EvaluationTrustedKeyAuthority,
     SnapshotSigningRequest,
 )
 from athena_context.contracts import (
@@ -320,6 +324,46 @@ def _assert_no_artifact(
     assert harness.store.publication_count == 0
 
 
+def _mutate_same_uow_after_extensible_preparation(
+    harness: DemoHarness,
+    mutation: Callable[[Any], None],
+) -> None:
+    """Wrap the real transaction so mutation uses its active local state."""
+
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction.put_evaluation_conditionally
+            )
+
+            def insert_with_same_uow_mutation(
+                condition: object,
+                artifact_preparation: Callable[[object], object],
+            ) -> object:
+                def mutate_after_preparation(
+                    trusted_key: object,
+                ) -> object:
+                    prepared = artifact_preparation(trusted_key)
+                    mutation(active_transaction)
+                    return prepared
+
+                return original_insert(
+                    condition,
+                    mutate_after_preparation,
+                )
+
+            active_transaction.put_evaluation_conditionally = (  # type: ignore[method-assign]
+                insert_with_same_uow_mutation
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+
+
 def _delay_final_authority_or_persistence(
     harness: DemoHarness,
     *,
@@ -328,19 +372,9 @@ def _delay_final_authority_or_persistence(
 ) -> None:
     if location == "finalAuthorityResolution":
         service = harness.context_resolver.service
-        original = service._resolve_evaluation_authority
-        commit_resolutions = 0
-
-        def delayed_resolution(*args: object, **kwargs: object) -> object:
-            nonlocal commit_resolutions
-            result = original(*args, **kwargs)  # type: ignore[arg-type]
-            if kwargs.get("expected_authority") is not None:
-                commit_resolutions += 1
-                if commit_resolutions == 2:
-                    harness.clock.advance(delay)
-            return result
-
-        service._resolve_evaluation_authority = delayed_resolution  # type: ignore[assignment]
+        service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
+            lambda: harness.clock.advance(delay)
+        )
         return
     if location == "persistence":
         harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
@@ -735,6 +769,143 @@ def test_context_reader_revocation_during_final_policy_work_rolls_back() -> None
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+@pytest.mark.parametrize(
+    "same_uow_change",
+    [
+        "readerGrant",
+        "publisherGrant",
+        "keyDisabled",
+        "keyReplaced",
+        "approval",
+        "context",
+    ],
+)
+def test_same_uow_authority_mutation_after_preparation_rolls_back(
+    same_uow_change: str,
+) -> None:
+    context_reader = Actor(
+        actor_id="wc013-same-uow-reader",
+        kind=ActorKind.SERVICE,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        context_reader_actor=context_reader,
+    )
+    idempotency_key = f"wc013-same-uow-{same_uow_change}"
+    context_service = harness.context_resolver.service
+    original_grants, original_grant_revision = (
+        context_service.get_demo_evaluation_grants(PUBLISHER)
+    )
+    original_key = harness.trust_registry.resolve()
+    original_approval = harness.approval_registry.resolve(
+        harness.approval.decision_id
+    )
+    assert original_key is not None
+    assert original_approval is not None
+
+    def mutate(active_transaction: Any) -> None:
+        if same_uow_change in {"readerGrant", "publisherGrant"}:
+            actor_id = (
+                context_reader.actor_id
+                if same_uow_change == "readerGrant"
+                else PUBLISHER.actor_id
+            )
+            grants, revision = active_transaction.get_evaluation_grants()
+            active_transaction.replace_evaluation_grants(
+                tuple(grant for grant in grants if grant.actor_id != actor_id),
+                expected_revision=revision,
+            )
+            return
+        if same_uow_change in {"keyDisabled", "keyReplaced"}:
+            current = active_transaction.get_demo_evaluation_trusted_key(
+                original_key.record.anchor
+            )
+            assert current is not None
+            replacement_record = replace(
+                current.record,
+                enabled=same_uow_change != "keyDisabled",
+                expires_at=(
+                    current.record.expires_at + timedelta(days=1)
+                    if (
+                        same_uow_change == "keyReplaced"
+                        and current.record.expires_at is not None
+                    )
+                    else current.record.expires_at
+                ),
+            )
+            active_transaction.put_demo_evaluation_trusted_key(
+                EvaluationTrustedKeyAuthority(
+                    record=replacement_record,
+                    revision=current.revision + 1,
+                    revoked_at=(
+                        harness.clock.value
+                        if same_uow_change == "keyDisabled"
+                        else None
+                    ),
+                ),
+                expected_revision=current.revision,
+            )
+            return
+        if same_uow_change == "approval":
+            current = active_transaction.get_demo_evaluation_approval(
+                original_approval.decision_id
+            )
+            assert current is not None
+            active_transaction.put_demo_evaluation_approval(
+                current.model_copy(
+                    update={
+                        "status": "revoked",
+                        "revision": current.revision + 1,
+                        "revoked_at": harness.clock.value,
+                    }
+                ),
+                expected_revision=current.revision,
+            )
+            return
+        published = harness.context_resolver.view.published
+        active_transaction.put_supersession(
+            Supersession(
+                manifest_id=published.manifest_id,
+                superseded_version=published.manifest_version,
+                replacement_version="9.9.9",
+                superseded_by=PUBLISHER,
+                superseded_at=harness.clock.value,
+                reason="Exercise same-transaction context authority rollback",
+            )
+        )
+
+    _mutate_same_uow_after_extensible_preparation(harness, mutate)
+
+    with pytest.raises(
+        (
+            AuthorizationError,
+            DemoEvaluationApprovalError,
+            EvaluationFailedClosedError,
+        )
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    current_grants, current_grant_revision = (
+        context_service.get_demo_evaluation_grants(PUBLISHER)
+    )
+    assert current_grants == original_grants
+    assert current_grant_revision == original_grant_revision
+    assert harness.trust_registry.resolve() == original_key
+    assert (
+        harness.approval_registry.resolve(original_approval.decision_id)
+        == original_approval
+    )
+    assert harness.context_resolver.view.supersession is None
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_publication_timestamp_is_acquired_after_final_crypto_policy_work() -> None:
     harness = build_harness(
         as_of=CURRENT_NOW,
@@ -830,10 +1001,7 @@ def test_approval_revocation_during_transaction_fails_before_insertion() -> None
     )
     idempotency_key = "wc013-approval-revoke-inside-uow"
 
-    def revoke_after_initial_read(
-        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
-    ) -> None:
-        del unit_of_work
+    def revoke_after_initial_read() -> None:
         harness.approval_registry.revoke(
             harness.approval.decision_id,
             revoked_at=harness.clock.value,
@@ -1048,10 +1216,7 @@ def test_context_mutation_waits_until_authority_reads_and_artifact_insert_comple
         finally:
             mutation_completed.set()
 
-    def hold_between_authority_and_insert(
-        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
-    ) -> None:
-        del unit_of_work
+    def hold_between_authority_and_insert() -> None:
         barrier_reached.set()
         assert mutation_attempted.wait(timeout=5)
         assert not mutation_completed.wait(timeout=0.1)
@@ -1122,7 +1287,7 @@ def test_governance_expiry_during_transaction_aborts_conditional_commit(
 
     idempotency_key = f"wc013-{authority_expiry}-expiry-race"
     harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
-        lambda _: harness.clock.advance(timedelta(minutes=1))
+        lambda: harness.clock.advance(timedelta(minutes=1))
     )
     with pytest.raises(
         EvaluationFailedClosedError,

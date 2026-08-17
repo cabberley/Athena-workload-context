@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime
-from threading import RLock
 from types import TracebackType
 from typing import Literal
 
@@ -28,21 +25,28 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
     StaleRevisionError,
 )
+from athena_context.api.evaluation_authority import (
+    TransactionEvaluationAuthorityUnitOfWork,
+    build_evaluation_temporal_validity,
+    resolve_transaction_evaluation_authority,
+)
 from athena_context.api.evaluation_domain import (
     AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
     DemoEvaluationResult,
-    TrustedKeyAuthorityToken,
     build_authorized_publication,
     build_demo_evaluation_result,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
+    EvaluationCommitAuthorityCondition,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     StoredEvaluation,
+    build_evaluation_evidence_binding_digest,
 )
 from athena_context.api.ports import ClockPort, ContextTransactionPort
+from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.contracts import EvidenceSnapshot, TrustedKeyAnchor
 
 
@@ -233,22 +237,6 @@ class InMemoryContextStore:
 
     def _before_evaluation_commit_timestamp(self) -> None:
         """Test seam for delay inside persistence before authoritative time."""
-
-
-class InMemoryTransactionLock:
-    """Small internally owned transaction lock for standalone test adapters."""
-
-    def __init__(self) -> None:
-        self._lock = RLock()
-
-    @property
-    def lock(self) -> RLock:
-        return self._lock
-
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
-        with self._lock:
-            yield
 
 
 class _MemoryTransaction(ContextTransactionPort):
@@ -553,8 +541,7 @@ class _MemoryTransaction(ContextTransactionPort):
 
     def put_evaluation_conditionally(
         self,
-        trusted_key_anchor: TrustedKeyAnchor,
-        expected_trusted_key: TrustedKeyAuthorityToken,
+        condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
         clock = self._store._authoritative_clock
@@ -567,11 +554,12 @@ class _MemoryTransaction(ContextTransactionPort):
         # executable post-time callback.
         self._store._before_evaluation_commit_timestamp()
         trusted_key = self.get_demo_evaluation_trusted_key(
-            trusted_key_anchor
+            condition.trusted_key_anchor
         )
         if (
             trusted_key is None
-            or trusted_key.authority_token() != expected_trusted_key
+            or trusted_key.authority_token()
+            != condition.expected_authority.trusted_key
         ):
             raise StaleRevisionError(
                 "trusted signing-key authority changed before publication"
@@ -581,6 +569,73 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 "authoritative persistence changed during evaluation preparation"
             )
+        # The preparation callback is the last extensible operation. Resolve
+        # the complete authority again from this transaction's current local
+        # state so mutations staged through this same UoW cannot evade the
+        # store-generation check.
+        authority_checked_at = ensure_timestamp(clock.now())
+        authority_unit_of_work = TransactionEvaluationAuthorityUnitOfWork(
+            context_transaction=self,
+            evaluation_transaction=self,
+            reader_actor=condition.reader_actor,
+        )
+        approval, resolved, authority = (
+            resolve_transaction_evaluation_authority(
+                authority_unit_of_work,
+                actor=condition.actor,
+                command=condition.command,
+                as_of=authority_checked_at,
+                private_mcp_endpoint=condition.private_mcp_endpoint,
+                evidence_identity_object_id=(
+                    condition.evidence_identity_object_id
+                ),
+                trusted_key_anchor=condition.trusted_key_anchor,
+                expected_authority=condition.expected_authority,
+            )
+        )
+        current_trusted_key = self.get_demo_evaluation_trusted_key(
+            condition.trusted_key_anchor
+        )
+        expected_temporal_validity = build_evaluation_temporal_validity(
+            prepared.snapshot,
+            approval=approval,
+            resolved_profile=resolved.profile,
+            manifest=resolved.view.published.manifest,
+            as_of=authority_checked_at,
+        )
+        if (
+            current_trusted_key is None
+            or current_trusted_key.authority_token()
+            != condition.expected_authority.trusted_key
+            or prepared.authority != authority
+            or prepared.approval.authority_token()
+            != authority.approval
+            or prepared.resolved_profile_digest
+            != resolved.profile.resolved_profile_digest
+            or prepared.actor != condition.actor
+            or prepared.idempotency_key != condition.idempotency_key
+            or prepared.request_digest != condition.request_digest
+            or prepared.private_mcp_endpoint
+            != condition.private_mcp_endpoint
+            or prepared.authorized_scope.canonical_json()
+            != condition.command.authorized_scope.canonical_json()
+            or prepared.reason != condition.command.reason
+            or prepared.temporal_validity != expected_temporal_validity
+            or build_evaluation_evidence_binding_digest(
+                prepared.snapshot,
+                envelope_attempt_id=prepared.envelope_attempt_id,
+                envelope=prepared.envelope,
+            )
+            != condition.evidence_binding_digest
+        ):
+            raise StaleRevisionError(
+                "complete evaluation authority or evidence binding changed "
+                "before publication"
+            )
+        if self._store._transaction_generation != self._base_generation:
+            raise StaleRevisionError(
+                "authoritative persistence changed during final authority check"
+            )
         published_at = ensure_timestamp(clock.now())
         # No caller-provided or overridable behavior executes after this read.
         # The sealed finalizer only compares captured bounds, builds canonical
@@ -588,7 +643,7 @@ class _MemoryTransaction(ContextTransactionPort):
         artifact = _finalize_prepared_evaluation(
             prepared,
             published_at=published_at,
-            trusted_key=trusted_key,
+            trusted_key=current_trusted_key,
         )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
         if receipt_key in self._evaluation_receipts:

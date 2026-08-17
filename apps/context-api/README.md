@@ -62,6 +62,11 @@ The integration composes the merged components without introducing direct Azure 
   transaction. After persistence delay and exact key-revision comparison, the transaction performs
   the delay-capable cryptographic verification and authoritative WC-004 evaluation. Only after
   that work returns does preparation return immutable data rather than executable behavior.
+  Persistence then re-resolves and compares the complete context/profile, approval, publisher
+  grant, reader grant, key trust, snapshot/envelope binding, inherited governance, risk authority,
+  and all associated revisions and digests from the transaction's current local state. No
+  overridable hook receives the active unit of work. A mutation staged through that same unit of
+  work during preparation therefore aborts and rolls back with the artifact and receipt.
   Persistence then obtains its authoritative insertion timestamp and runs its own sealed,
   bounded, no-I/O finalizer. No caller-supplied callback runs after the timestamp. The finalizer
   revalidates the already loaded exact approval,

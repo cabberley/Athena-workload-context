@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TypeVar
 
 from pydantic import ValidationError
 
-from athena_context.api.authorization import authorize_role_grants
 from athena_context.api.domain import (
     Actor,
     ActorKind,
@@ -38,7 +37,6 @@ from athena_context.api.domain import (
 from athena_context.api.errors import (
     AlreadySupersededError,
     AmbiguousLookupError,
-    DemoEvaluationApprovalError,
     DemoEvaluationConfigurationError,
     DigestMismatchError,
     DuplicateVersionError,
@@ -51,12 +49,15 @@ from athena_context.api.errors import (
     StaleRevisionError,
     VersionMismatchError,
 )
+from athena_context.api.evaluation_authority import (
+    TransactionEvaluationAuthorityUnitOfWork,
+    build_evaluation_temporal_validity,
+    resolve_transaction_evaluation_authority,
+    validate_loaded_evaluation_authority,
+)
 from athena_context.api.evaluation_context import (
     build_resource_evidence_context,
     make_resource_snapshot_context_verifier,
-    resolve_active_manifest_profile,
-    validate_demo_evaluation_approval,
-    validate_published_context_binding,
 )
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
@@ -65,22 +66,19 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationCommand,
     DemoEvaluationResult,
     EvaluationAuthorityToken,
-    PublishedContextSelection,
     ResolvedPublishedContext,
-    TrustedKeyAuthorityToken,
     build_authorized_publication,
-    build_published_context_authority_token,
 )
 from athena_context.api.evaluation_ports import (
     DemoEvaluationTrustConfiguration,
-    EvaluationArtifactPreparation,
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
+    EvaluationCommitAuthorityCondition,
     EvaluationCommitCandidate,
-    EvaluationTemporalValidity,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     StoredEvaluation,
+    build_evaluation_evidence_binding_digest,
 )
 from athena_context.api.ports import (
     AuthorizationPort,
@@ -93,12 +91,8 @@ from athena_context.contracts import (
     ManifestFinding,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
-    resolve_manifest_profile,
 )
-from athena_context.contracts.common import (
-    compute_artifact_digest,
-    normalize_nfc_text,
-)
+from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
     EvidenceFreshnessProof,
@@ -139,196 +133,6 @@ def _changed_paths(left: object, right: object, path: str = "") -> list[str]:
                 changes.extend(_changed_paths(left[index], right[index], child_path))
         return changes
     return [] if left == right else [path or "/"]
-
-
-class _ContextServiceEvaluationAuthorityUnitOfWork:
-    """Narrow evaluation view over one transaction opened by ContextService."""
-
-    def __init__(
-        self,
-        *,
-        context_transaction: ContextTransactionPort,
-        evaluation_transaction: EvaluationAuthorityTransactionPort,
-        reader_actor: Actor,
-    ) -> None:
-        self._context_transaction = context_transaction
-        self._evaluation_transaction = evaluation_transaction
-        self._reader_actor = reader_actor
-
-    def resolve_context(
-        self,
-        selection: PublishedContextSelection,
-        *,
-        as_of: datetime,
-    ) -> tuple[ResolvedPublishedContext, AuthorizationGrantToken]:
-        tx = self._context_transaction
-        if selection.manifest_version is None:
-            reader_authorization = self.authorize(
-                self._reader_actor,
-                Permission.LIST,
-                selection.manifest_id,
-            )
-            active = [
-                item
-                for item in tx.list_published(manifest_id=selection.manifest_id)
-                if tx.get_supersession(
-                    item.manifest_id,
-                    item.manifest_version,
-                )
-                is None
-            ]
-            if not active:
-                raise ResourceNotFoundError(
-                    "published manifest has no active version"
-                )
-            if len(active) != 1:
-                raise AmbiguousLookupError(
-                    "published manifest has multiple active versions"
-                )
-            published = active[0]
-        else:
-            published = self._require_published(
-                tx,
-                selection.manifest_id,
-                selection.manifest_version,
-            )
-            reader_authorization = self.authorize(
-                self._reader_actor,
-                Permission.READ,
-                selection.manifest_id,
-            )
-        view = PublishedManifestView(
-            published=published,
-            supersession=tx.get_supersession(
-                published.manifest_id,
-                published.manifest_version,
-            ),
-        )
-        profile = resolve_manifest_profile(
-            published.manifest,
-            selection.profile_id,
-            as_of=as_of,
-        )
-        return (
-            ResolvedPublishedContext(
-                view=view,
-                profile=profile,
-                authority_token=build_published_context_authority_token(
-                    view,
-                    profile,
-                    requested_manifest_version=selection.manifest_version,
-                ),
-            ),
-            reader_authorization,
-        )
-
-    def resolve_approval(
-        self,
-        decision_id: str,
-    ) -> DemoEvaluationApproval | None:
-        return self._evaluation_transaction.get_demo_evaluation_approval(
-            decision_id
-        )
-
-    def put_approval(
-        self,
-        approval: DemoEvaluationApproval,
-        *,
-        expected_revision: int | None,
-    ) -> None:
-        self._evaluation_transaction.put_demo_evaluation_approval(
-            approval,
-            expected_revision=expected_revision,
-        )
-
-    def authorize(
-        self,
-        actor: Actor,
-        permission: Permission,
-        manifest_id: str,
-    ) -> AuthorizationGrantToken:
-        grants, revision = self._evaluation_transaction.get_evaluation_grants()
-        return authorize_role_grants(
-            actor,
-            permission,
-            manifest_id,
-            grants=grants,
-            grant_revision=revision,
-        )
-
-    def get_grants(self) -> tuple[tuple[RoleGrant, ...], int]:
-        return self._evaluation_transaction.get_evaluation_grants()
-
-    def replace_grants(
-        self,
-        grants: tuple[RoleGrant, ...],
-        *,
-        expected_revision: int,
-    ) -> int:
-        return self._evaluation_transaction.replace_evaluation_grants(
-            grants,
-            expected_revision=expected_revision,
-        )
-
-    def load_receipt(
-        self,
-        actor_id: str,
-        idempotency_key: str,
-    ) -> StoredEvaluation | None:
-        return self._evaluation_transaction.get_evaluation_receipt(
-            actor_id,
-            idempotency_key,
-        )
-
-    def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None:
-        return self._evaluation_transaction.get_evaluation_artifact(snapshot_id)
-
-    def resolve_trusted_key(
-        self,
-        trusted_key_anchor: TrustedKeyAnchor,
-    ) -> EvaluationTrustedKeyAuthority | None:
-        return self._evaluation_transaction.get_demo_evaluation_trusted_key(
-            trusted_key_anchor
-        )
-
-    def put_trusted_key(
-        self,
-        authority: EvaluationTrustedKeyAuthority,
-        *,
-        expected_revision: int,
-    ) -> None:
-        self._evaluation_transaction.put_demo_evaluation_trusted_key(
-            authority,
-            expected_revision=expected_revision,
-        )
-
-    def insert_evaluation_conditionally(
-        self,
-        trusted_key_anchor: TrustedKeyAnchor,
-        expected_trusted_key: TrustedKeyAuthorityToken,
-        artifact_preparation: EvaluationArtifactPreparation,
-    ) -> StoredEvaluation:
-        return self._evaluation_transaction.put_evaluation_conditionally(
-            trusted_key_anchor,
-            expected_trusted_key,
-            artifact_preparation,
-        )
-
-    def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
-        return self._evaluation_transaction.list_evaluations()
-
-    @staticmethod
-    def _require_published(
-        tx: ContextTransactionPort,
-        manifest_id: str,
-        manifest_version: str,
-    ) -> PublishedManifest:
-        published = tx.get_published(manifest_id, manifest_version)
-        if published is None:
-            raise ResourceNotFoundError(
-                f"manifest version {manifest_id}/{manifest_version} was not found"
-            )
-        return published
 
 
 class ContextService:
@@ -393,7 +197,7 @@ class ContextService:
                     "ContextService persistence does not implement the "
                     "evaluation authority unit of work"
                 )
-            unit_of_work = _ContextServiceEvaluationAuthorityUnitOfWork(
+            unit_of_work = TransactionEvaluationAuthorityUnitOfWork(
                 context_transaction=transaction,
                 evaluation_transaction=transaction,
                 reader_actor=reader_actor,
@@ -443,13 +247,17 @@ class ContextService:
             ResolvedPublishedContext,
             EvaluationAuthorityToken,
         ]:
-            approval, resolved, authority = self._resolve_evaluation_authority(
-                unit_of_work,
-                actor=actor,
-                command=command,
-                as_of=as_of,
-                private_mcp_endpoint=private_mcp_endpoint,
-                evidence_identity_object_id=evidence_identity_object_id,
+            trust = self._require_demo_evaluation_trust()
+            approval, resolved, authority = (
+                resolve_transaction_evaluation_authority(
+                    unit_of_work,
+                    actor=actor,
+                    command=command,
+                    as_of=as_of,
+                    private_mcp_endpoint=private_mcp_endpoint,
+                    evidence_identity_object_id=evidence_identity_object_id,
+                    trusted_key_anchor=trust.trusted_key_anchor,
+                )
             )
             return approval, resolved, authority
 
@@ -472,6 +280,7 @@ class ContextService:
                 operation=lambda unit_of_work: self._commit_demo_evaluation(
                     unit_of_work,
                     candidate,
+                    reader_actor=reader_actor,
                 ),
             )
         except StaleRevisionError as exc:
@@ -483,6 +292,8 @@ class ContextService:
         self,
         unit_of_work: EvaluationAuthorityUnitOfWorkPort,
         candidate: EvaluationCommitCandidate,
+        *,
+        reader_actor: Actor,
     ) -> DemoEvaluationResult:
         replay = unit_of_work.load_receipt(
             candidate.actor.actor_id,
@@ -496,13 +307,15 @@ class ContextService:
             return DemoEvaluationResult.model_validate_json(replay.result_json)
 
         initial_time = self._now()
-        self._resolve_evaluation_authority(
+        trust = self._require_demo_evaluation_trust()
+        resolve_transaction_evaluation_authority(
             unit_of_work,
             actor=candidate.actor,
             command=candidate.command,
             as_of=initial_time,
             private_mcp_endpoint=candidate.private_mcp_endpoint,
             evidence_identity_object_id=candidate.evidence_identity_object_id,
+            trusted_key_anchor=trust.trusted_key_anchor,
             expected_authority=candidate.expected_authority,
         )
         if initial_time >= candidate.snapshot.expires_at:
@@ -510,27 +323,32 @@ class ContextService:
                 "snapshot became stale before publication"
             )
 
-        self._before_evaluation_artifact_insert(unit_of_work)
+        self._before_evaluation_artifact_insert()
 
         # Perform mutable authority reads before persistence obtains the final
         # timestamp. Key trust is read again and revision-bound by the
         # conditional persistence operation after its delay seam.
         authority_read_at = self._now()
-        approval, resolved, authority = self._resolve_evaluation_authority(
-            unit_of_work,
-            actor=candidate.actor,
-            command=candidate.command,
-            as_of=authority_read_at,
-            private_mcp_endpoint=candidate.private_mcp_endpoint,
-            evidence_identity_object_id=candidate.evidence_identity_object_id,
-            expected_authority=candidate.expected_authority,
+        approval, resolved, authority = (
+            resolve_transaction_evaluation_authority(
+                unit_of_work,
+                actor=candidate.actor,
+                command=candidate.command,
+                as_of=authority_read_at,
+                private_mcp_endpoint=candidate.private_mcp_endpoint,
+                evidence_identity_object_id=(
+                    candidate.evidence_identity_object_id
+                ),
+                trusted_key_anchor=trust.trusted_key_anchor,
+                expected_authority=candidate.expected_authority,
+            )
         )
 
         def prepare_before_persistence_time(
             trusted_key: EvaluationTrustedKeyAuthority,
         ) -> PreparedEvaluationArtifact:
             prepared_approval, prepared_resolved, _ = (
-                self._validate_loaded_evaluation_authority(
+                validate_loaded_evaluation_authority(
                     actor=candidate.actor,
                     command=candidate.command,
                     approval=approval,
@@ -545,6 +363,10 @@ class ContextService:
                         candidate.evidence_identity_object_id
                     ),
                     trusted_key=trusted_key,
+                    trusted_key_anchor=(
+                        self._require_demo_evaluation_trust()
+                        .trusted_key_anchor
+                    ),
                     expected_authority=candidate.expected_authority,
                 )
             )
@@ -594,18 +416,34 @@ class ContextService:
                 findings=findings,
                 envelope_attempt_id=candidate.envelope_attempt_id,
                 envelope=candidate.envelope,
-                temporal_validity=self._build_evaluation_temporal_validity(
-                    candidate,
+                authority=candidate.expected_authority,
+                temporal_validity=build_evaluation_temporal_validity(
+                    candidate.snapshot,
                     approval=prepared_approval,
-                    resolved=prepared_resolved,
+                    resolved_profile=prepared_resolved.profile,
+                    manifest=prepared_resolved.view.published.manifest,
                     as_of=authority_read_at,
                 ),
             )
 
-        trust = self._require_demo_evaluation_trust()
+        condition = EvaluationCommitAuthorityCondition(
+            reader_actor=reader_actor,
+            actor=candidate.actor,
+            command=candidate.command,
+            expected_authority=candidate.expected_authority,
+            private_mcp_endpoint=candidate.private_mcp_endpoint,
+            evidence_identity_object_id=candidate.evidence_identity_object_id,
+            trusted_key_anchor=trust.trusted_key_anchor,
+            idempotency_key=candidate.idempotency_key,
+            request_digest=candidate.request_digest,
+            evidence_binding_digest=build_evaluation_evidence_binding_digest(
+                candidate.snapshot,
+                envelope_attempt_id=candidate.envelope_attempt_id,
+                envelope=candidate.envelope,
+            ),
+        )
         artifact = unit_of_work.insert_evaluation_conditionally(
-            trust.trusted_key_anchor,
-            candidate.expected_authority.trusted_key,
+            condition,
             prepare_before_persistence_time,
         )
         return DemoEvaluationResult.model_validate_json(artifact.result_json)
@@ -750,270 +588,8 @@ class ContextService:
                     "publication time"
                 )
 
-    def _build_evaluation_temporal_validity(
-        self,
-        candidate: EvaluationCommitCandidate,
-        *,
-        approval: DemoEvaluationApproval,
-        resolved: ResolvedPublishedContext,
-        as_of: datetime,
-    ) -> EvaluationTemporalValidity:
-        """Capture every time boundary for the sealed insertion finalizer."""
-
-        manifest = resolved.view.published.manifest
-        profiles_by_id = {
-            normalize_nfc_text(profile.profile_id).casefold(): profile
-            for profile in manifest.profiles.values()
-        }
-        lineage_profiles = [
-            profiles_by_id[normalize_nfc_text(profile_id).casefold()]
-            for profile_id in resolved.profile.inheritance_chain
-        ]
-        active_overrides = [
-            override
-            for profile in lineage_profiles
-            for override in profile.weakening_overrides
-            if override.accepted_at <= as_of < override.expires_at
-        ]
-        exception_expiries = [
-            relationship.expires_at
-            for relationship in resolved.profile.relationships
-            if hasattr(relationship, "expires_at")
-        ]
-        governance_starts = [
-            override.accepted_at for override in active_overrides
-        ]
-        governance_expiries = [
-            *(override.expires_at for override in active_overrides),
-            *exception_expiries,
-        ]
-        risk_starts = [
-            acceptance.accepted_at
-            for acceptance in resolved.profile.risk_acceptances
-        ]
-        risk_expiries = [
-            acceptance.expires_at
-            for acceptance in resolved.profile.risk_acceptances
-        ]
-        freshness_deadlines = [
-            candidate.snapshot.collected_at
-            + timedelta(seconds=proof.maximum_age_seconds)
-            for constraint in resolved.profile.constraints
-            if isinstance(
-                proof := constraint.proof_requirement,
-                EvidenceFreshnessProof,
-            )
-        ]
-        return EvaluationTemporalValidity(
-            approval_active_from=approval.approved_at,
-            approval_expires_at=approval.expires_at,
-            snapshot_active_from=candidate.snapshot.collected_at,
-            snapshot_expires_at=candidate.snapshot.expires_at,
-            governance_active_from=(
-                max(governance_starts) if governance_starts else None
-            ),
-            governance_expires_at=(
-                min(governance_expiries) if governance_expiries else None
-            ),
-            risk_active_from=max(risk_starts) if risk_starts else None,
-            risk_expires_at=min(risk_expiries) if risk_expiries else None,
-            evidence_fresh_until=(
-                min(freshness_deadlines)
-                if freshness_deadlines
-                else None
-            ),
-        )
-
-    def _resolve_evaluation_authority(
-        self,
-        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
-        *,
-        actor: Actor,
-        command: DemoEvaluationCommand,
-        as_of: datetime,
-        private_mcp_endpoint: str,
-        evidence_identity_object_id: str,
-        expected_authority: EvaluationAuthorityToken | None = None,
-    ) -> tuple[
-        DemoEvaluationApproval,
-        ResolvedPublishedContext,
-        EvaluationAuthorityToken,
-    ]:
-        authorization = unit_of_work.authorize(
-            actor,
-            Permission.PUBLISH,
-            command.manifest_id,
-        )
-        approval = unit_of_work.resolve_approval(command.approval_decision_id)
-        if approval is None:
-            raise DemoEvaluationApprovalError(
-                "trusted demo evaluation approval decision was not found"
-            )
-
-        selection = PublishedContextSelection(
-            manifest_id=command.manifest_id,
-            manifest_version=command.manifest_version,
-            profile_id=command.profile_id,
-        )
-        try:
-            resolved, context_reader_authorization = (
-                unit_of_work.resolve_context(selection, as_of=as_of)
-            )
-        except (
-            AmbiguousLookupError,
-            AthenaValidationError,
-            ResourceNotFoundError,
-            ValueError,
-        ) as exc:
-            raise EvaluationFailedClosedError(
-                "published context/profile is missing, ambiguous, a superseded "
-                "context, or has inactive governance"
-            ) from exc
-        trust = self._require_demo_evaluation_trust()
-        trusted_key = unit_of_work.resolve_trusted_key(
-            trust.trusted_key_anchor
-        )
-        if trusted_key is None:
-            raise EvaluationFailedClosedError(
-                "authoritative demo evaluation signing key was not found"
-            )
-        return self._validate_loaded_evaluation_authority(
-            actor=actor,
-            command=command,
-            approval=approval,
-            resolved=resolved,
-            authorization=authorization,
-            context_reader_authorization=context_reader_authorization,
-            as_of=as_of,
-            private_mcp_endpoint=private_mcp_endpoint,
-            evidence_identity_object_id=evidence_identity_object_id,
-            trusted_key=trusted_key,
-            expected_authority=expected_authority,
-        )
-
-    def _validate_loaded_evaluation_authority(
-        self,
-        *,
-        actor: Actor,
-        command: DemoEvaluationCommand,
-        approval: DemoEvaluationApproval,
-        resolved: ResolvedPublishedContext,
-        authorization: AuthorizationGrantToken,
-        context_reader_authorization: AuthorizationGrantToken,
-        as_of: datetime,
-        private_mcp_endpoint: str,
-        evidence_identity_object_id: str,
-        trusted_key: EvaluationTrustedKeyAuthority,
-        expected_authority: EvaluationAuthorityToken | None,
-    ) -> tuple[
-        DemoEvaluationApproval,
-        ResolvedPublishedContext,
-        EvaluationAuthorityToken,
-    ]:
-        """Purely revalidate exact loaded authority at persistence time."""
-
-        validate_demo_evaluation_approval(
-            actor,
-            command,
-            approval,
-            as_of=as_of,
-            private_mcp_endpoint=private_mcp_endpoint,
-            evidence_identity_object_id=evidence_identity_object_id,
-        )
-        self._validate_trusted_key_authority(
-            trusted_key,
-            as_of=as_of,
-        )
-        selection = PublishedContextSelection(
-            manifest_id=command.manifest_id,
-            manifest_version=command.manifest_version,
-            profile_id=command.profile_id,
-        )
-        if expected_authority is not None:
-            expected_selection_mode = (
-                "uniqueActiveVersion"
-                if command.manifest_version is None
-                else "exactVersion"
-            )
-            if expected_authority.context.selection_mode != expected_selection_mode:
-                raise EvaluationFailedClosedError(
-                    "published context authority token changed selection mode"
-                )
-        try:
-            if resolved.view.supersession is not None:
-                raise AthenaValidationError(
-                    "superseded context cannot authorize evaluation"
-                )
-            profile = resolve_active_manifest_profile(
-                resolved.view.published.manifest,
-                selection.profile_id,
-                as_of=as_of,
-            )
-        except (AthenaValidationError, ValueError) as exc:
-            raise EvaluationFailedClosedError(
-                "published context/profile is missing, ambiguous, a superseded "
-                "context, or has inactive governance"
-            ) from exc
-        current_context = ResolvedPublishedContext(
-            view=resolved.view,
-            profile=profile,
-            authority_token=build_published_context_authority_token(
-                resolved.view,
-                profile,
-                requested_manifest_version=selection.manifest_version,
-            ),
-        )
-        validate_published_context_binding(command, approval, current_context)
-        authority = EvaluationAuthorityToken(
-            context=current_context.authority_token,
-            approval=approval.authority_token(),
-            authorization=authorization,
-            context_reader_authorization=context_reader_authorization,
-            trusted_key=trusted_key.authority_token(),
-        )
-        if expected_authority is not None and authority != expected_authority:
-            raise EvaluationFailedClosedError(
-                "evaluation authority revision changed before publication"
-            )
-        return approval, current_context, authority
-
-    def _validate_trusted_key_authority(
-        self,
-        authority: EvaluationTrustedKeyAuthority,
-        *,
-        as_of: datetime,
-    ) -> None:
-        trust = self._require_demo_evaluation_trust()
-        record = authority.record
-        if (
-            record.anchor != trust.trusted_key_anchor
-            or not record.enabled
-            or record.activated_at > as_of
-            or (
-                record.retired_at is not None
-                and record.retired_at <= as_of
-            )
-            or (
-                record.expires_at is not None
-                and record.expires_at <= as_of
-            )
-            or (
-                authority.revoked_at is not None
-                and authority.revoked_at <= as_of
-            )
-        ):
-            raise EvaluationFailedClosedError(
-                "trusted signing key is disabled, retired, expired, revoked, "
-                "or not active at publication time"
-            )
-
-    def _before_evaluation_artifact_insert(
-        self,
-        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
-    ) -> None:
-        """Internal test seam inside the exact persistence transaction."""
-
-        del unit_of_work
+    def _before_evaluation_artifact_insert(self) -> None:
+        """Delay-only test seam that cannot observe the active transaction."""
 
     def get_demo_evaluation_result(
         self,

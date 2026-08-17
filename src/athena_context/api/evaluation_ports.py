@@ -150,7 +150,45 @@ class PreparedEvaluationArtifact:
     findings: tuple[ManifestFinding, ...]
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
+    authority: EvaluationAuthorityToken
     temporal_validity: EvaluationTemporalValidity
+
+
+def build_evaluation_evidence_binding_digest(
+    snapshot: EvidenceSnapshot,
+    *,
+    envelope_attempt_id: str,
+    envelope: ValidatedEnvelope,
+) -> str:
+    """Bind the exact immutable snapshot and source envelope checked by policy."""
+
+    return compute_artifact_digest(
+        {
+            "snapshotCanonicalJson": snapshot.canonical_json(),
+            "snapshotArtifactDigest": snapshot.compatibility.artifact_digest,
+            "snapshotSemanticDigest": snapshot.compatibility.semantic_digest,
+            "envelopeAttemptId": envelope_attempt_id,
+            "envelopeKind": envelope.kind,
+            "envelopeDigest": envelope.digest,
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationCommitAuthorityCondition:
+    """Complete immutable authority and evidence predicate for atomic insertion."""
+
+    reader_actor: Actor
+    actor: Actor
+    command: DemoEvaluationCommand
+    expected_authority: EvaluationAuthorityToken
+    private_mcp_endpoint: str
+    evidence_identity_object_id: str
+    trusted_key_anchor: TrustedKeyAnchor
+    idempotency_key: str
+    request_digest: str
+    evidence_binding_digest: str
+
 
 # Delay-capable verification returns data, never executable post-time behavior.
 type EvaluationArtifactPreparation = Callable[
@@ -209,11 +247,10 @@ class EvaluationAuthorityTransactionPort(Protocol):
 
     def put_evaluation_conditionally(
         self,
-        trusted_key_anchor: TrustedKeyAnchor,
-        expected_trusted_key: TrustedKeyAuthorityToken,
+        condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
-        """Bind key revision, prepare, seal-finalize, and atomically insert."""
+        """Re-resolve complete authority, seal-finalize, and atomically insert."""
         ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -279,8 +316,7 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
 
     def insert_evaluation_conditionally(
         self,
-        trusted_key_anchor: TrustedKeyAnchor,
-        expected_trusted_key: TrustedKeyAuthorityToken,
+        condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation: ...
 
@@ -339,6 +375,7 @@ class SnapshotSigningPort(Protocol):
 __all__ = [
     "ConfiguredEvidenceClientPort",
     "EvaluationArtifactPreparation",
+    "EvaluationCommitAuthorityCondition",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
@@ -350,5 +387,6 @@ __all__ = [
     "SnapshotSigningPort",
     "SnapshotSigningRequest",
     "StoredEvaluation",
+    "build_evaluation_evidence_binding_digest",
     "TrustedWc008DeploymentConfigurationPort",
 ]
