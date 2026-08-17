@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import AwareDatetime, Field, model_validator
 
 from athena_context.api.cohort_domain import normalized_identifier
-from athena_context.api.domain import Actor, ApiModel, WorkloadIdentifier
+from athena_context.api.domain import Actor, ApiModel, DraftRecord, WorkloadIdentifier
 from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     AtomicSelector,
@@ -116,6 +116,88 @@ class DraftSelectorBaseline(ApiModel):
             entries=entries,
             captured_by=actor,
             captured_at=captured_at,
+        )
+
+
+class DraftSelectorPredecessorBinding(ApiModel):
+    """Immutable edge to exact unpublished selector authority."""
+
+    successor_draft_id: str = Field(pattern=_ID_PATTERN)
+    manifest_id: WorkloadIdentifier
+    successor_manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    successor_source_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    successor_selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
+    predecessor_draft_id: str = Field(pattern=_ID_PATTERN)
+    predecessor_manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    predecessor_revision: int = Field(ge=1)
+    predecessor_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    predecessor_selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
+    predecessor_baseline_source_manifest_digest: str = Field(
+        pattern=_DIGEST_PATTERN
+    )
+    predecessor_baseline_selector_provenance_digest: str = Field(
+        pattern=_DIGEST_PATTERN
+    )
+    bound_by: Actor
+    bound_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_lineage(self) -> DraftSelectorPredecessorBinding:
+        if self.successor_draft_id == self.predecessor_draft_id:
+            raise ValueError("selector predecessor cannot reference its own draft")
+        predecessor = tuple(
+            int(part) for part in self.predecessor_manifest_version.split(".")
+        )
+        successor = tuple(
+            int(part) for part in self.successor_manifest_version.split(".")
+        )
+        if predecessor >= successor:
+            raise ValueError(
+                "selector predecessor version must be lower than successor"
+            )
+        return self
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        successor_draft_id: str,
+        successor_manifest: CanonicalWorkloadManifest,
+        successor_manifest_digest: str,
+        predecessor: DraftRecord,
+        predecessor_baseline: DraftSelectorBaseline,
+        actor: Actor,
+        bound_at: datetime,
+    ) -> DraftSelectorPredecessorBinding:
+        successor_entries = manifest_selector_provenance(successor_manifest)
+        predecessor_entries = manifest_selector_provenance(
+            predecessor.manifest
+        )
+        return cls(
+            successor_draft_id=successor_draft_id,
+            manifest_id=successor_manifest.manifest_id,
+            successor_manifest_version=successor_manifest.manifest_version,
+            successor_source_manifest_digest=successor_manifest_digest,
+            successor_selector_provenance_digest=selector_provenance_digest(
+                successor_entries
+            ),
+            predecessor_draft_id=predecessor.draft_id,
+            predecessor_manifest_version=(
+                predecessor.manifest.manifest_version
+            ),
+            predecessor_revision=predecessor.revision,
+            predecessor_manifest_digest=predecessor.manifest_digest,
+            predecessor_selector_provenance_digest=(
+                selector_provenance_digest(predecessor_entries)
+            ),
+            predecessor_baseline_source_manifest_digest=(
+                predecessor_baseline.source_manifest_digest
+            ),
+            predecessor_baseline_selector_provenance_digest=(
+                predecessor_baseline.selector_provenance_digest
+            ),
+            bound_by=actor,
+            bound_at=bound_at,
         )
 
 
@@ -258,10 +340,12 @@ def selector_role_digests(
 
 __all__ = [
     "DraftSelectorBaseline",
+    "DraftSelectorPredecessorBinding",
     "SelectorProvenanceEntry",
     "SelectorRoleKey",
     "manifest_selector_provenance",
     "resolved_profile_selector_provenance",
     "role_selector_provenance_digest",
+    "selector_provenance_digest",
     "selector_role_digests",
 ]

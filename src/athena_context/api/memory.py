@@ -29,7 +29,13 @@ from athena_context.api.errors import (
     StaleRevisionError,
 )
 from athena_context.api.ports import ContextTransactionPort
-from athena_context.api.selector_provenance import DraftSelectorBaseline
+from athena_context.api.selector_authority import (
+    validate_draft_selector_predecessor_binding,
+)
+from athena_context.api.selector_provenance import (
+    DraftSelectorBaseline,
+    DraftSelectorPredecessorBinding,
+)
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -58,6 +64,10 @@ class InMemoryContextStore:
         self._lock = RLock()
         self._drafts: dict[str, DraftRecord] = {}
         self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
+        self._draft_selector_predecessors: dict[
+            str,
+            DraftSelectorPredecessorBinding,
+        ] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
@@ -81,6 +91,10 @@ class _MemoryTransaction(ContextTransactionPort):
         self._store = store
         self._drafts: dict[str, DraftRecord] = {}
         self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
+        self._draft_selector_predecessors: dict[
+            str,
+            DraftSelectorPredecessorBinding,
+        ] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
@@ -100,6 +114,9 @@ class _MemoryTransaction(ContextTransactionPort):
         self._drafts = dict(self._store._drafts)
         self._draft_selector_baselines = dict(
             self._store._draft_selector_baselines
+        )
+        self._draft_selector_predecessors = dict(
+            self._store._draft_selector_predecessors
         )
         self._published = dict(self._store._published)
         self._supersessions = dict(self._store._supersessions)
@@ -125,6 +142,9 @@ class _MemoryTransaction(ContextTransactionPort):
                 self._store._drafts = self._drafts
                 self._store._draft_selector_baselines = (
                     self._draft_selector_baselines
+                )
+                self._store._draft_selector_predecessors = (
+                    self._draft_selector_predecessors
                 )
                 self._store._published = self._published
                 self._store._supersessions = self._supersessions
@@ -178,6 +198,13 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 f"expected draft revision {expected_revision}, found {current.revision}"
             )
+        if current is not None and current != draft and any(
+            binding.predecessor_draft_id == draft.draft_id
+            for binding in self._draft_selector_predecessors.values()
+        ):
+            raise PersistenceConflictError(
+                "draft is an immutable selector authority predecessor"
+            )
         self._drafts[draft.draft_id] = draft.model_copy(deep=True)
 
     def get_draft_selector_baseline(
@@ -217,6 +244,55 @@ class _MemoryTransaction(ContextTransactionPort):
             )
         self._draft_selector_baselines[baseline.draft_id] = (
             baseline.model_copy(deep=True)
+        )
+
+    def get_draft_selector_predecessor_binding(
+        self,
+        successor_draft_id: str,
+    ) -> DraftSelectorPredecessorBinding | None:
+        binding = self._draft_selector_predecessors.get(successor_draft_id)
+        return None if binding is None else binding.model_copy(deep=True)
+
+    def list_draft_selector_predecessor_bindings(
+        self,
+        *,
+        manifest_id: str,
+        predecessor_draft_id: str | None = None,
+    ) -> list[DraftSelectorPredecessorBinding]:
+        matches = sorted(
+            (
+                binding
+                for binding in self._draft_selector_predecessors.values()
+                if binding.manifest_id == manifest_id
+                and (
+                    predecessor_draft_id is None
+                    or binding.predecessor_draft_id == predecessor_draft_id
+                )
+            ),
+            key=lambda binding: binding.successor_draft_id,
+        )
+        return [binding.model_copy(deep=True) for binding in matches]
+
+    def put_draft_selector_predecessor_binding(
+        self,
+        binding: DraftSelectorPredecessorBinding,
+    ) -> None:
+        if binding.successor_draft_id in self._draft_selector_predecessors:
+            raise PersistenceConflictError(
+                "draft selector predecessor binding is immutable"
+            )
+        successor = self._drafts.get(binding.successor_draft_id)
+        if successor is None:
+            raise PersistenceConflictError(
+                "selector authority successor draft is missing"
+            )
+        validate_draft_selector_predecessor_binding(
+            self,
+            successor=successor,
+            binding=binding,
+        )
+        self._draft_selector_predecessors[binding.successor_draft_id] = (
+            binding.model_copy(deep=True)
         )
 
     def get_published(
