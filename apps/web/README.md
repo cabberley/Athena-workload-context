@@ -88,12 +88,16 @@ The review view shows environment, manifest version, approval state, evidence sn
 band, support, dissent, conflicts, rejected candidates, selector preview, and digests. Member details
 are filterable and paginated 25 at a time; there is no per-resource editor. Medium, low,
 conflicting, cross-environment, split, and merge actions require a bounded rationale and explicit
-acknowledgement. Rejection is visibly session-only until a server decision endpoint exists.
+acknowledgement. Direct approval requires an existing bounded selector preview; low or conflicting
+proposals without one may still request a server-generated split preview. Rejection is visibly
+session-only until a server decision endpoint exists.
 
 A confirmed cohort approval is available only to a verified human `proposer`. It calls WC-007
 `PUT /v1/drafts/{draft_id}` with the exact revision/version/digest and a stable idempotency key,
 adding only profile-scoped bounded role selectors. The cohort flow never calls validate, lifecycle
-approve, publish, or supersede.
+approve, publish, or supersede. Before the draft update, the browser verifies that selector-preview
+members form a normalized, duplicate-free, disjoint union exactly equal to the source proposal
+members, with exact per-role member counts and `maxMatches` bounds.
 
 ## Local validation
 

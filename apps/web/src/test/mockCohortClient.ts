@@ -47,59 +47,62 @@ const proposal = (
   proposalId: string,
   role: CanonicalManifestRole,
   members: string[],
-  selectorPreview: CohortSelectorPreview,
+  selectorPreview: CohortSelectorPreview | null,
   options: {
     confidence: number
     band: CohortProposal['confidenceBand']
     conflict?: boolean
     rejected?: boolean
   },
-): CohortProposal => ({
-  proposalId,
-  scope,
-  role,
-  members,
-  confidence: options.confidence,
-  confidenceBand: options.band,
-  supportingEvidence: [{
-    signalType: selectorPreview.selector.selectorType === 'vmScaleSet' ? 'vmScaleSet' : 'namePredicate',
-    signalValue: `${selectorPreview.selector.selectorId} from synthetic verified inventory`,
-    memberCount: members.length,
-    evidenceRefCount: members.length,
-  }],
-  dissent: options.conflict
-    ? [{
-        resourceId: members[0]!,
-        signalType: 'approvedTags',
-        expectedValue: 'production',
-        observedValue: 'training',
-        reason: 'Synthetic environment tag dissent for explicit resolution testing.',
-        evidenceRefCount: 1,
-      }]
-    : [],
-  rejectedCandidates: options.rejected
-    ? [{
-        resourceId: resourceId('wc012-cross-environment-rejected'),
-        reasons: ['crossEnvironment'],
-        evidenceRefCount: 1,
-      }]
-    : [],
-  conflicts: options.conflict
-    ? [{
-        code: 'crossEnvironment',
-        detail: 'A synthetic candidate carries a different environment tag.',
-        resourceIds: [resourceId('wc012-cross-environment-rejected')],
-        roleRefs: [role.roleId],
-      }]
-    : [],
-  selectorPreview,
-  snapshot,
-  disposition: options.band === 'high' ? 'bulkHumanReview' : 'humanResolution',
-  requiresHumanReview: true,
-  bulkReviewEligible: options.band === 'high',
-  publicationAllowed: false,
-  manifestMutated: false,
-})
+): CohortProposal => {
+  const evidenceSelector = selectorPreview?.selector ?? role.selectors[0]!
+  return {
+    proposalId,
+    scope,
+    role,
+    members,
+    confidence: options.confidence,
+    confidenceBand: options.band,
+    supportingEvidence: [{
+      signalType: evidenceSelector.selectorType === 'vmScaleSet' ? 'vmScaleSet' : 'namePredicate',
+      signalValue: `${evidenceSelector.selectorId} from synthetic verified inventory`,
+      memberCount: members.length,
+      evidenceRefCount: members.length,
+    }],
+    dissent: options.conflict
+      ? [{
+          resourceId: members[0]!,
+          signalType: 'approvedTags',
+          expectedValue: 'production',
+          observedValue: 'training',
+          reason: 'Synthetic environment tag dissent for explicit resolution testing.',
+          evidenceRefCount: 1,
+        }]
+      : [],
+    rejectedCandidates: options.rejected
+      ? [{
+          resourceId: resourceId('wc012-cross-environment-rejected'),
+          reasons: ['crossEnvironment'],
+          evidenceRefCount: 1,
+        }]
+      : [],
+    conflicts: options.conflict
+      ? [{
+          code: 'crossEnvironment',
+          detail: 'A synthetic candidate carries a different environment tag.',
+          resourceIds: [resourceId('wc012-cross-environment-rejected')],
+          roleRefs: [role.roleId],
+        }]
+      : [],
+    selectorPreview,
+    snapshot,
+    disposition: options.band === 'high' ? 'bulkHumanReview' : 'humanResolution',
+    requiresHumanReview: true,
+    bulkReviewEligible: options.band === 'high',
+    publicationAllowed: false,
+    manifestMutated: false,
+  }
+}
 
 const makeBatch = (): CohortProposalBatch => {
   const workerMembers = Array.from({ length: 1000 }, (_, index) =>

@@ -2,7 +2,11 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { axe } from 'jest-axe'
 import App from './App'
-import { createMockCohortProposalApiClient } from './test/mockCohortClient'
+import type { CohortProposalBatch } from './cohortTypes'
+import {
+  createMockCohortProposalApiClient,
+  syntheticCohortBatch,
+} from './test/mockCohortClient'
 import { createMockContextApiClient, mockAuthSession } from './test/mockClient'
 
 const proposerSession = {
@@ -11,9 +15,9 @@ const proposerSession = {
   userLabel: 'Synthetic human cohort proposer',
 }
 
-const renderCohorts = async () => {
+const renderCohorts = async (batch?: CohortProposalBatch) => {
   const contextClient = createMockContextApiClient({ session: proposerSession })
-  const cohortClient = createMockCohortProposalApiClient({ session: proposerSession })
+  const cohortClient = createMockCohortProposalApiClient({ session: proposerSession, batch })
   const initialContexts = await contextClient.loadAuthorizedWorkloads()
   const rendered = render(
     <App
@@ -120,6 +124,48 @@ describe('cohort proposal review', () => {
     await user.click(screen.getByRole('checkbox', { name: /explicitly resolved/i }))
     expect(approve).toBeEnabled()
   })
+
+  it.each(['low', 'conflicting'] as const)(
+    'allows a resolved %s proposal without a selector to request a split preview',
+    async (band) => {
+      const batch = structuredClone(syntheticCohortBatch)
+      const proposal = batch.proposals[1]!
+      proposal.confidenceBand = band
+      proposal.confidence = 0.4
+      proposal.disposition = 'humanResolution'
+      proposal.bulkReviewEligible = false
+      proposal.selectorPreview = null
+      const { user, cohortClient } = await renderCohorts(batch)
+      const preview = vi.spyOn(cohortClient, 'previewReview')
+      await user.click(screen.getByRole('button', { name: /web.*12 members/i }))
+
+      expect(screen.getByText(/no bounded selector preview was provided/i)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /approve bounded cohort to draft/i }))
+        .toBeDisabled()
+      const split = screen.getByRole('button', { name: /preview split/i })
+      expect(split).toBeDisabled()
+      await user.type(
+        screen.getByLabelText(/resolution rationale/i),
+        `Resolve the synthetic ${band} proposal before requesting a split preview.`,
+      )
+      await user.click(screen.getByRole('checkbox', { name: /explicitly resolved/i }))
+
+      expect(split).toBeEnabled()
+      expect(screen.getByRole('button', { name: /approve bounded cohort to draft/i }))
+        .toBeDisabled()
+      await user.click(split)
+      await user.click(
+        within(screen.getByRole('alertdialog', { name: /confirm split/i }))
+          .getByRole('button', { name: /confirm split/i }),
+      )
+      expect(await screen.findByRole('heading', { name: /split result.*api preview only/i }))
+        .toBeInTheDocument()
+      expect(preview).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'split',
+        proposalIds: [proposal.proposalId],
+      }))
+    },
+  )
 
   it('gets split and merge selectors from the proposal API rather than fabricating them in the client', async () => {
     const { user, cohortClient } = await renderCohorts()

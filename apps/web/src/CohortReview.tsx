@@ -555,7 +555,10 @@ export default function CohortReview({
                   </p>
                 </>
               ) : (
-                <p role="alert">No bounded selector preview was provided. Draft approval is blocked.</p>
+                <p role="alert">
+                  No bounded selector preview was provided. Direct draft approval is blocked;
+                  a human may request a server-generated split preview after explicit resolution.
+                </p>
               )}
             </div>
 
@@ -749,7 +752,7 @@ export default function CohortReview({
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!isHuman || busy || !selected.selectorPreview || !resolutionReady}
+                disabled={!isHuman || busy || !resolutionReady}
                 onClick={() => openConfirmation('split', [selected.proposalId])}
               >
                 Preview split
