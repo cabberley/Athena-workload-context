@@ -84,3 +84,24 @@ class RoleBasedAuthorization:
             raise AuthorizationError(
                 f"actor {actor.actor_id!r} is not authorized for {permission.value}"
             )
+
+    def require_explicit(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str,
+    ) -> None:
+        """Require a concrete workload grant; wildcard grants never satisfy this boundary."""
+
+        if permission in _HUMAN_ONLY and actor.kind is not ActorKind.HUMAN:
+            raise AuthorizationError(f"{permission.value} requires a human actor")
+        authorized = any(
+            grant.actor_id == actor.actor_id
+            and permission in _ROLE_PERMISSIONS[grant.role]
+            and grant.manifest_id == manifest_id
+            for grant in self._grants
+        )
+        if not authorized:
+            raise AuthorizationError(
+                f"actor {actor.actor_id!r} has no explicit grant for {permission.value}"
+            )

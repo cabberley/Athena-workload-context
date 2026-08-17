@@ -10,6 +10,18 @@ from athena_context.api.authorization import (
     RejectUnverifiedAuthentication,
     RoleBasedAuthorization,
 )
+from athena_context.api.cohort_domain import (
+    CohortProposalBatchResponse,
+    CohortProposalQuery,
+    CohortReviewCandidate,
+    CohortReviewPreviewRequest,
+)
+from athena_context.api.cohort_memory import (
+    EmptyEvidenceSnapshotRepository,
+    InMemoryCohortPersistence,
+    RejectingTrustedEvidenceSnapshotVerifier,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
@@ -30,6 +42,7 @@ from athena_context.api.domain import (
 from athena_context.api.errors import (
     AuthenticationError,
     AuthorizationError,
+    CohortBoundaryError,
     ContextApiError,
     ManifestValidationError,
     ResourceNotFoundError,
@@ -88,10 +101,13 @@ def create_app(
     *,
     service: ContextService | None = None,
     authentication: AuthenticationPort | None = None,
+    cohort_service: CohortProposalService | None = None,
 ) -> FastAPI:
+    default_store: InMemoryContextStore | None = None
     if service is None:
+        default_store = InMemoryContextStore()
         service = ContextService(
-            store=InMemoryContextStore(),
+            store=default_store,
             authorization=RoleBasedAuthorization(),
             clock=SystemClock(),
             publication_actor=Actor(
@@ -99,11 +115,23 @@ def create_app(
                 kind=ActorKind.SERVICE,
             ),
         )
+    if cohort_service is None:
+        cohort_persistence = InMemoryCohortPersistence()
+        cohort_service = CohortProposalService(
+            context_store=default_store or InMemoryContextStore(),
+            authorization=RoleBasedAuthorization(),
+            clock=SystemClock(),
+            snapshot_repository=EmptyEvidenceSnapshotRepository(),
+            snapshot_verifier=RejectingTrustedEvidenceSnapshotVerifier(),
+            proposal_cache=cohort_persistence,
+            preview_receipts=cohort_persistence,
+        )
     authenticator = authentication or RejectUnverifiedAuthentication()
     application = FastAPI(
         title="Athena Context API",
         version="1.0.0",
         description="Authoritative, human-governed workload manifest lifecycle API.",
+        separate_input_output_schemas=False,
     )
     application.state.authenticator = authenticator
 
@@ -118,12 +146,73 @@ def create_app(
             http_status = status.HTTP_403_FORBIDDEN
         elif isinstance(exc, ResourceNotFoundError):
             http_status = status.HTTP_404_NOT_FOUND
+        elif isinstance(exc, CohortBoundaryError):
+            http_status = status.HTTP_413_CONTENT_TOO_LARGE
         elif isinstance(exc, ManifestValidationError):
             http_status = status.HTTP_422_UNPROCESSABLE_CONTENT
         else:
             http_status = status.HTTP_409_CONFLICT
         body = ErrorResponse(error=ErrorDetail(code=exc.code, message=exc.message))
         return JSONResponse(status_code=http_status, content=body.model_dump(mode="json"))
+
+    @application.get(
+        "/v1/cohort-proposals",
+        response_model=CohortProposalBatchResponse,
+        response_model_exclude_none=True,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+        },
+    )
+    def get_cohort_proposals(
+        actor: ActorDependency,
+        manifest_id: Annotated[str, Query(min_length=1, max_length=128)],
+        manifest_version: Annotated[str, Query(pattern=_VERSION_PATTERN)],
+        profile_id: Annotated[str, Query(pattern=_ID_PATTERN)],
+        draft_id: Annotated[str, Query(pattern=_ID_PATTERN)],
+        expected_revision: Annotated[
+            int,
+            Query(ge=1, le=9_007_199_254_740_991),
+        ],
+        expected_digest: Annotated[
+            str,
+            Query(pattern=r"^sha256:[a-f0-9]{64}$"),
+        ],
+    ) -> CohortProposalBatchResponse:
+        return cohort_service.get_proposals(
+            actor,
+            CohortProposalQuery(
+                manifest_id=manifest_id,
+                manifest_version=manifest_version,
+                profile_id=profile_id,
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+                expected_digest=expected_digest,
+            ),
+        )
+
+    @application.post(
+        "/v1/cohort-proposals/preview",
+        response_model=CohortReviewCandidate,
+        response_model_exclude_none=True,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def preview_cohort_proposals(
+        command: CohortReviewPreviewRequest,
+        idempotency_key: IdempotencyHeader,
+        actor: ActorDependency,
+    ) -> CohortReviewCandidate:
+        return cohort_service.preview(actor, idempotency_key, command)
 
     @application.post(
         "/v1/drafts",
