@@ -11,10 +11,16 @@ from athena_context.api.domain import (
 from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationResult,
+    VerifiedWc008DeploymentConfiguration,
 )
-from athena_context.contracts import SnapshotPublicationRecord, TrustedKeyAnchor
+from athena_context.contracts import (
+    SnapshotPublicationRecord,
+    TrustedKeyAnchor,
+    TrustedKeyResolver,
+)
 from athena_context.evidence import (
     CollectedEvidence,
+    CollectorTrustConfiguration,
     EvidenceCollectionCommand,
     ValidatedEnvelope,
 )
@@ -42,9 +48,22 @@ class StoredEvaluation:
 
 class ConfiguredEvidenceClientPort(Protocol):
     @property
-    def private_mcp_endpoint(self) -> str: ...
+    def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration: ...
+
+    @property
+    def trust_configuration(self) -> CollectorTrustConfiguration: ...
+
+    @property
+    def trusted_key_anchor(self) -> TrustedKeyAnchor: ...
+
+    @property
+    def key_resolver(self) -> TrustedKeyResolver: ...
 
     def collect(self, command: EvidenceCollectionCommand) -> CollectedEvidence: ...
+
+
+class TrustedWc008DeploymentConfigurationPort(Protocol):
+    def load_verified(self) -> VerifiedWc008DeploymentConfiguration: ...
 
 
 class PublishedContextResolverPort(Protocol):
@@ -86,4 +105,5 @@ __all__ = [
     "SnapshotSigningPort",
     "SnapshotSigningRequest",
     "StoredEvaluation",
+    "TrustedWc008DeploymentConfigurationPort",
 ]

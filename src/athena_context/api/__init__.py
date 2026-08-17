@@ -21,6 +21,8 @@ from athena_context.api.domain import (
 from athena_context.api.evaluation_adapters import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ContextServicePublishedContextResolver,
+    EnvironmentWc008DeploymentConfigurationPort,
+    OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
     PrivateMcpInvokerPort,
     StaticDemoEvaluationApprovalResolver,
@@ -28,12 +30,17 @@ from athena_context.api.evaluation_adapters import (
 )
 from athena_context.api.evaluation_domain import (
     AZURE_MCP_2_0_5_ALLOWED_TOOLS,
+    AZURE_MCP_2_0_5_CATALOG_HASH,
+    AZURE_MCP_2_0_5_IMAGE_DIGEST,
     AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
     McpReadAssignment,
-    PrivateMcpEndpointConfiguration,
+    OperatorDeploymentApproval,
+    VerifiedWc008DeploymentConfiguration,
+    Wc008DeploymentOutputAssertion,
+    build_wc008_deployment_assertion,
 )
 from athena_context.api.evaluation_memory import InMemoryEvaluationArtifactStore
 from athena_context.api.evaluation_service import DemoEvaluationService
@@ -46,6 +53,8 @@ __all__ = [
     "ActorKind",
     "AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL",
     "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
+    "AZURE_MCP_2_0_5_CATALOG_HASH",
+    "AZURE_MCP_2_0_5_IMAGE_DIGEST",
     "AuthorizedSnapshotPublication",
     "ContextServicePublishedContextResolver",
     "ContextService",
@@ -56,10 +65,12 @@ __all__ = [
     "DemoEvaluationCommand",
     "DemoEvaluationResult",
     "DemoEvaluationService",
+    "EnvironmentWc008DeploymentConfigurationPort",
     "InMemoryEvaluationArtifactStore",
     "InMemoryContextStore",
     "McpReadAssignment",
-    "PrivateMcpEndpointConfiguration",
+    "OperatorDeploymentApproval",
+    "OperatorTrustedWc008ConfigurationPort",
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",
     "PublishedManifest",
@@ -74,6 +85,9 @@ __all__ = [
     "StaticDemoEvaluationApprovalResolver",
     "TransitionCommand",
     "VerifiedAuthentication",
+    "VerifiedWc008DeploymentConfiguration",
+    "Wc008DeploymentOutputAssertion",
     "Wc009EvidenceClientAdapter",
+    "build_wc008_deployment_assertion",
     "create_app",
 ]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from ipaddress import ip_address
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -21,7 +20,10 @@ from athena_context.evidence import EvidenceResponseBounds
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
 _VERSION_PATTERN = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
-_AZURE_RESOURCE_ID_PATTERN = r"^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]+/.+$"
+_AZURE_RESOURCE_ID_PATTERN = (
+    r"^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]+/"
+    r"providers/[A-Za-z0-9.]+/[A-Za-z0-9-]+/[^/]+$"
+)
 _GUID_PATTERN = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -37,6 +39,12 @@ AZURE_MCP_2_0_5_ALLOWED_TOOLS: tuple[str, ...] = (
     "monitor_workspace_log_query",
     "resourcehealth_availability-status_get",
 )
+AZURE_MCP_2_0_5_CATALOG_HASH: Literal[
+    "sha256:032b52ae4214b9df410182292b2bf0a82f9a84eec7b64cc5c8c40f726c4d4a0c"
+] = "sha256:032b52ae4214b9df410182292b2bf0a82f9a84eec7b64cc5c8c40f726c4d4a0c"
+AZURE_MCP_2_0_5_IMAGE_DIGEST: Literal[
+    "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a"
+] = "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a"
 
 
 class McpReadAssignment(ApiModel):
@@ -46,18 +54,29 @@ class McpReadAssignment(ApiModel):
     role: Literal["Reader", "Log Analytics Data Reader"]
 
 
-class PrivateMcpEndpointConfiguration(ApiModel):
-    """Trusted WC-008 outputs plus the identity-separation assertions used at runtime."""
+class Wc008DeploymentOutputAssertion(ApiModel):
+    """Bounded WC-008 outputs/config before a separate operator trust decision."""
 
-    private_mcp_endpoint: str = Field(min_length=12, max_length=2048)
+    azure_mcp_internal_endpoint: str = Field(min_length=12, max_length=2048)
     endpoint_output_name: Literal["azureMcpInternalEndpoint"] = "azureMcpInternalEndpoint"
-    network_access: Literal["internalContainerAppsEnvironment"] = (
-        "internalContainerAppsEnvironment"
+    managed_environment_resource_id: str = Field(pattern=_AZURE_RESOURCE_ID_PATTERN)
+    azure_mcp_container_app_resource_id: str = Field(
+        pattern=_AZURE_RESOURCE_ID_PATTERN
     )
-    azure_mcp_version: Literal["2.0.5"] = "2.0.5"
-    allowed_tools: tuple[str, ...] = AZURE_MCP_2_0_5_ALLOWED_TOOLS
     evidence_identity_resource_id: str = Field(pattern=_AZURE_RESOURCE_ID_PATTERN)
     context_identity_resource_id: str = Field(pattern=_AZURE_RESOURCE_ID_PATTERN)
+    internal_environment: Literal[True]
+    public_network_access: Literal["Disabled"]
+    external_ingress: Literal[False]
+    allow_insecure: Literal[False]
+    azure_mcp_version: Literal["2.0.5"] = "2.0.5"
+    azure_mcp_image_digest: Literal[
+        "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a"
+    ] = AZURE_MCP_2_0_5_IMAGE_DIGEST
+    allowed_tools: tuple[str, ...] = AZURE_MCP_2_0_5_ALLOWED_TOOLS
+    tool_catalog_hash: Literal[
+        "sha256:032b52ae4214b9df410182292b2bf0a82f9a84eec7b64cc5c8c40f726c4d4a0c"
+    ] = AZURE_MCP_2_0_5_CATALOG_HASH
     evidence_identity_object_id: str = Field(pattern=_GUID_PATTERN)
     context_identity_object_id: str = Field(pattern=_GUID_PATTERN)
     evidence_read_assignments: tuple[McpReadAssignment, ...] = Field(
@@ -66,10 +85,11 @@ class PrivateMcpEndpointConfiguration(ApiModel):
     )
     context_identity_azure_roles: tuple[str, ...] = ()
     evidence_identity_context_permissions: tuple[str, ...] = ()
+    assertion_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
-    def validate_private_read_only_boundary(self) -> PrivateMcpEndpointConfiguration:
-        parsed = urlsplit(self.private_mcp_endpoint)
+    def validate_private_read_only_boundary(self) -> Wc008DeploymentOutputAssertion:
+        parsed = urlsplit(self.azure_mcp_internal_endpoint)
         if (
             parsed.scheme != "https"
             or not parsed.hostname
@@ -79,22 +99,40 @@ class PrivateMcpEndpointConfiguration(ApiModel):
             or parsed.fragment
             or parsed.path not in {"", "/"}
         ):
-            raise ValueError("private MCP endpoint must be an HTTPS origin without credentials")
-        try:
-            ip_address(parsed.hostname)
-        except ValueError:
-            hostname = parsed.hostname.casefold()
-            if not (
-                hostname.endswith(".internal")
-                or hostname.endswith(".azurecontainerapps.io")
-            ):
-                raise ValueError(
-                    "private MCP endpoint must be an internal or Container Apps deployment output"
-                ) from None
-        else:
-            raise ValueError("private MCP endpoint must use a private deployment DNS name")
+            raise ValueError("WC-008 MCP endpoint must be an HTTPS origin without credentials")
         if self.allowed_tools != AZURE_MCP_2_0_5_ALLOWED_TOOLS:
             raise ValueError("allowedTools must exactly match the reviewed WC-008 output")
+        required_types = (
+            (
+                self.managed_environment_resource_id,
+                "/providers/microsoft.app/managedenvironments/",
+                "managed environment",
+            ),
+            (
+                self.azure_mcp_container_app_resource_id,
+                "/providers/microsoft.app/containerapps/",
+                "MCP container app",
+            ),
+            (
+                self.evidence_identity_resource_id,
+                "/providers/microsoft.managedidentity/userassignedidentities/",
+                "evidence identity",
+            ),
+            (
+                self.context_identity_resource_id,
+                "/providers/microsoft.managedidentity/userassignedidentities/",
+                "context identity",
+            ),
+        )
+        for resource_id, expected_segment, label in required_types:
+            if expected_segment not in resource_id.casefold():
+                raise ValueError(f"WC-008 {label} resource ID has the wrong resource type")
+        hosting_scopes = {
+            resource_id.casefold().split("/providers/", maxsplit=1)[0]
+            for resource_id, _, _ in required_types
+        }
+        if len(hosting_scopes) != 1:
+            raise ValueError("WC-008 deployment resource IDs must share one hosting resource group")
         if (
             self.evidence_identity_resource_id.casefold()
             == self.context_identity_resource_id.casefold()
@@ -114,7 +152,14 @@ class PrivateMcpEndpointConfiguration(ApiModel):
         ]
         if len(canonical_assignments) != len(set(canonical_assignments)):
             raise ValueError("evidence read assignments must be unique")
+        if self.assertion_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("WC-008 deployment assertion digest does not match its outputs")
         return self
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("assertion_digest")
+        return payload
 
     def authorizes_inventory_scope(self, scope: EvidenceScope) -> bool:
         expected = scope.canonical_json()
@@ -122,6 +167,94 @@ class PrivateMcpEndpointConfiguration(ApiModel):
             assignment.role == "Reader" and assignment.scope.canonical_json() == expected
             for assignment in self.evidence_read_assignments
         )
+
+
+class OperatorDeploymentApproval(ApiModel):
+    """Separately pinned human trust decision for one exact WC-008 assertion digest."""
+
+    approval_id: str = Field(pattern=_ID_PATTERN)
+    status: Literal["trusted"]
+    assertion_digest: str = Field(pattern=_DIGEST_PATTERN)
+    approved_by: Actor
+    approved_at: AwareDatetime
+    reason: str = Field(min_length=3, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_operator(self) -> OperatorDeploymentApproval:
+        if self.approved_by.kind is not ActorKind.HUMAN:
+            raise ValueError("WC-008 deployment assertion requires a human operator")
+        return self
+
+
+class VerifiedWc008DeploymentConfiguration(ApiModel):
+    """Nominal result produced only by a trusted deployment configuration port."""
+
+    assertion: Wc008DeploymentOutputAssertion
+    operator_approval: OperatorDeploymentApproval
+
+    @model_validator(mode="after")
+    def validate_exact_trust_binding(self) -> VerifiedWc008DeploymentConfiguration:
+        if (
+            self.operator_approval.assertion_digest
+            != self.assertion.assertion_digest
+        ):
+            raise ValueError(
+                "operator trust decision does not bind the exact WC-008 assertion"
+            )
+        return self
+
+
+def build_wc008_deployment_assertion(
+    *,
+    azure_mcp_internal_endpoint: str,
+    managed_environment_resource_id: str,
+    azure_mcp_container_app_resource_id: str,
+    evidence_identity_resource_id: str,
+    context_identity_resource_id: str,
+    evidence_identity_object_id: str,
+    context_identity_object_id: str,
+    evidence_read_assignments: tuple[McpReadAssignment, ...],
+    internal_environment: bool = True,
+    public_network_access: str = "Disabled",
+    external_ingress: bool = False,
+    allow_insecure: bool = False,
+    context_identity_azure_roles: tuple[str, ...] = (),
+    evidence_identity_context_permissions: tuple[str, ...] = (),
+) -> Wc008DeploymentOutputAssertion:
+    payload: dict[str, object] = {
+        "azure_mcp_internal_endpoint": azure_mcp_internal_endpoint,
+        "managed_environment_resource_id": managed_environment_resource_id,
+        "azure_mcp_container_app_resource_id": azure_mcp_container_app_resource_id,
+        "evidence_identity_resource_id": evidence_identity_resource_id,
+        "context_identity_resource_id": context_identity_resource_id,
+        "internal_environment": internal_environment,
+        "public_network_access": public_network_access,
+        "external_ingress": external_ingress,
+        "allow_insecure": allow_insecure,
+        "azure_mcp_version": "2.0.5",
+        "azure_mcp_image_digest": AZURE_MCP_2_0_5_IMAGE_DIGEST,
+        "allowed_tools": AZURE_MCP_2_0_5_ALLOWED_TOOLS,
+        "tool_catalog_hash": AZURE_MCP_2_0_5_CATALOG_HASH,
+        "evidence_identity_object_id": evidence_identity_object_id,
+        "context_identity_object_id": context_identity_object_id,
+        "evidence_read_assignments": evidence_read_assignments,
+        "context_identity_azure_roles": context_identity_azure_roles,
+        "evidence_identity_context_permissions": (
+            evidence_identity_context_permissions
+        ),
+    }
+    unsigned = Wc008DeploymentOutputAssertion.model_construct(
+        **cast(Any, payload),
+        assertion_digest=_PLACEHOLDER_DIGEST,
+    )
+    return Wc008DeploymentOutputAssertion.model_validate(
+        {
+            **payload,
+            "assertion_digest": compute_artifact_digest(
+                unsigned._digest_payload()
+            ),
+        }
+    )
 
 
 class DemoEvaluationApproval(ApiModel):
@@ -369,13 +502,18 @@ def build_demo_evaluation_result(
 
 __all__ = [
     "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
+    "AZURE_MCP_2_0_5_CATALOG_HASH",
+    "AZURE_MCP_2_0_5_IMAGE_DIGEST",
     "AuthorizedSnapshotPublication",
     "DemoEvaluationApproval",
     "DemoEvaluationCommand",
     "DemoEvaluationResult",
     "McpReadAssignment",
-    "PrivateMcpEndpointConfiguration",
+    "OperatorDeploymentApproval",
+    "VerifiedWc008DeploymentConfiguration",
+    "Wc008DeploymentOutputAssertion",
     "build_authorized_publication",
     "build_demo_evaluation_result",
+    "build_wc008_deployment_assertion",
     "publication_digest_payload",
 ]

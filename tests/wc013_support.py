@@ -4,6 +4,7 @@ import base64
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -20,7 +21,8 @@ from athena_context.api import (
     InMemoryContextStore,
     InMemoryEvaluationArtifactStore,
     McpReadAssignment,
-    PrivateMcpEndpointConfiguration,
+    OperatorDeploymentApproval,
+    OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
     PublishCommand,
     Role,
@@ -28,7 +30,10 @@ from athena_context.api import (
     RoleGrant,
     StaticDemoEvaluationApprovalResolver,
     TransitionCommand,
+    VerifiedWc008DeploymentConfiguration,
+    Wc008DeploymentOutputAssertion,
     Wc009EvidenceClientAdapter,
+    build_wc008_deployment_assertion,
 )
 from athena_context.api.domain import (
     DraftRecord,
@@ -60,7 +65,6 @@ from athena_context.evidence import (
     McpSuccessResponse,
     McpTimeoutNoResponse,
     McpToolUnavailable,
-    SyncEvidenceClient,
     TrustedIngestionBinding,
 )
 from athena_context.evidence.models import McpTransportOutcome
@@ -537,35 +541,103 @@ class DemoHarness:
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: GoldenContextResolver
     approval: DemoEvaluationApproval
+    deployment_configuration: VerifiedWc008DeploymentConfiguration
 
 
-def endpoint_configuration() -> PrivateMcpEndpointConfiguration:
-    return PrivateMcpEndpointConfiguration(
-        private_mcp_endpoint=PRIVATE_ENDPOINT,
+def deployment_assertion(
+    endpoint: str = PRIVATE_ENDPOINT,
+    *,
+    internal_environment: bool = True,
+    public_network_access: str = "Disabled",
+    external_ingress: bool = False,
+) -> Wc008DeploymentOutputAssertion:
+    resource_group_prefix = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture"
+    )
+    return build_wc008_deployment_assertion(
+        azure_mcp_internal_endpoint=endpoint,
+        managed_environment_resource_id=(
+            f"{resource_group_prefix}/providers/Microsoft.App/"
+            "managedEnvironments/athena-synthetic-mcp-env"
+        ),
+        azure_mcp_container_app_resource_id=(
+            f"{resource_group_prefix}/providers/Microsoft.App/"
+            "containerApps/athena-synthetic-mcp"
+        ),
         evidence_identity_resource_id=(
-            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture/"
+            f"{resource_group_prefix}/"
             "providers/Microsoft.ManagedIdentity/userAssignedIdentities/mcp-evidence"
         ),
         context_identity_resource_id=(
-            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture/"
+            f"{resource_group_prefix}/"
             "providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-context"
         ),
         evidence_identity_object_id=MCP_OBJECT_ID,
         context_identity_object_id=CONTEXT_OBJECT_ID,
         evidence_read_assignments=(McpReadAssignment(scope=scope(), role="Reader"),),
+        internal_environment=internal_environment,
+        public_network_access=public_network_access,
+        external_ingress=external_ingress,
     )
 
 
-def build_harness(scenario: str = "success") -> DemoHarness:
+def operator_approval(
+    assertion: Wc008DeploymentOutputAssertion,
+) -> OperatorDeploymentApproval:
+    return OperatorDeploymentApproval(
+        approval_id="approval-wc008-deployment",
+        status="trusted",
+        assertion_digest=assertion.assertion_digest,
+        approved_by=APPROVER,
+        approved_at=NOW - timedelta(minutes=10),
+        reason="Trust the exact synthetic WC-008 private deployment outputs",
+    )
+
+
+def verified_deployment_configuration(
+    endpoint: str = PRIVATE_ENDPOINT,
+) -> VerifiedWc008DeploymentConfiguration:
+    assertion = deployment_assertion(endpoint)
+    return OperatorTrustedWc008ConfigurationPort(
+        assertion=assertion,
+        pinned_assertion_digest=assertion.assertion_digest,
+        operator_approval=operator_approval(assertion),
+    ).load_verified()
+
+
+def _trusted_configuration_port(
+    configuration: VerifiedWc008DeploymentConfiguration,
+) -> OperatorTrustedWc008ConfigurationPort:
+    return OperatorTrustedWc008ConfigurationPort(
+        assertion=configuration.assertion,
+        pinned_assertion_digest=configuration.assertion.assertion_digest,
+        operator_approval=configuration.operator_approval,
+    )
+
+
+def build_harness(
+    scenario: str = "success",
+    *,
+    service_configuration: VerifiedWc008DeploymentConfiguration | None = None,
+    transport_configuration: VerifiedWc008DeploymentConfiguration | None = None,
+    configuration_port: Any | None = None,
+) -> DemoHarness:
     clock = StepClock()
     trust = trust_configuration()
     private_key = CANONICAL_PRIVATE_KEY
-    transport = ScenarioTransport(scenario)
-    evidence_client = SyncEvidenceClient(
-        transport=PrivateMcpEvidenceTransport(
-            private_mcp_endpoint=PRIVATE_ENDPOINT,
-            invoker=transport,
-        ),
+    trusted_configuration = (
+        service_configuration or verified_deployment_configuration()
+    )
+    actual_transport_configuration = (
+        transport_configuration or trusted_configuration
+    )
+    invoker = ScenarioTransport(scenario)
+    transport = PrivateMcpEvidenceTransport(
+        deployment_configuration=actual_transport_configuration,
+        invoker=invoker,
+    )
+    evidence_client = Wc009EvidenceClientAdapter(
+        transport=transport,
         signer=DeterministicIngestionSigner(private_key),
         replay_guard=ReplayGuard(),
         clock=clock,
@@ -591,7 +663,9 @@ def build_harness(scenario: str = "success") -> DemoHarness:
         manifest_digest=manifest.compatibility.artifact_digest,
         profile_id="production",
         authorized_scope=scope(),
-        private_mcp_endpoint=PRIVATE_ENDPOINT,
+        private_mcp_endpoint=(
+            trusted_configuration.assertion.azure_mcp_internal_endpoint
+        ),
         evidence_identity_object_id=MCP_OBJECT_ID,
         reason="Authorize one bounded synthetic private MCP demonstration",
     )
@@ -624,14 +698,11 @@ def build_harness(scenario: str = "success") -> DemoHarness:
         ]
     )
     service = DemoEvaluationService(
-        endpoint_configuration=endpoint_configuration(),
-        trust_configuration=trust,
-        trusted_key_anchor=key_anchor(private_key.public_key()),
-        key_resolver=key_resolver(private_key.public_key()),
-        evidence_client=Wc009EvidenceClientAdapter(
-            private_mcp_endpoint=PRIVATE_ENDPOINT,
-            client=evidence_client,
+        deployment_configuration=(
+            configuration_port
+            or _trusted_configuration_port(trusted_configuration)
         ),
+        evidence_client=evidence_client,
         context_resolver=context_resolver,
         approval_resolver=StaticDemoEvaluationApprovalResolver([approval]),
         snapshot_signer=snapshot_signer,
@@ -644,10 +715,11 @@ def build_harness(scenario: str = "success") -> DemoHarness:
         service=service,
         command=command,
         store=store,
-        transport=transport,
+        transport=invoker,
         snapshot_signer=snapshot_signer,
         context_resolver=context_resolver,
         approval=approval,
+        deployment_configuration=trusted_configuration,
     )
 
 
@@ -663,6 +735,8 @@ __all__ = [
     "PUBLISHER",
     "TENANT_ID",
     "build_harness",
-    "endpoint_configuration",
+    "deployment_assertion",
+    "operator_approval",
     "scope",
+    "verified_deployment_configuration",
 ]

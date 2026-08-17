@@ -25,11 +25,16 @@ authorized evidence scope.
 
 The integration composes the merged components without introducing direct Azure access:
 
-- WC-008 outputs provide the HTTPS internal Container Apps endpoint, exact Azure MCP 2.0.5 tool
-  list, separate identity IDs, and read assignments at explicit scopes.
-- `PrivateMcpEvidenceTransport` feeds that endpoint to an injected invoker, and
+- A trusted WC-008 configuration port verifies a bounded deployment-output assertion against a
+  separately pinned human operator decision. The assertion binds the exact endpoint, managed
+  environment and Container App resource IDs, internal/private ingress flags, separate identity
+  IDs, Azure MCP 2.0.5 image digest, seven-tool allowlist/catalog hash, and explicit read scopes.
+  A hostname suffix or caller-supplied private flag is never treated as proof of private ingress.
+- `PrivateMcpEvidenceTransport` owns that immutable verified configuration and derives the endpoint
+  used by its injected invoker from it; no independent endpoint label can be supplied. It
   maps the WC-009 semantic inventory operation to WC-008's exact `group_resource_list` deployment
-  tool. `Wc009EvidenceClientAdapter` binds the resulting typed client to the same endpoint.
+  tool. The service rejects composition unless the actual transport configuration exactly equals
+  the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
@@ -44,12 +49,16 @@ gaps, superseded context, signature failure, or golden-oracle mismatch produces 
 The context identity configuration forbids Azure workload roles. The MCP identity configuration
 permits only reviewed read roles and forbids Context API permissions.
 
-The deterministic tests use a clearly synthetic `.internal` endpoint and fake invoker. The optional
-live authentication probe is marked `live` and skipped unless both variables are explicitly set:
+The deterministic tests use a clearly synthetic endpoint, operator-pinned configuration port, and
+fake invoker. The optional live authentication probe is marked `live` and skipped unless explicitly
+enabled. The live path loads bounded WC-008 assertion and operator-approval JSON files and requires
+the independently pinned assertion digest:
 
 ```powershell
 $env:ATHENA_WC013_LIVE = '1'
-$env:ATHENA_WC013_PRIVATE_MCP_ENDPOINT = '<WC-008 azureMcpInternalEndpoint>'
+$env:ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE = '<bounded WC-008 assertion JSON>'
+$env:ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE = '<operator approval JSON>'
+$env:ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST = 'sha256:<exact assertion digest>'
 python -m pytest tests/test_wc013_live.py -m live
 ```
 

@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
+    EnvironmentWc008DeploymentConfigurationPort,
     McpReadAssignment,
-    PrivateMcpEndpointConfiguration,
+    OperatorTrustedWc008ConfigurationPort,
+    Wc008DeploymentOutputAssertion,
 )
 from athena_context.api.domain import Supersession
 from athena_context.api.errors import (
     AuthorizationError,
     DemoEvaluationApprovalError,
+    DemoEvaluationConfigurationError,
     EvaluationFailedClosedError,
     EvidenceCollectionRejectedError,
     IdempotencyConflictError,
@@ -30,8 +35,10 @@ from wc013_support import (
     PUBLICATION_SERVICE,
     PUBLISHER,
     build_harness,
-    endpoint_configuration,
+    deployment_assertion,
+    operator_approval,
     scope,
+    verified_deployment_configuration,
 )
 
 EXPECTED_VERDICTS = {
@@ -41,6 +48,20 @@ EXPECTED_VERDICTS = {
     "web-zone-distribution": "pass",
     "worker-db-zone-colocation": "pass",
 }
+
+
+def _changed_assertion_payload(**updates: object) -> dict[str, object]:
+    unsigned = deployment_assertion().model_copy(
+        update={
+            **updates,
+            "assertion_digest": "sha256:" + ("0" * 64),
+        }
+    )
+    payload = unsigned.model_dump(mode="python", exclude={"assertion_digest"})
+    return {
+        **payload,
+        "assertion_digest": compute_artifact_digest(unsigned._digest_payload()),
+    }
 
 
 def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -> None:
@@ -240,34 +261,211 @@ def test_superseded_context_fails_before_collection() -> None:
 
 
 def test_wc008_output_configuration_enforces_identity_and_role_separation() -> None:
-    base = endpoint_configuration().model_dump(mode="python")
+    assertion = deployment_assertion()
 
     with pytest.raises(ValidationError, match="context identity must not receive"):
-        PrivateMcpEndpointConfiguration.model_validate(
-            {**base, "context_identity_azure_roles": ("Reader",)}
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(
+                context_identity_azure_roles=("Reader",)
+            )
         )
     with pytest.raises(ValidationError, match="must not receive context write"):
-        PrivateMcpEndpointConfiguration.model_validate(
-            {
-                **base,
-                "evidence_identity_context_permissions": ("publish",),
-            }
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(
+                evidence_identity_context_permissions=("publish",)
+            )
         )
     with pytest.raises(ValidationError, match="identities must remain separate"):
-        PrivateMcpEndpointConfiguration.model_validate(
-            {
-                **base,
-                "context_identity_object_id": MCP_OBJECT_ID,
-                "evidence_identity_object_id": MCP_OBJECT_ID,
-            }
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(
+                context_identity_object_id=MCP_OBJECT_ID,
+                evidence_identity_object_id=MCP_OBJECT_ID,
+            )
         )
-    with pytest.raises(ValidationError, match="private MCP endpoint"):
-        PrivateMcpEndpointConfiguration.model_validate(
-            {**base, "private_mcp_endpoint": "https://public.example.com"}
+    with pytest.raises(ValidationError, match="external_ingress"):
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(external_ingress=True)
         )
     with pytest.raises(ValidationError):
         McpReadAssignment(scope=scope(), role="Contributor")  # type: ignore[arg-type]
-    assert endpoint_configuration().context_identity_object_id == CONTEXT_OBJECT_ID
+    assert assertion.context_identity_object_id == CONTEXT_OBJECT_ID
+
+
+def test_endpoint_is_derived_from_actual_transport_and_cannot_be_relabelled() -> None:
+    approved_endpoint = verified_deployment_configuration(
+        "https://approved-a.internal.example"
+    )
+    actual_endpoint = verified_deployment_configuration(
+        "https://actual-b.internal.example"
+    )
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="actual evidence transport",
+    ):
+        build_harness(
+            service_configuration=approved_endpoint,
+            transport_configuration=actual_endpoint,
+        )
+
+
+def test_self_asserted_private_flags_cannot_make_a_public_hostname_trusted() -> None:
+    class SelfAssertedConfigurationPort:
+        def load_verified(self) -> Wc008DeploymentOutputAssertion:
+            return deployment_assertion("https://public.example.com")
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="operator-verified",
+    ):
+        build_harness(configuration_port=SelfAssertedConfigurationPort())
+
+
+def test_operator_trust_not_dns_suffix_is_authoritative_for_private_ingress() -> None:
+    configuration = verified_deployment_configuration(
+        "https://private-gateway.corp.example"
+    )
+    harness = build_harness(
+        service_configuration=configuration,
+        transport_configuration=configuration,
+    )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-private-assertion-not-suffix",
+        harness.command,
+    )
+
+    assert harness.transport.endpoints == [
+        "https://private-gateway.corp.example"
+    ]
+    assert result.publication.endpoint_digest == compute_artifact_digest(
+        {"privateMcpEndpoint": "https://private-gateway.corp.example"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "managed_environment_resource_id",
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg-athena-fixture/providers/Microsoft.App/"
+                "managedEnvironments/other-env"
+            ),
+        ),
+        (
+            "azure_mcp_container_app_resource_id",
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg-athena-fixture/providers/Microsoft.App/"
+                "containerApps/other-app"
+            ),
+        ),
+        ("evidence_identity_object_id", "55555555-5555-5555-5555-555555555555"),
+    ],
+)
+def test_wc008_exact_deployment_binding_mismatches_fail_composition(
+    field: str,
+    value: str,
+) -> None:
+    trusted = verified_deployment_configuration()
+    changed_assertion = Wc008DeploymentOutputAssertion.model_validate(
+        _changed_assertion_payload(**{field: value})
+    )
+    changed = OperatorTrustedWc008ConfigurationPort(
+        assertion=changed_assertion,
+        pinned_assertion_digest=changed_assertion.assertion_digest,
+        operator_approval=operator_approval(changed_assertion),
+    ).load_verified()
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="actual evidence transport",
+    ):
+        build_harness(
+            service_configuration=trusted,
+            transport_configuration=changed,
+        )
+
+
+def test_wc008_catalog_and_allowlist_are_exact_and_assertion_pin_is_required() -> None:
+    with pytest.raises(ValidationError):
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(
+                tool_catalog_hash="sha256:" + ("0" * 64)
+            )
+        )
+    with pytest.raises(ValidationError):
+        Wc008DeploymentOutputAssertion.model_validate(
+            _changed_assertion_payload(
+                allowed_tools=("group_resource_list",)
+            )
+        )
+
+    assertion = deployment_assertion()
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="pinned assertion digest",
+    ):
+        OperatorTrustedWc008ConfigurationPort(
+            assertion=assertion,
+            pinned_assertion_digest="sha256:" + ("0" * 64),
+            operator_approval=operator_approval(assertion),
+        ).load_verified()
+
+
+def test_live_configuration_adapter_loads_exact_bounded_operator_outputs(
+    tmp_path: Path,
+) -> None:
+    assertion = deployment_assertion()
+    approval = operator_approval(assertion)
+    assertion_path = tmp_path / "wc008-assertion.json"
+    approval_path = tmp_path / "wc008-approval.json"
+    assertion_path.write_text(assertion.model_dump_json(), encoding="utf-8")
+    approval_path.write_text(approval.model_dump_json(), encoding="utf-8")
+
+    configuration = EnvironmentWc008DeploymentConfigurationPort(
+        {
+            "ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE": str(assertion_path),
+            "ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE": str(approval_path),
+            "ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST": assertion.assertion_digest,
+        }
+    ).load_verified()
+
+    assert configuration.assertion == assertion
+    assert configuration.operator_approval == approval
+
+
+def test_live_configuration_adapter_fails_closed_for_missing_or_malformed_input(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="configuration variable",
+    ):
+        EnvironmentWc008DeploymentConfigurationPort({}).load_verified()
+
+    malformed_path = tmp_path / "malformed.json"
+    malformed_path.write_text('{"selfAssertedPrivate":true}', encoding="utf-8")
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="malformed or untrusted",
+    ):
+        EnvironmentWc008DeploymentConfigurationPort(
+            {
+                "ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE": str(
+                    malformed_path
+                ),
+                "ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE": str(
+                    malformed_path
+                ),
+                "ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST": (
+                    "sha256:" + ("0" * 64)
+                ),
+            }
+        ).load_verified()
 
 
 def test_snapshot_and_publication_reject_post_validation_tampering() -> None:

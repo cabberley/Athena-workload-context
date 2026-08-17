@@ -21,7 +21,7 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
-    PrivateMcpEndpointConfiguration,
+    VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     build_demo_evaluation_result,
 )
@@ -33,6 +33,7 @@ from athena_context.api.evaluation_ports import (
     SnapshotSigningPort,
     SnapshotSigningRequest,
     StoredEvaluation,
+    TrustedWc008DeploymentConfigurationPort,
 )
 from athena_context.api.evaluation_snapshot import (
     finalize_signed_snapshot,
@@ -43,14 +44,11 @@ from athena_context.contracts import (
     AthenaValidationError,
     EvidenceGapRecord,
     SnapshotPublicationRecord,
-    TrustedKeyAnchor,
-    TrustedKeyResolver,
     compute_artifact_digest,
     resolve_manifest_profile,
 )
 from athena_context.evidence import (
     CollectedEvidence,
-    CollectorTrustConfiguration,
     EvidenceClientError,
     EvidenceCollectionCommand,
 )
@@ -69,10 +67,7 @@ class DemoEvaluationService:
     def __init__(
         self,
         *,
-        endpoint_configuration: PrivateMcpEndpointConfiguration,
-        trust_configuration: CollectorTrustConfiguration,
-        trusted_key_anchor: TrustedKeyAnchor,
-        key_resolver: TrustedKeyResolver,
+        deployment_configuration: TrustedWc008DeploymentConfigurationPort,
         evidence_client: ConfiguredEvidenceClientPort,
         context_resolver: PublishedContextResolverPort,
         approval_resolver: DemoEvaluationApprovalResolverPort,
@@ -82,10 +77,16 @@ class DemoEvaluationService:
         clock: ClockPort,
         publication_actor: Actor,
     ) -> None:
-        self._endpoint_configuration = endpoint_configuration
-        self._trust_configuration = trust_configuration
-        self._trusted_key_anchor = trusted_key_anchor
-        self._key_resolver = key_resolver
+        verified_configuration = deployment_configuration.load_verified()
+        if not isinstance(
+            verified_configuration,
+            VerifiedWc008DeploymentConfiguration,
+        ):
+            raise DemoEvaluationConfigurationError(
+                "WC-008 deployment configuration was not returned as an "
+                "operator-verified configuration by a trusted port"
+            )
+        self._deployment_configuration = verified_configuration
         self._evidence_client = evidence_client
         self._context_resolver = context_resolver
         self._approval_resolver = approval_resolver
@@ -97,26 +98,31 @@ class DemoEvaluationService:
         self._validate_composition()
 
     def _validate_composition(self) -> None:
-        configuration = self._endpoint_configuration
-        trust = self._trust_configuration
+        configuration = self._deployment_configuration
+        assertion = configuration.assertion
+        trust = self._evidence_client.trust_configuration
         if self._publication_actor.kind is not ActorKind.SERVICE:
             raise DemoEvaluationConfigurationError(
                 "snapshot publication actor must be the Context API service"
             )
-        if self._evidence_client.private_mcp_endpoint != configuration.private_mcp_endpoint:
+        if self._evidence_client.deployment_configuration != configuration:
             raise DemoEvaluationConfigurationError(
-                "WC-009 client is not bound to the configured private MCP endpoint"
+                "actual evidence transport is not bound to the trusted WC-008 "
+                "deployment assertion"
             )
         if (
             trust.managed_identity_object_id
-            != configuration.evidence_identity_object_id
+            != assertion.evidence_identity_object_id
             or trust.context_identity_object_id
-            != configuration.context_identity_object_id
+            != assertion.context_identity_object_id
         ):
             raise DemoEvaluationConfigurationError(
                 "WC-009 trust identities do not match WC-008 deployment outputs"
             )
-        if trust.trust_anchor_ref != self._trusted_key_anchor.key_vault_key_id:
+        if (
+            trust.trust_anchor_ref
+            != self._evidence_client.trusted_key_anchor.key_vault_key_id
+        ):
             raise DemoEvaluationConfigurationError(
                 "trusted snapshot key does not match the evidence ingestion anchor"
             )
@@ -185,15 +191,15 @@ class DemoEvaluationService:
             material = prepare_snapshot_signing_material(
                 collected,
                 snapshot_id=command.snapshot_id,
-                trust_configuration=self._trust_configuration,
-                trusted_key_anchor=self._trusted_key_anchor,
+                trust_configuration=self._evidence_client.trust_configuration,
+                trusted_key_anchor=self._evidence_client.trusted_key_anchor,
                 attested_at=attested_at,
             )
             signature = self._snapshot_signer.sign(
                 SnapshotSigningRequest(
                     canonical_preimage=material.canonical_signing_preimage,
                     preimage_digest=material.signing_preimage_digest,
-                    trusted_key_anchor=self._trusted_key_anchor,
+                    trusted_key_anchor=self._evidence_client.trusted_key_anchor,
                 )
             )
             snapshot = finalize_signed_snapshot(material, signature=signature)
@@ -212,7 +218,7 @@ class DemoEvaluationService:
             publication_actor=self._publication_actor,
             published_at=published_at,
             resolved_profile_digest=profile.resolved_profile_digest,
-            endpoint=self._endpoint_configuration.private_mcp_endpoint,
+            endpoint=self._actual_private_mcp_endpoint,
             scope=command.authorized_scope,
             reason=command.reason,
         )
@@ -247,8 +253,8 @@ class DemoEvaluationService:
                 as_of=published_at,
                 expected_artifact_digest=snapshot.compatibility.artifact_digest,
                 publication_resolver=publication_resolver,
-                key_resolver=self._key_resolver,
-                trusted_key_anchor=self._trusted_key_anchor,
+                key_resolver=self._evidence_client.key_resolver,
+                trusted_key_anchor=self._evidence_client.trusted_key_anchor,
                 envelope_resolver=envelope_resolver,
             )
             findings_by_clause = evaluate_manifest_profile(
@@ -301,8 +307,8 @@ class DemoEvaluationService:
         return result
 
     def _collect(self, command: DemoEvaluationCommand) -> CollectedEvidence:
-        configuration = self._endpoint_configuration
-        if not configuration.authorizes_inventory_scope(command.authorized_scope):
+        assertion = self._deployment_configuration.assertion
+        if not assertion.authorizes_inventory_scope(command.authorized_scope):
             raise EvidenceCollectionRejectedError(
                 "authorized scope has no exact WC-008 Reader assignment"
             )
@@ -333,9 +339,9 @@ class DemoEvaluationService:
         claims = identity.verified_claims
         if (
             claims.managed_identity_object_id
-            != self._endpoint_configuration.evidence_identity_object_id
+            != assertion.evidence_identity_object_id
             or claims.managed_identity_object_id
-            != self._trust_configuration.managed_identity_object_id
+            != self._evidence_client.trust_configuration.managed_identity_object_id
         ):
             raise EvidenceCollectionRejectedError(
                 "collected evidence identity does not match the read-only MCP identity"
@@ -379,9 +385,9 @@ class DemoEvaluationService:
             or approval.authorized_scope.canonical_json()
             != command.authorized_scope.canonical_json()
             or approval.private_mcp_endpoint
-            != self._endpoint_configuration.private_mcp_endpoint
+            != self._actual_private_mcp_endpoint
             or approval.evidence_identity_object_id
-            != self._endpoint_configuration.evidence_identity_object_id
+            != self._deployment_configuration.assertion.evidence_identity_object_id
         ):
             raise DemoEvaluationApprovalError(
                 "approval does not authorize this exact endpoint, identity, context, and scope"
@@ -401,10 +407,13 @@ class DemoEvaluationService:
                     by_alias=True,
                     exclude_none=True,
                 ),
-                "privateMcpEndpoint": (
-                    self._endpoint_configuration.private_mcp_endpoint
+                "wc008DeploymentAssertionDigest": (
+                    self._deployment_configuration.assertion.assertion_digest
                 ),
-                "trustConfiguration": self._trust_configuration.model_dump(
+                "actualPrivateMcpEndpoint": self._actual_private_mcp_endpoint,
+                "trustConfiguration": (
+                    self._evidence_client.trust_configuration
+                ).model_dump(
                     mode="json",
                     by_alias=True,
                     exclude_none=True,
@@ -414,6 +423,13 @@ class DemoEvaluationService:
 
     def _now(self) -> datetime:
         return ensure_timestamp(self._clock.now())
+
+    @property
+    def _actual_private_mcp_endpoint(self) -> str:
+        return (
+            self._evidence_client.deployment_configuration.assertion
+            .azure_mcp_internal_endpoint
+        )
 
     def get_result(self, actor: Actor, snapshot_id: str) -> DemoEvaluationResult:
         result = self._artifact_store.resolve_result(snapshot_id)
