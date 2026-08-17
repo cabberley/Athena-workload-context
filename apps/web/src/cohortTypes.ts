@@ -8,7 +8,8 @@ import type {
 
 export type ConfidenceBand = 'high' | 'medium' | 'low' | 'conflicting'
 export type CohortReviewAction = 'approve' | 'split' | 'merge'
-export type CohortDecisionState = 'pending' | 'drafted' | 'rejected'
+export type CohortDecisionAction = CohortReviewAction | 'reject'
+export type CohortDecisionState = 'pending' | 'applied' | 'rejected'
 export type CohortSignalType =
   | 'approvedTags'
   | 'namePredicate'
@@ -187,10 +188,56 @@ export interface CohortReviewCandidate {
   manifestMutated: false
 }
 
+export interface CohortDecisionLoadRequest extends CohortProposalLoadRequest {
+  scope: CohortProposalScope
+  proposalIds: string[]
+  proposalSetDigest: string
+  snapshotArtifactDigest: string
+}
+
+export interface CohortDecisionSubmitRequest extends CohortDecisionLoadRequest {
+  action: CohortDecisionAction
+  candidate: CohortReviewCandidate | null
+  rationale: string
+}
+
+export interface CohortDecisionDraftResult {
+  draftId: string
+  revision: number
+  manifestDigest: string
+}
+
+/**
+ * Durable decision state returned by the decision service. No production HTTP
+ * mapping is defined until issue #34 establishes and merges the wire contract.
+ */
+export interface CohortDecisionRecord {
+  decisionId: string
+  action: CohortDecisionAction
+  sourceDraft: CohortDraftBinding
+  scope: CohortProposalScope
+  proposalIds: string[]
+  proposalSetDigest: string
+  snapshotArtifactDigest: string
+  candidateId: string | null
+  rationale: string
+  state: Exclude<CohortDecisionState, 'pending'>
+  decidedBy: string
+  decidedAt: string
+  draftResult: CohortDecisionDraftResult | null
+  publicationAllowed: false
+}
+
 export interface CohortProposalApiPort {
   auth: AuthSession
   loadProposalBatch: (request: CohortProposalLoadRequest) => Promise<CohortProposalBatch>
   previewReview: (request: CohortReviewPreviewRequest) => Promise<CohortReviewCandidate>
+}
+
+export interface CohortDecisionApiPort {
+  auth: AuthSession
+  loadDecisions: (request: CohortDecisionLoadRequest) => Promise<CohortDecisionRecord[]>
+  submitDecision: (request: CohortDecisionSubmitRequest) => Promise<CohortDecisionRecord>
 }
 
 export interface CohortProposalApiOptions {

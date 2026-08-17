@@ -218,6 +218,11 @@ describe('production startup', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: 'Cohorts' }))
 
     expect(await screen.findByText('high · 94%')).toBeInTheDocument()
+    expect(screen.getByText(/blocked until the issue #34 decision API is merged/i))
+      .toBeInTheDocument()
+    expect(screen.getByLabelText(/resolution rationale/i)).toBeDisabled()
+    expect(screen.getByRole('button', { name: /approve bounded cohort to draft/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^reject proposal$/i })).toBeDisabled()
     const cohortCall = fetchMock.mock.calls.find((call) =>
       String(call[0]).startsWith('https://cohorts.invalid/v1/cohort-proposals?'),
     )

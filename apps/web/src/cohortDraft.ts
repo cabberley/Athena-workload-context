@@ -243,11 +243,3 @@ export const applyCohortCandidateToDraft = (
   }
   return replacement
 }
-
-export const cohortDraftIdempotencyKey = (
-  candidate: CohortReviewCandidate,
-  revision: number,
-): string =>
-  `cohort-r${revision}-${candidate.candidateId}`
-    .replace(/[^A-Za-z0-9._-]/g, '-')
-    .slice(0, 128)

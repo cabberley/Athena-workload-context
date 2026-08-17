@@ -1,6 +1,5 @@
 import {
   applyCohortCandidateToDraft,
-  cohortDraftIdempotencyKey,
   proposalReviewCandidate,
 } from './cohortDraft'
 import { createMockCohortProposalApiClient, syntheticCohortBatch } from './test/mockCohortClient'
@@ -42,9 +41,6 @@ describe('cohort draft binding', () => {
     ])
     expect(candidate.publicationAllowed).toBe(false)
     expect(candidate.manifestMutated).toBe(false)
-    expect(cohortDraftIdempotencyKey(candidate, context.draft!.revision)).toMatch(
-      /^cohort-r1-review-proposal-/,
-    )
   })
 
   it('fails closed for stale draft binding, expiry, and environment mismatch', async () => {

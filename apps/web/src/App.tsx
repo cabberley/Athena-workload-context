@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import CohortReview from './CohortReview'
 import { SupersessionRecoveryRequiredError } from './client'
-import type { CohortProposalApiPort } from './cohortTypes'
+import type { CohortDecisionApiPort, CohortProposalApiPort } from './cohortTypes'
 import type {
   AppRoute,
   CanonicalWorkloadManifest,
@@ -36,10 +36,11 @@ const concurrencyRequest = (context: WorkloadContext, reason: string): Concurren
 interface AppProps {
   client: ContextApiClientPort
   cohortClient: CohortProposalApiPort
+  decisionClient?: CohortDecisionApiPort
   initialContexts: WorkloadContext[]
 }
 
-function App({ client, cohortClient, initialContexts }: AppProps) {
+function App({ client, cohortClient, decisionClient, initialContexts }: AppProps) {
   const initial = initialContexts[0]!
   const [route, setRoute] = useState<AppRoute>('overview')
   const [contexts, setContexts] = useState(() => new Map(initialContexts.map((context) => [context.workloadId, context])))
@@ -465,6 +466,7 @@ function App({ client, cohortClient, initialContexts }: AppProps) {
               context={workloadContext}
               contextClient={client}
               cohortClient={cohortClient}
+              decisionClient={decisionClient}
               onContextChange={applyContext}
               headingRef={routeHeadingRef}
             />

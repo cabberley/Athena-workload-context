@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { axe } from 'jest-axe'
 import App from './App'
@@ -7,6 +7,11 @@ import {
   createMockCohortProposalApiClient,
   syntheticCohortBatch,
 } from './test/mockCohortClient'
+import {
+  createMockCohortDecisionApiClient,
+  createMockCohortDecisionStore,
+  type MockCohortDecisionStore,
+} from './test/mockCohortDecisionClient'
 import { createMockContextApiClient, mockAuthSession } from './test/mockClient'
 
 const proposerSession = {
@@ -15,14 +20,22 @@ const proposerSession = {
   userLabel: 'Synthetic human cohort proposer',
 }
 
-const renderCohorts = async (batch?: CohortProposalBatch) => {
+const renderCohorts = async (
+  batch?: CohortProposalBatch,
+  decisionStore: MockCohortDecisionStore = createMockCohortDecisionStore(),
+) => {
   const contextClient = createMockContextApiClient({ session: proposerSession })
   const cohortClient = createMockCohortProposalApiClient({ session: proposerSession, batch })
+  const decisionClient = createMockCohortDecisionApiClient({
+    session: proposerSession,
+    store: decisionStore,
+  })
   const initialContexts = await contextClient.loadAuthorizedWorkloads()
   const rendered = render(
     <App
       client={contextClient}
       cohortClient={cohortClient}
+      decisionClient={decisionClient}
       initialContexts={initialContexts}
     />,
   )
@@ -30,7 +43,8 @@ const renderCohorts = async (batch?: CohortProposalBatch) => {
   await user.click(screen.getByRole('button', { name: 'Cohorts' }))
   await screen.findByRole('heading', { name: /cohort proposal review/i })
   await screen.findByRole('button', { name: /worker.*1,000 members/i })
-  return { ...rendered, user, contextClient, cohortClient }
+  await screen.findByText(/loaded 3 proposals and their durable decision state/i)
+  return { ...rendered, user, contextClient, cohortClient, decisionClient, decisionStore }
 }
 
 describe('cohort proposal review', () => {
@@ -67,19 +81,25 @@ describe('cohort proposal review', () => {
     expect(screen.getAllByText(/snapshot digest/i).length).toBeGreaterThan(0)
   })
 
-  it('writes a high-confidence bounded proposal only after confirmation and never publishes', async () => {
-    const { user, contextClient } = await renderCohorts()
+  it('submits a durable atomic decision only after confirmation and never writes WC-007 directly', async () => {
+    const { user, contextClient, decisionClient } = await renderCohorts()
     const update = vi.spyOn(contextClient, 'updateDraft')
+    const decide = vi.spyOn(decisionClient, 'submitDecision')
     const validate = vi.spyOn(contextClient, 'validateDraft')
     const approveLifecycle = vi.spyOn(contextClient, 'approveDraft')
     const publish = vi.spyOn(contextClient, 'publishDraft')
 
     const approve = screen.getByRole('button', { name: /approve bounded cohort to draft/i })
+    expect(approve).toBeDisabled()
+    await user.type(
+      screen.getByLabelText(/resolution rationale/i),
+      'Approve the exact synthetic high-confidence cohort.',
+    )
     expect(approve).toBeEnabled()
     await user.click(approve)
 
     const dialog = screen.getByRole('alertdialog', { name: /confirm approve/i })
-    expect(dialog).toHaveTextContent(/exact concurrency and idempotency/i)
+    expect(dialog).toHaveTextContent(/durable decision.*atomic selector-only draft apply/i)
     expect(dialog).toHaveTextContent(/never validates, approves, or publishes/i)
     const confirm = within(dialog).getByRole('button', { name: /confirm approve/i })
     const cancel = within(dialog).getByRole('button', { name: /cancel/i })
@@ -90,24 +110,44 @@ describe('cohort proposal review', () => {
     expect(confirm).toHaveFocus()
     await user.click(confirm)
 
-    await waitFor(() => expect(update).toHaveBeenCalledOnce())
-    const request = update.mock.calls[0]![0]
+    await waitFor(() => expect(decide).toHaveBeenCalledOnce())
+    const request = decide.mock.calls[0]![0]
     expect(request).toMatchObject({
-      expectedRevision: 1,
-      expectedManifestVersion: '1.0.0',
-      expectedDigest: expect.stringMatching(/^sha256:/),
-      idempotencyKey: expect.stringMatching(/^cohort-r1-review-proposal-/),
-    })
-    expect(request.replacementManifest.roles).toHaveLength(4)
-    expect(request.replacementManifest.profiles.production!.roles).toEqual([
-      expect.objectContaining({
-        roleId: 'worker',
-        selectors: [expect.objectContaining({ maxMatches: 1000 })],
+      action: 'approve',
+      sourceDraft: expect.objectContaining({ revision: 1 }),
+      proposalIds: ['proposal-1111111111111111'],
+      rationale: 'Approve the exact synthetic high-confidence cohort.',
+      candidate: expect.objectContaining({
+        candidateId: 'review-proposal-1111111111111111',
+        publicationAllowed: false,
       }),
-    ])
+    })
+    expect(update).not.toHaveBeenCalled()
     expect(validate).not.toHaveBeenCalled()
     expect(approveLifecycle).not.toHaveBeenCalled()
     expect(publish).not.toHaveBeenCalled()
+    expect(screen.getByText(/decision-wc012-0001/i)).toBeInTheDocument()
+  })
+
+  it('keeps a full 2,000-character rationale in the decision request and out of WC-007', async () => {
+    const { user, contextClient, decisionClient, decisionStore } = await renderCohorts()
+    const decide = vi.spyOn(decisionClient, 'submitDecision')
+    const update = vi.spyOn(contextClient, 'updateDraft')
+    const rationale = 'R'.repeat(2000)
+
+    fireEvent.change(screen.getByLabelText(/resolution rationale/i), {
+      target: { value: rationale },
+    })
+    await user.click(screen.getByRole('button', { name: /approve bounded cohort to draft/i }))
+    await user.click(
+      within(screen.getByRole('alertdialog', { name: /confirm approve/i }))
+        .getByRole('button', { name: /confirm approve/i }),
+    )
+
+    await waitFor(() => expect(decide).toHaveBeenCalledOnce())
+    expect(decide.mock.calls[0]![0].rationale).toBe(rationale)
+    expect(decisionStore.records[0]?.rationale).toBe(rationale)
+    expect(update).not.toHaveBeenCalled()
   })
 
   it('blocks medium, conflicting, and cross-environment bulk approval until explicit resolution', async () => {
@@ -216,18 +256,55 @@ describe('cohort proposal review', () => {
     }))
   })
 
-  it('makes rejection confirmation explicit without fabricating persisted authority', async () => {
-    const { user, contextClient } = await renderCohorts()
+  it('persists rejection, clears cached previews, and gates approve, split, merge, and apply after reload', async () => {
+    const decisionStore = createMockCohortDecisionStore()
+    const first = await renderCohorts(undefined, decisionStore)
+    const { user, contextClient } = first
     const update = vi.spyOn(contextClient, 'updateDraft')
 
-    await user.click(screen.getByRole('button', { name: /reject proposal in this review/i }))
+    await user.click(screen.getByRole('button', { name: /web.*medium.*12 members/i }))
+    await user.type(
+      screen.getByLabelText(/resolution rationale/i),
+      'Reject the exact synthetic proposal after reviewing its cached split preview.',
+    )
+    await user.click(screen.getByRole('checkbox', { name: /explicitly resolved/i }))
+    await user.click(screen.getByRole('button', { name: /preview split/i }))
+    await user.click(
+      within(screen.getByRole('alertdialog', { name: /confirm split/i }))
+        .getByRole('button', { name: /confirm split/i }),
+    )
+    expect(await screen.findByRole('heading', { name: /split result.*api preview only/i }))
+      .toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /^reject proposal$/i }))
     const dialog = screen.getByRole('alertdialog', { name: /confirm reject/i })
-    expect(dialog).toHaveTextContent(/session-only and writes no authority/i)
+    expect(dialog).toHaveTextContent(/persists a durable rejection.*permanently blocks/i)
     await user.click(within(dialog).getByRole('button', { name: /confirm reject/i }))
 
-    expect(screen.getByText(/browser review session only/i)).toBeInTheDocument()
+    expect(await screen.findByText(/durable rejection decision-wc012-0001 recorded/i))
+      .toBeInTheDocument()
     expect(update).not.toHaveBeenCalled()
-    expect(screen.getByText(/session decision/i).parentElement).toHaveTextContent(/rejected/i)
+    expect(screen.queryByRole('heading', { name: /split result.*api preview only/i }))
+      .not.toBeInTheDocument()
+    expect(screen.getByText('Durable decision', { selector: 'dt' }).parentElement)
+      .toHaveTextContent(/rejected/i)
+    expect(screen.getByRole('button', { name: /approve bounded cohort to draft/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^reject proposal$/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /preview split/i })).toBeDisabled()
+    expect(screen.getAllByRole('checkbox', { name: /include web proposal in merge/i })[0])
+      .toBeDisabled()
+
+    first.unmount()
+    const reloaded = await renderCohorts(undefined, decisionStore)
+    await reloaded.user.click(screen.getByRole('button', { name: /web.*medium.*12 members/i }))
+
+    expect(screen.getByText('Durable decision', { selector: 'dt' }).parentElement)
+      .toHaveTextContent(/rejected/i)
+    expect(screen.getByText('decision-wc012-0001')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /approve bounded cohort to draft/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /preview split/i })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /apply preview as draft selector proposal/i }))
+      .not.toBeInTheDocument()
   })
 
   it('supports keyboard focus, responsive summaries, and WCAG automated checks', async () => {

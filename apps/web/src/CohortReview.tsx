@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import {
   applyCohortCandidateToDraft,
-  cohortDraftIdempotencyKey,
   proposalReviewCandidate,
 } from './cohortDraft'
 import type {
+  CohortDecisionApiPort,
+  CohortDecisionRecord,
   CohortDecisionState,
   CohortProposal,
   CohortProposalApiPort,
@@ -90,6 +91,65 @@ const needsResolution = (
   proposal.rejectedCandidates.some((candidate) => candidate.reasons.includes('crossEnvironment')) ||
   relevantBatchConflicts(proposal, batch).length > 0
 
+const indexDecisionRecords = (
+  records: CohortDecisionRecord[],
+  batch: CohortProposalBatch,
+): Map<string, CohortDecisionRecord> => {
+  if (records.length > batch.proposals.length) {
+    throw new Error('Decision API returned too many final decisions for the proposal batch.')
+  }
+  const result = new Map<string, CohortDecisionRecord>()
+  const proposalIds = new Set(batch.proposals.map((proposal) => proposal.proposalId))
+  records.forEach((record) => {
+    const rejected = record.action === 'reject' && record.state === 'rejected'
+    const applied = record.action !== 'reject' && record.state === 'applied'
+    if (
+      !record.decisionId ||
+      record.rationale.length < 1 ||
+      record.rationale.length > 2000 ||
+      record.rationale !== record.rationale.trim() ||
+      record.publicationAllowed !== false ||
+      record.decisionId.length > 128 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(record.decisionId) ||
+      record.decidedBy.length < 1 ||
+      record.decidedBy.length > 128 ||
+      Number.isNaN(Date.parse(record.decidedAt)) ||
+      record.proposalIds.length < 1 ||
+      new Set(record.proposalIds).size !== record.proposalIds.length ||
+      record.proposalIds.some((proposalId) => !proposalIds.has(proposalId)) ||
+      record.sourceDraft.draftId !== batch.sourceDraft.draftId ||
+      record.sourceDraft.revision !== batch.sourceDraft.revision ||
+      record.sourceDraft.manifestDigest !== batch.sourceDraft.manifestDigest ||
+      record.scope.manifestId !== batch.scope.manifestId ||
+      record.scope.manifestVersion !== batch.scope.manifestVersion ||
+      record.scope.profileId !== batch.scope.profileId ||
+      record.scope.profileType !== batch.scope.profileType ||
+      record.scope.resolvedProfileDigest !== batch.scope.resolvedProfileDigest ||
+      record.proposalSetDigest !== batch.proposalSetDigest ||
+      record.snapshotArtifactDigest !== batch.snapshot.artifactDigest ||
+      (!rejected && !applied) ||
+      (rejected && (record.candidateId !== null || record.draftResult !== null)) ||
+      (applied && (
+        !record.candidateId ||
+        record.candidateId.length > 128 ||
+        !record.draftResult ||
+        record.draftResult.draftId !== record.sourceDraft.draftId ||
+        record.draftResult.revision !== record.sourceDraft.revision + 1 ||
+        !/^sha256:[a-f0-9]{64}$/.test(record.draftResult.manifestDigest)
+      ))
+    ) {
+      throw new Error('Decision API returned state outside the exact proposal batch or authority.')
+    }
+    record.proposalIds.forEach((proposalId) => {
+      if (result.has(proposalId)) {
+        throw new Error('Decision API returned multiple final decisions for one proposal.')
+      }
+      result.set(proposalId, record)
+    })
+  })
+  return result
+}
+
 type Confirmation =
   | { action: 'approve' | 'reject' | 'split'; proposalIds: string[] }
   | { action: 'merge'; proposalIds: string[] }
@@ -99,6 +159,7 @@ interface CohortReviewProps {
   context: WorkloadContext
   contextClient: ContextApiClientPort
   cohortClient: CohortProposalApiPort
+  decisionClient?: CohortDecisionApiPort
   onContextChange: (context: WorkloadContext) => void
   headingRef: RefObject<HTMLHeadingElement>
 }
@@ -107,6 +168,7 @@ export default function CohortReview({
   context,
   contextClient,
   cohortClient,
+  decisionClient,
   onContextChange,
   headingRef,
 }: CohortReviewProps) {
@@ -120,7 +182,10 @@ export default function CohortReview({
   const [resolution, setResolution] = useState('')
   const [resolutionAcknowledged, setResolutionAcknowledged] = useState(false)
   const [mergeSelection, setMergeSelection] = useState<Set<string>>(new Set())
-  const [decisions, setDecisions] = useState<Map<string, CohortDecisionState>>(new Map())
+  const [decisions, setDecisions] = useState<Map<string, CohortDecisionRecord>>(new Map())
+  const [decisionLoadState, setDecisionLoadState] = useState<
+    'loading' | 'ready' | 'error' | 'unavailable'
+  >('loading')
   const [candidate, setCandidate] = useState<CohortReviewCandidate | null>(null)
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
   const [busy, setBusy] = useState(false)
@@ -147,10 +212,14 @@ export default function CohortReview({
     let active = true
     setBatch(null)
     setCandidate(null)
+    setDecisions(new Map())
+    setDecisionLoadState('loading')
     setSelectedProposalId(null)
     setMergeSelection(new Set())
-    if (!profile || !binding || context.draft?.state !== 'draft') {
+    const draft = context.draft
+    if (!profile || !binding || draft?.state !== 'draft') {
       setLoadState('unavailable')
+      setDecisionLoadState('unavailable')
       setStatusMessage(
         'Cohort review requires an active WC-007 draft in draft state. No proposal authority was inferred.',
       )
@@ -163,6 +232,7 @@ export default function CohortReview({
       !cohortClient.auth.authorizedWorkloadIds.includes(context.workloadId)
     ) {
       setLoadState('error')
+      setDecisionLoadState('error')
       setStatusMessage('Context and cohort API identities or workload scopes do not match.')
       return () => {
         active = false
@@ -170,31 +240,76 @@ export default function CohortReview({
     }
     setLoadState('loading')
     setStatusMessage('Loading exact draft-bound cohort proposals.')
-    void cohortClient.loadProposalBatch({
-      workloadId: context.workloadId,
-      manifestVersion: context.draft.manifest.manifestVersion,
-      profileId: profile.profileId,
-      sourceDraft: binding,
-    }).then((loaded) => {
-      if (!active) return
-      setBatch(loaded)
-      setSelectedProposalId(loaded.proposals[0]?.proposalId ?? null)
-      setLoadState('ready')
-      setStatusMessage(
-        loaded.proposals.length
-          ? `Loaded ${loaded.proposals.length} non-authoritative proposals for explicit human review.`
-          : 'The cohort API returned no proposals for this exact draft and profile.',
-      )
-    }).catch((error: unknown) => {
-      if (!active) return
-      setLoadState('error')
-      setStatusMessage(errorMessage(error, 'Unable to load cohort proposals.'))
-    })
+    void (async () => {
+      let proposalsLoaded = false
+      try {
+        const loaded = await cohortClient.loadProposalBatch({
+          workloadId: context.workloadId,
+          manifestVersion: draft.manifest.manifestVersion,
+          profileId: profile.profileId,
+          sourceDraft: binding,
+        })
+        proposalsLoaded = true
+        if (!active) return
+        setBatch(loaded)
+        setSelectedProposalId(loaded.proposals[0]?.proposalId ?? null)
+        setLoadState('ready')
+        if (!decisionClient) {
+          setDecisionLoadState('unavailable')
+          setStatusMessage(
+            'Proposals loaded for review. Durable decisions and draft apply are blocked until ' +
+            'the issue #34 decision API is merged.',
+          )
+          return
+        }
+        if (
+          decisionClient.auth.actorId !== contextClient.auth.actorId ||
+          decisionClient.auth.actorId !== cohortClient.auth.actorId ||
+          !decisionClient.auth.authorizedWorkloadIds.includes(context.workloadId)
+        ) {
+          setDecisionLoadState('error')
+          setStatusMessage(
+            'Proposal and decision API identities or workload scopes do not match. ' +
+            'All cohort actions are blocked.',
+          )
+          return
+        }
+        const loadedDecisions = await decisionClient.loadDecisions({
+          workloadId: context.workloadId,
+          manifestVersion: draft.manifest.manifestVersion,
+          profileId: profile.profileId,
+          sourceDraft: binding,
+          scope: loaded.scope,
+          proposalIds: loaded.proposals.map((proposal) => proposal.proposalId),
+          proposalSetDigest: loaded.proposalSetDigest,
+          snapshotArtifactDigest: loaded.snapshot.artifactDigest,
+        })
+        if (!active) return
+        setDecisions(indexDecisionRecords(loadedDecisions, loaded))
+        setDecisionLoadState('ready')
+        setStatusMessage(
+          loaded.proposals.length
+            ? `Loaded ${loaded.proposals.length} proposals and their durable decision state.`
+            : 'The cohort API returned no proposals for this exact draft and profile.',
+        )
+      } catch (error) {
+        if (!active) return
+        if (proposalsLoaded) {
+          setDecisionLoadState('error')
+          setStatusMessage(errorMessage(error, 'Unable to load durable cohort decisions.'))
+        } else {
+          setLoadState('error')
+          setDecisionLoadState('error')
+          setStatusMessage(errorMessage(error, 'Unable to load cohort proposals.'))
+        }
+      }
+    })()
     return () => {
       active = false
     }
   }, [
     cohortClient,
+    decisionClient,
     binding,
     context.workloadId,
     context.draft,
@@ -226,14 +341,50 @@ export default function CohortReview({
     rejectedPage * REJECTED_PAGE_SIZE,
     (rejectedPage + 1) * REJECTED_PAGE_SIZE,
   ) ?? []
-  const isHuman = contextClient.auth.kind === 'human' && cohortClient.auth.kind === 'human'
-  const canWriteDraft = isHuman && contextClient.auth.role === 'proposer'
+  const isHuman =
+    contextClient.auth.kind === 'human' &&
+    cohortClient.auth.kind === 'human' &&
+    (!decisionClient || decisionClient.auth.kind === 'human')
+  const canSubmitDecision =
+    isHuman &&
+    contextClient.auth.role === 'proposer' &&
+    decisionLoadState === 'ready' &&
+    decisionClient !== undefined
   const selectedNeedsResolution = Boolean(selected && batch && needsResolution(selected, batch))
+  const rationaleReady =
+    resolution.trim().length >= 1 &&
+    resolution.trim().length <= 2000
   const resolutionReady =
     resolution.trim().length >= 12 &&
     resolution.trim().length <= 2000 &&
     resolutionAcknowledged
-  const selectedDecision = selected ? decisions.get(selected.proposalId) ?? 'pending' : 'pending'
+  const selectedDecisionRecord = selected ? decisions.get(selected.proposalId) : undefined
+  const selectedDecision: CohortDecisionState = selectedDecisionRecord?.state ?? 'pending'
+  const rejectedProposalIds = useMemo(
+    () => new Set(
+      [...decisions.entries()]
+        .filter(([, decision]) => decision.state === 'rejected')
+        .map(([proposalId]) => proposalId),
+    ),
+    [decisions],
+  )
+
+  useEffect(() => {
+    if (!rejectedProposalIds.size) return
+    setMergeSelection((current) =>
+      new Set([...current].filter((proposalId) => !rejectedProposalIds.has(proposalId))),
+    )
+    setCandidate((current) =>
+      current?.sourceProposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+        ? null
+        : current,
+    )
+    setConfirmation((current) =>
+      current?.proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+        ? null
+        : current,
+    )
+  }, [rejectedProposalIds])
 
   const selectProposal = (proposalId: string): void => {
     setSelectedProposalId(proposalId)
@@ -246,6 +397,10 @@ export default function CohortReview({
   }
 
   const updateMergeSelection = (proposalId: string, checked: boolean): void => {
+    if (checked && (decisionLoadState !== 'ready' || rejectedProposalIds.has(proposalId))) {
+      setStatusMessage('Rejected or unverified proposals cannot be selected for merge.')
+      return
+    }
     setMergeSelection((current) => {
       const next = new Set(current)
       if (checked) next.add(proposalId)
@@ -259,6 +414,14 @@ export default function CohortReview({
     proposalIds: string[],
     reviewCandidate?: CohortReviewCandidate,
   ): void => {
+    if (
+      decisionLoadState !== 'ready' ||
+      proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+    ) {
+      setCandidate(null)
+      setStatusMessage('Rejected or unverified proposals cannot continue to another cohort action.')
+      return
+    }
     confirmationReturnFocusRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null
     if (action === 'apply' && reviewCandidate) {
@@ -277,7 +440,15 @@ export default function CohortReview({
     action: 'split' | 'merge',
     proposalIds: string[],
   ): Promise<void> => {
-    if (!batch || !binding || !profile || !resolutionReady) {
+    if (
+      !batch ||
+      !binding ||
+      !profile ||
+      !resolutionReady ||
+      decisionLoadState !== 'ready' ||
+      proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+    ) {
+      setCandidate(null)
       setStatusMessage('Split and merge require an acknowledged resolution rationale.')
       return
     }
@@ -316,51 +487,87 @@ export default function CohortReview({
     }
   }
 
-  const applyCandidate = async (reviewCandidate: CohortReviewCandidate): Promise<void> => {
-    if (!canWriteDraft || !context.draft || !batch) {
-      setStatusMessage('A human proposer with WC-007 update permission is required to write a draft.')
+  const submitDecision = async (
+    action: 'approve' | 'reject' | 'split' | 'merge',
+    proposalIds: string[],
+    reviewCandidate: CohortReviewCandidate | null,
+  ): Promise<void> => {
+    if (!canSubmitDecision || !decisionClient || !context.draft || !batch) {
+      setCandidate(null)
+      setStatusMessage(
+        'A verified human proposer and the durable cohort decision API are required for this action.',
+      )
+      return
+    }
+    if (
+      proposalIds.some((proposalId) => decisions.has(proposalId)) ||
+      (action === 'reject' && reviewCandidate !== null) ||
+      (action !== 'reject' && reviewCandidate === null)
+    ) {
+      setCandidate(null)
+      setStatusMessage('A final cohort decision already blocks this proposal or candidate.')
+      return
+    }
+    const rationale = reviewCandidate?.resolution.trim() ?? resolution.trim()
+    if (rationale.length < 1 || rationale.length > 2000) {
+      setStatusMessage('A durable cohort decision requires a rationale of 1 to 2,000 characters.')
       return
     }
     setBusy(true)
     try {
-      const replacementManifest = applyCohortCandidateToDraft(
-        context,
-        reviewCandidate,
-        batch,
-        new Date(),
-      )
-      await contextClient.updateDraft({
-        workloadId: context.workloadId,
-        draftId: context.draft.draftId,
-        expectedRevision: context.draft.revision,
-        expectedManifestVersion: context.draft.manifest.manifestVersion,
-        expectedDigest: context.draft.manifestDigest,
-        replacementManifest,
-        reason: (
-          `Human ${reviewCandidate.action} review wrote bounded selector proposal(s) from ` +
-          `${reviewCandidate.sourceProposalIds.join(', ')}; snapshot ` +
-          `${reviewCandidate.snapshot.artifactDigest}. Draft only; publication was not requested. ` +
-          reviewCandidate.resolution
-        ).slice(0, 2000),
-        idempotencyKey: cohortDraftIdempotencyKey(
+      if (reviewCandidate) {
+        void applyCohortCandidateToDraft(
+          context,
           reviewCandidate,
-          context.draft.revision,
-        ),
+          batch,
+          new Date(),
+        )
+      }
+      const decision = await decisionClient.submitDecision({
+        workloadId: context.workloadId,
+        manifestVersion: context.draft.manifest.manifestVersion,
+        profileId: batch.scope.profileId,
+        sourceDraft: batch.sourceDraft,
+        scope: batch.scope,
+        proposalIds,
+        proposalSetDigest: batch.proposalSetDigest,
+        snapshotArtifactDigest: batch.snapshot.artifactDigest,
+        action,
+        candidate: reviewCandidate,
+        rationale,
       })
-      const refreshed = await contextClient.loadWorkloadContext(context.workloadId)
-      onContextChange(refreshed)
+      const indexed = indexDecisionRecords([decision], batch)
+      if (
+        decision.action !== action ||
+        decision.rationale !== rationale ||
+        JSON.stringify(decision.proposalIds) !== JSON.stringify(proposalIds)
+      ) {
+        throw new Error('Decision API returned a different durable decision.')
+      }
       setDecisions((current) => {
         const next = new Map(current)
-        reviewCandidate.sourceProposalIds.forEach((proposalId) => next.set(proposalId, 'drafted'))
+        indexed.forEach((record, proposalId) => next.set(proposalId, record))
         return next
       })
       setCandidate(null)
-      setStatusMessage(
-        `Bounded ${reviewCandidate.action} selector proposal saved to WC-007 draft revision ` +
-        `${refreshed.draft?.revision ?? 'unknown'}. Nothing was validated, approved, or published.`,
+      setMergeSelection((current) =>
+        new Set([...current].filter((proposalId) => !proposalIds.includes(proposalId))),
       )
+      if (decision.state === 'applied') {
+        const refreshed = await contextClient.loadWorkloadContext(context.workloadId)
+        onContextChange(refreshed)
+        setStatusMessage(
+          `Durable decision ${decision.decisionId} atomically applied bounded selectors to draft ` +
+          `revision ${decision.draftResult?.revision ?? 'unknown'}. Nothing was published.`,
+        )
+      } else {
+        setStatusMessage(
+          `Durable rejection ${decision.decisionId} recorded. The proposal is blocked from later ` +
+          'approve, split, merge, or apply actions.',
+        )
+      }
     } catch (error) {
-      setStatusMessage(errorMessage(error, 'The draft selector update failed closed.'))
+      setStatusMessage(errorMessage(error, 'The durable cohort decision failed closed.'))
     } finally {
       setBusy(false)
     }
@@ -371,14 +578,7 @@ export default function CohortReview({
     if (!pending || !batch) return
     closeConfirmation()
     if (pending.action === 'reject') {
-      setDecisions((current) => {
-        const next = new Map(current)
-        pending.proposalIds.forEach((proposalId) => next.set(proposalId, 'rejected'))
-        return next
-      })
-      setStatusMessage(
-        'Proposal rejected for this browser review session only. No authoritative or draft state was written.',
-      )
+      await submitDecision('reject', pending.proposalIds, null)
       return
     }
     if (pending.action === 'split' || pending.action === 'merge') {
@@ -386,7 +586,11 @@ export default function CohortReview({
       return
     }
     if (pending.action === 'apply') {
-      await applyCandidate(pending.candidate)
+      await submitDecision(
+        pending.candidate.action,
+        pending.proposalIds,
+        pending.candidate,
+      )
       return
     }
     const proposal = batch.proposals.find(
@@ -397,7 +601,9 @@ export default function CohortReview({
       return
     }
     try {
-      await applyCandidate(
+      await submitDecision(
+        'approve',
+        pending.proposalIds,
         proposalReviewCandidate(proposal, batch, resolution.trim()),
       )
     } catch (error) {
@@ -410,8 +616,9 @@ export default function CohortReview({
   ) ?? []
   const mergeRoleCount = new Set(mergeCandidates.map((proposal) => proposal.role.roleId)).size
   const canMerge =
-    isHuman &&
+    canSubmitDecision &&
     mergeCandidates.length >= 2 &&
+    mergeCandidates.every((proposal) => !rejectedProposalIds.has(proposal.proposalId)) &&
     mergeRoleCount === 1 &&
     resolutionReady
 
@@ -457,12 +664,13 @@ export default function CohortReview({
         <div><dt>Snapshot digest</dt><dd className="digest-value">{batch.snapshot.artifactDigest}</dd></div>
         <div><dt>Proposal set digest</dt><dd className="digest-value">{batch.proposalSetDigest}</dd></div>
         <div><dt>Draft binding</dt><dd>{batch.sourceDraft.draftId} · revision {batch.sourceDraft.revision}</dd></div>
+        <div><dt>Decision API</dt><dd>{displayToken(decisionLoadState)}</dd></div>
         <div><dt>Publication</dt><dd>Not allowed by proposal contract</dd></div>
       </dl>
 
       <p className="relationship-legend">
         <strong>Observed:</strong> bounded evidence summaries. <strong>Inferred:</strong> cohort membership.
-        {' '}<strong>Declared:</strong> selector changes only after a confirmed WC-007 draft update.
+        {' '}<strong>Declared:</strong> selectors change only through a durable, atomic decision.
         {' '}<strong>Exception:</strong> conflicts require an explicit resolution.
       </p>
 
@@ -471,7 +679,8 @@ export default function CohortReview({
           <h3>Proposals</h3>
           <ul className="proposal-list">
             {batch.proposals.map((proposal) => {
-              const decision = decisions.get(proposal.proposalId) ?? 'pending'
+              const decision = decisions.get(proposal.proposalId)?.state ?? 'pending'
+              const rejected = decision === 'rejected'
               return (
                 <li key={proposal.proposalId}>
                   <button
@@ -496,7 +705,7 @@ export default function CohortReview({
                       checked={mergeSelection.has(proposal.proposalId)}
                       onChange={(event) =>
                         updateMergeSelection(proposal.proposalId, event.target.checked)}
-                      disabled={!isHuman || busy}
+                      disabled={!canSubmitDecision || busy || rejected}
                     />
                     Include {proposal.role.roleId} proposal in merge
                   </label>
@@ -539,7 +748,11 @@ export default function CohortReview({
               <div><dt>Dissent</dt><dd>{selected.dissent.length.toLocaleString()}</dd></div>
               <div><dt>Conflicts</dt><dd>{selected.conflicts.length + relevantBatchConflicts(selected, batch).length}</dd></div>
               <div><dt>Rejected candidates</dt><dd>{selected.rejectedCandidates.length.toLocaleString()}</dd></div>
-              <div><dt>Session decision</dt><dd>{displayToken(selectedDecision)}</dd></div>
+              <div><dt>Durable decision</dt><dd>{displayToken(selectedDecision)}</dd></div>
+              <div>
+                <dt>Decision ID</dt>
+                <dd>{selectedDecisionRecord?.decisionId ?? 'Not recorded'}</dd>
+              </div>
             </dl>
 
             <div className="selector-preview">
@@ -709,20 +922,25 @@ export default function CohortReview({
                   id="cohort-resolution"
                   value={resolution}
                   maxLength={2000}
-                  onChange={(event) => setResolution(event.target.value)}
-                  disabled={!isHuman || busy}
+                  onChange={(event) => {
+                    setResolution(event.target.value)
+                    setCandidate(null)
+                  }}
+                  disabled={!canSubmitDecision || busy}
                   aria-describedby="cohort-resolution-help"
                 />
               </label>
               <p id="cohort-resolution-help" className="field-help">
-                Required for medium, low, conflicting, cross-environment, split, or merge review.
+                A rationale of 1–2,000 characters is stored in the durable decision record.
+                At least 12 characters and acknowledgement are required for medium, low,
+                conflicting, cross-environment, split, or merge review.
               </p>
               <label className="review-confirmation">
                 <input
                   type="checkbox"
                   checked={resolutionAcknowledged}
                   onChange={(event) => setResolutionAcknowledged(event.target.checked)}
-                  disabled={!isHuman || busy}
+                  disabled={!canSubmitDecision || busy}
                 />
                 I explicitly resolved the listed dissent, conflicts, and environment boundary for
                 this exact snapshot and proposal digest.
@@ -735,7 +953,8 @@ export default function CohortReview({
                 className="primary-action"
                 disabled={
                   busy ||
-                  !canWriteDraft ||
+                  !canSubmitDecision ||
+                  !rationaleReady ||
                   !selected.selectorPreview ||
                   selectedDecision !== 'pending' ||
                   (selectedNeedsResolution && !resolutionReady)
@@ -747,24 +966,35 @@ export default function CohortReview({
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!isHuman || busy || selectedDecision !== 'pending'}
+                disabled={
+                  !canSubmitDecision ||
+                  busy ||
+                  !rationaleReady ||
+                  selectedDecision !== 'pending'
+                }
                 onClick={() => openConfirmation('reject', [selected.proposalId])}
               >
-                Reject proposal in this review
+                Reject proposal
               </button>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!isHuman || busy || !resolutionReady}
+                disabled={
+                  !canSubmitDecision ||
+                  busy ||
+                  selectedDecision !== 'pending' ||
+                  !resolutionReady
+                }
                 onClick={() => openConfirmation('split', [selected.proposalId])}
               >
                 Preview split
               </button>
             </div>
-            {!canWriteDraft && (
+            {!canSubmitDecision && (
               <p className="field-help" role="status">
-                Draft approval requires a human session with the WC-007 proposer role. Current role:
-                {' '}{contextClient.auth.role}.
+                Durable cohort decisions require a human WC-007 proposer and the merged issue #34
+                decision API. Current role: {contextClient.auth.role}; decision API:
+                {' '}{displayToken(decisionLoadState)}.
               </p>
             )}
 
@@ -794,7 +1024,11 @@ export default function CohortReview({
                 <button
                   type="button"
                   className="primary-action"
-                  disabled={!canWriteDraft || busy}
+                  disabled={
+                    !canSubmitDecision ||
+                    busy ||
+                    candidate.sourceProposalIds.some((proposalId) => decisions.has(proposalId))
+                  }
                   onClick={() => openConfirmation(
                     'apply',
                     candidate.sourceProposalIds,
@@ -846,10 +1080,10 @@ export default function CohortReview({
               {' '}{displayEnvironment(batch.scope.profileType)}, manifest {batch.scope.manifestVersion},
               snapshot <span className="digest-value">{batch.snapshot.artifactDigest}</span>.
               {confirmation.action === 'reject'
-                ? ' Rejection is session-only and writes no authority.'
+                ? ' This persists a durable rejection and permanently blocks later actions for this proposal set.'
                 : confirmation.action === 'split' || confirmation.action === 'merge'
                   ? ' This requests a non-authoritative selector preview and does not change the manifest.'
-                  : ' This writes only bounded selectors to the current WC-007 draft with exact concurrency and idempotency. It never validates, approves, or publishes.'}
+                  : ' This records a durable decision and requests one atomic selector-only draft apply. The full rationale stays in the decision record; it never validates, approves, or publishes.'}
             </p>
             <div className="confirmation-actions">
               <button

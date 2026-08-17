@@ -89,18 +89,30 @@ band, support, dissent, conflicts, rejected candidates, selector preview, and di
 are filterable and paginated 25 at a time; there is no per-resource editor. Medium, low,
 conflicting, cross-environment, split, and merge actions require a bounded rationale and explicit
 acknowledgement. Direct approval requires an existing bounded selector preview; low or conflicting
-proposals without one may still request a server-generated split preview. Rejection is a visibly
-non-persisted session decision and never fabricates server authority.
+proposals without one may still request a server-generated split preview. A rejection is accepted
+only as a visible durable decision; local session-only rejection is not treated as authority.
 
-A confirmed cohort approval is available only to a verified human `proposer`. It calls WC-007
-`PUT /v1/drafts/{draft_id}` with the exact revision/version/digest and a stable idempotency key,
-adding only profile-scoped bounded role selectors. The cohort flow never calls validate, lifecycle
-approve, publish, or supersede. Before the draft update, the browser verifies that selector-preview
-members form a normalized, duplicate-free, disjoint union exactly equal to the source proposal
-members, with exact per-role member counts and `maxMatches` bounds.
+Final decision persistence and atomic draft apply are tracked by
+[issue #34](https://github.com/cabberley/Athena-workload-context/issues/34). Until that authenticated
+contract merges, production composition has no decision adapter and fails closed: reject, approve,
+split, merge, and apply controls are disabled rather than fabricating durable state. A narrow typed
+decision port and explicit in-memory adapter exist only for UI tests.
+
+The decision flow sends the complete bounded 1–2,000 character rationale to the durable decision
+record. Context Studio never concatenates that rationale or a proposal list into a WC-007
+`ReplaceDraftCommand.reason`, and it never calls WC-007 directly for cohort apply. The merged
+decision service must atomically add only profile-scoped bounded role selectors and keep the
+WC-007 reason at 500 characters or fewer with its durable decision ID. The cohort flow never calls
+validate, lifecycle approve, publish, or supersede.
+
+Before submitting an apply decision, the browser verifies that selector-preview members form a
+normalized, duplicate-free, disjoint union exactly equal to the source proposal members, with exact
+per-role member counts and `maxMatches` bounds.
 
 The browser also validates that every split/merge response from the merged route is the exact
 normalized source-member union before it can reach the WC-007 draft boundary.
+Persisted rejection immediately clears cached previews and disables approve, split, merge, and
+apply; decision state is reloaded for the exact draft, proposal-set, and snapshot binding.
 
 ## Local validation
 
