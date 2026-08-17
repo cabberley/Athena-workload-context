@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,7 @@ from athena_context.api import (
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
     PublishedContextSelection,
+    ResolvedPublishedContext,
     Wc008DeploymentOutputAssertion,
 )
 from athena_context.api.domain import Supersession
@@ -31,6 +32,7 @@ from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.contracts import (
     canonicalize_json,
     compute_artifact_digest,
+    resolve_manifest_profile,
 )
 from wc013_support import (
     APPROVER,
@@ -88,7 +90,7 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
         AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL
     ]
     assert harness.snapshot_signer.calls == 1
-    assert harness.context_resolver.calls == 1
+    assert harness.context_resolver.calls == 2
     assert harness.store.publication_count == 1
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
     assert result.publication.approval_decision_id == harness.approval.decision_id
@@ -170,6 +172,133 @@ def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None
     assert {
         finding.clause_id: finding.verdict for finding in result.findings
     } == EXPECTED_VERDICTS
+
+
+def test_approval_expiry_during_collection_aborts_atomic_publication() -> None:
+    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        approval_expires_at=CURRENT_NOW + timedelta(seconds=1),
+    )
+    idempotency_key = "wc013-approval-expiry-race"
+
+    with pytest.raises(
+        DemoEvaluationApprovalError,
+        match="not active",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    assert harness.context_resolver.calls == 2
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_supersession_during_collection_aborts_atomic_publication() -> None:
+    harness = build_harness()
+    resolver = harness.context_resolver
+
+    class SupersedingResolver:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(
+            self,
+            selection: PublishedContextSelection,
+            *,
+            as_of: datetime,
+        ) -> ResolvedPublishedContext:
+            self.calls += 1
+            if self.calls == 2:
+                published = resolver.view.published
+                resolver.view = resolver.view.model_copy(
+                    update={
+                        "supersession": Supersession(
+                            manifest_id=published.manifest_id,
+                            superseded_version=published.manifest_version,
+                            replacement_version="9.9.9",
+                            superseded_by=PUBLISHER,
+                            superseded_at=published.published_at,
+                            reason="A human-authorized replacement won the race",
+                        )
+                    }
+                )
+            return resolver.resolve(selection, as_of=as_of)
+
+    mutable_resolver = SupersedingResolver()
+    harness.service._context_resolver = mutable_resolver  # type: ignore[attr-defined]
+    idempotency_key = "wc013-supersession-race"
+
+    with pytest.raises(EvaluationFailedClosedError, match="superseded"):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert mutable_resolver.calls == 2
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_inherited_parent_override_expiry_is_canonically_reresolved_at_commit() -> None:
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        override_expires_at=CURRENT_NOW + timedelta(seconds=1),
+        production_extends_development=True,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+    )
+    published_manifest = harness.context_resolver.view.published.manifest
+    initially_resolved = resolve_manifest_profile(
+        published_manifest,
+        "production",
+        as_of=CURRENT_NOW,
+    )
+    parent = published_manifest.profiles["development"]
+
+    assert initially_resolved.inheritance_chain == [
+        "development",
+        "production",
+    ]
+    assert parent.weakening_overrides
+    assert all(
+        "production" not in override.profiles
+        for override in parent.weakening_overrides
+    )
+
+    idempotency_key = "wc013-inherited-override-expiry-race"
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="inactive governance",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.context_resolver.calls == 2
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
 
 
 @pytest.mark.parametrize(

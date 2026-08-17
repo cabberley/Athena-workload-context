@@ -21,13 +21,14 @@ from athena_context.api.errors import (
 from athena_context.api.evaluation_context import (
     build_resource_evidence_context,
     make_resource_snapshot_context_verifier,
-    require_active_manifest_governance,
+    resolve_active_manifest_profile,
 )
 from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
     PublishedContextSelection,
+    ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     build_demo_evaluation_result,
@@ -151,54 +152,9 @@ class DemoEvaluationService:
             )
         self._validate_approval(actor, command, approval, as_of=as_of)
 
-        try:
-            resolved_context = self._context_resolver.resolve(
-                PublishedContextSelection(
-                    manifest_id=command.manifest_id,
-                    manifest_version=command.manifest_version,
-                    profile_id=command.profile_id,
-                ),
-                as_of=as_of,
-            )
-            published_view = resolved_context.view
-            if published_view.supersession is not None:
-                raise AthenaValidationError(
-                    "superseded context cannot authorize evaluation"
-                )
-            require_active_manifest_governance(
-                published_view.published.manifest,
-                resolved_context.profile,
-                as_of=as_of,
-            )
-        except (
-            AmbiguousLookupError,
-            AthenaValidationError,
-            ResourceNotFoundError,
-            ValueError,
-        ) as exc:
-            raise EvaluationFailedClosedError(
-                "published context/profile is missing, ambiguous, a superseded "
-                "context, or has inactive governance"
-            ) from exc
-        published = published_view.published
+        resolved_context = self._resolve_published_context(command, as_of=as_of)
+        self._validate_context_binding(command, approval, resolved_context)
         profile = resolved_context.profile
-        if (
-            published.manifest_id != command.manifest_id
-            or published.manifest_version != command.manifest_version
-            or published.manifest_digest != command.expected_manifest_digest
-            or published.manifest_digest != approval.manifest_digest
-            or profile.manifest_id != command.manifest_id
-            or profile.manifest_version != command.manifest_version
-            or profile.profile_id.casefold() != command.profile_id.casefold()
-        ):
-            raise EvaluationFailedClosedError(
-                "resolved published context/profile does not match the approved "
-                "immutable selection"
-            )
-        if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
-            raise EvaluationFailedClosedError(
-                "resolved profile digest does not match the requested authoritative context"
-            )
 
         collected = self._collect(command)
         attested_at = self._now()
@@ -226,16 +182,6 @@ class DemoEvaluationService:
         published_at = self._now()
         if published_at >= snapshot.expires_at:
             raise EvaluationFailedClosedError("snapshot became stale before publication")
-        try:
-            require_active_manifest_governance(
-                published.manifest,
-                profile,
-                as_of=published_at,
-            )
-        except AthenaValidationError as exc:
-            raise EvaluationFailedClosedError(
-                "manifest governance expired before snapshot publication"
-            ) from exc
         publication = build_authorized_publication(
             snapshot=snapshot,
             approval=approval,
@@ -308,23 +254,136 @@ class DemoEvaluationService:
             raise EvaluationFailedClosedError(
                 "successful evidence publication requires a validated source envelope"
             )
-        self._artifact_store.commit(
-            StoredEvaluation(
-                actor_id=actor.actor_id,
-                idempotency_key=idempotency_key,
-                request_digest=request_digest,
-                snapshot_id=snapshot.snapshot_id,
-                result_json=result.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ),
-                snapshot_json=snapshot.canonical_json(),
-                publication_json=publication.model_dump_json(exclude_none=True),
-                envelope_attempt_id=collected.collector_attempt.attempt_id,
-                envelope=envelope,
-            )
+        stored = StoredEvaluation(
+            actor_id=actor.actor_id,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            snapshot_id=snapshot.snapshot_id,
+            result_json=result.model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+            ),
+            snapshot_json=snapshot.canonical_json(),
+            publication_json=publication.model_dump_json(exclude_none=True),
+            envelope_attempt_id=collected.collector_attempt.attempt_id,
+            envelope=envelope,
         )
+        self._revalidate_commit_authority(
+            actor,
+            command,
+            expected_approval=approval,
+            expected_context=resolved_context,
+            as_of=published_at,
+        )
+        self._artifact_store.commit(stored)
         return result
+
+    def _resolve_published_context(
+        self,
+        command: DemoEvaluationCommand,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext:
+        try:
+            resolved = self._context_resolver.resolve(
+                PublishedContextSelection(
+                    manifest_id=command.manifest_id,
+                    manifest_version=command.manifest_version,
+                    profile_id=command.profile_id,
+                ),
+                as_of=as_of,
+            )
+            if resolved.view.supersession is not None:
+                raise AthenaValidationError(
+                    "superseded context cannot authorize evaluation"
+                )
+            canonical_profile = resolve_active_manifest_profile(
+                resolved.view.published.manifest,
+                command.profile_id,
+                as_of=as_of,
+            )
+            if canonical_profile != resolved.profile:
+                raise AthenaValidationError(
+                    "trusted resolver profile does not match canonical resolution"
+                )
+            return ResolvedPublishedContext(
+                view=resolved.view,
+                profile=canonical_profile,
+            )
+        except (
+            AmbiguousLookupError,
+            AthenaValidationError,
+            ResourceNotFoundError,
+            ValueError,
+        ) as exc:
+            raise EvaluationFailedClosedError(
+                "published context/profile is missing, ambiguous, a superseded "
+                "context, or has inactive governance"
+            ) from exc
+
+    @staticmethod
+    def _validate_context_binding(
+        command: DemoEvaluationCommand,
+        approval: DemoEvaluationApproval,
+        context: ResolvedPublishedContext,
+    ) -> None:
+        published = context.view.published
+        profile = context.profile
+        if (
+            published.manifest_id != command.manifest_id
+            or published.manifest_version != command.manifest_version
+            or published.manifest_digest != command.expected_manifest_digest
+            or published.manifest_digest != approval.manifest_digest
+            or profile.manifest_id != command.manifest_id
+            or profile.manifest_version != command.manifest_version
+            or profile.profile_id.casefold() != command.profile_id.casefold()
+        ):
+            raise EvaluationFailedClosedError(
+                "resolved published context/profile does not match the approved "
+                "immutable selection"
+            )
+        if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
+            raise EvaluationFailedClosedError(
+                "resolved profile digest does not match the requested authoritative context"
+            )
+
+    def _revalidate_commit_authority(
+        self,
+        actor: Actor,
+        command: DemoEvaluationCommand,
+        *,
+        expected_approval: DemoEvaluationApproval,
+        expected_context: ResolvedPublishedContext,
+        as_of: datetime,
+    ) -> None:
+        self._authorization.require(actor, Permission.PUBLISH, command.manifest_id)
+        current_approval = self._approval_resolver.resolve(
+            command.approval_decision_id
+        )
+        current_context = self._resolve_published_context(command, as_of=as_of)
+        if current_approval is None:
+            raise DemoEvaluationApprovalError(
+                "trusted demo evaluation approval disappeared before publication"
+            )
+        self._validate_approval(
+            actor,
+            command,
+            current_approval,
+            as_of=as_of,
+        )
+        self._validate_context_binding(
+            command,
+            current_approval,
+            current_context,
+        )
+        if current_approval != expected_approval:
+            raise DemoEvaluationApprovalError(
+                "demo evaluation approval changed before publication"
+            )
+        if current_context != expected_context:
+            raise EvaluationFailedClosedError(
+                "published manifest or resolved profile changed before publication"
+            )
 
     def _collect(self, command: DemoEvaluationCommand) -> CollectedEvidence:
         assertion = self._deployment_configuration.assertion

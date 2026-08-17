@@ -552,6 +552,7 @@ def build_current_synthetic_manifest(
     as_of: datetime = CURRENT_NOW,
     override_expires_at: datetime | None = None,
     risk_acceptance_expires_at: datetime | None = None,
+    production_extends_development: bool = False,
 ) -> CanonicalWorkloadManifest:
     """Build a new test version; only WC-007 humans may publish it."""
 
@@ -590,6 +591,8 @@ def build_current_synthetic_manifest(
         for acceptance in profile["riskAcceptances"]:
             acceptance["acceptedAt"] = risk_expiry - timedelta(days=60)
             acceptance["expiresAt"] = risk_expiry
+    if production_extends_development:
+        payload["profiles"]["production"]["extends"] = "development"
     return CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
@@ -614,6 +617,7 @@ class DemoHarness:
     context_resolver: LifecycleContextResolver
     approval: DemoEvaluationApproval
     deployment_configuration: VerifiedWc008DeploymentConfiguration
+    clock: StepClock
 
 
 def deployment_assertion(
@@ -696,6 +700,7 @@ def build_harness(
     as_of: datetime = NOW,
     manifest: CanonicalWorkloadManifest | None = None,
     profile_resolution_as_of: datetime | None = None,
+    approval_expires_at: datetime | None = None,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -741,7 +746,7 @@ def build_harness(
         status="authorized",
         approved_by=APPROVER,
         approved_at=as_of - timedelta(minutes=5),
-        expires_at=as_of + timedelta(hours=1),
+        expires_at=approval_expires_at or (as_of + timedelta(hours=1)),
         manifest_id=published_manifest.manifest_id,
         manifest_version=published_manifest.manifest_version,
         manifest_digest=published_manifest.compatibility.artifact_digest,
@@ -804,6 +809,7 @@ def build_harness(
         context_resolver=context_resolver,
         approval=approval,
         deployment_configuration=trusted_configuration,
+        clock=clock,
     )
 
 

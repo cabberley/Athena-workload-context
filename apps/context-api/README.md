@@ -42,6 +42,11 @@ The integration composes the merged components without introducing direct Azure 
   requires every applicable weakening override and every resolved risk acceptance to be approved
   and active at the trusted evaluation time before MCP collection. The service never renews,
   edits, approves, or publishes a manifest on an agent's behalf.
+- Immediately before the atomic artifact-store commit, the service re-resolves the exact WC-007
+  manifest/version/profile and approval at `publishedAt`, canonically resolves the full profile
+  inheritance chain again, rechecks publisher authority, and requires identities and digests to
+  equal the initial decisions. Approval expiry, inherited override expiry, supersession, or
+  authorization change during collection leaves no receipt, snapshot, or publication.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
   RS256 attestation; production composition must back it with the configured versioned Key Vault
   key and managed identity rather than key material in configuration.

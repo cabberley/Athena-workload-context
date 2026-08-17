@@ -20,6 +20,7 @@ from athena_context.contracts import (
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
     compute_artifact_digest,
+    resolve_manifest_profile,
     validate_resolved_manifest_profile,
     verified_snapshot_context_verifier,
 )
@@ -36,7 +37,7 @@ def require_active_manifest_governance(
     *,
     as_of: datetime,
 ) -> None:
-    """Require every selected override and risk decision to be active now."""
+    """Validate a canonically resolved profile and every resolved risk decision."""
 
     validate_resolved_manifest_profile(
         profile,
@@ -50,27 +51,6 @@ def require_active_manifest_governance(
         raise AthenaValidationError(
             "resolved profile does not belong to the published manifest"
         )
-    selected_profile = _normalized(profile.profile_id)
-    profiles = {_normalized(item.profile_id): item for item in manifest.profiles.values()}
-    for profile_ref in profile.inheritance_chain:
-        source = profiles.get(_normalized(profile_ref))
-        if source is None:
-            raise AthenaValidationError(
-                "resolved profile inheritance is missing from the published manifest"
-            )
-        for override in source.weakening_overrides:
-            applicable = {
-                _normalized(item) for item in override.profiles
-            }
-            if selected_profile not in applicable:
-                continue
-            if not (
-                override.status == "approved"
-                and override.accepted_at <= as_of < override.expires_at
-            ):
-                raise AthenaValidationError(
-                    f"weakening override is not active: {override.override_id}"
-                )
     for acceptance in profile.risk_acceptances:
         if not (
             acceptance.status == "approved"
@@ -80,6 +60,27 @@ def require_active_manifest_governance(
                 "risk acceptance is not active: "
                 f"{acceptance.risk_acceptance_id}"
             )
+
+
+def resolve_active_manifest_profile(
+    manifest: CanonicalWorkloadManifest,
+    profile_id: str,
+    *,
+    as_of: datetime,
+) -> ResolvedManifestProfile:
+    """Canonically re-resolve inheritance and applied governance at trusted time."""
+
+    profile = resolve_manifest_profile(
+        manifest,
+        profile_id,
+        as_of=as_of,
+    )
+    require_active_manifest_governance(
+        manifest,
+        profile,
+        as_of=as_of,
+    )
+    return profile
 
 
 def _select_role_resources(
@@ -282,4 +283,5 @@ __all__ = [
     "build_resource_evidence_context",
     "make_resource_snapshot_context_verifier",
     "require_active_manifest_governance",
+    "resolve_active_manifest_profile",
 ]
