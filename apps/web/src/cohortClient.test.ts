@@ -94,6 +94,50 @@ const wireBatch = {
   publicationAllowed: false,
   manifestMutated: false,
 }
+const routeCandidate = (
+  action: 'split' | 'merge',
+  sourceProposalIds: string[],
+  selectedMembers = members,
+) => {
+  const selectorPreviews = selectedMembers.map((resourceId, index) => {
+    const boundedSelector: CanonicalManifestSelector = {
+      selectorType: 'resourceIdList',
+      selectorId: `preview-${action}-${index + 1}`,
+      resourceIds: [resourceId],
+      maxMatches: 1,
+    }
+    return {
+      selector: boundedSelector,
+      matchedResourceIds: [resourceId],
+      selectorResultDigest: digest(String(index + 1)),
+      maxMatches: 1,
+    }
+  })
+  return {
+    candidateId: `candidate-wc012-${action}`,
+    action,
+    sourceDraft,
+    scope,
+    sourceProposalIds,
+    proposalSetDigest: wireBatch.proposalSetDigest,
+    snapshot,
+    roleUpdates: [{
+      role: {
+        ...sourceRole,
+        selectors: selectorPreviews.map((preview) => preview.selector),
+      },
+      selectorPreviews,
+      memberCount: selectedMembers.length,
+    }],
+    replaceRoleRefs: ['worker'],
+    resolution: `Explicit synthetic ${action} resolution.`,
+    generatedAt: '2026-08-17T00:02:00.000Z',
+    expiresAt: '2027-08-17T00:00:00.000Z',
+    requiresHumanReview: true,
+    publicationAllowed: false,
+    manifestMutated: false,
+  }
+}
 const loadRequest = {
   workloadId: canonicalManifestFixture.manifestId,
   manifestVersion: canonicalManifestFixture.manifestVersion,
@@ -148,27 +192,7 @@ describe('typed cohort proposal HTTP adapter', () => {
   })
 
   it('posts a non-authoritative split preview with stable idempotency and exact source binding', async () => {
-    const candidate = {
-      candidateId: 'candidate-wc012-split',
-      action: 'split',
-      sourceDraft,
-      scope,
-      sourceProposalIds: [proposal.proposalId],
-      proposalSetDigest: wireBatch.proposalSetDigest,
-      snapshot,
-      roleUpdates: [{
-        role: proposal.role,
-        selectorPreviews: [proposal.selectorPreview],
-        memberCount: 2,
-      }],
-      replaceRoleRefs: ['worker'],
-      resolution: 'Explicit synthetic split resolution.',
-      generatedAt: '2026-08-17T00:02:00.000Z',
-      expiresAt: '2027-08-17T00:00:00.000Z',
-      requiresHumanReview: true,
-      publicationAllowed: false,
-      manifestMutated: false,
-    }
+    const candidate = routeCandidate('split', [proposal.proposalId])
     const fetchMock = vi.fn(async (...request: Parameters<typeof fetch>) => {
       void request
       return response(candidate)
@@ -185,6 +209,7 @@ describe('typed cohort proposal HTTP adapter', () => {
       action: 'split',
       proposalIds: [proposal.proposalId],
       sourceRoles: [proposal.role],
+      sourceMembers: proposal.members,
       proposalSetDigest: wireBatch.proposalSetDigest,
       snapshotArtifactDigest: snapshot.artifactDigest,
       resolution: candidate.resolution,
@@ -211,6 +236,49 @@ describe('typed cohort proposal HTTP adapter', () => {
     expect(new Headers(init?.headers).get('Idempotency-Key')).toMatch(
       /^cohort-preview-[a-f0-9]{32}$/,
     )
+  })
+
+  it('accepts exact merged-route split and merge unions and rejects injected unions', async () => {
+    const mergeProposalIds = [
+      proposal.proposalId,
+      'proposal-2222222222222222',
+    ]
+    const request = (action: 'split' | 'merge') => ({
+      ...loadRequest,
+      action,
+      proposalIds: action === 'split' ? [proposal.proposalId] : mergeProposalIds,
+      sourceRoles: [proposal.role],
+      sourceMembers: members,
+      proposalSetDigest: wireBatch.proposalSetDigest,
+      snapshotArtifactDigest: snapshot.artifactDigest,
+      resolution: `Explicit synthetic ${action} resolution.`,
+    })
+    const clientFor = (candidate: unknown) => createCohortProposalApiClient({
+      baseUrl: 'https://cohorts.invalid',
+      authPort,
+      session: mockAuthSession,
+      fetchImpl: vi.fn(async () => response(candidate)) as typeof fetch,
+    })
+
+    await expect(
+      clientFor(routeCandidate('split', [proposal.proposalId]))
+        .previewReview(request('split')),
+    ).resolves.toMatchObject({ action: 'split' })
+    await expect(
+      clientFor(routeCandidate('merge', mergeProposalIds))
+        .previewReview(request('merge')),
+    ).resolves.toMatchObject({ action: 'merge' })
+
+    await expect(
+      clientFor(routeCandidate('split', [proposal.proposalId], [
+        members[0]!,
+        member('injected'),
+      ])).previewReview(request('split')),
+    ).rejects.toThrow(/inconsistent or authoritative/i)
+    await expect(
+      clientFor(routeCandidate('merge', mergeProposalIds, [members[0]!]))
+        .previewReview(request('merge')),
+    ).rejects.toThrow(/inconsistent or authoritative/i)
   })
 
   it('rejects authority fabrication, malformed previews, and oversized responses', async () => {

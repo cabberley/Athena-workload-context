@@ -157,6 +157,7 @@ export interface CohortReviewPreviewRequest extends CohortProposalLoadRequest {
   action: 'split' | 'merge'
   proposalIds: string[]
   sourceRoles: CanonicalManifestRole[]
+  sourceMembers: string[]
   proposalSetDigest: string
   snapshotArtifactDigest: string
   resolution: string

@@ -297,6 +297,9 @@ export default function CohortReview({
               .map((proposal) => [proposal.role.roleId, proposal.role]),
           ).values(),
         ],
+        sourceMembers: batch.proposals
+          .filter((proposal) => proposalIds.includes(proposal.proposalId))
+          .flatMap((proposal) => proposal.members),
         proposalSetDigest: batch.proposalSetDigest,
         snapshotArtifactDigest: batch.snapshot.artifactDigest,
         resolution: resolution.trim(),

@@ -1,4 +1,5 @@
 import { ContextApiRequestError } from './client'
+import { caseFold as unicodeCaseFold } from 'unicode-case-folding'
 import type {
   CohortConflict,
   CohortConflictCode,
@@ -184,18 +185,27 @@ const stringArray = (
     return item
   })
 
+const normalizeIdentifier = (value: string): string =>
+  unicodeCaseFold(value.normalize('NFC'))
+
 const uniqueNormalized = (values: string[], label: string): void => {
-  const normalized = values.map((value) => value.normalize('NFC').toLowerCase())
+  const normalized = values.map(normalizeIdentifier)
   if (new Set(normalized).size !== values.length) {
     throw new Error(`Cohort API returned duplicate normalized ${label}.`)
   }
 }
 
 const sortedNormalized = (values: string[], label: string): void => {
-  const normalized = values.map((value) => value.normalize('NFC').toLowerCase())
+  const normalized = values.map(normalizeIdentifier)
   if (JSON.stringify(normalized) !== JSON.stringify([...normalized].sort())) {
     throw new Error(`Cohort API returned unsorted normalized ${label}.`)
   }
+}
+
+const sameNormalizedMembers = (left: string[], right: string[]): boolean => {
+  const normalizedLeft = left.map(normalizeIdentifier).sort()
+  const normalizedRight = right.map(normalizeIdentifier).sort()
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight)
 }
 
 const timestamp = (record: Record<string, unknown>, key: string, label: string): string => {
@@ -655,6 +665,8 @@ const parseRoleUpdate = (value: unknown, label: string): CohortRoleUpdate => {
     (preview, index) => parseSelectorPreview(preview, `${label}.selectorPreviews[${index}]`),
   )
   const memberCount = requiredInteger(record, 'memberCount', label, 1, 1000)
+  const selectedMembers = selectorPreviews.flatMap((preview) => preview.matchedResourceIds)
+  uniqueNormalized(selectedMembers, `${label} selected members`)
   if (
     selectorPreviews.length === 0 ||
     role.selectors.length !== selectorPreviews.length ||
@@ -662,7 +674,10 @@ const parseRoleUpdate = (value: unknown, label: string): CohortRoleUpdate => {
       (selector, index) =>
         JSON.stringify(selector) !== JSON.stringify(selectorPreviews[index]!.selector),
     ) ||
-    memberCount > selectorPreviews.reduce((total, preview) => total + preview.maxMatches, 0)
+    selectorPreviews.some(
+      (preview) => preview.maxMatches !== preview.matchedResourceIds.length,
+    ) ||
+    memberCount !== selectedMembers.length
   ) {
     throw new Error(`Cohort API returned an inconsistent ${label}.`)
   }
@@ -701,20 +716,20 @@ export const parseCohortReviewCandidate = (
   )
   uniqueNormalized(replaceRoleRefs, 'review candidate replace role refs')
   const sourceRoleById = new Map(
-    request.sourceRoles.map((role) => [role.roleId.normalize('NFC').toLowerCase(), role]),
+    request.sourceRoles.map((role) => [normalizeIdentifier(role.roleId), role]),
   )
   const sourceRoleRefs = [...sourceRoleById.keys()].sort()
   const updateRoleRefs = roleUpdates
-    .map((update) => update.role.roleId.normalize('NFC').toLowerCase())
+    .map((update) => normalizeIdentifier(update.role.roleId))
     .sort()
   const normalizedReplacements = replaceRoleRefs
-    .map((roleRef) => roleRef.normalize('NFC').toLowerCase())
+    .map(normalizeIdentifier)
     .sort()
   if (
     JSON.stringify(updateRoleRefs) !== JSON.stringify(sourceRoleRefs) ||
     JSON.stringify(normalizedReplacements) !== JSON.stringify(sourceRoleRefs) ||
     roleUpdates.some((update) => {
-      const baseline = sourceRoleById.get(update.role.roleId.normalize('NFC').toLowerCase())
+      const baseline = sourceRoleById.get(normalizeIdentifier(update.role.roleId))
       return !baseline || JSON.stringify({
         kind: update.role.kind,
         cardinality: update.role.cardinality,
@@ -732,6 +747,10 @@ export const parseCohortReviewCandidate = (
   }
   const generatedAt = timestamp(record, 'generatedAt', 'cohort review candidate')
   const expiresAt = timestamp(record, 'expiresAt', 'cohort review candidate')
+  const selectedMembers = roleUpdates.flatMap((update) =>
+    update.selectorPreviews.flatMap((preview) => preview.matchedResourceIds),
+  )
+  uniqueNormalized(selectedMembers, 'review candidate selected members')
   if (
     scope.manifestId !== request.workloadId ||
     scope.manifestVersion !== request.manifestVersion ||
@@ -744,6 +763,7 @@ export const parseCohortReviewCandidate = (
     snapshot.artifactDigest !== request.snapshotArtifactDigest ||
     requiredString(record, 'resolution', 'cohort review candidate', 2000) !== request.resolution ||
     roleUpdates.length === 0 ||
+    !sameNormalizedMembers(selectedMembers, request.sourceMembers) ||
     Date.parse(expiresAt) <= Date.parse(generatedAt) ||
     Date.parse(expiresAt) <= Date.now() ||
     requiredBoolean(record, 'requiresHumanReview', 'cohort review candidate') !== true ||
@@ -913,10 +933,16 @@ export const createCohortProposalApiClient = (
         parseRole(role, `review request.sourceRoles[${index}]`),
       )
       uniqueNormalized(sourceRoles.map((role) => role.roleId), 'review request source role refs')
-      if (sourceRoles.length === 0) {
-        throw new Error('A cohort review preview requires source role references.')
+      const sourceMembers = stringArray(
+        request.sourceMembers,
+        'review request.sourceMembers',
+        1000,
+      )
+      uniqueNormalized(sourceMembers, 'review request source members')
+      if (sourceRoles.length === 0 || sourceMembers.length === 0) {
+        throw new Error('A cohort review preview requires source roles and members.')
       }
-      const validatedRequest = { ...request, sourceRoles }
+      const validatedRequest = { ...request, sourceRoles, sourceMembers }
       const payload = {
         action: request.action,
         manifest_id: request.workloadId,

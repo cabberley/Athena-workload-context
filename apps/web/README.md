@@ -65,9 +65,9 @@ The mock adapter is under `src/test/` and is imported only by tests.
 ## Cohort review boundary
 
 Context Studio has a typed, authenticated WC-010 proposal port and HTTP adapter. Production
-composition never imports the synthetic proposal adapter. The production API dependency is tracked
-by [issue #31](https://github.com/cabberley/Athena-workload-context/issues/31); until those routes
-exist, opening **Cohorts** reports the API failure and does not invent proposal or approval state.
+composition never imports the synthetic proposal adapter. The merged WC-031 API supplies the
+proposal and split/merge preview routes; a missing, stale, malformed, or out-of-scope response fails
+closed without inventing proposal or approval state.
 
 The narrow adapter uses:
 
@@ -89,8 +89,8 @@ band, support, dissent, conflicts, rejected candidates, selector preview, and di
 are filterable and paginated 25 at a time; there is no per-resource editor. Medium, low,
 conflicting, cross-environment, split, and merge actions require a bounded rationale and explicit
 acknowledgement. Direct approval requires an existing bounded selector preview; low or conflicting
-proposals without one may still request a server-generated split preview. Rejection is visibly
-session-only until a server decision endpoint exists.
+proposals without one may still request a server-generated split preview. Rejection is a visibly
+non-persisted session decision and never fabricates server authority.
 
 A confirmed cohort approval is available only to a verified human `proposer`. It calls WC-007
 `PUT /v1/drafts/{draft_id}` with the exact revision/version/digest and a stable idempotency key,
@@ -98,6 +98,9 @@ adding only profile-scoped bounded role selectors. The cohort flow never calls v
 approve, publish, or supersede. Before the draft update, the browser verifies that selector-preview
 members form a normalized, duplicate-free, disjoint union exactly equal to the source proposal
 members, with exact per-role member counts and `maxMatches` bounds.
+
+The browser also validates that every split/merge response from the merged route is the exact
+normalized source-member union before it can reach the WC-007 draft boundary.
 
 ## Local validation
 

@@ -46,6 +46,87 @@ const wireDraft: WireDraftRecord = {
   updated_at: '2026-08-17T00:00:00.000Z',
   reason: 'Synthetic production adapter draft.',
 }
+const cohortDigest = (character: string): string => `sha256:${character.repeat(64)}`
+const cohortMembers = [
+  '/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/rg-wc012-synthetic/' +
+    'providers/microsoft.compute/virtualmachines/wc012-worker-001',
+  '/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/rg-wc012-synthetic/' +
+    'providers/microsoft.compute/virtualmachines/wc012-worker-002',
+]
+const cohortSelector = {
+  selectorType: 'namePredicate',
+  selectorId: 'wc012-worker-name',
+  prefix: 'wc012-worker-',
+  maxMatches: 2,
+}
+const cohortRole = {
+  ...structuredClone(canonicalManifestFixture.roles.find((role) => role.roleId === 'worker')!),
+  selectors: [cohortSelector],
+}
+const cohortSnapshot = {
+  snapshotId: 'snapshot-wc012-http',
+  artifactDigest: cohortDigest('b'),
+  semanticDigest: cohortDigest('c'),
+  collectedAt: '2026-08-17T00:00:00.000Z',
+  expiresAt: '2027-08-17T00:00:00.000Z',
+}
+const wireCohortBatch = {
+  sourceDraft: {
+    draftId: wireDraft.draft_id,
+    revision: wireDraft.revision,
+    manifestDigest: wireDraft.manifest_digest,
+  },
+  scope: {
+    manifestId: wireDraft.manifest_id,
+    manifestVersion: wireDraft.manifest.manifestVersion,
+    profileId: 'production',
+    profileType: 'production',
+    resolvedProfileDigest: cohortDigest('a'),
+  },
+  snapshot: cohortSnapshot,
+  evaluatedAt: '2026-08-17T00:01:00.000Z',
+  inputDigest: cohortDigest('e'),
+  proposalSetDigest: cohortDigest('f'),
+  proposals: [{
+    proposalId: 'proposal-1111111111111111',
+    scope: {
+      manifestId: wireDraft.manifest_id,
+      manifestVersion: wireDraft.manifest.manifestVersion,
+      profileId: 'production',
+      profileType: 'production',
+      resolvedProfileDigest: cohortDigest('a'),
+    },
+    role: cohortRole,
+    members: cohortMembers,
+    confidence: 0.94,
+    confidenceBand: 'high',
+    supportingEvidence: [{
+      signalType: 'namePredicate',
+      signalValue: 'wc012-worker-',
+      memberResourceIds: cohortMembers,
+      evidenceRefs: [{ referenceType: 'item' }, { referenceType: 'item' }],
+    }],
+    dissent: [],
+    rejectedCandidates: [],
+    conflicts: [],
+    selectorPreview: {
+      selector: cohortSelector,
+      matchedResourceIds: cohortMembers,
+      selectorResultDigest: cohortDigest('d'),
+      maxMatches: 2,
+    },
+    snapshot: cohortSnapshot,
+    disposition: 'bulkHumanReview',
+    requiresHumanReview: true,
+    bulkReviewEligible: true,
+    publicationAllowed: false,
+    manifestMutated: false,
+  }],
+  conflicts: [],
+  requiresHumanReview: true,
+  publicationAllowed: false,
+  manifestMutated: false,
+}
 
 const response = (body: unknown): Response =>
   new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
@@ -107,7 +188,7 @@ describe('production startup', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('uses the production cohort HTTP adapter and exposes the absent API dependency', async () => {
+  it('loads the merged cohort route through the production HTTP adapter', async () => {
     const authPort: AuthPort = {
       acquireSession: vi.fn(async () => ({ ...mockAuthSession, role: 'proposer' as const })),
       acquireAccessToken: vi.fn(async () => 'per-user-runtime-token'),
@@ -116,17 +197,7 @@ describe('production startup', () => {
       void init
       const url = String(input)
       if (url.includes('/v1/drafts?')) return response([wireDraft])
-      if (url.includes('/v1/cohort-proposals?')) {
-        return new Response(JSON.stringify({
-          error: {
-            code: 'cohort_api_not_implemented',
-            message: 'Production cohort proposal endpoint is not implemented.',
-          },
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
+      if (url.includes('/v1/cohort-proposals?')) return response(wireCohortBatch)
       return response([])
     })
     const rootElement = document.createElement('div')
@@ -146,8 +217,7 @@ describe('production startup', () => {
     })
     await userEvent.setup().click(screen.getByRole('button', { name: 'Cohorts' }))
 
-    expect(await screen.findByText(/production cohort proposal endpoint is not implemented/i))
-      .toBeInTheDocument()
+    expect(await screen.findByText('high · 94%')).toBeInTheDocument()
     const cohortCall = fetchMock.mock.calls.find((call) =>
       String(call[0]).startsWith('https://cohorts.invalid/v1/cohort-proposals?'),
     )
@@ -155,7 +225,7 @@ describe('production startup', () => {
     expect(String(cohortCall![0])).toContain('expected_revision=1')
     expect(new Headers((cohortCall![1] as RequestInit).headers).get('Authorization'))
       .toBe('Bearer per-user-runtime-token')
-    expect(screen.queryByText(/proposal-1111111111111111/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/not implemented/i)).not.toBeInTheDocument()
     await act(async () => root.unmount())
   })
 
