@@ -9,21 +9,21 @@ param workspaceName string
 @description('Principal ID of the dedicated Azure MCP user-assigned identity.')
 param mcpIdentityPrincipalId string
 
-var logAnalyticsReaderRoleDefinitionId = '73c42c96-874c-492b-b04d-ab87d138a893'
+var logAnalyticsDataReaderRoleDefinitionId = '3b03c2da-16b3-4a49-8834-0f8130efdd3b'
 
 resource approvedWorkspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
   name: workspaceName
 }
 
-resource workspaceLogReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource workspaceLogDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: approvedWorkspace
-  name: guid(approvedWorkspace.id, mcpIdentityPrincipalId, logAnalyticsReaderRoleDefinitionId)
+  name: guid(approvedWorkspace.id, mcpIdentityPrincipalId, logAnalyticsDataReaderRoleDefinitionId)
   properties: {
     principalId: mcpIdentityPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      logAnalyticsReaderRoleDefinitionId
+      logAnalyticsDataReaderRoleDefinitionId
     )
   }
 }

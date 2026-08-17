@@ -131,9 +131,6 @@ module workloadReadRoleAssignments 'modules/workload-read-rbac.bicep' = [
     scope: resourceGroup(readScope.subscriptionId, readScope.resourceGroupName)
     params: {
       mcpIdentityPrincipalId: mcpIdentity.properties.principalId
-      grantReader: readScope.grantReader
-      grantMonitoringReader: readScope.grantMonitoringReader
-      grantResourceHealthReader: readScope.grantResourceHealthReader
     }
   }
 ]

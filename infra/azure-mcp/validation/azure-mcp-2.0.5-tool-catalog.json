@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "1.0",
+  "serverVersion": "2.0.5",
+  "image": {
+    "repository": "mcr.microsoft.com/azure-sdk/azure-mcp",
+    "manifestDigest": "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a"
+  },
+  "httpRoute": "/",
+  "provenance": {
+    "package": "@azure/mcp@2.0.5",
+    "catalogCommand": "npx -y @azure/mcp@2.0.5 tools list",
+    "catalogRecordCount": 235,
+    "catalogCanonicalSha256": "2629c825868a1456c2370bf31f160ae0779a65e3971d19d9103a1cc41b019c29",
+    "sourceRepository": "https://github.com/microsoft/mcp",
+    "sourceCommit": "f43b47a21545e5f3f87b3bceee35986442217bb4",
+    "routeSource": "core/Microsoft.Mcp.Core/src/Areas/Server/Commands/ServiceStartCommand.cs",
+    "routeMapping": "app.MapMcp()",
+    "retrievedAt": "2026-08-17T00:01:53Z"
+  },
+  "tools": [
+    {
+      "id": "b1c2d3e4-f5a6-7890-abcd-ef1234567890",
+      "command": "group resource list",
+      "name": "group_resource_list",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "ffc0ed72-0622-4a27-bfd8-6df9b83adce8",
+      "command": "monitor activitylog list",
+      "name": "monitor_activitylog_list",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "d3bf37ed-5f2e-448d-a16e-73140ef908c2",
+      "command": "monitor metrics definitions",
+      "name": "monitor_metrics_definitions",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "6e86ef31-04e1-4cec-8bda-5292d4bc3ad8",
+      "command": "monitor metrics query",
+      "name": "monitor_metrics_query",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "02aaf533-0593-4e1d-bd87-f7c69d34c7ba",
+      "command": "monitor resource log query",
+      "name": "monitor_resource_log_query",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "3f513aea-b6fc-4ad0-8f7d-9fbaa1056ac6",
+      "command": "monitor workspace log query",
+      "name": "monitor_workspace_log_query",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
+      "id": "3b388cc7-4b16-4919-9e90-f592247d9891",
+      "command": "resourcehealth availability-status get",
+      "name": "resourcehealth_availability-status_get",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    }
+  ]
+}

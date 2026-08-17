@@ -38,13 +38,13 @@ var azureMcpImage = '${azureMcpImageRepository}:${azureMcpVersion}@${azureMcpIma
 
 // Keep this list exact. Every entry is a reviewed read-only Azure MCP 2.0.5 tool.
 var approvedTools = [
-  'azmcp_group_resource_list'
-  'azmcp_monitor_activitylog_list'
-  'azmcp_monitor_metrics_definitions'
-  'azmcp_monitor_metrics_query'
-  'azmcp_monitor_resource_log_query'
-  'azmcp_monitor_workspace_log_query'
-  'azmcp_resourcehealth_availability-status_get'
+  'group_resource_list'
+  'monitor_activitylog_list'
+  'monitor_metrics_definitions'
+  'monitor_metrics_query'
+  'monitor_resource_log_query'
+  'monitor_workspace_log_query'
+  'resourcehealth_availability-status_get'
 ]
 
 var baseServerArgs = [
@@ -168,5 +168,5 @@ resource azureMcp 'Microsoft.App/containerApps@2026-01-01' = {
 }
 
 output containerAppResourceId string = azureMcp.id
-output internalEndpoint string = 'https://${azureMcp.properties.configuration.ingress.fqdn}/mcp'
+output internalEndpoint string = 'https://${azureMcp.properties.configuration.ingress.fqdn}'
 output allowedTools array = approvedTools

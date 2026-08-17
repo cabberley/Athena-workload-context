@@ -15,7 +15,7 @@ not change shared root orchestration.
 - Outbound Azure access uses `UseHostingEnvironmentIdentity` and a dedicated user-assigned managed
   identity. `--read-only` remains enabled.
 - The separately created Athena context identity is never passed to an RBAC module. It has no
-  workload Reader, Monitoring Reader, Resource Health Reader, or workspace log role.
+  workload Reader or workspace log role.
 - Workload and workspace assignments default to empty. Workload roles can only be assigned at an
   explicitly named resource group; log access can only be assigned on an explicitly named existing
   Log Analytics workspace. There is no subscription-scope role-assignment path.
@@ -31,15 +31,21 @@ cross-resource-group optional RBAC scopes must stay visible for review.
 
 The allowlist is a source constant, not a deployment parameter:
 
-1. `azmcp_group_resource_list`
-2. `azmcp_monitor_activitylog_list`
-3. `azmcp_monitor_metrics_definitions`
-4. `azmcp_monitor_metrics_query`
-5. `azmcp_monitor_resource_log_query`
-6. `azmcp_monitor_workspace_log_query`
-7. `azmcp_resourcehealth_availability-status_get`
+1. `group_resource_list`
+2. `monitor_activitylog_list`
+3. `monitor_metrics_definitions`
+4. `monitor_metrics_query`
+5. `monitor_resource_log_query`
+6. `monitor_workspace_log_query`
+7. `resourcehealth_availability-status_get`
 
 Every tool is read-only in Azure MCP 2.0.5. Namespace filters and wildcards are not accepted.
+The pinned catalog snapshot under `validation/` records each runtime name, command ID, safety
+metadata, source commit, catalog hash, image digest, and retrieval command. Runtime tool names do
+not include the CLI executable prefix.
+
+Azure MCP 2.0.5 maps HTTP MCP with `app.MapMcp()` at `/`. The deployment output is therefore the
+root internal FQDN, with no `/mcp` suffix. Clients send MCP requests using `POST /`.
 
 ## RBAC inputs
 
@@ -50,9 +56,6 @@ Every tool is read-only in Azure MCP 2.0.5. Namespace filters and wildcards are 
   {
     subscriptionId: '<target-subscription-guid>'
     resourceGroupName: 'synthetic-workload-rg'
-    grantReader: true
-    grantMonitoringReader: true
-    grantResourceHealthReader: true
   }
 ]
 ```
@@ -69,9 +72,18 @@ Every tool is read-only in Azure MCP 2.0.5. Namespace filters and wildcards are 
 ]
 ```
 
-The only assignable built-in roles are Reader, Monitoring Reader, Resource Health Reader, and Log
-Analytics Reader. Do not use a subscription as a convenience scope. The deployment principal is a
-separate operator or CI identity and must not be either runtime identity.
+The only assignable built-in roles are:
+
+- **Reader** at each approved workload resource group. Its official `*/read` permission covers
+  inventory, metrics, activity logs, and
+  `Microsoft.ResourceHealth/availabilityStatuses/read`. No duplicate Monitoring Reader or
+  nonexistent Resource Health Reader assignment is added.
+- **Log Analytics Data Reader** at each approved workspace. Its permissions are limited to
+  workspace/query reads and table data reads; it has no export, action, write, or delete permission.
+
+The official role snapshot under `validation/` records the reviewed role IDs and permissions. Do
+not use a subscription as a convenience scope. The deployment principal is a separate operator or
+CI identity and must not be either runtime identity.
 
 ## Deployment
 
@@ -133,7 +145,7 @@ az role assignment list --assignee-object-id <context-principal-id> --all `
   --query "[?contains(scope, '/resourceGroups/<workload-rg>')]"
 ```
 
-From an approved caller in the same environment, first send `POST /mcp` without a token and confirm
+From an approved caller in the same environment, first send `POST /` without a token and confirm
 HTTP 401. Then use its managed identity to request the configured resource-app token and issue an
 MCP `tools/list` request. Compare the returned names exactly with the seven entries above. Exercise
 one denied write tool and one out-of-scope resource and confirm both fail.
