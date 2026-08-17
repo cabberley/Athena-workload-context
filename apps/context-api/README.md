@@ -56,14 +56,17 @@ The integration composes the merged components without introducing direct Azure 
   independently mutable resolver. After every persistence delay, the conditional operation loads
   the exact configured key anchor and compares its revision and digest with the pre-collection
   authority token. Disabled, retired, expired, revoked, missing, or changed key trust aborts the
-  transaction. The persistence operation then obtains its authoritative commit timestamp and
-  invokes a pure transaction-local finalizer: it revalidates the already loaded exact approval,
-  complete profile governance, and bound key trust at that later value, rejects snapshot or
-  signing-key expiry, re-verifies the snapshot, and recomputes authoritative WC-004 findings. The
-  same value is used for policy freshness, `publishedAt`, and `evaluatedAt`; no hook, authority
-  read, trust lookup, or independently supplied persistence call can run between timestamp
-  acquisition and insertion. Findings produced by preflight orchestration are never accepted as
-  commit inputs.
+  transaction. After persistence delay and exact key-revision comparison, the transaction performs
+  the delay-capable cryptographic verification and authoritative WC-004 evaluation. Only after
+  that work returns does persistence obtain its authoritative insertion timestamp and invoke a
+  pure, bounded, no-I/O finalizer. The finalizer revalidates the already loaded exact approval,
+  complete profile governance and risk acceptances, bound key trust, snapshot expiry, and every
+  policy evidence-freshness bound at that exact value. Prepared findings are accepted only when
+  those immutable findings are proven temporally unchanged at insertion; the same value is used
+  for `publishedAt` and `evaluatedAt`. No hook, authority read, trust lookup, cryptographic
+  operation, policy evaluator, or independently supplied persistence call can run between
+  timestamp acquisition and insertion. Findings supplied by preflight orchestration are never
+  accepted as commit inputs.
   The operation inserts the idempotency receipt, snapshot, source envelope, publication, and final
   recomputed result as one state change. No independently supplied commit capability can redirect
   publication to a foreign store. The HTTP composition root accepts only non-authoritative

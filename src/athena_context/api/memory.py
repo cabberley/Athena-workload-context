@@ -30,7 +30,7 @@ from athena_context.api.evaluation_domain import (
     TrustedKeyAuthorityToken,
 )
 from athena_context.api.evaluation_ports import (
-    EvaluationArtifactFactory,
+    EvaluationArtifactPreparation,
     EvaluationTrustedKeyAuthority,
     StoredEvaluation,
 )
@@ -405,15 +405,16 @@ class _MemoryTransaction(ContextTransactionPort):
         self,
         trusted_key_anchor: TrustedKeyAnchor,
         expected_trusted_key: TrustedKeyAuthorityToken,
-        artifact_factory: EvaluationArtifactFactory,
+        artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
         clock = self._store._authoritative_clock
         if clock is None:
             raise RuntimeError(
                 "evaluation persistence has no authoritative commit clock"
             )
-        # Any storage wait happens before the key read and timestamp. The key
-        # authority and artifact share this transaction through insertion.
+        # All persistence and cryptographic/policy delay happens before the
+        # insertion timestamp. The returned finalizer is pure, bounded, has no
+        # hook or I/O, and rechecks every temporal predicate at that timestamp.
         self._store._before_evaluation_commit_timestamp()
         trusted_key = self.get_demo_evaluation_trusted_key(
             trusted_key_anchor
@@ -425,8 +426,14 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 "trusted signing-key authority changed before publication"
             )
+        artifact_factory = artifact_preparation(trusted_key)
+        if self._store._transaction_generation != self._base_generation:
+            raise StaleRevisionError(
+                "authoritative persistence changed during evaluation preparation"
+            )
+        published_at = ensure_timestamp(clock.now())
         artifact = artifact_factory(
-            ensure_timestamp(clock.now()),
+            published_at,
             trusted_key,
         )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)

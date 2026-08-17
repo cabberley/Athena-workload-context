@@ -522,6 +522,149 @@ def test_signing_key_revocation_during_persistence_delay_rolls_back() -> None:
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+@pytest.mark.parametrize(
+    ("expiring_condition", "expected_error", "expected_message"),
+    [
+        ("approval", DemoEvaluationApprovalError, "not active"),
+        ("key", EvaluationFailedClosedError, "trusted signing key is"),
+        ("snapshot", EvaluationFailedClosedError, "snapshot became stale"),
+        ("governance", EvaluationFailedClosedError, "inactive governance"),
+        ("riskAcceptance", EvaluationFailedClosedError, "inactive governance"),
+        (
+            "evidenceFreshness",
+            EvaluationFailedClosedError,
+            "policy evidence freshness failed",
+        ),
+    ],
+)
+def test_expiry_during_final_crypto_policy_work_rolls_back_atomically(
+    expiring_condition: str,
+    expected_error: type[Exception],
+    expected_message: str,
+) -> None:
+    expiring_at = CURRENT_NOW + timedelta(seconds=30)
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        override_expires_at=(
+            expiring_at if expiring_condition == "governance" else None
+        ),
+        risk_acceptance_expires_at=(
+            expiring_at if expiring_condition == "riskAcceptance" else None
+        ),
+        production_extends_development=expiring_condition == "governance",
+        evidence_freshness_seconds=(
+            30 if expiring_condition == "evidenceFreshness" else None
+        ),
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        approval_expires_at=(
+            expiring_at if expiring_condition == "approval" else None
+        ),
+        trusted_key_expires_at=(
+            expiring_at if expiring_condition == "key" else None
+        ),
+        snapshot_freshness_seconds=(
+            30 if expiring_condition == "snapshot" else 300
+        ),
+    )
+    idempotency_key = f"wc013-{expiring_condition}-crypto-policy-expiry"
+    context_service = harness.context_resolver.service
+    original_evaluation = (
+        context_service._evaluate_demo_snapshot_for_publication
+    )
+
+    def delayed_evaluation(*args: object, **kwargs: object) -> object:
+        result = original_evaluation(*args, **kwargs)  # type: ignore[arg-type]
+        harness.clock.advance(timedelta(minutes=1))
+        return result
+
+    context_service._evaluate_demo_snapshot_for_publication = (  # type: ignore[method-assign]
+        delayed_evaluation
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_publication_timestamp_is_acquired_after_final_crypto_policy_work() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    context_service = harness.context_resolver.service
+    original_evaluation = (
+        context_service._evaluate_demo_snapshot_for_publication
+    )
+
+    def delayed_evaluation(*args: object, **kwargs: object) -> object:
+        result = original_evaluation(*args, **kwargs)  # type: ignore[arg-type]
+        harness.clock.advance(timedelta(minutes=1))
+        return result
+
+    context_service._evaluate_demo_snapshot_for_publication = (  # type: ignore[method-assign]
+        delayed_evaluation
+    )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-post-crypto-policy-timestamp",
+        harness.command,
+    )
+
+    assert result.publication.published_at >= CURRENT_NOW + timedelta(minutes=1)
+    assert result.evaluated_at == result.publication.published_at
+    assert harness.store.publication_count == 1
+
+
+def test_key_revision_change_during_final_crypto_policy_work_rolls_back() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-key-revision-during-crypto-policy"
+    context_service = harness.context_resolver.service
+    original_evaluation = (
+        context_service._evaluate_demo_snapshot_for_publication
+    )
+
+    def revoke_during_evaluation(*args: object, **kwargs: object) -> object:
+        result = original_evaluation(*args, **kwargs)  # type: ignore[arg-type]
+        harness.trust_registry.disable(revoked_at=harness.clock.value)
+        return result
+
+    context_service._evaluate_demo_snapshot_for_publication = (  # type: ignore[method-assign]
+        revoke_during_evaluation
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="authority changed during the publication transaction",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    current_trust = harness.trust_registry.resolve()
+    assert current_trust is not None
+    assert current_trust.revision == 2
+    assert current_trust.record.enabled is False
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_approval_revoke_after_final_evaluation_aborts_conditional_commit() -> None:
     harness = build_harness(
         as_of=CURRENT_NOW,

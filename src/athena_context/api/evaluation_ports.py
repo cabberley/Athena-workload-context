@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -100,14 +101,17 @@ class EvaluationTrustedKeyAuthority:
         )
 
 
-class EvaluationArtifactFactory(Protocol):
-    """Pure finalizer invoked with the persistence-owned commit timestamp."""
+# No-I/O finalizer invoked with the persistence-owned insertion timestamp.
+type EvaluationArtifactFactory = Callable[
+    [datetime, EvaluationTrustedKeyAuthority],
+    StoredEvaluation,
+]
 
-    def __call__(
-        self,
-        published_at: datetime,
-        trusted_key: EvaluationTrustedKeyAuthority,
-    ) -> StoredEvaluation: ...
+# Delay-capable verification that returns the insertion-time finalizer.
+type EvaluationArtifactPreparation = Callable[
+    [EvaluationTrustedKeyAuthority],
+    EvaluationArtifactFactory,
+]
 
 
 @runtime_checkable
@@ -162,9 +166,9 @@ class EvaluationAuthorityTransactionPort(Protocol):
         self,
         trusted_key_anchor: TrustedKeyAnchor,
         expected_trusted_key: TrustedKeyAuthorityToken,
-        artifact_factory: EvaluationArtifactFactory,
+        artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
-        """Bind exact key revision, finalize, and insert in this transaction."""
+        """Bind key revision, prepare, timestamp, finalize, and insert."""
         ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -232,7 +236,7 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
         self,
         trusted_key_anchor: TrustedKeyAnchor,
         expected_trusted_key: TrustedKeyAuthorityToken,
-        artifact_factory: EvaluationArtifactFactory,
+        artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation: ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -290,6 +294,7 @@ class SnapshotSigningPort(Protocol):
 __all__ = [
     "ConfiguredEvidenceClientPort",
     "EvaluationArtifactFactory",
+    "EvaluationArtifactPreparation",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",

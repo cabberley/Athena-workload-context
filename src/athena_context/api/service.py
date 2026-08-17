@@ -75,6 +75,7 @@ from athena_context.api.evaluation_domain import (
 from athena_context.api.evaluation_ports import (
     DemoEvaluationTrustConfiguration,
     EvaluationArtifactFactory,
+    EvaluationArtifactPreparation,
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
     EvaluationCommitCandidate,
@@ -98,6 +99,7 @@ from athena_context.contracts import (
 from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
+    EvidenceFreshnessProof,
     canonicalize_manifest_payload,
 )
 from athena_context.policy import evaluate_manifest_profile
@@ -301,12 +303,12 @@ class _ContextServiceEvaluationAuthorityUnitOfWork:
         self,
         trusted_key_anchor: TrustedKeyAnchor,
         expected_trusted_key: TrustedKeyAuthorityToken,
-        artifact_factory: EvaluationArtifactFactory,
+        artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
         return self._evaluation_transaction.put_evaluation_conditionally(
             trusted_key_anchor,
             expected_trusted_key,
-            artifact_factory,
+            artifact_preparation,
         )
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
@@ -522,18 +524,17 @@ class ContextService:
             expected_authority=candidate.expected_authority,
         )
 
-        def finalize_at_persistence_time(
-            published_at: datetime,
+        def prepare_before_persistence_time(
             trusted_key: EvaluationTrustedKeyAuthority,
-        ) -> StoredEvaluation:
-            final_approval, final_resolved, _ = (
+        ) -> EvaluationArtifactFactory:
+            prepared_approval, prepared_resolved, _ = (
                 self._validate_loaded_evaluation_authority(
                     actor=candidate.actor,
                     command=candidate.command,
                     approval=approval,
                     resolved=resolved,
                     authorization=authority.authorization,
-                    as_of=published_at,
+                    as_of=authority_read_at,
                     private_mcp_endpoint=candidate.private_mcp_endpoint,
                     evidence_identity_object_id=(
                         candidate.evidence_identity_object_id
@@ -542,18 +543,18 @@ class ContextService:
                     expected_authority=candidate.expected_authority,
                 )
             )
-            if published_at >= candidate.snapshot.expires_at:
+            if authority_read_at >= candidate.snapshot.expires_at:
                 raise EvaluationFailedClosedError(
                     "snapshot became stale before publication"
                 )
-            publication = build_authorized_publication(
+            verification_publication = build_authorized_publication(
                 snapshot=candidate.snapshot,
-                approval=final_approval,
+                approval=prepared_approval,
                 publisher=candidate.actor,
                 publication_actor=self._publication_actor,
-                published_at=published_at,
+                published_at=authority_read_at,
                 resolved_profile_digest=(
-                    final_resolved.profile.resolved_profile_digest
+                    prepared_resolved.profile.resolved_profile_digest
                 ),
                 endpoint=candidate.private_mcp_endpoint,
                 scope=candidate.command.authorized_scope,
@@ -561,39 +562,87 @@ class ContextService:
             )
             findings = self._evaluate_demo_snapshot_for_publication(
                 candidate,
-                resolved=final_resolved,
-                publication=publication,
+                resolved=prepared_resolved,
+                publication=verification_publication,
                 trusted_key=trusted_key,
-                as_of=published_at,
+                as_of=authority_read_at,
             )
-            result = build_demo_evaluation_result(
-                publication=publication,
-                snapshot=candidate.snapshot,
-                findings=findings,
-                evaluated_at=published_at,
-            )
-            artifact = StoredEvaluation(
-                actor_id=candidate.actor.actor_id,
-                idempotency_key=candidate.idempotency_key,
-                request_digest=candidate.request_digest,
-                snapshot_id=candidate.snapshot.snapshot_id,
-                result_json=result.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ),
-                snapshot_json=candidate.snapshot.canonical_json(),
-                publication_json=publication.model_dump_json(exclude_none=True),
-                envelope_attempt_id=candidate.envelope_attempt_id,
-                envelope=candidate.envelope,
-            )
-            self._validate_evaluation_components(artifact)
-            return artifact
+
+            def finalize_at_persistence_time(
+                published_at: datetime,
+                final_trusted_key: EvaluationTrustedKeyAuthority,
+            ) -> StoredEvaluation:
+                final_approval, final_resolved, _ = (
+                    self._validate_loaded_evaluation_authority(
+                        actor=candidate.actor,
+                        command=candidate.command,
+                        approval=approval,
+                        resolved=resolved,
+                        authorization=authority.authorization,
+                        as_of=published_at,
+                        private_mcp_endpoint=candidate.private_mcp_endpoint,
+                        evidence_identity_object_id=(
+                            candidate.evidence_identity_object_id
+                        ),
+                        trusted_key=final_trusted_key,
+                        expected_authority=candidate.expected_authority,
+                    )
+                )
+                if published_at >= candidate.snapshot.expires_at:
+                    raise EvaluationFailedClosedError(
+                        "snapshot became stale before publication"
+                    )
+                self._validate_precomputed_finding_time_bounds(
+                    candidate,
+                    resolved=final_resolved,
+                    findings=findings,
+                    as_of=published_at,
+                )
+                publication = build_authorized_publication(
+                    snapshot=candidate.snapshot,
+                    approval=final_approval,
+                    publisher=candidate.actor,
+                    publication_actor=self._publication_actor,
+                    published_at=published_at,
+                    resolved_profile_digest=(
+                        final_resolved.profile.resolved_profile_digest
+                    ),
+                    endpoint=candidate.private_mcp_endpoint,
+                    scope=candidate.command.authorized_scope,
+                    reason=candidate.command.reason,
+                )
+                result = build_demo_evaluation_result(
+                    publication=publication,
+                    snapshot=candidate.snapshot,
+                    findings=findings,
+                    evaluated_at=published_at,
+                )
+                artifact = StoredEvaluation(
+                    actor_id=candidate.actor.actor_id,
+                    idempotency_key=candidate.idempotency_key,
+                    request_digest=candidate.request_digest,
+                    snapshot_id=candidate.snapshot.snapshot_id,
+                    result_json=result.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                    snapshot_json=candidate.snapshot.canonical_json(),
+                    publication_json=publication.model_dump_json(
+                        exclude_none=True
+                    ),
+                    envelope_attempt_id=candidate.envelope_attempt_id,
+                    envelope=candidate.envelope,
+                )
+                self._validate_evaluation_components(artifact)
+                return artifact
+
+            return finalize_at_persistence_time
 
         trust = self._require_demo_evaluation_trust()
         artifact = unit_of_work.insert_evaluation_conditionally(
             trust.trusted_key_anchor,
             candidate.expected_authority.trusted_key,
-            finalize_at_persistence_time,
+            prepare_before_persistence_time,
         )
         return DemoEvaluationResult.model_validate_json(artifact.result_json)
 
@@ -616,7 +665,7 @@ class ContextService:
         trusted_key: EvaluationTrustedKeyAuthority,
         as_of: datetime,
     ) -> tuple[ManifestFinding, ...]:
-        """Cryptographically verify and evaluate at the final transaction time."""
+        """Cryptographically verify and evaluate inside the authority transaction."""
 
         trust = self._demo_evaluation_trust
         if trust is None:
@@ -701,6 +750,41 @@ class ContextService:
             findings_by_clause[clause_id]
             for clause_id in sorted(findings_by_clause, key=str.casefold)
         )
+
+    def _validate_precomputed_finding_time_bounds(
+        self,
+        candidate: EvaluationCommitCandidate,
+        *,
+        resolved: ResolvedPublishedContext,
+        findings: tuple[ManifestFinding, ...],
+        as_of: datetime,
+    ) -> None:
+        """Prove prepared findings remain valid at the exact insertion time."""
+
+        findings_by_clause = {
+            finding.clause_id: finding for finding in findings
+        }
+        if len(findings_by_clause) != len(findings):
+            raise EvaluationFailedClosedError(
+                "prepared policy findings contain duplicate clauses"
+            )
+        for constraint in resolved.profile.constraints:
+            proof = constraint.proof_requirement
+            if not isinstance(proof, EvidenceFreshnessProof):
+                continue
+            finding = findings_by_clause.get(constraint.constraint_id)
+            age_seconds = (
+                as_of - candidate.snapshot.collected_at
+            ).total_seconds()
+            if (
+                finding is None
+                or finding.verdict != constraint.success_verdict
+                or age_seconds > proof.maximum_age_seconds
+            ):
+                raise EvaluationFailedClosedError(
+                    "policy evidence freshness failed at the authoritative "
+                    "publication time"
+                )
 
     def _resolve_evaluation_authority(
         self,
