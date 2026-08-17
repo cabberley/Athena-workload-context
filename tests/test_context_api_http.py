@@ -117,6 +117,85 @@ def test_unverified_or_caller_asserted_identity_is_rejected() -> None:
     assert unverified_bearer.json()["error"]["code"] == "authentication_required"
 
 
+def test_reserved_wildcard_is_rejected_by_every_wc007_manifest_id_boundary() -> None:
+    _, client = _client()
+    manifest = canonical_manifest(manifest_id="*")
+    manifest_payload = manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    create_payload = {
+        "draft_id": "reserved-wildcard-create",
+        "manifest": manifest_payload,
+        "manifest_digest": manifest.compatibility.artifact_digest,
+        "reason": "Reject a reserved wildcard manifest identifier",
+    }
+    replacement_payload = {
+        "expected_revision": 1,
+        "expected_manifest_version": "1.0.0",
+        "expected_digest": BAD_DIGEST,
+        "replacement_manifest": manifest_payload,
+        "replacement_digest": manifest.compatibility.artifact_digest,
+        "reason": "Reject a reserved wildcard replacement identifier",
+    }
+    supersede_payload = {
+        "expected_revision": 1,
+        "expected_manifest_version": "1.0.0",
+        "expected_digest": BAD_DIGEST,
+        "replacement_version": "1.1.0",
+        "replacement_digest": BAD_DIGEST,
+        "reason": "Reject a reserved wildcard supersession identifier",
+    }
+    responses = [
+        client.post(
+            "/v1/drafts",
+            headers=_headers(AGENT.actor_id, "reserved-wildcard-create"),
+            json=create_payload,
+        ),
+        client.put(
+            "/v1/drafts/nonexistent",
+            headers=_headers(AGENT.actor_id, "reserved-wildcard-replace"),
+            json=replacement_payload,
+        ),
+        client.get(
+            "/v1/drafts?manifest_id=*",
+            headers=_headers(AGENT.actor_id),
+        ),
+        client.get(
+            "/v1/manifests/*/versions/1.0.0",
+            headers=_headers(AGENT.actor_id),
+        ),
+        client.get(
+            "/v1/manifests/*/versions",
+            headers=_headers(AGENT.actor_id),
+        ),
+        client.get(
+            "/v1/versions/1.0.0?manifest_id=*",
+            headers=_headers(AGENT.actor_id),
+        ),
+        client.post(
+            "/v1/manifests/*/versions/1.0.0/supersede",
+            headers=_headers(PUBLISHER.actor_id, "reserved-wildcard-supersede"),
+            json=supersede_payload,
+        ),
+        client.get(
+            "/v1/manifests/*/compare?from_version=1.0.0&to_version=1.1.0",
+            headers=_headers(AUDITOR.actor_id),
+        ),
+        client.get(
+            "/v1/manifests/*/audit",
+            headers=_headers(AUDITOR.actor_id),
+        ),
+    ]
+
+    assert all(response.status_code == 422 for response in responses)
+    assert all(
+        any("reserved" in error["msg"] for error in response.json()["detail"])
+        for response in responses
+    )
+
+
 def test_http_create_get_list_and_stale_revision_mapping() -> None:
     _, client = _client()
     manifest = canonical_manifest()

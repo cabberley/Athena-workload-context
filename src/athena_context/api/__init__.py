@@ -3,9 +3,24 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_domain import (
+    CohortDraftBinding,
+    CohortEvidenceBinding,
+    CohortProposalBatchResponse,
+    CohortProposalQuery,
+    CohortReviewCandidate,
+    CohortReviewPreviewRequest,
+)
+from athena_context.api.cohort_memory import (
+    CallableTrustedEvidenceSnapshotVerifier,
+    InMemoryCohortPersistence,
+    InMemoryEvidenceSnapshotRepository,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    AllWorkloadsGrantScope,
     CreateDraftCommand,
     DraftRecord,
     DraftState,
@@ -17,6 +32,8 @@ from athena_context.api.domain import (
     SupersedeCommand,
     TransitionCommand,
     VerifiedAuthentication,
+    WorkloadGrantScope,
+    WorkloadIdentifier,
 )
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
@@ -25,11 +42,22 @@ from athena_context.api.service import ContextService
 __all__ = [
     "Actor",
     "ActorKind",
+    "AllWorkloadsGrantScope",
+    "CallableTrustedEvidenceSnapshotVerifier",
+    "CohortDraftBinding",
+    "CohortEvidenceBinding",
+    "CohortProposalBatchResponse",
+    "CohortProposalQuery",
+    "CohortProposalService",
+    "CohortReviewCandidate",
+    "CohortReviewPreviewRequest",
     "ContextService",
     "CreateDraftCommand",
     "DraftRecord",
     "DraftState",
     "InMemoryContextStore",
+    "InMemoryCohortPersistence",
+    "InMemoryEvidenceSnapshotRepository",
     "PublishedManifest",
     "PublishCommand",
     "ReplaceDraftCommand",
@@ -41,5 +69,7 @@ __all__ = [
     "StaticTestAuthenticator",
     "TransitionCommand",
     "VerifiedAuthentication",
+    "WorkloadGrantScope",
+    "WorkloadIdentifier",
     "create_app",
 ]

@@ -619,7 +619,7 @@ class ContextService:
         manifest_id: str | None = None,
         state: DraftState | None = None,
     ) -> list[DraftRecord]:
-        self._authorization.require(actor, Permission.LIST, manifest_id or "*")
+        self._authorization.require(actor, Permission.LIST, manifest_id)
         with self._store.transaction() as tx:
             return tx.list_drafts(manifest_id=manifest_id, state=state)
 
@@ -632,7 +632,7 @@ class ContextService:
     ) -> PublishedManifestView:
         with self._store.transaction() as tx:
             if manifest_id is None:
-                self._authorization.require(actor, Permission.LIST, "*")
+                self._authorization.require(actor, Permission.LIST, None)
                 matches = [
                     item
                     for item in tx.list_published()
