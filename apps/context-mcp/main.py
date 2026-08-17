@@ -2,6 +2,9 @@
 
 from athena_context.agent import (
     AuthoritativeFindingsPort,
+    ConfirmationClockPort,
+    ConfirmationSignerPort,
+    ConfirmationStorePort,
     ContextApiPort,
     ContextMcpServer,
     build_context_mcp_server,
@@ -12,10 +15,19 @@ def create_server(
     *,
     context_api: ContextApiPort,
     findings: AuthoritativeFindingsPort,
+    confirmation_signer: ConfirmationSignerPort,
+    confirmation_store: ConfirmationStorePort,
+    confirmation_clock: ConfirmationClockPort,
 ) -> ContextMcpServer:
     """Compose the exact reviewed tools over deployment-supplied authoritative ports."""
 
-    return build_context_mcp_server(context_api=context_api, findings=findings)
+    return build_context_mcp_server(
+        context_api=context_api,
+        findings=findings,
+        confirmation_signer=confirmation_signer,
+        confirmation_store=confirmation_store,
+        confirmation_clock=confirmation_clock,
+    )
 
 
 __all__ = ["create_server"]

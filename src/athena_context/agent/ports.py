@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Protocol
 
 from athena_context.agent.models import (
     AgentModel,
     AuthoritativePolicyView,
+    ConfirmationBinding,
+    ConfirmationClaims,
     ToolCallContext,
     ToolDefinition,
 )
@@ -58,6 +61,30 @@ class AuthoritativeFindingsPort(Protocol):
     ) -> AuthoritativePolicyView: ...
 
 
+class ConfirmationClockPort(Protocol):
+    def now(self) -> datetime: ...
+
+
+class ConfirmationSignerPort(Protocol):
+    def sign(self, claims: ConfirmationClaims) -> str: ...
+
+    def verify(self, token: str) -> ConfirmationClaims: ...
+
+
+class ConfirmationStorePort(Protocol):
+    """Atomic one-time confirmation reservation and consumption."""
+
+    def reserve(self, binding: ConfirmationBinding) -> str: ...
+
+    def consume(
+        self,
+        challenge_id: str,
+        binding: ConfirmationBinding,
+        *,
+        now: datetime,
+    ) -> bool: ...
+
+
 type ToolDispatch = Callable[
     [str, Mapping[str, object], ToolCallContext],
     AgentModel,
@@ -70,6 +97,7 @@ class McpTransportPort(Protocol):
     def run(
         self,
         *,
+        system_guidance: str,
         tools: Sequence[ToolDefinition],
         dispatch: ToolDispatch,
     ) -> None: ...
@@ -77,6 +105,9 @@ class McpTransportPort(Protocol):
 
 __all__ = [
     "AuthoritativeFindingsPort",
+    "ConfirmationClockPort",
+    "ConfirmationSignerPort",
+    "ConfirmationStorePort",
     "ContextApiPort",
     "McpTransportPort",
     "ToolDispatch",

@@ -40,10 +40,15 @@ class ToolPortError(ContextMcpError):
     code = "authoritative_port_rejected"
 
 
+class ToolConfirmationError(ContextMcpError):
+    code = "confirmation_rejected"
+
+
 __all__ = [
     "ContextMcpError",
     "ToolAuthenticationError",
     "ToolAuthorizationError",
+    "ToolConfirmationError",
     "ToolGroundingError",
     "ToolInputError",
     "ToolNotFoundError",

@@ -7,11 +7,36 @@ from athena_context.agent import ContextMcpServer
 from athena_context.agent.errors import (
     ToolAuthenticationError,
     ToolAuthorizationError,
+    ToolConfirmationError,
     ToolGroundingError,
     ToolInputError,
     ToolNotFoundError,
     ToolResponseTooLargeError,
 )
+from athena_context.agent.models import ManifestPatchOutput, ToolCallContext
+
+
+def _proposal_arguments(*, phase: str = "preview") -> dict[str, object]:
+    return {
+        "phase": phase,
+        "workload_id": WORKLOAD_ID,
+        "base_manifest_version": "1.1.0",
+        "proposed_manifest_version": "1.1.1",
+        "profile_id": "production",
+        "draft_id": "risk-proposal",
+        "idempotency_key": "risk-proposal-create",
+        "reason": "Propose a bounded synthetic residual-risk statement",
+        "operations": [
+            {
+                "op": "replace",
+                "path": (
+                    "/profiles/production/riskAcceptances/0/"
+                    "residualRiskStatement"
+                ),
+                "value": "Synthetic residual risk remains subject to human review.",
+            }
+        ],
+    }
 
 
 def test_unknown_tool_cross_workload_and_unverified_context_fail_closed(
@@ -54,6 +79,7 @@ def test_prompt_injection_strings_are_rejected(
     value: str,
 ) -> None:
     arguments = {
+        "phase": "preview",
         "workload_id": WORKLOAD_ID,
         "base_manifest_version": "1.1.0",
         "proposed_manifest_version": "1.1.1",
@@ -100,6 +126,7 @@ def test_arbitrary_query_fields_and_unapproved_patch_paths_are_rejected(
         harness.server.call_tool(
             "propose_manifest_patch",
             {
+                "phase": "preview",
                 "workload_id": WORKLOAD_ID,
                 "base_manifest_version": "1.1.0",
                 "proposed_manifest_version": "1.1.1",
@@ -145,6 +172,7 @@ def test_patch_count_and_input_output_byte_bounds_fail_closed(
         harness.server.call_tool(
             "propose_manifest_patch",
             {
+                "phase": "preview",
                 "workload_id": WORKLOAD_ID,
                 "base_manifest_version": "1.1.0",
                 "proposed_manifest_version": "1.1.1",
@@ -160,6 +188,9 @@ def test_patch_count_and_input_output_byte_bounds_fail_closed(
     tiny_output_server = ContextMcpServer(
         context_api=harness.service,
         findings=harness.findings,
+        confirmation_signer=harness.confirmation_signer,
+        confirmation_store=harness.confirmation_store,
+        confirmation_clock=harness.confirmation_clock,
         max_output_bytes=256,
     )
     with pytest.raises(ToolResponseTooLargeError, match="byte bound"):
@@ -201,44 +232,154 @@ def test_fabricated_finding_reference_is_rejected_before_explanation(
         )
 
 
-def test_risk_statement_patch_stays_a_draft_and_is_idempotent(
+def test_preview_creates_no_draft_and_confirmation_is_one_time(
     harness: Harness,
 ) -> None:
-    arguments = {
-        "workload_id": WORKLOAD_ID,
-        "base_manifest_version": "1.1.0",
-        "proposed_manifest_version": "1.1.1",
-        "profile_id": "production",
-        "draft_id": "risk-proposal",
-        "idempotency_key": "risk-proposal-create",
-        "reason": "Propose a bounded synthetic residual-risk statement",
-        "operations": [
-            {
-                "op": "replace",
-                "path": (
-                    "/profiles/production/riskAcceptances/0/"
-                    "residualRiskStatement"
-                ),
-                "value": "Synthetic residual risk remains subject to human review.",
-            }
-        ],
+    arguments = _proposal_arguments()
+    drafts_before = len(
+        harness.service.list_drafts(
+            harness.context.authentication.actor,
+            manifest_id=WORKLOAD_ID,
+        )
+    )
+    preview = harness.server.call_tool(
+        "propose_manifest_patch",
+        arguments,
+        harness.context,
+    )
+    assert isinstance(preview, ManifestPatchOutput)
+    assert preview.phase == "preview"
+    assert preview.confirmation is not None
+    assert preview.draft is None
+    assert len(
+        harness.service.list_drafts(
+            harness.context.authentication.actor,
+            manifest_id=WORKLOAD_ID,
+        )
+    ) == drafts_before
+
+    confirmed_arguments = {
+        **arguments,
+        "phase": "confirm",
+        "confirmation_token": preview.confirmation.token,
     }
-
-    first = harness.server.call_tool(
+    confirmed = harness.server.call_tool(
         "propose_manifest_patch",
-        arguments,
-        harness.context,
-    )
-    replay = harness.server.call_tool(
-        "propose_manifest_patch",
-        arguments,
+        confirmed_arguments,
         harness.context,
     )
 
-    assert first == replay
-    assert first.state == "draft"
-    assert first.requires_human_review is True
-    assert first.publication_allowed is False
-    assert first.changed_paths == (
+    assert isinstance(confirmed, ManifestPatchOutput)
+    assert confirmed.phase == "confirmed"
+    assert confirmed.draft is not None
+    assert confirmed.draft.state == "draft"
+    assert confirmed.preview.requires_human_review is True
+    assert confirmed.preview.publication_allowed is False
+    assert tuple(item.value for item in confirmed.preview.changed_paths) == (
         "/profiles/production/riskAcceptances/0/residualRiskStatement",
     )
+    with pytest.raises(ToolConfirmationError, match="already consumed"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            confirmed_arguments,
+            harness.context,
+        )
+
+
+def test_confirmation_rejects_tampered_patch_and_expiry(harness: Harness) -> None:
+    arguments = _proposal_arguments()
+    preview = harness.server.call_tool(
+        "propose_manifest_patch",
+        arguments,
+        harness.context,
+    )
+    assert isinstance(preview, ManifestPatchOutput)
+    assert preview.confirmation is not None
+    invalid_token = (
+        ("A" if preview.confirmation.token[0] != "A" else "B")
+        + preview.confirmation.token[1:]
+    )
+    with pytest.raises(ToolConfirmationError, match="token is invalid"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            {
+                **arguments,
+                "phase": "confirm",
+                "confirmation_token": invalid_token,
+            },
+            harness.context,
+        )
+    tampered = {
+        **arguments,
+        "phase": "confirm",
+        "confirmation_token": preview.confirmation.token,
+        "reason": "Propose a different bounded synthetic statement",
+    }
+
+    with pytest.raises(ToolConfirmationError, match="binding"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            tampered,
+            harness.context,
+        )
+
+    harness.confirmation_clock.advance(301)
+    with pytest.raises(ToolConfirmationError, match="expiry"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            {
+                **arguments,
+                "phase": "confirm",
+                "confirmation_token": preview.confirmation.token,
+            },
+            harness.context,
+        )
+
+
+def test_confirmation_rejects_cross_user_and_cross_workload(
+    harness: Harness,
+) -> None:
+    arguments = _proposal_arguments()
+    preview = harness.server.call_tool(
+        "propose_manifest_patch",
+        arguments,
+        harness.context,
+    )
+    assert isinstance(preview, ManifestPatchOutput)
+    assert preview.confirmation is not None
+    confirmation = {
+        **arguments,
+        "phase": "confirm",
+        "confirmation_token": preview.confirmation.token,
+    }
+    other_user = ToolCallContext(
+        authentication=harness.context.authentication.model_copy(
+            update={"subject_id": "different-synthetic-subject"}
+        ),
+        authorized_workload_ids=harness.context.authorized_workload_ids,
+    )
+
+    with pytest.raises(ToolConfirmationError, match="identity"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            confirmation,
+            other_user,
+        )
+
+    cross_workload_context = harness.context.model_copy(
+        update={
+            "authorized_workload_ids": (
+                WORKLOAD_ID,
+                "wl-synthetic-other",
+            )
+        }
+    )
+    with pytest.raises(ToolConfirmationError, match="workload"):
+        harness.server.call_tool(
+            "propose_manifest_patch",
+            {
+                **confirmation,
+                "workload_id": "wl-synthetic-other",
+            },
+            cross_workload_context,
+        )
