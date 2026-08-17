@@ -19,11 +19,13 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationResult,
     EvaluationAuthorityToken,
     McpReadAssignment,
+    OperatorDeploymentApproval,
     PublishedContextSelection,
     ResolvedPublishedContext,
     SealedTrustedKeyAuthority,
     TrustedKeyAuthorityToken,
     VerifiedWc008DeploymentConfiguration,
+    Wc008DeploymentOutputAssertion,
     build_authorized_publication,
     build_demo_evaluation_result,
 )
@@ -34,6 +36,7 @@ from athena_context.contracts import (
     TrustedKeyAnchor,
     TrustedKeyRecord,
     TrustedKeyResolver,
+    canonicalize_json,
     compute_artifact_digest,
 )
 from athena_context.evidence import (
@@ -50,6 +53,77 @@ class SnapshotSigningRequest:
     canonical_preimage: bytes
     preimage_digest: str
     trusted_key_anchor: TrustedKeyAnchor
+
+
+@dataclass(frozen=True, slots=True)
+class SealedMcpTransportConfiguration:
+    """Exact primitive WC-008 configuration consumed by MCP transport I/O."""
+
+    configuration_json: str
+    private_mcp_endpoint: str
+
+
+def seal_mcp_transport_configuration(
+    configuration: VerifiedWc008DeploymentConfiguration,
+) -> tuple[
+    VerifiedWc008DeploymentConfiguration,
+    SealedMcpTransportConfiguration,
+]:
+    """Reject polymorphic configuration and copy it into exact base models."""
+
+    if (
+        type(configuration) is not VerifiedWc008DeploymentConfiguration
+        or type(configuration.assertion) is not Wc008DeploymentOutputAssertion
+        or type(configuration.operator_approval) is not OperatorDeploymentApproval
+    ):
+        raise ValueError(
+            "MCP transport configuration must use exact verified WC-008 base models"
+        )
+    configuration_json = canonicalize_json(
+        configuration.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    )
+    if type(configuration_json) is not str:
+        raise ValueError("MCP transport configuration did not produce primitive JSON")
+    normalized = VerifiedWc008DeploymentConfiguration.model_validate_json(
+        configuration_json
+    )
+    normalized_json = canonicalize_json(
+        normalized.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    )
+    endpoint = normalized.assertion.azure_mcp_internal_endpoint
+    if type(normalized_json) is not str or type(endpoint) is not str:
+        raise ValueError("MCP transport configuration contains non-primitive state")
+    return normalized, SealedMcpTransportConfiguration(
+        configuration_json=str.__str__(normalized_json),
+        private_mcp_endpoint=str.__str__(endpoint),
+    )
+
+
+def sealed_mcp_transport_configuration_primitives(
+    configuration: SealedMcpTransportConfiguration,
+) -> tuple[str, str]:
+    """Extract exact strings without invoking subclass equality or properties."""
+
+    if (
+        type(configuration) is not SealedMcpTransportConfiguration
+        or type(configuration.configuration_json) is not str
+        or type(configuration.private_mcp_endpoint) is not str
+    ):
+        raise ValueError(
+            "MCP transport binding must use exact sealed primitive configuration"
+        )
+    return (
+        str.__str__(configuration.configuration_json),
+        str.__str__(configuration.private_mcp_endpoint),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +834,9 @@ class ConfiguredEvidenceClientPort(Protocol):
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration: ...
 
     @property
+    def transport_configuration(self) -> SealedMcpTransportConfiguration: ...
+
+    @property
     def trust_configuration(self) -> CollectorTrustConfiguration: ...
 
     @property
@@ -802,6 +879,7 @@ __all__ = [
     "PreparedEvaluationArtifact",
     "DemoEvaluationTrustConfiguration",
     "PublishedContextResolverPort",
+    "SealedMcpTransportConfiguration",
     "SnapshotSigningPort",
     "SnapshotSigningRequest",
     "StoredEvaluation",
@@ -810,6 +888,8 @@ __all__ = [
     "build_evaluation_collection_authority",
     "build_evaluation_evidence_binding_digest",
     "seal_evaluation_collection_authority",
+    "seal_mcp_transport_configuration",
+    "sealed_mcp_transport_configuration_primitives",
     "seal_timestamp_epoch_milliseconds",
     "TrustedWc008DeploymentConfigurationPort",
 ]

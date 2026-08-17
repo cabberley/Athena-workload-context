@@ -26,6 +26,10 @@ from athena_context.api.evaluation_domain import (
     Wc008DeploymentOutputAssertion,
     build_published_context_authority_token,
 )
+from athena_context.api.evaluation_ports import (
+    SealedMcpTransportConfiguration,
+    seal_mcp_transport_configuration,
+)
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
     TrustedKeyAnchor,
@@ -206,18 +210,34 @@ class PrivateMcpEvidenceTransport:
         deployment_configuration: VerifiedWc008DeploymentConfiguration,
         invoker: PrivateMcpInvokerPort,
     ) -> None:
-        self._deployment_configuration = deployment_configuration
+        try:
+            normalized, sealed = seal_mcp_transport_configuration(
+                deployment_configuration
+            )
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "private MCP transport requires an exact operator-verified "
+                "WC-008 configuration"
+            ) from exc
+        self._deployment_configuration = normalized
+        self._transport_configuration = sealed
         self._invoker = invoker
 
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
         return self._deployment_configuration
 
+    @property
+    def transport_configuration(self) -> SealedMcpTransportConfiguration:
+        """Return the same sealed primitives consumed by invoke()."""
+
+        return self._transport_configuration
+
     def invoke(self, request: EvidenceTransportRequest) -> McpTransportOutcome:
         if request.tool_name != AZURE_RESOURCE_INVENTORY_TOOL:
             raise ValueError("private MCP transport received an unsupported semantic tool")
         return self._invoker.invoke(
-            self._deployment_configuration.assertion.azure_mcp_internal_endpoint,
+            self._transport_configuration.private_mcp_endpoint,
             AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
             request,
         )
@@ -237,6 +257,10 @@ class Wc009EvidenceClientAdapter:
         key_resolver: TrustedKeyResolver,
         trusted_key_anchor: TrustedKeyAnchor,
     ) -> None:
+        if type(transport) is not PrivateMcpEvidenceTransport:
+            raise DemoEvaluationConfigurationError(
+                "WC-009 requires the exact endpoint-owning private MCP transport"
+            )
         self._transport = transport
         self._trust_configuration = trust_configuration
         self._key_resolver = key_resolver
@@ -254,6 +278,10 @@ class Wc009EvidenceClientAdapter:
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
         return self._transport.deployment_configuration
+
+    @property
+    def transport_configuration(self) -> SealedMcpTransportConfiguration:
+        return self._transport.transport_configuration
 
     @property
     def trust_configuration(self) -> CollectorTrustConfiguration:

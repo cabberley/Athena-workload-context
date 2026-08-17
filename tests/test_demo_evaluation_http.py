@@ -4,8 +4,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from athena_context.api import (
+    PrivateMcpEvidenceTransport,
     StaticTestAuthenticator,
     VerifiedAuthentication,
+    VerifiedWc008DeploymentConfiguration,
+    Wc009EvidenceClientAdapter,
     create_app,
 )
 from athena_context.api.domain import (
@@ -15,10 +18,15 @@ from athena_context.api.domain import (
     WorkloadGrantScope,
 )
 from athena_context.api.errors import DemoEvaluationConfigurationError
+from athena_context.api.evaluation_ports import (
+    seal_mcp_transport_configuration,
+)
 from wc013_support import (
     MCP_SERVICE_ACTOR,
     PUBLISHER,
+    ScenarioTransport,
     build_harness,
+    verified_deployment_configuration,
 )
 
 PUBLISHER_TOKEN = "synthetic-wc013-publisher-token"
@@ -106,6 +114,59 @@ def test_api_returns_snapshot_publication_record_and_exact_citations() -> None:
     assert replay.json() == body
     assert harness.transport.calls == 1
     assert harness.store.publication_count == 1
+
+
+def test_http_rejects_polymorphic_foreign_transport_before_any_side_effect() -> None:
+    """The endpoint actually consumed by WC-009 cannot masquerade via __eq__."""
+
+    class AlwaysEqualConfiguration(VerifiedWc008DeploymentConfiguration):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+    harness, client = _client()
+    foreign_base = verified_deployment_configuration(
+        "https://foreign-mcp.internal"
+    )
+    _, foreign_binding = seal_mcp_transport_configuration(foreign_base)
+    foreign_configuration = AlwaysEqualConfiguration.model_validate_json(
+        foreign_base.model_dump_json(by_alias=True)
+    )
+    rejected_invoker = ScenarioTransport()
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="exact operator-verified WC-008 configuration",
+    ):
+        PrivateMcpEvidenceTransport(
+            deployment_configuration=foreign_configuration,
+            invoker=rejected_invoker,
+        )
+
+    evidence_client = harness.dependencies.evidence_client
+    assert type(evidence_client) is Wc009EvidenceClientAdapter
+    transport = evidence_client._transport
+    transport._deployment_configuration = foreign_configuration
+    transport._transport_configuration = foreign_binding
+    idempotency_key = "wc013-http-polymorphic-foreign-endpoint"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert rejected_invoker.calls == 0
+    assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.publication_count == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
 
 
 def test_api_never_replays_cross_workload_receipt_after_access_revocation() -> None:

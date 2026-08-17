@@ -23,9 +23,12 @@ from athena_context.api.evaluation_domain import (
 )
 from athena_context.api.evaluation_ports import (
     ConfiguredEvidenceClientPort,
+    SealedMcpTransportConfiguration,
     SnapshotSigningPort,
     SnapshotSigningRequest,
     TrustedWc008DeploymentConfigurationPort,
+    seal_mcp_transport_configuration,
+    sealed_mcp_transport_configuration_primitives,
 )
 from athena_context.api.evaluation_snapshot import (
     finalize_signed_snapshot,
@@ -79,9 +82,21 @@ class DemoEvaluationService:
                 "WC-008 deployment configuration was not returned as an "
                 "operator-verified configuration by a trusted port"
             )
+        try:
+            normalized_configuration, transport_configuration = (
+                seal_mcp_transport_configuration(verified_configuration)
+            )
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "WC-008 deployment configuration must use exact verified "
+                "base models"
+            ) from exc
         self._context_service = context_service
         self._context_reader_actor = context_reader_actor
-        self._deployment_configuration = verified_configuration
+        self._deployment_configuration = normalized_configuration
+        self._transport_configuration: SealedMcpTransportConfiguration = (
+            transport_configuration
+        )
         self._evidence_client = evidence_client
         self._snapshot_signer = snapshot_signer
         self._clock = clock
@@ -110,14 +125,19 @@ class DemoEvaluationService:
         )
 
     def _validate_composition(self) -> None:
+        from athena_context.api.evaluation_adapters import (
+            Wc009EvidenceClientAdapter,
+        )
+
+        if type(self._evidence_client) is not Wc009EvidenceClientAdapter:
+            raise DemoEvaluationConfigurationError(
+                "demo evaluation requires the exact endpoint-bound WC-009 "
+                "evidence client adapter"
+            )
         configuration = self._deployment_configuration
         assertion = configuration.assertion
         trust = self._evidence_client.trust_configuration
-        if self._evidence_client.deployment_configuration != configuration:
-            raise DemoEvaluationConfigurationError(
-                "actual evidence transport is not bound to the trusted WC-008 "
-                "deployment assertion"
-            )
+        self._require_exact_transport_binding()
         if (
             trust.managed_identity_object_id
             != assertion.evidence_identity_object_id
@@ -138,12 +158,32 @@ class DemoEvaluationService:
             self._evidence_client.trusted_key_anchor
         )
 
+    def _require_exact_transport_binding(self) -> None:
+        try:
+            expected = sealed_mcp_transport_configuration_primitives(
+                self._transport_configuration
+            )
+            actual = sealed_mcp_transport_configuration_primitives(
+                self._evidence_client.transport_configuration
+            )
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "actual evidence transport does not expose an exact sealed "
+                "WC-008 configuration"
+            ) from exc
+        if actual != expected:
+            raise DemoEvaluationConfigurationError(
+                "actual evidence transport is not bound to the trusted WC-008 "
+                "deployment assertion"
+            )
+
     def evaluate(
         self,
         actor: Actor,
         idempotency_key: str,
         command: DemoEvaluationCommand,
     ) -> DemoEvaluationResult:
+        self._require_exact_transport_binding()
         prepared_request = (
             self._context_service._prepare_demo_evaluation_request(
                 orchestrator_capability=self.__orchestrator_capability,
@@ -274,6 +314,7 @@ class DemoEvaluationService:
         """Test seam before ContextService opens its authoritative transaction."""
 
     def _collect(self, command: DemoEvaluationCommand) -> CollectedEvidence:
+        self._require_exact_transport_binding()
         assertion = self._deployment_configuration.assertion
         if not assertion.authorizes_inventory_scope(command.authorized_scope):
             raise EvidenceCollectionRejectedError(
@@ -341,10 +382,7 @@ class DemoEvaluationService:
 
     @property
     def _actual_private_mcp_endpoint(self) -> str:
-        return (
-            self._evidence_client.deployment_configuration.assertion
-            .azure_mcp_internal_endpoint
-        )
+        return self._transport_configuration.private_mcp_endpoint
 
     def get_result(self, actor: Actor, snapshot_id: str) -> DemoEvaluationResult:
         result = self._context_service.get_demo_evaluation_result(
