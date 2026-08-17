@@ -1,8 +1,14 @@
 import { act, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { bootstrapContextStudio } from './bootstrap'
 import { refreshCanonicalManifestDigests } from './canonical'
 import { canonicalManifestFixture, mockAuthSession } from './test/mockClient'
-import type { AuthPort, CanonicalWorkloadManifest, WirePublishedManifest } from './types'
+import type {
+  AuthPort,
+  CanonicalWorkloadManifest,
+  WireDraftRecord,
+  WirePublishedManifest,
+} from './types'
 
 const actor = { actor_id: mockAuthSession.actorId, kind: mockAuthSession.kind }
 const wirePublished: WirePublishedManifest = {
@@ -26,6 +32,19 @@ const wirePublished: WirePublishedManifest = {
   publication_authorized_by: { actor_id: 'athena-context-api', kind: 'service' },
   publication_authorized_at: '2026-08-17T00:00:00.000Z',
   reason: 'Synthetic startup publication.',
+}
+const wireDraft: WireDraftRecord = {
+  draft_id: 'draft-synthetic-canonical',
+  manifest_id: canonicalManifestFixture.manifestId,
+  state: 'draft',
+  revision: 1,
+  manifest: canonicalManifestFixture,
+  manifest_digest: canonicalManifestFixture.compatibility.artifactDigest,
+  created_by: actor,
+  created_at: '2026-08-17T00:00:00.000Z',
+  updated_by: actor,
+  updated_at: '2026-08-17T00:00:00.000Z',
+  reason: 'Synthetic production adapter draft.',
 }
 
 const response = (body: unknown): Response =>
@@ -86,6 +105,58 @@ describe('production startup', () => {
       }),
     ).rejects.toThrow(/authenticated session/i)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('uses the production cohort HTTP adapter and exposes the absent API dependency', async () => {
+    const authPort: AuthPort = {
+      acquireSession: vi.fn(async () => ({ ...mockAuthSession, role: 'proposer' as const })),
+      acquireAccessToken: vi.fn(async () => 'per-user-runtime-token'),
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void init
+      const url = String(input)
+      if (url.includes('/v1/drafts?')) return response([wireDraft])
+      if (url.includes('/v1/cohort-proposals?')) {
+        return new Response(JSON.stringify({
+          error: {
+            code: 'cohort_api_not_implemented',
+            message: 'Production cohort proposal endpoint is not implemented.',
+          },
+        }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return response([])
+    })
+    const rootElement = document.createElement('div')
+    document.body.append(rootElement)
+
+    let root: Awaited<ReturnType<typeof bootstrapContextStudio>>
+    await act(async () => {
+      root = await bootstrapContextStudio(
+        {
+          apiBaseUrl: 'https://context.invalid',
+          cohortApiBaseUrl: 'https://cohorts.invalid',
+          authPort,
+          fetchImpl: fetchMock as typeof fetch,
+        },
+        rootElement,
+      )
+    })
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Cohorts' }))
+
+    expect(await screen.findByText(/production cohort proposal endpoint is not implemented/i))
+      .toBeInTheDocument()
+    const cohortCall = fetchMock.mock.calls.find((call) =>
+      String(call[0]).startsWith('https://cohorts.invalid/v1/cohort-proposals?'),
+    )
+    expect(cohortCall).toBeDefined()
+    expect(String(cohortCall![0])).toContain('expected_revision=1')
+    expect(new Headers((cohortCall![1] as RequestInit).headers).get('Authorization'))
+      .toBe('Bearer per-user-runtime-token')
+    expect(screen.queryByText(/proposal-1111111111111111/i)).not.toBeInTheDocument()
+    await act(async () => root.unmount())
   })
 
   it('starts and renders an exact canonical exception relationship without endpoint fields', async () => {

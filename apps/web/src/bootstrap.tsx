@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import App from './App'
 import { createContextApiClient } from './client'
+import { createCohortProposalApiClient } from './cohortClient'
 import type { AuthSession, ContextStudioRuntime } from './types'
 
 const validSession = (session: AuthSession | null): session is AuthSession =>
@@ -53,6 +54,13 @@ export const bootstrapContextStudio = async (
     fetchImpl: runtime.fetchImpl,
     createId: runtime.createId,
   })
+  const cohortClient = createCohortProposalApiClient({
+    baseUrl: runtime.cohortApiBaseUrl ?? runtime.apiBaseUrl,
+    authPort: runtime.authPort,
+    session,
+    fetchImpl: runtime.fetchImpl,
+    createId: runtime.createId,
+  })
   const initialContexts = await client.loadAuthorizedWorkloads()
   if (initialContexts.length === 0) {
     throw new Error('The authenticated session has no active authorized workload context.')
@@ -60,7 +68,7 @@ export const bootstrapContextStudio = async (
 
   root.render(
     <StrictMode>
-      <App client={client} initialContexts={initialContexts} />
+      <App client={client} cohortClient={cohortClient} initialContexts={initialContexts} />
     </StrictMode>,
   )
   return root

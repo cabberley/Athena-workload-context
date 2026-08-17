@@ -25,7 +25,7 @@ export type DeclaredRelationshipType =
   | 'protectedBy'
   | 'prohibited'
 export type DraftState = 'draft' | 'validated' | 'in_review' | 'approved' | 'published' | 'superseded'
-export type AppRoute = 'overview' | 'catalogue' | 'manifest' | 'controls'
+export type AppRoute = 'overview' | 'cohorts' | 'catalogue' | 'manifest' | 'controls'
 export type ActorKind = 'human' | 'agent' | 'service'
 export type RoleName = 'proposer' | 'reviewer' | 'approver' | 'publisher' | 'reader' | 'auditor'
 
@@ -54,6 +54,7 @@ export interface AuthPort {
 
 export interface ContextStudioRuntime {
   apiBaseUrl: string
+  cohortApiBaseUrl?: string
   authPort: AuthPort
   fetchImpl?: typeof fetch
   createId?: () => string
@@ -246,11 +247,123 @@ export interface CanonicalManifestOwner {
   authorityRef: string
 }
 
+interface CanonicalSelectorBase {
+  selectorId: string
+  maxMatches: number
+}
+
+export interface CanonicalResourceIdListSelector extends CanonicalSelectorBase {
+  selectorType: 'resourceIdList'
+  resourceIds: string[]
+}
+
+export interface CanonicalTagPredicateSelector extends CanonicalSelectorBase {
+  selectorType: 'tagPredicate'
+  predicates: Array<{ key: string; value: string }>
+}
+
+export interface CanonicalNamePredicateSelector extends CanonicalSelectorBase {
+  selectorType: 'namePredicate'
+  prefix?: string
+  suffix?: string
+}
+
+export interface CanonicalResourceTypeSelector extends CanonicalSelectorBase {
+  selectorType: 'resourceType'
+  resourceType: string
+  locations: string[]
+  resourceGroups: string[]
+}
+
+export interface CanonicalVmssSelector extends CanonicalSelectorBase {
+  selectorType: 'vmScaleSet'
+  scaleSetResourceId: string
+  instanceIds: string[]
+}
+
+export interface CanonicalLoadBalancerBackendSelector extends CanonicalSelectorBase {
+  selectorType: 'loadBalancerBackend'
+  loadBalancerResourceId: string
+  backendPoolName: string
+}
+
+export interface CanonicalSubnetSelector extends CanonicalSelectorBase {
+  selectorType: 'subnet'
+  subnetResourceId: string
+}
+
+export interface CanonicalImageSelector extends CanonicalSelectorBase {
+  selectorType: 'image'
+  publisher: string
+  offer: string
+  sku: string
+  version?: string
+}
+
+export interface CanonicalProvenanceSelector extends CanonicalSelectorBase {
+  selectorType: 'provenance'
+  collectorToolName: string
+  collectorToolVersion: string
+  identityEvidenceRef: string
+}
+
+export type CanonicalAtomicSelector =
+  | CanonicalResourceIdListSelector
+  | CanonicalTagPredicateSelector
+  | CanonicalNamePredicateSelector
+  | CanonicalResourceTypeSelector
+  | CanonicalVmssSelector
+  | CanonicalLoadBalancerBackendSelector
+  | CanonicalSubnetSelector
+  | CanonicalImageSelector
+  | CanonicalProvenanceSelector
+
+export interface CanonicalCompositeAllSelector extends CanonicalSelectorBase {
+  selectorType: 'compositeAll'
+  children: CanonicalAtomicSelector[]
+}
+
+export interface CanonicalCompositeAnySelector extends CanonicalSelectorBase {
+  selectorType: 'compositeAny'
+  children: CanonicalAtomicSelector[]
+}
+
+export type CanonicalManifestSelector =
+  | CanonicalAtomicSelector
+  | CanonicalCompositeAllSelector
+  | CanonicalCompositeAnySelector
+
+export type CanonicalManifestCardinality =
+  | { cardinalityKind: 'exactlyOne' }
+  | { cardinalityKind: 'oneOrMore' }
+  | { cardinalityKind: 'zeroOrMore' }
+  | { cardinalityKind: 'boundedRange'; minimum: number; maximum: number }
+
+export interface CanonicalManifestRole {
+  roleId: string
+  kind:
+    | 'singletonDatabase'
+    | 'databaseReplica'
+    | 'worker'
+    | 'webService'
+    | 'loadBalancer'
+    | 'integrationEndpoint'
+    | 'storage'
+    | 'network'
+    | 'identity'
+    | 'observability'
+    | 'externalDependency'
+  cardinality: CanonicalManifestCardinality
+  selectors: CanonicalManifestSelector[]
+  ownerRef: string
+  status: 'approved' | 'deprecated'
+}
+
 export interface CanonicalManifestProfile {
   profileId: string
   profileType: EnvironmentName
   settings: JsonObject
-  roles: JsonObject[]
+  roles: CanonicalManifestRole[]
   relationships: CanonicalRelationship[]
   constraints: JsonObject[]
   controls: CanonicalControl[]
@@ -271,7 +384,7 @@ export interface CanonicalWorkloadManifest {
   cloud: string
   workload: CanonicalWorkloadIdentity
   profiles: Record<string, CanonicalManifestProfile>
-  roles: JsonObject[]
+  roles: CanonicalManifestRole[]
   relationships: CanonicalRelationship[]
   constraints: JsonObject[]
   controls: CanonicalControl[]
@@ -387,6 +500,7 @@ export interface ConcurrencyRequest {
   expectedManifestVersion: string
   expectedDigest: string
   reason: string
+  idempotencyKey?: string
 }
 
 export interface PublishRequest extends ConcurrencyRequest {

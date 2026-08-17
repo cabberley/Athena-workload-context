@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import CohortReview from './CohortReview'
 import { SupersessionRecoveryRequiredError } from './client'
+import type { CohortProposalApiPort } from './cohortTypes'
 import type {
   AppRoute,
   CanonicalWorkloadManifest,
@@ -33,10 +35,11 @@ const concurrencyRequest = (context: WorkloadContext, reason: string): Concurren
 
 interface AppProps {
   client: ContextApiClientPort
+  cohortClient: CohortProposalApiPort
   initialContexts: WorkloadContext[]
 }
 
-function App({ client, initialContexts }: AppProps) {
+function App({ client, cohortClient, initialContexts }: AppProps) {
   const initial = initialContexts[0]!
   const [route, setRoute] = useState<AppRoute>('overview')
   const [contexts, setContexts] = useState(() => new Map(initialContexts.map((context) => [context.workloadId, context])))
@@ -306,7 +309,7 @@ function App({ client, initialContexts }: AppProps) {
       </header>
 
       <nav className="primary-nav" aria-label="Primary navigation">
-        {(['overview', 'catalogue', 'manifest', 'controls'] as AppRoute[]).map((item) => (
+        {(['overview', 'cohorts', 'catalogue', 'manifest', 'controls'] as AppRoute[]).map((item) => (
           <button
             key={item}
             type="button"
@@ -457,6 +460,16 @@ function App({ client, initialContexts }: AppProps) {
             </section>
           )}
 
+          {route === 'cohorts' && (
+            <CohortReview
+              context={workloadContext}
+              contextClient={client}
+              cohortClient={cohortClient}
+              onContextChange={applyContext}
+              headingRef={routeHeadingRef}
+            />
+          )}
+
           {route === 'manifest' && (
             <section className="panel editor-panel" aria-labelledby="manifest-heading">
               <div className="panel-heading">
@@ -560,6 +573,29 @@ function App({ client, initialContexts }: AppProps) {
           )}
         </div>
 
+        {route === 'cohorts' && (
+          <aside className="panel review-panel" aria-label="Cohort review guardrails">
+            <div className="panel-kicker">Draft-only boundary</div>
+            <h2>Cohort review guardrails</h2>
+            <p>
+              Cohort proposals are inferred from observed evidence. They never become declared
+              authority until a human explicitly writes bounded selectors to a WC-007 draft.
+            </p>
+            <dl className="summary-list">
+              <div><dt>Actor</dt><dd>{client.auth.userLabel}</dd></div>
+              <div><dt>Role</dt><dd>{client.auth.role}</dd></div>
+              <div><dt>Environment</dt><dd>{displayEnvironment(workloadContext.environment)}</dd></div>
+              <div><dt>Manifest</dt><dd>{workloadContext.manifestVersion}</dd></div>
+              <div><dt>Approval</dt><dd>{currentDraft?.state ?? workloadContext.approvalState}</dd></div>
+            </dl>
+            <p className="source-note">
+              This flow can update a draft with exact revision, digest, and idempotency. It cannot
+              validate, approve, or publish a manifest.
+            </p>
+          </aside>
+        )}
+
+        {route !== 'cohorts' && (
         <aside className="panel review-panel" aria-label="Draft review and publication">
           <div className="panel-kicker">Lifecycle state</div>
           <h2>Explicit human review</h2>
@@ -620,6 +656,7 @@ function App({ client, initialContexts }: AppProps) {
             </small>
           </div>
         </aside>
+        )}
       </main>
     </div>
   )
