@@ -91,7 +91,17 @@ export interface ReviewSubmission {
   submittedBy: Actor
   submittedAt: string
   submittedRevision: number
+  publicationCandidateDigest: string
   reason: string
+}
+
+export interface PublicationCandidate {
+  finalizedBy: Actor
+  finalizedAt: string
+  manifestVersion: string
+  manifestDigest: string
+  semanticDigest: string
+  approvalStatus: 'approved'
 }
 
 export interface ApprovalDecision {
@@ -119,6 +129,7 @@ export interface DraftRecord {
   reason: string
   validation: ValidationRecord | null
   review: ReviewSubmission | null
+  publicationCandidate: PublicationCandidate | null
   approval: ApprovalDecision | null
 }
 
@@ -126,12 +137,15 @@ export interface PublishedManifest {
   manifestId: string
   manifestVersion: string
   manifestDigest: string
+  manifest: ManifestDraft
   sourceDraftId: string
   sourceDraftRevision: number
   previousVersion: string | null
   approval: ApprovalDecision
   publishedBy: Actor
   publishedAt: string
+  publicationAuthorizedBy: Actor
+  publicationAuthorizedAt: string
   reason: string
 }
 
@@ -156,14 +170,14 @@ export interface WorkloadContext {
 }
 
 export interface PublishRequest {
-  workloadId: string
   draftId: string
-  manifestId: string
   expectedRevision: number
   expectedManifestVersion: string
   expectedDigest: string
   approvalId: string
   reason: string
+  workloadId?: string
+  manifestId?: string
 }
 
 export interface ContextApiClientPort {

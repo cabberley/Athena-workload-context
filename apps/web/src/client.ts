@@ -107,6 +107,7 @@ export const createContextApiClient = (): ContextApiClientPort => ({
       reason,
       validation: null,
       review: null,
+      publicationCandidate: null,
       approval: null,
     }
 
@@ -146,6 +147,7 @@ export const createContextApiClient = (): ContextApiClientPort => ({
       reason,
       validation: null,
       review: null,
+      publicationCandidate: null,
       approval: null,
       state: 'draft',
     }
@@ -179,6 +181,7 @@ export const createContextApiClient = (): ContextApiClientPort => ({
         validatedRevision: current.revision + 1,
         manifestDigest: current.manifestDigest,
       },
+      publicationCandidate: null,
     }
     draftStore.set(draftId, updated)
     return updated
@@ -206,8 +209,10 @@ export const createContextApiClient = (): ContextApiClientPort => ({
         submittedBy: buildActor('proposer'),
         submittedAt: currentIso(),
         submittedRevision: current.revision + 1,
+        publicationCandidateDigest: current.manifestDigest,
         reason,
       },
+      publicationCandidate: null,
     }
     draftStore.set(draftId, updated)
     return updated
@@ -233,6 +238,14 @@ export const createContextApiClient = (): ContextApiClientPort => ({
       manifestDigest: current.manifestDigest,
       reason,
     }
+    const publicationCandidate = {
+      finalizedBy: buildActor('approver'),
+      finalizedAt: currentIso(),
+      manifestVersion: current.manifest.manifestVersion,
+      manifestDigest: current.manifestDigest,
+      semanticDigest: current.manifestDigest,
+      approvalStatus: 'approved' as const,
+    }
     const updated: DraftRecord = {
       ...current,
       state: 'approved',
@@ -241,25 +254,29 @@ export const createContextApiClient = (): ContextApiClientPort => ({
       updatedAt: currentIso(),
       reason,
       approval,
+      publicationCandidate,
     }
     draftStore.set(draftId, updated)
     return updated
   },
   publishDraft: async ({
-    workloadId,
     draftId,
-    manifestId,
     expectedRevision,
     expectedManifestVersion,
     expectedDigest,
     approvalId,
     reason,
+    workloadId,
+    manifestId,
   }) => {
     const draft = draftStore.get(draftId)
     if (!draft) {
       throw new Error('Draft not found before publication.')
     }
-    if (draft.manifestId !== manifestId || workloadId !== manifestId) {
+    if (manifestId && draft.manifestId !== manifestId) {
+      throw new Error('Workload identity mismatch prevented publication.')
+    }
+    if (workloadId && manifestId && workloadId !== manifestId) {
       throw new Error('Workload identity mismatch prevented publication.')
     }
     if (draft.revision !== expectedRevision) {
@@ -279,15 +296,18 @@ export const createContextApiClient = (): ContextApiClientPort => ({
     }
 
     const published: PublishedManifest = {
-      manifestId,
+      manifestId: draft.manifestId,
       manifestVersion: draft.manifest.manifestVersion,
       manifestDigest: draft.manifestDigest,
+      manifest: draft.manifest,
       sourceDraftId: draftId,
       sourceDraftRevision: draft.revision + 1,
       previousVersion: null,
       approval: draft.approval,
       publishedBy: buildActor('publisher'),
       publishedAt: currentIso(),
+      publicationAuthorizedBy: buildActor('publisher'),
+      publicationAuthorizedAt: currentIso(),
       reason,
     }
 
@@ -301,7 +321,7 @@ export const createContextApiClient = (): ContextApiClientPort => ({
     }
 
     draftStore.set(draftId, updatedDraft)
-    publishedStore.set(workloadId, published)
+    publishedStore.set(draft.manifestId, published)
     return published
   },
 })

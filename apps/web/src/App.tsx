@@ -181,14 +181,14 @@ function App() {
         throw new Error('Publication requires a server-derived approval record.')
       }
       const published = await apiClient.publishDraft({
-        workloadId: selectedWorkloadId,
         draftId: currentDraft.draftId,
-        manifestId: currentDraft.manifestId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
         approvalId: currentDraft.approval.decisionId,
         reason: 'Publish the approved manifest version.',
+        workloadId: selectedWorkloadId,
+        manifestId: currentDraft.manifestId,
       })
       await refreshCurrentWorkload()
       setStatusMessage(`Manifest ${published.manifestVersion} is live for ${published.manifestId}.`)
