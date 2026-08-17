@@ -194,9 +194,109 @@ export interface PublishRequest {
 }
 
 export interface ContextApiClientOptions {
-  baseUrl?: string
-  auth?: AuthState
+  baseUrl: string
+  auth: AuthState
   fetchImpl?: typeof fetch
+}
+
+export interface WireActor {
+  actor_id: string
+  kind: 'human' | 'agent' | 'service'
+}
+
+export interface WireCompatibility {
+  artifact_kind: 'workloadManifest'
+  artifact_digest: string
+  semantic_digest: string
+  schema_version: string
+  semantic_contract_version: string
+  policy_contract_version: string
+  minimum_reader_version: string
+  requires_capabilities: string[]
+}
+
+export interface WireManifest {
+  manifestId: string
+  manifestVersion: string
+  workloadName: string
+  environment: EnvironmentName
+  businessOwner: string
+  runbook: string
+  requiredRelationships: string[]
+  optionalRelationships: string[]
+  controls: ControlRecord[]
+  riskAcceptances: RiskAcceptance[]
+  manifestDigest?: string
+  compatibility?: CompatibilityMetadata
+}
+
+export interface WireDraftRecord {
+  draft_id: string
+  manifest_id: string
+  state: DraftState
+  revision: number
+  manifest: WireManifest
+  manifest_digest: string
+  previous_version: string | null
+  created_by: WireActor
+  created_at: string
+  updated_by: WireActor
+  updated_at: string
+  reason: string
+  validation: {
+    validated_by: WireActor
+    validated_at: string
+    validated_revision: number
+    manifest_digest: string
+  } | null
+  review: {
+    submitted_by: WireActor
+    submitted_at: string
+    submitted_revision: number
+    publication_candidate_digest: string
+    reason: string
+  } | null
+  publication_candidate: {
+    finalized_by: WireActor
+    finalized_at: string
+    manifest_version: string
+    manifest_digest: string
+    semantic_digest: string
+    approval_status: 'approved'
+  } | null
+  approval: {
+    decision_id: string
+    approved_by: WireActor
+    approved_at: string
+    approved_revision: number
+    manifest_version: string
+    manifest_digest: string
+    reason: string
+  } | null
+}
+
+export interface WirePublishedManifest {
+  manifest_id: string
+  manifest_version: string
+  manifest_digest: string
+  manifest: WireManifest
+  source_draft_id: string
+  source_draft_revision: number
+  previous_version: string | null
+  approval: {
+    decision_id: string
+    approved_by: WireActor
+    approved_at: string
+    approved_revision: number
+    manifest_version: string
+    manifest_digest: string
+    reason: string
+  }
+  published_by: WireActor
+  published_at: string
+  publication_authorized_by: WireActor
+  publication_authorized_at: string
+  reason: string
 }
 
 export interface ContextApiClientPort {

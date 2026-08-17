@@ -1,5 +1,4 @@
-import { useState } from 'react'
-import { createContextApiClient } from './client'
+import { useEffect, useMemo, useState } from 'react'
 import type { AppRoute, ContextApiClientPort, ManifestDraft, WorkloadContext } from './types'
 import './App.css'
 
@@ -11,18 +10,53 @@ const cloneManifest = (context: WorkloadContext): ManifestDraft => ({
   riskAcceptances: context.manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
 })
 
-function App({ client = createContextApiClient() }: { client?: ContextApiClientPort }) {
-  const apiClient = client
+const bumpVersion = (value: string): string => {
+  const match = /^([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(value.trim())
+  if (!match) {
+    return value
+  }
+  const [, major, minor, patch] = match
+  return `${Number(major)}.${Number(minor)}.${Number(patch) + 1}`
+}
+
+function App({ client }: { client: ContextApiClientPort }) {
   const [route, setRoute] = useState<AppRoute>('overview')
   const [selectedWorkloadId, setSelectedWorkloadId] = useState('atlas-api')
-  const [workloadContext, setWorkloadContext] = useState<WorkloadContext>(() =>
-    apiClient.loadWorkloadSync('atlas-api'),
-  )
-  const [draftForm, setDraftForm] = useState<ManifestDraft>(() =>
-    cloneManifest(apiClient.loadWorkloadSync('atlas-api')),
-  )
-  const [statusMessage, setStatusMessage] = useState('Ready to create or reload a draft.')
+  const [workloadContext, setWorkloadContext] = useState<WorkloadContext | null>(() => {
+    try {
+      return client.loadWorkloadSync('atlas-api')
+    } catch {
+      return null
+    }
+  })
+  const [draftForm, setDraftForm] = useState<ManifestDraft | null>(() => {
+    try {
+      const initial = client.loadWorkloadSync('atlas-api')
+      return cloneManifest(initial)
+    } catch {
+      return null
+    }
+  })
+  const [statusMessage, setStatusMessage] = useState('Ready to create a draft or load the selected workload.')
   const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (workloadContext) {
+      setDraftForm(cloneManifest(workloadContext))
+    }
+  }, [workloadContext])
+
+  const currentDraft = workloadContext?.draft ?? null
+  const publishDisabled =
+    busy ||
+    !currentDraft ||
+    currentDraft.state !== 'approved' ||
+    !currentDraft.approval ||
+    selectedWorkloadId !== currentDraft.manifestId
+
+  const validateDisabled = busy || !currentDraft || currentDraft.state !== 'draft'
+  const submitDisabled = busy || !currentDraft || currentDraft.state !== 'validated'
+  const approveDisabled = busy || !currentDraft || currentDraft.state !== 'in_review'
 
   const applyContext = (nextContext: WorkloadContext) => {
     setSelectedWorkloadId(nextContext.workloadId)
@@ -30,74 +64,72 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
     setDraftForm(cloneManifest(nextContext))
   }
 
+  const refreshCurrentWorkload = async (nextWorkloadId = selectedWorkloadId) => {
+    const nextContext = await client.reloadWorkload(nextWorkloadId)
+    applyContext(nextContext)
+    return nextContext
+  }
+
   const handleSelectWorkload = async (nextWorkloadId: string) => {
     setBusy(true)
     try {
-      const nextContext = await apiClient.loadWorkloadContext(nextWorkloadId)
+      const nextContext = await client.loadWorkloadContext(nextWorkloadId)
       applyContext(nextContext)
       setStatusMessage(`Loaded ${nextContext.manifest.workloadName} context.`)
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : `Unable to load workload ${nextWorkloadId}.`,
-      )
+      setStatusMessage(error instanceof Error ? error.message : `Unable to load workload ${nextWorkloadId}.`)
     } finally {
       setBusy(false)
     }
   }
 
-  const refreshCurrentWorkload = async (nextWorkloadId = selectedWorkloadId) => {
-    const nextContext = await apiClient.reloadWorkload(nextWorkloadId)
-    applyContext(nextContext)
-    return nextContext
-  }
-
   const updateField = <K extends keyof ManifestDraft>(field: K, value: ManifestDraft[K]) => {
-    setDraftForm((current) => ({ ...current, [field]: value }))
+    setDraftForm((current) => {
+      if (!current) {
+        return current
+      }
+      return { ...current, [field]: value }
+    })
   }
 
-  const updateRelationshipList = (
-    field: 'requiredRelationships' | 'optionalRelationships',
-    value: string,
-  ) => {
-    setDraftForm((current) => ({
-      ...current,
-      [field]: value
-        .split(/\r?\n/)
-        .map((item) => item.trim())
-        .filter(Boolean),
-    }))
+  const updateRelationshipList = (field: 'requiredRelationships' | 'optionalRelationships', value: string) => {
+    setDraftForm((current) => {
+      if (!current) {
+        return current
+      }
+      return {
+        ...current,
+        [field]: value
+          .split(/\r?\n/)
+          .map((item) => item.trim())
+          .filter(Boolean),
+      }
+    })
   }
 
   const saveDraft = async () => {
+    if (!draftForm || !workloadContext) {
+      setStatusMessage('No draft content is currently loaded.')
+      return
+    }
     setBusy(true)
     try {
-      const currentDraft = workloadContext.draft
-      if (currentDraft?.state === 'published') {
-        throw new Error('Published manifests are immutable. Create a new draft version before editing.')
-      }
       if (!currentDraft) {
-        const created = await apiClient.createDraft(
-          selectedWorkloadId,
-          { ...draftForm, manifestDigest: draftForm.manifestDigest ?? workloadContext.manifest.manifestDigest ?? workloadContext.manifestVersion },
-          'Create draft from the structured editor.',
-        )
-        await refreshCurrentWorkload()
+        const created = await client.createDraft(selectedWorkloadId, draftForm, 'Create draft from the structured manifest editor.')
+        await refreshCurrentWorkload(selectedWorkloadId)
         setStatusMessage(`Draft ${created.draftId} created. Revision ${created.revision}.`)
         return
       }
 
-      const updated = await apiClient.updateDraft({
+      const updated = await client.updateDraft({
         draftId: currentDraft.draftId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
-        replacementManifest: {
-          ...draftForm,
-          manifestDigest: currentDraft.manifestDigest,
-        },
-        reason: 'Save manifest changes with optimistic concurrency checks.',
+        replacementManifest: draftForm,
+        reason: 'Save the manifest with optimistic concurrency checks.',
       })
-      await refreshCurrentWorkload()
+      await refreshCurrentWorkload(selectedWorkloadId)
       setStatusMessage(`Draft ${updated.draftId} saved. Revision ${updated.revision}.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Unable to save the draft.')
@@ -107,18 +139,21 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
   }
 
   const createDraftVersion = async () => {
+    if (!workloadContext || !draftForm) {
+      setStatusMessage('No manifest context is currently loaded.')
+      return
+    }
     setBusy(true)
     try {
-      const sourceManifest = workloadContext.published?.manifest ?? workloadContext.manifest
-      const created = await apiClient.createDraft(
-        selectedWorkloadId,
-        {
-          ...cloneManifest({ ...workloadContext, manifest: sourceManifest }),
-          manifestDigest: sourceManifest.manifestDigest ?? sourceManifest.compatibility?.artifactDigest ?? workloadContext.manifestVersion,
-        },
-        'Create a new draft version from the current published or working manifest.',
-      )
-      await refreshCurrentWorkload()
+      const source = workloadContext.published?.manifest ?? workloadContext.manifest
+      const nextVersion = bumpVersion(source.manifestVersion)
+      const nextManifest: ManifestDraft = {
+        ...source,
+        manifestVersion: nextVersion,
+        manifestDigest: source.manifestDigest ?? source.compatibility?.artifactDigest,
+      }
+      const created = await client.createDraft(selectedWorkloadId, nextManifest, 'Create a new draft version from the active published manifest.')
+      await refreshCurrentWorkload(selectedWorkloadId)
       setStatusMessage(`Draft version ${created.draftId} created. Revision ${created.revision}.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Unable to create a new draft version.')
@@ -128,20 +163,20 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
   }
 
   const validateDraft = async () => {
+    if (!currentDraft) {
+      setStatusMessage('Create a draft before validation.')
+      return
+    }
     setBusy(true)
     try {
-      const currentDraft = workloadContext.draft
-      if (!currentDraft) {
-        throw new Error('Create a draft before validation.')
-      }
-      const validated = await apiClient.validateDraft({
+      const validated = await client.validateDraft({
         draftId: currentDraft.draftId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
-        reason: 'Validate the structured manifest.',
+        reason: 'Validate the structured manifest and confirm the digest matches the current draft.',
       })
-      await refreshCurrentWorkload()
+      await refreshCurrentWorkload(selectedWorkloadId)
       setStatusMessage(`Validation checks passed for ${validated.draftId}.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Validation failed.')
@@ -151,21 +186,21 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
   }
 
   const submitForReview = async () => {
+    if (!currentDraft) {
+      setStatusMessage('Create a draft before review submission.')
+      return
+    }
     setBusy(true)
     try {
-      const currentDraft = workloadContext.draft
-      if (!currentDraft) {
-        throw new Error('Create a draft before submission.')
-      }
-      const submitted = await apiClient.submitForReview({
+      const submitted = await client.submitForReview({
         draftId: currentDraft.draftId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
-        reason: 'Submit ready-for-review draft.',
+        reason: 'Submit the validated draft for human review.',
       })
-      await refreshCurrentWorkload()
-      setStatusMessage(`Review submission accepted. Draft is in review for ${submitted.draftId}.`)
+      await refreshCurrentWorkload(selectedWorkloadId)
+      setStatusMessage(`Review submission accepted. Draft ${submitted.draftId} is in review.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Submission failed.')
     } finally {
@@ -174,20 +209,20 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
   }
 
   const approveDraft = async () => {
+    if (!currentDraft) {
+      setStatusMessage('Create a draft before approval.')
+      return
+    }
     setBusy(true)
     try {
-      const currentDraft = workloadContext.draft
-      if (!currentDraft) {
-        throw new Error('Create a draft before approval.')
-      }
-      const approved = await apiClient.approveDraft({
+      const approved = await client.approveDraft({
         draftId: currentDraft.draftId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
-        reason: 'Human approval granted by the server-authorized role.',
+        reason: 'Approve the draft for publication using the server-authoritative approval decision.',
       })
-      await refreshCurrentWorkload()
+      await refreshCurrentWorkload(selectedWorkloadId)
       setStatusMessage(`Approval record ${approved.approval?.decisionId ?? 'created'} is ready for publication.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Approval failed.')
@@ -197,27 +232,28 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
   }
 
   const publishDraft = async () => {
+    if (!currentDraft) {
+      setStatusMessage('Create a draft before publication.')
+      return
+    }
+    if (!currentDraft.approval) {
+      setStatusMessage('Publication requires a server-derived approval record.')
+      return
+    }
     setBusy(true)
     try {
-      const currentDraft = workloadContext.draft
-      if (!currentDraft) {
-        throw new Error('Create a draft before publication.')
-      }
-      if (!currentDraft.approval) {
-        throw new Error('Publication requires a server-derived approval record.')
-      }
-      const published = await apiClient.publishDraft({
+      const published = await client.publishDraft({
         draftId: currentDraft.draftId,
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
         approvalId: currentDraft.approval.decisionId,
-        reason: 'Publish the approved manifest version.',
+        reason: 'Publish the approved manifest version to the authoritative registry.',
         workloadId: selectedWorkloadId,
         manifestId: currentDraft.manifestId,
       })
-      await refreshCurrentWorkload()
-      setStatusMessage(`Manifest ${published.manifestVersion} is live for ${published.manifestId}.`)
+      await refreshCurrentWorkload(selectedWorkloadId)
+      setStatusMessage(`Published version ${published.manifestVersion} for ${published.manifestId}.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Publication failed.')
     } finally {
@@ -225,20 +261,15 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
     }
   }
 
-  const currentDraft = workloadContext.draft
-  const publishedManifest = workloadContext.published
-  const publishDisabled =
-    busy ||
-    !currentDraft ||
-    currentDraft.state !== 'approved' ||
-    !currentDraft.approval ||
-    currentDraft.manifestId !== selectedWorkloadId
+  const comparisonRows = useMemo(() => workloadContext?.comparison ?? [], [workloadContext])
 
-  const saveDisabled = busy || currentDraft?.state === 'published' || publishedManifest !== null
-  const validateDisabled = busy || !currentDraft || currentDraft.state !== 'draft'
-  const submitDisabled = busy || !currentDraft || currentDraft.state !== 'validated'
-  const approveDisabled = busy || !currentDraft || currentDraft.state !== 'in_review'
-  const newVersionDisabled = busy || currentDraft?.state === 'published' || publishedManifest !== null
+  if (!workloadContext || !draftForm) {
+    return (
+      <div className="loading-state" aria-live="polite">
+        Loading Athena Context Studio…
+      </div>
+    )
+  }
 
   return (
     <div className="studio-shell">
@@ -286,11 +317,7 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
               <li key={workload.id}>
                 <button
                   type="button"
-                  className={
-                    workload.id === selectedWorkloadId
-                      ? 'catalogue-button is-selected'
-                      : 'catalogue-button'
-                  }
+                  className={workload.id === selectedWorkloadId ? 'catalogue-button is-selected' : 'catalogue-button'}
                   onClick={() => void handleSelectWorkload(workload.id)}
                   aria-pressed={workload.id === selectedWorkloadId}
                 >
@@ -329,16 +356,12 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
                 </div>
               </section>
 
-              <section className="panel comparison-panel">
+              <section className="panel comparison-panel" aria-label="Production and environment comparison">
                 <div className="panel-heading">
                   <h2>Production / Development / Training comparison</h2>
                 </div>
 
-                <div
-                  role="table"
-                  aria-label="Production, Development and Training comparison"
-                  className="comparison-table"
-                >
+                <div role="table" aria-label="Production, Development and Training comparison" className="comparison-table">
                   <div className="table-head" role="row">
                     <span role="columnheader">Environment</span>
                     <span role="columnheader">Topology</span>
@@ -346,12 +369,12 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
                     <span role="columnheader">Residual risk</span>
                   </div>
 
-                  {workloadContext.comparison.map((row) => (
+                  {comparisonRows.map((row) => (
                     <div className="table-row" role="row" key={row.environment}>
-                      <span role="cell">{row.environment}</span>
-                      <span role="cell">{row.topology}</span>
-                      <span role="cell">{row.policy}</span>
-                      <span role="cell">{row.residualRisk}</span>
+                      <span role="cell" data-label="Environment">{row.environment}</span>
+                      <span role="cell" data-label="Topology">{row.topology}</span>
+                      <span role="cell" data-label="Policy">{row.policy}</span>
+                      <span role="cell" data-label="Residual risk">{row.residualRisk}</span>
                     </div>
                   ))}
                 </div>
@@ -444,7 +467,7 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
                     <legend>Required relationships</legend>
                     <textarea
                       aria-label="Required relationships"
-                      value={draftForm.requiredRelationships.join('\n')}
+                      value={draftForm.requiredRelationships.join('\\n')}
                       onChange={(event) => updateRelationshipList('requiredRelationships', event.target.value)}
                     />
                   </fieldset>
@@ -453,7 +476,7 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
                     <legend>Optional relationships</legend>
                     <textarea
                       aria-label="Optional relationships"
-                      value={draftForm.optionalRelationships.join('\n')}
+                      value={draftForm.optionalRelationships.join('\\n')}
                       onChange={(event) => updateRelationshipList('optionalRelationships', event.target.value)}
                     />
                   </fieldset>
@@ -521,10 +544,7 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
 
               <ul className="relationship-list">
                 {workloadContext.relationships.map((relationship) => (
-                  <li
-                    key={relationship.title}
-                    className={`relationship-item kind-${relationship.kind}`}
-                  >
+                  <li key={relationship.title} className={`relationship-item kind-${relationship.kind}`}>
                     <span className="relationship-kind">{relationship.kind}</span>
                     <strong>{relationship.title}</strong>
                     <p>{relationship.detail}</p>
@@ -539,13 +559,13 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
         <aside className="panel review-panel" aria-label="Draft review panel">
           <div className="panel-kicker">Lifecycle state</div>
           <h2>Draft review</h2>
-          <p>Agent proposals remain drafts until the server-derived approval record exists.</p>
+          <p>Agent proposals remain drafts until the authenticated server approval record exists.</p>
 
           <div className="action-stack">
-            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={saveDisabled}>
+            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={busy || !draftForm}>
               Save draft
             </button>
-            <button type="button" className="secondary-action" onClick={() => void createDraftVersion()} disabled={newVersionDisabled}>
+            <button type="button" className="secondary-action" onClick={() => void createDraftVersion()} disabled={busy || !workloadContext}>
               Create new version draft
             </button>
             <button type="button" className="secondary-action" onClick={() => void validateDraft()} disabled={validateDisabled}>
@@ -580,10 +600,7 @@ function App({ client = createContextApiClient() }: { client?: ContextApiClientP
             <h3>Relationship context</h3>
             <ul className="relationship-list">
               {workloadContext.relationships.map((relationship) => (
-                <li
-                  key={relationship.title}
-                  className={`relationship-item kind-${relationship.kind}`}
-                >
+                <li key={relationship.title} className={`relationship-item kind-${relationship.kind}`}>
                   <span className="relationship-kind">{relationship.kind}</span>
                   <strong>{relationship.title}</strong>
                   <p>{relationship.detail}</p>

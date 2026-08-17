@@ -57,7 +57,7 @@ describe('Context Studio shell', () => {
 
     await user.click(screen.getByRole('button', { name: /^publish$/i }))
     await waitFor(() => {
-      expect(screen.getByText(/published/i)).toBeInTheDocument()
+      expect(screen.getByText(/published version .*atlas-api/i)).toBeInTheDocument()
     })
   })
 
