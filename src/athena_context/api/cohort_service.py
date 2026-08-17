@@ -49,6 +49,9 @@ from athena_context.api.errors import (
     VersionMismatchError,
 )
 from athena_context.api.ports import ClockPort, ContextStorePort
+from athena_context.api.selector_authority import (
+    persisted_selector_authority_for_draft,
+)
 from athena_context.binding import (
     VerifiedCohortSnapshot,
     evaluate_selector,
@@ -71,6 +74,7 @@ from athena_context.contracts.manifest import (
     ManifestSelector,
     ResolvedManifestProfile,
     ResourceIdListSelector,
+    _resolve_manifest_profile_for_cohort_decision,
     is_guarded_selector_replacement_narrower,
     resolve_manifest_profile,
 )
@@ -481,6 +485,14 @@ class CohortProposalService:
         as_of = ensure_timestamp(self._clock.now())
         with self._context_store.transaction() as tx:
             draft = tx.get_draft(query.draft_id)
+            selector_authority = (
+                None
+                if draft is None
+                else persisted_selector_authority_for_draft(
+                    tx,
+                    current=draft,
+                )
+            )
         if draft is None:
             raise ResourceNotFoundError(f"draft {query.draft_id!r} was not found")
         self._ensure_query_matches_draft(query, draft)
@@ -493,10 +505,19 @@ class CohortProposalService:
         ):
             raise DigestMismatchError("draft manifest digest is not canonical")
         try:
-            profile = resolve_manifest_profile(
-                draft.manifest,
-                query.profile_id,
-                as_of=as_of,
+            profile = (
+                resolve_manifest_profile(
+                    draft.manifest,
+                    query.profile_id,
+                    as_of=as_of,
+                )
+                if selector_authority is None
+                else _resolve_manifest_profile_for_cohort_decision(
+                    draft.manifest,
+                    query.profile_id,
+                    as_of=as_of,
+                    selector_capability=selector_authority,
+                )
             )
         except AthenaValidationError as exc:
             raise CohortProfileMismatchError(

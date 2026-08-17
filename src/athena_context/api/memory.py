@@ -5,6 +5,7 @@ from types import TracebackType
 from typing import Literal
 
 from athena_context.api.cohort_decision_domain import (
+    CohortDecisionKind,
     CohortDecisionReceipt,
     CohortDecisionRecord,
     CohortProposalSetVersion,
@@ -38,8 +39,8 @@ def _version_key(version: str) -> tuple[int, int, int]:
 
 def _cohort_overlap_binding_key(
     version: CohortProposalSetVersion,
-) -> tuple[str, str, str, str, str, str]:
-    """Stable authority identity; mutable draft coordinates are deliberately absent."""
+) -> tuple[str]:
+    """Stable workload scope; mutable proposal-generation coordinates are absent."""
 
     return version.authority_overlap_identity()
 
@@ -328,14 +329,34 @@ class _MemoryTransaction(ContextTransactionPort):
         version: CohortProposalSetVersion,
     ) -> list[CohortDecisionRecord]:
         binding_key = _cohort_overlap_binding_key(version)
-        selected = set(version.source_proposal_ids)
+        batch_key = version.batch_overlap_identity()
+        selected_fingerprints = set(
+            version.source_rejection_fingerprints
+        )
+        selected_proposal_ids = set(version.source_proposal_ids)
         matches = sorted(
             (
                 decision
                 for decision in self._cohort_decisions.values()
-                if _cohort_overlap_binding_key(decision.proposal_set_version())
-                == binding_key
-                and selected.intersection(decision.source_proposal_ids)
+                if (
+                    (
+                        decision.decision is CohortDecisionKind.REJECT
+                        and _cohort_overlap_binding_key(
+                            decision.proposal_set_version()
+                        )
+                        == binding_key
+                        and selected_fingerprints.intersection(
+                            decision.source_rejection_fingerprints
+                        )
+                    )
+                    or (
+                        decision.proposal_set_version().batch_overlap_identity()
+                        == batch_key
+                        and selected_proposal_ids.intersection(
+                            decision.source_proposal_ids
+                        )
+                    )
+                )
             ),
             key=lambda decision: (decision.decided_at, decision.decision_id),
         )

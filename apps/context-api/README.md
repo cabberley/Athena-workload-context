@@ -57,11 +57,11 @@ mutate it.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity
-  uses only the immutable workload/version, resolved profile, snapshot, proposal-set, and
-  canonical selected-proposal bindings. Mutable draft ID, revision, digest, proposal evaluation
-  time, and input digest cannot bypass a durable rejection after an unrelated edit, cache
-  regeneration, or identical fresh draft. Exact draft coordinates remain mandatory only for
-  stale application validation.
+  uses the normalized workload plus canonical selector/role/member fingerprints for each selected
+  proposal. Draft ID, revision, digest, manifest version, inheritance topology, resolved-profile
+  digest, snapshot, proposal-set regeneration, proposal evaluation time, and input digest cannot
+  bypass a durable rejection. Exact batch, snapshot, profile, and draft coordinates remain
+  mandatory only for candidate and stale-application validation.
   Overlap arbitration occurs before mutable draft freshness checks. A disjoint apply from the same
   immutable batch may atomically rebase only over the contiguous draft revisions produced by
   earlier decisions from that batch; unrelated draft changes remain stale. Preview candidate
@@ -69,9 +69,10 @@ mutate it.
   reviewer's candidate. Rebased replacement starts from the current draft and therefore preserves
   every prior disjoint selector change. Applied selectors are exactly the final selectors shown in
   the approved candidate; selector IDs needed for a safe local override are finalized before human
-  review. The final decision transaction samples a fresh authoritative timestamp after entering
-  the transaction, then reloads and revalidates the exact immutable candidate, proposal batch,
-  snapshot binding, and snapshot expiry before writing a decision, audit, draft, or receipt.
+  review. The final decision transaction performs cryptographic and candidate verification first,
+  then samples a fresh authoritative timestamp immediately before persistence. The atomic draft
+  path samples again after resolver validation and immediately before mutation, so expiry crossing
+  during either verifier or resolver work rolls the entire transaction back.
 - `GET /v1/cohort-proposals/decisions` and
   `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
   granted workload scope.
@@ -86,7 +87,10 @@ metadata.
 Validation resolves every profile and enforces selector identity inheritance before changing
 state. Submission repeats that check before and after server finalization, and publication checks
 the approved candidate again. Exact selector identities introduced by a cohort decision remain
-resolvable only from their persisted apply provenance. Any failure leaves draft state, revision,
+resolvable only from their persisted apply provenance. Proposal resolution recovers that immutable
+provenance, and publication carries it through the published source draft into an exact
+selector-preserving next-version baseline. This permits legitimate proposal and lifecycle work
+without granting generic selector-change authority. Any failure leaves draft state, revision,
 audit, and idempotency receipts unchanged.
 
 Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and

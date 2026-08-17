@@ -9,8 +9,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import athena_context.fixtures as fixture_factory
-from athena_context.api.authorization import StaticTestAuthenticator
+from athena_context.api.authorization import (
+    RoleBasedAuthorization,
+    StaticTestAuthenticator,
+)
 from athena_context.api.cohort_decision_service import CohortDecisionService
+from athena_context.api.cohort_domain import CohortEvidenceBinding
 from athena_context.api.cohort_memory import (
     CallableTrustedEvidenceSnapshotVerifier,
     InMemoryCohortPersistence,
@@ -18,15 +22,23 @@ from athena_context.api.cohort_memory import (
 from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     CreateDraftCommand,
+    PublishCommand,
     ReplaceDraftCommand,
+    Role,
+    RoleGrant,
     TransitionCommand,
+    WorkloadGrantScope,
 )
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
+from athena_context.api.selector_authority import (
+    persisted_selector_authority_for_draft,
+)
 from athena_context.api.selector_provenance import (
     manifest_selector_provenance,
     resolved_profile_selector_provenance,
 )
+from athena_context.api.service import ContextService
 from athena_context.contracts import (
     AthenaValidationError,
     CanonicalWorkloadManifest,
@@ -34,11 +46,15 @@ from athena_context.contracts import (
     compute_artifact_digest,
     resolve_manifest_profile,
 )
+from athena_context.contracts.manifest import (
+    _resolve_manifest_profile_for_cohort_decision,
+)
 from test_cohort_binding import _build_attested_snapshot
 from test_context_api_cohorts import (
     AGENT,
     HUMAN,
     OUTSIDER,
+    PUBLICATION_SERVICE,
     SECOND_REVIEWER,
     TOKENS,
     WILDCARD,
@@ -187,6 +203,100 @@ def _replace_only_proposal_cache(harness: Harness) -> None:
     harness.client = TestClient(
         create_app(
             service=harness.lifecycle,
+            authentication=StaticTestAuthenticator(
+                {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
+            ),
+            cohort_service=cohorts,
+            cohort_decision_service=decisions,
+        )
+    )
+
+
+def _register_persisted_profile(
+    harness: Harness,
+    *,
+    draft_id: str,
+) -> None:
+    draft = harness.lifecycle.get_draft(HUMAN, draft_id)
+    with harness.store.transaction() as tx:
+        authority = persisted_selector_authority_for_draft(
+            tx,
+            current=draft,
+        )
+    assert authority is not None
+    profile = _resolve_manifest_profile_for_cohort_decision(
+        draft.manifest,
+        "production",
+        as_of=harness.clock.now(),
+        selector_capability=authority,
+    )
+    harness.snapshots.put_snapshot(
+        CohortEvidenceBinding(
+            manifest_id=draft.manifest_id,
+            manifest_version=draft.manifest.manifest_version,
+            profile_id=profile.profile_id,
+            profile_type=profile.profile_type,
+            resolved_profile_digest=profile.resolved_profile_digest,
+            draft_id=draft.draft_id,
+            draft_revision=draft.revision,
+            draft_digest=draft.manifest_digest,
+        ),
+        harness.snapshot,
+    )
+    harness.draft_id = draft.draft_id
+    harness.draft_revision = draft.revision
+    harness.draft_digest = draft.manifest_digest
+    harness.manifest = draft.manifest
+
+
+def _enable_full_lifecycle(harness: Harness) -> None:
+    scope = WorkloadGrantScope(
+        workload_id=harness.manifest.manifest_id,
+    )
+    authorization = RoleBasedAuthorization(
+        RoleGrant(
+            actor_id=HUMAN.actor_id,
+            role=role,
+            scope=scope,
+        )
+        for role in (
+            Role.PROPOSER,
+            Role.APPROVER,
+            Role.PUBLISHER,
+        )
+    )
+    lifecycle = ContextService(
+        store=harness.store,
+        authorization=authorization,
+        clock=harness.clock,
+        publication_actor=PUBLICATION_SERVICE,
+    )
+    cohorts = CohortProposalService(
+        context_store=harness.store,
+        authorization=authorization,
+        clock=harness.clock,
+        snapshot_repository=harness.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            harness.verifier
+        ),
+        proposal_cache=harness.persistence,
+        preview_receipts=harness.persistence,
+    )
+    decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=authorization,
+        clock=harness.clock,
+        context_service=lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=harness.persistence,
+    )
+    harness.authorization = authorization
+    harness.lifecycle = lifecycle
+    harness.cohorts = cohorts
+    harness.decisions = decisions
+    harness.client = TestClient(
+        create_app(
+            service=lifecycle,
             authentication=StaticTestAuthenticator(
                 {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
             ),
@@ -1358,6 +1468,130 @@ def test_reject_survives_mutable_draft_rebinding_without_side_effects(
         assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
 
 
+def test_reject_survives_selector_neutral_profile_topology_regeneration() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    proposal = _proposal(original_batch, require_multiple_members=True)
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            original_batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject this role and member cohort across topology changes.",
+        ),
+        "wc-034-topology-reject",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    current = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    payload = current.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["profiles"]["production"]["extends"] = "training"
+    topology_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    topology_update = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-topology-neutral-put",
+        ),
+        json=ReplaceDraftCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            replacement_manifest=topology_manifest,
+            replacement_digest=(
+                topology_manifest.compatibility.artifact_digest
+            ),
+            reason="Apply selector-neutral production inheritance topology",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert topology_update.status_code == 200, topology_update.text
+    rebound = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    harness.manifest = rebound.manifest
+    harness.draft_revision = rebound.revision
+    harness.draft_digest = rebound.manifest_digest
+    harness.register_profile("production")
+    regenerated_batch = _load(harness)
+    regenerated = next(
+        item
+        for item in regenerated_batch["proposals"]
+        if item["role"]["roleId"] == proposal["role"]["roleId"]
+        and item["members"] == proposal["members"]
+    )
+    assert regenerated["proposalId"] != proposal["proposalId"]
+    assert regenerated_batch["proposalSetDigest"] != (
+        original_batch["proposalSetDigest"]
+    )
+    assert regenerated_batch["scope"]["resolvedProfileDigest"] != (
+        original_batch["scope"]["resolvedProfileDigest"]
+    )
+
+    preview_body = _preview_body(
+        harness,
+        regenerated_batch,
+        proposal_ids=[regenerated["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-topology-preview",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    failed_key = "wc-034-topology-blocked-apply"
+    with harness.store.transaction() as tx:
+        drafts_before = tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            regenerated_batch,
+            decision="split",
+            proposal_ids=[regenerated["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    with harness.store.transaction() as tx:
+        assert tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        ) == drafts_before
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            failed_key,
+        ) is None
+        assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
+
+
 def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
     harness = _build_harness()
     batch = _load(harness)
@@ -1919,6 +2153,13 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
         by_alias=True,
         exclude_none=True,
     ) == merge_preview.json()["roleUpdates"][0]["role"]
+    _register_persisted_profile(merge, draft_id=merge.draft_id)
+    merge_proposals = merge.client.get(
+        "/v1/cohort-proposals",
+        params=_params(merge),
+        headers=_headers(),
+    )
+    assert merge_proposals.status_code == 200, merge_proposals.text
     with split.store.transaction() as tx:
         assert len(tx.list_cohort_decisions(
             manifest_id=split.manifest.manifest_id
@@ -1992,6 +2233,161 @@ def test_persisted_split_authority_survives_validate_and_submit_rechecks() -> No
     assert len(decisions) == 1
     assert decisions[0].apply_authorization is not None
     assert decisions[0].apply_authorization.status == "approved"
+
+
+def test_approved_split_supports_proposals_publish_and_next_version() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            idempotency_key="wc-034-provenance-lifecycle-preview",
+        ),
+    )
+    applied = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-provenance-lifecycle-apply",
+    )
+    assert preview.status_code == 200, preview.text
+    assert applied.status_code == 201, applied.text
+
+    _register_persisted_profile(harness, draft_id=harness.draft_id)
+    proposals_after_apply = harness.client.get(
+        "/v1/cohort-proposals",
+        params=_params(harness),
+        headers=_headers(),
+    )
+    assert proposals_after_apply.status_code == 200, (
+        proposals_after_apply.text
+    )
+
+    _enable_full_lifecycle(harness)
+    current = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    validated = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/validate",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-lifecycle-validate",
+        ),
+        json=TransitionCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            reason="Validate the exact persisted cohort selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert validated.status_code == 200, validated.text
+    submitted = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/submit",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-lifecycle-submit",
+        ),
+        json=TransitionCommand(
+            expected_revision=validated.json()["revision"],
+            expected_manifest_version=harness.manifest.manifest_version,
+            expected_digest=validated.json()["manifest_digest"],
+            reason="Submit the exact persisted cohort selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert submitted.status_code == 200, submitted.text
+    approved = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/approve",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-lifecycle-approve",
+        ),
+        json=TransitionCommand(
+            expected_revision=submitted.json()["revision"],
+            expected_manifest_version=harness.manifest.manifest_version,
+            expected_digest=submitted.json()["manifest_digest"],
+            reason="Approve the persisted cohort selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert approved.status_code == 200, approved.text
+    approval_id = approved.json()["approval"]["decision_id"]
+    published = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/publish",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-lifecycle-publish",
+        ),
+        json=PublishCommand(
+            expected_revision=approved.json()["revision"],
+            expected_manifest_version=harness.manifest.manifest_version,
+            expected_digest=approved.json()["manifest_digest"],
+            approval_id=approval_id,
+            reason="Publish exact approved cohort selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert published.status_code == 201, published.text
+
+    published_manifest = CanonicalWorkloadManifest.model_validate(
+        published.json()["manifest"]
+    )
+    next_payload = published_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    next_payload["manifestVersion"] = "1.0.1"
+    next_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(next_payload)
+    )
+    next_draft_id = "draft-wc-034-approved-provenance-next"
+    created = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-create",
+        ),
+        json=CreateDraftCommand(
+            draft_id=next_draft_id,
+            manifest=next_manifest,
+            manifest_digest=next_manifest.compatibility.artifact_digest,
+            previous_version=harness.manifest.manifest_version,
+            reason="Create the next version from published selector provenance",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["manifest"]["manifestVersion"] == "1.0.1"
+
+    _register_persisted_profile(harness, draft_id=next_draft_id)
+    next_proposals = harness.client.get(
+        "/v1/cohort-proposals",
+        params=_params(harness),
+        headers=_headers(),
+    )
+    assert next_proposals.status_code == 200, next_proposals.text
+    next_validated = harness.client.post(
+        f"/v1/drafts/{next_draft_id}/validate",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-validate",
+        ),
+        json=TransitionCommand(
+            expected_revision=created.json()["revision"],
+            expected_manifest_version="1.0.1",
+            expected_digest=created.json()["manifest_digest"],
+            reason="Validate the carried immutable selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert next_validated.status_code == 200, next_validated.text
 
 
 def test_display_name_only_put_after_approved_split_preserves_selectors() -> None:
@@ -2477,6 +2873,95 @@ def test_snapshot_expiry_crossing_at_final_transaction_rolls_back() -> None:
             HUMAN.actor_id,
             "wc-034-expiry-at-final-transaction",
         ) is None
+
+
+def test_snapshot_expiry_crossing_during_verification_rolls_back() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    body = _decision_body(
+        harness,
+        batch,
+        rationale="Reject persistence after verification crosses snapshot expiry.",
+    )
+    harness.clock.value = (
+        harness.snapshot.expires_at - timedelta(seconds=1)
+    )
+    verifier_calls = 0
+
+    def crossing_verifier(candidate, as_of):
+        nonlocal verifier_calls
+        verifier_calls += 1
+        verified = harness.verifier(candidate, as_of)
+        harness.clock.value = (
+            harness.snapshot.expires_at + timedelta(seconds=1)
+        )
+        return verified
+
+    cohorts = CohortProposalService(
+        context_store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        snapshot_repository=harness.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            crossing_verifier
+        ),
+        proposal_cache=harness.persistence,
+        preview_receipts=harness.persistence,
+    )
+    decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=harness.persistence,
+    )
+    client = TestClient(
+        create_app(
+            service=harness.lifecycle,
+            authentication=StaticTestAuthenticator(
+                {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
+            ),
+            cohort_service=cohorts,
+            cohort_decision_service=decisions,
+        )
+    )
+    failed_key = "wc-034-expiry-during-verification"
+    with harness.store.transaction() as tx:
+        drafts_before = tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    response = client.post(
+        "/v1/cohort-proposals/decisions",
+        json=body,
+        headers=_headers(idempotency_key=failed_key),
+    )
+
+    assert verifier_calls == 1
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "stale_evidence_snapshot"
+    with harness.store.transaction() as tx:
+        assert tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        ) == drafts_before
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            failed_key,
+        ) is None
+        assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
 
 
 def test_decision_and_draft_roll_back_together_on_persistence_failure() -> None:

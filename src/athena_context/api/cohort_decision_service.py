@@ -123,6 +123,73 @@ def _authority_projection(role: ManifestRole) -> dict[str, Any]:
     }
 
 
+def _proposal_rejection_fingerprint(
+    manifest_id: str,
+    proposal: CohortProposal,
+) -> str:
+    """Bind durable authority to stable workload, role, selector, and members."""
+
+    selectors = [
+        _stable_selector_payload(
+            selector.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        for selector in proposal.role.selectors
+    ]
+    return compute_artifact_digest(
+        {
+            "operation": "cohort_rejection_fingerprint",
+            "manifestId": normalized_identifier(manifest_id),
+            "roleRef": normalized_identifier(proposal.role.role_id),
+            "selectors": sorted(
+                selectors,
+                key=compute_artifact_digest,
+            ),
+            "members": sorted(
+                normalize_resource_id(member)
+                for member in proposal.members
+            ),
+        }
+    )
+
+
+def _stable_selector_payload(value: Any) -> Any:
+    """Canonicalize commutative selector collections for durable comparison."""
+
+    if isinstance(value, dict):
+        normalized = {
+            key: _stable_selector_payload(item)
+            for key, item in value.items()
+        }
+        selector_id = normalized.get("selectorId")
+        if isinstance(selector_id, str):
+            normalized["selectorId"] = normalized_identifier(selector_id)
+        resource_ids = normalized.get("resourceIds")
+        if isinstance(resource_ids, list) and all(
+            isinstance(item, str) for item in resource_ids
+        ):
+            normalized["resourceIds"] = sorted(
+                normalize_resource_id(item)
+                for item in resource_ids
+            )
+        children = normalized.get("children")
+        if isinstance(children, list):
+            normalized["children"] = sorted(
+                children,
+                key=compute_artifact_digest,
+            )
+        return normalized
+    if isinstance(value, list):
+        return [
+            _stable_selector_payload(item)
+            for item in value
+        ]
+    return value
+
+
 class CohortDecisionService:
     """Persist human cohort decisions and atomically apply selector-only drafts."""
 
@@ -176,7 +243,6 @@ class CohortDecisionService:
         if replay is not None:
             return replay
 
-        version = self._proposal_set_version(request)
         with self._store.transaction() as tx:
             receipt = tx.get_cohort_decision_receipt(
                 actor.actor_id,
@@ -188,10 +254,6 @@ class CohortDecisionService:
                     request_digest=request_digest,
                     manifest_id=request.manifest_id,
                 )
-            self._arbitrate_overlap(
-                request,
-                tx.list_overlapping_cohort_decisions(version),
-            )
 
         decision_seed = request_digest.removeprefix("sha256:")[:32]
         decision_id = f"cohort-decision-{decision_seed}"
@@ -208,12 +270,7 @@ class CohortDecisionService:
                     manifest_id=request.manifest_id,
                 )
 
-            self._arbitrate_overlap(
-                request,
-                tx.list_overlapping_cohort_decisions(version),
-            )
-
-            decided_at = ensure_timestamp(self._clock.now())
+            validation_time = ensure_timestamp(self._clock.now())
             resolved = self._proposal_service.resolve_for_decision(
                 actor,
                 CohortProposalQuery(
@@ -225,10 +282,22 @@ class CohortDecisionService:
                     expected_digest=request.expected_digest,
                 ),
                 scope=request.scope,
-                as_of=decided_at,
+                as_of=validation_time,
             )
             proposals = self._validate_request_binding(request, resolved)
-            if decided_at >= resolved.snapshot.expires_at:
+            rejection_fingerprints = self._rejection_fingerprints(
+                request,
+                proposals,
+            )
+            version = self._proposal_set_version(
+                request,
+                rejection_fingerprints=rejection_fingerprints,
+            )
+            self._arbitrate_overlap(
+                request,
+                tx.list_overlapping_cohort_decisions(version),
+            )
+            if validation_time >= resolved.snapshot.expires_at:
                 raise StaleEvidenceSnapshotError(
                     "the exact decision snapshot expired before atomic apply"
                 )
@@ -237,7 +306,7 @@ class CohortDecisionService:
                 request,
                 resolved,
                 proposals,
-                decided_at=decided_at,
+                decided_at=validation_time,
             )
             current = self._require_current_draft(tx, request, version)
             self._validate_candidate(
@@ -245,7 +314,7 @@ class CohortDecisionService:
                 resolved,
                 proposals,
                 candidate,
-                decided_at=decided_at,
+                decided_at=validation_time,
             )
             candidate_digest: str | None = None
             apply_command: ReplaceDraftCommand | None = None
@@ -270,8 +339,27 @@ class CohortDecisionService:
                     actor=actor,
                     decision_id=decision_id,
                     candidate_digest=candidate_digest,
-                    decided_at=decided_at,
+                    decided_at=validation_time,
                     reason=reason,
+                )
+            decided_at = ensure_timestamp(self._clock.now())
+            if (
+                decided_at < validation_time
+                or decided_at >= resolved.snapshot.expires_at
+                or (
+                    candidate is not None
+                    and decided_at >= candidate.expires_at
+                )
+            ):
+                raise StaleEvidenceSnapshotError(
+                    "the exact decision evidence expired before atomic persistence"
+                )
+            if apply_command is not None and apply_authorization is not None:
+                apply_authorization = CohortDecisionApplyAuthorization.issue(
+                    apply_authorization.binding.model_copy(
+                        update={"decided_at": decided_at},
+                    ),
+                    apply_command,
                 )
             applied_binding = (
                 None
@@ -318,6 +406,7 @@ class CohortDecisionService:
                 candidate_digest=candidate_digest,
                 applied_binding=applied_binding,
                 apply_authorization=apply_authorization,
+                rejection_fingerprints=rejection_fingerprints,
                 audit_id=audit_event.event_id,
             )
             tx.put_cohort_decision(record)
@@ -461,6 +550,8 @@ class CohortDecisionService:
     @staticmethod
     def _proposal_set_version(
         request: CohortDecisionRequest,
+        *,
+        rejection_fingerprints: list[str],
     ) -> CohortProposalSetVersion:
         return CohortProposalSetVersion(
             manifest_id=request.manifest_id,
@@ -475,7 +566,26 @@ class CohortDecisionService:
             proposal_set_digest=request.proposal_set_digest,
             snapshot_artifact_digest=request.snapshot_artifact_digest,
             sourceProposalIds=request.proposal_ids,
+            sourceRejectionFingerprints=rejection_fingerprints,
         )
+
+    @staticmethod
+    def _rejection_fingerprints(
+        request: CohortDecisionRequest,
+        proposals: list[CohortProposal],
+    ) -> list[str]:
+        fingerprints = sorted(
+            _proposal_rejection_fingerprint(
+                request.manifest_id,
+                proposal,
+            )
+            for proposal in proposals
+        )
+        if len(fingerprints) != len(set(fingerprints)):
+            raise CohortContractError(
+                "selected proposals do not have unique stable authority fingerprints"
+            )
+        return fingerprints
 
     @staticmethod
     def _arbitrate_overlap(
@@ -783,7 +893,10 @@ class CohortDecisionService:
         binding = version.model_dump_json(
             by_alias=True,
             exclude_none=True,
-            exclude={"source_proposal_ids"},
+            exclude={
+                "source_proposal_ids",
+                "source_rejection_fingerprints",
+            },
         )
         applied_by_revision: dict[int, CohortDecisionRecord] = {}
         for decision in tx.list_cohort_decisions(
@@ -795,7 +908,10 @@ class CohortDecisionService:
             decision_binding = decision.proposal_set_version().model_dump_json(
                 by_alias=True,
                 exclude_none=True,
-                exclude={"source_proposal_ids"},
+                exclude={
+                    "source_proposal_ids",
+                    "source_rejection_fingerprints",
+                },
             )
             applied = decision.applied_draft
             if decision_binding != binding or applied is None:
@@ -1137,6 +1253,7 @@ class CohortDecisionService:
         candidate_digest: str | None,
         applied_binding: CohortDraftBinding | None,
         apply_authorization: CohortDecisionApplyAuthorization | None,
+        rejection_fingerprints: list[str],
         audit_id: str,
     ) -> CohortDecisionRecord:
         return CohortDecisionRecord(
@@ -1159,6 +1276,7 @@ class CohortDecisionService:
                     if proposal.proposal_id in request.proposal_ids
                 )
             ),
+            sourceRejectionFingerprints=rejection_fingerprints,
             snapshot=resolved.batch.snapshot,
             candidateId=None if candidate is None else candidate.candidate_id,
             candidateDigest=candidate_digest,
