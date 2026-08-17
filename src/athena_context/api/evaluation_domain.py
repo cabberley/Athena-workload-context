@@ -268,12 +268,23 @@ class AuthorizationGrantToken(ApiModel):
     grant_digest: str = Field(pattern=_DIGEST_PATTERN)
 
 
+class TrustedKeyAuthorityToken(ApiModel):
+    """Revision and digest for transaction-owned signing-key trust."""
+
+    key_vault_key_id: str = Field(min_length=1, max_length=2048)
+    key_version: str = Field(min_length=1, max_length=128)
+    public_key_fingerprint: str = Field(pattern=_DIGEST_PATTERN)
+    revision: int = Field(ge=1)
+    authority_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
 class EvaluationAuthorityToken(ApiModel):
     """All optimistic authority revisions a production commit must compare."""
 
     context: PublishedContextAuthorityToken
     approval: ApprovalAuthorityToken
     authorization: AuthorizationGrantToken
+    trusted_key: TrustedKeyAuthorityToken
 
 
 def build_published_context_authority_token(

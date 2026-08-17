@@ -37,7 +37,6 @@ from athena_context.api.evaluation_ports import (
     SnapshotSigningRequest,
 )
 from athena_context.contracts import (
-    AthenaValidationError,
     NormalizationCollisionError,
     canonicalize_json,
     compute_artifact_digest,
@@ -479,16 +478,45 @@ def test_signing_key_expiry_during_commit_rolls_back() -> None:
 
     with pytest.raises(
         EvaluationFailedClosedError,
-        match="snapshot verification or policy evaluation failed",
-    ) as captured:
+        match="trusted signing key is .* expired",
+    ):
         harness.service.evaluate(
             PUBLISHER,
             idempotency_key,
             harness.command,
         )
 
-    assert isinstance(captured.value.__cause__, AthenaValidationError)
-    assert "cryptographic verification failed" in str(captured.value.__cause__)
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_signing_key_revocation_during_persistence_delay_rolls_back() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-signing-key-revocation-race"
+    harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
+        lambda: harness.trust_registry.disable(
+            revoked_at=harness.clock.value,
+        )
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="authority changed during the publication transaction",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    current_trust = harness.trust_registry.resolve()
+    assert current_trust is not None
+    assert current_trust.record.enabled is False
+    assert current_trust.revoked_at is not None
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)

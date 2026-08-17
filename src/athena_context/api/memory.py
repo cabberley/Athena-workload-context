@@ -25,12 +25,17 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
     StaleRevisionError,
 )
-from athena_context.api.evaluation_domain import DemoEvaluationApproval
+from athena_context.api.evaluation_domain import (
+    DemoEvaluationApproval,
+    TrustedKeyAuthorityToken,
+)
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactFactory,
+    EvaluationTrustedKeyAuthority,
     StoredEvaluation,
 )
 from athena_context.api.ports import ClockPort, ContextTransactionPort
+from athena_context.contracts import TrustedKeyAnchor
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -45,6 +50,9 @@ class InMemoryContextStore:
         self,
         *,
         authoritative_clock: ClockPort | None = None,
+        demo_evaluation_trusted_key: (
+            EvaluationTrustedKeyAuthority | None
+        ) = None,
     ) -> None:
         self._transaction_lock = InMemoryTransactionLock()
         self._lock = self._transaction_lock.lock
@@ -59,6 +67,15 @@ class InMemoryContextStore:
         self._evaluation_grant_revision = 0
         self._evaluation_receipts: dict[tuple[str, str], StoredEvaluation] = {}
         self._evaluation_artifacts: dict[str, StoredEvaluation] = {}
+        self._demo_evaluation_trusted_keys: dict[
+            str,
+            EvaluationTrustedKeyAuthority,
+        ] = {}
+        if demo_evaluation_trusted_key is not None:
+            anchor = demo_evaluation_trusted_key.record.anchor
+            self._demo_evaluation_trusted_keys[anchor.key_vault_key_id] = (
+                demo_evaluation_trusted_key
+            )
         self._transaction_generation = 0
 
     def transaction(self) -> _MemoryTransaction:
@@ -97,6 +114,10 @@ class _MemoryTransaction(ContextTransactionPort):
         self._evaluation_grant_revision = 0
         self._evaluation_receipts: dict[tuple[str, str], StoredEvaluation] = {}
         self._evaluation_artifacts: dict[str, StoredEvaluation] = {}
+        self._demo_evaluation_trusted_keys: dict[
+            str,
+            EvaluationTrustedKeyAuthority,
+        ] = {}
         self._base_generation = 0
         self._dirty = False
 
@@ -114,6 +135,9 @@ class _MemoryTransaction(ContextTransactionPort):
         self._evaluation_grant_revision = self._store._evaluation_grant_revision
         self._evaluation_receipts = dict(self._store._evaluation_receipts)
         self._evaluation_artifacts = dict(self._store._evaluation_artifacts)
+        self._demo_evaluation_trusted_keys = dict(
+            self._store._demo_evaluation_trusted_keys
+        )
         self._base_generation = self._store._transaction_generation
         self._dirty = False
         return self
@@ -145,6 +169,9 @@ class _MemoryTransaction(ContextTransactionPort):
                     )
                     self._store._evaluation_receipts = self._evaluation_receipts
                     self._store._evaluation_artifacts = self._evaluation_artifacts
+                    self._store._demo_evaluation_trusted_keys = (
+                        self._demo_evaluation_trusted_keys
+                    )
                     self._store._transaction_generation += 1
         finally:
             self._store._lock.release()
@@ -334,8 +361,50 @@ class _MemoryTransaction(ContextTransactionPort):
     ) -> StoredEvaluation | None:
         return self._evaluation_artifacts.get(snapshot_id)
 
+    def get_demo_evaluation_trusted_key(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> EvaluationTrustedKeyAuthority | None:
+        authority = self._demo_evaluation_trusted_keys.get(
+            trusted_key_anchor.key_vault_key_id
+        )
+        if (
+            authority is None
+            or authority.record.anchor != trusted_key_anchor
+        ):
+            return None
+        return authority
+
+    def put_demo_evaluation_trusted_key(
+        self,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None:
+        anchor = authority.record.anchor
+        current = self._demo_evaluation_trusted_keys.get(
+            anchor.key_vault_key_id
+        )
+        if current is None:
+            raise ResourceNotFoundError(
+                "demo evaluation trusted key was not found"
+            )
+        if current.revision != expected_revision:
+            raise StaleRevisionError(
+                f"expected trusted key revision {expected_revision}, "
+                f"found {current.revision}"
+            )
+        if authority.revision != expected_revision + 1:
+            raise StaleRevisionError(
+                "trusted key replacement must use the next revision"
+            )
+        self._demo_evaluation_trusted_keys[anchor.key_vault_key_id] = authority
+        self._dirty = True
+
     def put_evaluation_conditionally(
         self,
+        trusted_key_anchor: TrustedKeyAnchor,
+        expected_trusted_key: TrustedKeyAuthorityToken,
         artifact_factory: EvaluationArtifactFactory,
     ) -> StoredEvaluation:
         clock = self._store._authoritative_clock
@@ -343,10 +412,23 @@ class _MemoryTransaction(ContextTransactionPort):
             raise RuntimeError(
                 "evaluation persistence has no authoritative commit clock"
             )
-        # Any storage wait happens before the timestamp. The callback is a pure,
-        # transaction-local finalizer, and the insert below has no external hook.
+        # Any storage wait happens before the key read and timestamp. The key
+        # authority and artifact share this transaction through insertion.
         self._store._before_evaluation_commit_timestamp()
-        artifact = artifact_factory(ensure_timestamp(clock.now()))
+        trusted_key = self.get_demo_evaluation_trusted_key(
+            trusted_key_anchor
+        )
+        if (
+            trusted_key is None
+            or trusted_key.authority_token() != expected_trusted_key
+        ):
+            raise StaleRevisionError(
+                "trusted signing-key authority changed before publication"
+            )
+        artifact = artifact_factory(
+            ensure_timestamp(clock.now()),
+            trusted_key,
+        )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
         if receipt_key in self._evaluation_receipts:
             raise IdempotencyConflictError(

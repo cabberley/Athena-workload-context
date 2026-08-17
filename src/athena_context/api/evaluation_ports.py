@@ -8,6 +8,7 @@ from athena_context.api.domain import (
     Actor,
     Permission,
     RoleGrant,
+    ensure_timestamp,
 )
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
@@ -16,12 +17,15 @@ from athena_context.api.evaluation_domain import (
     EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
+    TrustedKeyAuthorityToken,
     VerifiedWc008DeploymentConfiguration,
 )
 from athena_context.contracts import (
     EvidenceSnapshot,
     TrustedKeyAnchor,
+    TrustedKeyRecord,
     TrustedKeyResolver,
+    compute_artifact_digest,
 )
 from athena_context.evidence import (
     CollectedEvidence,
@@ -56,13 +60,54 @@ class DemoEvaluationTrustConfiguration:
     """ContextService-owned trust used for authoritative final verification."""
 
     trusted_key_anchor: TrustedKeyAnchor
-    key_resolver: TrustedKeyResolver
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationTrustedKeyAuthority:
+    """Versioned signing-key trust stored in the publication transaction."""
+
+    record: TrustedKeyRecord
+    revision: int
+    revoked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.revision < 1:
+            raise ValueError("trusted key authority revision must be positive")
+        if self.revoked_at is not None:
+            ensure_timestamp(self.revoked_at)
+
+    def authority_token(self) -> TrustedKeyAuthorityToken:
+        record = self.record
+        anchor = record.anchor
+        payload = {
+            "keyVaultKeyId": anchor.key_vault_key_id,
+            "keyName": anchor.key_name,
+            "keyVersion": anchor.key_version,
+            "publicKeyFingerprint": anchor.public_key_fingerprint,
+            "enabled": record.enabled,
+            "activatedAt": record.activated_at,
+            "retiredAt": record.retired_at,
+            "expiresAt": record.expires_at,
+            "revokedAt": self.revoked_at,
+            "revision": self.revision,
+        }
+        return TrustedKeyAuthorityToken(
+            key_vault_key_id=anchor.key_vault_key_id,
+            key_version=anchor.key_version,
+            public_key_fingerprint=anchor.public_key_fingerprint,
+            revision=self.revision,
+            authority_digest=compute_artifact_digest(payload),
+        )
 
 
 class EvaluationArtifactFactory(Protocol):
     """Pure finalizer invoked with the persistence-owned commit timestamp."""
 
-    def __call__(self, published_at: datetime) -> StoredEvaluation: ...
+    def __call__(
+        self,
+        published_at: datetime,
+        trusted_key: EvaluationTrustedKeyAuthority,
+    ) -> StoredEvaluation: ...
 
 
 @runtime_checkable
@@ -101,11 +146,25 @@ class EvaluationAuthorityTransactionPort(Protocol):
         snapshot_id: str,
     ) -> StoredEvaluation | None: ...
 
+    def get_demo_evaluation_trusted_key(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> EvaluationTrustedKeyAuthority | None: ...
+
+    def put_demo_evaluation_trusted_key(
+        self,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None: ...
+
     def put_evaluation_conditionally(
         self,
+        trusted_key_anchor: TrustedKeyAnchor,
+        expected_trusted_key: TrustedKeyAuthorityToken,
         artifact_factory: EvaluationArtifactFactory,
     ) -> StoredEvaluation:
-        """Finalize and insert after obtaining authoritative persistence time."""
+        """Bind exact key revision, finalize, and insert in this transaction."""
         ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -157,8 +216,22 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
 
     def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None: ...
 
+    def resolve_trusted_key(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> EvaluationTrustedKeyAuthority | None: ...
+
+    def put_trusted_key(
+        self,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None: ...
+
     def insert_evaluation_conditionally(
         self,
+        trusted_key_anchor: TrustedKeyAnchor,
+        expected_trusted_key: TrustedKeyAuthorityToken,
         artifact_factory: EvaluationArtifactFactory,
     ) -> StoredEvaluation: ...
 
@@ -220,6 +293,7 @@ __all__ = [
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
+    "EvaluationTrustedKeyAuthority",
     "DemoEvaluationTrustConfiguration",
     "PublishedContextResolverPort",
     "SnapshotSigningPort",

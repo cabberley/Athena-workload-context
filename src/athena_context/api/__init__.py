@@ -64,6 +64,7 @@ from athena_context.api.evaluation_domain import (
     PublishedContextAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
+    TrustedKeyAuthorityToken,
     VerifiedWc008DeploymentConfiguration,
     Wc008DeploymentOutputAssertion,
     build_wc008_deployment_assertion,
@@ -71,9 +72,13 @@ from athena_context.api.evaluation_domain import (
 from athena_context.api.evaluation_memory import (
     InMemoryDemoEvaluationApprovalRegistry,
     InMemoryDemoEvaluationStateReader,
+    InMemoryDemoEvaluationTrustRegistry,
     InMemoryEvaluationAuthorizationRegistry,
 )
-from athena_context.api.evaluation_ports import DemoEvaluationTrustConfiguration
+from athena_context.api.evaluation_ports import (
+    DemoEvaluationTrustConfiguration,
+    EvaluationTrustedKeyAuthority,
+)
 from athena_context.api.evaluation_service import (
     DemoEvaluationDependencies,
     DemoEvaluationService,
@@ -115,12 +120,14 @@ __all__ = [
     "DemoEvaluationService",
     "DemoEvaluationTrustConfiguration",
     "EvaluationAuthorityToken",
+    "EvaluationTrustedKeyAuthority",
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
     "EnvironmentContextApiPublishedContextReader",
     "InMemoryContextStore",
     "InMemoryDemoEvaluationApprovalRegistry",
     "InMemoryDemoEvaluationStateReader",
+    "InMemoryDemoEvaluationTrustRegistry",
     "InMemoryEvaluationAuthorizationRegistry",
     "McpReadAssignment",
     "OperatorDeploymentApproval",
@@ -142,6 +149,7 @@ __all__ = [
     "SupersedeCommand",
     "StaticTestAuthenticator",
     "TransitionCommand",
+    "TrustedKeyAuthorityToken",
     "VerifiedAuthentication",
     "VerifiedWc008DeploymentConfiguration",
     "Wc008DeploymentOutputAssertion",

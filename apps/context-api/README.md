@@ -52,28 +52,32 @@ The integration composes the merged components without introducing direct Azure 
   from that exact transaction. It reads the active unsuperseded WC-007 context revision/ETag,
   approval revision/status/expiry, and actor grant revision, canonically resolves the complete
   profile inheritance chain, and compares typed authority tokens captured before collection.
-  Every store read and potentially blocking trusted-key lookup completes before the actual
-  persistence transaction obtains its authoritative commit timestamp. The persistence operation
-  then invokes a pure transaction-local finalizer: it revalidates the already loaded exact
-  approval and complete profile governance at that later value, rejects snapshot or signing-key
-  expiry, re-verifies the snapshot, and recomputes authoritative WC-004 findings. The same value
-  is used for policy freshness, `publishedAt`, and `evaluatedAt`; no hook, authority read, trust
-  lookup, or independently supplied persistence call can run between timestamp acquisition and
-  insertion. Findings produced by preflight orchestration are never accepted as commit inputs.
+  Signing-key trust is also versioned state in that exact transaction, not a caller-advertised or
+  independently mutable resolver. After every persistence delay, the conditional operation loads
+  the exact configured key anchor and compares its revision and digest with the pre-collection
+  authority token. Disabled, retired, expired, revoked, missing, or changed key trust aborts the
+  transaction. The persistence operation then obtains its authoritative commit timestamp and
+  invokes a pure transaction-local finalizer: it revalidates the already loaded exact approval,
+  complete profile governance, and bound key trust at that later value, rejects snapshot or
+  signing-key expiry, re-verifies the snapshot, and recomputes authoritative WC-004 findings. The
+  same value is used for policy freshness, `publishedAt`, and `evaluatedAt`; no hook, authority
+  read, trust lookup, or independently supplied persistence call can run between timestamp
+  acquisition and insertion. Findings produced by preflight orchestration are never accepted as
+  commit inputs.
   The operation inserts the idempotency receipt, snapshot, source envelope, publication, and final
   recomputed result as one state change. No independently supplied commit capability can redirect
   publication to a foreign store. The HTTP composition root accepts only non-authoritative
   evidence/configuration/signing dependencies and constructs the demo service with the exact
   app-owned `ContextService`; preconstructed demo services are rejected.
 
-  Context, approval, evaluation-grant, receipt, and artifact operations are methods on the same
-  unit of work. The in-memory store owns both its commit clock and lock, samples time only after
-  its persistence-delay seam, and snapshots and commits all five state sets under that lock,
-  including rollback on failure. Production implementations must obtain authoritative database
-  time and provide the same conditional finalization on the transaction returned by the actual
-  Context API persistence adapter or one equivalent database conditional batch. Object identity,
-  advertised backend equality, and nested independently locked registries are not accepted as
-  evidence of atomicity. Approval
+  Context, approval, evaluation-grant, signing-key trust, receipt, and artifact operations are
+  methods on the same unit of work. The in-memory store owns its commit clock, lock, and key-trust
+  revision, samples time only after its persistence-delay seam, and snapshots and commits all six
+  state sets under that lock, including rollback on failure. Production implementations must
+  obtain authoritative database time and provide the same key-revision comparison and conditional
+  finalization on the transaction returned by the actual Context API persistence adapter or one
+  equivalent database conditional batch. Object identity, advertised backend equality, and nested
+  independently locked registries are not accepted as evidence of atomicity. Approval
   revoke/expiry, inherited override or risk-acceptance expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
   Authority tokens bind whether the caller selected an exact version or the unique active version.

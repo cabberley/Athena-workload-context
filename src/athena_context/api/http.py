@@ -55,7 +55,10 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationCommand,
     DemoEvaluationResult,
 )
-from athena_context.api.evaluation_ports import DemoEvaluationTrustConfiguration
+from athena_context.api.evaluation_ports import (
+    DemoEvaluationTrustConfiguration,
+    EvaluationTrustedKeyAuthority,
+)
 from athena_context.api.evaluation_service import (
     DemoEvaluationDependencies,
     DemoEvaluationService,
@@ -129,8 +132,27 @@ def create_app(
     default_store: InMemoryContextStore | None = None
     if service is None:
         default_clock = SystemClock()
+        demo_trust: DemoEvaluationTrustConfiguration | None = None
+        trusted_key: EvaluationTrustedKeyAuthority | None = None
+        if demo_evaluation_dependencies is not None:
+            evidence_client = demo_evaluation_dependencies.evidence_client
+            anchor = evidence_client.trusted_key_anchor
+            record = evidence_client.key_resolver(anchor)
+            if record is None:
+                raise DemoEvaluationConfigurationError(
+                    "demo evaluation signing key was not found while seeding "
+                    "the ContextService trust authority"
+                )
+            demo_trust = DemoEvaluationTrustConfiguration(
+                trusted_key_anchor=anchor,
+            )
+            trusted_key = EvaluationTrustedKeyAuthority(
+                record=record,
+                revision=1,
+            )
         default_store = InMemoryContextStore(
             authoritative_clock=default_clock,
+            demo_evaluation_trusted_key=trusted_key,
         )
         service = ContextService(
             store=default_store,
@@ -140,19 +162,7 @@ def create_app(
                 actor_id="athena-context-api",
                 kind=ActorKind.SERVICE,
             ),
-            demo_evaluation_trust=(
-                None
-                if demo_evaluation_dependencies is None
-                else DemoEvaluationTrustConfiguration(
-                    trusted_key_anchor=(
-                        demo_evaluation_dependencies.evidence_client
-                        .trusted_key_anchor
-                    ),
-                    key_resolver=(
-                        demo_evaluation_dependencies.evidence_client.key_resolver
-                    ),
-                )
-            ),
+            demo_evaluation_trust=demo_trust,
         )
     if cohort_service is None:
         cohort_persistence = InMemoryCohortPersistence()

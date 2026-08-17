@@ -67,6 +67,7 @@ from athena_context.api.evaluation_domain import (
     EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
+    TrustedKeyAuthorityToken,
     build_authorized_publication,
     build_demo_evaluation_result,
     build_published_context_authority_token,
@@ -77,6 +78,7 @@ from athena_context.api.evaluation_ports import (
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
     EvaluationCommitCandidate,
+    EvaluationTrustedKeyAuthority,
     StoredEvaluation,
 )
 from athena_context.api.ports import (
@@ -91,7 +93,6 @@ from athena_context.contracts import (
     ManifestFinding,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
-    TrustedKeyRecord,
     resolve_manifest_profile,
 )
 from athena_context.contracts.common import compute_artifact_digest
@@ -277,12 +278,35 @@ class _ContextServiceEvaluationAuthorityUnitOfWork:
     def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None:
         return self._evaluation_transaction.get_evaluation_artifact(snapshot_id)
 
+    def resolve_trusted_key(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> EvaluationTrustedKeyAuthority | None:
+        return self._evaluation_transaction.get_demo_evaluation_trusted_key(
+            trusted_key_anchor
+        )
+
+    def put_trusted_key(
+        self,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None:
+        self._evaluation_transaction.put_demo_evaluation_trusted_key(
+            authority,
+            expected_revision=expected_revision,
+        )
+
     def insert_evaluation_conditionally(
         self,
+        trusted_key_anchor: TrustedKeyAnchor,
+        expected_trusted_key: TrustedKeyAuthorityToken,
         artifact_factory: EvaluationArtifactFactory,
     ) -> StoredEvaluation:
         return self._evaluation_transaction.put_evaluation_conditionally(
-            artifact_factory
+            trusted_key_anchor,
+            expected_trusted_key,
+            artifact_factory,
         )
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
@@ -484,9 +508,9 @@ class ContextService:
 
         self._before_evaluation_artifact_insert(unit_of_work)
 
-        # Perform every authoritative store read and potentially blocking trust
-        # lookup before persistence obtains the final timestamp. The immutable
-        # records are revalidated by a pure callback at that later time.
+        # Perform mutable authority reads before persistence obtains the final
+        # timestamp. Key trust is read again and revision-bound by the
+        # conditional persistence operation after its delay seam.
         authority_read_at = self._now()
         approval, resolved, authority = self._resolve_evaluation_authority(
             unit_of_work,
@@ -497,10 +521,10 @@ class ContextService:
             evidence_identity_object_id=candidate.evidence_identity_object_id,
             expected_authority=candidate.expected_authority,
         )
-        trusted_key_record = self._resolve_demo_evaluation_key()
 
         def finalize_at_persistence_time(
             published_at: datetime,
+            trusted_key: EvaluationTrustedKeyAuthority,
         ) -> StoredEvaluation:
             final_approval, final_resolved, _ = (
                 self._validate_loaded_evaluation_authority(
@@ -514,6 +538,7 @@ class ContextService:
                     evidence_identity_object_id=(
                         candidate.evidence_identity_object_id
                     ),
+                    trusted_key=trusted_key,
                     expected_authority=candidate.expected_authority,
                 )
             )
@@ -538,7 +563,7 @@ class ContextService:
                 candidate,
                 resolved=final_resolved,
                 publication=publication,
-                trusted_key_record=trusted_key_record,
+                trusted_key=trusted_key,
                 as_of=published_at,
             )
             result = build_demo_evaluation_result(
@@ -564,25 +589,23 @@ class ContextService:
             self._validate_evaluation_components(artifact)
             return artifact
 
+        trust = self._require_demo_evaluation_trust()
         artifact = unit_of_work.insert_evaluation_conditionally(
-            finalize_at_persistence_time
+            trust.trusted_key_anchor,
+            candidate.expected_authority.trusted_key,
+            finalize_at_persistence_time,
         )
         return DemoEvaluationResult.model_validate_json(artifact.result_json)
 
-    def _resolve_demo_evaluation_key(self) -> TrustedKeyRecord:
-        """Complete the potentially blocking trust lookup before final time."""
-
+    def _require_demo_evaluation_trust(
+        self,
+    ) -> DemoEvaluationTrustConfiguration:
         trust = self._demo_evaluation_trust
         if trust is None:
             raise EvaluationFailedClosedError(
                 "ContextService has no authoritative demo evaluation trust"
             )
-        record = trust.key_resolver(trust.trusted_key_anchor)
-        if record is None:
-            raise EvaluationFailedClosedError(
-                "authoritative demo evaluation signing key was not found"
-            )
-        return record
+        return trust
 
     def _evaluate_demo_snapshot_for_publication(
         self,
@@ -590,7 +613,7 @@ class ContextService:
         *,
         resolved: ResolvedPublishedContext,
         publication: AuthorizedSnapshotPublication,
-        trusted_key_record: TrustedKeyRecord,
+        trusted_key: EvaluationTrustedKeyAuthority,
         as_of: datetime,
     ) -> tuple[ManifestFinding, ...]:
         """Cryptographically verify and evaluate at the final transaction time."""
@@ -641,7 +664,7 @@ class ContextService:
                 ),
                 publication_resolver=publication_resolver,
                 key_resolver=lambda requested: (
-                    trusted_key_record
+                    trusted_key.record
                     if requested == trust.trusted_key_anchor
                     else None
                 ),
@@ -722,6 +745,14 @@ class ContextService:
                 "published context/profile is missing, ambiguous, a superseded "
                 "context, or has inactive governance"
             ) from exc
+        trust = self._require_demo_evaluation_trust()
+        trusted_key = unit_of_work.resolve_trusted_key(
+            trust.trusted_key_anchor
+        )
+        if trusted_key is None:
+            raise EvaluationFailedClosedError(
+                "authoritative demo evaluation signing key was not found"
+            )
         return self._validate_loaded_evaluation_authority(
             actor=actor,
             command=command,
@@ -731,6 +762,7 @@ class ContextService:
             as_of=as_of,
             private_mcp_endpoint=private_mcp_endpoint,
             evidence_identity_object_id=evidence_identity_object_id,
+            trusted_key=trusted_key,
             expected_authority=expected_authority,
         )
 
@@ -745,6 +777,7 @@ class ContextService:
         as_of: datetime,
         private_mcp_endpoint: str,
         evidence_identity_object_id: str,
+        trusted_key: EvaluationTrustedKeyAuthority,
         expected_authority: EvaluationAuthorityToken | None,
     ) -> tuple[
         DemoEvaluationApproval,
@@ -760,6 +793,10 @@ class ContextService:
             as_of=as_of,
             private_mcp_endpoint=private_mcp_endpoint,
             evidence_identity_object_id=evidence_identity_object_id,
+        )
+        self._validate_trusted_key_authority(
+            trusted_key,
+            as_of=as_of,
         )
         selection = PublishedContextSelection(
             manifest_id=command.manifest_id,
@@ -805,12 +842,43 @@ class ContextService:
             context=current_context.authority_token,
             approval=approval.authority_token(),
             authorization=authorization,
+            trusted_key=trusted_key.authority_token(),
         )
         if expected_authority is not None and authority != expected_authority:
             raise EvaluationFailedClosedError(
                 "evaluation authority revision changed before publication"
             )
         return approval, current_context, authority
+
+    def _validate_trusted_key_authority(
+        self,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        as_of: datetime,
+    ) -> None:
+        trust = self._require_demo_evaluation_trust()
+        record = authority.record
+        if (
+            record.anchor != trust.trusted_key_anchor
+            or not record.enabled
+            or record.activated_at > as_of
+            or (
+                record.retired_at is not None
+                and record.retired_at <= as_of
+            )
+            or (
+                record.expires_at is not None
+                and record.expires_at <= as_of
+            )
+            or (
+                authority.revoked_at is not None
+                and authority.revoked_at <= as_of
+            )
+        ):
+            raise EvaluationFailedClosedError(
+                "trusted signing key is disabled, retired, expired, revoked, "
+                "or not active at publication time"
+            )
 
     def _before_evaluation_artifact_insert(
         self,
@@ -921,6 +989,45 @@ class ContextService:
             reader_actor=actor,
             operation=lambda unit_of_work: unit_of_work.resolve_approval(
                 decision_id
+            ),
+        )
+
+    def get_demo_evaluation_trusted_key(
+        self,
+        actor: Actor,
+    ) -> EvaluationTrustedKeyAuthority | None:
+        """Read this service's exact transaction-owned signing-key trust."""
+
+        self._authorization.require(actor, Permission.AUDIT, None)
+        trust = self._require_demo_evaluation_trust()
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.resolve_trusted_key(
+                trust.trusted_key_anchor
+            ),
+        )
+
+    def put_demo_evaluation_trusted_key(
+        self,
+        actor: Actor,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """Replace signing-key trust through the actual ContextService store."""
+
+        self._authorization.require(actor, Permission.APPROVE, None)
+        trust = self._require_demo_evaluation_trust()
+        if authority.record.anchor != trust.trusted_key_anchor:
+            raise DemoEvaluationConfigurationError(
+                "trusted key replacement does not match this ContextService "
+                "anchor"
+            )
+        self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.put_trusted_key(
+                authority,
+                expected_revision=expected_revision,
             ),
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime
 from typing import Literal
 
@@ -14,7 +15,10 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationResult,
 )
-from athena_context.api.evaluation_ports import StoredEvaluation
+from athena_context.api.evaluation_ports import (
+    EvaluationTrustedKeyAuthority,
+    StoredEvaluation,
+)
 from athena_context.api.service import ContextService
 from athena_context.contracts import SnapshotPublicationRecord
 
@@ -207,8 +211,44 @@ class InMemoryDemoEvaluationApprovalRegistry:
         )
 
 
+class InMemoryDemoEvaluationTrustRegistry:
+    """Test key-trust registry whose writes remain ContextService-authoritative."""
+
+    def __init__(
+        self,
+        *,
+        context_service: ContextService,
+        administration_actor: Actor,
+    ) -> None:
+        self._context_service = context_service
+        self._administration_actor = administration_actor
+
+    def resolve(self) -> EvaluationTrustedKeyAuthority | None:
+        return self._context_service.get_demo_evaluation_trusted_key(
+            self._administration_actor
+        )
+
+    def disable(self, *, revoked_at: datetime) -> None:
+        current = self.resolve()
+        if current is None:
+            raise ResourceNotFoundError(
+                "demo evaluation trusted key was not found"
+            )
+        replacement = EvaluationTrustedKeyAuthority(
+            record=replace(current.record, enabled=False),
+            revision=current.revision + 1,
+            revoked_at=revoked_at,
+        )
+        self._context_service.put_demo_evaluation_trusted_key(
+            self._administration_actor,
+            replacement,
+            expected_revision=current.revision,
+        )
+
+
 __all__ = [
     "InMemoryDemoEvaluationApprovalRegistry",
     "InMemoryDemoEvaluationStateReader",
+    "InMemoryDemoEvaluationTrustRegistry",
     "InMemoryEvaluationAuthorizationRegistry",
 ]

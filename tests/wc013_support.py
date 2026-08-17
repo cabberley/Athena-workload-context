@@ -24,6 +24,7 @@ from athena_context.api import (
     InMemoryContextStore,
     InMemoryDemoEvaluationApprovalRegistry,
     InMemoryDemoEvaluationStateReader,
+    InMemoryDemoEvaluationTrustRegistry,
     InMemoryEvaluationAuthorizationRegistry,
     McpReadAssignment,
     OperatorDeploymentApproval,
@@ -46,7 +47,10 @@ from athena_context.api.domain import (
     PublishedManifestView,
     SupersedeCommand,
 )
-from athena_context.api.evaluation_ports import SnapshotSigningRequest
+from athena_context.api.evaluation_ports import (
+    EvaluationTrustedKeyAuthority,
+    SnapshotSigningRequest,
+)
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
@@ -455,10 +459,14 @@ class LifecycleContextResolver:
         publish_manifest: bool = True,
         clock: StepClock | None = None,
         demo_evaluation_trust: DemoEvaluationTrustConfiguration | None = None,
+        demo_evaluation_trusted_key: (
+            EvaluationTrustedKeyAuthority | None
+        ) = None,
     ) -> None:
         lifecycle_clock = clock or StepClock(lifecycle_start)
         self.store = InMemoryContextStore(
             authoritative_clock=lifecycle_clock,
+            demo_evaluation_trusted_key=demo_evaluation_trusted_key,
         )
         self.authorization = RoleBasedAuthorization(
             [
@@ -739,6 +747,7 @@ class DemoHarness:
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: LifecycleContextResolver
     approval_registry: InMemoryDemoEvaluationApprovalRegistry
+    trust_registry: InMemoryDemoEvaluationTrustRegistry
     authorization: InMemoryEvaluationAuthorizationRegistry
     approval: DemoEvaluationApproval
     deployment_configuration: VerifiedWc008DeploymentConfiguration
@@ -839,6 +848,8 @@ def build_harness(
         private_key.public_key(),
         expires_at=trusted_key_expires_at,
     )
+    trusted_key_record = trusted_key_resolver(trusted_key_anchor)
+    assert trusted_key_record is not None
     trusted_configuration = (
         service_configuration or verified_deployment_configuration()
     )
@@ -872,7 +883,10 @@ def build_harness(
         clock=clock,
         demo_evaluation_trust=DemoEvaluationTrustConfiguration(
             trusted_key_anchor=trusted_key_anchor,
-            key_resolver=trusted_key_resolver,
+        ),
+        demo_evaluation_trusted_key=EvaluationTrustedKeyAuthority(
+            record=trusted_key_record,
+            revision=1,
         ),
     )
     published_manifest = (
@@ -927,6 +941,10 @@ def build_harness(
         context_service=context_resolver.service,
         approval_actor=APPROVER,
     )
+    trust_registry = InMemoryDemoEvaluationTrustRegistry(
+        context_service=context_resolver.service,
+        administration_actor=APPROVER,
+    )
     authorization = InMemoryEvaluationAuthorizationRegistry(
         (
             RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
@@ -967,6 +985,7 @@ def build_harness(
         snapshot_signer=snapshot_signer,
         context_resolver=context_resolver,
         approval_registry=approval_registry,
+        trust_registry=trust_registry,
         authorization=authorization,
         approval=approval,
         deployment_configuration=trusted_configuration,
