@@ -16,7 +16,7 @@ from athena_context.api.cohort_memory import (
     InMemoryCohortPersistence,
 )
 from athena_context.api.cohort_service import CohortProposalService
-from athena_context.api.domain import ReplaceDraftCommand
+from athena_context.api.domain import ReplaceDraftCommand, TransitionCommand
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
 from athena_context.contracts import (
@@ -272,10 +272,10 @@ def test_approve_persists_audited_decision_and_atomically_replaces_selectors() -
             harness.manifest.manifest_id,
             decision["decisionId"],
         )
-        assert audit[-2].reason == draft.reason
-        assert audit[-1].action == "cohort_decision_recorded"
-        assert decision["decisionId"] in audit[-1].reason
-        assert audit[-1].revision == 2
+        assert audit[-1].reason == draft.reason
+        assert audit[-2].action == "cohort_decision_recorded"
+        assert decision["decisionId"] in audit[-2].reason
+        assert audit[-2].revision == 2
         assert stored is not None
         assert stored.candidate_digest == compute_artifact_digest(
             body["candidate"]
@@ -697,6 +697,75 @@ def test_generic_put_allows_global_role_non_selector_edit() -> None:
     )
     assert updated_worker["ownerRef"] == "synthetic-platform-owner"
     assert updated_worker["selectors"] == original_selectors
+
+
+def test_direct_replace_cannot_fabricate_cohort_authority_without_decision() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-direct-fabrication-preview"),
+    )
+    assert preview.status_code == 200, preview.text
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    payload["profiles"]["production"]["roles"].append(candidate_role)
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    fabricated_decision_id = "cohort-decision-fabricated-authority"
+    command = ReplaceDraftCommand(
+        expected_revision=harness.draft_revision,
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=harness.draft_digest,
+        replacement_manifest=replacement,
+        replacement_digest=replacement.compatibility.artifact_digest,
+        reason=(
+            f"Attempt selector mutation with {fabricated_decision_id} "
+            "but no persisted decision"
+        ),
+    )
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(manifest_id=harness.manifest.manifest_id)
+
+    with pytest.raises(
+        PersistenceConflictError,
+        match="requires a persisted approved decision",
+    ), harness.store.transaction() as tx:
+        harness.lifecycle.replace_draft_in_transaction(
+            tx,
+            actor=HUMAN,
+            draft_id=harness.draft_id,
+            command=command,
+            occurred_at=harness.clock.now(),
+            cohort_decision_id=fabricated_decision_id,
+        )
+
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == harness.draft_revision
+    assert draft.manifest == harness.manifest
+    with harness.store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == []
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            "fabricated-cohort-authority",
+        ) is None
 
 
 def test_reject_survives_proposal_cache_regeneration_at_a_later_time() -> None:
@@ -1331,6 +1400,71 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
         )) == 1
 
 
+def test_persisted_split_authority_survives_validate_and_submit_rechecks() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-lifecycle-split-preview"),
+    )
+    applied = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-lifecycle-split-apply",
+    )
+    assert preview.status_code == 200, preview.text
+    assert applied.status_code == 201, applied.text
+    draft_result = applied.json()["draftResult"]
+    validate_command = TransitionCommand(
+        expected_revision=draft_result["revision"],
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=draft_result["manifestDigest"],
+        reason="Validate exact selectors authorized by the persisted decision",
+    )
+    validated = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/validate",
+        json=validate_command.model_dump(mode="json"),
+        headers=_headers(idempotency_key="wc-034-lifecycle-validate"),
+    )
+    assert validated.status_code == 200, validated.text
+    submit_command = TransitionCommand(
+        expected_revision=validated.json()["revision"],
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=validated.json()["manifest_digest"],
+        reason="Submit exact persisted decision selectors for normal review",
+    )
+    submitted = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/submit",
+        json=submit_command.model_dump(mode="json"),
+        headers=_headers(idempotency_key="wc-034-lifecycle-submit"),
+    )
+
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["state"] == "in_review"
+    assert submitted.json()["revision"] == draft_result["revision"] + 2
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+    assert len(decisions) == 1
+    assert decisions[0].apply_authorization is not None
+    assert decisions[0].apply_authorization.status == "approved"
+
+
 def test_preview_candidates_are_actor_bound_for_two_authorized_reviewers() -> None:
     harness = _build_harness()
     batch = _load(harness)
@@ -1468,10 +1602,10 @@ class _FailAfterDraftTransaction:
             raise AttributeError(name)
         return getattr(self._transaction, name)
 
-    def put_cohort_decision(self, decision) -> None:
-        del decision
+    def put_cohort_decision_receipt(self, receipt) -> None:
+        del receipt
         raise PersistenceConflictError(
-            "synthetic decision persistence failure after draft update"
+            "synthetic receipt persistence failure after decision and draft"
         )
 
 

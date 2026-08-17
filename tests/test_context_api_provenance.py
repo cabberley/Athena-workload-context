@@ -68,7 +68,7 @@ def test_submission_finalizes_exact_publication_candidate_before_approval() -> N
     assert submitted.manifest.audit != untrusted_audit
     assert submitted.manifest.audit.published_by == PUBLICATION_SERVICE.actor_id
     assert submitted.manifest.audit.published_at == datetime(
-        2026, 8, 17, 0, 0, 2, tzinfo=UTC
+        2025, 6, 1, 0, 0, 2, tzinfo=UTC
     )
     assert submitted.manifest.audit.approval_status == "approved"
     assert submitted.manifest.compute_artifact_digest_value() == submitted.manifest_digest
@@ -120,7 +120,7 @@ def test_approval_and_publication_preserve_candidate_and_record_human_authority(
     assert published.published_by == PUBLICATION_SERVICE
     assert published.publication_authorized_by == PUBLISHER
     assert published.publication_authorized_at == datetime(
-        2026, 8, 17, 0, 0, 4, tzinfo=UTC
+        2025, 6, 1, 0, 0, 4, tzinfo=UTC
     )
     publication_event = service.audit_history(PUBLISHER, published.manifest_id)[-1]
     assert publication_event.actor == PUBLISHER

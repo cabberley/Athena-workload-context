@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from athena_context.api.domain import (
     Actor,
@@ -17,6 +17,9 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadIdentifier,
 )
+
+if TYPE_CHECKING:
+    from athena_context.api.cohort_decision_domain import CohortDecisionRecord
 
 
 class ClockPort(Protocol):
@@ -78,6 +81,21 @@ class ContextTransactionPort(Protocol):
     def get_receipt(self, actor_id: str, idempotency_key: str) -> MutationReceipt | None: ...
 
     def put_receipt(self, receipt: MutationReceipt) -> None: ...
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None: ...
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]: ...
 
 
 class ContextStorePort(Protocol):

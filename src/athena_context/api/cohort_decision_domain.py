@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -14,7 +12,12 @@ from athena_context.api.cohort_domain import (
     canonical_proposal_ids,
     normalized_identifier,
 )
-from athena_context.api.domain import Actor, ApiModel, WorkloadIdentifier
+from athena_context.api.domain import (
+    Actor,
+    ApiModel,
+    ReplaceDraftCommand,
+    WorkloadIdentifier,
+)
 from athena_context.binding.domain import ProposalScope, ProposalSnapshot
 from athena_context.contracts.common import (
     compute_artifact_digest,
@@ -37,13 +40,12 @@ class CohortDecisionKind(StrEnum):
     MERGE = "merge"
 
 
-@dataclass(frozen=True, slots=True)
-class CohortDecisionSelectorCapability:
-    """In-process authority for one exact, atomically persisted decision apply."""
+class CohortDecisionApplyBinding(ApiModel):
+    """Immutable provenance and selector binding for one intended apply."""
 
     decision_id: str
     decision: CohortDecisionKind
-    decided_at: datetime
+    decided_at: AwareDatetime
     actor: Actor
     candidate_id: str
     candidate_digest: str
@@ -53,7 +55,8 @@ class CohortDecisionSelectorCapability:
     resolved_profile_digest: str
     source_draft: CohortDraftBinding
     current_draft: CohortDraftBinding
-    proposal_ids: tuple[str, ...]
+    resulting_draft: CohortDraftBinding
+    proposal_ids: list[str]
     proposal_set_digest: str
     snapshot_artifact_digest: str
     target_role_id: str
@@ -62,67 +65,119 @@ class CohortDecisionSelectorCapability:
     retained_replacement_role_digests: tuple[tuple[str, str, str], ...]
     replacement_manifest_digest: str
 
-    def permits_selector_identity_replacement(
-        self,
-        *,
-        manifest_id: str,
-        manifest_version: str,
-        profile_id: str,
-        inherited_role: ManifestRole,
-        replacement_role: ManifestRole,
-    ) -> bool:
-        """Authorize only the exact guarded selectors reviewed by one actor."""
+    @field_validator("proposal_ids")
+    @classmethod
+    def validate_proposal_ids(cls, values: list[str]) -> list[str]:
+        canonical = canonical_proposal_ids(values)
+        if values != canonical:
+            raise ValueError("apply proposal_ids must use canonical proposal order")
+        return values
 
-        inherited_digest = compute_artifact_digest(
-            inherited_role.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            )
+
+class CohortDecisionApplyAuthorization(ApiModel):
+    """Persisted approval required before the draft transaction may mutate."""
+
+    status: Literal["approved"] = "approved"
+    binding: CohortDecisionApplyBinding
+    mutation_digest: str = Field(
+        alias="mutationDigest",
+        pattern=_DIGEST_PATTERN,
+    )
+
+    @classmethod
+    def issue(
+        cls,
+        binding: CohortDecisionApplyBinding,
+        command: ReplaceDraftCommand,
+    ) -> CohortDecisionApplyAuthorization:
+        return cls(
+            binding=binding,
+            mutationDigest=compute_artifact_digest(
+                {
+                    "operation": "cohort_decision_apply",
+                    "status": "approved",
+                    "binding": binding.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                    "command": command.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                }
+            ),
         )
-        replacement_digest = compute_artifact_digest(
-            replacement_role.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            )
+
+    def authorizes(self, command: ReplaceDraftCommand) -> bool:
+        expected = type(self).issue(self.binding, command)
+        return self.status == "approved" and self.mutation_digest == (
+            expected.mutation_digest
         )
-        exact_candidate = (
-            self.decision
-            in {
-                CohortDecisionKind.SPLIT,
-                CohortDecisionKind.MERGE,
-            }
-            and normalized_identifier(inherited_role.role_id)
-            == normalized_identifier(self.target_role_id)
-            and normalized_identifier(replacement_role.role_id)
-            == normalized_identifier(self.target_role_id)
-            and inherited_digest == self.inherited_role_digest
-            and replacement_digest == self.replacement_role_digest
+
+
+def _selector_binding_permits(
+    binding: CohortDecisionApplyBinding,
+    *,
+    manifest_id: str,
+    manifest_version: str,
+    profile_id: str,
+    inherited_role: ManifestRole,
+    replacement_role: ManifestRole,
+) -> bool:
+    """Evaluate selector policy data without making it mutation authority."""
+
+    inherited_digest = compute_artifact_digest(
+        inherited_role.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
         )
-        retained_from_current_draft = (
-            normalized_identifier(profile_id),
-            normalized_identifier(replacement_role.role_id),
-            replacement_digest,
-        ) in self.retained_replacement_role_digests
-        return (
-            self.decision
-            in {
-                CohortDecisionKind.APPROVE,
-                CohortDecisionKind.SPLIT,
-                CohortDecisionKind.MERGE,
-            }
-            and normalized_identifier(manifest_id)
-            == normalized_identifier(self.manifest_id)
-            and manifest_version == self.manifest_version
-            and normalized_identifier(profile_id)
-            == normalized_identifier(self.profile_id)
-            and (exact_candidate or retained_from_current_draft)
-            and is_guarded_selector_replacement_narrower(
-                inherited_role.selectors,
-                replacement_role.selectors,
-            )
+    )
+    replacement_digest = compute_artifact_digest(
+        replacement_role.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
         )
+    )
+    exact_candidate = (
+        binding.decision
+        in {
+            CohortDecisionKind.SPLIT,
+            CohortDecisionKind.MERGE,
+        }
+        and normalized_identifier(inherited_role.role_id)
+        == normalized_identifier(binding.target_role_id)
+        and normalized_identifier(replacement_role.role_id)
+        == normalized_identifier(binding.target_role_id)
+        and inherited_digest == binding.inherited_role_digest
+        and replacement_digest == binding.replacement_role_digest
+    )
+    retained_from_current_draft = (
+        normalized_identifier(profile_id),
+        normalized_identifier(replacement_role.role_id),
+        replacement_digest,
+    ) in binding.retained_replacement_role_digests
+    return (
+        binding.decision
+        in {
+            CohortDecisionKind.APPROVE,
+            CohortDecisionKind.SPLIT,
+            CohortDecisionKind.MERGE,
+        }
+        and normalized_identifier(manifest_id)
+        == normalized_identifier(binding.manifest_id)
+        and manifest_version == binding.manifest_version
+        and normalized_identifier(profile_id)
+        == normalized_identifier(binding.profile_id)
+        and (exact_candidate or retained_from_current_draft)
+        and is_guarded_selector_replacement_narrower(
+            inherited_role.selectors,
+            replacement_role.selectors,
+        )
+    )
 
 
 class CohortDecisionRequest(ApiModel):
@@ -285,6 +340,10 @@ class CohortDecisionRecord(ApiModel):
         alias="candidateDigest",
         pattern=_DIGEST_PATTERN,
     )
+    apply_authorization: CohortDecisionApplyAuthorization | None = Field(
+        default=None,
+        alias="applyAuthorization",
+    )
     rationale: str = Field(min_length=1, max_length=2000)
     decided_by: Actor = Field(alias="decidedBy")
     decided_at: AwareDatetime = Field(alias="decidedAt")
@@ -309,6 +368,38 @@ class CohortDecisionRecord(ApiModel):
             raise ValueError("only reject decisions may omit a candidate")
         if rejected != (self.candidate_digest is None):
             raise ValueError("only reject decisions may omit a candidate digest")
+        if rejected != (self.apply_authorization is None):
+            raise ValueError("only reject decisions may omit apply authorization")
+        if self.apply_authorization is not None:
+            binding = self.apply_authorization.binding
+            if (
+                binding.decision_id != self.decision_id
+                or binding.decision is not self.decision
+                or binding.decided_at != self.decided_at
+                or binding.actor != self.decided_by
+                or binding.candidate_id != self.candidate_id
+                or binding.candidate_digest != self.candidate_digest
+                or binding.manifest_id != self.manifest_id
+                or binding.manifest_version != self.manifest_version
+                or normalized_identifier(binding.profile_id)
+                != normalized_identifier(self.profile_id)
+                or binding.resolved_profile_digest
+                != self.resolved_profile_digest
+                or binding.source_draft != self.source_draft
+                or binding.resulting_draft != self.applied_draft
+                or binding.proposal_ids != self.source_proposal_ids
+                or binding.proposal_set_digest != self.proposal_set_digest
+                or binding.snapshot_artifact_digest
+                != self.snapshot.artifact_digest
+                or normalized_identifier(binding.target_role_id)
+                not in {
+                    normalized_identifier(role_ref)
+                    for role_ref in self.source_role_refs
+                }
+            ):
+                raise ValueError(
+                    "cohort apply authorization is inconsistent with its decision"
+                )
         if (
             self.audit.decision_id != self.decision_id
             or self.audit.actor != self.decided_by
@@ -424,7 +515,6 @@ __all__ = [
     "CohortDecisionRecord",
     "CohortDecisionRequest",
     "CohortDecisionResponse",
-    "CohortDecisionSelectorCapability",
     "CohortProposalSetVersion",
     "decision_response",
 ]

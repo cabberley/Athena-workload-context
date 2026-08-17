@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar
 
 from pydantic import ValidationError
 
 from athena_context.api.cohort_decision_domain import (
+    CohortDecisionApplyBinding,
     CohortDecisionKind,
-    CohortDecisionSelectorCapability,
+    _selector_binding_permits,
 )
 from athena_context.api.domain import (
     Actor,
@@ -45,6 +47,7 @@ from athena_context.api.errors import (
     IdempotencyConflictError,
     InvalidTransitionError,
     ManifestValidationError,
+    PersistenceConflictError,
     ResourceNotFoundError,
     StaleApprovalError,
     StaleRevisionError,
@@ -62,13 +65,43 @@ from athena_context.contracts.common import (
 )
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
+    ManifestRole,
     _resolve_manifest_profile_for_cohort_decision,
     canonicalize_manifest_payload,
+    resolve_manifest_profile,
     validate_manifest_selector_identity_inheritance,
     validate_manifest_selector_identity_transition,
 )
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistedSelectorAuthority:
+    """Selector resolver authority derived only from persisted decisions."""
+
+    bindings: tuple[CohortDecisionApplyBinding, ...]
+
+    def permits_selector_identity_replacement(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str,
+        profile_id: str,
+        inherited_role: ManifestRole,
+        replacement_role: ManifestRole,
+    ) -> bool:
+        return any(
+            _selector_binding_permits(
+                binding,
+                manifest_id=manifest_id,
+                manifest_version=manifest_version,
+                profile_id=profile_id,
+                inherited_role=inherited_role,
+                replacement_role=replacement_role,
+            )
+            for binding in self.bindings
+        )
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -214,9 +247,7 @@ class ContextService:
         draft_id: str,
         command: ReplaceDraftCommand,
         occurred_at: datetime | None = None,
-        cohort_decision_capability: (
-            CohortDecisionSelectorCapability | None
-        ) = None,
+        cohort_decision_id: str | None = None,
     ) -> DraftRecord:
         """Apply WC-007 replacement rules inside a caller-owned atomic transaction."""
 
@@ -242,14 +273,23 @@ class ContextService:
             previous_version=current.previous_version,
         )
         now = self._now() if occurred_at is None else ensure_timestamp(occurred_at)
+        selector_authority = (
+            None
+            if cohort_decision_id is None
+            else self._require_persisted_cohort_apply(
+                tx,
+                actor=actor,
+                current=current,
+                command=command,
+                occurred_at=now,
+                decision_id=cohort_decision_id,
+            )
+        )
         self._validate_replacement_profiles(
-            actor=actor,
             current=current,
             replacement=command.replacement_manifest,
-            replacement_digest=command.replacement_digest,
-            reason=command.reason,
             as_of=now,
-            capability=cohort_decision_capability,
+            selector_authority=selector_authority,
         )
         replacement = current.model_copy(
             update={
@@ -280,17 +320,13 @@ class ContextService:
     @staticmethod
     def _validate_replacement_profiles(
         *,
-        actor: Actor,
         current: DraftRecord,
         replacement: CanonicalWorkloadManifest,
-        replacement_digest: str,
-        reason: str,
         as_of: datetime,
-        capability: CohortDecisionSelectorCapability | None,
+        selector_authority: _PersistedSelectorAuthority | None,
     ) -> None:
         try:
-            profile = next(iter(replacement.profiles.values()))
-            if capability is None:
+            if selector_authority is None:
                 validate_manifest_selector_identity_transition(
                     current.manifest,
                     replacement,
@@ -299,44 +335,209 @@ class ContextService:
                     replacement,
                 )
                 return
-            if (
-                capability.decision
-                not in {
-                    CohortDecisionKind.APPROVE,
-                    CohortDecisionKind.SPLIT,
-                    CohortDecisionKind.MERGE,
-                }
-                or capability.actor != actor
-                or capability.decided_at != as_of
-                or capability.manifest_id != current.manifest_id
-                or capability.manifest_version
-                != replacement.manifest_version
-                or capability.current_draft.draft_id != current.draft_id
-                or capability.current_draft.revision != current.revision
-                or capability.current_draft.manifest_digest
-                != current.manifest_digest
-                or capability.source_draft.draft_id != current.draft_id
-                or capability.source_draft.revision > current.revision
-                or capability.replacement_manifest_digest
-                != replacement_digest
-                or replacement.compatibility.artifact_digest
-                != capability.replacement_manifest_digest
-                or capability.decision_id not in reason
-            ):
-                raise AthenaValidationError(
-                    "cohort selector capability does not match the exact "
-                    "authenticated draft mutation"
+            for profile in replacement.profiles.values():
+                _resolve_manifest_profile_for_cohort_decision(
+                    replacement,
+                    profile.profile_id,
+                    as_of=as_of,
+                    selector_capability=selector_authority,
                 )
-            _resolve_manifest_profile_for_cohort_decision(
-                replacement,
-                profile.profile_id,
-                as_of=as_of,
-                selector_capability=capability,
-            )
         except (AthenaValidationError, StopIteration) as exc:
             raise ManifestValidationError(
                 "replacement manifest profile inheritance is not valid"
             ) from exc
+
+    @staticmethod
+    def _require_persisted_cohort_apply(
+        tx: ContextTransactionPort,
+        *,
+        actor: Actor,
+        current: DraftRecord,
+        command: ReplaceDraftCommand,
+        occurred_at: datetime,
+        decision_id: str,
+    ) -> _PersistedSelectorAuthority:
+        """Load and verify immutable decision authority before any mutation."""
+
+        record = tx.get_cohort_decision(current.manifest_id, decision_id)
+        authorization = (
+            None if record is None else record.apply_authorization
+        )
+        if authorization is None or record is None:
+            raise PersistenceConflictError(
+                "cohort draft mutation requires a persisted approved decision"
+            )
+        binding = authorization.binding
+        resulting_revision = current.revision + 1
+        matching_audit = next(
+            (
+                event
+                for event in tx.list_audit(manifest_id=current.manifest_id)
+                if event.event_id == record.audit.audit_id
+            ),
+            None,
+        )
+        if (
+            authorization.status != "approved"
+            or record.decision
+            not in {
+                CohortDecisionKind.APPROVE,
+                CohortDecisionKind.SPLIT,
+                CohortDecisionKind.MERGE,
+            }
+            or record.decision_id != decision_id
+            or record.decided_by != actor
+            or record.decided_at != occurred_at
+            or record.manifest_id != current.manifest_id
+            or record.manifest_version
+            != command.replacement_manifest.manifest_version
+            or record.candidate_id is None
+            or record.candidate_digest is None
+            or binding.actor != actor
+            or binding.decided_at != occurred_at
+            or binding.current_draft.draft_id != current.draft_id
+            or binding.current_draft.revision != current.revision
+            or binding.current_draft.manifest_digest
+            != current.manifest_digest
+            or binding.source_draft.draft_id != current.draft_id
+            or binding.source_draft.revision > current.revision
+            or binding.resulting_draft.draft_id != current.draft_id
+            or binding.resulting_draft.revision != resulting_revision
+            or binding.resulting_draft.manifest_digest
+            != command.replacement_digest
+            or record.applied_draft != binding.resulting_draft
+            or binding.replacement_manifest_digest
+            != command.replacement_digest
+            or command.replacement_manifest.compatibility.artifact_digest
+            != command.replacement_digest
+            or decision_id not in command.reason
+            or not authorization.authorizes(command)
+            or matching_audit is None
+            or matching_audit.action is not AuditAction.COHORT_DECISION_RECORDED
+            or matching_audit.actor != actor
+            or matching_audit.occurred_at != occurred_at
+            or matching_audit.draft_id != current.draft_id
+            or matching_audit.revision != resulting_revision
+            or matching_audit.manifest_digest != command.replacement_digest
+        ):
+            raise PersistenceConflictError(
+                "persisted cohort decision does not authorize the exact "
+                "authenticated draft mutation"
+            )
+        return _PersistedSelectorAuthority((binding,))
+
+    def _validate_lifecycle_manifest(
+        self,
+        tx: ContextTransactionPort,
+        *,
+        current: DraftRecord,
+        manifest: CanonicalWorkloadManifest,
+        manifest_digest: str,
+        as_of: datetime,
+    ) -> None:
+        """Resolve every profile before validate, submit, or publish."""
+
+        try:
+            validated_manifest = CanonicalWorkloadManifest.model_validate(
+                manifest.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+            self._ensure_manifest_digest(validated_manifest, manifest_digest)
+        except (ValidationError, ValueError) as exc:
+            raise ManifestValidationError(
+                "the draft manifest is not valid"
+            ) from exc
+
+        try:
+            validate_manifest_selector_identity_inheritance(
+                validated_manifest
+            )
+            for profile in validated_manifest.profiles.values():
+                resolve_manifest_profile(
+                    validated_manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                )
+            return
+        except AthenaValidationError as generic_error:
+            authority = self._persisted_lifecycle_selector_authority(
+                tx,
+                current=current,
+            )
+            if authority is None:
+                raise ManifestValidationError(
+                    "the draft manifest profile inheritance is not valid"
+                ) from generic_error
+            try:
+                for profile in validated_manifest.profiles.values():
+                    _resolve_manifest_profile_for_cohort_decision(
+                        validated_manifest,
+                        profile.profile_id,
+                        as_of=as_of,
+                        selector_capability=authority,
+                    )
+            except AthenaValidationError as exc:
+                raise ManifestValidationError(
+                    "the draft manifest profile inheritance is not valid"
+                ) from exc
+
+    @staticmethod
+    def _persisted_lifecycle_selector_authority(
+        tx: ContextTransactionPort,
+        *,
+        current: DraftRecord,
+    ) -> _PersistedSelectorAuthority | None:
+        """Recover selector provenance only from immutable applied decisions."""
+
+        applied = [
+            decision
+            for decision in tx.list_cohort_decisions(
+                manifest_id=current.manifest_id,
+                draft_id=current.draft_id,
+            )
+            if decision.manifest_version
+            == current.manifest.manifest_version
+            and decision.apply_authorization is not None
+            and decision.applied_draft is not None
+            and decision.applied_draft.revision <= current.revision
+            and decision.apply_authorization.status == "approved"
+        ]
+        if not applied:
+            return None
+        latest = max(
+            applied,
+            key=lambda decision: (
+                decision.applied_draft.revision
+                if decision.applied_draft is not None
+                else 0
+            ),
+        )
+        if latest.applied_draft is None:
+            return None
+        if current.state is DraftState.DRAFT and (
+            latest.applied_draft.revision != current.revision
+            or latest.applied_draft.manifest_digest
+            != current.manifest_digest
+        ):
+            return None
+        if current.state is DraftState.VALIDATED and (
+            current.validation is None
+            or current.validation.validated_revision != current.revision
+            or current.validation.manifest_digest
+            != latest.applied_draft.manifest_digest
+            or current.manifest_digest
+            != latest.applied_draft.manifest_digest
+        ):
+            return None
+        bindings = tuple(
+            decision.apply_authorization.binding
+            for decision in applied
+            if decision.apply_authorization is not None
+        )
+        return _PersistedSelectorAuthority(bindings)
 
     def validate_draft(
         self,
@@ -352,18 +553,14 @@ class ContextService:
             self._authorization.require(actor, Permission.VALIDATE, current.manifest_id)
             self._require_state(current, DraftState.DRAFT)
             self._ensure_expected_command(current, command)
-            try:
-                validated_manifest = CanonicalWorkloadManifest.model_validate(
-                    current.manifest.model_dump(
-                        mode="python",
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                )
-            except (ValidationError, ValueError) as exc:
-                raise ManifestValidationError("the draft manifest is not valid") from exc
-            self._ensure_manifest_digest(validated_manifest, current.manifest_digest)
             now = self._now()
+            self._validate_lifecycle_manifest(
+                tx,
+                current=current,
+                manifest=current.manifest,
+                manifest_digest=current.manifest_digest,
+                as_of=now,
+            )
             revision = current.revision + 1
             updated = current.model_copy(
                 update={
@@ -418,11 +615,25 @@ class ContextService:
             self._require_state(current, DraftState.VALIDATED)
             self._ensure_expected_command(current, command)
             now = self._now()
+            self._validate_lifecycle_manifest(
+                tx,
+                current=current,
+                manifest=current.manifest,
+                manifest_digest=current.manifest_digest,
+                as_of=now,
+            )
             candidate_manifest = self._finalize_publication_candidate(
                 current.manifest,
                 finalized_at=now,
             )
             candidate_digest = candidate_manifest.compatibility.artifact_digest
+            self._validate_lifecycle_manifest(
+                tx,
+                current=current,
+                manifest=candidate_manifest,
+                manifest_digest=candidate_digest,
+                as_of=now,
+            )
             revision = current.revision + 1
             updated = current.model_copy(
                 update={
@@ -560,6 +771,14 @@ class ContextService:
                 or approval.manifest_digest != current.manifest_digest
             ):
                 raise StaleApprovalError("the approval does not authorize this draft revision")
+            now = self._now()
+            self._validate_lifecycle_manifest(
+                tx,
+                current=current,
+                manifest=current.manifest,
+                manifest_digest=current.manifest_digest,
+                as_of=now,
+            )
             if (
                 tx.get_published(current.manifest_id, current.manifest.manifest_version)
                 is not None
@@ -571,7 +790,6 @@ class ContextService:
                 new_version=current.manifest.manifest_version,
                 previous_version=current.previous_version,
             )
-            now = self._now()
             revision = current.revision + 1
             published = PublishedManifest(
                 manifest_id=current.manifest_id,

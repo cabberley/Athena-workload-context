@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from pydantic import ValidationError
 
 from athena_context.api.cohort_decision_domain import (
+    CohortDecisionApplyAuthorization,
+    CohortDecisionApplyBinding,
     CohortDecisionAudit,
     CohortDecisionKind,
     CohortDecisionReceipt,
     CohortDecisionRecord,
     CohortDecisionRequest,
-    CohortDecisionSelectorCapability,
     CohortProposalSetVersion,
+    _selector_binding_permits,
 )
 from athena_context.api.cohort_decision_ports import (
     CohortDecisionStorePort,
@@ -76,6 +79,31 @@ from athena_context.contracts.manifest import (
 from athena_context.contracts.models import ResourceEvidenceRecord
 
 _MAX_DECISIONS = 200
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSelectorValidator:
+    """Non-authoritative resolver adapter for pre-persistence validation."""
+
+    binding: CohortDecisionApplyBinding
+
+    def permits_selector_identity_replacement(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str,
+        profile_id: str,
+        inherited_role: ManifestRole,
+        replacement_role: ManifestRole,
+    ) -> bool:
+        return _selector_binding_permits(
+            self.binding,
+            manifest_id=manifest_id,
+            manifest_version=manifest_version,
+            profile_id=profile_id,
+            inherited_role=inherited_role,
+            replacement_role=replacement_role,
+        )
 
 
 def _authority_projection(role: ManifestRole) -> dict[str, Any]:
@@ -215,9 +243,9 @@ class CohortDecisionService:
                 candidate,
                 decided_at=decided_at,
             )
-            applied: DraftRecord | None = None
             candidate_digest: str | None = None
-            selector_capability: CohortDecisionSelectorCapability | None = None
+            apply_command: ReplaceDraftCommand | None = None
+            apply_authorization: CohortDecisionApplyAuthorization | None = None
             if candidate is not None:
                 candidate_digest = compute_artifact_digest(
                     candidate.model_dump(
@@ -226,7 +254,11 @@ class CohortDecisionService:
                         exclude_none=True,
                     )
                 )
-                replacement, selector_capability = self._selector_only_replacement(
+                reason = (
+                    f"Applied cohort {request.action.value} decision {decision_id}; "
+                    "selector-only draft update. Full rationale retained in decision."
+                )
+                apply_command, apply_authorization = self._selector_only_replacement(
                     current,
                     request,
                     candidate,
@@ -235,28 +267,13 @@ class CohortDecisionService:
                     decision_id=decision_id,
                     candidate_digest=candidate_digest,
                     decided_at=decided_at,
+                    reason=reason,
                 )
-                reason = (
-                    f"Applied cohort {request.action.value} decision {decision_id}; "
-                    "selector-only draft update. Full rationale retained in decision."
-                )
-                applied = self._context_service.replace_draft_in_transaction(
-                    tx,
-                    actor=actor,
-                    draft_id=request.draft_id,
-                    command=ReplaceDraftCommand(
-                        expected_revision=current.revision,
-                        expected_manifest_version=request.manifest_version,
-                        expected_digest=current.manifest_digest,
-                        replacement_manifest=replacement,
-                        replacement_digest=replacement.compatibility.artifact_digest,
-                        reason=reason,
-                    ),
-                    occurred_at=decided_at,
-                    cohort_decision_capability=selector_capability,
-                )
-
-            audit_draft = applied or current
+            applied_binding = (
+                None
+                if apply_authorization is None
+                else apply_authorization.binding.resulting_draft
+            )
             audit_event = tx.append_audit(
                 PendingAuditEvent(
                     occurred_at=decided_at,
@@ -264,13 +281,23 @@ class CohortDecisionService:
                     action=AuditAction.COHORT_DECISION_RECORDED,
                     manifest_id=request.manifest_id,
                     draft_id=request.draft_id,
-                    revision=audit_draft.revision,
+                    revision=(
+                        current.revision
+                        if applied_binding is None
+                        else applied_binding.revision
+                    ),
                     previous_revision=(
-                        current.revision if applied is not None else None
+                        current.revision
+                        if applied_binding is not None
+                        else None
                     ),
                     manifest_version=request.manifest_version,
                     previous_version=current.previous_version,
-                    manifest_digest=audit_draft.manifest_digest,
+                    manifest_digest=(
+                        current.manifest_digest
+                        if applied_binding is None
+                        else applied_binding.manifest_digest
+                    ),
                     reason=(
                         f"Recorded cohort {request.action.value} decision "
                         f"{decision_id}; full rationale retained in decision record."
@@ -285,21 +312,31 @@ class CohortDecisionService:
                 decided_at=decided_at,
                 candidate=candidate,
                 candidate_digest=candidate_digest,
-                applied=applied,
+                applied_binding=applied_binding,
+                apply_authorization=apply_authorization,
                 audit_id=audit_event.event_id,
             )
             tx.put_cohort_decision(record)
-            if selector_capability is not None:
-                stored = tx.get_cohort_decision(
-                    request.manifest_id,
-                    decision_id,
+            if apply_command is not None:
+                applied = self._context_service.replace_draft_in_transaction(
+                    tx,
+                    actor=actor,
+                    draft_id=request.draft_id,
+                    command=apply_command,
+                    occurred_at=decided_at,
+                    cohort_decision_id=decision_id,
                 )
-                self._require_persisted_capability_binding(
-                    selector_capability,
-                    stored,
-                    current=current,
-                    applied=applied,
-                )
+                if (
+                    applied_binding is None
+                    or applied.draft_id != applied_binding.draft_id
+                    or applied.revision != applied_binding.revision
+                    or applied.manifest_digest
+                    != applied_binding.manifest_digest
+                ):
+                    raise PersistenceConflictError(
+                        "atomic cohort decision result differs from its "
+                        "persisted apply authorization"
+                    )
             tx.put_cohort_decision_receipt(
                 CohortDecisionReceipt(
                     actor_id=actor.actor_id,
@@ -803,9 +840,10 @@ class CohortDecisionService:
         decision_id: str,
         candidate_digest: str,
         decided_at: datetime,
+        reason: str,
     ) -> tuple[
-        CanonicalWorkloadManifest,
-        CohortDecisionSelectorCapability | None,
+        ReplaceDraftCommand,
+        CohortDecisionApplyAuthorization,
     ]:
         payload = current.manifest.model_dump(
             mode="json",
@@ -853,72 +891,88 @@ class CohortDecisionService:
             replacement = CanonicalWorkloadManifest.model_validate(
                 canonicalize_manifest_payload(payload)
             )
-            selector_capability = (
-                CohortDecisionSelectorCapability(
-                    decision_id=decision_id,
-                    decision=request.action,
-                    decided_at=decided_at,
-                    actor=actor,
-                    candidate_id=candidate.candidate_id,
-                    candidate_digest=candidate_digest,
-                    manifest_id=request.manifest_id,
-                    manifest_version=request.manifest_version,
-                    profile_id=request.profile_id,
-                    resolved_profile_digest=request.scope.resolved_profile_digest,
-                    source_draft=CohortDraftBinding(
-                        draftId=request.draft_id,
-                        revision=request.expected_revision,
-                        manifestDigest=request.expected_digest,
-                    ),
-                    current_draft=CohortDraftBinding(
-                        draftId=current.draft_id,
-                        revision=current.revision,
-                        manifestDigest=current.manifest_digest,
-                    ),
-                    proposal_ids=tuple(request.proposal_ids),
-                    proposal_set_digest=request.proposal_set_digest,
-                    snapshot_artifact_digest=request.snapshot_artifact_digest,
-                    target_role_id=update.role.role_id,
-                    inherited_role_digest=compute_artifact_digest(
-                        source_role.model_dump(
-                            mode="json",
-                            by_alias=True,
-                            exclude_none=True,
-                        )
-                    ),
-                    replacement_role_digest=compute_artifact_digest(
-                        applied_role.model_dump(
-                            mode="json",
-                            by_alias=True,
-                            exclude_none=True,
-                        )
-                    ),
-                    retained_replacement_role_digests=tuple(
-                        sorted(
-                            (
-                                normalized_identifier(profile.profile_id),
-                                normalized_identifier(role.role_id),
-                                compute_artifact_digest(
-                                    role.model_dump(
-                                        mode="json",
-                                        by_alias=True,
-                                        exclude_none=True,
-                                    )
-                                ),
-                            )
-                            for profile in current.manifest.profiles.values()
-                            for role in profile.roles
-                        )
-                    ),
-                    replacement_manifest_digest=(
-                        replacement.compatibility.artifact_digest
-                    ),
-                )
+            command = ReplaceDraftCommand(
+                expected_revision=current.revision,
+                expected_manifest_version=request.manifest_version,
+                expected_digest=current.manifest_digest,
+                replacement_manifest=replacement,
+                replacement_digest=replacement.compatibility.artifact_digest,
+                reason=reason,
             )
+            binding = CohortDecisionApplyBinding(
+                decision_id=decision_id,
+                decision=request.action,
+                decided_at=decided_at,
+                actor=actor,
+                candidate_id=candidate.candidate_id,
+                candidate_digest=candidate_digest,
+                manifest_id=request.manifest_id,
+                manifest_version=request.manifest_version,
+                profile_id=request.profile_id,
+                resolved_profile_digest=request.scope.resolved_profile_digest,
+                source_draft=CohortDraftBinding(
+                    draftId=request.draft_id,
+                    revision=request.expected_revision,
+                    manifestDigest=request.expected_digest,
+                ),
+                current_draft=CohortDraftBinding(
+                    draftId=current.draft_id,
+                    revision=current.revision,
+                    manifestDigest=current.manifest_digest,
+                ),
+                resulting_draft=CohortDraftBinding(
+                    draftId=current.draft_id,
+                    revision=current.revision + 1,
+                    manifestDigest=replacement.compatibility.artifact_digest,
+                ),
+                proposal_ids=request.proposal_ids,
+                proposal_set_digest=request.proposal_set_digest,
+                snapshot_artifact_digest=request.snapshot_artifact_digest,
+                target_role_id=update.role.role_id,
+                inherited_role_digest=compute_artifact_digest(
+                    source_role.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                ),
+                replacement_role_digest=compute_artifact_digest(
+                    applied_role.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                ),
+                retained_replacement_role_digests=tuple(
+                    sorted(
+                        (
+                            normalized_identifier(profile.profile_id),
+                            normalized_identifier(role.role_id),
+                            compute_artifact_digest(
+                                role.model_dump(
+                                    mode="json",
+                                    by_alias=True,
+                                    exclude_none=True,
+                                )
+                            ),
+                        )
+                        for profile in current.manifest.profiles.values()
+                        for role in profile.roles
+                    )
+                ),
+                replacement_manifest_digest=(
+                    replacement.compatibility.artifact_digest
+                ),
+            )
+            apply_authorization = CohortDecisionApplyAuthorization.issue(
+                binding,
+                command,
+            )
+            selector_validator = _CandidateSelectorValidator(binding)
             before_profiles = CohortDecisionService._resolve_all_profiles(
                 current.manifest,
                 as_of=decided_at,
-                selector_capability=selector_capability,
+                selector_validator=selector_validator,
             )
             target_before = before_profiles.get(requested_profile)
             if target_before is None:
@@ -940,7 +994,7 @@ class CohortDecisionService:
             after_profiles = CohortDecisionService._resolve_all_profiles(
                 replacement,
                 as_of=decided_at,
-                selector_capability=selector_capability,
+                selector_validator=selector_validator,
             )
         except (AthenaValidationError, ValidationError, ValueError) as exc:
             raise CohortContractError(
@@ -1014,14 +1068,14 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate attempted to mutate non-role profile metadata"
             )
-        return replacement, selector_capability
+        return command, apply_authorization
 
     @staticmethod
     def _resolve_all_profiles(
         manifest: CanonicalWorkloadManifest,
         *,
         as_of: datetime,
-        selector_capability: CohortDecisionSelectorCapability | None = None,
+        selector_validator: _CandidateSelectorValidator | None = None,
     ) -> dict[str, ResolvedManifestProfile]:
         return {
             normalized_identifier(profile.profile_id): (
@@ -1030,62 +1084,16 @@ class CohortDecisionService:
                     profile.profile_id,
                     as_of=as_of,
                 )
-                if selector_capability is None
+                if selector_validator is None
                 else _resolve_manifest_profile_for_cohort_decision(
                     manifest,
                     profile.profile_id,
                     as_of=as_of,
-                    selector_capability=selector_capability,
+                    selector_capability=selector_validator,
                 )
             )
             for profile in manifest.profiles.values()
         }
-
-    @staticmethod
-    def _require_persisted_capability_binding(
-        capability: CohortDecisionSelectorCapability,
-        record: CohortDecisionRecord | None,
-        *,
-        current: DraftRecord,
-        applied: DraftRecord | None,
-    ) -> None:
-        if (
-            record is None
-            or applied is None
-            or record.decision_id != capability.decision_id
-            or record.decision is not capability.decision
-            or record.decided_at != capability.decided_at
-            or record.decided_by != capability.actor
-            or record.candidate_id != capability.candidate_id
-            or record.candidate_digest != capability.candidate_digest
-            or record.manifest_id != capability.manifest_id
-            or record.manifest_version != capability.manifest_version
-            or normalized_identifier(record.profile_id)
-            != normalized_identifier(capability.profile_id)
-            or record.resolved_profile_digest
-            != capability.resolved_profile_digest
-            or record.source_draft != capability.source_draft
-            or tuple(record.source_proposal_ids) != capability.proposal_ids
-            or record.proposal_set_digest != capability.proposal_set_digest
-            or record.snapshot.artifact_digest
-            != capability.snapshot_artifact_digest
-            or capability.target_role_id not in record.source_role_refs
-            or capability.current_draft.draft_id != current.draft_id
-            or capability.current_draft.revision != current.revision
-            or capability.current_draft.manifest_digest
-            != current.manifest_digest
-            or record.applied_draft is None
-            or record.applied_draft.draft_id != applied.draft_id
-            or record.applied_draft.revision != current.revision + 1
-            or record.applied_draft.manifest_digest
-            != capability.replacement_manifest_digest
-            or applied.manifest_digest
-            != capability.replacement_manifest_digest
-        ):
-            raise PersistenceConflictError(
-                "cohort selector capability is not bound to its exact "
-                "persisted decision and atomic draft result"
-            )
 
     @staticmethod
     def _materialize_local_role_override(
@@ -1117,18 +1125,10 @@ class CohortDecisionService:
         decided_at: datetime,
         candidate: CohortReviewCandidate | None,
         candidate_digest: str | None,
-        applied: DraftRecord | None,
+        applied_binding: CohortDraftBinding | None,
+        apply_authorization: CohortDecisionApplyAuthorization | None,
         audit_id: str,
     ) -> CohortDecisionRecord:
-        applied_binding = (
-            None
-            if applied is None
-            else CohortDraftBinding(
-                draftId=applied.draft_id,
-                revision=applied.revision,
-                manifestDigest=applied.manifest_digest,
-            )
-        )
         return CohortDecisionRecord(
             decisionId=decision_id,
             decision=request.action,
@@ -1152,6 +1152,7 @@ class CohortDecisionService:
             snapshot=resolved.batch.snapshot,
             candidateId=None if candidate is None else candidate.candidate_id,
             candidateDigest=candidate_digest,
+            applyAuthorization=apply_authorization,
             rationale=request.rationale,
             decidedBy=actor,
             decidedAt=decided_at,
@@ -1162,8 +1163,12 @@ class CohortDecisionService:
                 occurredAt=decided_at,
                 sourceRevision=request.expected_revision,
                 sourceProposalIds=request.proposal_ids,
-                resultingRevision=None if applied is None else applied.revision,
-                draftMutated=applied is not None,
+                resultingRevision=(
+                    None
+                    if applied_binding is None
+                    else applied_binding.revision
+                ),
+                draftMutated=applied_binding is not None,
             ),
             publicationAllowed=False,
             roleMetadataMutated=False,

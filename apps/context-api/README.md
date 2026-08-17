@@ -34,10 +34,11 @@ mutate it.
   rejected candidate into a global role cannot establish a new inheritance baseline. Split/merge
   preview instead emits final guarded
   conjunctions whose inherited selector child proves narrowing and whose exact child binds the
-  reviewed cohort. Only the decision transaction receives a typed in-process capability bound to
-  the authenticated actor, persisted decision, candidate digest, workload/profile, proposal set,
-  snapshot, and exact source/current/resulting draft state. The candidate is actor scoped and
-  applied without post-approval transformation; the capability is unavailable to generic PUT.
+  reviewed cohort. The decision transaction first persists an immutable apply authorization bound
+  to the authenticated actor, candidate digest, workload/profile, proposal set, snapshot, exact
+  source/current/resulting draft state, and complete replacement command. `ContextService` loads
+  and verifies that persisted decision itself before mutation; no caller-constructed capability is
+  accepted. The candidate is actor scoped and applied without post-approval transformation.
   It preserves role authority, never edits an ancestor or global role, and rejects candidates
   that cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.
@@ -64,6 +65,12 @@ version. Decision, decision audit, idempotency receipt, and draft replacement co
 roll back together. The bounded WC-007 replacement reason references the decision ID while the
 decision record retains the full rationale. These routes never publish or change role authority
 metadata.
+
+Validation resolves every profile and enforces selector identity inheritance before changing
+state. Submission repeats that check before and after server finalization, and publication checks
+the approved candidate again. Exact selector identities introduced by a cohort decision remain
+resolvable only from their persisted apply provenance. Any failure leaves draft state, revision,
+audit, and idempotency receipts unchanged.
 
 Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and
 candidate cache, actor-scoped idempotency ports, and a decision transaction port spanning WC-007
