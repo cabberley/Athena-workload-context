@@ -15,11 +15,7 @@ from athena_context.api.domain import (
 )
 from athena_context.api.errors import AuthenticationError, AuthorizationError
 from athena_context.api.evaluation_domain import AuthorizationGrantToken
-from athena_context.api.memory import InMemoryAuthorityCoordinator
-from athena_context.api.ports import (
-    ContextAuthorityTransactionBackendPort,
-    ContextTransactionBackendIdentity,
-)
+from athena_context.api.memory import InMemoryTransactionLock
 from athena_context.contracts import compute_artifact_digest
 
 _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
@@ -54,6 +50,55 @@ _HUMAN_ONLY = frozenset(
 )
 
 
+def authorize_role_grants(
+    actor: Actor,
+    permission: Permission,
+    manifest_id: str,
+    *,
+    grants: tuple[RoleGrant, ...],
+    grant_revision: int,
+) -> AuthorizationGrantToken:
+    """Authorize from one transaction-owned immutable grant snapshot."""
+
+    RoleBasedAuthorization._require_actor_kind(actor, permission)
+    RoleBasedAuthorization._require_concrete_manifest_id(manifest_id)
+    matching = tuple(
+        grant
+        for grant in grants
+        if grant.actor_id == actor.actor_id
+        and permission in _ROLE_PERMISSIONS[grant.role]
+        and (
+            isinstance(grant.scope, AllWorkloadsGrantScope)
+            or (
+                isinstance(grant.scope, WorkloadGrantScope)
+                and grant.scope.workload_id == manifest_id
+            )
+        )
+    )
+    if not matching:
+        raise AuthorizationError(
+            f"actor {actor.actor_id!r} is not authorized for {permission.value}"
+        )
+    canonical_grants = sorted(
+        (grant.model_dump(mode="json") for grant in matching),
+        key=compute_artifact_digest,
+    )
+    return AuthorizationGrantToken(
+        actor_id=actor.actor_id,
+        permission=permission,
+        manifest_id=manifest_id,
+        grant_revision=grant_revision,
+        grant_digest=compute_artifact_digest(
+            {
+                "actorId": actor.actor_id,
+                "permission": permission.value,
+                "manifestId": manifest_id,
+                "grants": canonical_grants,
+            }
+        ),
+    )
+
+
 class RejectUnverifiedAuthentication:
     """Production-safe default that rejects credentials until a verifier is configured."""
 
@@ -81,12 +126,8 @@ class RoleBasedAuthorization:
     def __init__(
         self,
         grants: Iterable[RoleGrant] = (),
-        *,
-        transaction_backend: ContextAuthorityTransactionBackendPort | None = None,
     ) -> None:
-        self._transaction_backend = (
-            transaction_backend or InMemoryAuthorityCoordinator()
-        )
+        self._transaction_lock = InMemoryTransactionLock()
         self._grants = tuple(grants)
         self._grant_revision = 1
 
@@ -96,7 +137,7 @@ class RoleBasedAuthorization:
         permission: Permission,
         manifest_id: str | None,
     ) -> None:
-        with self._transaction_backend.transaction():
+        with self._transaction_lock.transaction():
             self._require_actor_kind(actor, permission)
             self._require_concrete_manifest_id(manifest_id)
             if not self._matching_grants(
@@ -116,40 +157,13 @@ class RoleBasedAuthorization:
         permission: Permission,
         manifest_id: str,
     ) -> AuthorizationGrantToken:
-        with self._transaction_backend.transaction():
-            self._require_actor_kind(actor, permission)
-            self._require_concrete_manifest_id(manifest_id)
-            matching = self._matching_grants(
+        with self._transaction_lock.transaction():
+            return authorize_role_grants(
                 actor,
                 permission,
                 manifest_id,
-                explicit_only=False,
-            )
-            if not matching:
-                raise AuthorizationError(
-                    f"actor {actor.actor_id!r} is not authorized for "
-                    f"{permission.value}"
-                )
-            grants = sorted(
-                (
-                    grant.model_dump(mode="json")
-                    for grant in matching
-                ),
-                key=compute_artifact_digest,
-            )
-            return AuthorizationGrantToken(
-                actor_id=actor.actor_id,
-                permission=permission,
-                manifest_id=manifest_id,
+                grants=self._grants,
                 grant_revision=self._grant_revision,
-                grant_digest=compute_artifact_digest(
-                    {
-                        "actorId": actor.actor_id,
-                        "permission": permission.value,
-                        "manifestId": manifest_id,
-                        "grants": grants,
-                    }
-                ),
             )
 
     def require_explicit(
@@ -160,7 +174,7 @@ class RoleBasedAuthorization:
     ) -> None:
         """Require a concrete workload grant; wildcard grants never satisfy this boundary."""
 
-        with self._transaction_backend.transaction():
+        with self._transaction_lock.transaction():
             self._require_actor_kind(actor, permission)
             self._require_concrete_manifest_id(manifest_id)
             if not self._matching_grants(
@@ -217,13 +231,9 @@ class RoleBasedAuthorization:
     def remove_grant(self, grant: RoleGrant) -> None:
         """Revoke one exact in-memory grant under the shared authority lock."""
 
-        with self._transaction_backend.transaction():
+        with self._transaction_lock.transaction():
             remaining = tuple(candidate for candidate in self._grants if candidate != grant)
             if len(remaining) == len(self._grants):
                 return
             self._grants = remaining
             self._grant_revision += 1
-
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
-        return self._transaction_backend.identity

@@ -52,15 +52,17 @@ The integration composes the merged components without introducing direct Azure 
   approval revision/status/expiry, and actor grant revision, canonically resolves the full profile
   inheritance chain at that time, compares typed authority tokens captured before collection, and
   inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
-  change. `ContextService` opens the actual persistence transaction and derives its opaque backend
-  identity from that opened transaction, never from a store- or resolver-advertised coordinator.
-  The in-memory commit adapter accepts no independent coordinator or resolver; it creates its
-  resolver itself, rejects approval or grant registries not bound to that transaction-derived
-  identity, and asks `ContextService` to hold the actual store transaction across authority reads
-  and artifact insertion. Production implementations have the same typed contract: the commit
-  adapter owns its resolver and performs both authority reads and insertion in its identified
-  backing-store transaction or conditional batch. Approval
-  revoke/expiry, inherited override expiry,
+change. `ContextService` opens the actual configured persistence transaction and constructs a
+narrow transaction-scoped evaluation unit of work from that transaction. Context, approval,
+evaluation-grant, receipt, and artifact operations are methods on that same unit of work; the
+commit adapter cannot inject an approval resolver, authorization registry, lock, coordinator,
+store label, or backend identity for final validation. The in-memory store snapshots and commits
+all five state sets under its internally owned lock, including rollback on failure. Production
+implementations must provide the same operations on the transaction returned by the actual
+Context API persistence adapter or one equivalent database conditional batch. Object identity,
+advertised backend equality, and nested independently locked registries are not accepted as
+evidence of atomicity. Approval
+revoke/expiry, inherited override expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
   Authority tokens bind whether the caller selected an exact version or the unique active version.
   A unique-active commit repeats that lookup with no version inside the transaction, so a

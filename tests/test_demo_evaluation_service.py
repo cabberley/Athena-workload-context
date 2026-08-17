@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
@@ -11,12 +10,9 @@ from pydantic import ValidationError
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
-    ContextService,
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
-    InMemoryContextStore,
-    InMemoryDemoEvaluationApprovalRegistry,
     InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
@@ -37,10 +33,9 @@ from athena_context.api.errors import (
 from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
-from athena_context.api.evaluation_ports import SnapshotSigningRequest
-from athena_context.api.ports import (
-    ContextAuthorityTransactionBackendPort,
-    ContextTransactionPort,
+from athena_context.api.evaluation_ports import (
+    EvaluationAuthorityUnitOfWorkPort,
+    SnapshotSigningRequest,
 )
 from athena_context.contracts import (
     NormalizationCollisionError,
@@ -106,10 +101,6 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
         AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL
     ]
     assert harness.snapshot_signer.calls == 1
-    assert (
-        harness.store.transaction_backend_identity
-        is harness.context_resolver.service.authority_transaction_backend_identity
-    )
     assert harness.store.publication_count == 1
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
     assert result.publication.approval_decision_id == harness.approval.decision_id
@@ -375,6 +366,40 @@ def test_approval_revoke_after_final_evaluation_aborts_conditional_commit() -> N
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+def test_approval_revocation_during_transaction_fails_before_insertion() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-approval-revoke-inside-uow"
+
+    def revoke_after_initial_read(
+        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+    ) -> None:
+        del unit_of_work
+        harness.approval_registry.revoke(
+            harness.approval.decision_id,
+            revoked_at=harness.clock.value,
+        )
+
+    harness.store._before_artifact_insert = (  # type: ignore[method-assign]
+        revoke_after_initial_read
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="authority changed during",
+    ):
+        harness.service.evaluate(PUBLISHER, idempotency_key, harness.command)
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    revoked = harness.approval_registry.resolve(harness.approval.decision_id)
+    assert revoked is not None
+    assert revoked.status == "revoked"
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_supersession_after_final_evaluation_aborts_conditional_commit() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(as_of=CURRENT_NOW, manifest=manifest)
@@ -463,77 +488,70 @@ def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
-def test_in_memory_commit_rejects_independent_authority_locks() -> None:
-    harness = build_harness()
-    foreign_store = InMemoryContextStore()
-    foreign_authorization = type(harness.authorization)(
-        [RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)],
-        transaction_backend=foreign_store.authority_transaction_backend,
+def test_malicious_independent_authority_store_cannot_substitute_commit_uow() -> None:
+    actual = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    foreign = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-malicious-independent-authority"
+
+    class MaliciousApprovalResolver:
+        advertised_backend = actual.context_resolver.store
+
+        def resolve(self, decision_id: str):
+            return foreign.approval_registry.resolve(decision_id)
+
+    class MaliciousAuthorization:
+        advertised_backend = actual.context_resolver.store
+
+        def authorize(self, actor, permission, manifest_id):
+            return foreign.authorization.authorize(
+                actor,
+                permission,
+                manifest_id,
+            )
+
+    # A caller can influence pre-collection adapters, but the final commit has
+    # no resolver/backend injection points and reads only its service-owned UoW.
+    actual.service._approval_resolver = (  # type: ignore[attr-defined]
+        MaliciousApprovalResolver()
+    )
+    actual.service._authorization = MaliciousAuthorization()  # type: ignore[attr-defined]
+    actual.commit_hook.before_commit = lambda: actual.approval_registry.revoke(
+        actual.approval.decision_id,
+        revoked_at=actual.clock.value,
     )
 
-    with pytest.raises(ValueError, match="does not share"):
-        InMemoryEvaluationCommitPort(
-            context_service=harness.context_resolver.service,
-            context_reader_actor=PUBLISHER,
-            approval_resolver=harness.approval_registry,
-            authorization=foreign_authorization,
-            clock=harness.clock,
-            publication_actor=PUBLICATION_SERVICE,
-            evidence_identity_object_id=MCP_OBJECT_ID,
+    with pytest.raises(DemoEvaluationApprovalError, match="not active"):
+        actual.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            actual.command,
         )
 
-
-def test_lying_store_cannot_advertise_a_different_transaction_backend() -> None:
-    harness = build_harness()
-    advertised_store = InMemoryContextStore()
-
-    class LyingStore:
-        def __init__(
-            self,
-            actual_store: InMemoryContextStore,
-            advertised_backend: ContextAuthorityTransactionBackendPort,
-        ) -> None:
-            self._actual_store = actual_store
-            self.authority_transaction_backend = advertised_backend
-
-        def transaction(
-            self,
-        ) -> AbstractContextManager[ContextTransactionPort]:
-            return self._actual_store.transaction()
-
-    authorization = type(harness.authorization)(
-        [RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)],
-        transaction_backend=advertised_store.authority_transaction_backend,
+    foreign_approval = foreign.approval_registry.resolve(
+        foreign.approval.decision_id
     )
-    approval_registry = InMemoryDemoEvaluationApprovalRegistry(
-        [harness.approval],
-        transaction_backend=advertised_store.authority_transaction_backend,
-    )
-    lying_service = ContextService(
-        store=LyingStore(
-            harness.context_resolver.store,
-            advertised_store.authority_transaction_backend,
-        ),
-        authorization=authorization,
-        clock=harness.clock,
-        publication_actor=PUBLICATION_SERVICE,
-    )
+    assert foreign_approval is not None
+    assert foreign_approval.status == "authorized"
+    _assert_no_artifact(harness=actual, idempotency_key=idempotency_key)
 
-    assert (
-        lying_service.authority_transaction_backend_identity
-        is harness.context_resolver.service.authority_transaction_backend_identity
-    )
-    assert (
-        lying_service.authority_transaction_backend_identity
-        is not advertised_store.authority_transaction_backend.identity
-    )
-    with pytest.raises(ValueError, match="does not share"):
-        InMemoryEvaluationCommitPort(
-            context_service=lying_service,
+
+def test_commit_rejects_independent_authority_store_injection() -> None:
+    actual = build_harness()
+    foreign = build_harness()
+
+    with pytest.raises(TypeError, match="approval_resolver"):
+        InMemoryEvaluationCommitPort(  # type: ignore[call-arg]
+            context_service=actual.context_resolver.service,
             context_reader_actor=PUBLISHER,
-            approval_resolver=approval_registry,
-            authorization=authorization,
-            clock=harness.clock,
+            approval_resolver=foreign.approval_registry,
+            authorization=foreign.authorization,
+            clock=actual.clock,
             publication_actor=PUBLICATION_SERVICE,
             evidence_identity_object_id=MCP_OBJECT_ID,
         )
@@ -561,13 +579,7 @@ def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() ->
     def malicious_factory(
         store_b: LifecycleContextResolver,
     ) -> MaliciousResolver:
-        assert (
-            store_a.service.authority_transaction_backend_identity
-            is not store_b.service.authority_transaction_backend_identity
-        )
-        return MaliciousResolver(
-            store_b.store.authority_transaction_backend
-        )
+        return MaliciousResolver(store_b.store)
 
     with pytest.raises(
         DemoEvaluationConfigurationError,
@@ -606,7 +618,10 @@ def test_context_mutation_waits_until_authority_reads_and_artifact_insert_comple
         finally:
             mutation_completed.set()
 
-    def hold_between_authority_and_insert() -> None:
+    def hold_between_authority_and_insert(
+        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+    ) -> None:
+        del unit_of_work
         barrier_reached.set()
         assert mutation_attempted.wait(timeout=5)
         assert not mutation_completed.wait(timeout=0.1)

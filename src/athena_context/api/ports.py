@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -37,30 +36,7 @@ class AuthorizationPort(Protocol):
     ) -> None: ...
 
 
-@dataclass(frozen=True, eq=False, slots=True)
-class ContextTransactionBackendIdentity:
-    """Opaque identity for one authoritative persistence transaction backend.
-
-    Equality is deliberately object identity. Recreating a value cannot impersonate
-    the backend-owned capability issued to its transaction participants.
-    """
-
-
-class ContextAuthorityTransactionBackendPort(Protocol):
-    """Backend-owned transaction capability used by conditional publications."""
-
-    @property
-    def identity(self) -> ContextTransactionBackendIdentity: ...
-
-    def transaction(self) -> AbstractContextManager[None]: ...
-
-
 class ContextTransactionPort(Protocol):
-    @property
-    def authority_transaction_backend_identity(
-        self,
-    ) -> ContextTransactionBackendIdentity: ...
-
     def get_draft(self, draft_id: str) -> DraftRecord | None: ...
 
     def list_drafts(

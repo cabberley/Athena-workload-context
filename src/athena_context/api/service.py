@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import datetime
 from typing import TypeVar
 
 from pydantic import ValidationError
 
+from athena_context.api.authorization import authorize_role_grants
 from athena_context.api.domain import (
     Actor,
     ActorKind,
@@ -27,6 +27,7 @@ from athena_context.api.domain import (
     PublishedManifestView,
     ReplaceDraftCommand,
     ReviewSubmission,
+    RoleGrant,
     SupersedeCommand,
     Supersession,
     TransitionCommand,
@@ -47,13 +48,25 @@ from athena_context.api.errors import (
     StaleRevisionError,
     VersionMismatchError,
 )
+from athena_context.api.evaluation_domain import (
+    AuthorizationGrantToken,
+    DemoEvaluationApproval,
+    PublishedContextSelection,
+    ResolvedPublishedContext,
+    build_published_context_authority_token,
+)
+from athena_context.api.evaluation_ports import (
+    EvaluationAuthorityTransactionPort,
+    EvaluationAuthorityUnitOfWorkPort,
+    StoredEvaluation,
+)
 from athena_context.api.ports import (
     AuthorizationPort,
     ClockPort,
     ContextStorePort,
-    ContextTransactionBackendIdentity,
     ContextTransactionPort,
 )
+from athena_context.contracts import resolve_manifest_profile
 from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
@@ -61,6 +74,7 @@ from athena_context.contracts.manifest import (
 )
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
+TUnitOfWorkResult = TypeVar("TUnitOfWorkResult")
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -94,6 +108,167 @@ def _changed_paths(left: object, right: object, path: str = "") -> list[str]:
     return [] if left == right else [path or "/"]
 
 
+class _ContextServiceEvaluationAuthorityUnitOfWork:
+    """Narrow evaluation view over one transaction opened by ContextService."""
+
+    def __init__(
+        self,
+        *,
+        context_transaction: ContextTransactionPort,
+        evaluation_transaction: EvaluationAuthorityTransactionPort,
+        authorization: AuthorizationPort,
+        reader_actor: Actor,
+    ) -> None:
+        self._context_transaction = context_transaction
+        self._evaluation_transaction = evaluation_transaction
+        self._authorization = authorization
+        self._reader_actor = reader_actor
+
+    def resolve_context(
+        self,
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext:
+        tx = self._context_transaction
+        if selection.manifest_version is None:
+            self._authorization.require(
+                self._reader_actor,
+                Permission.LIST,
+                selection.manifest_id,
+            )
+            active = [
+                item
+                for item in tx.list_published(manifest_id=selection.manifest_id)
+                if tx.get_supersession(
+                    item.manifest_id,
+                    item.manifest_version,
+                )
+                is None
+            ]
+            if not active:
+                raise ResourceNotFoundError(
+                    "published manifest has no active version"
+                )
+            if len(active) != 1:
+                raise AmbiguousLookupError(
+                    "published manifest has multiple active versions"
+                )
+            published = active[0]
+        else:
+            published = self._require_published(
+                tx,
+                selection.manifest_id,
+                selection.manifest_version,
+            )
+            self._authorization.require(
+                self._reader_actor,
+                Permission.READ,
+                selection.manifest_id,
+            )
+        view = PublishedManifestView(
+            published=published,
+            supersession=tx.get_supersession(
+                published.manifest_id,
+                published.manifest_version,
+            ),
+        )
+        profile = resolve_manifest_profile(
+            published.manifest,
+            selection.profile_id,
+            as_of=as_of,
+        )
+        return ResolvedPublishedContext(
+            view=view,
+            profile=profile,
+            authority_token=build_published_context_authority_token(
+                view,
+                profile,
+                requested_manifest_version=selection.manifest_version,
+            ),
+        )
+
+    def resolve_approval(
+        self,
+        decision_id: str,
+    ) -> DemoEvaluationApproval | None:
+        return self._evaluation_transaction.get_demo_evaluation_approval(
+            decision_id
+        )
+
+    def put_approval(
+        self,
+        approval: DemoEvaluationApproval,
+        *,
+        expected_revision: int | None,
+    ) -> None:
+        self._evaluation_transaction.put_demo_evaluation_approval(
+            approval,
+            expected_revision=expected_revision,
+        )
+
+    def authorize(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str,
+    ) -> AuthorizationGrantToken:
+        grants, revision = self._evaluation_transaction.get_evaluation_grants()
+        return authorize_role_grants(
+            actor,
+            permission,
+            manifest_id,
+            grants=grants,
+            grant_revision=revision,
+        )
+
+    def get_grants(self) -> tuple[tuple[RoleGrant, ...], int]:
+        return self._evaluation_transaction.get_evaluation_grants()
+
+    def replace_grants(
+        self,
+        grants: tuple[RoleGrant, ...],
+        *,
+        expected_revision: int,
+    ) -> int:
+        return self._evaluation_transaction.replace_evaluation_grants(
+            grants,
+            expected_revision=expected_revision,
+        )
+
+    def load_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> StoredEvaluation | None:
+        return self._evaluation_transaction.get_evaluation_receipt(
+            actor_id,
+            idempotency_key,
+        )
+
+    def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None:
+        return self._evaluation_transaction.get_evaluation_artifact(snapshot_id)
+
+    def insert_evaluation(self, artifact: StoredEvaluation) -> None:
+        self._evaluation_transaction.put_evaluation(artifact)
+
+    def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
+        return self._evaluation_transaction.list_evaluations()
+
+    @staticmethod
+    def _require_published(
+        tx: ContextTransactionPort,
+        manifest_id: str,
+        manifest_version: str,
+    ) -> PublishedManifest:
+        published = tx.get_published(manifest_id, manifest_version)
+        if published is None:
+            raise ResourceNotFoundError(
+                f"manifest version {manifest_id}/{manifest_version} was not found"
+            )
+        return published
+
+
 class ContextService:
     """Authoritative application service for every manifest state mutation."""
 
@@ -112,31 +287,33 @@ class ContextService:
         self._clock = clock
         self._publication_actor = publication_actor
 
-    @property
-    def authority_transaction_backend_identity(
+    def run_evaluation_authority_transaction(
         self,
-    ) -> ContextTransactionBackendIdentity:
-        """Derive identity from a transaction opened on the actual store."""
+        *,
+        reader_actor: Actor,
+        operation: Callable[
+            [EvaluationAuthorityUnitOfWorkPort],
+            TUnitOfWorkResult,
+        ],
+    ) -> TUnitOfWorkResult:
+        """Run one narrow UoW on the actual configured persistence transaction."""
 
         with self._store.transaction() as transaction:
-            return transaction.authority_transaction_backend_identity
-
-    @contextmanager
-    def authority_transaction(
-        self,
-        expected_identity: ContextTransactionBackendIdentity,
-    ) -> Iterator[None]:
-        """Open the actual store transaction without exposing storage mutation."""
-
-        with self._store.transaction() as transaction:
-            if (
-                transaction.authority_transaction_backend_identity
-                is not expected_identity
+            if not isinstance(
+                transaction,
+                EvaluationAuthorityTransactionPort,
             ):
                 raise RuntimeError(
-                    "ContextService persistence transaction backend changed"
+                    "ContextService persistence does not implement the "
+                    "evaluation authority unit of work"
                 )
-            yield
+            unit_of_work = _ContextServiceEvaluationAuthorityUnitOfWork(
+                context_transaction=transaction,
+                evaluation_transaction=transaction,
+                authorization=self._authorization,
+                reader_actor=reader_actor,
+            )
+            return operation(unit_of_work)
 
     def create_draft(
         self,

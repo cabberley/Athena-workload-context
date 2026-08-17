@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from athena_context.api.domain import (
     Actor,
     Permission,
+    RoleGrant,
 )
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
@@ -18,7 +19,6 @@ from athena_context.api.evaluation_domain import (
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
 )
-from athena_context.api.ports import ContextTransactionBackendIdentity
 from athena_context.contracts import (
     EvidenceSnapshot,
     ManifestFinding,
@@ -52,6 +52,98 @@ class StoredEvaluation:
     publication_json: str
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
+
+
+@runtime_checkable
+class EvaluationAuthorityTransactionPort(Protocol):
+    """Evaluation state implemented by the actual Context API transaction."""
+
+    def get_demo_evaluation_approval(
+        self,
+        decision_id: str,
+    ) -> DemoEvaluationApproval | None: ...
+
+    def put_demo_evaluation_approval(
+        self,
+        approval: DemoEvaluationApproval,
+        *,
+        expected_revision: int | None,
+    ) -> None: ...
+
+    def get_evaluation_grants(self) -> tuple[tuple[RoleGrant, ...], int]: ...
+
+    def replace_evaluation_grants(
+        self,
+        grants: tuple[RoleGrant, ...],
+        *,
+        expected_revision: int,
+    ) -> int: ...
+
+    def get_evaluation_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> StoredEvaluation | None: ...
+
+    def get_evaluation_artifact(
+        self,
+        snapshot_id: str,
+    ) -> StoredEvaluation | None: ...
+
+    def put_evaluation(self, artifact: StoredEvaluation) -> None: ...
+
+    def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
+
+
+class EvaluationAuthorityUnitOfWorkPort(Protocol):
+    """Narrow unit of work created from one actual ContextService transaction."""
+
+    def resolve_context(
+        self,
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext: ...
+
+    def resolve_approval(
+        self,
+        decision_id: str,
+    ) -> DemoEvaluationApproval | None: ...
+
+    def put_approval(
+        self,
+        approval: DemoEvaluationApproval,
+        *,
+        expected_revision: int | None,
+    ) -> None: ...
+
+    def authorize(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str,
+    ) -> AuthorizationGrantToken: ...
+
+    def get_grants(self) -> tuple[tuple[RoleGrant, ...], int]: ...
+
+    def replace_grants(
+        self,
+        grants: tuple[RoleGrant, ...],
+        *,
+        expected_revision: int,
+    ) -> int: ...
+
+    def load_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> StoredEvaluation | None: ...
+
+    def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None: ...
+
+    def insert_evaluation(self, artifact: StoredEvaluation) -> None: ...
+
+    def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,9 +194,6 @@ class PublishedContextResolverPort(Protocol):
 class DemoEvaluationApprovalResolverPort(Protocol):
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None: ...
 
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
-
 
 class SnapshotSigningPort(Protocol):
     def sign(self, request: SnapshotSigningRequest) -> str: ...
@@ -123,9 +212,6 @@ class EvaluationCommitPort(Protocol):
     @property
     def context_resolver(self) -> PublishedContextResolverPort: ...
 
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
-
     def load_receipt(self, actor_id: str, idempotency_key: str) -> StoredEvaluation | None: ...
 
     def commit(self, candidate: EvaluationCommitCandidate) -> DemoEvaluationResult: ...
@@ -143,13 +229,12 @@ class EvaluationAuthorizationPort(Protocol):
         manifest_id: str,
     ) -> AuthorizationGrantToken: ...
 
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
-
 
 __all__ = [
     "ConfiguredEvidenceClientPort",
     "DemoEvaluationApprovalResolverPort",
+    "EvaluationAuthorityTransactionPort",
+    "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
     "EvaluationCommitPort",
     "EvaluationAuthorizationPort",

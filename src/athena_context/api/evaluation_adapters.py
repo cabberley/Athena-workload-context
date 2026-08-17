@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -27,9 +27,8 @@ from athena_context.api.evaluation_domain import (
     Wc008DeploymentOutputAssertion,
     build_published_context_authority_token,
 )
-from athena_context.api.ports import (
-    ContextAuthorityTransactionBackendPort,
-    ContextTransactionBackendIdentity,
+from athena_context.api.evaluation_ports import (
+    EvaluationAuthorityUnitOfWorkPort,
 )
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
@@ -50,6 +49,7 @@ from athena_context.evidence import (
 from athena_context.evidence.models import EvidenceTransportRequest, McpTransportOutcome
 
 AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL = "group_resource_list"
+TUnitOfWorkResult = TypeVar("TUnitOfWorkResult")
 
 
 class PrivateMcpInvokerPort(Protocol):
@@ -477,25 +477,18 @@ class ContextServicePublishedContextResolver:
     ) -> ResolvedPublishedContext:
         return self._resolver.resolve(selection, as_of=as_of)
 
+
 class StaticDemoEvaluationApprovalResolver:
     """Deterministic adapter for tests and explicitly injected local demo configuration."""
 
     def __init__(
         self,
         approvals: Iterable[DemoEvaluationApproval],
-        *,
-        transaction_backend: ContextAuthorityTransactionBackendPort,
     ) -> None:
-        self._transaction_backend = transaction_backend
         self._approvals = {approval.decision_id: approval for approval in approvals}
 
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
-        with self._transaction_backend.transaction():
-            return self._approvals.get(decision_id)
-
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
-        return self._transaction_backend.identity
+        return self._approvals.get(decision_id)
 
 
 class InMemoryDemoEvaluationApprovalRegistry:
@@ -505,48 +498,80 @@ class InMemoryDemoEvaluationApprovalRegistry:
         self,
         approvals: Iterable[DemoEvaluationApproval],
         *,
-        transaction_backend: ContextAuthorityTransactionBackendPort,
+        context_service: ContextService,
+        context_reader_actor: Actor,
     ) -> None:
-        self._transaction_backend = transaction_backend
-        self._approvals = {
-            approval.decision_id: approval for approval in approvals
-        }
+        self._context_service = context_service
+        self._context_reader_actor = context_reader_actor
+        for approval in approvals:
+
+            def seed(
+                unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+                *,
+                approval: DemoEvaluationApproval = approval,
+            ) -> None:
+                unit_of_work.put_approval(
+                    approval,
+                    expected_revision=None,
+                )
+
+            self._run(seed)
 
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
-        with self._transaction_backend.transaction():
-            return self._approvals.get(decision_id)
+        return self._run(
+            lambda unit_of_work: unit_of_work.resolve_approval(decision_id)
+        )
 
     def revoke(self, decision_id: str, *, revoked_at: datetime) -> None:
-        with self._transaction_backend.transaction():
-            current = self._approvals.get(decision_id)
+        def revoke(unit_of_work: EvaluationAuthorityUnitOfWorkPort) -> None:
+            current = unit_of_work.resolve_approval(decision_id)
             if current is None:
                 raise ResourceNotFoundError(
                     f"demo evaluation approval {decision_id!r} was not found"
                 )
             if current.status == "revoked":
                 return
-            self._approvals[decision_id] = current.model_copy(
+            replacement = current.model_copy(
                 update={
                     "status": "revoked",
                     "revision": current.revision + 1,
                     "revoked_at": revoked_at,
                 }
             )
+            unit_of_work.put_approval(
+                replacement,
+                expected_revision=current.revision,
+            )
+
+        self._run(revoke)
 
     def replace(self, approval: DemoEvaluationApproval) -> None:
         """Replace one decision only with its next monotonic registry revision."""
 
-        with self._transaction_backend.transaction():
-            current = self._approvals.get(approval.decision_id)
+        def replace(unit_of_work: EvaluationAuthorityUnitOfWorkPort) -> None:
+            current = unit_of_work.resolve_approval(approval.decision_id)
             if current is None or approval.revision != current.revision + 1:
                 raise DemoEvaluationConfigurationError(
                     "approval replacement requires the next registry revision"
                 )
-            self._approvals[approval.decision_id] = approval
+            unit_of_work.put_approval(
+                approval,
+                expected_revision=current.revision,
+            )
 
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
-        return self._transaction_backend.identity
+        self._run(replace)
+
+    def _run(
+        self,
+        operation: Callable[
+            [EvaluationAuthorityUnitOfWorkPort],
+            TUnitOfWorkResult,
+        ],
+    ) -> TUnitOfWorkResult:
+        return self._context_service.run_evaluation_authority_transaction(
+            reader_actor=self._context_reader_actor,
+            operation=operation,
+        )
 
 
 __all__ = [

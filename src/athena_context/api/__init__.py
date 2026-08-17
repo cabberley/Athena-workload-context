@@ -70,7 +70,10 @@ from athena_context.api.evaluation_domain import (
     Wc008DeploymentOutputAssertion,
     build_wc008_deployment_assertion,
 )
-from athena_context.api.evaluation_memory import InMemoryEvaluationCommitPort
+from athena_context.api.evaluation_memory import (
+    InMemoryEvaluationAuthorizationRegistry,
+    InMemoryEvaluationCommitPort,
+)
 from athena_context.api.evaluation_service import DemoEvaluationService
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
@@ -112,6 +115,7 @@ __all__ = [
     "EnvironmentContextApiPublishedContextReader",
     "InMemoryContextStore",
     "InMemoryDemoEvaluationApprovalRegistry",
+    "InMemoryEvaluationAuthorizationRegistry",
     "InMemoryEvaluationCommitPort",
     "McpReadAssignment",
     "OperatorDeploymentApproval",

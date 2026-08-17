@@ -22,6 +22,7 @@ from athena_context.api import (
     DemoEvaluationService,
     InMemoryContextStore,
     InMemoryDemoEvaluationApprovalRegistry,
+    InMemoryEvaluationAuthorizationRegistry,
     InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorDeploymentApproval,
@@ -50,7 +51,6 @@ from athena_context.api.evaluation_ports import (
     SnapshotSigningRequest,
     StoredEvaluation,
 )
-from athena_context.api.ports import ContextTransactionBackendIdentity
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
@@ -465,8 +465,7 @@ class LifecycleContextResolver:
                 RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
                 # Deliberate grant proves actor-kind checks still reject MCP writes.
                 RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
-            ],
-            transaction_backend=self.store.authority_transaction_backend,
+            ]
         )
         self.service = ContextService(
             store=self.store,
@@ -695,10 +694,6 @@ class HookedEvaluationCommitPort:
     def context_resolver(self) -> PublishedContextResolverPort:
         return self._delegate.context_resolver
 
-    @property
-    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
-        return self._delegate.transaction_backend_identity
-
     def load_receipt(
         self,
         actor_id: str,
@@ -734,7 +729,7 @@ class DemoHarness:
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: LifecycleContextResolver
     approval_registry: InMemoryDemoEvaluationApprovalRegistry
-    authorization: RoleBasedAuthorization
+    authorization: InMemoryEvaluationAuthorizationRegistry
     approval: DemoEvaluationApproval
     deployment_configuration: VerifiedWc008DeploymentConfiguration
     clock: StepClock
@@ -908,16 +903,23 @@ def build_harness(
         reason="Collect, publish, and evaluate the approved synthetic demo",
     )
     snapshot_signer = DeterministicSnapshotSigner(private_key)
-    authorization = context_resolver.authorization
     approval_registry = InMemoryDemoEvaluationApprovalRegistry(
         [approval],
-        transaction_backend=context_resolver.store.authority_transaction_backend,
+        context_service=context_resolver.service,
+        context_reader_actor=PUBLISHER,
+    )
+    authorization = InMemoryEvaluationAuthorizationRegistry(
+        (
+            RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
+            # Deliberate grant proves actor-kind checks still reject MCP writes.
+            RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
+        ),
+        context_service=context_resolver.service,
+        context_reader_actor=PUBLISHER,
     )
     store = InMemoryEvaluationCommitPort(
         context_service=context_resolver.service,
         context_reader_actor=PUBLISHER,
-        approval_resolver=approval_registry,
-        authorization=authorization,
         clock=clock,
         publication_actor=PUBLICATION_SERVICE,
         evidence_identity_object_id=MCP_OBJECT_ID,
