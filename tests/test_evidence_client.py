@@ -753,6 +753,39 @@ def _collect_matrix_result(
     return asyncio.run(client.collect(command))
 
 
+def _collect_resource_items(
+    mode: Literal["sync", "async"],
+    items: list[object],
+    private_key: rsa.RSAPrivateKey,
+    *,
+    attempt_suffix: str,
+) -> CollectedEvidence:
+    command = _command(attempt_id=f"attempt-{attempt_suffix}")
+
+    def outcome(request: EvidenceTransportRequest) -> McpTransportOutcome:
+        return McpSuccessResponse(
+            body=_body(_success_payload(request, items=items)),
+            response_received_at=NOW,
+        )
+
+    if mode == "sync":
+        return _sync_client(
+            FakeSyncTransport(outcome),
+            signer=RealTestSigner(private_key),
+        ).collect(command)
+    public_key = private_key.public_key()
+    client = AsyncEvidenceClient(
+        transport=FakeAsyncTransport(outcome),
+        signer=AsyncRealTestSigner(RealTestSigner(private_key)),
+        replay_guard=AsyncReplayGuard(),
+        clock=FrozenClock(),
+        trust_configuration=_trust(),
+        key_resolver=_key_resolver(public_key),
+        trusted_key_anchor=_key_anchor(public_key),
+    )
+    return asyncio.run(client.collect(command))
+
+
 def test_reviewed_tool_allowlist_is_exact_and_digest_bound() -> None:
     assert REVIEWED_TOOL_ALLOWLIST == (("azure.resourceInventory.read", "1.0.0"),)
     assert compute_artifact_digest(
@@ -1226,6 +1259,71 @@ def test_transport_outcome_matrix_builds_evaluation_valid_snapshot(
     )
     assert validated.snapshot_id == f"snap-{suffix}"
     assert len(validated.evidence_refs) == len(validated.evidence_records)
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_sparse_approved_tags_match_envelope_and_signed_snapshot_projection(
+    mode: Literal["sync", "async"],
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    item = _item()
+    item["tags"] = {"environment": "production"}
+    suffix = "000000000201" if mode == "sync" else "000000000202"
+    result = _collect_resource_items(
+        mode,
+        [item],
+        private_key,
+        attempt_suffix=suffix,
+    )
+    record = result.evidence_records[0]
+    assert isinstance(record, ResourceEvidenceRecord)
+    assert result.envelope is not None
+    envelope_item = result.envelope.payload()["items"][0]
+    assert isinstance(envelope_item, dict)
+    assert envelope_item["tags"] == {"environment": "production"}
+    assert record.tags.model_dump(
+        mode="json", by_alias=True, exclude_none=True
+    ) == {"environment": "production"}
+    validated = _validate_result_as_snapshot(
+        result,
+        private_key,
+        snapshot_suffix=suffix,
+    )
+    assert validated.snapshot_id == f"snap-{suffix}"
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("tag_case", ["unknown", "invalid"])
+def test_untrusted_sparse_tags_remain_malformed_through_signed_snapshot(
+    mode: Literal["sync", "async"],
+    tag_case: str,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    item = _item()
+    item["tags"] = (
+        {"environment": "production", "owner": "untrusted-free-form"}
+        if tag_case == "unknown"
+        else {"environment": "prod-untrusted"}
+    )
+    base = 0x210 if tag_case == "unknown" else 0x220
+    if mode == "async":
+        base += 1
+    suffix = f"{base:012x}"
+    result = _collect_resource_items(
+        mode,
+        [item],
+        private_key,
+        attempt_suffix=suffix,
+    )
+    gap = result.evidence_records[0]
+    assert isinstance(gap, EvidenceGapRecord)
+    assert gap.gap_reason == "malformed"
+    validated = _validate_result_as_snapshot(
+        result,
+        private_key,
+        snapshot_suffix=suffix,
+    )
+    assert validated.snapshot_id == f"snap-{suffix}"
 
 
 def test_mismatched_or_unverifiable_signer_output_is_rejected() -> None:

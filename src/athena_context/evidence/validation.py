@@ -738,6 +738,7 @@ def _resource_source_projection(item: ResourceResponseItem) -> dict[str, object]
             mode="json",
             by_alias=True,
             exclude={"observed_at"},
+            exclude_none=True,
         ),
     )
 
