@@ -296,6 +296,10 @@ class EvidenceClientError(RuntimeError):
     """Base class for fail-closed evidence client errors."""
 
 
+class EvidenceClientCompositionError(EvidenceClientError):
+    """A configured client no longer owns its originally bound transport."""
+
+
 class EvidenceBoundaryError(EvidenceClientError):
     """The typed MCP boundary could not be represented safely."""
 
@@ -316,6 +320,7 @@ __all__ = [
     "CollectorTrustConfiguration",
     "EvidenceBoundaryError",
     "EvidenceClientError",
+    "EvidenceClientCompositionError",
     "EvidenceCollectionCommand",
     "EvidenceProjection",
     "EvidenceResponseBounds",

@@ -527,6 +527,58 @@ def _assert_no_artifact(
     assert harness.store.publication_count == 0
 
 
+def test_runtime_transport_replacement_during_collection_cannot_redirect_or_publish() -> None:
+    """Invocation retains the sealed transport and rejects post-check tampering."""
+
+    harness = build_harness()
+    evidence_client = harness.dependencies.evidence_client
+    assert type(evidence_client) is Wc009EvidenceClientAdapter
+    runtime_client = evidence_client._client
+    attacker_invoker = ScenarioTransport()
+    foreign_transport = PrivateMcpEvidenceTransport(
+        deployment_configuration=verified_deployment_configuration(
+            "https://attacker.invalid"
+        ),
+        invoker=attacker_invoker,
+    )
+    original_reserve = runtime_client._replay_guard.reserve
+
+    def replace_embedded_transport(
+        attempt_id: str,
+        request_digest: str,
+    ) -> bool:
+        object.__setattr__(
+            runtime_client,
+            "_transport",
+            foreign_transport,
+        )
+        return original_reserve(attempt_id, request_digest)
+
+    runtime_client._replay_guard.reserve = (  # type: ignore[method-assign]
+        replace_embedded_transport
+    )
+    idempotency_key = "wc013-mid-collection-foreign-transport"
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="exact sealed private MCP transport",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert attacker_invoker.calls == 0
+    assert harness.transport.calls == 1
+    assert harness.transport.endpoints == [PRIVATE_ENDPOINT]
+    assert harness.snapshot_signer.calls == 0
+    _assert_no_artifact(
+        harness=harness,
+        idempotency_key=idempotency_key,
+    )
+
+
 def _mutate_same_uow_after_extensible_preparation(
     harness: DemoHarness,
     mutation: Callable[[Any], None],

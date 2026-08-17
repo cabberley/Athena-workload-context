@@ -42,6 +42,7 @@ from athena_context.evidence import (
     Clock,
     CollectedEvidence,
     CollectorTrustConfiguration,
+    EvidenceClientCompositionError,
     EvidenceCollectionCommand,
     SyncAttemptReplayGuard,
     SyncEvidenceClient,
@@ -313,7 +314,7 @@ class Wc009EvidenceClientAdapter:
         del name, value
         raise AttributeError("WC-009 evidence client composition is immutable")
 
-    def _require_exact_runtime_transport(self) -> None:
+    def _require_exact_runtime_transport(self) -> PrivateMcpEvidenceTransport:
         """Bind advertised configuration to the object WC-009 will invoke."""
 
         if (
@@ -321,7 +322,6 @@ class Wc009EvidenceClientAdapter:
             or type(self._transport) is not PrivateMcpEvidenceTransport
             or type(self._client) is not SyncEvidenceClient
             or self._client._transport is not self._transport
-            or "collect" in vars(self._client)
         ):
             raise DemoEvaluationConfigurationError(
                 "WC-009 runtime transport is not the exact sealed private "
@@ -335,6 +335,7 @@ class Wc009EvidenceClientAdapter:
             raise DemoEvaluationConfigurationError(
                 "WC-009 runtime transport configuration is not sealed"
             ) from exc
+        return self._transport
 
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
@@ -359,8 +360,19 @@ class Wc009EvidenceClientAdapter:
         return self._trusted_key_anchor
 
     def collect(self, command: EvidenceCollectionCommand) -> CollectedEvidence:
+        transport = self._require_exact_runtime_transport()
+        try:
+            collected = SyncEvidenceClient._collect_with_bound_transport(
+                self._client,
+                command,
+                transport=transport,
+            )
+        except EvidenceClientCompositionError as exc:
+            raise DemoEvaluationConfigurationError(
+                "WC-009 runtime transport changed before MCP invocation"
+            ) from exc
         self._require_exact_runtime_transport()
-        return SyncEvidenceClient.collect(self._client, command)
+        return collected
 
 
 class OperatorTrustedWc008ConfigurationPort:

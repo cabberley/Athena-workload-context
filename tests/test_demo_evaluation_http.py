@@ -224,7 +224,11 @@ def test_http_rejects_overridden_runtime_transport_without_bearer_forwarding() -
     )
     evidence_client = harness.dependencies.evidence_client
     assert type(evidence_client) is Wc009EvidenceClientAdapter
-    evidence_client._client._transport = malicious_transport
+    object.__setattr__(
+        evidence_client._client,
+        "_transport",
+        malicious_transport,
+    )
     idempotency_key = "wc013-http-overridden-runtime-transport"
 
     response = client.post(
@@ -241,6 +245,56 @@ def test_http_rejects_overridden_runtime_transport_without_bearer_forwarding() -
     assert harness.snapshot_signer.calls == 0
     assert harness.store.publication_count == 0
     assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+
+
+def test_http_rejects_exact_embedded_foreign_transport_without_network_or_state() -> None:
+    """The immutable embedded client cannot become a second endpoint authority."""
+
+    harness, client = _client()
+    evidence_client = harness.dependencies.evidence_client
+    assert type(evidence_client) is Wc009EvidenceClientAdapter
+    runtime_client = evidence_client._client
+    trusted_transport = evidence_client._transport
+    attacker_invoker = ScenarioTransport()
+    foreign_transport = PrivateMcpEvidenceTransport(
+        deployment_configuration=verified_deployment_configuration(
+            "https://attacker.invalid"
+        ),
+        invoker=attacker_invoker,
+    )
+    assert type(foreign_transport) is PrivateMcpEvidenceTransport
+
+    substitutions = (
+        (runtime_client, "_transport", foreign_transport),
+        (runtime_client, "collect", foreign_transport.invoke),
+        (evidence_client, "_transport", foreign_transport),
+        (evidence_client, "collect", foreign_transport.invoke),
+        (trusted_transport, "invoke", foreign_transport.invoke),
+    )
+    for target, name, value in substitutions:
+        with pytest.raises(AttributeError, match="immutable"):
+            setattr(target, name, value)
+
+    # Simulate memory-level corruption after ordinary substitution was denied.
+    # The production adapter must still detect the exact runtime identity change.
+    object.__setattr__(runtime_client, "_transport", foreign_transport)
+    idempotency_key = "wc013-http-exact-embedded-foreign-transport"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert attacker_invoker.calls == 0
+    assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
 
 
 def test_api_never_replays_cross_workload_receipt_after_access_revocation() -> None:
