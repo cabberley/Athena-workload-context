@@ -37,6 +37,7 @@ from athena_context.api.evaluation_ports import (
     SnapshotSigningRequest,
 )
 from athena_context.contracts import (
+    AthenaValidationError,
     NormalizationCollisionError,
     canonicalize_json,
     compute_artifact_digest,
@@ -340,6 +341,63 @@ def test_approval_expiry_during_transaction_aborts_conditional_commit() -> None:
             harness.command,
         )
 
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_policy_evidence_freshness_expiry_during_commit_rolls_back() -> None:
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        evidence_freshness_seconds=30,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+    )
+    idempotency_key = "wc013-policy-freshness-expiry-race"
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
+        lambda _: harness.clock.advance(timedelta(minutes=1))
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="policy evidence freshness failed",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_signing_key_expiry_during_commit_rolls_back() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        trusted_key_expires_at=CURRENT_NOW + timedelta(seconds=30),
+    )
+    idempotency_key = "wc013-signing-key-expiry-race"
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
+        lambda _: harness.clock.advance(timedelta(minutes=1))
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="snapshot verification or policy evaluation failed",
+    ) as captured:
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert isinstance(captured.value.__cause__, AthenaValidationError)
+    assert "cryptographic verification failed" in str(captured.value.__cause__)
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)

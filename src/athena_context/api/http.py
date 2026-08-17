@@ -55,6 +55,7 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationCommand,
     DemoEvaluationResult,
 )
+from athena_context.api.evaluation_ports import DemoEvaluationTrustConfiguration
 from athena_context.api.evaluation_service import (
     DemoEvaluationDependencies,
     DemoEvaluationService,
@@ -135,6 +136,19 @@ def create_app(
             publication_actor=Actor(
                 actor_id="athena-context-api",
                 kind=ActorKind.SERVICE,
+            ),
+            demo_evaluation_trust=(
+                None
+                if demo_evaluation_dependencies is None
+                else DemoEvaluationTrustConfiguration(
+                    trusted_key_anchor=(
+                        demo_evaluation_dependencies.evidence_client
+                        .trusted_key_anchor
+                    ),
+                    key_resolver=(
+                        demo_evaluation_dependencies.evidence_client.key_resolver
+                    ),
+                )
             ),
         )
     if cohort_service is None:

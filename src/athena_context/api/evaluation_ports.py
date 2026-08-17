@@ -20,7 +20,6 @@ from athena_context.api.evaluation_domain import (
 )
 from athena_context.contracts import (
     EvidenceSnapshot,
-    ManifestFinding,
     TrustedKeyAnchor,
     TrustedKeyResolver,
 )
@@ -50,6 +49,14 @@ class StoredEvaluation:
     publication_json: str
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
+
+
+@dataclass(frozen=True, slots=True)
+class DemoEvaluationTrustConfiguration:
+    """ContextService-owned trust used for authoritative final verification."""
+
+    trusted_key_anchor: TrustedKeyAnchor
+    key_resolver: TrustedKeyResolver
 
 
 @runtime_checkable
@@ -153,7 +160,6 @@ class EvaluationCommitCandidate:
     request_digest: str
     command: DemoEvaluationCommand
     snapshot: EvidenceSnapshot
-    findings: tuple[ManifestFinding, ...]
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
     expected_authority: EvaluationAuthorityToken
@@ -199,6 +205,7 @@ __all__ = [
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
+    "DemoEvaluationTrustConfiguration",
     "PublishedContextResolverPort",
     "SnapshotSigningPort",
     "SnapshotSigningRequest",

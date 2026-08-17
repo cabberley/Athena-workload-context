@@ -20,6 +20,7 @@ from athena_context.api import (
     DemoEvaluationCommand,
     DemoEvaluationDependencies,
     DemoEvaluationService,
+    DemoEvaluationTrustConfiguration,
     InMemoryContextStore,
     InMemoryDemoEvaluationApprovalRegistry,
     InMemoryDemoEvaluationStateReader,
@@ -154,6 +155,8 @@ def key_anchor(public_key: object) -> TrustedKeyAnchor:
 
 def key_resolver(
     public_key: object,
+    *,
+    expires_at: datetime | None = None,
 ) -> Callable[[TrustedKeyAnchor], TrustedKeyRecord | None]:
     anchor = key_anchor(public_key)
     record = TrustedKeyRecord(
@@ -161,7 +164,7 @@ def key_resolver(
         public_key=public_key,
         enabled=True,
         activated_at=datetime(2025, 5, 1, tzinfo=UTC),
-        expires_at=datetime(2027, 5, 1, tzinfo=UTC),
+        expires_at=expires_at or datetime(2027, 5, 1, tzinfo=UTC),
     )
 
     def resolve(requested: TrustedKeyAnchor) -> TrustedKeyRecord | None:
@@ -451,6 +454,7 @@ class LifecycleContextResolver:
         lifecycle_start: datetime,
         publish_manifest: bool = True,
         clock: StepClock | None = None,
+        demo_evaluation_trust: DemoEvaluationTrustConfiguration | None = None,
     ) -> None:
         self.store = InMemoryContextStore()
         self.authorization = RoleBasedAuthorization(
@@ -467,6 +471,7 @@ class LifecycleContextResolver:
             authorization=self.authorization,
             clock=clock or StepClock(lifecycle_start),
             publication_actor=PUBLICATION_SERVICE,
+            demo_evaluation_trust=demo_evaluation_trust,
         )
         self._manifest_id = manifest.manifest_id
         self._manifest_version = manifest.manifest_version
@@ -590,6 +595,7 @@ def build_current_synthetic_manifest(
     manifest_version: str = "2.0.0",
     add_prod_east: bool = False,
     additional_profile_ids: tuple[str, ...] = (),
+    evidence_freshness_seconds: int | None = None,
 ) -> CanonicalWorkloadManifest:
     """Build a new test version; only WC-007 humans may publish it."""
 
@@ -661,6 +667,39 @@ def build_current_synthetic_manifest(
 
         replace_profile_references(additional_profile)
         payload["profiles"][profile_id] = additional_profile
+    if evidence_freshness_seconds is not None:
+        all_profile_ids = list(payload["profiles"])
+
+        def freshness_constraint(profile_id: str, profiles: list[str]) -> dict[str, object]:
+            return {
+                "constraintId": "demo-evidence-freshness",
+                "constraintType": "evidenceFreshness",
+                "findingKind": "evidenceGap",
+                "governanceScope": {
+                    "governanceScopeType": "clause",
+                    "manifestId": "wl-athena-wc013-current-demo",
+                    "profileId": profile_id,
+                    "clausePath": "/constraints/demo-evidence-freshness",
+                    "ownerRef": "ops-owner",
+                },
+                "ownerRef": "ops-owner",
+                "profiles": profiles,
+                "proofRequirement": {
+                    "proofKind": "evidenceFreshnessProof",
+                    "maximumAgeSeconds": evidence_freshness_seconds,
+                },
+                "failureVerdict": "violation",
+                "successVerdict": "pass",
+                "protected": False,
+            }
+
+        payload["constraints"].append(
+            freshness_constraint("production", all_profile_ids)
+        )
+        for profile_id, profile in payload["profiles"].items():
+            profile["constraints"].append(
+                freshness_constraint(profile_id, [profile_id])
+            )
     return CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
@@ -786,10 +825,16 @@ def build_harness(
     approval_expires_at: datetime | None = None,
     profile_id: str = "production",
     publish_context: bool = True,
+    trusted_key_expires_at: datetime | None = None,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
     private_key = CANONICAL_PRIVATE_KEY
+    trusted_key_anchor = key_anchor(private_key.public_key())
+    trusted_key_resolver = key_resolver(
+        private_key.public_key(),
+        expires_at=trusted_key_expires_at,
+    )
     trusted_configuration = (
         service_configuration or verified_deployment_configuration()
     )
@@ -807,8 +852,8 @@ def build_harness(
         replay_guard=ReplayGuard(),
         clock=clock,
         trust_configuration=trust,
-        key_resolver=key_resolver(private_key.public_key()),
-        trusted_key_anchor=key_anchor(private_key.public_key()),
+        key_resolver=trusted_key_resolver,
+        trusted_key_anchor=trusted_key_anchor,
     )
     source_manifest = manifest or load_golden_manifest()
     lifecycle_start = (
@@ -821,6 +866,10 @@ def build_harness(
         lifecycle_start=lifecycle_start,
         publish_manifest=publish_context,
         clock=clock,
+        demo_evaluation_trust=DemoEvaluationTrustConfiguration(
+            trusted_key_anchor=trusted_key_anchor,
+            key_resolver=trusted_key_resolver,
+        ),
     )
     published_manifest = (
         context_resolver.view.published.manifest

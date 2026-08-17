@@ -73,6 +73,7 @@ from athena_context.api.evaluation_memory import (
     InMemoryDemoEvaluationStateReader,
     InMemoryEvaluationAuthorizationRegistry,
 )
+from athena_context.api.evaluation_ports import DemoEvaluationTrustConfiguration
 from athena_context.api.evaluation_service import (
     DemoEvaluationDependencies,
     DemoEvaluationService,
@@ -112,6 +113,7 @@ __all__ = [
     "DemoEvaluationDependencies",
     "DemoEvaluationResult",
     "DemoEvaluationService",
+    "DemoEvaluationTrustConfiguration",
     "EvaluationAuthorityToken",
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",

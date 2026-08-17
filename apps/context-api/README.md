@@ -53,9 +53,12 @@ The integration composes the merged components without introducing direct Azure 
   approval revision/status/expiry, and actor grant revision, canonically resolves the complete
   profile inheritance chain, and compares typed authority tokens captured before collection.
   Immediately before final validation it re-samples the service-owned trusted clock and uses that
-  same value for approval/governance/freshness checks, `publishedAt`, and `evaluatedAt`. It then
-  inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
-  change. No independently supplied commit capability can redirect publication to a foreign
+  same value for approval/governance/freshness checks, cryptographic snapshot and signing-key
+  verification, authoritative WC-004 policy evaluation, `publishedAt`, and `evaluatedAt`.
+  ContextService owns the trusted key anchor/resolver and recomputes every finding; findings
+  produced by preflight orchestration are never accepted as commit inputs. It then inserts the
+  idempotency receipt, snapshot, source envelope, publication, and final recomputed result as one
+  state change. No independently supplied commit capability can redirect publication to a foreign
   store. The HTTP composition root accepts only non-authoritative evidence/configuration/signing
   dependencies and constructs the demo service with the exact app-owned `ContextService`;
   preconstructed demo services are rejected.

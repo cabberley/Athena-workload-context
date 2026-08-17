@@ -131,6 +131,9 @@ class DemoEvaluationService:
             raise DemoEvaluationConfigurationError(
                 "trusted snapshot key does not match the evidence ingestion anchor"
             )
+        self._context_service.require_demo_evaluation_trust_anchor(
+            self._evidence_client.trusted_key_anchor
+        )
 
     def evaluate(
         self,
@@ -238,7 +241,7 @@ class DemoEvaluationService:
                 trusted_key_anchor=self._evidence_client.trusted_key_anchor,
                 envelope_resolver=envelope_resolver,
             )
-            findings_by_clause = evaluate_manifest_profile(
+            evaluate_manifest_profile(
                 profile,
                 evidence,
                 as_of=evaluated_at,
@@ -246,13 +249,9 @@ class DemoEvaluationService:
             )
         except AthenaValidationError as exc:
             raise EvaluationFailedClosedError(
-                "verified evidence did not satisfy authoritative manifest evaluation"
+                "verified evidence did not satisfy preflight manifest evaluation"
             ) from exc
 
-        findings = tuple(
-            findings_by_clause[clause_id]
-            for clause_id in sorted(findings_by_clause, key=str.casefold)
-        )
         envelope = collected.envelope
         if envelope is None:
             raise EvaluationFailedClosedError(
@@ -264,7 +263,6 @@ class DemoEvaluationService:
             request_digest=request_digest,
             command=command,
             snapshot=snapshot,
-            findings=findings,
             envelope_attempt_id=collected.collector_attempt.attempt_id,
             envelope=envelope,
             expected_authority=expected_authority,

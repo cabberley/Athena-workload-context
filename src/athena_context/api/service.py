@@ -39,6 +39,7 @@ from athena_context.api.errors import (
     AlreadySupersededError,
     AmbiguousLookupError,
     DemoEvaluationApprovalError,
+    DemoEvaluationConfigurationError,
     DigestMismatchError,
     DuplicateVersionError,
     EvaluationFailedClosedError,
@@ -51,6 +52,8 @@ from athena_context.api.errors import (
     VersionMismatchError,
 )
 from athena_context.api.evaluation_context import (
+    build_resource_evidence_context,
+    make_resource_snapshot_context_verifier,
     resolve_active_manifest_profile,
     validate_demo_evaluation_approval,
     validate_published_context_binding,
@@ -69,6 +72,7 @@ from athena_context.api.evaluation_domain import (
     build_published_context_authority_token,
 )
 from athena_context.api.evaluation_ports import (
+    DemoEvaluationTrustConfiguration,
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
     EvaluationCommitCandidate,
@@ -83,7 +87,9 @@ from athena_context.api.ports import (
 from athena_context.contracts import (
     AthenaValidationError,
     EvidenceSnapshot,
+    ManifestFinding,
     SnapshotPublicationRecord,
+    TrustedKeyAnchor,
     resolve_manifest_profile,
 )
 from athena_context.contracts.common import compute_artifact_digest
@@ -91,6 +97,7 @@ from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
     canonicalize_manifest_payload,
 )
+from athena_context.policy import evaluate_manifest_profile
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
 TUnitOfWorkResult = TypeVar("TUnitOfWorkResult")
@@ -298,6 +305,7 @@ class ContextService:
         authorization: AuthorizationPort,
         clock: ClockPort,
         publication_actor: Actor,
+        demo_evaluation_trust: DemoEvaluationTrustConfiguration | None = None,
     ) -> None:
         if publication_actor.kind is not ActorKind.SERVICE:
             raise ValueError("publication_actor must be a service actor")
@@ -305,12 +313,29 @@ class ContextService:
         self._authorization = authorization
         self._clock = clock
         self._publication_actor = publication_actor
+        self._demo_evaluation_trust = demo_evaluation_trust
 
     @property
     def publication_actor(self) -> Actor:
         """The service identity finalized by this ContextService instance."""
 
         return self._publication_actor
+
+    def require_demo_evaluation_trust_anchor(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> None:
+        """Reject demo composition unless this service owns the exact trust anchor."""
+
+        configured = self._demo_evaluation_trust
+        if (
+            configured is None
+            or configured.trusted_key_anchor != trusted_key_anchor
+        ):
+            raise DemoEvaluationConfigurationError(
+                "ContextService is not configured with the demo evaluation "
+                "trusted key anchor"
+            )
 
     def _run_evaluation_authority_transaction(
         self,
@@ -480,10 +505,16 @@ class ContextService:
             scope=candidate.command.authorized_scope,
             reason=candidate.command.reason,
         )
+        findings = self._evaluate_demo_snapshot_for_publication(
+            candidate,
+            resolved=resolved,
+            publication=publication,
+            as_of=published_at,
+        )
         result = build_demo_evaluation_result(
             publication=publication,
             snapshot=candidate.snapshot,
-            findings=candidate.findings,
+            findings=findings,
             evaluated_at=published_at,
         )
         artifact = StoredEvaluation(
@@ -503,6 +534,96 @@ class ContextService:
         self._validate_evaluation_components(artifact)
         unit_of_work.insert_evaluation(artifact)
         return result
+
+    def _evaluate_demo_snapshot_for_publication(
+        self,
+        candidate: EvaluationCommitCandidate,
+        *,
+        resolved: ResolvedPublishedContext,
+        publication: AuthorizedSnapshotPublication,
+        as_of: datetime,
+    ) -> tuple[ManifestFinding, ...]:
+        """Cryptographically verify and evaluate at the final transaction time."""
+
+        trust = self._demo_evaluation_trust
+        if trust is None:
+            raise EvaluationFailedClosedError(
+                "ContextService has no authoritative demo evaluation trust"
+            )
+        registry_record = publication.registry_record()
+
+        def publication_resolver(
+            snapshot_id: str,
+        ) -> SnapshotPublicationRecord | None:
+            return (
+                registry_record
+                if snapshot_id == candidate.snapshot.snapshot_id
+                else None
+            )
+
+        def envelope_resolver(
+            attempt_id: str,
+            kind: str,
+            digest: str,
+        ) -> object | None:
+            envelope = candidate.envelope
+            return (
+                envelope.payload()
+                if (
+                    attempt_id == candidate.envelope_attempt_id
+                    and kind == envelope.kind
+                    and digest == envelope.digest
+                )
+                else None
+            )
+
+        try:
+            evidence = build_resource_evidence_context(
+                resolved.profile,
+                candidate.snapshot,
+            )
+            verifier = make_resource_snapshot_context_verifier(
+                candidate.snapshot,
+                resolved.profile,
+                as_of=as_of,
+                expected_artifact_digest=(
+                    candidate.snapshot.compatibility.artifact_digest
+                ),
+                publication_resolver=publication_resolver,
+                key_resolver=trust.key_resolver,
+                trusted_key_anchor=trust.trusted_key_anchor,
+                envelope_resolver=envelope_resolver,
+            )
+            findings_by_clause = evaluate_manifest_profile(
+                resolved.profile,
+                evidence,
+                as_of=as_of,
+                verify_evidence_context=verifier,
+            )
+        except AthenaValidationError as exc:
+            raise EvaluationFailedClosedError(
+                "snapshot verification or policy evaluation failed at the "
+                "authoritative publication time"
+            ) from exc
+
+        constraints = {
+            constraint.constraint_id: constraint
+            for constraint in resolved.profile.constraints
+        }
+        for clause_id, finding in findings_by_clause.items():
+            constraint = constraints[clause_id]
+            if (
+                constraint.constraint_type == "evidenceFreshness"
+                and finding.verdict != constraint.success_verdict
+            ):
+                raise EvaluationFailedClosedError(
+                    "policy evidence freshness failed at the authoritative "
+                    "publication time"
+                )
+        return tuple(
+            findings_by_clause[clause_id]
+            for clause_id in sorted(findings_by_clause, key=str.casefold)
+        )
 
     def _resolve_evaluation_authority(
         self,
