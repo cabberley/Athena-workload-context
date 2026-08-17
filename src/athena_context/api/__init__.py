@@ -3,9 +3,24 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_domain import (
+    CohortDraftBinding,
+    CohortEvidenceBinding,
+    CohortProposalBatchResponse,
+    CohortProposalQuery,
+    CohortReviewCandidate,
+    CohortReviewPreviewRequest,
+)
+from athena_context.api.cohort_memory import (
+    CallableTrustedEvidenceSnapshotVerifier,
+    InMemoryCohortPersistence,
+    InMemoryEvidenceSnapshotRepository,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    AllWorkloadsGrantScope,
     CreateDraftCommand,
     DraftRecord,
     DraftState,
@@ -17,6 +32,8 @@ from athena_context.api.domain import (
     SupersedeCommand,
     TransitionCommand,
     VerifiedAuthentication,
+    WorkloadGrantScope,
+    WorkloadIdentifier,
 )
 from athena_context.api.evaluation_adapters import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
@@ -60,6 +77,15 @@ __all__ = [
     "AZURE_MCP_2_0_5_IMAGE_DIGEST",
     "AuthorizedSnapshotPublication",
     "ContextServicePublishedContextResolver",
+    "AllWorkloadsGrantScope",
+    "CallableTrustedEvidenceSnapshotVerifier",
+    "CohortDraftBinding",
+    "CohortEvidenceBinding",
+    "CohortProposalBatchResponse",
+    "CohortProposalQuery",
+    "CohortProposalService",
+    "CohortReviewCandidate",
+    "CohortReviewPreviewRequest",
     "ContextService",
     "CreateDraftCommand",
     "DraftRecord",
@@ -78,6 +104,8 @@ __all__ = [
     "PublishedContextSelection",
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",
+    "InMemoryCohortPersistence",
+    "InMemoryEvidenceSnapshotRepository",
     "PublishedManifest",
     "PublishCommand",
     "ReplaceDraftCommand",
@@ -95,5 +123,7 @@ __all__ = [
     "Wc008DeploymentOutputAssertion",
     "Wc009EvidenceClientAdapter",
     "build_wc008_deployment_assertion",
+    "WorkloadGrantScope",
+    "WorkloadIdentifier",
     "create_app",
 ]

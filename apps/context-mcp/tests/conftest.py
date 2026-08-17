@@ -28,6 +28,7 @@ from athena_context.api.domain import (
     RoleGrant,
     TransitionCommand,
     VerifiedAuthentication,
+    WorkloadGrantScope,
 )
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
@@ -224,22 +225,22 @@ def harness() -> Harness:
                 RoleGrant(
                     actor_id=AGENT.actor_id,
                     role=Role.PROPOSER,
-                    manifest_id=WORKLOAD_ID,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
                 RoleGrant(
                     actor_id=AGENT.actor_id,
                     role=Role.AUDITOR,
-                    manifest_id=WORKLOAD_ID,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
                 RoleGrant(
                     actor_id=APPROVER.actor_id,
                     role=Role.APPROVER,
-                    manifest_id=WORKLOAD_ID,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
                 RoleGrant(
                     actor_id=PUBLISHER.actor_id,
                     role=Role.PUBLISHER,
-                    manifest_id=WORKLOAD_ID,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
             ]
         ),
