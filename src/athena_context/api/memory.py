@@ -36,12 +36,18 @@ def _version_key(version: str) -> tuple[int, int, int]:
     return (int(major), int(minor), int(patch))
 
 
-def _cohort_version_binding_key(version: CohortProposalSetVersion) -> str:
-    return version.model_dump_json(
-        by_alias=True,
-        exclude_none=True,
-        exclude={"source_proposal_ids"},
-    )
+def _cohort_overlap_binding_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, str, str, str, str, str]:
+    """Stable authority identity; mutable draft coordinates are deliberately absent."""
+
+    return version.authority_overlap_identity()
+
+
+def _cohort_selected_version_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, ...]:
+    return version.authority_selected_identity()
 
 
 class InMemoryContextStore:
@@ -56,7 +62,10 @@ class InMemoryContextStore:
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
         self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
-        self._cohort_decision_versions: dict[str, tuple[str, str]] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
         self._cohort_decision_receipts: dict[
             tuple[str, str],
             CohortDecisionReceipt,
@@ -76,7 +85,10 @@ class _MemoryTransaction(ContextTransactionPort):
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
         self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
-        self._cohort_decision_versions: dict[str, tuple[str, str]] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
         self._cohort_decision_receipts: dict[
             tuple[str, str],
             CohortDecisionReceipt,
@@ -315,13 +327,13 @@ class _MemoryTransaction(ContextTransactionPort):
         self,
         version: CohortProposalSetVersion,
     ) -> list[CohortDecisionRecord]:
-        binding_key = _cohort_version_binding_key(version)
+        binding_key = _cohort_overlap_binding_key(version)
         selected = set(version.source_proposal_ids)
         matches = sorted(
             (
                 decision
                 for decision in self._cohort_decisions.values()
-                if _cohort_version_binding_key(decision.proposal_set_version())
+                if _cohort_overlap_binding_key(decision.proposal_set_version())
                 == binding_key
                 and selected.intersection(decision.source_proposal_ids)
             ),
@@ -332,10 +344,7 @@ class _MemoryTransaction(ContextTransactionPort):
     def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
         decision_key = (decision.manifest_id, decision.decision_id)
         version = decision.proposal_set_version()
-        version_key = version.model_dump_json(
-            by_alias=True,
-            exclude_none=True,
-        )
+        version_key = _cohort_selected_version_key(version)
         if decision_key in self._cohort_decisions:
             raise PersistenceConflictError(
                 "cohort decision identifier already exists"

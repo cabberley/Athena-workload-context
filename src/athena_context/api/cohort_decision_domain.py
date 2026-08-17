@@ -248,6 +248,9 @@ class CohortProposalSetVersion(ApiModel):
 
     The batch input digest is retained on the decision record for audit, but is
     intentionally absent here because it includes the proposal evaluation time.
+    ``source_draft`` remains an exact stale-apply binding, but authoritative
+    rejection/overlap indexes must exclude its mutable identifier, revision,
+    and digest.
     """
 
     manifest_id: WorkloadIdentifier
@@ -272,6 +275,25 @@ class CohortProposalSetVersion(ApiModel):
                 "source_proposal_ids must be a canonical unique proposal set"
             )
         return values
+
+    def authority_overlap_identity(
+        self,
+    ) -> tuple[str, str, str, str, str, str]:
+        """Return stable authority scope without mutable source-draft coordinates."""
+
+        return (
+            normalized_identifier(self.manifest_id),
+            self.manifest_version,
+            normalized_identifier(self.profile_id),
+            self.resolved_profile_digest,
+            self.proposal_set_digest,
+            self.snapshot_artifact_digest,
+        )
+
+    def authority_selected_identity(self) -> tuple[str, ...]:
+        """Return stable authority scope including the canonical selected proposals."""
+
+        return (*self.authority_overlap_identity(), *self.source_proposal_ids)
 
 
 class CohortDecisionAudit(ApiModel):

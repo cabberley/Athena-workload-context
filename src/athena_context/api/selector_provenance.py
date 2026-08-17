@@ -16,6 +16,7 @@ from athena_context.contracts.manifest import (
     CompositeAnySelector,
     ManifestRole,
     ManifestSelector,
+    ResolvedManifestProfile,
 )
 
 _DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
@@ -221,6 +222,23 @@ def manifest_selector_provenance(
     return tuple(sorted(entries, key=_entry_key))
 
 
+def resolved_profile_selector_provenance(
+    profile: ResolvedManifestProfile,
+) -> tuple[SelectorProvenanceEntry, ...]:
+    """Capture the selectors a profile actually resolves, not only its declarations."""
+
+    entries: list[SelectorProvenanceEntry] = []
+    for role in profile.roles:
+        entries.extend(
+            role_selector_provenance(
+                role,
+                location="profile",
+                profile_id=profile.profile_id,
+            )
+        )
+    return tuple(sorted(entries, key=_entry_key))
+
+
 def selector_role_digests(
     entries: tuple[SelectorProvenanceEntry, ...],
 ) -> dict[SelectorRoleKey, str]:
@@ -243,6 +261,7 @@ __all__ = [
     "SelectorProvenanceEntry",
     "SelectorRoleKey",
     "manifest_selector_provenance",
+    "resolved_profile_selector_provenance",
     "role_selector_provenance_digest",
     "selector_role_digests",
 ]

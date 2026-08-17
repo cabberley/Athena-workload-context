@@ -62,7 +62,9 @@ from athena_context.api.ports import (
 )
 from athena_context.api.selector_provenance import (
     DraftSelectorBaseline,
+    SelectorProvenanceEntry,
     manifest_selector_provenance,
+    resolved_profile_selector_provenance,
     selector_role_digests,
 )
 from athena_context.contracts.common import (
@@ -375,6 +377,54 @@ class ContextService:
                 replacement,
                 selector_authority,
             )
+            allowed_effective_changes: set[str] = set()
+            if selector_change_authorized:
+                if selector_authority is None:
+                    raise AthenaValidationError(
+                        "selector-changing replacement lacks persisted authority"
+                    )
+                allowed_effective_changes = {
+                    normalized_identifier(binding.profile_id)
+                    for binding in selector_authority.bindings
+                    if binding.current_draft.draft_id == current.draft_id
+                    and binding.current_draft.revision == current.revision
+                    and binding.current_draft.manifest_digest
+                    == current.manifest_digest
+                    and binding.resulting_draft.draft_id == current.draft_id
+                    and binding.resulting_draft.revision
+                    == current.revision + 1
+                    and binding.resulting_draft.manifest_digest
+                    == replacement.compatibility.artifact_digest
+                }
+                if len(allowed_effective_changes) != 1:
+                    raise AthenaValidationError(
+                        "selector-changing replacement is not bound to one exact profile"
+                    )
+            current_effective = (
+                ContextService._resolve_effective_selector_provenance(
+                    current.manifest,
+                    as_of=as_of,
+                    selector_authority=selector_authority,
+                )
+            )
+            replacement_effective = (
+                ContextService._resolve_effective_selector_provenance(
+                    replacement,
+                    as_of=as_of,
+                    selector_authority=selector_authority,
+                )
+            )
+            if set(current_effective) != set(replacement_effective) or any(
+                current_effective[profile_id]
+                != replacement_effective[profile_id]
+                and profile_id not in allowed_effective_changes
+                for profile_id in current_effective.keys()
+                & replacement_effective.keys()
+            ):
+                raise AthenaValidationError(
+                    "draft replacement cannot alter effective selectors outside "
+                    "the exact decision-bound profile"
+                )
             if selector_authority is None:
                 validate_manifest_selector_identity_transition(
                     current.manifest,
@@ -385,17 +435,43 @@ class ContextService:
                     as_of=as_of,
                 )
                 return
-            for profile in replacement.profiles.values():
-                _resolve_manifest_profile_for_cohort_decision(
-                    replacement,
-                    profile.profile_id,
-                    as_of=as_of,
-                    selector_capability=selector_authority,
-                )
         except (AthenaValidationError, StopIteration) as exc:
             raise ManifestValidationError(
                 "replacement manifest profile inheritance is not valid"
             ) from exc
+
+    @staticmethod
+    def _resolve_effective_selector_provenance(
+        manifest: CanonicalWorkloadManifest,
+        *,
+        as_of: datetime,
+        selector_authority: _PersistedSelectorAuthority | None,
+    ) -> dict[str, tuple[SelectorProvenanceEntry, ...]]:
+        effective: dict[str, tuple[SelectorProvenanceEntry, ...]] = {}
+        for profile in manifest.profiles.values():
+            resolved = (
+                resolve_manifest_profile(
+                    manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                )
+                if selector_authority is None
+                else _resolve_manifest_profile_for_cohort_decision(
+                    manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                    selector_capability=selector_authority,
+                )
+            )
+            profile_id = normalized_identifier(resolved.profile_id)
+            if profile_id in effective:
+                raise AthenaValidationError(
+                    "resolved profile identifiers must be unique after normalization"
+                )
+            effective[profile_id] = resolved_profile_selector_provenance(
+                resolved
+            )
+        return effective
 
     @staticmethod
     def _validate_generic_manifest_profiles(

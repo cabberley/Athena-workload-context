@@ -25,6 +25,7 @@ from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
 from athena_context.api.selector_provenance import (
     manifest_selector_provenance,
+    resolved_profile_selector_provenance,
 )
 from athena_context.contracts import (
     AthenaValidationError,
@@ -1190,6 +1191,173 @@ def test_reject_survives_proposal_cache_regeneration_at_a_later_time() -> None:
     assert decisions[0].batch_input_digest == original_batch["inputDigest"]
 
 
+@pytest.mark.parametrize("rebound", ["unrelated-edit", "fresh-draft"])
+def test_reject_survives_mutable_draft_rebinding_without_side_effects(
+    rebound: str,
+) -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    proposal = _proposal(original_batch, require_multiple_members=True)
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            original_batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject this selector independent of mutable draft coordinates.",
+        ),
+        f"wc-034-stable-reject-{rebound}",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    mutation_key = f"wc-034-stable-reject-rebind-{rebound}"
+    if rebound == "unrelated-edit":
+        source = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+        payload = source.manifest.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        payload["workload"]["displayName"] += " selector-neutral"
+        rebound_manifest = CanonicalWorkloadManifest.model_validate(
+            canonicalize_manifest_payload(payload)
+        )
+        response = harness.client.put(
+            f"/v1/drafts/{harness.draft_id}",
+            headers=_headers(HUMAN, idempotency_key=mutation_key),
+            json=ReplaceDraftCommand(
+                expected_revision=source.revision,
+                expected_manifest_version=source.manifest.manifest_version,
+                expected_digest=source.manifest_digest,
+                replacement_manifest=rebound_manifest,
+                replacement_digest=(
+                    rebound_manifest.compatibility.artifact_digest
+                ),
+                reason="Apply an unrelated display name edit",
+            ).model_dump(mode="json", by_alias=True, exclude_none=True),
+        )
+        assert response.status_code == 200, response.text
+        rebound_draft = harness.lifecycle.get_draft(
+            HUMAN,
+            harness.draft_id,
+        )
+    else:
+        fresh_id = "draft-wc-034-stable-reject-fresh"
+        response = harness.client.post(
+            "/v1/drafts",
+            headers=_headers(HUMAN, idempotency_key=mutation_key),
+            json=CreateDraftCommand(
+                draft_id=fresh_id,
+                manifest=harness.manifest,
+                manifest_digest=(
+                    harness.manifest.compatibility.artifact_digest
+                ),
+                reason="Create an identical fresh draft after rejection",
+            ).model_dump(mode="json", by_alias=True, exclude_none=True),
+        )
+        assert response.status_code == 201, response.text
+        rebound_draft = harness.lifecycle.get_draft(HUMAN, fresh_id)
+
+    harness.draft_id = rebound_draft.draft_id
+    harness.draft_revision = rebound_draft.revision
+    harness.draft_digest = rebound_draft.manifest_digest
+    harness.manifest = rebound_draft.manifest
+    harness.register_profile("production")
+    regenerated_batch = _load(harness)
+    regenerated_proposal = next(
+        item
+        for item in regenerated_batch["proposals"]
+        if item["proposalId"] == proposal["proposalId"]
+    )
+
+    assert regenerated_batch["proposalSetDigest"] == (
+        original_batch["proposalSetDigest"]
+    )
+    assert regenerated_batch["snapshot"]["artifactDigest"] == (
+        original_batch["snapshot"]["artifactDigest"]
+    )
+    assert regenerated_proposal["proposalId"] == proposal["proposalId"]
+
+    preview_body = _preview_body(
+        harness,
+        regenerated_batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key=f"wc-034-stable-reject-preview-{rebound}",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    failed_key = f"wc-034-stable-reject-blocked-{rebound}"
+    with harness.store.transaction() as tx:
+        drafts_before = tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+        rejection_receipt_before = tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            f"wc-034-stable-reject-{rebound}",
+        )
+        mutation_receipt_before = tx.get_receipt(
+            HUMAN.actor_id,
+            mutation_key,
+        )
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            failed_key,
+        ) is None
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            regenerated_batch,
+            decision="split",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    with harness.store.transaction() as tx:
+        assert tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        ) == drafts_before
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            f"wc-034-stable-reject-{rebound}",
+        ) == rejection_receipt_before
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            failed_key,
+        ) is None
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            mutation_key,
+        ) == mutation_receipt_before
+        assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
+
+
 def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
     harness = _build_harness()
     batch = _load(harness)
@@ -1907,6 +2075,139 @@ def test_display_name_only_put_after_approved_split_preserves_selectors() -> Non
         ).model_dump(mode="json"),
     )
     assert validated.status_code == 200, validated.text
+
+
+def test_generic_put_cannot_launder_effective_selectors_through_inheritance() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-effective-preview"),
+    )
+    applied = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-effective-apply",
+    )
+    assert preview.status_code == 200, preview.text
+    assert applied.status_code == 201, applied.text
+
+    current = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    development_before = resolve_manifest_profile(
+        harness.manifest,
+        "development",
+        as_of=harness.clock.now(),
+    )
+    payload = current.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["profiles"]["development"]["extends"] = "production"
+    laundering = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    failed_key = "wc-034-effective-inheritance-launder"
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    blocked = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(HUMAN, idempotency_key=failed_key),
+        json=ReplaceDraftCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            replacement_manifest=laundering,
+            replacement_digest=laundering.compatibility.artifact_digest,
+            reason="Attempt effective selector laundering through inheritance",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert blocked.status_code == 422, blocked.text
+    assert blocked.json()["error"]["code"] == "manifest_validation_failed"
+    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id) == current
+    with harness.store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
+
+    neutral_payload = current.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    neutral_payload["profiles"]["development"]["extends"] = "training"
+    neutral = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(neutral_payload)
+    )
+    allowed = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-effective-inheritance-neutral",
+        ),
+        json=ReplaceDraftCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            replacement_manifest=neutral,
+            replacement_digest=neutral.compatibility.artifact_digest,
+            reason="Apply selector-neutral inheritance metadata",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert allowed.status_code == 200, allowed.text
+    updated = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    inherited_training = resolve_manifest_profile(
+        harness.manifest,
+        "training",
+        as_of=harness.clock.now(),
+    )
+    assert updated.manifest.profiles["development"].extends == "training"
+    assert updated.manifest.profiles["development"].roles == []
+    assert [
+        (
+            entry.role_id,
+            entry.selector_path,
+            entry.selector_variant,
+            entry.semantic_digest,
+        )
+        for entry in resolved_profile_selector_provenance(inherited_training)
+    ] == [
+        (
+            entry.role_id,
+            entry.selector_path,
+            entry.selector_variant,
+            entry.semantic_digest,
+        )
+        for entry in resolved_profile_selector_provenance(
+            development_before
+        )
+    ]
 
 
 def test_preview_candidates_are_actor_bound_for_two_authorized_reviewers() -> None:

@@ -50,12 +50,18 @@ mutate it.
   rejected or merely proposed candidate into a new baseline. Create and ordinary replacement
   resolve every profile before any baseline, draft, audit, or receipt write. A selector-preserving
   replacement after an approved decision recovers only persisted apply provenance, so unrelated
-  non-selector edits remain legal without accepting caller-supplied authority.
+  non-selector edits remain legal without accepting caller-supplied authority. Replacement also
+  compares the effective resolved selector provenance of every profile before and after the
+  mutation. Inheritance-topology changes cannot make approved selectors effective in another
+  profile; selector-neutral inheritance and non-selector edits remain legal.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity
-  uses only the immutable draft, profile, snapshot, and proposal-set bindings; proposal evaluation
-  time and its derived input digest cannot bypass a durable rejection after cache regeneration.
+  uses only the immutable workload/version, resolved profile, snapshot, proposal-set, and
+  canonical selected-proposal bindings. Mutable draft ID, revision, digest, proposal evaluation
+  time, and input digest cannot bypass a durable rejection after an unrelated edit, cache
+  regeneration, or identical fresh draft. Exact draft coordinates remain mandatory only for
+  stale application validation.
   Overlap arbitration occurs before mutable draft freshness checks. A disjoint apply from the same
   immutable batch may atomically rebase only over the contiguous draft revisions produced by
   earlier decisions from that batch; unrelated draft changes remain stale. Preview candidate
