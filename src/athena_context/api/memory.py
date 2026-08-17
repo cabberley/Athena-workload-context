@@ -109,6 +109,7 @@ class _SealedEvaluationTemporalValidity:
 @dataclass(frozen=True, slots=True)
 class _SealedEvaluationInsertion:
     actor_id: str
+    workload_id: str
     idempotency_key: str
     request_digest: str
     candidate_digest: str
@@ -310,6 +311,7 @@ def _finalize_prepared_evaluation(
 
     return StoredEvaluation(
         actor_id=sealed.actor_id,
+        workload_id=sealed.workload_id,
         idempotency_key=sealed.idempotency_key,
         request_digest=sealed.request_digest,
         candidate_digest=sealed.candidate_digest,
@@ -560,7 +562,10 @@ class InMemoryContextStore:
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
-        self._evaluation_receipts: dict[tuple[str, str], StoredEvaluation] = {}
+        self._evaluation_receipts: dict[
+            tuple[str, str, str],
+            StoredEvaluation,
+        ] = {}
         self._evaluation_artifacts: dict[str, StoredEvaluation] = {}
         self._demo_evaluation_trusted_keys: dict[
             str,
@@ -666,7 +671,10 @@ class _MemoryTransaction(ContextTransactionPort):
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
-        self._evaluation_receipts: dict[tuple[str, str], StoredEvaluation] = {}
+        self._evaluation_receipts: dict[
+            tuple[str, str, str],
+            StoredEvaluation,
+        ] = {}
         self._evaluation_artifacts: dict[str, StoredEvaluation] = {}
         self._demo_evaluation_trusted_keys: dict[
             str,
@@ -919,11 +927,24 @@ class _MemoryTransaction(ContextTransactionPort):
     def get_evaluation_receipt(
         self,
         actor_id: str,
+        workload_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None:
         artifact = self._evaluation_receipts.get(
-            (actor_id, idempotency_key)
+            (actor_id, workload_id, idempotency_key)
         )
+        if artifact is None and any(
+            stored_actor_id == actor_id
+            and stored_idempotency_key == idempotency_key
+            for (
+                stored_actor_id,
+                _stored_workload_id,
+                stored_idempotency_key,
+            ) in self._evaluation_receipts
+        ):
+            raise IdempotencyConflictError(
+                "evaluation idempotency key belongs to a different workload"
+            )
         return None if artifact is None else deepcopy(artifact)
 
     def get_evaluation_artifact(
@@ -1242,6 +1263,10 @@ class _MemoryTransaction(ContextTransactionPort):
                 normalized.material.actor.actor_id,
                 label="publication actor",
             ),
+            workload_id=_exact_text(
+                resolved.view.published.manifest_id,
+                label="publication workload",
+            ),
             idempotency_key=_exact_text(
                 condition.idempotency_key,
                 label="idempotency key",
@@ -1276,9 +1301,19 @@ class _MemoryTransaction(ContextTransactionPort):
         )
         receipt_key = (
             sealed_insertion.actor_id,
+            sealed_insertion.workload_id,
             sealed_insertion.idempotency_key,
         )
-        if receipt_key in self._evaluation_receipts:
+        if receipt_key in self._evaluation_receipts or any(
+            stored_actor_id == sealed_insertion.actor_id
+            and stored_idempotency_key
+            == sealed_insertion.idempotency_key
+            for (
+                stored_actor_id,
+                _stored_workload_id,
+                stored_idempotency_key,
+            ) in self._evaluation_receipts
+        ):
             raise IdempotencyConflictError(
                 "evaluation idempotency key has already been recorded"
             )

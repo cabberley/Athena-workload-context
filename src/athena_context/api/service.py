@@ -336,8 +336,29 @@ class ContextService:
         def load(
             unit_of_work: EvaluationAuthorityUnitOfWorkPort,
         ) -> StoredEvaluation | None:
-            unit_of_work.authorize(actor, Permission.PUBLISH, manifest_id)
-            return unit_of_work.load_receipt(actor.actor_id, idempotency_key)
+            unit_of_work.authorize(
+                actor,
+                Permission.PUBLISH,
+                manifest_id,
+            )
+            receipt = unit_of_work.load_receipt(
+                actor.actor_id,
+                manifest_id,
+                idempotency_key,
+            )
+            if receipt is None:
+                return None
+            if receipt.workload_id != manifest_id:
+                raise EvaluationFailedClosedError(
+                    "evaluation receipt workload does not match the requested "
+                    "workload"
+                )
+            unit_of_work.authorize(
+                actor,
+                Permission.PUBLISH,
+                receipt.workload_id,
+            )
+            return receipt
 
         return self._run_evaluation_authority_transaction(
             reader_actor=actor,
@@ -413,9 +434,20 @@ class ContextService:
             )
             replay = unit_of_work.load_receipt(
                 normalized_actor.actor_id,
+                normalized_command.manifest_id,
                 idempotency_key,
             )
             if replay is not None:
+                if replay.workload_id != normalized_command.manifest_id:
+                    raise EvaluationFailedClosedError(
+                        "evaluation receipt workload does not match the "
+                        "authorized command"
+                    )
+                unit_of_work.authorize(
+                    normalized_actor,
+                    Permission.PUBLISH,
+                    replay.workload_id,
+                )
                 if replay.request_digest != request_digest:
                     raise IdempotencyConflictError(
                         "idempotency key was used for a different demo evaluation"
@@ -546,9 +578,20 @@ class ContextService:
             )
         replay = unit_of_work.load_receipt(
             request.actor.actor_id,
+            command.manifest_id,
             request.idempotency_key,
         )
         if replay is not None:
+            if replay.workload_id != command.manifest_id:
+                raise EvaluationFailedClosedError(
+                    "evaluation receipt workload does not match the "
+                    "authorized command"
+                )
+            unit_of_work.authorize(
+                request.actor,
+                Permission.PUBLISH,
+                replay.workload_id,
+            )
             if replay.request_digest != request.request_digest:
                 raise IdempotencyConflictError(
                     "idempotency key was concurrently used for a different evaluation"

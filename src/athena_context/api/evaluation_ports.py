@@ -95,6 +95,7 @@ class StoredEvaluationMaterial:
 @dataclass(frozen=True, slots=True)
 class StoredEvaluation:
     actor_id: str
+    workload_id: str
     idempotency_key: str
     request_digest: str
     candidate_digest: str
@@ -634,6 +635,7 @@ class EvaluationAuthorityTransactionPort(Protocol):
     def get_evaluation_receipt(
         self,
         actor_id: str,
+        workload_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None: ...
 
@@ -707,6 +709,7 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
     def load_receipt(
         self,
         actor_id: str,
+        workload_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None: ...
 

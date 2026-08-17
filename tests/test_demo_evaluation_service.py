@@ -33,7 +33,11 @@ from athena_context.api import (
     Wc009EvidenceClientAdapter,
 )
 from athena_context.api.authorization import authorize_role_grants
-from athena_context.api.domain import Permission, Supersession
+from athena_context.api.domain import (
+    Permission,
+    Supersession,
+    WorkloadGrantScope,
+)
 from athena_context.api.errors import (
     AuthorizationError,
     DemoEvaluationApprovalError,
@@ -131,6 +135,8 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     assert harness.store.publication_count == 1
     receipt = harness.store.load_receipt(PUBLISHER.actor_id, "wc013-success")
     assert receipt is not None
+    assert receipt.workload_id == harness.command.manifest_id
+    assert receipt.material.private_mcp_endpoint == PRIVATE_ENDPOINT
     assert receipt.candidate_digest.startswith("sha256:")
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
     assert result.publication.approval_decision_id == harness.approval.decision_id
@@ -1040,6 +1046,133 @@ def test_polymorphic_commit_clock_primitive_fails_before_insertion() -> None:
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+def test_temporal_subclass_same_uow_approval_revocation_rolls_back() -> None:
+    """A temporal callback runs before time sampling and cannot commit a revocation."""
+
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    original_approval = harness.approval_registry.resolve(
+        harness.approval.decision_id
+    )
+    assert original_approval is not None
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+    original_final_clock = harness.clock.now_epoch_milliseconds
+    final_clock_reads = 0
+    armed = False
+    revoked = False
+
+    def tracked_final_clock() -> int:
+        nonlocal final_clock_reads
+        final_clock_reads += 1
+        return original_final_clock()
+
+    harness.clock.now_epoch_milliseconds = tracked_final_clock  # type: ignore[method-assign]
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            class RevokingDateTime(datetime):
+                def astimezone(self, tz: object = None) -> datetime:
+                    nonlocal revoked
+                    if armed and not revoked:
+                        assert final_clock_reads == 0
+                        revoked = True
+                        current = (
+                            active_transaction
+                            .get_demo_evaluation_approval(
+                                original_approval.decision_id
+                            )
+                        )
+                        assert current is not None
+                        active_transaction.put_demo_evaluation_approval(
+                            current.model_copy(
+                                update={
+                                    "status": "revoked",
+                                    "revision": current.revision + 1,
+                                    "revoked_at": harness.clock.value,
+                                }
+                            ),
+                            expected_revision=current.revision,
+                        )
+                    return super().astimezone(tz)  # type: ignore[arg-type]
+
+            def insert_with_revoking_temporal_bound(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                def prepare(
+                    trusted_key: EvaluationTrustedKeyAuthority,
+                ) -> PreparedEvaluationArtifact:
+                    nonlocal armed
+                    prepared = artifact_preparation(trusted_key)
+                    original_bound = (
+                        prepared.temporal_validity.approval_expires_at
+                    )
+                    adversarial_bound = RevokingDateTime(
+                        original_bound.year,
+                        original_bound.month,
+                        original_bound.day,
+                        original_bound.hour,
+                        original_bound.minute,
+                        original_bound.second,
+                        original_bound.microsecond,
+                        tzinfo=original_bound.tzinfo or UTC,
+                        fold=original_bound.fold,
+                    )
+                    validity = replace(
+                        prepared.temporal_validity,
+                        approval_expires_at=adversarial_bound,
+                    )
+                    armed = True
+                    return replace(
+                        prepared,
+                        temporal_validity=validity,
+                    )
+
+                return original_insert(
+                    capability,
+                    condition,
+                    prepare,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                insert_with_revoking_temporal_bound
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = "wc013-temporal-same-uow-approval-revocation"
+    try:
+        with pytest.raises(DemoEvaluationApprovalError):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+        harness.clock.now_epoch_milliseconds = original_final_clock  # type: ignore[method-assign]
+
+    assert revoked is True
+    assert final_clock_reads == 0
+    assert (
+        harness.approval_registry.resolve(original_approval.decision_id)
+        == original_approval
+    )
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_collection_authority_subclass_cannot_spoof_foreign_endpoint() -> None:
     """Polymorphic equality cannot replace store-pinned WC-008 authority."""
 
@@ -1121,6 +1254,68 @@ def test_collection_authority_subclass_cannot_spoof_foreign_endpoint() -> None:
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_exact_foreign_collection_authority_cannot_set_persisted_endpoint() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    foreign = build_evaluation_collection_authority(
+        verified_deployment_configuration(
+            "https://forged-persisted-mcp.internal"
+        ),
+        trust_configuration(),
+        authorized_scope=harness.command.authorized_scope,
+    )
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def insert_with_foreign_collection_authority(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                return original_insert(
+                    capability,
+                    replace(
+                        condition,
+                        collection_authority=foreign,
+                    ),
+                    artifact_preparation,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                insert_with_foreign_collection_authority
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = "wc013-exact-foreign-collection-authority"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="canonical validation",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
@@ -2305,6 +2500,46 @@ def test_success_result_is_idempotent_before_any_repeat_collection_or_signing() 
     with pytest.raises(IdempotencyConflictError):
         harness.service.evaluate(PUBLISHER, "wc013-idempotent", changed)
     assert harness.transport.calls == 1
+    assert harness.store.publication_count == 1
+
+
+def test_receipt_lookup_rejects_authorized_foreign_workload_after_revocation() -> None:
+    harness = build_harness()
+    idempotency_key = "wc013-cross-workload-receipt"
+    result = harness.service.evaluate(
+        PUBLISHER,
+        idempotency_key,
+        harness.command,
+    )
+    original_workload = harness.command.manifest_id
+    foreign_workload = "wl-authorized-foreign-receipt"
+    harness.authorization.remove_grant(
+        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    )
+    harness.authorization.add_grant(
+        RoleGrant(
+            actor_id=PUBLISHER.actor_id,
+            role=Role.PUBLISHER,
+            scope=WorkloadGrantScope(workload_id=foreign_workload),
+        )
+    )
+
+    with pytest.raises(AuthorizationError):
+        harness.service.get_result(PUBLISHER, result.snapshot.snapshot_id)
+    with pytest.raises(
+        IdempotencyConflictError,
+        match="different workload",
+    ):
+        harness.context_resolver.service.load_demo_evaluation_receipt(
+            PUBLISHER,
+            idempotency_key,
+            manifest_id=foreign_workload,
+        )
+
+    assert original_workload not in foreign_workload
+    harness.authorization.add_grant(
+        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    )
     assert harness.store.publication_count == 1
 
 

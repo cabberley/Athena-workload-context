@@ -260,10 +260,12 @@ class TransactionEvaluationAuthorityUnitOfWork:
     def load_receipt(
         self,
         actor_id: str,
+        workload_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None:
         return self._evaluation_transaction.get_evaluation_receipt(
             actor_id,
+            workload_id,
             idempotency_key,
         )
 

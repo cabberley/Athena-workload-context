@@ -8,7 +8,12 @@ from athena_context.api import (
     VerifiedAuthentication,
     create_app,
 )
-from athena_context.api.domain import AuthenticationMethod
+from athena_context.api.domain import (
+    AuthenticationMethod,
+    Role,
+    RoleGrant,
+    WorkloadGrantScope,
+)
 from athena_context.api.errors import DemoEvaluationConfigurationError
 from wc013_support import (
     MCP_SERVICE_ACTOR,
@@ -100,6 +105,55 @@ def test_api_returns_snapshot_publication_record_and_exact_citations() -> None:
     assert replay.status_code == 201
     assert replay.json() == body
     assert harness.transport.calls == 1
+    assert harness.store.publication_count == 1
+
+
+def test_api_never_replays_cross_workload_receipt_after_access_revocation() -> None:
+    harness, client = _client()
+    idempotency_key = "wc013-http-cross-workload"
+    published = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+    assert published.status_code == 201
+    published_body = published.json()
+    original_workload = harness.command.manifest_id
+    foreign_workload = "wl-authorized-foreign-http"
+    harness.authorization.remove_grant(
+        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    )
+    harness.authorization.add_grant(
+        RoleGrant(
+            actor_id=PUBLISHER.actor_id,
+            role=Role.PUBLISHER,
+            scope=WorkloadGrantScope(workload_id=foreign_workload),
+        )
+    )
+
+    denied_artifact = client.get(
+        f"/v1/demo-evaluations/{published_body['snapshot']['snapshotId']}",
+        headers=_headers(PUBLISHER_TOKEN),
+    )
+    foreign_command = harness.command.model_copy(
+        update={"manifest_id": foreign_workload}
+    )
+    mismatched_receipt = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=foreign_command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert denied_artifact.status_code == 403
+    assert mismatched_receipt.status_code == 409
+    assert mismatched_receipt.json()["error"]["code"] == "idempotency_conflict"
+    response_text = mismatched_receipt.text
+    assert original_workload not in response_text
+    assert published_body["snapshot"]["snapshotId"] not in response_text
+    assert harness.transport.calls == 1
+    harness.authorization.add_grant(
+        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    )
     assert harness.store.publication_count == 1
 
 
