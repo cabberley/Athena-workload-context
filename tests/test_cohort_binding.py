@@ -24,6 +24,7 @@ from athena_context.binding import (
 from athena_context.contracts import (
     AthenaValidationError,
     CanonicalWorkloadManifest,
+    EvidenceItemRef,
     EvidenceSnapshot,
     ManifestSelector,
     ResourceEvidenceRecord,
@@ -34,6 +35,7 @@ from athena_context.contracts import (
     compute_response_envelope_digest,
     resolve_manifest_profile,
     sha256_hex,
+    validate_resolved_manifest_profile,
 )
 
 AS_OF = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
@@ -501,26 +503,91 @@ def test_proposal_boundary_rejects_profile_changed_after_resolution(
         propose_cohorts(profile, verified, as_of=AS_OF)
 
 
-def test_proposal_roles_and_selectors_are_detached_from_approved_profile() -> None:
-    _, verified = _verified_bundle()
+def test_proposal_models_are_detached_from_profile_and_snapshot() -> None:
+    bundle, verified = _verified_bundle()
     profile = _profile()
     original_digest = profile.resolved_profile_digest
+    original_profile_json = profile.canonical_json()
+    original_snapshot_json = bundle.canonical_snapshot.canonical_json()
+    original_snapshot_digests = (
+        bundle.canonical_snapshot.compatibility.artifact_digest,
+        bundle.canonical_snapshot.compatibility.semantic_digest,
+    )
     profile_worker = next(role for role in profile.roles if role.role_id == "worker")
     profile_selector = profile_worker.selectors[0]
 
     result = propose_cohorts(profile, verified, as_of=AS_OF)
     proposal_worker = _worker_proposal(result)
     proposal_selector = proposal_worker.role.selectors[0]
+    proposal_refs = [
+        ref
+        for evidence in proposal_worker.supporting_evidence
+        for ref in evidence.evidence_refs
+    ]
+    snapshot_ref_ids = {id(ref) for ref in bundle.canonical_snapshot.evidence_refs}
 
     assert proposal_worker.role is not profile_worker
     assert proposal_worker.role.selectors is not profile_worker.selectors
     assert proposal_selector is not profile_selector
+    assert proposal_worker.dissent
+    assert proposal_refs
+    assert all(isinstance(ref, EvidenceItemRef) for ref in proposal_refs)
+    assert not ({id(ref) for ref in proposal_refs} & snapshot_ref_ids)
+    assert len({id(ref) for ref in proposal_refs}) == len(proposal_refs)
+    assert (
+        proposal_worker.supporting_evidence[0].evidence_refs
+        is not proposal_worker.supporting_evidence[1].evidence_refs
+    )
 
     proposal_selector.prefix = "review-only-worker-"
+    proposal_worker.role.role_id = "review-only-worker"
+    proposal_refs[0].item_digest = "sha256:" + "9" * 64
+    proposal_worker.dissent[0].reason = "review-only dissent mutation"
+    proposal_worker.dissent[0].evidence_refs.append(proposal_refs[0])
+
+    def over_max_worker(payload: dict[str, Any]) -> None:
+        worker = next(
+            role for role in payload["roles"] if role["roleId"] == "worker"
+        )
+        worker["selectors"][0]["maxMatches"] = 1
+
+    rejected_profile = _profile(over_max_worker)
+    original_rejected_profile_json = rejected_profile.canonical_json()
+    rejected_worker = _worker_proposal(
+        propose_cohorts(rejected_profile, verified, as_of=AS_OF)
+    )
+    rejected_refs = [
+        ref
+        for candidate in rejected_worker.rejected_candidates
+        for ref in candidate.evidence_refs
+    ]
+    assert rejected_refs
+    assert not ({id(ref) for ref in rejected_refs} & snapshot_ref_ids)
+    assert len({id(ref) for ref in rejected_refs}) == len(rejected_refs)
+    rejected_refs[0].item_digest = "sha256:" + "8" * 64
+
     assert proposal_selector.prefix == "review-only-worker-"
     assert profile_selector.prefix == "athena-worker-"
     assert profile.resolved_profile_digest == original_digest
     assert profile.recompute_semantic_digest() == original_digest
+    assert profile.canonical_json() == original_profile_json
+    assert rejected_profile.canonical_json() == original_rejected_profile_json
+    assert bundle.canonical_snapshot.canonical_json() == original_snapshot_json
+    assert (
+        bundle.canonical_snapshot.compatibility.artifact_digest,
+        bundle.canonical_snapshot.compatibility.semantic_digest,
+    ) == original_snapshot_digests
+
+    validate_resolved_manifest_profile(profile, as_of=AS_OF)
+    validate_resolved_manifest_profile(rejected_profile, as_of=AS_OF)
+    EvidenceSnapshot.model_validate(
+        bundle.canonical_snapshot.model_dump(
+            mode="python", by_alias=True, exclude_none=False
+        )
+    )
+    assert _bundle_verifier(bundle)(bundle.canonical_snapshot, AS_OF) is (
+        bundle.canonical_snapshot
+    )
 
 
 def test_cross_tenant_same_subscription_and_resource_group_is_out_of_scope() -> None:

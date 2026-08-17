@@ -6,7 +6,13 @@ from pydantic import Field, field_validator, model_validator
 
 from athena_context.contracts.common import AthenaValidationError, normalize_nfc_text
 from athena_context.contracts.manifest import ManifestRole, ManifestSelector
-from athena_context.contracts.models import AthenaBaseModel, EvidenceItemRef, UtcDateTime
+from athena_context.contracts.models import (
+    AthenaBaseModel,
+    EvidenceGapRef,
+    EvidenceItemRef,
+    EvidenceReference,
+    UtcDateTime,
+)
 
 type ConfidenceBand = Literal["high", "medium", "low", "conflicting"]
 type ReviewDisposition = Literal["bulkHumanReview", "humanResolution"]
@@ -51,6 +57,21 @@ type RejectionReason = Literal[
     "overMaxMatches",
     "staleEvidence",
 ]
+
+
+def _detached_evidence_refs(
+    references: list[EvidenceReference],
+) -> list[EvidenceReference]:
+    detached: list[EvidenceReference] = []
+    for reference in references:
+        payload = reference.model_dump(mode="python", by_alias=True, exclude_none=False)
+        if isinstance(reference, EvidenceItemRef):
+            detached.append(EvidenceItemRef.model_validate(payload))
+        elif isinstance(reference, EvidenceGapRef):
+            detached.append(EvidenceGapRef.model_validate(payload))
+        else:
+            raise AthenaValidationError("unsupported proposal evidence reference variant")
+    return detached
 
 
 class SelectorEvaluation(AthenaBaseModel):
@@ -121,9 +142,17 @@ class SupportingEvidence(AthenaBaseModel):
     member_resource_ids: list[str] = Field(
         ..., alias="memberResourceIds", min_length=1, max_length=30000
     )
-    evidence_refs: list[EvidenceItemRef] = Field(
+    evidence_refs: list[EvidenceReference] = Field(
         ..., alias="evidenceRefs", min_length=1, max_length=30000
     )
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def detach_evidence_refs(
+        cls,
+        references: list[EvidenceReference],
+    ) -> list[EvidenceReference]:
+        return _detached_evidence_refs(references)
 
 
 class DissentingEvidence(AthenaBaseModel):
@@ -134,17 +163,33 @@ class DissentingEvidence(AthenaBaseModel):
         default=None, alias="observedValue", min_length=1, max_length=2000
     )
     reason: str = Field(..., min_length=1, max_length=500)
-    evidence_refs: list[EvidenceItemRef] = Field(
+    evidence_refs: list[EvidenceReference] = Field(
         default_factory=list, alias="evidenceRefs", max_length=100
     )
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def detach_evidence_refs(
+        cls,
+        references: list[EvidenceReference],
+    ) -> list[EvidenceReference]:
+        return _detached_evidence_refs(references)
 
 
 class RejectedCandidate(AthenaBaseModel):
     resource_id: str = Field(..., alias="resourceId", min_length=1, max_length=2048)
     reasons: list[RejectionReason] = Field(..., min_length=1, max_length=20)
-    evidence_refs: list[EvidenceItemRef] = Field(
+    evidence_refs: list[EvidenceReference] = Field(
         default_factory=list, alias="evidenceRefs", max_length=100
     )
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def detach_evidence_refs(
+        cls,
+        references: list[EvidenceReference],
+    ) -> list[EvidenceReference]:
+        return _detached_evidence_refs(references)
 
 
 class ProposalConflict(AthenaBaseModel):

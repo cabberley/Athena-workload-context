@@ -54,6 +54,7 @@ from athena_context.contracts.manifest import (
 from athena_context.contracts.models import (
     EvidenceGapRecord,
     EvidenceItemRef,
+    EvidenceReference,
     EvidenceResourceRef,
     EvidenceScope,
     EvidenceSnapshot,
@@ -206,9 +207,15 @@ def _proposal_scope(profile: ResolvedManifestProfile) -> ProposalScope:
     )
 
 
-def _unique_refs(refs: Iterable[EvidenceItemRef]) -> list[EvidenceItemRef]:
+def _detached_item_ref(ref: EvidenceItemRef) -> EvidenceReference:
+    return EvidenceItemRef.model_validate(
+        ref.model_dump(mode="python", by_alias=True, exclude_none=False)
+    )
+
+
+def _unique_refs(refs: Iterable[EvidenceItemRef]) -> list[EvidenceReference]:
     by_canonical = {ref.canonical_json(): ref for ref in refs}
-    return [by_canonical[key] for key in sorted(by_canonical)]
+    return [_detached_item_ref(by_canonical[key]) for key in sorted(by_canonical)]
 
 
 def _conflict(
@@ -750,7 +757,9 @@ def _support_and_dissent(
                             f"workloadRole={record.tags.workload_role}"
                         ),
                         reason="approved tags do not fully corroborate the proposed role",
-                        evidenceRefs=[index.resource_refs[resource_id]],
+                        evidenceRefs=[
+                            _detached_item_ref(index.resource_refs[resource_id])
+                        ],
                     )
                 )
 
@@ -824,7 +833,11 @@ def _confidence(
         return 0.0, "low"
     independent_source_sets: list[set[str]] = []
     for evidence in supporting:
-        source_set = {ref.item_digest for ref in evidence.evidence_refs}
+        source_set = {
+            ref.item_digest
+            for ref in evidence.evidence_refs
+            if isinstance(ref, EvidenceItemRef)
+        }
         if source_set and not any(
             source_set.intersection(existing) for existing in independent_source_sets
         ):
@@ -1095,7 +1108,9 @@ def propose_cohorts(
                         RejectedCandidate(
                             resourceId=resource_id,
                             reasons=sorted(reasons),
-                            evidenceRefs=[ref] if ref is not None else [],
+                            evidenceRefs=(
+                                [_detached_item_ref(ref)] if ref is not None else []
+                            ),
                         )
                     )
 
