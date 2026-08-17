@@ -1,10 +1,21 @@
 export type EnvironmentName = 'Production' | 'Development' | 'Training'
-export type ApprovalState = 'draft' | 'validation' | 'approved' | 'published'
 export type RelationshipKind = 'declared' | 'observed' | 'inferred' | 'exception'
+export type DraftState = 'draft' | 'validated' | 'in_review' | 'approved' | 'published' | 'superseded'
+export type AppRoute = 'overview' | 'catalogue' | 'manifest' | 'controls'
+export type ActorKind = 'human' | 'agent' | 'service'
+export type RoleName = 'proposer' | 'reviewer' | 'approver' | 'publisher' | 'reader' | 'auditor'
+
+export interface Actor {
+  actorId: string
+  kind: ActorKind
+  role: RoleName
+}
 
 export interface AuthState {
-  status: 'authenticated' | 'stubbed'
-  user: string
+  actorId: string
+  kind: ActorKind
+  role: RoleName
+  userLabel: string
   port: string
 }
 
@@ -57,6 +68,8 @@ export interface EvidenceItem {
 }
 
 export interface ManifestDraft {
+  manifestId: string
+  manifestVersion: string
   workloadName: string
   environment: EnvironmentName
   businessOwner: string
@@ -67,13 +80,69 @@ export interface ManifestDraft {
   riskAcceptances: RiskAcceptance[]
 }
 
-export interface ContextStudioSnapshot {
-  environment: EnvironmentName
+export interface ValidationRecord {
+  validatedBy: Actor
+  validatedAt: string
+  validatedRevision: number
+  manifestDigest: string
+}
+
+export interface ReviewSubmission {
+  submittedBy: Actor
+  submittedAt: string
+  submittedRevision: number
+  reason: string
+}
+
+export interface ApprovalDecision {
+  decisionId: string
+  approvedBy: Actor
+  approvedAt: string
+  approvedRevision: number
+  manifestVersion: string
+  manifestDigest: string
+  reason: string
+}
+
+export interface DraftRecord {
+  draftId: string
+  manifestId: string
+  state: DraftState
+  revision: number
+  manifest: ManifestDraft
+  manifestDigest: string
+  previousVersion: string | null
+  createdBy: Actor
+  createdAt: string
+  updatedBy: Actor
+  updatedAt: string
+  reason: string
+  validation: ValidationRecord | null
+  review: ReviewSubmission | null
+  approval: ApprovalDecision | null
+}
+
+export interface PublishedManifest {
+  manifestId: string
+  manifestVersion: string
+  manifestDigest: string
+  sourceDraftId: string
+  sourceDraftRevision: number
+  previousVersion: string | null
+  approval: ApprovalDecision
+  publishedBy: Actor
+  publishedAt: string
+  reason: string
+}
+
+export interface WorkloadContext {
+  workloadId: string
   auth: AuthState
+  environment: EnvironmentName
   evidenceSource: string
   confidence: number
   manifestVersion: string
-  approvalState: ApprovalState
+  approvalState: DraftState
   workloadCatalogue: CatalogItem[]
   comparison: ComparisonRow[]
   relationships: TopologyRelationship[]
@@ -82,4 +151,62 @@ export interface ContextStudioSnapshot {
   riskAcceptances: RiskAcceptance[]
   provenance: EvidenceItem[]
   validationMessages: string[]
+  draft: DraftRecord | null
+  published: PublishedManifest | null
 }
+
+export interface PublishRequest {
+  workloadId: string
+  draftId: string
+  manifestId: string
+  expectedRevision: number
+  expectedManifestVersion: string
+  expectedDigest: string
+  approvalId: string
+  reason: string
+}
+
+export interface ContextApiClientPort {
+  auth: AuthState
+  loadWorkloads: () => Promise<CatalogItem[]>
+  loadWorkloadContext: (workloadId: string) => Promise<WorkloadContext>
+  loadWorkloadSync: (workloadId: string) => WorkloadContext
+  reloadWorkload: (workloadId: string) => Promise<WorkloadContext>
+  createDraft: (
+    workloadId: string,
+    manifest: ManifestDraft,
+    reason: string,
+  ) => Promise<DraftRecord>
+  updateDraft: (request: {
+    draftId: string
+    expectedRevision: number
+    expectedManifestVersion: string
+    expectedDigest: string
+    replacementManifest: ManifestDraft
+    reason: string
+  }) => Promise<DraftRecord>
+  validateDraft: (request: {
+    draftId: string
+    expectedRevision: number
+    expectedManifestVersion: string
+    expectedDigest: string
+    reason: string
+  }) => Promise<DraftRecord>
+  submitForReview: (request: {
+    draftId: string
+    expectedRevision: number
+    expectedManifestVersion: string
+    expectedDigest: string
+    reason: string
+  }) => Promise<DraftRecord>
+  approveDraft: (request: {
+    draftId: string
+    expectedRevision: number
+    expectedManifestVersion: string
+    expectedDigest: string
+    reason: string
+  }) => Promise<DraftRecord>
+  publishDraft: (request: PublishRequest) => Promise<PublishedManifest>
+}
+
+export type ContextStudioSnapshot = WorkloadContext
