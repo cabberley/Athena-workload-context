@@ -28,9 +28,13 @@ mutate it.
   proposal union, snapshot, profile, source draft, and immutable candidate before invoking the
   WC-007 `ContextService` selector-only replacement inside the same storage transaction.
   The replacement materializes only a requested-profile local, complete role override. Generic
-  disjoint selector identities fail closed. Split/merge preview instead emits final guarded
+  resolution and ordinary draft replacement reject every disjoint selector identity, including
+  guarded conjunctions copied from a preview. Split/merge preview instead emits final guarded
   conjunctions whose inherited selector child proves narrowing and whose exact child binds the
-  reviewed cohort; the candidate is actor scoped and applied without post-approval transformation.
+  reviewed cohort. Only the decision transaction receives a typed in-process capability bound to
+  the authenticated actor, persisted decision, candidate digest, workload/profile, proposal set,
+  snapshot, and exact source/current/resulting draft state. The candidate is actor scoped and
+  applied without post-approval transformation; the capability is unavailable to generic PUT.
   It preserves role authority, never edits an ancestor or global role, and rejects candidates
   that cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.

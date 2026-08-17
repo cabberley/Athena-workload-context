@@ -6,6 +6,10 @@ from typing import TypeVar
 
 from pydantic import ValidationError
 
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionKind,
+    CohortDecisionSelectorCapability,
+)
 from athena_context.api.domain import (
     Actor,
     ActorKind,
@@ -52,10 +56,15 @@ from athena_context.api.ports import (
     ContextStorePort,
     ContextTransactionPort,
 )
-from athena_context.contracts.common import compute_artifact_digest
+from athena_context.contracts.common import (
+    AthenaValidationError,
+    compute_artifact_digest,
+)
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
+    _resolve_manifest_profile_for_cohort_decision,
     canonicalize_manifest_payload,
+    validate_manifest_selector_identity_inheritance,
 )
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
@@ -204,6 +213,9 @@ class ContextService:
         draft_id: str,
         command: ReplaceDraftCommand,
         occurred_at: datetime | None = None,
+        cohort_decision_capability: (
+            CohortDecisionSelectorCapability | None
+        ) = None,
     ) -> DraftRecord:
         """Apply WC-007 replacement rules inside a caller-owned atomic transaction."""
 
@@ -229,6 +241,15 @@ class ContextService:
             previous_version=current.previous_version,
         )
         now = self._now() if occurred_at is None else ensure_timestamp(occurred_at)
+        self._validate_replacement_profiles(
+            actor=actor,
+            current=current,
+            replacement=command.replacement_manifest,
+            replacement_digest=command.replacement_digest,
+            reason=command.reason,
+            as_of=now,
+            capability=cohort_decision_capability,
+        )
         replacement = current.model_copy(
             update={
                 "revision": current.revision + 1,
@@ -254,6 +275,63 @@ class ContextService:
             )
         )
         return replacement
+
+    @staticmethod
+    def _validate_replacement_profiles(
+        *,
+        actor: Actor,
+        current: DraftRecord,
+        replacement: CanonicalWorkloadManifest,
+        replacement_digest: str,
+        reason: str,
+        as_of: datetime,
+        capability: CohortDecisionSelectorCapability | None,
+    ) -> None:
+        try:
+            profile = next(iter(replacement.profiles.values()))
+            if capability is None:
+                validate_manifest_selector_identity_inheritance(
+                    replacement,
+                )
+                return
+            if (
+                capability.decision
+                not in {
+                    CohortDecisionKind.APPROVE,
+                    CohortDecisionKind.SPLIT,
+                    CohortDecisionKind.MERGE,
+                }
+                or capability.actor != actor
+                or capability.decided_at != as_of
+                or capability.manifest_id != current.manifest_id
+                or capability.manifest_version
+                != replacement.manifest_version
+                or capability.current_draft.draft_id != current.draft_id
+                or capability.current_draft.revision != current.revision
+                or capability.current_draft.manifest_digest
+                != current.manifest_digest
+                or capability.source_draft.draft_id != current.draft_id
+                or capability.source_draft.revision > current.revision
+                or capability.replacement_manifest_digest
+                != replacement_digest
+                or replacement.compatibility.artifact_digest
+                != capability.replacement_manifest_digest
+                or capability.decision_id not in reason
+            ):
+                raise AthenaValidationError(
+                    "cohort selector capability does not match the exact "
+                    "authenticated draft mutation"
+                )
+            _resolve_manifest_profile_for_cohort_decision(
+                replacement,
+                profile.profile_id,
+                as_of=as_of,
+                selector_capability=capability,
+            )
+        except (AthenaValidationError, StopIteration) as exc:
+            raise ManifestValidationError(
+                "replacement manifest profile inheritance is not valid"
+            ) from exc
 
     def validate_draft(
         self,

@@ -11,6 +11,7 @@ from athena_context.api.cohort_decision_domain import (
     CohortDecisionReceipt,
     CohortDecisionRecord,
     CohortDecisionRequest,
+    CohortDecisionSelectorCapability,
     CohortProposalSetVersion,
 )
 from athena_context.api.cohort_decision_ports import (
@@ -67,6 +68,7 @@ from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
     ManifestRole,
     ResolvedManifestProfile,
+    _resolve_manifest_profile_for_cohort_decision,
     canonicalize_manifest_payload,
     is_guarded_selector_replacement_narrower,
     resolve_manifest_profile,
@@ -215,20 +217,24 @@ class CohortDecisionService:
             )
             applied: DraftRecord | None = None
             candidate_digest: str | None = None
+            selector_capability: CohortDecisionSelectorCapability | None = None
             if candidate is not None:
-                replacement = self._selector_only_replacement(
-                    current,
-                    request,
-                    candidate,
-                    proposals,
-                    decided_at=decided_at,
-                )
                 candidate_digest = compute_artifact_digest(
                     candidate.model_dump(
                         mode="json",
                         by_alias=True,
                         exclude_none=True,
                     )
+                )
+                replacement, selector_capability = self._selector_only_replacement(
+                    current,
+                    request,
+                    candidate,
+                    proposals,
+                    actor=actor,
+                    decision_id=decision_id,
+                    candidate_digest=candidate_digest,
+                    decided_at=decided_at,
                 )
                 reason = (
                     f"Applied cohort {request.action.value} decision {decision_id}; "
@@ -247,6 +253,7 @@ class CohortDecisionService:
                         reason=reason,
                     ),
                     occurred_at=decided_at,
+                    cohort_decision_capability=selector_capability,
                 )
 
             audit_draft = applied or current
@@ -282,6 +289,17 @@ class CohortDecisionService:
                 audit_id=audit_event.event_id,
             )
             tx.put_cohort_decision(record)
+            if selector_capability is not None:
+                stored = tx.get_cohort_decision(
+                    request.manifest_id,
+                    decision_id,
+                )
+                self._require_persisted_capability_binding(
+                    selector_capability,
+                    stored,
+                    current=current,
+                    applied=applied,
+                )
             tx.put_cohort_decision_receipt(
                 CohortDecisionReceipt(
                     actor_id=actor.actor_id,
@@ -781,8 +799,14 @@ class CohortDecisionService:
         candidate: CohortReviewCandidate,
         proposals: list[CohortProposal],
         *,
+        actor: Actor,
+        decision_id: str,
+        candidate_digest: str,
         decided_at: datetime,
-    ) -> CanonicalWorkloadManifest:
+    ) -> tuple[
+        CanonicalWorkloadManifest,
+        CohortDecisionSelectorCapability | None,
+    ]:
         payload = current.manifest.model_dump(
             mode="json",
             by_alias=True,
@@ -804,28 +828,7 @@ class CohortDecisionService:
         profile_key, _profile = profile_match
         update = candidate.role_updates[0]
         target = normalized_identifier(update.role.role_id)
-        before_profiles = CohortDecisionService._resolve_all_profiles(
-            current.manifest,
-            as_of=decided_at,
-        )
-        target_before = before_profiles.get(requested_profile)
         source_role = proposals[0].role
-        if target_before is None:
-            raise CohortContractError(
-                "requested profile changed before selector materialization"
-            )
-        target_before_role = next(
-            (
-                role
-                for role in target_before.roles
-                if normalized_identifier(role.role_id) == target
-            ),
-            None,
-        )
-        if target_before_role != source_role:
-            raise CohortContractError(
-                "requested role changed outside this disjoint decision apply chain"
-            )
         applied_role = CohortDecisionService._materialize_local_role_override(
             update.role,
             baseline=source_role,
@@ -850,9 +853,94 @@ class CohortDecisionService:
             replacement = CanonicalWorkloadManifest.model_validate(
                 canonicalize_manifest_payload(payload)
             )
+            selector_capability = (
+                CohortDecisionSelectorCapability(
+                    decision_id=decision_id,
+                    decision=request.action,
+                    decided_at=decided_at,
+                    actor=actor,
+                    candidate_id=candidate.candidate_id,
+                    candidate_digest=candidate_digest,
+                    manifest_id=request.manifest_id,
+                    manifest_version=request.manifest_version,
+                    profile_id=request.profile_id,
+                    resolved_profile_digest=request.scope.resolved_profile_digest,
+                    source_draft=CohortDraftBinding(
+                        draftId=request.draft_id,
+                        revision=request.expected_revision,
+                        manifestDigest=request.expected_digest,
+                    ),
+                    current_draft=CohortDraftBinding(
+                        draftId=current.draft_id,
+                        revision=current.revision,
+                        manifestDigest=current.manifest_digest,
+                    ),
+                    proposal_ids=tuple(request.proposal_ids),
+                    proposal_set_digest=request.proposal_set_digest,
+                    snapshot_artifact_digest=request.snapshot_artifact_digest,
+                    target_role_id=update.role.role_id,
+                    inherited_role_digest=compute_artifact_digest(
+                        source_role.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
+                    ),
+                    replacement_role_digest=compute_artifact_digest(
+                        applied_role.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
+                    ),
+                    retained_replacement_role_digests=tuple(
+                        sorted(
+                            (
+                                normalized_identifier(profile.profile_id),
+                                normalized_identifier(role.role_id),
+                                compute_artifact_digest(
+                                    role.model_dump(
+                                        mode="json",
+                                        by_alias=True,
+                                        exclude_none=True,
+                                    )
+                                ),
+                            )
+                            for profile in current.manifest.profiles.values()
+                            for role in profile.roles
+                        )
+                    ),
+                    replacement_manifest_digest=(
+                        replacement.compatibility.artifact_digest
+                    ),
+                )
+            )
+            before_profiles = CohortDecisionService._resolve_all_profiles(
+                current.manifest,
+                as_of=decided_at,
+                selector_capability=selector_capability,
+            )
+            target_before = before_profiles.get(requested_profile)
+            if target_before is None:
+                raise CohortContractError(
+                    "requested profile changed before selector materialization"
+                )
+            target_before_role = next(
+                (
+                    role
+                    for role in target_before.roles
+                    if normalized_identifier(role.role_id) == target
+                ),
+                None,
+            )
+            if target_before_role != source_role:
+                raise CohortContractError(
+                    "requested role changed outside this disjoint decision apply chain"
+                )
             after_profiles = CohortDecisionService._resolve_all_profiles(
                 replacement,
                 as_of=decided_at,
+                selector_capability=selector_capability,
             )
         except (AthenaValidationError, ValidationError, ValueError) as exc:
             raise CohortContractError(
@@ -926,22 +1014,78 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate attempted to mutate non-role profile metadata"
             )
-        return replacement
+        return replacement, selector_capability
 
     @staticmethod
     def _resolve_all_profiles(
         manifest: CanonicalWorkloadManifest,
         *,
         as_of: datetime,
+        selector_capability: CohortDecisionSelectorCapability | None = None,
     ) -> dict[str, ResolvedManifestProfile]:
         return {
-            normalized_identifier(profile.profile_id): resolve_manifest_profile(
-                manifest,
-                profile.profile_id,
-                as_of=as_of,
+            normalized_identifier(profile.profile_id): (
+                resolve_manifest_profile(
+                    manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                )
+                if selector_capability is None
+                else _resolve_manifest_profile_for_cohort_decision(
+                    manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                    selector_capability=selector_capability,
+                )
             )
             for profile in manifest.profiles.values()
         }
+
+    @staticmethod
+    def _require_persisted_capability_binding(
+        capability: CohortDecisionSelectorCapability,
+        record: CohortDecisionRecord | None,
+        *,
+        current: DraftRecord,
+        applied: DraftRecord | None,
+    ) -> None:
+        if (
+            record is None
+            or applied is None
+            or record.decision_id != capability.decision_id
+            or record.decision is not capability.decision
+            or record.decided_at != capability.decided_at
+            or record.decided_by != capability.actor
+            or record.candidate_id != capability.candidate_id
+            or record.candidate_digest != capability.candidate_digest
+            or record.manifest_id != capability.manifest_id
+            or record.manifest_version != capability.manifest_version
+            or normalized_identifier(record.profile_id)
+            != normalized_identifier(capability.profile_id)
+            or record.resolved_profile_digest
+            != capability.resolved_profile_digest
+            or record.source_draft != capability.source_draft
+            or tuple(record.source_proposal_ids) != capability.proposal_ids
+            or record.proposal_set_digest != capability.proposal_set_digest
+            or record.snapshot.artifact_digest
+            != capability.snapshot_artifact_digest
+            or capability.target_role_id not in record.source_role_refs
+            or capability.current_draft.draft_id != current.draft_id
+            or capability.current_draft.revision != current.revision
+            or capability.current_draft.manifest_digest
+            != current.manifest_digest
+            or record.applied_draft is None
+            or record.applied_draft.draft_id != applied.draft_id
+            or record.applied_draft.revision != current.revision + 1
+            or record.applied_draft.manifest_digest
+            != capability.replacement_manifest_digest
+            or applied.manifest_digest
+            != capability.replacement_manifest_digest
+        ):
+            raise PersistenceConflictError(
+                "cohort selector capability is not bound to its exact "
+                "persisted decision and atomic draft result"
+            )
 
     @staticmethod
     def _materialize_local_role_override(

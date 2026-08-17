@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -10,10 +12,18 @@ from athena_context.api.cohort_domain import (
     CohortReviewCandidate,
     ProfileType,
     canonical_proposal_ids,
+    normalized_identifier,
 )
 from athena_context.api.domain import Actor, ApiModel, WorkloadIdentifier
 from athena_context.binding.domain import ProposalScope, ProposalSnapshot
-from athena_context.contracts.common import normalize_nfc_text
+from athena_context.contracts.common import (
+    compute_artifact_digest,
+    normalize_nfc_text,
+)
+from athena_context.contracts.manifest import (
+    ManifestRole,
+    is_guarded_selector_replacement_narrower,
+)
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
@@ -25,6 +35,94 @@ class CohortDecisionKind(StrEnum):
     REJECT = "reject"
     SPLIT = "split"
     MERGE = "merge"
+
+
+@dataclass(frozen=True, slots=True)
+class CohortDecisionSelectorCapability:
+    """In-process authority for one exact, atomically persisted decision apply."""
+
+    decision_id: str
+    decision: CohortDecisionKind
+    decided_at: datetime
+    actor: Actor
+    candidate_id: str
+    candidate_digest: str
+    manifest_id: str
+    manifest_version: str
+    profile_id: str
+    resolved_profile_digest: str
+    source_draft: CohortDraftBinding
+    current_draft: CohortDraftBinding
+    proposal_ids: tuple[str, ...]
+    proposal_set_digest: str
+    snapshot_artifact_digest: str
+    target_role_id: str
+    inherited_role_digest: str
+    replacement_role_digest: str
+    retained_replacement_role_digests: tuple[tuple[str, str, str], ...]
+    replacement_manifest_digest: str
+
+    def permits_selector_identity_replacement(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str,
+        profile_id: str,
+        inherited_role: ManifestRole,
+        replacement_role: ManifestRole,
+    ) -> bool:
+        """Authorize only the exact guarded selectors reviewed by one actor."""
+
+        inherited_digest = compute_artifact_digest(
+            inherited_role.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        replacement_digest = compute_artifact_digest(
+            replacement_role.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        exact_candidate = (
+            self.decision
+            in {
+                CohortDecisionKind.SPLIT,
+                CohortDecisionKind.MERGE,
+            }
+            and normalized_identifier(inherited_role.role_id)
+            == normalized_identifier(self.target_role_id)
+            and normalized_identifier(replacement_role.role_id)
+            == normalized_identifier(self.target_role_id)
+            and inherited_digest == self.inherited_role_digest
+            and replacement_digest == self.replacement_role_digest
+        )
+        retained_from_current_draft = (
+            normalized_identifier(profile_id),
+            normalized_identifier(replacement_role.role_id),
+            replacement_digest,
+        ) in self.retained_replacement_role_digests
+        return (
+            self.decision
+            in {
+                CohortDecisionKind.APPROVE,
+                CohortDecisionKind.SPLIT,
+                CohortDecisionKind.MERGE,
+            }
+            and normalized_identifier(manifest_id)
+            == normalized_identifier(self.manifest_id)
+            and manifest_version == self.manifest_version
+            and normalized_identifier(profile_id)
+            == normalized_identifier(self.profile_id)
+            and (exact_candidate or retained_from_current_draft)
+            and is_guarded_selector_replacement_narrower(
+                inherited_role.selectors,
+                replacement_role.selectors,
+            )
+        )
 
 
 class CohortDecisionRequest(ApiModel):
@@ -326,6 +424,7 @@ __all__ = [
     "CohortDecisionRecord",
     "CohortDecisionRequest",
     "CohortDecisionResponse",
+    "CohortDecisionSelectorCapability",
     "CohortProposalSetVersion",
     "decision_response",
 ]

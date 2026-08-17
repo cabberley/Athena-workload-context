@@ -1745,8 +1745,33 @@ def test_direct_selector_control_and_applicability_weakening_fail_closed() -> No
             "resourceIds": [f"{RESOURCE_PREFIX}athena-worker-001"],
             "maxMatches": 1,
         },
+        {
+            "selectorType": "compositeAll",
+            "selectorId": "replacement-guarded",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "replacement-guard",
+                    "prefix": "athena-worker-",
+                    "maxMatches": 20,
+                },
+                {
+                    "selectorType": "resourceIdList",
+                    "selectorId": "replacement-exact",
+                    "resourceIds": [
+                        f"{RESOURCE_PREFIX}athena-worker-001"
+                    ],
+                    "maxMatches": 1,
+                },
+            ],
+            "maxMatches": 1,
+        },
     ],
-    ids=["broadening", "unguarded-new-identity"],
+    ids=[
+        "broadening",
+        "unguarded-new-identity",
+        "guarded-new-identity",
+    ],
 )
 def test_generic_disjoint_selector_replacement_fails_closed(
     replacement_selector: dict[str, object],
@@ -1760,7 +1785,7 @@ def test_generic_disjoint_selector_replacement_fails_closed(
 
     with pytest.raises(
         AthenaValidationError,
-        match="not a provably narrower guarded replacement",
+        match="selector identities are immutable",
     ):
         resolve_manifest_profile(
             CanonicalWorkloadManifest.model_validate(payload),

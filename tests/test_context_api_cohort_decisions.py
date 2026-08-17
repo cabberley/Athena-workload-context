@@ -5,6 +5,7 @@ from datetime import timedelta
 from types import TracebackType
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 import athena_context.fixtures as fixture_factory
@@ -19,6 +20,7 @@ from athena_context.api.domain import ReplaceDraftCommand
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
 from athena_context.contracts import (
+    AthenaValidationError,
     CanonicalWorkloadManifest,
     canonicalize_manifest_payload,
     compute_artifact_digest,
@@ -466,6 +468,88 @@ def test_reject_is_durable_idempotent_and_permanently_blocks_apply() -> None:
         audit = tx.list_audit(manifest_id=harness.manifest.manifest_id)
         assert audit[-1].action == "cohort_decision_recorded"
         assert first.json()["decisionId"] in audit[-1].reason
+
+
+def test_rejected_split_candidate_cannot_bypass_decision_api_with_generic_put() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-rejected-put-preview"),
+    )
+    assert preview.status_code == 200, preview.text
+
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject this exact split proposal before generic PUT.",
+        ),
+        "wc-034-rejected-before-generic-put",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    local_roles = payload["profiles"]["production"]["roles"]
+    local_roles[:] = [
+        role
+        for role in local_roles
+        if role["roleId"] != candidate_role["roleId"]
+    ]
+    local_roles.append(candidate_role)
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    command = ReplaceDraftCommand(
+        expected_revision=harness.draft_revision,
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=harness.draft_digest,
+        replacement_manifest=replacement,
+        replacement_digest=replacement.compatibility.artifact_digest,
+        reason="Attempt rejected cohort selectors through ordinary draft PUT",
+    )
+    bypass = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-rejected-candidate-generic-put",
+        ),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert bypass.status_code == 422, bypass.text
+    assert bypass.json()["error"]["code"] == "manifest_validation_failed"
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == 1
+    assert draft.manifest == harness.manifest
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit = tx.list_audit(manifest_id=harness.manifest.manifest_id)
+    assert len(decisions) == 1
+    assert decisions[0].decision.value == "reject"
+    assert all(event.action.value != "draft_replaced" for event in audit)
 
 
 def test_reject_survives_proposal_cache_regeneration_at_a_later_time() -> None:
@@ -918,14 +1002,6 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
     split = _build_harness()
     split_batch = _load(split)
     split_proposal = _proposal(split_batch, require_multiple_members=True)
-    split_before = {
-        profile_id: resolve_manifest_profile(
-            split.manifest,
-            profile_id,
-            as_of=split.clock.now(),
-        )
-        for profile_id in ("production", "development", "training")
-    }
     split_preview_body = _preview_body(
         split,
         split_batch,
@@ -976,17 +1052,18 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
     split_draft = split.lifecycle.get_draft(HUMAN, split.draft_id)
     assert split_draft.revision == 2
     assert split_draft.manifest.roles == split.manifest.roles
-    split_after = {
-        profile_id: resolve_manifest_profile(
+    with pytest.raises(
+        AthenaValidationError,
+        match="selector identities are immutable",
+    ):
+        resolve_manifest_profile(
             split_draft.manifest,
-            profile_id,
+            "production",
             as_of=split.clock.now(),
         )
-        for profile_id in ("production", "development", "training")
-    }
     split_role = next(
         role
-        for role in split_after["production"].roles
+        for role in split_draft.manifest.profiles["production"].roles
         if role.role_id == split_proposal["role"]["roleId"]
     )
     assert split_role.model_dump(
@@ -994,20 +1071,10 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
         by_alias=True,
         exclude_none=True,
     ) == split_preview.json()["roleUpdates"][0]["role"]
-    split_before_roles = {
-        role.role_id: role for role in split_before["production"].roles
-    }
-    split_after_roles = {
-        role.role_id: role for role in split_after["production"].roles
-    }
-    assert set(split_after_roles) == set(split_before_roles)
-    assert all(
-        split_after_roles[role_id] == role
-        for role_id, role in split_before_roles.items()
-        if role_id != split_role.role_id
-    )
     for profile_id in ("development", "training"):
-        assert split_after[profile_id] == split_before[profile_id]
+        assert split_draft.manifest.profiles[profile_id] == (
+            split.manifest.profiles[profile_id]
+        )
 
     merge = _build_harness()
     binding = merge.register_profile("production")
@@ -1088,14 +1155,18 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
     merge_draft = merge.lifecycle.get_draft(HUMAN, merge.draft_id)
     assert merge_draft.revision == 2
     assert merge_draft.manifest.roles == merge.manifest.roles
-    merge_profile = resolve_manifest_profile(
-        merge_draft.manifest,
-        "production",
-        as_of=merge.clock.now(),
-    )
+    with pytest.raises(
+        AthenaValidationError,
+        match="selector identities are immutable",
+    ):
+        resolve_manifest_profile(
+            merge_draft.manifest,
+            "production",
+            as_of=merge.clock.now(),
+        )
     merge_role = next(
         role
-        for role in merge_profile.roles
+        for role in merge_draft.manifest.profiles["production"].roles
         if role.role_id == merged_wire["proposals"][0]["role"]["roleId"]
     )
     assert merge_role.model_dump(
