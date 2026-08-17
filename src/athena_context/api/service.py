@@ -177,6 +177,10 @@ class ContextService:
                 previous_version=command.previous_version,
             )
             now = self._now()
+            self._validate_generic_manifest_profiles(
+                command.manifest,
+                as_of=now,
+            )
             selector_baseline = DraftSelectorBaseline.capture(
                 draft_id=command.draft_id,
                 manifest=command.manifest,
@@ -376,8 +380,9 @@ class ContextService:
                     current.manifest,
                     replacement,
                 )
-                validate_manifest_selector_identity_inheritance(
+                ContextService._validate_generic_manifest_profiles(
                     replacement,
+                    as_of=as_of,
                 )
                 return
             for profile in replacement.profiles.values():
@@ -390,6 +395,27 @@ class ContextService:
         except (AthenaValidationError, StopIteration) as exc:
             raise ManifestValidationError(
                 "replacement manifest profile inheritance is not valid"
+            ) from exc
+
+    @staticmethod
+    def _validate_generic_manifest_profiles(
+        manifest: CanonicalWorkloadManifest,
+        *,
+        as_of: datetime,
+    ) -> None:
+        """Resolve every profile without cohort authority before mutation."""
+
+        try:
+            validate_manifest_selector_identity_inheritance(manifest)
+            for profile in manifest.profiles.values():
+                resolve_manifest_profile(
+                    manifest,
+                    profile.profile_id,
+                    as_of=as_of,
+                )
+        except (AthenaValidationError, StopIteration) as exc:
+            raise ManifestValidationError(
+                "the draft manifest profile inheritance is not valid"
             ) from exc
 
     @staticmethod

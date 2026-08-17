@@ -47,7 +47,10 @@ mutate it.
   semantic digest, normalized role identity, and global/profile location against that baseline
   plus exact persisted apply provenance. Removal/re-addition, role rename, profile/global
   movement, same-ID variant changes, and fresh-draft/version laundering therefore cannot turn a
-  rejected or merely proposed candidate into a new baseline. Non-selector edits remain legal.
+  rejected or merely proposed candidate into a new baseline. Create and ordinary replacement
+  resolve every profile before any baseline, draft, audit, or receipt write. A selector-preserving
+  replacement after an approved decision recovers only persisted apply provenance, so unrelated
+  non-selector edits remain legal without accepting caller-supplied authority.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity

@@ -11,6 +11,7 @@ from athena_context.api.domain import (
     CreateDraftCommand,
     DraftState,
     PublishCommand,
+    ReplaceDraftCommand,
     TransitionCommand,
     ValidationRecord,
     VerifiedAuthentication,
@@ -88,6 +89,20 @@ def _invalid_inherited_selector_manifest(
     replacement = deepcopy(worker)
     replacement["selectors"][0]["selectorId"] = "arbitrary-inherited-selector"
     payload["profiles"]["production"]["roles"] = [replacement]
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+
+
+def _unresolved_profile_manifest(
+    base: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = base.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["roles"][0]["ownerRef"] = "missing-synthetic-owner"
     return CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
@@ -290,9 +305,9 @@ def test_http_digest_failure_is_typed() -> None:
     assert digest_response.json()["error"]["code"] == "digest_mismatch"
 
 
-def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -> None:
+def test_http_create_resolves_every_profile_without_side_effects() -> None:
     store = InMemoryContextStore()
-    service, client = _client(store=store)
+    _, client = _client(store=store)
     manifest = _invalid_inherited_selector_manifest(canonical_manifest())
     create = CreateDraftCommand(
         draft_id="invalid-inheritance-workflow",
@@ -305,23 +320,88 @@ def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -
         headers=_headers(AGENT.actor_id, "invalid-inheritance-create"),
         json=create.model_dump(mode="json", by_alias=True, exclude_none=True),
     )
-    assert created.status_code == 201, created.text
-    initial = service.get_draft(AGENT, create.draft_id)
+
+    assert created.status_code == 422, created.text
+    assert created.json()["error"]["code"] == "manifest_validation_failed"
     with store.transaction() as tx:
+        assert tx.get_draft(create.draft_id) is None
+        assert tx.get_draft_selector_baseline(create.draft_id) is None
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == []
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-create",
+        ) is None
+
+
+def test_http_put_resolves_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-profile-put",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    command = ReplaceDraftCommand(
+        expected_revision=initial.revision,
+        expected_manifest_version=initial.manifest.manifest_version,
+        expected_digest=initial.manifest_digest,
+        replacement_manifest=manifest,
+        replacement_digest=manifest.compatibility.artifact_digest,
+        reason="Reject an unresolved profile before ordinary replacement",
+    )
+    with store.transaction() as tx:
+        audit_before = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    response = client.put(
+        f"/v1/drafts/{initial.draft_id}",
+        headers=_headers(AGENT.actor_id, "invalid-profile-put"),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == initial
+    with store.transaction() as tx:
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
+        assert tx.get_receipt(AGENT.actor_id, "invalid-profile-put") is None
+
+
+def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-inheritance-workflow",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    tampered = initial.model_copy(
+        update={
+            "manifest": manifest,
+            "manifest_digest": manifest.compatibility.artifact_digest,
+        }
+    )
+    with store.transaction() as tx:
+        tx.put_draft(tampered, expected_revision=initial.revision)
         audit_before_validate = tx.list_audit(manifest_id=manifest.manifest_id)
 
     validate = client.post(
-        f"/v1/drafts/{create.draft_id}/validate",
+        f"/v1/drafts/{initial.draft_id}/validate",
         headers=_headers(AGENT.actor_id, "invalid-inheritance-validate"),
         json=transition(
-            initial,
+            tampered,
             "Reject unresolved selector inheritance during validation",
         ).model_dump(mode="json"),
     )
 
     assert validate.status_code == 422, validate.text
     assert validate.json()["error"]["code"] == "manifest_validation_failed"
-    assert service.get_draft(AGENT, create.draft_id) == initial
+    assert service.get_draft(AGENT, initial.draft_id) == tampered
     with store.transaction() as tx:
         assert tx.list_audit(
             manifest_id=manifest.manifest_id
@@ -330,7 +410,7 @@ def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -
             AGENT.actor_id,
             "invalid-inheritance-validate",
         ) is None
-        current = tx.get_draft(create.draft_id)
+        current = tx.get_draft(initial.draft_id)
         assert current is not None
         previously_validated = current.model_copy(
             update={
@@ -349,7 +429,7 @@ def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -
         audit_before_submit = tx.list_audit(manifest_id=manifest.manifest_id)
 
     submit = client.post(
-        f"/v1/drafts/{create.draft_id}/submit",
+        f"/v1/drafts/{initial.draft_id}/submit",
         headers=_headers(AGENT.actor_id, "invalid-inheritance-submit"),
         json=transition(
             previously_validated,
@@ -359,7 +439,7 @@ def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -
 
     assert submit.status_code == 422, submit.text
     assert submit.json()["error"]["code"] == "manifest_validation_failed"
-    assert service.get_draft(AGENT, create.draft_id) == previously_validated
+    assert service.get_draft(AGENT, initial.draft_id) == previously_validated
     with store.transaction() as tx:
         assert tx.list_audit(
             manifest_id=manifest.manifest_id
@@ -385,7 +465,7 @@ def test_http_publish_rechecks_profile_resolution_without_side_effects() -> None
     assert approved.review is not None
     assert approved.publication_candidate is not None
     assert approved.approval is not None
-    manifest = _invalid_inherited_selector_manifest(approved.manifest)
+    manifest = _unresolved_profile_manifest(approved.manifest)
     digest = manifest.compatibility.artifact_digest
     tampered = approved.model_copy(
         update={

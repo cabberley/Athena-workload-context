@@ -659,6 +659,7 @@ def test_rejected_split_candidate_cannot_become_global_role_with_generic_put() -
         "same-id-new-semantics",
         "move-to-other-profile",
         "move-to-other-role",
+        "copy-to-new-role",
     ],
 )
 def test_rejected_selectors_cannot_change_immutable_provenance(
@@ -729,13 +730,17 @@ def test_rejected_selectors_cannot_change_immutable_provenance(
             if role["roleId"] != target_role_id
         ]
         development_roles.append(candidate_role)
-    else:
+    elif attack == "move-to-other-role":
         other_role = next(
             role
             for role in payload["roles"]
             if role["roleId"] != target_role_id
         )
         other_role["selectors"] = candidate_role["selectors"]
+    else:
+        copied_role = deepcopy(candidate_role)
+        copied_role["roleId"] = "rejected-selector-copy"
+        payload["roles"].append(copied_role)
     replacement = CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
@@ -767,9 +772,10 @@ def test_rejected_selectors_cannot_change_immutable_provenance(
 
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "manifest_validation_failed"
-    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id).manifest == (
-        harness.manifest
-    )
+    unchanged = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert unchanged.revision == harness.draft_revision
+    assert unchanged.manifest_digest == harness.draft_digest
+    assert unchanged.manifest == harness.manifest
     with harness.store.transaction() as tx:
         assert tx.list_audit(
             manifest_id=harness.manifest.manifest_id
@@ -1820,7 +1826,7 @@ def test_persisted_split_authority_survives_validate_and_submit_rechecks() -> No
     assert decisions[0].apply_authorization.status == "approved"
 
 
-def test_approved_selectors_survive_legal_non_selector_replacement() -> None:
+def test_display_name_only_put_after_approved_split_preserves_selectors() -> None:
     harness = _build_harness()
     batch = _load(harness)
     proposal = _proposal(batch, require_multiple_members=True)
@@ -1880,6 +1886,9 @@ def test_approved_selectors_survive_legal_non_selector_replacement() -> None:
     )
     assert replaced.status_code == 200, replaced.text
     updated = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert updated.manifest.workload.display_name == (
+        replacement.workload.display_name
+    )
     assert manifest_selector_provenance(updated.manifest) == (
         manifest_selector_provenance(current.manifest)
     )
