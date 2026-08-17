@@ -14,6 +14,7 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortBatchCacheKey,
     CohortEvidenceBinding,
@@ -88,6 +89,7 @@ class Harness:
     store: InMemoryContextStore
     lifecycle: ContextService
     cohorts: CohortProposalService
+    decisions: CohortDecisionService
     snapshots: InMemoryEvidenceSnapshotRepository
     persistence: InMemoryCohortPersistence
     authorization: RoleBasedAuthorization
@@ -208,6 +210,14 @@ def _build_harness(
         proposal_cache=persistence,
         preview_receipts=persistence,
     )
+    decisions = CohortDecisionService(
+        store=store,
+        authorization=authorization,
+        clock=clock,
+        context_service=lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=persistence,
+    )
     identities = {
         TOKENS[actor.actor_id]: _verified(actor)
         for actor in (HUMAN, OUTSIDER, WILDCARD, AGENT)
@@ -217,6 +227,7 @@ def _build_harness(
             service=lifecycle,
             authentication=StaticTestAuthenticator(identities),
             cohort_service=cohorts,
+            cohort_decision_service=decisions,
         )
     )
     harness = Harness(
@@ -226,6 +237,7 @@ def _build_harness(
         store=store,
         lifecycle=lifecycle,
         cohorts=cohorts,
+        decisions=decisions,
         snapshots=snapshots,
         persistence=persistence,
         authorization=authorization,
@@ -771,6 +783,14 @@ def _synthetic_merge_batch(
         proposal_cache=fresh_persistence,
         preview_receipts=fresh_persistence,
     )
+    harness.decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=harness.cohorts,
+        candidate_repository=fresh_persistence,
+    )
     harness.client = TestClient(
         create_app(
             service=harness.lifecycle,
@@ -778,6 +798,7 @@ def _synthetic_merge_batch(
                 {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
             ),
             cohort_service=harness.cohorts,
+            cohort_decision_service=harness.decisions,
         )
     )
     return merged

@@ -89,3 +89,11 @@ class CohortBoundaryError(ContextApiError):
 
 class CohortContractError(ContextApiError):
     code = "cohort_contract_invalid"
+
+
+class CohortDecisionConflictError(ContextApiError):
+    code = "cohort_decision_conflict"
+
+
+class RejectedProposalSetError(ContextApiError):
+    code = "cohort_proposal_set_rejected"

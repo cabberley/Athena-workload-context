@@ -23,11 +23,24 @@ mutate it.
 - `POST /v1/cohort-proposals/preview` accepts only exact split/merge bindings and returns
   deterministic selector-only candidates. It never mutates a manifest, validates a draft,
   approves, or publishes.
+- `POST /v1/cohort-proposals/decisions` durably records an idempotent human
+  `approve`, `reject`, `split`, or `merge` decision. Apply decisions revalidate the exact batch,
+  proposal union, snapshot, profile, source draft, and immutable candidate before invoking the
+  WC-007 `ContextService` selector-only replacement inside the same storage transaction.
+- `GET /v1/cohort-proposals/decisions` and
+  `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
+  granted workload scope.
 
-Both routes require a verified human identity and a concrete workload grant; wildcard grants do
-not cross this boundary. Deployments must inject the snapshot repository, cryptographic verifier,
-immutable proposal cache, and actor-scoped idempotency receipt ports. The default composition
-contains no evidence and grants no access.
+All cohort routes require a verified human identity and a concrete workload grant; wildcard grants
+do not cross this boundary. Reject is durable and blocks later apply for the same proposal-set
+version. Decision, decision audit, idempotency receipt, and draft replacement commit together or
+roll back together. The bounded WC-007 replacement reason references the decision ID while the
+decision record retains the full rationale. These routes never publish or change role authority
+metadata.
+
+Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and
+candidate cache, actor-scoped idempotency ports, and a decision transaction port spanning WC-007
+draft storage. The default composition contains no evidence and grants no access.
 
 The literal `*` is reserved and is never a valid manifest or workload identifier at an HTTP or
 command boundary. Cross-workload WC-007 access uses the typed `AllWorkloadsGrantScope`; cohort

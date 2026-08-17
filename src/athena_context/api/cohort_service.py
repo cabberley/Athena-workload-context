@@ -98,6 +98,16 @@ class _ResolvedCohortContext:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedCohortReview:
+    draft: DraftRecord
+    profile: ResolvedManifestProfile
+    evidence_binding: CohortEvidenceBinding
+    snapshot: EvidenceSnapshot
+    batch: CohortProposalBatchResponse
+    as_of: datetime
+
+
 def _authority_projection(role: ManifestRole) -> dict[str, Any]:
     return {
         "roleId": normalized_identifier(role.role_id),
@@ -258,6 +268,31 @@ class CohortProposalService:
         self._validate_candidate(stored.candidate, request, batch, proposals)
         self._enforce_candidate_bounds(stored.candidate)
         return stored.candidate
+
+    def resolve_for_decision(
+        self,
+        actor: Actor,
+        query: CohortProposalQuery,
+    ) -> ResolvedCohortReview:
+        """Revalidate the exact immutable batch and trusted snapshot for a decision."""
+
+        resolved = self._resolve_context(actor, query)
+        batch = self._proposal_cache.get_batch(resolved.cache_key)
+        if batch is None:
+            raise CohortContractError(
+                "the exact proposal batch must be loaded before recording a decision"
+            )
+        self._validate_batch_binding(batch, resolved)
+        self._enforce_batch_bounds(batch)
+        self._ensure_current_draft(query)
+        return ResolvedCohortReview(
+            draft=resolved.draft,
+            profile=resolved.profile,
+            evidence_binding=resolved.evidence_binding,
+            snapshot=resolved.snapshot,
+            batch=batch,
+            as_of=resolved.as_of,
+        )
 
     def _resolve_context(
         self,
@@ -786,4 +821,4 @@ class CohortProposalService:
             )
 
 
-__all__ = ["CohortProposalService"]
+__all__ = ["CohortProposalService", "ResolvedCohortReview"]

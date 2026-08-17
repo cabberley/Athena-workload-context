@@ -28,6 +28,7 @@ type ProfileType = Literal[
     "sandbox",
 ]
 type CohortPreviewAction = Literal["split", "merge"]
+type CohortReviewAction = Literal["approve", "split", "merge"]
 
 
 def normalized_identifier(value: str) -> str:
@@ -170,7 +171,7 @@ class CohortRoleUpdate(ApiModel):
 
 class CohortReviewCandidate(ApiModel):
     candidate_id: str = Field(alias="candidateId", pattern=_ID_PATTERN)
-    action: CohortPreviewAction
+    action: CohortReviewAction
     source_draft: CohortDraftBinding = Field(alias="sourceDraft")
     scope: ProposalScope
     source_proposal_ids: list[str] = Field(
@@ -190,9 +191,9 @@ class CohortReviewCandidate(ApiModel):
         min_length=1,
         max_length=200,
     )
-    resolution: str = Field(min_length=12, max_length=2000)
-    generated_at: AwareDatetime = Field(alias="generatedAt")
-    expires_at: AwareDatetime = Field(alias="expiresAt")
+    resolution: str = Field(min_length=1, max_length=2000)
+    generated_at: AwareDatetime = Field(alias="generatedAt", strict=False)
+    expires_at: AwareDatetime = Field(alias="expiresAt", strict=False)
     requires_human_review: Literal[True] = Field(True, alias="requiresHumanReview")
     publication_allowed: Literal[False] = Field(False, alias="publicationAllowed")
     manifest_mutated: Literal[False] = Field(False, alias="manifestMutated")
@@ -214,6 +215,7 @@ __all__ = [
     "CohortProposalBatchResponse",
     "CohortProposalQuery",
     "CohortReviewCandidate",
+    "CohortReviewAction",
     "CohortReviewPreviewRequest",
     "CohortRoleUpdate",
     "ProfileType",

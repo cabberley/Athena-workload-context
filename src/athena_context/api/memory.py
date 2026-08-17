@@ -4,6 +4,11 @@ from threading import RLock
 from types import TracebackType
 from typing import Literal
 
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionReceipt,
+    CohortDecisionRecord,
+    CohortProposalSetVersion,
+)
 from athena_context.api.domain import (
     AuditEvent,
     DraftRecord,
@@ -18,6 +23,7 @@ from athena_context.api.errors import (
     DuplicateDraftError,
     DuplicateVersionError,
     IdempotencyConflictError,
+    PersistenceConflictError,
     ResourceNotFoundError,
     StaleRevisionError,
 )
@@ -30,7 +36,7 @@ def _version_key(version: str) -> tuple[int, int, int]:
 
 
 class InMemoryContextStore:
-    """Transactional, deterministic in-memory implementation of the storage port."""
+    """Transactional in-memory adapter for WC-007 and cohort decision ports."""
 
     def __init__(self) -> None:
         self._lock = RLock()
@@ -39,6 +45,12 @@ class InMemoryContextStore:
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
+        self._cohort_decision_versions: dict[str, tuple[str, str]] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
@@ -52,6 +64,12 @@ class _MemoryTransaction(ContextTransactionPort):
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
+        self._cohort_decision_versions: dict[str, tuple[str, str]] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
 
     def __enter__(self) -> _MemoryTransaction:
         self._store._lock.acquire()
@@ -60,6 +78,13 @@ class _MemoryTransaction(ContextTransactionPort):
         self._supersessions = dict(self._store._supersessions)
         self._audit = list(self._store._audit)
         self._receipts = dict(self._store._receipts)
+        self._cohort_decisions = dict(self._store._cohort_decisions)
+        self._cohort_decision_versions = dict(
+            self._store._cohort_decision_versions
+        )
+        self._cohort_decision_receipts = dict(
+            self._store._cohort_decision_receipts
+        )
         return self
 
     def __exit__(
@@ -75,6 +100,13 @@ class _MemoryTransaction(ContextTransactionPort):
                 self._store._supersessions = self._supersessions
                 self._store._audit = self._audit
                 self._store._receipts = self._receipts
+                self._store._cohort_decisions = self._cohort_decisions
+                self._store._cohort_decision_versions = (
+                    self._cohort_decision_versions
+                )
+                self._store._cohort_decision_receipts = (
+                    self._cohort_decision_receipts
+                )
         finally:
             self._store._lock.release()
         return False
@@ -187,3 +219,87 @@ class _MemoryTransaction(ContextTransactionPort):
         if key in self._receipts:
             raise IdempotencyConflictError("idempotency key has already been recorded")
         self._receipts[key] = receipt.model_copy(deep=True)
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None:
+        decision = self._cohort_decisions.get((manifest_id, decision_id))
+        return None if decision is None else decision.model_copy(deep=True)
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]:
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if decision.manifest_id == manifest_id
+                and (profile_id is None or decision.profile_id == profile_id)
+                and (
+                    draft_id is None
+                    or decision.source_draft.draft_id == draft_id
+                )
+                and (
+                    proposal_set_digest is None
+                    or decision.proposal_set_digest == proposal_set_digest
+                )
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
+        )
+        return [decision.model_copy(deep=True) for decision in matches]
+
+    def get_cohort_decision_for_version(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> CohortDecisionRecord | None:
+        decision_key = self._cohort_decision_versions.get(
+            version.model_dump_json(by_alias=True, exclude_none=True)
+        )
+        if decision_key is None:
+            return None
+        return self._cohort_decisions[decision_key].model_copy(deep=True)
+
+    def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
+        decision_key = (decision.manifest_id, decision.decision_id)
+        version_key = decision.proposal_set_version().model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
+        if decision_key in self._cohort_decisions:
+            raise PersistenceConflictError(
+                "cohort decision identifier already exists"
+            )
+        if version_key in self._cohort_decision_versions:
+            raise PersistenceConflictError(
+                "the proposal-set version already has an authoritative decision"
+            )
+        self._cohort_decisions[decision_key] = decision.model_copy(deep=True)
+        self._cohort_decision_versions[version_key] = decision_key
+
+    def get_cohort_decision_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> CohortDecisionReceipt | None:
+        receipt = self._cohort_decision_receipts.get(
+            (actor_id, idempotency_key)
+        )
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_cohort_decision_receipt(
+        self,
+        receipt: CohortDecisionReceipt,
+    ) -> None:
+        key = (receipt.actor_id, receipt.idempotency_key)
+        if key in self._cohort_decision_receipts:
+            raise IdempotencyConflictError(
+                "cohort decision idempotency key has already been recorded"
+            )
+        self._cohort_decision_receipts[key] = receipt.model_copy(deep=True)

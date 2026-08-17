@@ -179,53 +179,12 @@ class ContextService:
         self._authorize_draft(actor, draft_id, Permission.UPDATE_DRAFT)
 
         def replace(tx: ContextTransactionPort) -> DraftRecord:
-            current = self._require_draft(tx, draft_id)
-            self._authorization.require(actor, Permission.UPDATE_DRAFT, current.manifest_id)
-            self._require_state(current, DraftState.DRAFT)
-            self._ensure_expected(
-                current,
-                command.expected_revision,
-                command.expected_manifest_version,
-                command.expected_digest,
-            )
-            if command.replacement_manifest.manifest_id != current.manifest_id:
-                raise VersionMismatchError("a replacement cannot change manifestId")
-            self._ensure_manifest_digest(
-                command.replacement_manifest,
-                command.replacement_digest,
-            )
-            self._ensure_lineage(
+            return self.replace_draft_in_transaction(
                 tx,
-                manifest_id=current.manifest_id,
-                new_version=command.replacement_manifest.manifest_version,
-                previous_version=current.previous_version,
+                actor=actor,
+                draft_id=draft_id,
+                command=command,
             )
-            now = self._now()
-            replacement = current.model_copy(
-                update={
-                    "revision": current.revision + 1,
-                    "manifest": command.replacement_manifest,
-                    "manifest_digest": command.replacement_digest,
-                    "updated_by": actor,
-                    "updated_at": now,
-                    "reason": command.reason,
-                    "validation": None,
-                    "review": None,
-                    "approval": None,
-                }
-            )
-            tx.put_draft(replacement, expected_revision=current.revision)
-            tx.append_audit(
-                self._audit_event(
-                    now=now,
-                    actor=actor,
-                    action=AuditAction.DRAFT_REPLACED,
-                    draft=replacement,
-                    previous_revision=current.revision,
-                    reason=command.reason,
-                )
-            )
-            return replacement
 
         return self._mutate(
             actor,
@@ -236,6 +195,65 @@ class ContextService:
             DraftRecord,
             replace,
         )
+
+    def replace_draft_in_transaction(
+        self,
+        tx: ContextTransactionPort,
+        *,
+        actor: Actor,
+        draft_id: str,
+        command: ReplaceDraftCommand,
+        occurred_at: datetime | None = None,
+    ) -> DraftRecord:
+        """Apply WC-007 replacement rules inside a caller-owned atomic transaction."""
+
+        current = self._require_draft(tx, draft_id)
+        self._authorization.require(actor, Permission.UPDATE_DRAFT, current.manifest_id)
+        self._require_state(current, DraftState.DRAFT)
+        self._ensure_expected(
+            current,
+            command.expected_revision,
+            command.expected_manifest_version,
+            command.expected_digest,
+        )
+        if command.replacement_manifest.manifest_id != current.manifest_id:
+            raise VersionMismatchError("a replacement cannot change manifestId")
+        self._ensure_manifest_digest(
+            command.replacement_manifest,
+            command.replacement_digest,
+        )
+        self._ensure_lineage(
+            tx,
+            manifest_id=current.manifest_id,
+            new_version=command.replacement_manifest.manifest_version,
+            previous_version=current.previous_version,
+        )
+        now = self._now() if occurred_at is None else ensure_timestamp(occurred_at)
+        replacement = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+                "manifest": command.replacement_manifest,
+                "manifest_digest": command.replacement_digest,
+                "updated_by": actor,
+                "updated_at": now,
+                "reason": command.reason,
+                "validation": None,
+                "review": None,
+                "approval": None,
+            }
+        )
+        tx.put_draft(replacement, expected_revision=current.revision)
+        tx.append_audit(
+            self._audit_event(
+                now=now,
+                actor=actor,
+                action=AuditAction.DRAFT_REPLACED,
+                draft=replacement,
+                previous_revision=current.revision,
+                reason=command.reason,
+            )
+        )
+        return replacement
 
     def validate_draft(
         self,

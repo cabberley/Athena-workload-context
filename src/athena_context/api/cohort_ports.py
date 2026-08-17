@@ -73,7 +73,17 @@ class CohortPreviewReceiptPort(Protocol):
     ) -> CohortPreviewReceipt: ...
 
 
+class CohortCandidateRepositoryPort(Protocol):
+    """Immutable lookup of server-generated candidates by their stable identifier."""
+
+    def get_candidate(
+        self,
+        candidate_id: str,
+    ) -> CohortPreviewReceipt | None: ...
+
+
 __all__ = [
+    "CohortCandidateRepositoryPort",
     "CohortPreviewReceiptPort",
     "CohortProposalCachePort",
     "EvidenceSnapshotRepositoryPort",
