@@ -1,0 +1,432 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from athena_context.api.domain import (
+    Actor,
+    ActorKind,
+    Permission,
+    ensure_timestamp,
+)
+from athena_context.api.errors import (
+    DemoEvaluationApprovalError,
+    DemoEvaluationConfigurationError,
+    EvaluationFailedClosedError,
+    EvidenceCollectionRejectedError,
+    IdempotencyConflictError,
+    ResourceNotFoundError,
+)
+from athena_context.api.evaluation_domain import (
+    DemoEvaluationApproval,
+    DemoEvaluationCommand,
+    DemoEvaluationResult,
+    PrivateMcpEndpointConfiguration,
+    build_authorized_publication,
+    build_demo_evaluation_result,
+)
+from athena_context.api.evaluation_ports import (
+    ConfiguredEvidenceClientPort,
+    DemoEvaluationApprovalResolverPort,
+    EvaluationArtifactStorePort,
+    PublishedContextResolverPort,
+    SnapshotSigningPort,
+    SnapshotSigningRequest,
+    StoredEvaluation,
+)
+from athena_context.api.evaluation_snapshot import (
+    finalize_signed_snapshot,
+    prepare_snapshot_signing_material,
+)
+from athena_context.api.ports import AuthorizationPort, ClockPort
+from athena_context.contracts import (
+    AthenaValidationError,
+    EvidenceGapRecord,
+    SnapshotPublicationRecord,
+    TrustedKeyAnchor,
+    TrustedKeyResolver,
+    compute_artifact_digest,
+    resolve_manifest_profile,
+)
+from athena_context.evidence import (
+    CollectedEvidence,
+    CollectorTrustConfiguration,
+    EvidenceClientError,
+    EvidenceCollectionCommand,
+)
+from athena_context.golden import (
+    build_resource_evidence_context,
+    make_resource_snapshot_context_verifier,
+    validate_approved_golden_manifest,
+    validate_golden_profile_findings,
+)
+from athena_context.policy import evaluate_manifest_profile
+
+
+class DemoEvaluationService:
+    """Authoritative collect, attest, publish, resolve, and evaluate orchestration."""
+
+    def __init__(
+        self,
+        *,
+        endpoint_configuration: PrivateMcpEndpointConfiguration,
+        trust_configuration: CollectorTrustConfiguration,
+        trusted_key_anchor: TrustedKeyAnchor,
+        key_resolver: TrustedKeyResolver,
+        evidence_client: ConfiguredEvidenceClientPort,
+        context_resolver: PublishedContextResolverPort,
+        approval_resolver: DemoEvaluationApprovalResolverPort,
+        snapshot_signer: SnapshotSigningPort,
+        artifact_store: EvaluationArtifactStorePort,
+        authorization: AuthorizationPort,
+        clock: ClockPort,
+        publication_actor: Actor,
+    ) -> None:
+        self._endpoint_configuration = endpoint_configuration
+        self._trust_configuration = trust_configuration
+        self._trusted_key_anchor = trusted_key_anchor
+        self._key_resolver = key_resolver
+        self._evidence_client = evidence_client
+        self._context_resolver = context_resolver
+        self._approval_resolver = approval_resolver
+        self._snapshot_signer = snapshot_signer
+        self._artifact_store = artifact_store
+        self._authorization = authorization
+        self._clock = clock
+        self._publication_actor = publication_actor
+        self._validate_composition()
+
+    def _validate_composition(self) -> None:
+        configuration = self._endpoint_configuration
+        trust = self._trust_configuration
+        if self._publication_actor.kind is not ActorKind.SERVICE:
+            raise DemoEvaluationConfigurationError(
+                "snapshot publication actor must be the Context API service"
+            )
+        if self._evidence_client.private_mcp_endpoint != configuration.private_mcp_endpoint:
+            raise DemoEvaluationConfigurationError(
+                "WC-009 client is not bound to the configured private MCP endpoint"
+            )
+        if (
+            trust.managed_identity_object_id
+            != configuration.evidence_identity_object_id
+            or trust.context_identity_object_id
+            != configuration.context_identity_object_id
+        ):
+            raise DemoEvaluationConfigurationError(
+                "WC-009 trust identities do not match WC-008 deployment outputs"
+            )
+        if trust.trust_anchor_ref != self._trusted_key_anchor.key_vault_key_id:
+            raise DemoEvaluationConfigurationError(
+                "trusted snapshot key does not match the evidence ingestion anchor"
+            )
+
+    def evaluate(
+        self,
+        actor: Actor,
+        idempotency_key: str,
+        command: DemoEvaluationCommand,
+    ) -> DemoEvaluationResult:
+        self._authorization.require(actor, Permission.PUBLISH, command.manifest_id)
+        request_digest = self._request_digest(actor, command)
+        replay = self._artifact_store.load_receipt(actor.actor_id, idempotency_key)
+        if replay is not None:
+            if replay.request_digest != request_digest:
+                raise IdempotencyConflictError(
+                    "idempotency key was used for a different demo evaluation"
+                )
+            return DemoEvaluationResult.model_validate_json(replay.result_json)
+
+        as_of = self._now()
+        approval = self._approval_resolver.resolve(command.approval_decision_id)
+        if approval is None:
+            raise DemoEvaluationApprovalError(
+                "trusted demo evaluation approval decision was not found"
+            )
+        self._validate_approval(actor, command, approval, as_of=as_of)
+
+        published_view = self._context_resolver.resolve(
+            command.manifest_id,
+            command.manifest_version,
+        )
+        if published_view.supersession is not None:
+            raise EvaluationFailedClosedError(
+                "superseded context cannot authorize authoritative evaluation"
+            )
+        published = published_view.published
+        if (
+            published.manifest_id != command.manifest_id
+            or published.manifest_version != command.manifest_version
+            or published.manifest_digest != command.expected_manifest_digest
+            or published.manifest_digest != approval.manifest_digest
+        ):
+            raise EvaluationFailedClosedError(
+                "resolved published context does not match the approved immutable version"
+            )
+        try:
+            validate_approved_golden_manifest(published.manifest)
+            profile = resolve_manifest_profile(
+                published.manifest,
+                command.profile_id,
+                as_of=as_of,
+            )
+        except AthenaValidationError as exc:
+            raise EvaluationFailedClosedError(
+                "published context is not an active approved WC-005 golden manifest"
+            ) from exc
+        if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
+            raise EvaluationFailedClosedError(
+                "resolved profile digest does not match the requested authoritative context"
+            )
+
+        collected = self._collect(command)
+        attested_at = self._now()
+        try:
+            material = prepare_snapshot_signing_material(
+                collected,
+                snapshot_id=command.snapshot_id,
+                trust_configuration=self._trust_configuration,
+                trusted_key_anchor=self._trusted_key_anchor,
+                attested_at=attested_at,
+            )
+            signature = self._snapshot_signer.sign(
+                SnapshotSigningRequest(
+                    canonical_preimage=material.canonical_signing_preimage,
+                    preimage_digest=material.signing_preimage_digest,
+                    trusted_key_anchor=self._trusted_key_anchor,
+                )
+            )
+            snapshot = finalize_signed_snapshot(material, signature=signature)
+        except (AthenaValidationError, ValueError) as exc:
+            raise EvaluationFailedClosedError(
+                "canonical evidence snapshot assembly or signing failed"
+            ) from exc
+
+        published_at = self._now()
+        if published_at >= snapshot.expires_at:
+            raise EvaluationFailedClosedError("snapshot became stale before publication")
+        publication = build_authorized_publication(
+            snapshot=snapshot,
+            approval=approval,
+            publisher=actor,
+            publication_actor=self._publication_actor,
+            published_at=published_at,
+            resolved_profile_digest=profile.resolved_profile_digest,
+            endpoint=self._endpoint_configuration.private_mcp_endpoint,
+            scope=command.authorized_scope,
+            reason=command.reason,
+        )
+
+        registry_record = publication.registry_record()
+
+        def publication_resolver(
+            snapshot_id: str,
+        ) -> SnapshotPublicationRecord | None:
+            return registry_record if snapshot_id == snapshot.snapshot_id else None
+
+        def envelope_resolver(
+            attempt_id: str,
+            kind: Literal["response", "failure"],
+            digest: str,
+        ) -> object | None:
+            envelope = collected.envelope
+            if (
+                envelope is not None
+                and attempt_id == collected.collector_attempt.attempt_id
+                and kind == envelope.kind
+                and digest == envelope.digest
+            ):
+                return envelope.payload()
+            return None
+
+        try:
+            evidence = build_resource_evidence_context(profile, snapshot)
+            verifier = make_resource_snapshot_context_verifier(
+                snapshot,
+                profile,
+                as_of=published_at,
+                expected_artifact_digest=snapshot.compatibility.artifact_digest,
+                publication_resolver=publication_resolver,
+                key_resolver=self._key_resolver,
+                trusted_key_anchor=self._trusted_key_anchor,
+                envelope_resolver=envelope_resolver,
+            )
+            findings_by_clause = evaluate_manifest_profile(
+                profile,
+                evidence,
+                as_of=published_at,
+                verify_evidence_context=verifier,
+            )
+            validate_golden_profile_findings(
+                profile,
+                evidence,
+                findings_by_clause,
+            )
+        except AthenaValidationError as exc:
+            raise EvaluationFailedClosedError(
+                "verified evidence did not satisfy authoritative WC-005 evaluation"
+            ) from exc
+
+        findings = tuple(
+            findings_by_clause[clause_id]
+            for clause_id in sorted(findings_by_clause, key=str.casefold)
+        )
+        result = build_demo_evaluation_result(
+            publication=publication,
+            snapshot=snapshot,
+            findings=findings,
+            evaluated_at=published_at,
+        )
+        envelope = collected.envelope
+        if envelope is None:
+            raise EvaluationFailedClosedError(
+                "successful evidence publication requires a validated source envelope"
+            )
+        self._artifact_store.commit(
+            StoredEvaluation(
+                actor_id=actor.actor_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                snapshot_id=snapshot.snapshot_id,
+                result_json=result.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                snapshot_json=snapshot.canonical_json(),
+                publication_json=publication.model_dump_json(exclude_none=True),
+                envelope_attempt_id=collected.collector_attempt.attempt_id,
+                envelope=envelope,
+            )
+        )
+        return result
+
+    def _collect(self, command: DemoEvaluationCommand) -> CollectedEvidence:
+        configuration = self._endpoint_configuration
+        if not configuration.authorizes_inventory_scope(command.authorized_scope):
+            raise EvidenceCollectionRejectedError(
+                "authorized scope has no exact WC-008 Reader assignment"
+            )
+        collection_command = EvidenceCollectionCommand(
+            attemptId=command.attempt_id,
+            evidenceScope=command.authorized_scope,
+            authorizedScopes=(command.authorized_scope,),
+            bounds=command.bounds,
+        )
+        try:
+            collected = self._evidence_client.collect(collection_command)
+        except EvidenceClientError as exc:
+            raise EvidenceCollectionRejectedError(
+                "typed WC-009 evidence collection failed closed"
+            ) from exc
+        if (
+            collected.request.evidence_scope.canonical_json()
+            != command.authorized_scope.canonical_json()
+            or tuple(
+                scope.canonical_json() for scope in collected.request.authorized_scopes
+            )
+            != (command.authorized_scope.canonical_json(),)
+        ):
+            raise EvidenceCollectionRejectedError(
+                "collected evidence exceeded the explicitly authorized scope"
+            )
+        identity = collected.collector_identity_evidence
+        claims = identity.verified_claims
+        if (
+            claims.managed_identity_object_id
+            != self._endpoint_configuration.evidence_identity_object_id
+            or claims.managed_identity_object_id
+            != self._trust_configuration.managed_identity_object_id
+        ):
+            raise EvidenceCollectionRejectedError(
+                "collected evidence identity does not match the read-only MCP identity"
+            )
+        gaps = [
+            record
+            for record in collected.evidence_records
+            if isinstance(record, EvidenceGapRecord)
+        ]
+        if (
+            collected.collector_attempt.attempt_type != "successResponse"
+            or gaps
+            or not collected.evidence_records
+            or collected.envelope is None
+        ):
+            reasons = sorted({gap.gap_reason for gap in gaps})
+            detail = ",".join(reasons) if reasons else collected.collector_attempt.attempt_type
+            raise EvidenceCollectionRejectedError(
+                f"evidence collection produced a fail-closed outcome: {detail}"
+            )
+        return collected
+
+    def _validate_approval(
+        self,
+        actor: Actor,
+        command: DemoEvaluationCommand,
+        approval: DemoEvaluationApproval,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if approval.approved_at > as_of or approval.expires_at <= as_of:
+            raise DemoEvaluationApprovalError(
+                "demo evaluation approval is not active at the trusted evaluation time"
+            )
+        if (
+            approval.decision_id != command.approval_decision_id
+            or approval.manifest_id != command.manifest_id
+            or approval.manifest_version != command.manifest_version
+            or approval.manifest_digest != command.expected_manifest_digest
+            or approval.profile_id != command.profile_id
+            or approval.authorized_scope.canonical_json()
+            != command.authorized_scope.canonical_json()
+            or approval.private_mcp_endpoint
+            != self._endpoint_configuration.private_mcp_endpoint
+            or approval.evidence_identity_object_id
+            != self._endpoint_configuration.evidence_identity_object_id
+        ):
+            raise DemoEvaluationApprovalError(
+                "approval does not authorize this exact endpoint, identity, context, and scope"
+            )
+        if actor.kind is not ActorKind.HUMAN:
+            raise DemoEvaluationApprovalError(
+                "only an authorized human publisher may execute an approval"
+            )
+
+    def _request_digest(self, actor: Actor, command: DemoEvaluationCommand) -> str:
+        return compute_artifact_digest(
+            {
+                "operation": "evaluate_demo_workload",
+                "actor": actor.model_dump(mode="json"),
+                "command": command.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                "privateMcpEndpoint": (
+                    self._endpoint_configuration.private_mcp_endpoint
+                ),
+                "trustConfiguration": self._trust_configuration.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            }
+        )
+
+    def _now(self) -> datetime:
+        return ensure_timestamp(self._clock.now())
+
+    def get_result(self, actor: Actor, snapshot_id: str) -> DemoEvaluationResult:
+        result = self._artifact_store.resolve_result(snapshot_id)
+        if result is None:
+            raise ResourceNotFoundError(
+                f"published evaluation snapshot {snapshot_id!r} was not found"
+            )
+        self._authorization.require(
+            actor,
+            Permission.READ,
+            result.publication.manifest_id,
+        )
+        return result
+
+
+__all__ = ["DemoEvaluationService"]

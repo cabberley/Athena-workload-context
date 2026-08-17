@@ -43,6 +43,9 @@ athena_context = ["data/fixtures/*.json"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "live: requires explicit private Azure MCP environment configuration",
+]
 
 [tool.ruff]
 line-length = 100

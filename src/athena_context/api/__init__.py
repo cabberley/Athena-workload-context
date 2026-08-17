@@ -18,6 +18,25 @@ from athena_context.api.domain import (
     TransitionCommand,
     VerifiedAuthentication,
 )
+from athena_context.api.evaluation_adapters import (
+    AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+    ContextServicePublishedContextResolver,
+    PrivateMcpEvidenceTransport,
+    PrivateMcpInvokerPort,
+    StaticDemoEvaluationApprovalResolver,
+    Wc009EvidenceClientAdapter,
+)
+from athena_context.api.evaluation_domain import (
+    AZURE_MCP_2_0_5_ALLOWED_TOOLS,
+    AuthorizedSnapshotPublication,
+    DemoEvaluationApproval,
+    DemoEvaluationCommand,
+    DemoEvaluationResult,
+    McpReadAssignment,
+    PrivateMcpEndpointConfiguration,
+)
+from athena_context.api.evaluation_memory import InMemoryEvaluationArtifactStore
+from athena_context.api.evaluation_service import DemoEvaluationService
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
@@ -25,11 +44,24 @@ from athena_context.api.service import ContextService
 __all__ = [
     "Actor",
     "ActorKind",
+    "AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL",
+    "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
+    "AuthorizedSnapshotPublication",
+    "ContextServicePublishedContextResolver",
     "ContextService",
     "CreateDraftCommand",
     "DraftRecord",
     "DraftState",
+    "DemoEvaluationApproval",
+    "DemoEvaluationCommand",
+    "DemoEvaluationResult",
+    "DemoEvaluationService",
+    "InMemoryEvaluationArtifactStore",
     "InMemoryContextStore",
+    "McpReadAssignment",
+    "PrivateMcpEndpointConfiguration",
+    "PrivateMcpEvidenceTransport",
+    "PrivateMcpInvokerPort",
     "PublishedManifest",
     "PublishCommand",
     "ReplaceDraftCommand",
@@ -39,7 +71,9 @@ __all__ = [
     "RoleGrant",
     "SupersedeCommand",
     "StaticTestAuthenticator",
+    "StaticDemoEvaluationApprovalResolver",
     "TransitionCommand",
     "VerifiedAuthentication",
+    "Wc009EvidenceClientAdapter",
     "create_app",
 ]

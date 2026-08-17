@@ -69,3 +69,19 @@ class AlreadySupersededError(ContextApiError):
 
 class PersistenceConflictError(ContextApiError):
     code = "persistence_conflict"
+
+
+class DemoEvaluationConfigurationError(ContextApiError):
+    code = "demo_evaluation_configuration"
+
+
+class DemoEvaluationApprovalError(ContextApiError):
+    code = "demo_evaluation_approval"
+
+
+class EvidenceCollectionRejectedError(ContextApiError):
+    code = "evidence_collection_rejected"
+
+
+class EvaluationFailedClosedError(ContextApiError):
+    code = "evaluation_failed_closed"

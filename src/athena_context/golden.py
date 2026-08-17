@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +22,8 @@ from athena_context.contracts import (
     ResourceEvidenceRecord,
     ResourceProofFact,
     RoleBindingProof,
+    SnapshotPublicationRecord,
+    TrustedKeyAnchor,
     canonicalize_json,
     canonicalize_manifest_payload,
     compute_artifact_digest,
@@ -469,13 +472,32 @@ def _build_evidence_context(
     )
 
 
-def _make_context_verifier(
-    bundle: FixtureBundle,
+def build_resource_evidence_context(
+    profile: ResolvedManifestProfile,
+    snapshot: EvidenceSnapshot,
+) -> EvidenceReferenceContext:
+    """Build the canonical resource proof context used by the WC-005 policy path."""
+
+    return _build_evidence_context(profile, snapshot)
+
+
+def make_resource_snapshot_context_verifier(
+    snapshot: EvidenceSnapshot,
     profile: ResolvedManifestProfile,
     *,
     as_of: datetime,
+    expected_artifact_digest: str,
+    publication_resolver: Callable[[str], SnapshotPublicationRecord | None],
+    key_resolver: Callable[[TrustedKeyAnchor], Any],
+    trusted_key_anchor: TrustedKeyAnchor,
+    envelope_resolver: Callable[
+        [str, Literal["response", "failure"], str],
+        Any,
+    ],
 ) -> EvidenceContextVerifier:
-    expected_by_role = _select_role_resources(profile, bundle.canonical_snapshot)
+    """Bind WC-005 proof facts to a newly published, cryptographically verified snapshot."""
+
+    expected_by_role = _select_role_resources(profile, snapshot)
 
     def fact_validator(fact: ProofFact, record: EvidenceRecord) -> bool:
         if not isinstance(fact, ResourceProofFact) or not isinstance(
@@ -509,16 +531,34 @@ def _make_context_verifier(
         )
 
     return verified_snapshot_context_verifier(
+        snapshot,
+        as_of=as_of,
+        expected_artifact_digest=expected_artifact_digest,
+        publication_resolver=publication_resolver,
+        identity_evidence=snapshot.identity_evidence,
+        key_resolver=key_resolver,
+        trusted_key_anchor=trusted_key_anchor,
+        envelope_resolver=envelope_resolver,
+        fact_validator=fact_validator,
+        role_binding_validator=role_binding_validator,
+    )
+
+
+def _make_context_verifier(
+    bundle: FixtureBundle,
+    profile: ResolvedManifestProfile,
+    *,
+    as_of: datetime,
+) -> EvidenceContextVerifier:
+    return make_resource_snapshot_context_verifier(
         bundle.canonical_snapshot,
+        profile,
         as_of=as_of,
         expected_artifact_digest=bundle.snapshot_artifact_digest,
         publication_resolver=bundle.publication_resolver,
-        identity_evidence=bundle.canonical_snapshot.identity_evidence,
         key_resolver=bundle.key_resolver,
         trusted_key_anchor=bundle.trusted_key_anchor,
         envelope_resolver=bundle.envelope_resolver,
-        fact_validator=fact_validator,
-        role_binding_validator=role_binding_validator,
     )
 
 
@@ -603,6 +643,13 @@ def _validate_approved_golden_manifest(
         )
 
 
+def validate_approved_golden_manifest(manifest: CanonicalWorkloadManifest) -> None:
+    """Require the exact packaged WC-005 manifest and its approved WC-002 derivation."""
+
+    source = make_canonical_fixture_from_resources().canonical_manifest
+    _validate_approved_golden_manifest(manifest, source)
+
+
 def _expected_verdict(
     profile_id: GoldenProfileId,
     clause_id: str,
@@ -680,6 +727,16 @@ def _validate_finding_projection(
                 f"{profile_id}/{clause_id} verdict does not match the golden oracle"
             )
     return ()
+
+
+def validate_golden_profile_findings(
+    profile: ResolvedManifestProfile,
+    evidence: EvidenceReferenceContext,
+    findings: dict[str, ManifestFinding],
+) -> None:
+    """Require exact WC-005 clauses, verdicts, governance citations, and evidence refs."""
+
+    _validate_finding_projection(profile, evidence, findings)
 
 
 def run_golden_proof(
@@ -781,7 +838,11 @@ __all__ = [
     "GoldenProfileResult",
     "GoldenProofMismatchError",
     "GoldenProofResult",
+    "build_resource_evidence_context",
     "golden_web_minimum_distinct_zones",
     "load_golden_manifest",
+    "make_resource_snapshot_context_verifier",
     "run_golden_proof",
+    "validate_approved_golden_manifest",
+    "validate_golden_profile_findings",
 ]

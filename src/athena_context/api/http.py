@@ -31,9 +31,17 @@ from athena_context.api.errors import (
     AuthenticationError,
     AuthorizationError,
     ContextApiError,
+    DemoEvaluationConfigurationError,
+    EvaluationFailedClosedError,
+    EvidenceCollectionRejectedError,
     ManifestValidationError,
     ResourceNotFoundError,
 )
+from athena_context.api.evaluation_domain import (
+    DemoEvaluationCommand,
+    DemoEvaluationResult,
+)
+from athena_context.api.evaluation_service import DemoEvaluationService
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.ports import AuthenticationPort
 from athena_context.api.service import ContextService
@@ -88,6 +96,7 @@ def create_app(
     *,
     service: ContextService | None = None,
     authentication: AuthenticationPort | None = None,
+    demo_evaluation_service: DemoEvaluationService | None = None,
 ) -> FastAPI:
     if service is None:
         service = ContextService(
@@ -118,8 +127,17 @@ def create_app(
             http_status = status.HTTP_403_FORBIDDEN
         elif isinstance(exc, ResourceNotFoundError):
             http_status = status.HTTP_404_NOT_FOUND
-        elif isinstance(exc, ManifestValidationError):
+        elif isinstance(
+            exc,
+            (
+                ManifestValidationError,
+                EvidenceCollectionRejectedError,
+                EvaluationFailedClosedError,
+            ),
+        ):
             http_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif isinstance(exc, DemoEvaluationConfigurationError):
+            http_status = status.HTTP_503_SERVICE_UNAVAILABLE
         else:
             http_status = status.HTTP_409_CONFLICT
         body = ErrorResponse(error=ErrorDetail(code=exc.code, message=exc.message))
@@ -311,6 +329,36 @@ def create_app(
         actor: ActorDependency,
     ) -> list[AuditEvent]:
         return service.audit_history(actor, manifest_id)
+
+    if demo_evaluation_service is not None:
+
+        @application.post(
+            "/v1/demo-evaluations",
+            response_model=DemoEvaluationResult,
+            response_model_exclude_none=True,
+            status_code=status.HTTP_201_CREATED,
+        )
+        def evaluate_demo(
+            command: DemoEvaluationCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationResult:
+            return demo_evaluation_service.evaluate(
+                actor,
+                idempotency_key,
+                command,
+            )
+
+        @application.get(
+            "/v1/demo-evaluations/{snapshot_id}",
+            response_model=DemoEvaluationResult,
+            response_model_exclude_none=True,
+        )
+        def get_demo_evaluation(
+            snapshot_id: str,
+            actor: ActorDependency,
+        ) -> DemoEvaluationResult:
+            return demo_evaluation_service.get_result(actor, snapshot_id)
 
     return application
 
