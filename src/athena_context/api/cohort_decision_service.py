@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from athena_context.api.cohort_decision_domain import (
     CohortDecisionAudit,
@@ -66,7 +66,6 @@ from athena_context.contracts.common import AthenaValidationError, compute_artif
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
     ManifestRole,
-    ManifestSelector,
     ResolvedManifestProfile,
     canonicalize_manifest_payload,
     resolve_manifest_profile,
@@ -74,7 +73,6 @@ from athena_context.contracts.manifest import (
 from athena_context.contracts.models import ResourceEvidenceRecord
 
 _MAX_DECISIONS = 200
-_SELECTOR_ADAPTER: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
 
 
 def _authority_projection(role: ManifestRole) -> dict[str, Any]:
@@ -145,15 +143,20 @@ class CohortDecisionService:
             Permission.UPDATE_DRAFT,
             request.manifest_id,
         )
+        command = request.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        command["proposal_ids"] = sorted(
+            normalized_identifier(proposal_id)
+            for proposal_id in request.proposal_ids
+        )
         request_digest = compute_artifact_digest(
             {
                 "operation": "cohort_decision",
                 "actorId": actor.actor_id,
-                "command": request.model_dump(
-                    mode="json",
-                    by_alias=True,
-                    exclude_none=True,
-                ),
+                "command": command,
             }
         )
         replay = self._get_replay(
@@ -205,18 +208,19 @@ class CohortDecisionService:
                     manifest_id=request.manifest_id,
                 )
 
-            existing = tx.get_cohort_decision_for_version(version)
-            if existing is not None:
-                if (
-                    existing.decision is CohortDecisionKind.REJECT
-                    and request.action is not CohortDecisionKind.REJECT
+            existing = tx.list_overlapping_cohort_decisions(version)
+            if existing:
+                if request.action is not CohortDecisionKind.REJECT and any(
+                    decision.decision is CohortDecisionKind.REJECT
+                    for decision in existing
                 ):
                     raise RejectedProposalSetError(
-                        "a durable reject permanently blocks apply for this "
-                        "proposal-set version"
+                        "a durable reject permanently blocks apply for an "
+                        "overlapping selected proposal"
                     )
                 raise CohortDecisionConflictError(
-                    "the proposal-set version already has an authoritative decision"
+                    "an overlapping selected proposal already has an "
+                    "authoritative decision"
                 )
 
             current = self._require_current_draft(tx, request)
@@ -431,6 +435,10 @@ class CohortDecisionService:
             batch_input_digest=resolved.batch.input_digest,
             proposal_set_digest=request.proposal_set_digest,
             snapshot_artifact_digest=request.snapshot_artifact_digest,
+            sourceProposalIds=sorted(
+                normalized_identifier(proposal_id)
+                for proposal_id in request.proposal_ids
+            ),
         )
 
     @staticmethod
@@ -727,7 +735,7 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate profile is not present in the exact draft"
             )
-        profile_key, profile = profile_match
+        profile_key, _profile = profile_match
         update = candidate.role_updates[0]
         target = normalized_identifier(update.role.role_id)
         before_profiles = CohortDecisionService._resolve_all_profiles(
@@ -743,12 +751,10 @@ class CohortDecisionService:
             raise CohortContractError(
                 "requested profile changed before selector materialization"
             )
-        applied_role, intended_selector_id = (
-            CohortDecisionService._materialize_local_role_override(
-                update.role,
-                resolved=resolved,
-                candidate=candidate,
-            )
+        applied_role = CohortDecisionService._materialize_local_role_override(
+            update.role,
+            resolved=resolved,
+            candidate=candidate,
         )
         profile_payload = payload["profiles"].get(profile_key)
         if not isinstance(profile_payload, dict):
@@ -813,10 +819,7 @@ class CohortDecisionService:
         if (
             set(before_roles) != set(after_roles)
             or target not in after_roles
-            or _authority_projection(after_roles[target])
-            != _authority_projection(applied_role)
-            or _selector_projection(after_roles[target])
-            != _selector_projection(applied_role)
+            or after_roles[target] != applied_role
             or any(
                 before_roles[role_id] != after_roles[role_id]
                 for role_id in before_roles
@@ -826,19 +829,9 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate attempted an update outside the exact role selectors"
             )
-        before_selectors = _selector_projection(before_roles[target])
-        after_selectors = _selector_projection(after_roles[target])
-        if (
-            set(before_selectors) != set(after_selectors)
-            or intended_selector_id not in after_selectors
-            or any(
-                before_selectors[selector_id] != after_selectors[selector_id]
-                for selector_id in before_selectors
-                if selector_id != intended_selector_id
-            )
-        ):
+        if after_roles[target].selectors != update.role.selectors:
             raise CohortContractError(
-                "local override changed an unintended role selector"
+                "local override does not contain the exact approved candidate selectors"
             )
         before = target_before.model_dump(
             mode="json",
@@ -881,8 +874,8 @@ class CohortDecisionService:
         *,
         resolved: ResolvedCohortReview,
         candidate: CohortReviewCandidate,
-    ) -> tuple[ManifestRole, str]:
-        """Translate one exact candidate selector into a local same-variant override."""
+    ) -> ManifestRole:
+        """Require the approved role to already be a complete local override."""
 
         baseline = next(
             (
@@ -896,87 +889,33 @@ class CohortDecisionService:
         if baseline is None:
             raise CohortContractError("candidate role has no exact resolved baseline")
         update = candidate.role_updates[0]
-        if (
-            len(update.selector_previews) != 1
-            or len(role.selectors) != 1
-        ):
+        if update.role != role:
             raise CohortContractError(
-                "candidate selector set cannot be represented as one local "
-                "same-variant override"
+                "candidate role update does not match its approved role"
             )
-        preview = update.selector_previews[0]
-        resources = [
-            record
-            for record in resolved.snapshot.evidence_records
-            if isinstance(record, ResourceEvidenceRecord)
-        ]
-        intended_members = {
-            normalize_resource_id(member)
-            for member in preview.matched_resource_ids
-        }
-        matches: list[ManifestSelector] = []
-        for selector in baseline.selectors:
-            if selector.selector_type != preview.selector.selector_type:
-                continue
-            try:
-                evaluated = evaluate_selector(selector, resources)
-                baseline_members = {
-                    normalize_resource_id(member)
-                    for member in evaluated.matched_resource_ids
-                }
-            except AthenaValidationError:
-                continue
-            if baseline_members == intended_members:
-                matches.append(selector)
-        if len(matches) != 1:
+        baseline_selectors = _selector_projection(baseline)
+        approved_selectors = _selector_projection(role)
+        if set(baseline_selectors) != set(approved_selectors):
             raise CohortContractError(
-                "candidate selector has no unique same-variant baseline selector"
+                "approved candidate is not a complete local selector override"
             )
-        baseline_selector = matches[0]
-        selector_payload = preview.selector.model_dump(
-            mode="python",
-            by_alias=True,
-            exclude_none=True,
-        )
-        selector_payload["selectorId"] = baseline_selector.selector_id
-        try:
-            materialized_selector = _SELECTOR_ADAPTER.validate_python(
-                selector_payload
-            )
-            evaluated = evaluate_selector(materialized_selector, resources)
-            materialized_members = {
-                normalize_resource_id(member)
-                for member in evaluated.matched_resource_ids
-            }
-        except (AthenaValidationError, ValidationError) as exc:
-            raise CohortContractError(
-                "candidate selector cannot form a local same-variant override"
-            ) from exc
-        if (
-            materialized_selector.selector_type != baseline_selector.selector_type
-            or materialized_members != intended_members
-            or evaluated.max_match_violations
-            or evaluated.status != "matched"
-            or materialized_selector.max_matches != len(materialized_members)
-        ):
-            raise CohortContractError(
-                "local same-variant selector does not preserve exact membership"
-            )
-        selectors = [
-            materialized_selector
-            if normalized_identifier(selector.selector_id)
-            == normalized_identifier(baseline_selector.selector_id)
-            else selector
+        baseline_variants = {
+            normalized_identifier(selector.selector_id): selector.selector_type
             for selector in baseline.selectors
-        ]
-        materialized_role = baseline.model_copy(update={"selectors": selectors})
-        if _authority_projection(materialized_role) != _authority_projection(role):
+        }
+        approved_variants = {
+            normalized_identifier(selector.selector_id): selector.selector_type
+            for selector in role.selectors
+        }
+        if baseline_variants != approved_variants:
+            raise CohortContractError(
+                "approved candidate is not a local same-variant selector override"
+            )
+        if _authority_projection(baseline) != _authority_projection(role):
             raise CohortContractError(
                 "local override attempted to change role authority metadata"
             )
-        return materialized_role, normalized_identifier(
-            baseline_selector.selector_id
-        )
+        return role
 
     @staticmethod
     def _record(

@@ -107,6 +107,21 @@ class CohortProposalSetVersion(ApiModel):
     batch_input_digest: str = Field(pattern=_DIGEST_PATTERN)
     proposal_set_digest: str = Field(pattern=_DIGEST_PATTERN)
     snapshot_artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
+    source_proposal_ids: list[str] = Field(
+        alias="sourceProposalIds",
+        min_length=1,
+        max_length=200,
+    )
+
+    @field_validator("source_proposal_ids")
+    @classmethod
+    def validate_canonical_proposal_set(cls, values: list[str]) -> list[str]:
+        canonical = sorted(normalized_identifier(value) for value in values)
+        if values != canonical or len(canonical) != len(set(canonical)):
+            raise ValueError(
+                "source_proposal_ids must be a canonical unique proposal set"
+            )
+        return values
 
 
 class CohortDecisionAudit(ApiModel):
@@ -203,6 +218,10 @@ class CohortDecisionRecord(ApiModel):
             batch_input_digest=self.batch_input_digest,
             proposal_set_digest=self.proposal_set_digest,
             snapshot_artifact_digest=self.snapshot.artifact_digest,
+            sourceProposalIds=sorted(
+                normalized_identifier(proposal_id)
+                for proposal_id in self.source_proposal_ids
+            ),
         )
 
 

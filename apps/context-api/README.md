@@ -31,6 +31,10 @@ mutate it.
   preserves role authority and unrelated selectors, never edits an ancestor or global role, and
   rejects candidates that cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.
+  Selected proposal IDs are part of the canonical decision version: disjoint selections in one
+  batch may be decided independently, while any overlap conflicts and a rejection blocks only its
+  selected proposals. Applied selectors are exactly the final selectors shown in the approved
+  candidate; selector IDs needed for a safe local override are finalized before human review.
 - `GET /v1/cohort-proposals/decisions` and
   `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
   granted workload scope.

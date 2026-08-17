@@ -35,6 +35,14 @@ def _version_key(version: str) -> tuple[int, int, int]:
     return (int(major), int(minor), int(patch))
 
 
+def _cohort_version_binding_key(version: CohortProposalSetVersion) -> str:
+    return version.model_dump_json(
+        by_alias=True,
+        exclude_none=True,
+        exclude={"source_proposal_ids"},
+    )
+
+
 class InMemoryContextStore:
     """Transactional in-memory adapter for WC-007 and cohort decision ports."""
 
@@ -255,20 +263,28 @@ class _MemoryTransaction(ContextTransactionPort):
         )
         return [decision.model_copy(deep=True) for decision in matches]
 
-    def get_cohort_decision_for_version(
+    def list_overlapping_cohort_decisions(
         self,
         version: CohortProposalSetVersion,
-    ) -> CohortDecisionRecord | None:
-        decision_key = self._cohort_decision_versions.get(
-            version.model_dump_json(by_alias=True, exclude_none=True)
+    ) -> list[CohortDecisionRecord]:
+        binding_key = _cohort_version_binding_key(version)
+        selected = set(version.source_proposal_ids)
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if _cohort_version_binding_key(decision.proposal_set_version())
+                == binding_key
+                and selected.intersection(decision.source_proposal_ids)
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
         )
-        if decision_key is None:
-            return None
-        return self._cohort_decisions[decision_key].model_copy(deep=True)
+        return [decision.model_copy(deep=True) for decision in matches]
 
     def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
         decision_key = (decision.manifest_id, decision.decision_id)
-        version_key = decision.proposal_set_version().model_dump_json(
+        version = decision.proposal_set_version()
+        version_key = version.model_dump_json(
             by_alias=True,
             exclude_none=True,
         )
@@ -279,6 +295,10 @@ class _MemoryTransaction(ContextTransactionPort):
         if version_key in self._cohort_decision_versions:
             raise PersistenceConflictError(
                 "the proposal-set version already has an authoritative decision"
+            )
+        if self.list_overlapping_cohort_decisions(version):
+            raise PersistenceConflictError(
+                "an overlapping selected proposal already has an authoritative decision"
             )
         self._cohort_decisions[decision_key] = decision.model_copy(deep=True)
         self._cohort_decision_versions[version_key] = decision_key

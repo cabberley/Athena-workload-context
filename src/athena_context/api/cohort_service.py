@@ -185,6 +185,10 @@ class CohortProposalService:
                 **batch.model_dump(mode="python", by_alias=True, exclude_none=True),
             }
         )
+        response = self._bind_direct_review_selector_ids(
+            response,
+            _resource_records(resolved.snapshot),
+        )
         self._validate_batch_binding(response, resolved)
         self._enforce_batch_bounds(response)
         self._ensure_current_draft(query)
@@ -192,6 +196,86 @@ class CohortProposalService:
         self._validate_batch_binding(stored, resolved)
         self._enforce_batch_bounds(stored)
         return stored
+
+    @classmethod
+    def _bind_direct_review_selector_ids(
+        cls,
+        batch: CohortProposalBatchResponse,
+        resources: list[ResourceEvidenceRecord],
+    ) -> CohortProposalBatchResponse:
+        """Make safe direct-review selectors final before the human sees them."""
+
+        proposals: list[CohortProposal] = []
+        changed = False
+        for proposal in batch.proposals:
+            preview = proposal.selector_preview
+            if preview is None:
+                proposals.append(proposal)
+                continue
+            expected_members = {
+                normalize_resource_id(member)
+                for member in preview.matched_resource_ids
+            }
+            matches: list[ManifestSelector] = []
+            for selector in proposal.role.selectors:
+                if selector.selector_type != preview.selector.selector_type:
+                    continue
+                try:
+                    result = evaluate_selector(selector, resources)
+                except AthenaValidationError:
+                    continue
+                members = {
+                    normalize_resource_id(member)
+                    for member in result.matched_resource_ids
+                }
+                if members == expected_members:
+                    matches.append(selector)
+            if len(matches) != 1:
+                proposals.append(proposal)
+                continue
+            selector_payload = preview.selector.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+            selector_payload["selectorId"] = matches[0].selector_id
+            try:
+                selector = _SELECTOR_ADAPTER.validate_python(selector_payload)
+                final_preview = cls._evaluate_exact_preview(selector, resources)
+            except (AthenaValidationError, ValidationError) as exc:
+                raise CohortContractError(
+                    "direct review selector cannot be finalized before approval"
+                ) from exc
+            if final_preview.matched_resource_ids != preview.matched_resource_ids:
+                raise CohortContractError(
+                    "final direct review selector changed the proposed cohort"
+                )
+            proposals.append(
+                proposal.model_copy(
+                    update={"selector_preview": final_preview},
+                    deep=True,
+                )
+            )
+            changed = changed or final_preview != preview
+        if not changed:
+            return batch
+        payload = batch.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_none=True,
+        )
+        payload["proposals"] = proposals
+        payload["proposalSetDigest"] = compute_artifact_digest(
+            [
+                proposal.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for proposal in proposals
+            ]
+        )
+        return CohortProposalBatchResponse.model_validate(payload)
 
     def preview(
         self,
