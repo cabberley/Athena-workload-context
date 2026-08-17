@@ -22,7 +22,9 @@ from athena_context.api.evaluation_domain import (
     VerifiedWc008DeploymentConfiguration,
 )
 from athena_context.contracts import (
+    EvidenceScope,
     EvidenceSnapshot,
+    ManifestFinding,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     TrustedKeyResolver,
@@ -101,16 +103,59 @@ class EvaluationTrustedKeyAuthority:
         )
 
 
-# No-I/O finalizer invoked with the persistence-owned insertion timestamp.
-type EvaluationArtifactFactory = Callable[
-    [datetime, EvaluationTrustedKeyAuthority],
-    StoredEvaluation,
-]
+@dataclass(frozen=True, slots=True)
+class EvaluationTemporalValidity:
+    """Immutable time predicates consumed by the sealed persistence finalizer."""
 
-# Delay-capable verification that returns the insertion-time finalizer.
+    approval_active_from: datetime
+    approval_expires_at: datetime
+    snapshot_active_from: datetime
+    snapshot_expires_at: datetime
+    governance_active_from: datetime | None
+    governance_expires_at: datetime | None
+    risk_active_from: datetime | None
+    risk_expires_at: datetime | None
+    evidence_fresh_until: datetime | None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.approval_active_from,
+            self.approval_expires_at,
+            self.snapshot_active_from,
+            self.snapshot_expires_at,
+            self.governance_active_from,
+            self.governance_expires_at,
+            self.risk_active_from,
+            self.risk_expires_at,
+            self.evidence_fresh_until,
+        ):
+            if value is not None:
+                ensure_timestamp(value)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedEvaluationArtifact:
+    """Fully evaluated immutable inputs for persistence-owned finalization."""
+
+    actor: Actor
+    publication_actor: Actor
+    idempotency_key: str
+    request_digest: str
+    snapshot: EvidenceSnapshot
+    approval: DemoEvaluationApproval
+    resolved_profile_digest: str
+    private_mcp_endpoint: str
+    authorized_scope: EvidenceScope
+    reason: str
+    findings: tuple[ManifestFinding, ...]
+    envelope_attempt_id: str
+    envelope: ValidatedEnvelope
+    temporal_validity: EvaluationTemporalValidity
+
+# Delay-capable verification returns data, never executable post-time behavior.
 type EvaluationArtifactPreparation = Callable[
     [EvaluationTrustedKeyAuthority],
-    EvaluationArtifactFactory,
+    PreparedEvaluationArtifact,
 ]
 
 
@@ -168,7 +213,7 @@ class EvaluationAuthorityTransactionPort(Protocol):
         expected_trusted_key: TrustedKeyAuthorityToken,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
-        """Bind key revision, prepare, timestamp, finalize, and insert."""
+        """Bind key revision, prepare, seal-finalize, and atomically insert."""
         ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -182,7 +227,7 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
         selection: PublishedContextSelection,
         *,
         as_of: datetime,
-    ) -> ResolvedPublishedContext: ...
+    ) -> tuple[ResolvedPublishedContext, AuthorizationGrantToken]: ...
 
     def resolve_approval(
         self,
@@ -293,12 +338,13 @@ class SnapshotSigningPort(Protocol):
 
 __all__ = [
     "ConfiguredEvidenceClientPort",
-    "EvaluationArtifactFactory",
     "EvaluationArtifactPreparation",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
+    "EvaluationTemporalValidity",
     "EvaluationTrustedKeyAuthority",
+    "PreparedEvaluationArtifact",
     "DemoEvaluationTrustConfiguration",
     "PublishedContextResolverPort",
     "SnapshotSigningPort",

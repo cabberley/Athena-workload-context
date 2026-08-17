@@ -50,16 +50,21 @@ The integration composes the merged components without introducing direct Azure 
 - `ContextService.commit_demo_evaluation` owns the final conditional transaction. It opens the
   actual configured persistence transaction and creates a narrow transaction-scoped unit of work
   from that exact transaction. It reads the active unsuperseded WC-007 context revision/ETag,
-  approval revision/status/expiry, and actor grant revision, canonically resolves the complete
-  profile inheritance chain, and compares typed authority tokens captured before collection.
+  approval revision/status/expiry, publisher grant revision, and context-reader identity/grant
+  revision, canonically resolves the complete profile inheritance chain, and compares typed
+  authority tokens captured before collection. Both publisher and reader authorization are read
+  from the transaction-owned grant state; no independently locked reader authorization can
+  authorize an evaluation.
   Signing-key trust is also versioned state in that exact transaction, not a caller-advertised or
   independently mutable resolver. After every persistence delay, the conditional operation loads
   the exact configured key anchor and compares its revision and digest with the pre-collection
   authority token. Disabled, retired, expired, revoked, missing, or changed key trust aborts the
   transaction. After persistence delay and exact key-revision comparison, the transaction performs
   the delay-capable cryptographic verification and authoritative WC-004 evaluation. Only after
-  that work returns does persistence obtain its authoritative insertion timestamp and invoke a
-  pure, bounded, no-I/O finalizer. The finalizer revalidates the already loaded exact approval,
+  that work returns does preparation return immutable data rather than executable behavior.
+  Persistence then obtains its authoritative insertion timestamp and runs its own sealed,
+  bounded, no-I/O finalizer. No caller-supplied callback runs after the timestamp. The finalizer
+  revalidates the already loaded exact approval,
   complete profile governance and risk acceptances, bound key trust, snapshot expiry, and every
   policy evidence-freshness bound at that exact value. Prepared findings are accepted only when
   those immutable findings are proven temporally unchanged at insertion; the same value is used

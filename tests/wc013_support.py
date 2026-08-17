@@ -839,6 +839,7 @@ def build_harness(
     publish_context: bool = True,
     trusted_key_expires_at: datetime | None = None,
     snapshot_freshness_seconds: int = 300,
+    context_reader_actor: Actor = PUBLISHER,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -948,6 +949,16 @@ def build_harness(
     authorization = InMemoryEvaluationAuthorizationRegistry(
         (
             RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
+            *(
+                (
+                    RoleGrant(
+                        actor_id=context_reader_actor.actor_id,
+                        role=Role.PUBLISHER,
+                    ),
+                )
+                if context_reader_actor != PUBLISHER
+                else ()
+            ),
             # Deliberate grant proves actor-kind checks still reject MCP writes.
             RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
         ),
@@ -967,7 +978,7 @@ def build_harness(
         evidence_client=evidence_client,
         snapshot_signer=snapshot_signer,
         clock=clock,
-        context_reader_actor=PUBLISHER,
+        context_reader_actor=context_reader_actor,
     )
     service = DemoEvaluationService.from_dependencies(
         context_service=context_resolver.service,

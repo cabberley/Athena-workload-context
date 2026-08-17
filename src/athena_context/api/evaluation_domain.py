@@ -284,6 +284,7 @@ class EvaluationAuthorityToken(ApiModel):
     context: PublishedContextAuthorityToken
     approval: ApprovalAuthorityToken
     authorization: AuthorizationGrantToken
+    context_reader_authorization: AuthorizationGrantToken
     trusted_key: TrustedKeyAuthorityToken
 
 

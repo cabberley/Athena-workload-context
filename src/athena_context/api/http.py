@@ -95,7 +95,10 @@ class SystemClock:
     """Infrastructure clock used only by the default ASGI composition root."""
 
     def now(self) -> datetime:
-        return datetime.now(tz=UTC).replace(microsecond=0)
+        current = datetime.now(tz=UTC)
+        return current.replace(
+            microsecond=(current.microsecond // 1000) * 1000
+        )
 
 
 def _current_actor(

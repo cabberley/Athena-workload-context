@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from threading import RLock
 from types import TracebackType
 from typing import Literal
@@ -19,28 +20,177 @@ from athena_context.api.domain import (
 )
 from athena_context.api.errors import (
     AlreadySupersededError,
+    DemoEvaluationApprovalError,
     DuplicateDraftError,
     DuplicateVersionError,
+    EvaluationFailedClosedError,
     IdempotencyConflictError,
     ResourceNotFoundError,
     StaleRevisionError,
 )
 from athena_context.api.evaluation_domain import (
+    AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
+    DemoEvaluationResult,
     TrustedKeyAuthorityToken,
+    build_authorized_publication,
+    build_demo_evaluation_result,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
     EvaluationTrustedKeyAuthority,
+    PreparedEvaluationArtifact,
     StoredEvaluation,
 )
 from athena_context.api.ports import ClockPort, ContextTransactionPort
-from athena_context.contracts import TrustedKeyAnchor
+from athena_context.contracts import EvidenceSnapshot, TrustedKeyAnchor
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
     return (int(major), int(minor), int(patch))
+
+
+def _finalize_prepared_evaluation(
+    prepared: PreparedEvaluationArtifact,
+    *,
+    published_at: datetime,
+    trusted_key: EvaluationTrustedKeyAuthority,
+) -> StoredEvaluation:
+    """Sealed, bounded finalizer: no callbacks, lookups, hooks, crypto, or policy."""
+
+    validity = prepared.temporal_validity
+    approval = prepared.approval
+    snapshot = prepared.snapshot
+    if (
+        validity.approval_active_from != approval.approved_at
+        or validity.approval_expires_at != approval.expires_at
+        or approval.status != "authorized"
+        or approval.revoked_at is not None
+        or not (
+            validity.approval_active_from
+            <= published_at
+            < validity.approval_expires_at
+        )
+    ):
+        raise DemoEvaluationApprovalError(
+            "demo evaluation approval is not active at the trusted evaluation time"
+        )
+
+    key_record = trusted_key.record
+    if (
+        not key_record.enabled
+        or key_record.activated_at > published_at
+        or (
+            key_record.retired_at is not None
+            and key_record.retired_at <= published_at
+        )
+        or (
+            key_record.expires_at is not None
+            and key_record.expires_at <= published_at
+        )
+        or (
+            trusted_key.revoked_at is not None
+            and trusted_key.revoked_at <= published_at
+        )
+    ):
+        raise EvaluationFailedClosedError(
+            "trusted signing key is disabled, retired, expired, revoked, "
+            "or not active at publication time"
+        )
+
+    if (
+        validity.snapshot_active_from != snapshot.collected_at
+        or validity.snapshot_expires_at != snapshot.expires_at
+        or not (
+            validity.snapshot_active_from
+            <= published_at
+            < validity.snapshot_expires_at
+        )
+    ):
+        raise EvaluationFailedClosedError(
+            "snapshot became stale before publication"
+        )
+    if (
+        validity.governance_active_from is not None
+        and published_at < validity.governance_active_from
+    ) or (
+        validity.governance_expires_at is not None
+        and published_at >= validity.governance_expires_at
+    ):
+        raise EvaluationFailedClosedError(
+            "published context/profile is missing, ambiguous, a superseded "
+            "context, or has inactive governance"
+        )
+    if (
+        validity.risk_active_from is not None
+        and published_at < validity.risk_active_from
+    ) or (
+        validity.risk_expires_at is not None
+        and published_at >= validity.risk_expires_at
+    ):
+        raise EvaluationFailedClosedError(
+            "published context/profile is missing, ambiguous, a superseded "
+            "context, or has inactive governance"
+        )
+    if (
+        validity.evidence_fresh_until is not None
+        and published_at > validity.evidence_fresh_until
+    ):
+        raise EvaluationFailedClosedError(
+            "policy evidence freshness failed at the authoritative publication time"
+        )
+
+    publication = build_authorized_publication(
+        snapshot=snapshot,
+        approval=approval,
+        publisher=prepared.actor,
+        publication_actor=prepared.publication_actor,
+        published_at=published_at,
+        resolved_profile_digest=prepared.resolved_profile_digest,
+        endpoint=prepared.private_mcp_endpoint,
+        scope=prepared.authorized_scope,
+        reason=prepared.reason,
+    )
+    result = build_demo_evaluation_result(
+        publication=publication,
+        snapshot=snapshot,
+        findings=prepared.findings,
+        evaluated_at=published_at,
+    )
+    artifact = StoredEvaluation(
+        actor_id=prepared.actor.actor_id,
+        idempotency_key=prepared.idempotency_key,
+        request_digest=prepared.request_digest,
+        snapshot_id=snapshot.snapshot_id,
+        result_json=result.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        ),
+        snapshot_json=snapshot.canonical_json(),
+        publication_json=publication.model_dump_json(exclude_none=True),
+        envelope_attempt_id=prepared.envelope_attempt_id,
+        envelope=prepared.envelope,
+    )
+    stored_result = DemoEvaluationResult.model_validate_json(
+        artifact.result_json
+    )
+    stored_snapshot = EvidenceSnapshot.model_validate_json(
+        artifact.snapshot_json
+    )
+    stored_publication = AuthorizedSnapshotPublication.model_validate_json(
+        artifact.publication_json
+    )
+    if (
+        stored_result.snapshot.canonical_json()
+        != stored_snapshot.canonical_json()
+        or stored_result.publication != stored_publication
+        or stored_result.publication.snapshot_id != artifact.snapshot_id
+    ):
+        raise ValueError(
+            "stored evaluation components are not canonically identical"
+        )
+    return artifact
 
 
 class InMemoryContextStore:
@@ -413,8 +563,8 @@ class _MemoryTransaction(ContextTransactionPort):
                 "evaluation persistence has no authoritative commit clock"
             )
         # All persistence and cryptographic/policy delay happens before the
-        # insertion timestamp. The returned finalizer is pure, bounded, has no
-        # hook or I/O, and rechecks every temporal predicate at that timestamp.
+        # insertion timestamp. Preparation returns immutable data, never an
+        # executable post-time callback.
         self._store._before_evaluation_commit_timestamp()
         trusted_key = self.get_demo_evaluation_trusted_key(
             trusted_key_anchor
@@ -426,15 +576,19 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 "trusted signing-key authority changed before publication"
             )
-        artifact_factory = artifact_preparation(trusted_key)
+        prepared = artifact_preparation(trusted_key)
         if self._store._transaction_generation != self._base_generation:
             raise StaleRevisionError(
                 "authoritative persistence changed during evaluation preparation"
             )
         published_at = ensure_timestamp(clock.now())
-        artifact = artifact_factory(
-            published_at,
-            trusted_key,
+        # No caller-provided or overridable behavior executes after this read.
+        # The sealed finalizer only compares captured bounds, builds canonical
+        # records, and immediately stages both artifact and receipt.
+        artifact = _finalize_prepared_evaluation(
+            prepared,
+            published_at=published_at,
+            trusted_key=trusted_key,
         )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
         if receipt_key in self._evaluation_receipts:

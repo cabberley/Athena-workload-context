@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+    Actor,
     ActorKind,
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
@@ -20,6 +21,7 @@ from athena_context.api import (
     RoleGrant,
     Wc008DeploymentOutputAssertion,
 )
+from athena_context.api.domain import Permission
 from athena_context.api.errors import (
     AuthorizationError,
     DemoEvaluationApprovalError,
@@ -593,6 +595,143 @@ def test_expiry_during_final_crypto_policy_work_rolls_back_atomically(
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+@pytest.mark.parametrize(
+    ("expiring_condition", "expected_error", "expected_message"),
+    [
+        ("approval", DemoEvaluationApprovalError, "not active"),
+        ("key", EvaluationFailedClosedError, "trusted signing key is"),
+        ("snapshot", EvaluationFailedClosedError, "snapshot became stale"),
+        ("governance", EvaluationFailedClosedError, "inactive governance"),
+        ("riskAcceptance", EvaluationFailedClosedError, "inactive governance"),
+        (
+            "evidenceFreshness",
+            EvaluationFailedClosedError,
+            "policy evidence freshness failed",
+        ),
+    ],
+)
+def test_delay_in_former_post_timestamp_validation_is_sampled_before_commit_time(
+    expiring_condition: str,
+    expected_error: type[Exception],
+    expected_message: str,
+) -> None:
+    expiring_at = CURRENT_NOW + timedelta(seconds=30)
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            override_expires_at=(
+                expiring_at if expiring_condition == "governance" else None
+            ),
+            risk_acceptance_expires_at=(
+                expiring_at
+                if expiring_condition == "riskAcceptance"
+                else None
+            ),
+            production_extends_development=(
+                expiring_condition == "governance"
+            ),
+            evidence_freshness_seconds=(
+                30 if expiring_condition == "evidenceFreshness" else None
+            ),
+        ),
+        approval_expires_at=(
+            expiring_at if expiring_condition == "approval" else None
+        ),
+        trusted_key_expires_at=(
+            expiring_at if expiring_condition == "key" else None
+        ),
+        snapshot_freshness_seconds=(
+            30 if expiring_condition == "snapshot" else 300
+        ),
+    )
+    idempotency_key = f"wc013-{expiring_condition}-sealed-finalizer-expiry"
+    context_service = harness.context_resolver.service
+    original_validation = (
+        context_service._validate_precomputed_finding_time_bounds
+    )
+
+    def delayed_validation(*args: object, **kwargs: object) -> None:
+        original_validation(*args, **kwargs)  # type: ignore[arg-type]
+        harness.clock.advance(timedelta(minutes=1))
+
+    context_service._validate_precomputed_finding_time_bounds = (  # type: ignore[method-assign]
+        delayed_validation
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_context_reader_revocation_during_final_policy_work_rolls_back() -> None:
+    context_reader = Actor(
+        actor_id="wc013-context-reader",
+        kind=ActorKind.SERVICE,
+    )
+    reader_grant = RoleGrant(
+        actor_id=context_reader.actor_id,
+        role=Role.PUBLISHER,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        context_reader_actor=context_reader,
+    )
+    idempotency_key = "wc013-context-reader-revocation-during-policy"
+    context_service = harness.context_resolver.service
+    _, _, authority = context_service.prepare_demo_evaluation_authority(
+        reader_actor=context_reader,
+        actor=PUBLISHER,
+        command=harness.command,
+        as_of=harness.clock.now(),
+        private_mcp_endpoint=PRIVATE_ENDPOINT,
+        evidence_identity_object_id=MCP_OBJECT_ID,
+    )
+    assert authority.context_reader_authorization.actor_id == (
+        context_reader.actor_id
+    )
+    assert authority.context_reader_authorization.permission is Permission.READ
+    original_evaluation = (
+        context_service._evaluate_demo_snapshot_for_publication
+    )
+
+    def revoke_reader(*args: object, **kwargs: object) -> object:
+        result = original_evaluation(*args, **kwargs)  # type: ignore[arg-type]
+        harness.authorization.remove_grant(reader_grant)
+        return result
+
+    context_service._evaluate_demo_snapshot_for_publication = (  # type: ignore[method-assign]
+        revoke_reader
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="authority changed during the publication transaction",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    assert harness.authorization.authorize(
+        PUBLISHER,
+        Permission.PUBLISH,
+        harness.command.manifest_id,
+    ).actor_id == PUBLISHER.actor_id
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
