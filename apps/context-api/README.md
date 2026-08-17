@@ -42,11 +42,17 @@ The integration composes the merged components without introducing direct Azure 
   requires every applicable weakening override and every resolved risk acceptance to be approved
   and active at the trusted evaluation time before MCP collection. The service never renews,
   edits, approves, or publishes a manifest on an agent's behalf.
-- Immediately before the atomic artifact-store commit, the service re-resolves the exact WC-007
-  manifest/version/profile and approval at `publishedAt`, canonically resolves the full profile
-  inheritance chain again, rechecks publisher authority, and requires identities and digests to
-  equal the initial decisions. Approval expiry, inherited override expiry, supersession, or
-  authorization change during collection leaves no receipt, snapshot, or publication.
+- WC-007 profile IDs are bounded NFC+casefold-normalized strings rather than a closed environment
+  enum. The selected ID must resolve in the published manifest; manifest-defined IDs such as
+  `prod-east` use the same canonical inheritance and governance checks.
+- An `EvaluationCommitPort` owns the final conditional transaction. It assigns `publishedAt`
+  inside the transaction, reads the exact active unsuperseded WC-007 context revision/ETag,
+  approval revision/status/expiry, and actor grant revision, canonically resolves the full profile
+  inheritance chain at that time, compares typed authority tokens captured before collection, and
+  inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
+  change. The in-memory adapter uses the same coordinator lock as `ContextService`, its approval
+  registry, and its grant registry. Approval revoke/expiry, inherited override expiry,
+  supersession, authorization removal, or revision change after evaluation leaves no artifact.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
   RS256 attestation; production composition must back it with the configured versioned Key Vault
   key and managed identity rather than key material in configuration.
@@ -79,12 +85,16 @@ $env:ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST = 'sha256:<exact assertion diges
 $env:ATHENA_WC013_MANIFEST_ID = '<active published manifest ID>'
 $env:ATHENA_WC013_MANIFEST_VERSION = '<active published manifest version>'
 $env:ATHENA_WC013_PROFILE_ID = '<active profile ID>'
+$env:ATHENA_WC013_CONTEXT_API_ENDPOINT = 'https://<private-context-api-origin>'
+$env:ATHENA_WC013_CONTEXT_API_AUDIENCE = 'api://<context-api-app-id>'
 python -m pytest tests/test_wc013_live.py -m live
 ```
 
-The probe sends only an unauthenticated synthetic `tools/list` request and requires HTTP 401 or
-403. It does not deploy resources, acquire credentials, collect workload evidence, or use customer
-data.
+Before accessing MCP, the live path uses `DefaultAzureCredential` to resolve that exact selection
+from the authoritative Context API and rejects missing, expired, malformed, or superseded context.
+The probe then sends only an unauthenticated synthetic `tools/list` request and requires HTTP 401
+or 403. It does not deploy resources, collect workload evidence, or use customer data.
+
 ## Cohort proposal routes
 
 - `GET /v1/cohort-proposals` resolves one exact active draft/profile binding, retrieves an

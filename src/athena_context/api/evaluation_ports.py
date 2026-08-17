@@ -9,13 +9,18 @@ from athena_context.api.domain import (
     Permission,
 )
 from athena_context.api.evaluation_domain import (
+    AuthorizationGrantToken,
     DemoEvaluationApproval,
+    DemoEvaluationCommand,
     DemoEvaluationResult,
+    EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
 )
 from athena_context.contracts import (
+    EvidenceSnapshot,
+    ManifestFinding,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
     TrustedKeyResolver,
@@ -46,6 +51,22 @@ class StoredEvaluation:
     publication_json: str
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationCommitCandidate:
+    """Evaluated immutable inputs awaiting one conditional authority transaction."""
+
+    actor: Actor
+    idempotency_key: str
+    request_digest: str
+    command: DemoEvaluationCommand
+    snapshot: EvidenceSnapshot
+    findings: tuple[ManifestFinding, ...]
+    envelope_attempt_id: str
+    envelope: ValidatedEnvelope
+    expected_authority: EvaluationAuthorityToken
+    private_mcp_endpoint: str
 
 
 class ConfiguredEvidenceClientPort(Protocol):
@@ -85,10 +106,18 @@ class SnapshotSigningPort(Protocol):
     def sign(self, request: SnapshotSigningRequest) -> str: ...
 
 
-class EvaluationArtifactStorePort(Protocol):
+class EvaluationCommitPort(Protocol):
+    """Conditionally finalize and insert an evaluation in one authority transaction.
+
+    Production adapters must compare every typed authority revision/ETag and
+    perform the artifact insert in the same backing-store transaction or
+    conditional batch. A resolver call followed by an independent write does
+    not implement this port.
+    """
+
     def load_receipt(self, actor_id: str, idempotency_key: str) -> StoredEvaluation | None: ...
 
-    def commit(self, artifact: StoredEvaluation) -> None: ...
+    def commit(self, candidate: EvaluationCommitCandidate) -> DemoEvaluationResult: ...
 
     def resolve_publication(self, snapshot_id: str) -> SnapshotPublicationRecord | None: ...
 
@@ -96,13 +125,19 @@ class EvaluationArtifactStorePort(Protocol):
 
 
 class EvaluationAuthorizationPort(Protocol):
-    def require(self, actor: Actor, permission: Permission, manifest_id: str) -> None: ...
+    def authorize(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str,
+    ) -> AuthorizationGrantToken: ...
 
 
 __all__ = [
     "ConfiguredEvidenceClientPort",
     "DemoEvaluationApprovalResolverPort",
-    "EvaluationArtifactStorePort",
+    "EvaluationCommitCandidate",
+    "EvaluationCommitPort",
     "EvaluationAuthorizationPort",
     "PublishedContextResolverPort",
     "SnapshotSigningPort",

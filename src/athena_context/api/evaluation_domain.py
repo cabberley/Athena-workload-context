@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, BeforeValidator, Field, model_validator
 
 from athena_context.api.domain import (
     Actor,
     ActorKind,
     ApiModel,
+    Permission,
     PublishedManifestView,
 )
 from athena_context.contracts import (
@@ -21,6 +22,7 @@ from athena_context.contracts import (
     canonicalize_json,
     compute_artifact_digest,
 )
+from athena_context.contracts.common import normalize_nfc_text
 from athena_context.evidence import EvidenceResponseBounds
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
@@ -35,6 +37,19 @@ _GUID_PATTERN = (
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 _PLACEHOLDER_DIGEST = "sha256:" + ("0" * 64)
+
+
+def _normalize_profile_id(value: object) -> object:
+    if isinstance(value, str):
+        return normalize_nfc_text(value).casefold()
+    return value
+
+
+NormalizedProfileId = Annotated[
+    str,
+    BeforeValidator(_normalize_profile_id),
+    Field(min_length=1, max_length=128),
+]
 
 AZURE_MCP_2_0_5_ALLOWED_TOOLS: tuple[str, ...] = (
     "group_resource_list",
@@ -218,7 +233,80 @@ class PublishedContextSelection(ApiModel):
         default=None,
         pattern=_VERSION_PATTERN,
     )
-    profile_id: str = Field(min_length=1, max_length=128)
+    profile_id: NormalizedProfileId
+
+
+class PublishedContextAuthorityToken(ApiModel):
+    """Opaque-revision contract for a resolved immutable WC-007 publication."""
+
+    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    source_draft_id: str = Field(pattern=_ID_PATTERN)
+    revision: int = Field(ge=1)
+    etag: str = Field(pattern=_DIGEST_PATTERN)
+    profile_id: NormalizedProfileId
+    resolved_profile_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
+class ApprovalAuthorityToken(ApiModel):
+    """Revision and digest expected from a transactional approval registry."""
+
+    decision_id: str = Field(pattern=_ID_PATTERN)
+    revision: int = Field(ge=1)
+    decision_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
+class AuthorizationGrantToken(ApiModel):
+    """Revision and digest for the exact actor permission checked at commit."""
+
+    actor_id: str = Field(pattern=_ID_PATTERN)
+    permission: Permission
+    manifest_id: str = Field(min_length=1, max_length=128)
+    grant_revision: int = Field(ge=1)
+    grant_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+
+class EvaluationAuthorityToken(ApiModel):
+    """All optimistic authority revisions a production commit must compare."""
+
+    context: PublishedContextAuthorityToken
+    approval: ApprovalAuthorityToken
+    authorization: AuthorizationGrantToken
+
+
+def build_published_context_authority_token(
+    view: PublishedManifestView,
+    profile: ResolvedManifestProfile,
+) -> PublishedContextAuthorityToken:
+    published = view.published
+    revision = published.source_draft_revision + (
+        1 if view.supersession is not None else 0
+    )
+    payload = {
+        "manifestId": published.manifest_id,
+        "manifestVersion": published.manifest_version,
+        "manifestDigest": published.manifest_digest,
+        "sourceDraftId": published.source_draft_id,
+        "revision": revision,
+        "supersession": (
+            None
+            if view.supersession is None
+            else view.supersession.model_dump(mode="json")
+        ),
+        "profileId": profile.profile_id,
+        "resolvedProfileDigest": profile.resolved_profile_digest,
+    }
+    return PublishedContextAuthorityToken(
+        manifest_id=published.manifest_id,
+        manifest_version=published.manifest_version,
+        manifest_digest=published.manifest_digest,
+        source_draft_id=published.source_draft_id,
+        revision=revision,
+        etag=compute_artifact_digest(payload),
+        profile_id=profile.profile_id,
+        resolved_profile_digest=profile.resolved_profile_digest,
+    )
 
 
 class ResolvedPublishedContext(ApiModel):
@@ -226,6 +314,7 @@ class ResolvedPublishedContext(ApiModel):
 
     view: PublishedManifestView
     profile: ResolvedManifestProfile
+    authority_token: PublishedContextAuthorityToken
 
     @model_validator(mode="after")
     def validate_identity(self) -> ResolvedPublishedContext:
@@ -233,9 +322,11 @@ class ResolvedPublishedContext(ApiModel):
         if (
             self.profile.manifest_id != published.manifest_id
             or self.profile.manifest_version != published.manifest_version
+            or self.authority_token
+            != build_published_context_authority_token(self.view, self.profile)
         ):
             raise ValueError(
-                "resolved profile does not match the published manifest identity"
+                "resolved profile or authority token does not match the publication"
             )
         return self
 
@@ -297,14 +388,16 @@ class DemoEvaluationApproval(ApiModel):
     """Human decision loaded from a trusted approval registry, never from the request body."""
 
     decision_id: str = Field(pattern=_ID_PATTERN)
-    status: Literal["authorized"]
+    status: Literal["authorized", "revoked"]
+    revision: int = Field(default=1, ge=1)
+    revoked_at: AwareDatetime | None = None
     approved_by: Actor
     approved_at: AwareDatetime
     expires_at: AwareDatetime
     manifest_id: str = Field(min_length=1, max_length=128)
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
-    profile_id: Literal["production", "development", "training"]
+    profile_id: NormalizedProfileId
     authorized_scope: EvidenceScope
     private_mcp_endpoint: str = Field(min_length=12, max_length=2048)
     evidence_identity_object_id: str = Field(pattern=_GUID_PATTERN)
@@ -316,7 +409,22 @@ class DemoEvaluationApproval(ApiModel):
             raise ValueError("demo evaluation approval must be a human decision")
         if self.expires_at <= self.approved_at:
             raise ValueError("demo evaluation approval must expire after approval")
+        if self.status == "authorized" and self.revoked_at is not None:
+            raise ValueError("an authorized demo evaluation approval cannot be revoked")
+        if self.status == "revoked" and (
+            self.revoked_at is None or self.revoked_at < self.approved_at
+        ):
+            raise ValueError("a revoked demo evaluation approval requires revokedAt")
         return self
+
+    def authority_token(self) -> ApprovalAuthorityToken:
+        return ApprovalAuthorityToken(
+            decision_id=self.decision_id,
+            revision=self.revision,
+            decision_digest=compute_artifact_digest(
+                self.model_dump(mode="json", by_alias=True, exclude_none=True)
+            ),
+        )
 
 
 class DemoEvaluationCommand(ApiModel):
@@ -324,9 +432,9 @@ class DemoEvaluationCommand(ApiModel):
     attempt_id: str = Field(pattern=r"^attempt-[a-f0-9]{12}$")
     snapshot_id: str = Field(pattern=r"^snap-[a-f0-9]{12}$")
     manifest_id: str = Field(min_length=1, max_length=128)
-    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
     expected_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
-    profile_id: Literal["production", "development", "training"]
+    profile_id: NormalizedProfileId
     expected_resolved_profile_digest: str = Field(pattern=_DIGEST_PATTERN)
     authorized_scope: EvidenceScope
     bounds: EvidenceResponseBounds
@@ -540,18 +648,23 @@ __all__ = [
     "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
     "AZURE_MCP_2_0_5_CATALOG_HASH",
     "AZURE_MCP_2_0_5_IMAGE_DIGEST",
+    "ApprovalAuthorityToken",
     "AuthorizedSnapshotPublication",
+    "AuthorizationGrantToken",
     "DemoEvaluationApproval",
     "DemoEvaluationCommand",
     "DemoEvaluationResult",
+    "EvaluationAuthorityToken",
     "McpReadAssignment",
     "OperatorDeploymentApproval",
+    "PublishedContextAuthorityToken",
     "PublishedContextSelection",
     "ResolvedPublishedContext",
     "VerifiedWc008DeploymentConfiguration",
     "Wc008DeploymentOutputAssertion",
     "build_authorized_publication",
     "build_demo_evaluation_result",
+    "build_published_context_authority_token",
     "build_wc008_deployment_assertion",
     "publication_digest_payload",
 ]

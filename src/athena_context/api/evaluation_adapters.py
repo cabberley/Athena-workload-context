@@ -5,10 +5,14 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
-from pydantic import ValidationError
+from azure.identity import DefaultAzureCredential
+from pydantic import TypeAdapter, ValidationError
 
-from athena_context.api.domain import Actor
+from athena_context.api.domain import Actor, PublishedManifestView
 from athena_context.api.errors import (
     AmbiguousLookupError,
     DemoEvaluationConfigurationError,
@@ -21,7 +25,9 @@ from athena_context.api.evaluation_domain import (
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     Wc008DeploymentOutputAssertion,
+    build_published_context_authority_token,
 )
+from athena_context.api.memory import InMemoryAuthorityCoordinator
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
     TrustedKeyAnchor,
@@ -50,6 +56,127 @@ class PrivateMcpInvokerPort(Protocol):
         deployment_tool_name: str,
         request: EvidenceTransportRequest,
     ) -> McpTransportOutcome: ...
+
+
+class ContextApiAccessTokenPort(Protocol):
+    def get_token(self, audience: str) -> str: ...
+
+
+class PublishedContextReaderPort(Protocol):
+    def get_published(
+        self,
+        manifest_id: str,
+        manifest_version: str,
+    ) -> PublishedManifestView: ...
+
+    def list_published(self, manifest_id: str) -> tuple[PublishedManifestView, ...]: ...
+
+
+class DefaultAzureCredentialContextApiToken:
+    """Keyless Context API token provider for explicitly configured live runs."""
+
+    def __init__(self) -> None:
+        self._credential = DefaultAzureCredential()
+
+    def get_token(self, audience: str) -> str:
+        scope = f"{audience.rstrip('/')}/.default"
+        return self._credential.get_token(scope).token
+
+
+class EnvironmentContextApiPublishedContextReader:
+    """Bounded HTTPS reader for the authoritative deployed Context API."""
+
+    _MAX_RESPONSE_BYTES = 4_194_304
+
+    def __init__(
+        self,
+        environment: Mapping[str, str] | None = None,
+        *,
+        token_provider: ContextApiAccessTokenPort | None = None,
+    ) -> None:
+        values = dict(os.environ if environment is None else environment)
+        endpoint = values.get("ATHENA_WC013_CONTEXT_API_ENDPOINT", "").rstrip("/")
+        audience = values.get("ATHENA_WC013_CONTEXT_API_AUDIENCE", "")
+        parsed = urlsplit(endpoint)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise DemoEvaluationConfigurationError(
+                "live Context API endpoint must be a trusted HTTPS origin"
+            )
+        if (
+            not audience.strip()
+            or audience != audience.strip()
+            or len(audience) > 512
+        ):
+            raise DemoEvaluationConfigurationError(
+                "live Context API managed identity audience is required"
+            )
+        self._endpoint = endpoint
+        self._audience = audience
+        self._token_provider = (
+            token_provider or DefaultAzureCredentialContextApiToken()
+        )
+
+    def get_published(
+        self,
+        manifest_id: str,
+        manifest_version: str,
+    ) -> PublishedManifestView:
+        path = (
+            f"/v1/manifests/{quote(manifest_id, safe='')}/versions/"
+            f"{quote(manifest_version, safe='')}"
+        )
+        return PublishedManifestView.model_validate_json(self._request(path))
+
+    def list_published(
+        self,
+        manifest_id: str,
+    ) -> tuple[PublishedManifestView, ...]:
+        path = f"/v1/manifests/{quote(manifest_id, safe='')}/versions"
+        return tuple(
+            TypeAdapter(list[PublishedManifestView]).validate_json(
+                self._request(path)
+            )
+        )
+
+    def _request(self, path: str) -> bytes:
+        credential = self._token_provider.get_token(self._audience)
+        request = Request(  # noqa: S310 - endpoint was restricted to HTTPS above
+            f"{self._endpoint}{path}",
+            headers={
+                "Accept": "application/json",
+                "Cache-Control": "no-store",
+                "Authorization": f"Bearer {credential}",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=10) as response:  # noqa: S310
+                content = response.read(self._MAX_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise ResourceNotFoundError(
+                    "selected published Context API record was not found"
+                ) from exc
+            raise DemoEvaluationConfigurationError(
+                "authoritative Context API rejected the live resolution"
+            ) from exc
+        except URLError as exc:
+            raise DemoEvaluationConfigurationError(
+                "authoritative Context API is unavailable"
+            ) from exc
+        if not content or len(content) > self._MAX_RESPONSE_BYTES:
+            raise DemoEvaluationConfigurationError(
+                "authoritative Context API response exceeded its bound"
+            )
+        return content
 
 
 class PrivateMcpEvidenceTransport:
@@ -245,12 +372,11 @@ class EnvironmentWc007PublishedContextSelectionPort:
         return value
 
 
-class ContextServicePublishedContextResolver:
-    """Resolve context only through the authorized WC-007 service, never its store."""
+class ContextApiPublishedContextResolver:
+    """Production read adapter resolving only authoritative Context API responses."""
 
-    def __init__(self, *, service: ContextService, reader_actor: Actor) -> None:
-        self._service = service
-        self._reader_actor = reader_actor
+    def __init__(self, reader: PublishedContextReaderPort) -> None:
+        self._reader = reader
 
     def resolve(
         self,
@@ -261,10 +387,7 @@ class ContextServicePublishedContextResolver:
         if selection.manifest_version is None:
             active = [
                 view
-                for view in self._service.list_published(
-                    self._reader_actor,
-                    selection.manifest_id,
-                )
+                for view in self._reader.list_published(selection.manifest_id)
                 if view.supersession is None
             ]
             if not active:
@@ -277,10 +400,9 @@ class ContextServicePublishedContextResolver:
                 )
             view = active[0]
         else:
-            view = self._service.get_published(
-                self._reader_actor,
+            view = self._reader.get_published(
+                selection.manifest_id,
                 selection.manifest_version,
-                manifest_id=selection.manifest_id,
             )
         profile = resolve_manifest_profile(
             view.published.manifest,
@@ -290,7 +412,72 @@ class ContextServicePublishedContextResolver:
         return ResolvedPublishedContext(
             view=view,
             profile=profile,
+            authority_token=build_published_context_authority_token(
+                view,
+                profile,
+            ),
         )
+
+
+class ContextServicePublishedContextReader:
+    """Authorized in-process reader backed by real ContextService state."""
+
+    def __init__(self, *, service: ContextService, reader_actor: Actor) -> None:
+        self._service = service
+        self._reader_actor = reader_actor
+
+    def get_published(
+        self,
+        manifest_id: str,
+        manifest_version: str,
+    ) -> PublishedManifestView:
+        return self._service.get_published(
+            self._reader_actor,
+            manifest_version,
+            manifest_id=manifest_id,
+        )
+
+    def list_published(
+        self,
+        manifest_id: str,
+    ) -> tuple[PublishedManifestView, ...]:
+        return tuple(
+            self._service.list_published(
+                self._reader_actor,
+                manifest_id,
+            )
+        )
+
+
+class ContextServicePublishedContextResolver:
+    """Resolve context only through the authorized WC-007 service, never its store."""
+
+    def __init__(
+        self,
+        *,
+        service: ContextService,
+        reader_actor: Actor,
+        authority_coordinator: InMemoryAuthorityCoordinator | None = None,
+    ) -> None:
+        self._resolver = ContextApiPublishedContextResolver(
+            ContextServicePublishedContextReader(
+                service=service,
+                reader_actor=reader_actor,
+            )
+        )
+        self._authority_coordinator = authority_coordinator
+
+    def resolve(
+        self,
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext:
+        return self._resolver.resolve(selection, as_of=as_of)
+
+    @property
+    def authority_coordinator(self) -> InMemoryAuthorityCoordinator | None:
+        return self._authority_coordinator
 
 
 class StaticDemoEvaluationApprovalResolver:
@@ -303,11 +490,67 @@ class StaticDemoEvaluationApprovalResolver:
         return self._approvals.get(decision_id)
 
 
+class InMemoryDemoEvaluationApprovalRegistry:
+    """Revisioned approval registry coordinated with in-memory context commits."""
+
+    def __init__(
+        self,
+        approvals: Iterable[DemoEvaluationApproval],
+        *,
+        coordinator: InMemoryAuthorityCoordinator,
+    ) -> None:
+        self._coordinator = coordinator
+        self._approvals = {
+            approval.decision_id: approval for approval in approvals
+        }
+
+    def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
+        with self._coordinator.transaction():
+            return self._approvals.get(decision_id)
+
+    def revoke(self, decision_id: str, *, revoked_at: datetime) -> None:
+        with self._coordinator.transaction():
+            current = self._approvals.get(decision_id)
+            if current is None:
+                raise ResourceNotFoundError(
+                    f"demo evaluation approval {decision_id!r} was not found"
+                )
+            if current.status == "revoked":
+                return
+            self._approvals[decision_id] = current.model_copy(
+                update={
+                    "status": "revoked",
+                    "revision": current.revision + 1,
+                    "revoked_at": revoked_at,
+                }
+            )
+
+    def replace(self, approval: DemoEvaluationApproval) -> None:
+        """Replace one decision only with its next monotonic registry revision."""
+
+        with self._coordinator.transaction():
+            current = self._approvals.get(approval.decision_id)
+            if current is None or approval.revision != current.revision + 1:
+                raise DemoEvaluationConfigurationError(
+                    "approval replacement requires the next registry revision"
+                )
+            self._approvals[approval.decision_id] = approval
+
+    @property
+    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
+        return self._coordinator
+
+
 __all__ = [
     "AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL",
+    "ContextApiPublishedContextResolver",
+    "ContextServicePublishedContextReader",
     "ContextServicePublishedContextResolver",
+    "DefaultAzureCredentialContextApiToken",
+    "EnvironmentContextApiPublishedContextReader",
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
+    "InMemoryDemoEvaluationApprovalRegistry",
     "OperatorTrustedWc008ConfigurationPort",
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",

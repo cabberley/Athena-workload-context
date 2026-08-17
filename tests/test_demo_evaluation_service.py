@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -9,24 +9,28 @@ from pydantic import ValidationError
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
+    ContextService,
+    ContextServicePublishedContextResolver,
+    EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
+    InMemoryAuthorityCoordinator,
+    InMemoryContextStore,
+    InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
     PublishedContextSelection,
-    ResolvedPublishedContext,
+    Role,
+    RoleGrant,
     Wc008DeploymentOutputAssertion,
 )
-from athena_context.api.domain import Supersession
 from athena_context.api.errors import (
-    AmbiguousLookupError,
     AuthorizationError,
     DemoEvaluationApprovalError,
     DemoEvaluationConfigurationError,
     EvaluationFailedClosedError,
     EvidenceCollectionRejectedError,
     IdempotencyConflictError,
-    ResourceNotFoundError,
 )
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.contracts import (
@@ -44,6 +48,7 @@ from wc013_support import (
     PRIVATE_ENDPOINT,
     PUBLICATION_SERVICE,
     PUBLISHER,
+    DemoHarness,
     build_current_synthetic_manifest,
     build_harness,
     deployment_assertion,
@@ -174,14 +179,88 @@ def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None
     } == EXPECTED_VERDICTS
 
 
-def test_approval_expiry_during_collection_aborts_atomic_publication() -> None:
+def test_manifest_defined_prod_east_profile_normalizes_and_evaluates() -> None:
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        add_prod_east=True,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        profile_id="PROD-EAST",
+    )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-prod-east",
+        harness.command,
+    )
+
+    assert harness.command.profile_id == "prod-east"
+    assert harness.approval.profile_id == "prod-east"
+    assert result.publication.profile_id == "prod-east"
+    assert {
+        finding.clause_id: finding.verdict for finding in result.findings
+    } == EXPECTED_VERDICTS
+
+
+def test_unknown_normalized_profile_rejects_before_mcp_collection() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            add_prod_east=True,
+        ),
+    )
+    changed_approval = type(harness.approval).model_validate(
+        {
+            **harness.approval.model_dump(mode="python"),
+            "profile_id": "unknown-region",
+            "revision": harness.approval.revision + 1,
+        }
+    )
+    harness.approval_registry.replace(changed_approval)
+    command = type(harness.command).model_validate(
+        {
+            **harness.command.model_dump(mode="python"),
+            "profile_id": "UNKNOWN-REGION",
+        }
+    )
+
+    with pytest.raises(EvaluationFailedClosedError, match="missing, ambiguous"):
+        harness.service.evaluate(
+            PUBLISHER,
+            "wc013-unknown-profile",
+            command,
+        )
+
+    assert command.profile_id == "unknown-region"
+    assert harness.transport.calls == 0
+    assert harness.store.publication_count == 0
+
+
+def _assert_no_artifact(
+    *,
+    harness: DemoHarness,
+    idempotency_key: str,
+) -> None:
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_approval_expiry_after_final_evaluation_aborts_conditional_commit() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(
         as_of=CURRENT_NOW,
         manifest=manifest,
-        approval_expires_at=CURRENT_NOW + timedelta(seconds=1),
+        approval_expires_at=CURRENT_NOW + timedelta(seconds=30),
     )
     idempotency_key = "wc013-approval-expiry-race"
+    harness.commit_hook.before_commit = lambda: harness.clock.advance(
+        timedelta(minutes=1)
+    )
 
     with pytest.raises(
         DemoEvaluationApprovalError,
@@ -195,47 +274,39 @@ def test_approval_expiry_during_collection_aborts_atomic_publication() -> None:
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
-    assert harness.context_resolver.calls == 2
-    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
-    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
-    assert harness.store.resolve_result(harness.command.snapshot_id) is None
-    assert harness.store.publication_count == 0
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
-def test_supersession_during_collection_aborts_atomic_publication() -> None:
-    harness = build_harness()
-    resolver = harness.context_resolver
+def test_approval_revoke_after_final_evaluation_aborts_conditional_commit() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-approval-revoke-race"
+    harness.commit_hook.before_commit = lambda: harness.approval_registry.revoke(
+        harness.approval.decision_id,
+        revoked_at=harness.clock.value,
+    )
 
-    class SupersedingResolver:
-        def __init__(self) -> None:
-            self.calls = 0
+    with pytest.raises(DemoEvaluationApprovalError, match="not active"):
+        harness.service.evaluate(PUBLISHER, idempotency_key, harness.command)
 
-        def resolve(
-            self,
-            selection: PublishedContextSelection,
-            *,
-            as_of: datetime,
-        ) -> ResolvedPublishedContext:
-            self.calls += 1
-            if self.calls == 2:
-                published = resolver.view.published
-                resolver.view = resolver.view.model_copy(
-                    update={
-                        "supersession": Supersession(
-                            manifest_id=published.manifest_id,
-                            superseded_version=published.manifest_version,
-                            replacement_version="9.9.9",
-                            superseded_by=PUBLISHER,
-                            superseded_at=published.published_at,
-                            reason="A human-authorized replacement won the race",
-                        )
-                    }
-                )
-            return resolver.resolve(selection, as_of=as_of)
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
-    mutable_resolver = SupersedingResolver()
-    harness.service._context_resolver = mutable_resolver  # type: ignore[attr-defined]
+
+def test_supersession_after_final_evaluation_aborts_conditional_commit() -> None:
+    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    harness = build_harness(as_of=CURRENT_NOW, manifest=manifest)
+    replacement = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        manifest_version="2.1.0",
+    )
     idempotency_key = "wc013-supersession-race"
+    harness.commit_hook.before_commit = lambda: (
+        harness.context_resolver.supersede_with(replacement)
+    )
 
     with pytest.raises(EvaluationFailedClosedError, match="superseded"):
         harness.service.evaluate(
@@ -244,19 +315,49 @@ def test_supersession_during_collection_aborts_atomic_publication() -> None:
             harness.command,
         )
 
-    assert mutable_resolver.calls == 2
+    assert harness.context_resolver.calls == 2
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
-    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
-    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
-    assert harness.store.resolve_result(harness.command.snapshot_id) is None
-    assert harness.store.publication_count == 0
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
-def test_inherited_parent_override_expiry_is_canonically_reresolved_at_commit() -> None:
+def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    idempotency_key = "wc013-authorization-removal-race"
+    harness.commit_hook.before_commit = lambda: harness.authorization.remove_grant(
+        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    )
+
+    with pytest.raises(AuthorizationError, match="not authorized"):
+        harness.service.evaluate(PUBLISHER, idempotency_key, harness.command)
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_in_memory_commit_rejects_independent_authority_locks() -> None:
+    harness = build_harness()
+
+    with pytest.raises(ValueError, match="does not share"):
+        InMemoryEvaluationCommitPort(
+            coordinator=InMemoryAuthorityCoordinator(),
+            context_resolver=harness.context_resolver,
+            approval_resolver=harness.approval_registry,
+            authorization=harness.authorization,
+            clock=harness.clock,
+            publication_actor=PUBLICATION_SERVICE,
+            evidence_identity_object_id=MCP_OBJECT_ID,
+        )
+
+
+def test_inherited_override_expiry_after_evaluation_aborts_conditional_commit() -> None:
     manifest = build_current_synthetic_manifest(
         as_of=CURRENT_NOW,
-        override_expires_at=CURRENT_NOW + timedelta(seconds=1),
+        override_expires_at=CURRENT_NOW + timedelta(seconds=30),
         production_extends_development=True,
     )
     harness = build_harness(
@@ -282,6 +383,9 @@ def test_inherited_parent_override_expiry_is_canonically_reresolved_at_commit() 
     )
 
     idempotency_key = "wc013-inherited-override-expiry-race"
+    harness.commit_hook.before_commit = lambda: harness.clock.advance(
+        timedelta(minutes=1)
+    )
     with pytest.raises(
         EvaluationFailedClosedError,
         match="inactive governance",
@@ -295,10 +399,7 @@ def test_inherited_parent_override_expiry_is_canonically_reresolved_at_commit() 
     assert harness.context_resolver.calls == 2
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
-    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
-    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
-    assert harness.store.resolve_result(harness.command.snapshot_id) is None
-    assert harness.store.publication_count == 0
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
 @pytest.mark.parametrize(
@@ -340,24 +441,23 @@ def test_expired_published_manifest_governance_rejects_before_collection(
     assert harness.store.publication_count == 0
 
 
-@pytest.mark.parametrize(
-    "resolution_error",
-    [
-        ResourceNotFoundError("selected published context is missing"),
-        AmbiguousLookupError("selected published context is ambiguous"),
-    ],
-)
-def test_missing_or_ambiguous_published_context_fails_before_collection(
-    resolution_error: Exception,
-) -> None:
-    harness = build_harness()
-
-    class FailingPublishedContextResolver:
-        def resolve(self, *_args: object, **_kwargs: object) -> object:
-            raise resolution_error
-
-    harness.service._context_resolver = (  # type: ignore[attr-defined]
-        FailingPublishedContextResolver()
+def test_empty_context_service_state_fails_before_collection() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    empty_service = ContextService(
+        store=InMemoryContextStore(
+            coordinator=harness.context_resolver.coordinator
+        ),
+        authorization=harness.authorization,
+        clock=harness.clock,
+        publication_actor=PUBLICATION_SERVICE,
+    )
+    harness.service._context_resolver = ContextServicePublishedContextResolver(  # type: ignore[attr-defined]
+        service=empty_service,
+        reader_actor=PUBLISHER,
+        authority_coordinator=harness.context_resolver.coordinator,
     )
     with pytest.raises(
         EvaluationFailedClosedError,
@@ -369,6 +469,34 @@ def test_missing_or_ambiguous_published_context_fails_before_collection(
             harness.command,
         )
 
+    assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.publication_count == 0
+
+
+def test_multiple_real_active_versions_execute_production_ambiguity_branch() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    harness.context_resolver.publish_additional_active(
+        build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            manifest_version="2.1.0",
+        )
+    )
+    unique_selection = harness.command.model_copy(
+        update={"manifest_version": None}
+    )
+
+    with pytest.raises(EvaluationFailedClosedError, match="missing, ambiguous"):
+        harness.service.evaluate(
+            PUBLISHER,
+            "wc013-real-ambiguous-context",
+            unique_selection,
+        )
+
+    assert harness.context_resolver.calls == 1
     assert harness.transport.calls == 0
     assert harness.snapshot_signer.calls == 0
     assert harness.store.publication_count == 0
@@ -495,20 +623,15 @@ def test_untrusted_snapshot_signature_fails_before_publication() -> None:
 
 
 def test_superseded_context_fails_before_collection() -> None:
-    harness = build_harness()
-    published = harness.context_resolver.view.published
-
-    harness.context_resolver.view = harness.context_resolver.view.model_copy(
-        update={
-            "supersession": Supersession(
-                manifest_id=published.manifest_id,
-                superseded_version=published.manifest_version,
-                replacement_version="1.2.0",
-                superseded_by=PUBLISHER,
-                superseded_at=published.published_at,
-                reason="Synthetic replacement has become authoritative",
-            )
-        }
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    harness.context_resolver.supersede_with(
+        build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            manifest_version="2.1.0",
+        )
     )
 
     with pytest.raises(EvaluationFailedClosedError, match="superseded context"):
@@ -722,6 +845,29 @@ def test_live_context_selection_requires_exact_manifest_version_and_profile() ->
                 "ATHENA_WC013_PROFILE_ID": "production",
             }
         ).load()
+
+
+def test_live_context_reader_requires_https_origin_and_managed_identity_audience() -> None:
+    class NoopTokenProvider:
+        def get_token(self, audience: str) -> str:
+            del audience
+            return "synthetic-unused-token"
+
+    with pytest.raises(DemoEvaluationConfigurationError, match="HTTPS origin"):
+        EnvironmentContextApiPublishedContextReader(
+            {
+                "ATHENA_WC013_CONTEXT_API_ENDPOINT": "http://context.invalid",
+                "ATHENA_WC013_CONTEXT_API_AUDIENCE": "api://context",
+            },
+            token_provider=NoopTokenProvider(),
+        )
+    with pytest.raises(DemoEvaluationConfigurationError, match="audience"):
+        EnvironmentContextApiPublishedContextReader(
+            {
+                "ATHENA_WC013_CONTEXT_API_ENDPOINT": "https://context.internal",
+            },
+            token_provider=NoopTokenProvider(),
+        )
 
 
 def test_live_configuration_adapter_fails_closed_for_missing_or_malformed_input(

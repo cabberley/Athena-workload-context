@@ -4,6 +4,16 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
+from athena_context.api.domain import Actor, ActorKind
+from athena_context.api.errors import (
+    DemoEvaluationApprovalError,
+    EvaluationFailedClosedError,
+)
+from athena_context.api.evaluation_domain import (
+    DemoEvaluationApproval,
+    DemoEvaluationCommand,
+    ResolvedPublishedContext,
+)
 from athena_context.binding.selectors import evaluate_selector, normalize_resource_id
 from athena_context.contracts import (
     AthenaValidationError,
@@ -81,6 +91,81 @@ def resolve_active_manifest_profile(
         as_of=as_of,
     )
     return profile
+
+
+def validate_demo_evaluation_approval(
+    actor: Actor,
+    command: DemoEvaluationCommand,
+    approval: DemoEvaluationApproval,
+    *,
+    as_of: datetime,
+    private_mcp_endpoint: str,
+    evidence_identity_object_id: str,
+) -> None:
+    """Require one active human decision bound to the exact evaluation request."""
+
+    if (
+        approval.status != "authorized"
+        or approval.approved_at > as_of
+        or approval.expires_at <= as_of
+        or approval.revoked_at is not None
+    ):
+        raise DemoEvaluationApprovalError(
+            "demo evaluation approval is not active at the trusted evaluation time"
+        )
+    if (
+        approval.decision_id != command.approval_decision_id
+        or approval.manifest_id != command.manifest_id
+        or (
+            command.manifest_version is not None
+            and approval.manifest_version != command.manifest_version
+        )
+        or approval.manifest_digest != command.expected_manifest_digest
+        or approval.profile_id != command.profile_id
+        or approval.authorized_scope.canonical_json()
+        != command.authorized_scope.canonical_json()
+        or approval.private_mcp_endpoint != private_mcp_endpoint
+        or approval.evidence_identity_object_id != evidence_identity_object_id
+    ):
+        raise DemoEvaluationApprovalError(
+            "approval does not authorize this exact endpoint, identity, context, and scope"
+        )
+    if actor.kind is not ActorKind.HUMAN:
+        raise DemoEvaluationApprovalError(
+            "only an authorized human publisher may execute an approval"
+        )
+
+
+def validate_published_context_binding(
+    command: DemoEvaluationCommand,
+    approval: DemoEvaluationApproval,
+    context: ResolvedPublishedContext,
+) -> None:
+    """Bind an exact or uniquely selected WC-007 version to its approval."""
+
+    published = context.view.published
+    profile = context.profile
+    if (
+        published.manifest_id != command.manifest_id
+        or (
+            command.manifest_version is not None
+            and published.manifest_version != command.manifest_version
+        )
+        or published.manifest_version != approval.manifest_version
+        or published.manifest_digest != command.expected_manifest_digest
+        or published.manifest_digest != approval.manifest_digest
+        or profile.manifest_id != command.manifest_id
+        or profile.manifest_version != published.manifest_version
+        or profile.profile_id.casefold() != command.profile_id
+    ):
+        raise EvaluationFailedClosedError(
+            "resolved published context/profile does not match the approved "
+            "immutable selection"
+        )
+    if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
+        raise EvaluationFailedClosedError(
+            "resolved profile digest does not match the requested authoritative context"
+        )
 
 
 def _select_role_resources(
@@ -284,4 +369,6 @@ __all__ = [
     "make_resource_snapshot_context_verifier",
     "require_active_manifest_governance",
     "resolve_active_manifest_profile",
+    "validate_demo_evaluation_approval",
+    "validate_published_context_binding",
 ]

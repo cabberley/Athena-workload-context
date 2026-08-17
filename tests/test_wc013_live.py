@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
 from athena_context.api import (
+    ContextApiPublishedContextResolver,
+    EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
 )
@@ -17,7 +20,15 @@ from athena_context.api import (
 def test_optional_private_mcp_rejects_unauthenticated_tools_request() -> None:
     if os.getenv("ATHENA_WC013_LIVE") != "1":
         pytest.skip("set ATHENA_WC013_LIVE=1 for explicit private endpoint validation")
-    EnvironmentWc007PublishedContextSelectionPort().load()
+    selection = EnvironmentWc007PublishedContextSelectionPort().load()
+    resolved = ContextApiPublishedContextResolver(
+        EnvironmentContextApiPublishedContextReader()
+    ).resolve(
+        selection,
+        as_of=datetime.now(UTC),
+    )
+    assert resolved.view.supersession is None
+    assert resolved.authority_token.manifest_version == selection.manifest_version
     deployment = EnvironmentWc008DeploymentConfigurationPort().load_verified()
     endpoint = deployment.assertion.azure_mcp_internal_endpoint
 

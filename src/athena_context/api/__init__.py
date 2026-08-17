@@ -37,9 +37,13 @@ from athena_context.api.domain import (
 )
 from athena_context.api.evaluation_adapters import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+    ContextApiPublishedContextResolver,
+    ContextServicePublishedContextReader,
     ContextServicePublishedContextResolver,
+    EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
+    InMemoryDemoEvaluationApprovalRegistry,
     OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
     PrivateMcpInvokerPort,
@@ -50,22 +54,29 @@ from athena_context.api.evaluation_domain import (
     AZURE_MCP_2_0_5_ALLOWED_TOOLS,
     AZURE_MCP_2_0_5_CATALOG_HASH,
     AZURE_MCP_2_0_5_IMAGE_DIGEST,
+    ApprovalAuthorityToken,
+    AuthorizationGrantToken,
     AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
+    EvaluationAuthorityToken,
     McpReadAssignment,
     OperatorDeploymentApproval,
+    PublishedContextAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     Wc008DeploymentOutputAssertion,
     build_wc008_deployment_assertion,
 )
-from athena_context.api.evaluation_memory import InMemoryEvaluationArtifactStore
+from athena_context.api.evaluation_memory import InMemoryEvaluationCommitPort
 from athena_context.api.evaluation_service import DemoEvaluationService
 from athena_context.api.http import create_app
-from athena_context.api.memory import InMemoryContextStore
+from athena_context.api.memory import (
+    InMemoryAuthorityCoordinator,
+    InMemoryContextStore,
+)
 from athena_context.api.service import ContextService
 
 __all__ = [
@@ -75,7 +86,11 @@ __all__ = [
     "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
     "AZURE_MCP_2_0_5_CATALOG_HASH",
     "AZURE_MCP_2_0_5_IMAGE_DIGEST",
+    "ApprovalAuthorityToken",
     "AuthorizedSnapshotPublication",
+    "AuthorizationGrantToken",
+    "ContextApiPublishedContextResolver",
+    "ContextServicePublishedContextReader",
     "ContextServicePublishedContextResolver",
     "AllWorkloadsGrantScope",
     "CallableTrustedEvidenceSnapshotVerifier",
@@ -94,13 +109,18 @@ __all__ = [
     "DemoEvaluationCommand",
     "DemoEvaluationResult",
     "DemoEvaluationService",
+    "EvaluationAuthorityToken",
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
-    "InMemoryEvaluationArtifactStore",
+    "EnvironmentContextApiPublishedContextReader",
+    "InMemoryAuthorityCoordinator",
     "InMemoryContextStore",
+    "InMemoryDemoEvaluationApprovalRegistry",
+    "InMemoryEvaluationCommitPort",
     "McpReadAssignment",
     "OperatorDeploymentApproval",
     "OperatorTrustedWc008ConfigurationPort",
+    "PublishedContextAuthorityToken",
     "PublishedContextSelection",
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",

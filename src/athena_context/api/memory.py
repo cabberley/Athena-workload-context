@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from threading import RLock
 from types import TracebackType
 from typing import Literal
@@ -32,8 +34,13 @@ def _version_key(version: str) -> tuple[int, int, int]:
 class InMemoryContextStore:
     """Transactional, deterministic in-memory implementation of the storage port."""
 
-    def __init__(self) -> None:
-        self._lock = RLock()
+    def __init__(
+        self,
+        *,
+        coordinator: InMemoryAuthorityCoordinator | None = None,
+    ) -> None:
+        self._coordinator = coordinator or InMemoryAuthorityCoordinator()
+        self._lock = self._coordinator.lock
         self._drafts: dict[str, DraftRecord] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
@@ -42,6 +49,28 @@ class InMemoryContextStore:
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
+
+    @property
+    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
+        """Return the coordinator required by conditional evaluation commits."""
+
+        return self._coordinator
+
+
+class InMemoryAuthorityCoordinator:
+    """One lock shared by context, approval, grants, and evaluation publication."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+
+    @property
+    def lock(self) -> RLock:
+        return self._lock
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        with self._lock:
+            yield
 
 
 class _MemoryTransaction(ContextTransactionPort):

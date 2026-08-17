@@ -22,32 +22,35 @@ from athena_context.api.evaluation_context import (
     build_resource_evidence_context,
     make_resource_snapshot_context_verifier,
     resolve_active_manifest_profile,
+    validate_demo_evaluation_approval,
+    validate_published_context_binding,
 )
 from athena_context.api.evaluation_domain import (
-    DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
+    EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
-    build_demo_evaluation_result,
+    build_published_context_authority_token,
 )
 from athena_context.api.evaluation_ports import (
     ConfiguredEvidenceClientPort,
     DemoEvaluationApprovalResolverPort,
-    EvaluationArtifactStorePort,
+    EvaluationAuthorizationPort,
+    EvaluationCommitCandidate,
+    EvaluationCommitPort,
     PublishedContextResolverPort,
     SnapshotSigningPort,
     SnapshotSigningRequest,
-    StoredEvaluation,
     TrustedWc008DeploymentConfigurationPort,
 )
 from athena_context.api.evaluation_snapshot import (
     finalize_signed_snapshot,
     prepare_snapshot_signing_material,
 )
-from athena_context.api.ports import AuthorizationPort, ClockPort
+from athena_context.api.ports import ClockPort
 from athena_context.contracts import (
     AthenaValidationError,
     EvidenceGapRecord,
@@ -73,8 +76,8 @@ class DemoEvaluationService:
         context_resolver: PublishedContextResolverPort,
         approval_resolver: DemoEvaluationApprovalResolverPort,
         snapshot_signer: SnapshotSigningPort,
-        artifact_store: EvaluationArtifactStorePort,
-        authorization: AuthorizationPort,
+        evaluation_commit: EvaluationCommitPort,
+        authorization: EvaluationAuthorizationPort,
         clock: ClockPort,
         publication_actor: Actor,
     ) -> None:
@@ -92,7 +95,7 @@ class DemoEvaluationService:
         self._context_resolver = context_resolver
         self._approval_resolver = approval_resolver
         self._snapshot_signer = snapshot_signer
-        self._artifact_store = artifact_store
+        self._evaluation_commit = evaluation_commit
         self._authorization = authorization
         self._clock = clock
         self._publication_actor = publication_actor
@@ -134,9 +137,16 @@ class DemoEvaluationService:
         idempotency_key: str,
         command: DemoEvaluationCommand,
     ) -> DemoEvaluationResult:
-        self._authorization.require(actor, Permission.PUBLISH, command.manifest_id)
+        authorization_token = self._authorization.authorize(
+            actor,
+            Permission.PUBLISH,
+            command.manifest_id,
+        )
         request_digest = self._request_digest(actor, command)
-        replay = self._artifact_store.load_receipt(actor.actor_id, idempotency_key)
+        replay = self._evaluation_commit.load_receipt(
+            actor.actor_id,
+            idempotency_key,
+        )
         if replay is not None:
             if replay.request_digest != request_digest:
                 raise IdempotencyConflictError(
@@ -150,11 +160,25 @@ class DemoEvaluationService:
             raise DemoEvaluationApprovalError(
                 "trusted demo evaluation approval decision was not found"
             )
-        self._validate_approval(actor, command, approval, as_of=as_of)
+        validate_demo_evaluation_approval(
+            actor,
+            command,
+            approval,
+            as_of=as_of,
+            private_mcp_endpoint=self._actual_private_mcp_endpoint,
+            evidence_identity_object_id=(
+                self._deployment_configuration.assertion.evidence_identity_object_id
+            ),
+        )
 
         resolved_context = self._resolve_published_context(command, as_of=as_of)
-        self._validate_context_binding(command, approval, resolved_context)
+        validate_published_context_binding(command, approval, resolved_context)
         profile = resolved_context.profile
+        expected_authority = EvaluationAuthorityToken(
+            context=resolved_context.authority_token,
+            approval=approval.authority_token(),
+            authorization=authorization_token,
+        )
 
         collected = self._collect(command)
         attested_at = self._now()
@@ -179,22 +203,22 @@ class DemoEvaluationService:
                 "canonical evidence snapshot assembly or signing failed"
             ) from exc
 
-        published_at = self._now()
-        if published_at >= snapshot.expires_at:
+        evaluated_at = self._now()
+        if evaluated_at >= snapshot.expires_at:
             raise EvaluationFailedClosedError("snapshot became stale before publication")
-        publication = build_authorized_publication(
+        provisional_publication = build_authorized_publication(
             snapshot=snapshot,
             approval=approval,
             publisher=actor,
             publication_actor=self._publication_actor,
-            published_at=published_at,
+            published_at=evaluated_at,
             resolved_profile_digest=profile.resolved_profile_digest,
             endpoint=self._actual_private_mcp_endpoint,
             scope=command.authorized_scope,
             reason=command.reason,
         )
 
-        registry_record = publication.registry_record()
+        registry_record = provisional_publication.registry_record()
 
         def publication_resolver(
             snapshot_id: str,
@@ -221,7 +245,7 @@ class DemoEvaluationService:
             verifier = make_resource_snapshot_context_verifier(
                 snapshot,
                 profile,
-                as_of=published_at,
+                as_of=evaluated_at,
                 expected_artifact_digest=snapshot.compatibility.artifact_digest,
                 publication_resolver=publication_resolver,
                 key_resolver=self._evidence_client.key_resolver,
@@ -231,7 +255,7 @@ class DemoEvaluationService:
             findings_by_clause = evaluate_manifest_profile(
                 profile,
                 evidence,
-                as_of=published_at,
+                as_of=evaluated_at,
                 verify_evidence_context=verifier,
             )
         except AthenaValidationError as exc:
@@ -243,40 +267,25 @@ class DemoEvaluationService:
             findings_by_clause[clause_id]
             for clause_id in sorted(findings_by_clause, key=str.casefold)
         )
-        result = build_demo_evaluation_result(
-            publication=publication,
-            snapshot=snapshot,
-            findings=findings,
-            evaluated_at=published_at,
-        )
         envelope = collected.envelope
         if envelope is None:
             raise EvaluationFailedClosedError(
                 "successful evidence publication requires a validated source envelope"
             )
-        stored = StoredEvaluation(
-            actor_id=actor.actor_id,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
-            snapshot_id=snapshot.snapshot_id,
-            result_json=result.model_dump_json(
-                by_alias=True,
-                exclude_none=True,
-            ),
-            snapshot_json=snapshot.canonical_json(),
-            publication_json=publication.model_dump_json(exclude_none=True),
-            envelope_attempt_id=collected.collector_attempt.attempt_id,
-            envelope=envelope,
+        return self._evaluation_commit.commit(
+            EvaluationCommitCandidate(
+                actor=actor,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                command=command,
+                snapshot=snapshot,
+                findings=findings,
+                envelope_attempt_id=collected.collector_attempt.attempt_id,
+                envelope=envelope,
+                expected_authority=expected_authority,
+                private_mcp_endpoint=self._actual_private_mcp_endpoint,
+            )
         )
-        self._revalidate_commit_authority(
-            actor,
-            command,
-            expected_approval=approval,
-            expected_context=resolved_context,
-            as_of=published_at,
-        )
-        self._artifact_store.commit(stored)
-        return result
 
     def _resolve_published_context(
         self,
@@ -309,6 +318,10 @@ class DemoEvaluationService:
             return ResolvedPublishedContext(
                 view=resolved.view,
                 profile=canonical_profile,
+                authority_token=build_published_context_authority_token(
+                    resolved.view,
+                    canonical_profile,
+                ),
             )
         except (
             AmbiguousLookupError,
@@ -320,70 +333,6 @@ class DemoEvaluationService:
                 "published context/profile is missing, ambiguous, a superseded "
                 "context, or has inactive governance"
             ) from exc
-
-    @staticmethod
-    def _validate_context_binding(
-        command: DemoEvaluationCommand,
-        approval: DemoEvaluationApproval,
-        context: ResolvedPublishedContext,
-    ) -> None:
-        published = context.view.published
-        profile = context.profile
-        if (
-            published.manifest_id != command.manifest_id
-            or published.manifest_version != command.manifest_version
-            or published.manifest_digest != command.expected_manifest_digest
-            or published.manifest_digest != approval.manifest_digest
-            or profile.manifest_id != command.manifest_id
-            or profile.manifest_version != command.manifest_version
-            or profile.profile_id.casefold() != command.profile_id.casefold()
-        ):
-            raise EvaluationFailedClosedError(
-                "resolved published context/profile does not match the approved "
-                "immutable selection"
-            )
-        if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
-            raise EvaluationFailedClosedError(
-                "resolved profile digest does not match the requested authoritative context"
-            )
-
-    def _revalidate_commit_authority(
-        self,
-        actor: Actor,
-        command: DemoEvaluationCommand,
-        *,
-        expected_approval: DemoEvaluationApproval,
-        expected_context: ResolvedPublishedContext,
-        as_of: datetime,
-    ) -> None:
-        self._authorization.require(actor, Permission.PUBLISH, command.manifest_id)
-        current_approval = self._approval_resolver.resolve(
-            command.approval_decision_id
-        )
-        current_context = self._resolve_published_context(command, as_of=as_of)
-        if current_approval is None:
-            raise DemoEvaluationApprovalError(
-                "trusted demo evaluation approval disappeared before publication"
-            )
-        self._validate_approval(
-            actor,
-            command,
-            current_approval,
-            as_of=as_of,
-        )
-        self._validate_context_binding(
-            command,
-            current_approval,
-            current_context,
-        )
-        if current_approval != expected_approval:
-            raise DemoEvaluationApprovalError(
-                "demo evaluation approval changed before publication"
-            )
-        if current_context != expected_context:
-            raise EvaluationFailedClosedError(
-                "published manifest or resolved profile changed before publication"
-            )
 
     def _collect(self, command: DemoEvaluationCommand) -> CollectedEvidence:
         assertion = self._deployment_configuration.assertion
@@ -443,39 +392,6 @@ class DemoEvaluationService:
             )
         return collected
 
-    def _validate_approval(
-        self,
-        actor: Actor,
-        command: DemoEvaluationCommand,
-        approval: DemoEvaluationApproval,
-        *,
-        as_of: datetime,
-    ) -> None:
-        if approval.approved_at > as_of or approval.expires_at <= as_of:
-            raise DemoEvaluationApprovalError(
-                "demo evaluation approval is not active at the trusted evaluation time"
-            )
-        if (
-            approval.decision_id != command.approval_decision_id
-            or approval.manifest_id != command.manifest_id
-            or approval.manifest_version != command.manifest_version
-            or approval.manifest_digest != command.expected_manifest_digest
-            or approval.profile_id != command.profile_id
-            or approval.authorized_scope.canonical_json()
-            != command.authorized_scope.canonical_json()
-            or approval.private_mcp_endpoint
-            != self._actual_private_mcp_endpoint
-            or approval.evidence_identity_object_id
-            != self._deployment_configuration.assertion.evidence_identity_object_id
-        ):
-            raise DemoEvaluationApprovalError(
-                "approval does not authorize this exact endpoint, identity, context, and scope"
-            )
-        if actor.kind is not ActorKind.HUMAN:
-            raise DemoEvaluationApprovalError(
-                "only an authorized human publisher may execute an approval"
-            )
-
     def _request_digest(self, actor: Actor, command: DemoEvaluationCommand) -> str:
         return compute_artifact_digest(
             {
@@ -511,12 +427,12 @@ class DemoEvaluationService:
         )
 
     def get_result(self, actor: Actor, snapshot_id: str) -> DemoEvaluationResult:
-        result = self._artifact_store.resolve_result(snapshot_id)
+        result = self._evaluation_commit.resolve_result(snapshot_id)
         if result is None:
             raise ResourceNotFoundError(
                 f"published evaluation snapshot {snapshot_id!r} was not found"
             )
-        self._authorization.require(
+        self._authorization.authorize(
             actor,
             Permission.READ,
             result.publication.manifest_id,

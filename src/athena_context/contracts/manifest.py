@@ -90,6 +90,7 @@ type Environment = Literal[
     "disasterRecovery",
     "sandbox",
 ]
+type ProfileId = Annotated[str, Field(min_length=1, max_length=128)]
 type AzureCloudName = Literal[
     "azureCloud",
     "azureChinaCloud",
@@ -488,7 +489,7 @@ class DeclaredManifestRelationship(AthenaBaseModel):
     source: ManifestEndpoint
     target: ManifestEndpoint
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     source_clause: str = Field(
         ..., alias="sourceClause", min_length=1, max_length=512, pattern=r"^/"
     )
@@ -601,7 +602,7 @@ class ManifestConstraint(AthenaBaseModel):
     finding_kind: ManifestFindingKind = Field(..., alias="findingKind")
     governance_scope: ClauseScope = Field(..., alias="governanceScope")
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     proof_requirement: ManifestProof = Field(..., alias="proofRequirement")
     failure_verdict: FailureVerdict = Field(..., alias="failureVerdict")
     success_verdict: Literal["pass", "expectedConstraint", "observation"] = Field(
@@ -643,7 +644,7 @@ class _ControlBase(AthenaBaseModel):
     control_id: str = Field(..., alias="controlId", min_length=1, max_length=128)
     governance_scope: ClauseScope = Field(..., alias="governanceScope")
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     health: Literal[
         "effective",
         "degraded",
@@ -755,7 +756,7 @@ class ManifestRiskAcceptance(AthenaBaseModel):
         alias="acceptedResourceBindings",
         max_length=1000,
     )
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     status: ApprovalStatus
 
     @model_validator(mode="after")
@@ -830,7 +831,7 @@ class GovernedWeakeningOverride(AthenaBaseModel):
     status: ApprovalStatus
     accepted_at: UtcDateTime = Field(..., alias="acceptedAt")
     expires_at: UtcDateTime = Field(..., alias="expiresAt")
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
 
     def authorizes(
         self,

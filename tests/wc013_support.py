@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -17,9 +18,11 @@ from athena_context.api import (
     CreateDraftCommand,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
+    DemoEvaluationResult,
     DemoEvaluationService,
     InMemoryContextStore,
-    InMemoryEvaluationArtifactStore,
+    InMemoryDemoEvaluationApprovalRegistry,
+    InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorDeploymentApproval,
     OperatorTrustedWc008ConfigurationPort,
@@ -30,7 +33,6 @@ from athena_context.api import (
     Role,
     RoleBasedAuthorization,
     RoleGrant,
-    StaticDemoEvaluationApprovalResolver,
     TransitionCommand,
     VerifiedWc008DeploymentConfiguration,
     Wc008DeploymentOutputAssertion,
@@ -40,14 +42,19 @@ from athena_context.api import (
 from athena_context.api.domain import (
     DraftRecord,
     PublishedManifestView,
+    SupersedeCommand,
 )
 from athena_context.api.evaluation_ports import (
+    EvaluationCommitCandidate,
     SnapshotSigningRequest,
+    StoredEvaluation,
 )
+from athena_context.api.memory import InMemoryAuthorityCoordinator
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
     ResourceGroupScope,
+    SnapshotPublicationRecord,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
@@ -116,6 +123,13 @@ class StepClock:
         current = self._value
         self._value += timedelta(seconds=1)
         return current
+
+    def advance(self, delta: timedelta) -> None:
+        self._value += delta
+
+    @property
+    def value(self) -> datetime:
+        return self._value
 
 
 class ReplayGuard:
@@ -441,54 +455,75 @@ class LifecycleContextResolver:
         *,
         lifecycle_start: datetime,
     ) -> None:
-        authorization = RoleBasedAuthorization(
+        self.coordinator = InMemoryAuthorityCoordinator()
+        self.authorization = RoleBasedAuthorization(
             [
                 RoleGrant(actor_id=PROPOSER.actor_id, role=Role.PROPOSER),
                 RoleGrant(actor_id=APPROVER.actor_id, role=Role.APPROVER),
                 RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
-            ]
+                # Deliberate grant proves actor-kind checks still reject MCP writes.
+                RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
+            ],
+            coordinator=self.coordinator,
         )
-        service = ContextService(
-            store=InMemoryContextStore(),
-            authorization=authorization,
+        self.store = InMemoryContextStore(coordinator=self.coordinator)
+        self.service = ContextService(
+            store=self.store,
+            authorization=self.authorization,
             clock=StepClock(lifecycle_start),
             publication_actor=Actor(
                 actor_id="human-approved-context-api",
                 kind=ActorKind.SERVICE,
             ),
         )
+        self._manifest_id = manifest.manifest_id
+        self._manifest_version = manifest.manifest_version
+        self._publish(manifest, previous_version=None)
+        self._adapter = ContextServicePublishedContextResolver(
+            service=self.service,
+            reader_actor=PUBLISHER,
+            authority_coordinator=self.coordinator,
+        )
+        self.calls = 0
+
+    def _publish(
+        self,
+        manifest: CanonicalWorkloadManifest,
+        *,
+        previous_version: str | None,
+    ) -> None:
         version_key = manifest.manifest_version.replace(".", "-")
-        draft = service.create_draft(
+        draft = self.service.create_draft(
             PROPOSER,
             f"wc013-{version_key}-create",
             CreateDraftCommand(
                 draft_id=f"draft-wc013-{version_key}",
                 manifest=manifest,
                 manifest_digest=manifest.compatibility.artifact_digest,
-                previous_version=None,
+                previous_version=previous_version,
                 reason="Create the explicitly governed synthetic manifest draft",
             ),
         )
-        draft = service.validate_draft(
+        draft = self.service.validate_draft(
             PROPOSER,
             draft.draft_id,
             f"wc013-{version_key}-validate",
             _transition(draft, "Validate the synthetic canonical manifest"),
         )
-        draft = service.submit_for_review(
+        draft = self.service.submit_for_review(
             PROPOSER,
             draft.draft_id,
             f"wc013-{version_key}-submit",
             _transition(draft, "Submit the synthetic manifest for human review"),
         )
-        draft = service.approve_draft(
+        draft = self.service.approve_draft(
             APPROVER,
             draft.draft_id,
             f"wc013-{version_key}-approve",
             _transition(draft, "Human-approve the exact publication candidate"),
         )
         assert draft.approval is not None
-        service.publish_draft(
+        self.service.publish_draft(
             PUBLISHER,
             draft.draft_id,
             f"wc013-{version_key}-publish",
@@ -500,24 +535,53 @@ class LifecycleContextResolver:
                 approval_id=draft.approval.decision_id,
             ),
         )
-        self._adapter = ContextServicePublishedContextResolver(
-            service=service,
-            reader_actor=PUBLISHER,
-        )
-        self._view = service.get_published(
-            PUBLISHER,
-            manifest.manifest_version,
-            manifest_id=manifest.manifest_id,
-        )
-        self.calls = 0
+        self._manifest_id = manifest.manifest_id
+        self._manifest_version = manifest.manifest_version
 
     @property
     def view(self) -> PublishedManifestView:
-        return self._view
+        return self.service.get_published(
+            PUBLISHER,
+            self._manifest_version,
+            manifest_id=self._manifest_id,
+        )
 
-    @view.setter
-    def view(self, value: PublishedManifestView) -> None:
-        self._view = value
+    @property
+    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
+        return self.coordinator
+
+    def publish_additional_active(
+        self,
+        manifest: CanonicalWorkloadManifest,
+    ) -> None:
+        previous_version = self._manifest_version
+        self._publish(manifest, previous_version=previous_version)
+
+    def supersede_with(
+        self,
+        replacement: CanonicalWorkloadManifest,
+    ) -> None:
+        original = self.view.published
+        self._publish(
+            replacement,
+            previous_version=original.manifest_version,
+        )
+        self.service.supersede_version(
+            PUBLISHER,
+            original.manifest_id,
+            original.manifest_version,
+            f"wc013-{original.manifest_version}-supersede",
+            SupersedeCommand(
+                expected_revision=original.source_draft_revision,
+                expected_manifest_version=original.manifest_version,
+                expected_digest=original.manifest_digest,
+                replacement_version=replacement.manifest_version,
+                replacement_digest=(
+                    self.view.published.manifest_digest
+                ),
+                reason="Human-authorize a synthetic replacement version",
+            ),
+        )
 
     def resolve(
         self,
@@ -526,24 +590,6 @@ class LifecycleContextResolver:
         as_of: datetime,
     ) -> ResolvedPublishedContext:
         self.calls += 1
-        if (
-            selection.manifest_id != self.view.published.manifest_id
-            or (
-                selection.manifest_version is not None
-                and selection.manifest_version
-                != self.view.published.manifest_version
-            )
-        ):
-            raise AssertionError("test requested unexpected published context")
-        if self.view.supersession is not None:
-            return ResolvedPublishedContext(
-                view=self.view,
-                profile=resolve_manifest_profile(
-                    self.view.published.manifest,
-                    selection.profile_id,
-                    as_of=as_of,
-                ),
-            )
         return self._adapter.resolve(selection, as_of=as_of)
 
 
@@ -553,6 +599,8 @@ def build_current_synthetic_manifest(
     override_expires_at: datetime | None = None,
     risk_acceptance_expires_at: datetime | None = None,
     production_extends_development: bool = False,
+    manifest_version: str = "2.0.0",
+    add_prod_east: bool = False,
 ) -> CanonicalWorkloadManifest:
     """Build a new test version; only WC-007 humans may publish it."""
 
@@ -578,7 +626,7 @@ def build_current_synthetic_manifest(
                 replace_manifest_identity(child)
 
     replace_manifest_identity(payload)
-    payload["manifestVersion"] = "2.0.0"
+    payload["manifestVersion"] = manifest_version
     payload["audit"] = {
         "publishedBy": "synthetic-unpublished-candidate",
         "publishedAt": min(override_expiry, risk_expiry) - timedelta(days=60),
@@ -593,6 +641,30 @@ def build_current_synthetic_manifest(
             acceptance["expiresAt"] = risk_expiry
     if production_extends_development:
         payload["profiles"]["production"]["extends"] = "development"
+    if add_prod_east:
+        prod_east = deepcopy(payload["profiles"]["production"])
+
+        def replace_profile_references(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if (
+                        key in {"profileId", "extends"}
+                        and child == "production"
+                    ):
+                        value[key] = "prod-east"
+                    elif key == "profiles" and isinstance(child, list):
+                        value[key] = [
+                            "prod-east" if item == "production" else item
+                            for item in child
+                        ]
+                    else:
+                        replace_profile_references(child)
+            elif isinstance(value, list):
+                for child in value:
+                    replace_profile_references(child)
+
+        replace_profile_references(prod_east)
+        payload["profiles"]["prod-east"] = prod_east
     return CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
@@ -607,14 +679,49 @@ def _transition(draft: DraftRecord, reason: str) -> TransitionCommand:
     )
 
 
+class HookedEvaluationCommitPort:
+    """Test barrier that mutates authority after evaluation but before commit."""
+
+    def __init__(self, delegate: InMemoryEvaluationCommitPort) -> None:
+        self._delegate = delegate
+        self.before_commit: Callable[[], None] | None = None
+
+    def load_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> StoredEvaluation | None:
+        return self._delegate.load_receipt(actor_id, idempotency_key)
+
+    def commit(
+        self,
+        candidate: EvaluationCommitCandidate,
+    ) -> DemoEvaluationResult:
+        if self.before_commit is not None:
+            self.before_commit()
+        return self._delegate.commit(candidate)
+
+    def resolve_publication(
+        self,
+        snapshot_id: str,
+    ) -> SnapshotPublicationRecord | None:
+        return self._delegate.resolve_publication(snapshot_id)
+
+    def resolve_result(self, snapshot_id: str) -> DemoEvaluationResult | None:
+        return self._delegate.resolve_result(snapshot_id)
+
+
 @dataclass(frozen=True, slots=True)
 class DemoHarness:
     service: DemoEvaluationService
     command: DemoEvaluationCommand
-    store: InMemoryEvaluationArtifactStore
+    store: InMemoryEvaluationCommitPort
+    commit_hook: HookedEvaluationCommitPort
     transport: ScenarioTransport
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: LifecycleContextResolver
+    approval_registry: InMemoryDemoEvaluationApprovalRegistry
+    authorization: RoleBasedAuthorization
     approval: DemoEvaluationApproval
     deployment_configuration: VerifiedWc008DeploymentConfiguration
     clock: StepClock
@@ -701,6 +808,7 @@ def build_harness(
     manifest: CanonicalWorkloadManifest | None = None,
     profile_resolution_as_of: datetime | None = None,
     approval_expires_at: datetime | None = None,
+    profile_id: str = "production",
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -738,7 +846,7 @@ def build_harness(
     published_manifest = context_resolver.view.published.manifest
     profile = resolve_manifest_profile(
         published_manifest,
-        "production",
+        profile_id,
         as_of=profile_resolution_as_of or as_of,
     )
     approval = DemoEvaluationApproval(
@@ -750,7 +858,7 @@ def build_harness(
         manifest_id=published_manifest.manifest_id,
         manifest_version=published_manifest.manifest_version,
         manifest_digest=published_manifest.compatibility.artifact_digest,
-        profile_id="production",
+        profile_id=profile_id,
         authorized_scope=scope(),
         private_mcp_endpoint=(
             trusted_configuration.assertion.azure_mcp_internal_endpoint
@@ -765,7 +873,7 @@ def build_harness(
         manifest_id=published_manifest.manifest_id,
         manifest_version=published_manifest.manifest_version,
         expected_manifest_digest=published_manifest.compatibility.artifact_digest,
-        profile_id="production",
+        profile_id=profile_id,
         expected_resolved_profile_digest=profile.resolved_profile_digest,
         authorized_scope=scope(),
         bounds=EvidenceResponseBounds(
@@ -777,15 +885,22 @@ def build_harness(
         ),
         reason="Collect, publish, and evaluate the approved synthetic demo",
     )
-    store = InMemoryEvaluationArtifactStore()
     snapshot_signer = DeterministicSnapshotSigner(private_key)
-    authorization = RoleBasedAuthorization(
-        [
-            RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
-            # This deliberate grant proves the service identity still cannot publish.
-            RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
-        ]
+    authorization = context_resolver.authorization
+    approval_registry = InMemoryDemoEvaluationApprovalRegistry(
+        [approval],
+        coordinator=context_resolver.coordinator,
     )
+    store = InMemoryEvaluationCommitPort(
+        coordinator=context_resolver.coordinator,
+        context_resolver=context_resolver,
+        approval_resolver=approval_registry,
+        authorization=authorization,
+        clock=clock,
+        publication_actor=PUBLICATION_SERVICE,
+        evidence_identity_object_id=MCP_OBJECT_ID,
+    )
+    commit_hook = HookedEvaluationCommitPort(store)
     service = DemoEvaluationService(
         deployment_configuration=(
             configuration_port
@@ -793,9 +908,9 @@ def build_harness(
         ),
         evidence_client=evidence_client,
         context_resolver=context_resolver,
-        approval_resolver=StaticDemoEvaluationApprovalResolver([approval]),
+        approval_resolver=approval_registry,
         snapshot_signer=snapshot_signer,
-        artifact_store=store,
+        evaluation_commit=commit_hook,
         authorization=authorization,
         clock=clock,
         publication_actor=PUBLICATION_SERVICE,
@@ -804,9 +919,12 @@ def build_harness(
         service=service,
         command=command,
         store=store,
+        commit_hook=commit_hook,
         transport=invoker,
         snapshot_signer=snapshot_signer,
         context_resolver=context_resolver,
+        approval_registry=approval_registry,
+        authorization=authorization,
         approval=approval,
         deployment_configuration=trusted_configuration,
         clock=clock,
