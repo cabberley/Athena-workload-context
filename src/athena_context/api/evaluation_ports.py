@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from athena_context.api.domain import (
@@ -21,6 +21,7 @@ from athena_context.api.evaluation_domain import (
     McpReadAssignment,
     PublishedContextSelection,
     ResolvedPublishedContext,
+    SealedTrustedKeyAuthority,
     TrustedKeyAuthorityToken,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
@@ -143,27 +144,115 @@ class EvaluationTrustedKeyAuthority:
             ensure_timestamp(self.revoked_at)
 
     def authority_token(self) -> TrustedKeyAuthorityToken:
-        record = self.record
-        anchor = record.anchor
-        payload = {
-            "keyVaultKeyId": anchor.key_vault_key_id,
-            "keyName": anchor.key_name,
-            "keyVersion": anchor.key_version,
-            "publicKeyFingerprint": anchor.public_key_fingerprint,
-            "enabled": record.enabled,
-            "activatedAt": record.activated_at,
-            "retiredAt": record.retired_at,
-            "expiresAt": record.expires_at,
-            "revokedAt": self.revoked_at,
-            "revision": self.revision,
+        return seal_evaluation_trusted_key_authority(self).authority_token
+
+
+@dataclass(frozen=True, slots=True)
+class SealedEvaluationTrustedKeyAuthority:
+    """Exact key authority and time bounds safe for the sealed finalizer."""
+
+    authority: SealedTrustedKeyAuthority
+    authority_token: TrustedKeyAuthorityToken
+    enabled: bool
+    activated_at: datetime
+    retired_at: datetime | None
+    expires_at: datetime | None
+    revoked_at: datetime | None
+
+
+def _exact_utc_timestamp(value: datetime) -> datetime:
+    normalized = ensure_timestamp(value)
+    return datetime(
+        normalized.year,
+        normalized.month,
+        normalized.day,
+        normalized.hour,
+        normalized.minute,
+        normalized.second,
+        normalized.microsecond,
+        tzinfo=UTC,
+        fold=normalized.fold,
+    )
+
+
+def _exact_key_text(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("trusted key authority contains non-text state")
+    return str.__str__(value)
+
+
+def seal_evaluation_trusted_key_authority(
+    authority: EvaluationTrustedKeyAuthority,
+) -> SealedEvaluationTrustedKeyAuthority:
+    """Read an untrusted key record once and reconstruct exact primitives."""
+
+    record = authority.record
+    anchor = record.anchor
+    enabled = record.enabled
+    revision = authority.revision
+    if type(enabled) is not bool or type(revision) is not int:
+        raise ValueError("trusted key authority contains non-primitive state")
+    activated_at = _exact_utc_timestamp(record.activated_at)
+    raw_retired_at = record.retired_at
+    raw_expires_at = record.expires_at
+    raw_revoked_at = authority.revoked_at
+    retired_at = (
+        None
+        if raw_retired_at is None
+        else _exact_utc_timestamp(raw_retired_at)
+    )
+    expires_at = (
+        None
+        if raw_expires_at is None
+        else _exact_utc_timestamp(raw_expires_at)
+    )
+    revoked_at = (
+        None
+        if raw_revoked_at is None
+        else _exact_utc_timestamp(raw_revoked_at)
+    )
+    key_vault_key_id = _exact_key_text(anchor.key_vault_key_id)
+    key_name = _exact_key_text(anchor.key_name)
+    key_version = _exact_key_text(anchor.key_version)
+    public_key_fingerprint = _exact_key_text(
+        anchor.public_key_fingerprint
+    )
+    authority_digest = compute_artifact_digest(
+        {
+            "keyVaultKeyId": key_vault_key_id,
+            "keyName": key_name,
+            "keyVersion": key_version,
+            "publicKeyFingerprint": public_key_fingerprint,
+            "enabled": enabled,
+            "activatedAt": activated_at,
+            "retiredAt": retired_at,
+            "expiresAt": expires_at,
+            "revokedAt": revoked_at,
+            "revision": revision,
         }
-        return TrustedKeyAuthorityToken(
-            key_vault_key_id=anchor.key_vault_key_id,
-            key_version=anchor.key_version,
-            public_key_fingerprint=anchor.public_key_fingerprint,
-            revision=self.revision,
-            authority_digest=compute_artifact_digest(payload),
-        )
+    )
+    sealed_authority = SealedTrustedKeyAuthority(
+        key_vault_key_id=key_vault_key_id,
+        key_version=key_version,
+        public_key_fingerprint=public_key_fingerprint,
+        revision=revision,
+        authority_digest=authority_digest,
+    )
+    return SealedEvaluationTrustedKeyAuthority(
+        authority=sealed_authority,
+        authority_token=TrustedKeyAuthorityToken(
+            key_vault_key_id=key_vault_key_id,
+            key_version=key_version,
+            public_key_fingerprint=public_key_fingerprint,
+            revision=revision,
+            authority_digest=authority_digest,
+        ),
+        enabled=enabled,
+        activated_at=activated_at,
+        retired_at=retired_at,
+        expires_at=expires_at,
+        revoked_at=revoked_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)

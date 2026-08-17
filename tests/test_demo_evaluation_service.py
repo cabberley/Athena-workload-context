@@ -4,10 +4,14 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+from email.message import Message
 from inspect import stack
+from io import BytesIO
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
+from urllib.request import BaseHandler
+from urllib.response import addinfourl
 
 import pytest
 from pydantic import ValidationError
@@ -28,6 +32,7 @@ from athena_context.api import (
     Wc008DeploymentOutputAssertion,
     Wc009EvidenceClientAdapter,
 )
+from athena_context.api.authorization import authorize_role_grants
 from athena_context.api.domain import Permission, Supersession
 from athena_context.api.errors import (
     AuthorizationError,
@@ -40,6 +45,7 @@ from athena_context.api.errors import (
 from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
+from athena_context.api.evaluation_domain import EvaluationAuthorityToken
 from athena_context.api.evaluation_ports import (
     EvaluationCommitAuthorityCondition,
     EvaluationTrustedKeyAuthority,
@@ -722,6 +728,62 @@ def test_expiry_during_final_crypto_policy_work_rolls_back_atomically(
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+def test_key_record_property_delay_occurs_before_authoritative_timestamp() -> None:
+    expires_at = CURRENT_NOW + timedelta(seconds=30)
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        trusted_key_expires_at=expires_at,
+    )
+    current = harness.trust_registry.resolve()
+    assert current is not None
+    delayed = False
+
+    class DelayedKeyRecord:
+        anchor = current.record.anchor
+        public_key = current.record.public_key
+        activated_at = current.record.activated_at
+        retired_at = current.record.retired_at
+        expires_at = current.record.expires_at
+
+        @property
+        def enabled(self) -> bool:
+            nonlocal delayed
+            if not delayed and any(
+                frame.function == "_seal_trusted_key_for_finalization"
+                for frame in stack()
+            ):
+                delayed = True
+                harness.clock.advance(timedelta(minutes=1))
+            return True
+
+    malicious_authority = EvaluationTrustedKeyAuthority(
+        record=DelayedKeyRecord(),  # type: ignore[arg-type]
+        revision=current.revision + 1,
+    )
+    harness.context_resolver.service.put_demo_evaluation_trusted_key(
+        APPROVER,
+        malicious_authority,
+        expected_revision=current.revision,
+    )
+    idempotency_key = "wc013-key-property-delay"
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="trusted signing key is",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert delayed is True
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 @pytest.mark.parametrize(
     ("expiring_condition", "expected_error", "expected_message"),
     [
@@ -993,6 +1055,140 @@ def test_same_uow_authority_mutation_after_preparation_rolls_back(
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+@pytest.mark.parametrize(
+    "stale_grant",
+    ["publisher", "contextReader"],
+)
+def test_polymorphic_authority_equality_cannot_mask_stale_grant(
+    stale_grant: str,
+) -> None:
+    context_reader = Actor(
+        actor_id="wc013-polymorphic-token-reader",
+        kind=ActorKind.SERVICE,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        context_reader_actor=context_reader,
+    )
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    class AlwaysEqualAuthority(EvaluationAuthorityToken):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def insert_with_polymorphic_expected_authority(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                grants, revision = (
+                    active_transaction.get_evaluation_grants()
+                )
+                active_transaction.replace_evaluation_grants(
+                    (
+                        *grants,
+                        RoleGrant(
+                            actor_id="wc013-unrelated-revision-reader",
+                            role=Role.READER,
+                            scope=grants[0].scope,
+                        ),
+                    ),
+                    expected_revision=revision,
+                )
+                changed_grants, changed_revision = (
+                    active_transaction.get_evaluation_grants()
+                )
+                current_publisher = authorize_role_grants(
+                    PUBLISHER,
+                    Permission.PUBLISH,
+                    condition.command.manifest_id,
+                    grants=changed_grants,
+                    grant_revision=changed_revision,
+                )
+                current_reader = authorize_role_grants(
+                    context_reader,
+                    Permission.READ,
+                    condition.command.manifest_id,
+                    grants=changed_grants,
+                    grant_revision=changed_revision,
+                )
+                previous = condition.expected_authority
+                assert (
+                    previous.authorization.grant_revision
+                    != current_publisher.grant_revision
+                )
+                assert (
+                    previous.context_reader_authorization.grant_revision
+                    != current_reader.grant_revision
+                )
+                forged = AlwaysEqualAuthority(
+                    context=previous.context,
+                    approval=previous.approval,
+                    authorization=(
+                        previous.authorization
+                        if stale_grant == "publisher"
+                        else current_publisher
+                    ),
+                    context_reader_authorization=(
+                        previous.context_reader_authorization
+                        if stale_grant == "contextReader"
+                        else current_reader
+                    ),
+                    trusted_key=previous.trusted_key,
+                )
+                return original_insert(
+                    capability,
+                    replace(
+                        condition,
+                        expected_authority=forged,
+                    ),
+                    artifact_preparation,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                insert_with_polymorphic_expected_authority
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = f"wc013-polymorphic-{stale_grant}"
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="authority revision changed",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    _, current_revision = (
+        harness.context_resolver.service.get_demo_evaluation_grants(
+            PUBLISHER
+        )
+    )
+    assert current_revision == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_direct_transaction_cannot_publish_with_no_grant_and_forged_approval() -> None:
     harness = build_harness(
         as_of=CURRENT_NOW,
@@ -1084,6 +1280,89 @@ def test_direct_transaction_cannot_publish_invalid_snapshot_signature() -> None:
         harness=harness,
         idempotency_key=condition.idempotency_key,
     )
+
+
+def test_aborted_transaction_permit_cannot_survive_reentry_or_reuse() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    store = harness.context_resolver.store
+    reused_transaction = store.transaction()
+    original_put = reused_transaction._put_context_service_evaluation
+    captured: dict[str, object] = {}
+
+    def capture_unconsumed_permit(
+        transaction_capability: object,
+        condition: EvaluationCommitAuthorityCondition,
+        artifact_preparation: Callable[
+            [EvaluationTrustedKeyAuthority],
+            PreparedEvaluationArtifact,
+        ],
+    ) -> object:
+        trusted_key = reused_transaction.get_demo_evaluation_trusted_key(
+            condition.trusted_key_anchor
+        )
+        assert trusted_key is not None
+        captured["permit"] = transaction_capability
+        captured["condition"] = condition
+        captured["prepared"] = artifact_preparation(trusted_key)
+        raise EvaluationFailedClosedError(
+            "abort after capturing an unconsumed transaction permit"
+        )
+
+    reused_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+        capture_unconsumed_permit
+    )
+    original_transaction = store.transaction
+
+    def reuse_transaction_object() -> Any:
+        return reused_transaction
+
+    store.transaction = reuse_transaction_object  # type: ignore[method-assign]
+    idempotency_key = "wc013-aborted-transaction-permit"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="capturing an unconsumed",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+        reused_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+            original_put
+        )
+
+    preparation_called = False
+
+    def stale_preparation(
+        trusted_key: EvaluationTrustedKeyAuthority,
+    ) -> PreparedEvaluationArtifact:
+        nonlocal preparation_called
+        del trusted_key
+        preparation_called = True
+        prepared = captured["prepared"]
+        assert isinstance(prepared, PreparedEvaluationArtifact)
+        return prepared
+
+    condition = captured["condition"]
+    assert isinstance(condition, EvaluationCommitAuthorityCondition)
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="unused transaction-bound",
+    ), reused_transaction:
+        reused_transaction._put_context_service_evaluation(
+            captured["permit"],
+            condition,
+            stale_preparation,
+        )
+
+    assert preparation_called is False
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
 def test_persistence_reverifies_signature_after_service_preparation() -> None:
@@ -2339,6 +2618,75 @@ def test_live_context_reader_requires_https_origin_and_managed_identity_audience
             },
             token_provider=NoopTokenProvider(),
         )
+
+
+def test_live_context_reader_rejects_redirect_without_forwarding_bearer_token() -> None:
+    bearer_token = "synthetic-managed-identity-secret"
+    requests: list[tuple[str, str | None]] = []
+
+    class TokenProvider:
+        def get_token(self, audience: str) -> str:
+            assert audience == "api://context"
+            return bearer_token
+
+    class RedirectingTransport(BaseHandler):
+        handler_order = 100
+
+        def _open(self, request: Any) -> Any:
+            requests.append(
+                (
+                    request.full_url,
+                    request.get_header("Authorization"),
+                )
+            )
+            if request.full_url.startswith("https://context.internal/"):
+                headers = Message()
+                headers["Location"] = "http://attacker.invalid/token"
+                response = addinfourl(
+                    BytesIO(b""),
+                    headers,
+                    request.full_url,
+                    302,
+                )
+                response.msg = "Found"
+                return response
+            response = addinfourl(
+                BytesIO(b'{"leaked":true}'),
+                Message(),
+                request.full_url,
+                200,
+            )
+            response.msg = "OK"
+            return response
+
+        def https_open(self, request: Any) -> Any:
+            return self._open(request)
+
+        def http_open(self, request: Any) -> Any:
+            return self._open(request)
+
+    reader = EnvironmentContextApiPublishedContextReader(
+        {
+            "ATHENA_WC013_CONTEXT_API_ENDPOINT": "https://context.internal",
+            "ATHENA_WC013_CONTEXT_API_AUDIENCE": "api://context",
+        },
+        token_provider=TokenProvider(),
+    )
+    reader._opener.add_handler(RedirectingTransport())  # type: ignore[attr-defined]
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="rejected the live resolution",
+    ):
+        reader.list_published("wl-athena-wc013-current-demo")
+
+    assert requests == [
+        (
+            "https://context.internal/v1/manifests/"
+            "wl-athena-wc013-current-demo/versions",
+            "Bearer " + bearer_token,
+        )
+    ]
 
 
 def test_live_configuration_adapter_fails_closed_for_missing_or_malformed_input(

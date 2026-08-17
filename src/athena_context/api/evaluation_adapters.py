@@ -4,10 +4,10 @@ import os
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from azure.identity import DefaultAzureCredential
 from pydantic import TypeAdapter, ValidationError
@@ -70,6 +70,22 @@ class PublishedContextReaderPort(Protocol):
     def list_published(self, manifest_id: str) -> tuple[PublishedManifestView, ...]: ...
 
 
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    """Never forward the Context API bearer token through an HTTP redirect."""
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 class DefaultAzureCredentialContextApiToken:
     """Keyless Context API token provider for explicitly configured live runs."""
 
@@ -121,6 +137,7 @@ class EnvironmentContextApiPublishedContextReader:
         self._token_provider = (
             token_provider or DefaultAzureCredentialContextApiToken()
         )
+        self._opener = build_opener(_RejectRedirectHandler())
 
     def get_published(
         self,
@@ -156,7 +173,10 @@ class EnvironmentContextApiPublishedContextReader:
             method="GET",
         )
         try:
-            with urlopen(request, timeout=10) as response:  # noqa: S310
+            with self._opener.open(  # noqa: S310
+                request,
+                timeout=10,
+            ) as response:
                 content = response.read(self._MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             if exc.code == 404:

@@ -71,6 +71,10 @@ The integration composes the merged components without introducing direct Azure 
   Persistence then re-resolves and compares the complete context/profile, approval, publisher
   grant, reader grant, key trust, snapshot/envelope binding, inherited governance, risk authority,
   and all associated revisions and digests from the transaction's current local state. No
+  Pydantic/model equality participates in those comparisons: every token is reconstructed as
+  exact base primitive values, so polymorphic equality cannot hide a grant revision or digest
+  change. Key identity, status, revision, digest, and temporal bounds are likewise sealed before
+  the final clock sample; no caller-derived key-record property is read afterward. No
   overridable hook receives the active unit of work. A mutation staged through that same unit of
   work during preparation therefore aborts and rolls back with the artifact and receipt.
   Persistence independently reconstructs its WC-008 Reader authority from its own pinned
@@ -102,8 +106,10 @@ The integration composes the merged components without introducing direct Azure 
   recomputed result as one state change. No independently supplied commit capability can redirect
   publication to a foreign store. The store binds one opaque root capability to its owning
   `ContextService`; only the service can exchange it, after full validation, for a transaction-local
-  single-use permit. The public transaction surface has no general evaluation-artifact write, and
-  fabricated permits or prepared artifacts fail before callbacks or state mutation. The HTTP composition root accepts only non-authoritative
+  single-use permit bound to that transaction entry's unique epoch. Every exit invalidates all
+  permits, including aborted transactions, so inactive, cross-epoch, or re-entry reuse fails. The
+  public transaction surface has no general evaluation-artifact write, and fabricated permits or
+  prepared artifacts fail before callbacks or state mutation. The HTTP composition root accepts only non-authoritative
   evidence/configuration/signing dependencies and constructs the demo service with the exact
   app-owned `ContextService`; preconstructed demo services are rejected.
 
@@ -159,6 +165,8 @@ python -m pytest tests/test_wc013_live.py -m live
 
 Before accessing MCP, the live path uses `DefaultAzureCredential` to resolve that exact selection
 from the authoritative Context API and rejects missing, expired, malformed, or superseded context.
+The Context API reader rejects every HTTP redirect, so its managed-identity bearer token is sent
+only to the configured HTTPS origin and is never forwarded to another host or downgraded scheme.
 The probe then sends only an unauthenticated synthetic `tools/list` request and requires HTTP 401
 or 403. It does not deploy resources, collect workload evidence, or use customer data.
 

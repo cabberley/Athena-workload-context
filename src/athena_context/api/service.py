@@ -68,6 +68,7 @@ from athena_context.api.evaluation_domain import (
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
+    normalize_evaluation_authority_token,
 )
 from athena_context.api.evaluation_ports import (
     ContextServiceEvaluationPublicationStorePort,
@@ -459,7 +460,7 @@ class ContextService:
             actor=normalized_actor,
             idempotency_key=str(idempotency_key),
             command=normalized_command,
-            expected_authority=authority.model_copy(deep=True),
+            expected_authority=normalize_evaluation_authority_token(authority),
             collection_authority=collection_authority,
             request_digest=request_digest,
         )

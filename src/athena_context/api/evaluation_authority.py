@@ -29,6 +29,7 @@ from athena_context.api.evaluation_domain import (
     PublishedContextSelection,
     ResolvedPublishedContext,
     build_published_context_authority_token,
+    seal_evaluation_authority,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
@@ -38,6 +39,7 @@ from athena_context.api.evaluation_ports import (
     EvaluationTemporalValidity,
     EvaluationTrustedKeyAuthority,
     StoredEvaluation,
+    seal_evaluation_trusted_key_authority,
 )
 from athena_context.api.ports import ContextTransactionPort
 from athena_context.contracts import (
@@ -376,6 +378,11 @@ def validate_loaded_evaluation_authority(
 ]:
     """Purely validate one transaction-local complete authority snapshot."""
 
+    sealed_expected_authority = (
+        None
+        if expected_authority is None
+        else seal_evaluation_authority(expected_authority)
+    )
     validate_demo_evaluation_approval(
         actor,
         command,
@@ -394,13 +401,16 @@ def validate_loaded_evaluation_authority(
         manifest_version=command.manifest_version,
         profile_id=command.profile_id,
     )
-    if expected_authority is not None:
+    if sealed_expected_authority is not None:
         expected_selection_mode = (
             "uniqueActiveVersion"
             if command.manifest_version is None
             else "exactVersion"
         )
-        if expected_authority.context.selection_mode != expected_selection_mode:
+        if (
+            sealed_expected_authority.context.selection_mode
+            != expected_selection_mode
+        ):
             raise EvaluationFailedClosedError(
                 "published context authority token changed selection mode"
             )
@@ -434,9 +444,15 @@ def validate_loaded_evaluation_authority(
         approval=approval.authority_token(),
         authorization=authorization,
         context_reader_authorization=context_reader_authorization,
-        trusted_key=trusted_key.authority_token(),
+        trusted_key=seal_evaluation_trusted_key_authority(
+            trusted_key
+        ).authority_token,
     )
-    if expected_authority is not None and authority != expected_authority:
+    if (
+        sealed_expected_authority is not None
+        and seal_evaluation_authority(authority)
+        != sealed_expected_authority
+    ):
         raise EvaluationFailedClosedError(
             "evaluation authority revision changed before publication"
         )

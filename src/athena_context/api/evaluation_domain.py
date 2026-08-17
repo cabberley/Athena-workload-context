@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
@@ -286,6 +287,207 @@ class EvaluationAuthorityToken(ApiModel):
     authorization: AuthorizationGrantToken
     context_reader_authorization: AuthorizationGrantToken
     trusted_key: TrustedKeyAuthorityToken
+
+
+@dataclass(frozen=True, slots=True)
+class SealedPublishedContextAuthority:
+    """Exact primitive WC-007 authority values used for security comparisons."""
+
+    selection_mode: str
+    manifest_id: str
+    manifest_version: str
+    manifest_digest: str
+    source_draft_id: str
+    revision: int
+    etag: str
+    profile_id: str
+    resolved_profile_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SealedApprovalAuthority:
+    """Exact primitive approval authority values."""
+
+    decision_id: str
+    revision: int
+    decision_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SealedAuthorizationGrantAuthority:
+    """Exact primitive grant authority values, independent of model equality."""
+
+    actor_id: str
+    permission: str
+    manifest_id: str
+    grant_revision: int
+    grant_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SealedTrustedKeyAuthority:
+    """Exact primitive signing-key authority values."""
+
+    key_vault_key_id: str
+    key_version: str
+    public_key_fingerprint: str
+    revision: int
+    authority_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SealedEvaluationAuthority:
+    """Complete primitive authority snapshot with non-polymorphic equality."""
+
+    context: SealedPublishedContextAuthority
+    approval: SealedApprovalAuthority
+    authorization: SealedAuthorizationGrantAuthority
+    context_reader_authorization: SealedAuthorizationGrantAuthority
+    trusted_key: SealedTrustedKeyAuthority
+
+
+def _exact_text(value: str) -> str:
+    """Drop any string subclass before a security-sensitive comparison."""
+
+    if not isinstance(value, str):
+        raise ValueError("authority token contains non-text state")
+    return str.__str__(value)
+
+
+def _exact_revision(value: int) -> int:
+    if type(value) is not int:
+        raise ValueError("authority token contains non-integer revision state")
+    return value
+
+
+def seal_published_context_authority(
+    token: PublishedContextAuthorityToken,
+) -> SealedPublishedContextAuthority:
+    return SealedPublishedContextAuthority(
+        selection_mode=_exact_text(token.selection_mode),
+        manifest_id=_exact_text(token.manifest_id),
+        manifest_version=_exact_text(token.manifest_version),
+        manifest_digest=_exact_text(token.manifest_digest),
+        source_draft_id=_exact_text(token.source_draft_id),
+        revision=_exact_revision(token.revision),
+        etag=_exact_text(token.etag),
+        profile_id=_exact_text(token.profile_id),
+        resolved_profile_digest=_exact_text(token.resolved_profile_digest),
+    )
+
+
+def seal_approval_authority(
+    token: ApprovalAuthorityToken,
+) -> SealedApprovalAuthority:
+    return SealedApprovalAuthority(
+        decision_id=_exact_text(token.decision_id),
+        revision=_exact_revision(token.revision),
+        decision_digest=_exact_text(token.decision_digest),
+    )
+
+
+def seal_authorization_grant_authority(
+    token: AuthorizationGrantToken,
+) -> SealedAuthorizationGrantAuthority:
+    return SealedAuthorizationGrantAuthority(
+        actor_id=_exact_text(token.actor_id),
+        permission=_exact_text(token.permission.value),
+        manifest_id=_exact_text(token.manifest_id),
+        grant_revision=_exact_revision(token.grant_revision),
+        grant_digest=_exact_text(token.grant_digest),
+    )
+
+
+def seal_trusted_key_authority(
+    token: TrustedKeyAuthorityToken,
+) -> SealedTrustedKeyAuthority:
+    return SealedTrustedKeyAuthority(
+        key_vault_key_id=_exact_text(token.key_vault_key_id),
+        key_version=_exact_text(token.key_version),
+        public_key_fingerprint=_exact_text(token.public_key_fingerprint),
+        revision=_exact_revision(token.revision),
+        authority_digest=_exact_text(token.authority_digest),
+    )
+
+
+def seal_evaluation_authority(
+    token: EvaluationAuthorityToken,
+) -> SealedEvaluationAuthority:
+    """Reconstruct authority as exact primitives; never invoke model equality."""
+
+    return SealedEvaluationAuthority(
+        context=seal_published_context_authority(token.context),
+        approval=seal_approval_authority(token.approval),
+        authorization=seal_authorization_grant_authority(
+            token.authorization
+        ),
+        context_reader_authorization=seal_authorization_grant_authority(
+            token.context_reader_authorization
+        ),
+        trusted_key=seal_trusted_key_authority(token.trusted_key),
+    )
+
+
+def normalize_evaluation_authority_token(
+    token: EvaluationAuthorityToken,
+) -> EvaluationAuthorityToken:
+    """Return exact base models so subclasses never cross service boundaries."""
+
+    sealed = seal_evaluation_authority(token)
+    return EvaluationAuthorityToken(
+        context=PublishedContextAuthorityToken(
+            selection_mode=cast(
+                Literal["exactVersion", "uniqueActiveVersion"],
+                sealed.context.selection_mode,
+            ),
+            manifest_id=sealed.context.manifest_id,
+            manifest_version=sealed.context.manifest_version,
+            manifest_digest=sealed.context.manifest_digest,
+            source_draft_id=sealed.context.source_draft_id,
+            revision=sealed.context.revision,
+            etag=sealed.context.etag,
+            profile_id=sealed.context.profile_id,
+            resolved_profile_digest=(
+                sealed.context.resolved_profile_digest
+            ),
+        ),
+        approval=ApprovalAuthorityToken(
+            decision_id=sealed.approval.decision_id,
+            revision=sealed.approval.revision,
+            decision_digest=sealed.approval.decision_digest,
+        ),
+        authorization=AuthorizationGrantToken(
+            actor_id=sealed.authorization.actor_id,
+            permission=Permission(sealed.authorization.permission),
+            manifest_id=sealed.authorization.manifest_id,
+            grant_revision=sealed.authorization.grant_revision,
+            grant_digest=sealed.authorization.grant_digest,
+        ),
+        context_reader_authorization=AuthorizationGrantToken(
+            actor_id=sealed.context_reader_authorization.actor_id,
+            permission=Permission(
+                sealed.context_reader_authorization.permission
+            ),
+            manifest_id=(
+                sealed.context_reader_authorization.manifest_id
+            ),
+            grant_revision=(
+                sealed.context_reader_authorization.grant_revision
+            ),
+            grant_digest=(
+                sealed.context_reader_authorization.grant_digest
+            ),
+        ),
+        trusted_key=TrustedKeyAuthorityToken(
+            key_vault_key_id=sealed.trusted_key.key_vault_key_id,
+            key_version=sealed.trusted_key.key_version,
+            public_key_fingerprint=(
+                sealed.trusted_key.public_key_fingerprint
+            ),
+            revision=sealed.trusted_key.revision,
+            authority_digest=sealed.trusted_key.authority_digest,
+        ),
+    )
 
 
 def build_published_context_authority_token(

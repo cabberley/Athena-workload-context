@@ -43,6 +43,8 @@ from athena_context.api.evaluation_domain import (
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     build_demo_evaluation_result,
+    seal_approval_authority,
+    seal_evaluation_authority,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
@@ -50,12 +52,14 @@ from athena_context.api.evaluation_ports import (
     EvaluationCommitAuthorityCondition,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
+    SealedEvaluationTrustedKeyAuthority,
     StoredEvaluation,
     StoredEvaluationMaterial,
     build_demo_evaluation_candidate_digest,
     build_demo_evaluation_request_digest,
     build_evaluation_collection_authority,
     build_evaluation_evidence_binding_digest,
+    seal_evaluation_trusted_key_authority,
 )
 from athena_context.api.evaluation_verification import (
     validate_evaluation_collection_binding,
@@ -90,7 +94,7 @@ def _finalize_prepared_evaluation(
     request_digest: str,
     candidate_digest: str,
     published_at: datetime,
-    trusted_key: EvaluationTrustedKeyAuthority,
+    trusted_key: SealedEvaluationTrustedKeyAuthority,
     material: StoredEvaluationMaterial,
 ) -> StoredEvaluation:
     """Sealed, bounded finalizer: no callbacks, lookups, hooks, crypto, or policy."""
@@ -118,17 +122,16 @@ def _finalize_prepared_evaluation(
             "demo evaluation approval is not active at the trusted evaluation time"
         )
 
-    key_record = trusted_key.record
     if (
-        not key_record.enabled
-        or key_record.activated_at > published_at
+        not trusted_key.enabled
+        or trusted_key.activated_at > published_at
         or (
-            key_record.retired_at is not None
-            and key_record.retired_at <= published_at
+            trusted_key.retired_at is not None
+            and trusted_key.retired_at <= published_at
         )
         or (
-            key_record.expires_at is not None
-            and key_record.expires_at <= published_at
+            trusted_key.expires_at is not None
+            and trusted_key.expires_at <= published_at
         )
         or (
             trusted_key.revoked_at is not None
@@ -325,6 +328,14 @@ def _normalize_evaluation_preparation(
     )
 
 
+def _seal_trusted_key_for_finalization(
+    trusted_key: EvaluationTrustedKeyAuthority,
+) -> SealedEvaluationTrustedKeyAuthority:
+    """Perform every key-record property read before authoritative time."""
+
+    return seal_evaluation_trusted_key_authority(trusted_key)
+
+
 class InMemoryContextStore:
     """Transactional, deterministic in-memory implementation of the storage port."""
 
@@ -461,11 +472,19 @@ class _MemoryTransaction(ContextTransactionPort):
         ] = {}
         self._base_generation = 0
         self._dirty = False
+        self.__active_entry_epoch: object | None = None
+        self.__evaluation_publication_epoch: object | None = None
         self.__evaluation_publication_capability: object | None = None
         self.__evaluation_publication_consumed = False
 
     def __enter__(self) -> _MemoryTransaction:
+        if self.__active_entry_epoch is not None:
+            raise RuntimeError("context transaction is already active")
         self._store._lock.acquire()
+        self.__active_entry_epoch = object()
+        self.__evaluation_publication_epoch = None
+        self.__evaluation_publication_capability = None
+        self.__evaluation_publication_consumed = False
         self._drafts = dict(self._store._drafts)
         self._published = dict(self._store._published)
         self._supersessions = dict(self._store._supersessions)
@@ -517,6 +536,10 @@ class _MemoryTransaction(ContextTransactionPort):
                     )
                     self._store._transaction_generation += 1
         finally:
+            self.__evaluation_publication_capability = None
+            self.__evaluation_publication_epoch = None
+            self.__evaluation_publication_consumed = True
+            self.__active_entry_epoch = None
             self._store._lock.release()
         return False
 
@@ -752,6 +775,11 @@ class _MemoryTransaction(ContextTransactionPort):
         self,
         service_capability: object,
     ) -> object:
+        active_entry_epoch = self.__active_entry_epoch
+        if active_entry_epoch is None:
+            raise EvaluationFailedClosedError(
+                "evaluation publication requires an active transaction entry"
+            )
         if not self._store._owns_context_service_evaluation_capability(
             service_capability
         ):
@@ -765,6 +793,7 @@ class _MemoryTransaction(ContextTransactionPort):
             )
         transaction_capability = object()
         self.__evaluation_publication_capability = transaction_capability
+        self.__evaluation_publication_epoch = active_entry_epoch
         return transaction_capability
 
     def _put_context_service_evaluation(
@@ -774,7 +803,10 @@ class _MemoryTransaction(ContextTransactionPort):
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
         if (
-            self.__evaluation_publication_consumed
+            self.__active_entry_epoch is None
+            or self.__evaluation_publication_epoch
+            is not self.__active_entry_epoch
+            or self.__evaluation_publication_consumed
             or transaction_capability
             is not self.__evaluation_publication_capability
         ):
@@ -792,13 +824,19 @@ class _MemoryTransaction(ContextTransactionPort):
         # insertion timestamp. Preparation returns immutable data, never an
         # executable post-time callback.
         self._store._before_evaluation_commit_timestamp()
+        expected_authority = seal_evaluation_authority(
+            condition.expected_authority
+        )
         trusted_key = self.get_demo_evaluation_trusted_key(
             condition.trusted_key_anchor
         )
-        if (
-            trusted_key is None
-            or trusted_key.authority_token()
-            != condition.expected_authority.trusted_key
+        sealed_trusted_key = (
+            None
+            if trusted_key is None
+            else seal_evaluation_trusted_key_authority(trusted_key)
+        )
+        if trusted_key is None or sealed_trusted_key is None or (
+            sealed_trusted_key.authority != expected_authority.trusted_key
         ):
             raise StaleRevisionError(
                 "trusted signing-key authority changed before publication"
@@ -913,13 +951,22 @@ class _MemoryTransaction(ContextTransactionPort):
             if current_trusted_key is not None
             else ()
         )
+        sealed_current_trusted_key = (
+            None
+            if current_trusted_key is None
+            else _seal_trusted_key_for_finalization(current_trusted_key)
+        )
         if (
             current_trusted_key is None
-            or current_trusted_key.authority_token()
-            != condition.expected_authority.trusted_key
-            or authority != condition.expected_authority
-            or prepared.approval.authority_token()
-            != authority.approval
+            or sealed_current_trusted_key is None
+            or sealed_current_trusted_key.authority
+            != expected_authority.trusted_key
+            or seal_evaluation_authority(authority)
+            != expected_authority
+            or seal_approval_authority(
+                prepared.approval.authority_token()
+            )
+            != seal_approval_authority(authority.approval)
             or prepared.resolved_profile_digest
             != resolved.profile.resolved_profile_digest
             or normalized.authorized_scope_json
@@ -953,7 +1000,7 @@ class _MemoryTransaction(ContextTransactionPort):
             request_digest=request_digest,
             candidate_digest=candidate_digest,
             published_at=published_at,
-            trusted_key=current_trusted_key,
+            trusted_key=sealed_current_trusted_key,
             material=normalized.material,
         )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
