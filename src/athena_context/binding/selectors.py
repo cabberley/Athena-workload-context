@@ -1,17 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Literal, cast, get_args
 
-from athena_context.binding.domain import (
-    CohortSignalEvidence,
-    ImageSignalEvidence,
-    LoadBalancerBackendSignalEvidence,
-    SelectorEvaluation,
-    SubnetSignalEvidence,
-    VmssSignalEvidence,
-)
+from athena_context.binding.domain import SelectorEvaluation
 from athena_context.binding.normalization import normalize_resource_id
 from athena_context.contracts.common import (
     AthenaValidationError,
@@ -74,21 +66,6 @@ def _resource_group(resource_id: str) -> str | None:
     return None
 
 
-def _signals_by_resource(
-    signals: Iterable[CohortSignalEvidence],
-    resource_ids: set[str],
-) -> dict[str, list[CohortSignalEvidence]]:
-    indexed: dict[str, list[CohortSignalEvidence]] = defaultdict(list)
-    for signal in signals:
-        normalized_id = normalize_resource_id(signal.resource_id)
-        if normalized_id not in resource_ids:
-            raise AthenaValidationError(
-                "selector signal resourceId must resolve to exactly one supplied resource"
-            )
-        indexed[normalized_id].append(signal)
-    return indexed
-
-
 def _tag_matches(selector: TagPredicateSelector, resource: ResourceEvidenceRecord) -> bool:
     tags = resource.tags.model_dump(mode="json", by_alias=True, exclude_none=True)
     normalized_tags = {
@@ -102,53 +79,25 @@ def _tag_matches(selector: TagPredicateSelector, resource: ResourceEvidenceRecor
     )
 
 
-def _signal_matches(
-    selector: ManifestSelector,
-    signal: CohortSignalEvidence,
-) -> bool:
-    if isinstance(selector, VmssSelector) and isinstance(signal, VmssSignalEvidence):
-        scale_set_matches = _comparison_text(signal.scale_set_resource_id) == _comparison_text(
-            selector.scale_set_resource_id
-        )
-        instance_matches = not selector.instance_ids or (
-            signal.instance_id is not None
-            and _comparison_text(signal.instance_id)
-            in {_comparison_text(item) for item in selector.instance_ids}
-        )
-        return scale_set_matches and instance_matches
-    if isinstance(selector, LoadBalancerBackendSelector) and isinstance(
-        signal, LoadBalancerBackendSignalEvidence
-    ):
-        return (
-            _comparison_text(signal.load_balancer_resource_id)
-            == _comparison_text(selector.load_balancer_resource_id)
-            and _comparison_text(signal.backend_pool_name)
-            == _comparison_text(selector.backend_pool_name)
-        )
-    if isinstance(selector, SubnetSelector) and isinstance(signal, SubnetSignalEvidence):
-        return _comparison_text(signal.subnet_resource_id) == _comparison_text(
-            selector.subnet_resource_id
-        )
-    if isinstance(selector, ImageSelector) and isinstance(signal, ImageSignalEvidence):
-        return (
-            _comparison_text(signal.publisher) == _comparison_text(selector.publisher)
-            and _comparison_text(signal.offer) == _comparison_text(selector.offer)
-            and _comparison_text(signal.sku) == _comparison_text(selector.sku)
-            and (
-                selector.version is None
-                or (
-                    signal.version is not None
-                    and _comparison_text(signal.version) == _comparison_text(selector.version)
-                )
-            )
-        )
-    return False
+def _vmss_membership(resource_id: str) -> tuple[str, str] | None:
+    parts = resource_id.split("/")
+    lowered = [part.casefold() for part in parts]
+    for index in range(len(parts) - 4):
+        if (
+            lowered[index] == "providers"
+            and lowered[index + 1] == "microsoft.compute"
+            and lowered[index + 2] == "virtualmachinescalesets"
+            and lowered[index + 4] == "virtualmachines"
+            and index + 5 < len(parts)
+        ):
+            scale_set_id = "/".join(parts[: index + 4])
+            return normalize_resource_id(scale_set_id), _comparison_text(parts[index + 5])
+    return None
 
 
 def _atomic_matches(
     selector: ManifestSelector,
     resources: dict[str, ResourceEvidenceRecord],
-    signals: dict[str, list[CohortSignalEvidence]],
 ) -> set[str]:
     if isinstance(selector, ResourceIdListSelector):
         selected = {_comparison_text(item) for item in selector.resource_ids}
@@ -191,15 +140,26 @@ def _atomic_matches(
                 )
             )
         }
-    if isinstance(
-        selector,
-        (VmssSelector, LoadBalancerBackendSelector, SubnetSelector, ImageSelector),
-    ):
+    if isinstance(selector, VmssSelector):
+        try:
+            expected_scale_set = normalize_resource_id(selector.scale_set_resource_id)
+        except AthenaValidationError:
+            return set()
+        expected_instances = {_comparison_text(item) for item in selector.instance_ids}
         return {
             resource_id
-            for resource_id, resource_signals in signals.items()
-            if any(_signal_matches(selector, signal) for signal in resource_signals)
+            for resource_id in resources
+            if (membership := _vmss_membership(resource_id)) is not None
+            and membership[0] == expected_scale_set
+            and (not expected_instances or membership[1] in expected_instances)
         }
+    if isinstance(
+        selector,
+        (LoadBalancerBackendSelector, SubnetSelector, ImageSelector),
+    ):
+        # Canonical resource records do not carry these claims. They fail closed
+        # until a frozen evidence-record variant can prove the exact selector fields.
+        return set()
     if isinstance(selector, ProvenanceSelector):
         return {
             resource_id
@@ -219,8 +179,6 @@ def _atomic_matches(
 def evaluate_selector(
     selector: ManifestSelector,
     resources: Sequence[ResourceEvidenceRecord],
-    *,
-    signals: Sequence[CohortSignalEvidence] = (),
 ) -> SelectorEvaluation:
     """Evaluate a frozen manifest selector and enforce every nested maxMatches bound."""
 
@@ -232,8 +190,6 @@ def evaluate_selector(
                 "selector input contains duplicate normalized Azure resource IDs"
             )
         resources_by_id[normalized_id] = resource
-    signals_by_id = _signals_by_resource(signals, set(resources_by_id))
-
     def evaluate(current: ManifestSelector) -> tuple[set[str], list[str]]:
         violations: list[str] = []
         if isinstance(current, CompositeAllSelector):
@@ -251,7 +207,7 @@ def evaluate_selector(
             for _, child_violations in child_results:
                 violations.extend(child_violations)
         else:
-            matches = _atomic_matches(current, resources_by_id, signals_by_id)
+            matches = _atomic_matches(current, resources_by_id)
         if len(matches) > current.max_matches:
             violations.append(current.selector_id)
         return matches, violations

@@ -3,13 +3,9 @@
 from athena_context.binding.domain import (
     CohortProposal,
     CohortProposalBatch,
-    CohortSignalEvidence,
     ConfidenceBand,
     ConflictCode,
-    DeploymentProvenanceSignalEvidence,
     DissentingEvidence,
-    ImageSignalEvidence,
-    LoadBalancerBackendSignalEvidence,
     ProposalConflict,
     ProposalScope,
     ProposalSnapshot,
@@ -19,9 +15,7 @@ from athena_context.binding.domain import (
     SelectorEvaluation,
     SelectorPreview,
     SignalType,
-    SubnetSignalEvidence,
     SupportingEvidence,
-    VmssSignalEvidence,
 )
 from athena_context.binding.engine import propose_cohorts
 from athena_context.binding.selectors import (
@@ -29,17 +23,18 @@ from athena_context.binding.selectors import (
     normalize_resource_id,
     selector_runtime_variants,
 )
+from athena_context.binding.verification import (
+    TrustedSnapshotVerifier,
+    VerifiedCohortSnapshot,
+    verify_cohort_snapshot,
+)
 
 __all__ = [
     "CohortProposal",
     "CohortProposalBatch",
-    "CohortSignalEvidence",
     "ConfidenceBand",
     "ConflictCode",
-    "DeploymentProvenanceSignalEvidence",
     "DissentingEvidence",
-    "ImageSignalEvidence",
-    "LoadBalancerBackendSignalEvidence",
     "ProposalConflict",
     "ProposalScope",
     "ProposalSnapshot",
@@ -49,11 +44,12 @@ __all__ = [
     "SelectorEvaluation",
     "SelectorPreview",
     "SignalType",
-    "SubnetSignalEvidence",
     "SupportingEvidence",
-    "VmssSignalEvidence",
+    "TrustedSnapshotVerifier",
+    "VerifiedCohortSnapshot",
     "evaluate_selector",
     "normalize_resource_id",
     "propose_cohorts",
     "selector_runtime_variants",
+    "verify_cohort_snapshot",
 ]

@@ -11,12 +11,9 @@ from pydantic import TypeAdapter
 from athena_context.binding.domain import (
     CohortProposal,
     CohortProposalBatch,
-    CohortSignalEvidence,
     ConfidenceBand,
     ConflictCode,
     DissentingEvidence,
-    ImageSignalEvidence,
-    LoadBalancerBackendSignalEvidence,
     ProposalConflict,
     ProposalScope,
     ProposalSnapshot,
@@ -24,11 +21,13 @@ from athena_context.binding.domain import (
     RejectionReason,
     SelectorPreview,
     SignalType,
-    SubnetSignalEvidence,
     SupportingEvidence,
-    VmssSignalEvidence,
 )
 from athena_context.binding.selectors import evaluate_selector, normalize_resource_id
+from athena_context.binding.verification import (
+    VerifiedCohortSnapshot,
+    require_current_verified_snapshot,
+)
 from athena_context.contracts.common import (
     AthenaValidationError,
     canonicalize_json,
@@ -64,23 +63,9 @@ from athena_context.contracts.models import (
     ResourceIdScope,
     ServiceHealthRegionScope,
     SubscriptionScope,
-    compute_evidence_snapshot_artifact_digest,
-    compute_evidence_snapshot_semantic_digest,
 )
 
 _SELECTOR_ADAPTER: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
-_SIGNAL_PRIORITY = (
-    "vmScaleSet",
-    "loadBalancerBackend",
-    "deploymentProvenance",
-)
-_SUPPLEMENTAL_FAMILIES: tuple[SignalType, ...] = (
-    "vmScaleSet",
-    "loadBalancerBackend",
-    "subnet",
-    "image",
-    "deploymentProvenance",
-)
 
 
 @dataclass(slots=True)
@@ -88,14 +73,19 @@ class _EvidenceIndex:
     resources: dict[str, ResourceEvidenceRecord]
     all_resources: list[ResourceEvidenceRecord]
     resource_refs: dict[str, EvidenceItemRef]
-    signals: list[CohortSignalEvidence]
-    signals_by_resource: dict[str, dict[str, list[CohortSignalEvidence]]]
     communications: dict[str, list[tuple[str, EvidenceItemRef]]]
     rejection_reasons: dict[str, set[RejectionReason]]
     conflicts: list[ProposalConflict]
 
 
-def _scope_prefix(scope: EvidenceScope) -> tuple[str, ...] | None:
+def _scope_prefix(
+    scope: EvidenceScope,
+    *,
+    tenant_id: str,
+) -> tuple[str, ...] | None:
+    scope_tenant = getattr(scope, "tenant_id", None)
+    if scope_tenant is not None and str(scope_tenant).casefold() != tenant_id.casefold():
+        return None
     if isinstance(scope, SubscriptionScope):
         return ("subscriptions", scope.subscription_id.casefold())
     if isinstance(scope, ResourceGroupScope):
@@ -123,18 +113,45 @@ def _scope_prefix(scope: EvidenceScope) -> tuple[str, ...] | None:
     return None
 
 
-def _resource_in_scopes(resource_id: str, scopes: Iterable[EvidenceScope]) -> bool:
+def _resource_in_scopes(
+    resource_id: str,
+    scopes: Iterable[EvidenceScope],
+    *,
+    tenant_id: str,
+) -> bool:
+    scope_list = list(scopes)
     parts = tuple(part.casefold() for part in resource_id.split("/") if part)
-    return any(
-        prefix is not None and len(prefix) <= len(parts) and parts[: len(prefix)] == prefix
-        for prefix in (_scope_prefix(scope) for scope in scopes)
-    )
+    tenant_bound_prefixes = [
+        prefix
+        for scope in scope_list
+        if not isinstance(scope, ResourceIdScope)
+        and (prefix := _scope_prefix(scope, tenant_id=tenant_id)) is not None
+    ]
+    for scope in scope_list:
+        prefix = _scope_prefix(scope, tenant_id=tenant_id)
+        if prefix is None or len(prefix) > len(parts) or parts[: len(prefix)] != prefix:
+            continue
+        if not isinstance(scope, ResourceIdScope):
+            return True
+        if any(
+            len(parent) <= len(prefix) and prefix[: len(parent)] == parent
+            for parent in tenant_bound_prefixes
+        ):
+            return True
+    return False
 
 
-def _scopes_overlap(left: EvidenceScope, right: EvidenceScope) -> bool:
-    left_prefix = _scope_prefix(left)
-    right_prefix = _scope_prefix(right)
+def _scopes_overlap(
+    left: EvidenceScope,
+    right: EvidenceScope,
+    *,
+    tenant_id: str,
+) -> bool:
+    left_prefix = _scope_prefix(left, tenant_id=tenant_id)
+    right_prefix = _scope_prefix(right, tenant_id=tenant_id)
     if left_prefix is None or right_prefix is None:
+        return False
+    if isinstance(left, ResourceIdScope) and isinstance(right, ResourceIdScope):
         return False
     shortest = min(len(left_prefix), len(right_prefix))
     return left_prefix[:shortest] == right_prefix[:shortest]
@@ -273,7 +290,6 @@ def _communication_signature(
 def _build_evidence_index(
     profile: ResolvedManifestProfile,
     snapshot: EvidenceSnapshot,
-    signals: Sequence[CohortSignalEvidence],
     *,
     as_of: datetime,
 ) -> _EvidenceIndex:
@@ -289,30 +305,15 @@ def _build_evidence_index(
         elif isinstance(record, ObservedRelationshipEvidenceRecord):
             relationships.append(record)
         elif isinstance(record, EvidenceGapRecord) and any(
-            _scopes_overlap(record.evidence_scope, scope)
+            _scopes_overlap(
+                record.evidence_scope,
+                scope,
+                tenant_id=snapshot.collector.tenant_id,
+            )
             for scope in profile.allowed_evidence_scopes
         ):
             relevant_gap = True
 
-    if (
-        compute_evidence_snapshot_artifact_digest(snapshot)
-        != snapshot.compatibility.artifact_digest
-        or compute_evidence_snapshot_semantic_digest(snapshot)
-        != snapshot.compatibility.semantic_digest
-    ):
-        conflicts.append(
-            _conflict(
-                "snapshotDigestMismatch",
-                "snapshot records do not match the declared canonical snapshot digests",
-            )
-        )
-    if as_of < snapshot.collected_at or as_of >= snapshot.expires_at:
-        conflicts.append(
-            _conflict(
-                "staleEvidence",
-                "snapshot is not fresh at the requested deterministic evaluation time",
-            )
-        )
     if relevant_gap:
         conflicts.append(
             _conflict(
@@ -336,11 +337,9 @@ def _build_evidence_index(
             resources[resource_id] = records[0]
 
     item_refs_by_digest: dict[str, list[EvidenceItemRef]] = defaultdict(list)
-    allowed_ref_json: set[str] = set()
     for ref in snapshot.evidence_refs:
         if isinstance(ref, EvidenceItemRef):
             item_refs_by_digest[ref.item_digest].append(ref)
-            allowed_ref_json.add(ref.canonical_json())
 
     resource_refs: dict[str, EvidenceItemRef] = {}
     expected_environment = _expected_environment(profile.profile_type)
@@ -361,49 +360,22 @@ def _build_evidence_index(
             )
         else:
             resource_refs[resource_id] = refs[0]
-        if not _resource_in_scopes(resource_id, profile.allowed_evidence_scopes):
+        if not _resource_in_scopes(
+            resource_id,
+            profile.allowed_evidence_scopes,
+            tenant_id=snapshot.collector.tenant_id,
+        ):
             rejection_reasons[resource_id].add("outOfProfileScope")
-        if not _resource_in_scopes(resource_id, snapshot.authorized_scopes):
+        if not _resource_in_scopes(
+            resource_id,
+            snapshot.authorized_scopes,
+            tenant_id=snapshot.collector.tenant_id,
+        ):
             rejection_reasons[resource_id].add("outOfSnapshotScope")
         if record.tags.environment is None:
             rejection_reasons[resource_id].add("missingEnvironment")
         elif record.tags.environment.casefold() != expected_environment.casefold():
             rejection_reasons[resource_id].add("crossEnvironment")
-
-    valid_signals: list[CohortSignalEvidence] = []
-    signals_by_resource: dict[str, dict[str, list[CohortSignalEvidence]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for signal in signals:
-        try:
-            resource_id = normalize_resource_id(signal.resource_id)
-        except AthenaValidationError:
-            conflicts.append(
-                _conflict(
-                    "invalidEvidenceReference",
-                    "signal has a malformed Azure resource ID",
-                )
-            )
-            continue
-        resource_record = resources.get(resource_id)
-        valid_ref = (
-            resource_record is not None
-            and signal.evidence_ref.canonical_json() in allowed_ref_json
-            and signal.evidence_ref.item_digest == resource_record.item_digest
-            and _reference_matches_record(signal.evidence_ref, resource_record, snapshot)
-        )
-        if not valid_ref:
-            rejection_reasons[resource_id].add("invalidEvidenceReference")
-            conflicts.append(
-                _conflict(
-                    "invalidEvidenceReference",
-                    "supplemental signal is not bound to its canonical resource record",
-                    resource_ids=[resource_id],
-                )
-            )
-            continue
-        valid_signals.append(signal)
-        signals_by_resource[resource_id][signal.signal_type].append(signal)
 
     communications: dict[str, list[tuple[str, EvidenceItemRef]]] = defaultdict(list)
     for record in relationships:
@@ -432,46 +404,39 @@ def _build_evidence_index(
         resources=resources,
         all_resources=list(resources.values()),
         resource_refs=resource_refs,
-        signals=valid_signals,
-        signals_by_resource=signals_by_resource,
         communications=communications,
         rejection_reasons=rejection_reasons,
         conflicts=conflicts,
     )
 
 
-def _signal_key(signal: CohortSignalEvidence) -> str:
-    payload = signal.model_dump(
-        mode="json",
-        by_alias=True,
-        exclude={"resource_id", "evidence_ref", "instance_id"},
-        exclude_none=True,
-    )
-    return canonicalize_json(payload)
+def _vmss_anchor(resource_id: str) -> str | None:
+    parts = resource_id.split("/")
+    lowered = [part.casefold() for part in parts]
+    for index in range(len(parts) - 4):
+        if (
+            lowered[index] == "providers"
+            and lowered[index + 1] == "microsoft.compute"
+            and lowered[index + 2] == "virtualmachinescalesets"
+            and lowered[index + 4] == "virtualmachines"
+        ):
+            return normalize_resource_id("/".join(parts[: index + 4]))
+    return None
 
 
-def _candidate_groups(
-    candidates: list[str],
-    signal_index: dict[str, dict[str, list[CohortSignalEvidence]]],
-) -> list[tuple[str, list[str]]]:
+def _candidate_groups(candidates: list[str]) -> list[tuple[str, list[str]]]:
     if not candidates:
         return [("none", [])]
-    for family in _SIGNAL_PRIORITY:
-        keys_by_resource: dict[str, set[str]] = {
-            resource_id: {
-                _signal_key(signal)
-                for signal in signal_index.get(resource_id, {}).get(family, [])
-            }
-            for resource_id in candidates
-        }
-        if all(len(keys) == 1 for keys in keys_by_resource.values()):
-            groups: dict[str, list[str]] = defaultdict(list)
-            for resource_id, keys in keys_by_resource.items():
-                groups[next(iter(keys))].append(resource_id)
-            return [
-                (key, sorted(members))
-                for key, members in sorted(groups.items(), key=lambda item: item[0])
-            ]
+    anchors = {resource_id: _vmss_anchor(resource_id) for resource_id in candidates}
+    if all(anchor is not None for anchor in anchors.values()):
+        groups: dict[str, list[str]] = defaultdict(list)
+        for resource_id, anchor in anchors.items():
+            if anchor is not None:
+                groups[anchor].append(resource_id)
+        return [
+            (key, sorted(members))
+            for key, members in sorted(groups.items(), key=lambda item: item[0])
+        ]
     return [("unanchored", sorted(candidates))]
 
 
@@ -515,26 +480,6 @@ def _clone_atomic(
     return _SELECTOR_ADAPTER.validate_python(payload)
 
 
-def _common_signal(
-    members: Sequence[str],
-    signal_index: dict[str, dict[str, list[CohortSignalEvidence]]],
-    family: str,
-) -> tuple[str, list[CohortSignalEvidence]] | None:
-    values: list[set[str]] = []
-    facts: list[CohortSignalEvidence] = []
-    for resource_id in members:
-        resource_facts = signal_index.get(resource_id, {}).get(family, [])
-        keys = {_signal_key(fact) for fact in resource_facts}
-        values.append(keys)
-        facts.extend(resource_facts)
-    if values and all(len(value) == 1 for value in values):
-        common = set.intersection(*values)
-        if len(common) == 1:
-            key = next(iter(common))
-            return key, [fact for fact in facts if _signal_key(fact) == key]
-    return None
-
-
 def _preview_candidates(
     role: ManifestRole,
     profile: ResolvedManifestProfile,
@@ -550,7 +495,6 @@ def _preview_candidates(
             evaluation = evaluate_selector(
                 atom,
                 list(index.resources.values()),
-                signals=index.signals,
             )
             if set(members).issubset(evaluation.matched_resource_ids):
                 sequence += 1
@@ -562,50 +506,18 @@ def _preview_candidates(
                     )
                 )
 
-    for family in ("vmScaleSet", "loadBalancerBackend", "subnet", "image"):
-        common = _common_signal(members, index.signals_by_resource, family)
-        if common is None:
-            continue
-        _, facts = common
-        fact = facts[0]
+    vmss_anchors = {_vmss_anchor(resource_id) for resource_id in members}
+    if len(vmss_anchors) == 1 and None not in vmss_anchors:
         sequence += 1
-        selector_id = f"preview-{sequence}"
-        if isinstance(fact, VmssSignalEvidence):
-            candidate: ManifestSelector = VmssSelector(
+        candidates.append(
+            VmssSelector(
                 selectorType="vmScaleSet",
-                selectorId=selector_id,
-                scaleSetResourceId=fact.scale_set_resource_id,
+                selectorId=f"preview-{sequence}",
+                scaleSetResourceId=cast(str, next(iter(vmss_anchors))),
                 instanceIds=[],
                 maxMatches=total_bound,
             )
-        elif isinstance(fact, LoadBalancerBackendSignalEvidence):
-            candidate = LoadBalancerBackendSelector(
-                selectorType="loadBalancerBackend",
-                selectorId=selector_id,
-                loadBalancerResourceId=fact.load_balancer_resource_id,
-                backendPoolName=fact.backend_pool_name,
-                maxMatches=total_bound,
-            )
-        elif isinstance(fact, SubnetSignalEvidence):
-            candidate = SubnetSelector(
-                selectorType="subnet",
-                selectorId=selector_id,
-                subnetResourceId=fact.subnet_resource_id,
-                maxMatches=total_bound,
-            )
-        elif isinstance(fact, ImageSignalEvidence):
-            candidate = ImageSelector(
-                selectorType="image",
-                selectorId=selector_id,
-                publisher=fact.publisher,
-                offer=fact.offer,
-                sku=fact.sku,
-                version=fact.version,
-                maxMatches=total_bound,
-            )
-        else:
-            continue
-        candidates.append(candidate)
+        )
 
     expected_environment = _expected_environment(profile.profile_type)
     expected_role = _expected_workload_role(role)
@@ -699,7 +611,6 @@ def _build_selector_preview(
         result = evaluate_selector(
             candidate,
             index.all_resources,
-            signals=index.signals,
         )
         matched = set(result.matched_resource_ids)
         if not result.max_match_violations and member_set.issubset(matched):
@@ -760,7 +671,7 @@ def _build_selector_preview(
     else:
         return None
 
-    result = evaluate_selector(selector, index.all_resources, signals=index.signals)
+    result = evaluate_selector(selector, index.all_resources)
     if result.status != "matched" or result.matched_resource_ids != members:
         return None
     return SelectorPreview(
@@ -769,54 +680,6 @@ def _build_selector_preview(
         selectorResultDigest=result.selector_result_digest,
         maxMatches=selector.max_matches,
     )
-
-
-def _dissent_for_supplemental_signals(
-    members: list[str],
-    index: _EvidenceIndex,
-) -> tuple[list[SupportingEvidence], list[DissentingEvidence]]:
-    supporting: list[SupportingEvidence] = []
-    dissent: list[DissentingEvidence] = []
-    for family in _SUPPLEMENTAL_FAMILIES:
-        common = _common_signal(members, index.signals_by_resource, family)
-        any_facts = any(
-            index.signals_by_resource.get(resource_id, {}).get(family)
-            for resource_id in members
-        )
-        if common is not None:
-            value, facts = common
-            supporting.append(
-                SupportingEvidence(
-                    signalType=family,
-                    signalValue=value,
-                    memberResourceIds=members,
-                    evidenceRefs=_unique_refs(fact.evidence_ref for fact in facts),
-                )
-            )
-        elif any_facts:
-            observed_values = sorted(
-                {
-                    _signal_key(fact)
-                    for resource_id in members
-                    for fact in index.signals_by_resource.get(resource_id, {}).get(family, [])
-                }
-            )
-            expected = observed_values[0] if observed_values else "required cohort signal"
-            for resource_id in members:
-                facts = index.signals_by_resource.get(resource_id, {}).get(family, [])
-                values = sorted({_signal_key(fact) for fact in facts})
-                if values != [expected]:
-                    dissent.append(
-                        DissentingEvidence(
-                            resourceId=resource_id,
-                            signalType=family,
-                            expectedValue=expected,
-                            observedValue=canonicalize_json(values) if values else None,
-                            reason="cohort member is missing or disagrees with the shared signal",
-                            evidenceRefs=_unique_refs(fact.evidence_ref for fact in facts),
-                        )
-                    )
-    return supporting, dissent
 
 
 def _support_and_dissent(
@@ -840,6 +703,17 @@ def _support_and_dissent(
                     evidenceRefs=member_refs,
                 )
             )
+
+    vmss_anchors = {_vmss_anchor(resource_id) for resource_id in members}
+    if len(vmss_anchors) == 1 and None not in vmss_anchors:
+        supporting.append(
+            SupportingEvidence(
+                signalType="vmScaleSet",
+                signalValue=cast(str, next(iter(vmss_anchors))),
+                memberResourceIds=members,
+                evidenceRefs=member_refs,
+            )
+        )
 
     expected_environment = _expected_environment(profile.profile_type)
     expected_role = _expected_workload_role(role)
@@ -878,10 +752,6 @@ def _support_and_dissent(
                         evidenceRefs=[index.resource_refs[resource_id]],
                     )
                 )
-
-    signal_support, signal_dissent = _dissent_for_supplemental_signals(members, index)
-    supporting.extend(signal_support)
-    dissent.extend(signal_dissent)
 
     communication_sets = [
         {signature for signature, _ in index.communications.get(resource_id, [])}
@@ -951,9 +821,16 @@ def _confidence(
 ) -> tuple[float, ConfidenceBand]:
     if not members:
         return 0.0, "low"
-    independent_families = len({item.signal_type for item in supporting})
+    independent_source_sets: list[set[str]] = []
+    for evidence in supporting:
+        source_set = {ref.item_digest for ref in evidence.evidence_refs}
+        if source_set and not any(
+            source_set.intersection(existing) for existing in independent_source_sets
+        ):
+            independent_source_sets.append(source_set)
+    independent_sources = len(independent_source_sets)
     score = {0: 0.2, 1: 0.45, 2: 0.65, 3: 0.82, 4: 0.9}.get(
-        min(independent_families, 4),
+        min(independent_sources, 4),
         0.95,
     )
     if dissent or conflicts or preview is None:
@@ -987,7 +864,6 @@ def _proposal_id(
 def _request_digest(
     profile: ResolvedManifestProfile,
     snapshot: EvidenceSnapshot,
-    signals: Sequence[CohortSignalEvidence],
     as_of: datetime,
 ) -> str:
     return compute_artifact_digest(
@@ -1005,19 +881,17 @@ def _request_digest(
                 for record in snapshot.evidence_records
             ),
             "evidenceRefs": sorted(ref.canonical_json() for ref in snapshot.evidence_refs),
-            "signals": sorted(signal.canonical_json() for signal in signals),
         }
     )
 
 
 def propose_cohorts(
     profile: ResolvedManifestProfile,
-    snapshot: EvidenceSnapshot,
+    verified_snapshot: VerifiedCohortSnapshot,
     *,
     as_of: datetime,
-    signals: Sequence[CohortSignalEvidence] = (),
 ) -> CohortProposalBatch:
-    """Build deterministic, review-only cohort proposals from canonical evidence."""
+    """Build review-only proposals from an exactly verified canonical snapshot."""
 
     if as_of.tzinfo is None or as_of.microsecond % 1000:
         raise AthenaValidationError(
@@ -1025,6 +899,7 @@ def propose_cohorts(
         )
     if as_of.utcoffset() != UTC.utcoffset(as_of):
         raise AthenaValidationError("as_of must use UTC")
+    snapshot = require_current_verified_snapshot(verified_snapshot, as_of=as_of)
     roles = sorted(
         (role for role in profile.roles if role.status == "approved"),
         key=lambda item: item.role_id.casefold(),
@@ -1033,7 +908,7 @@ def propose_cohorts(
     if len(role_by_id) != len(roles):
         raise AthenaValidationError("resolved profile contains duplicate normalized role IDs")
 
-    index = _build_evidence_index(profile, snapshot, signals, as_of=as_of)
+    index = _build_evidence_index(profile, snapshot, as_of=as_of)
     selector_results: dict[str, list[Any]] = {}
     selector_roles_by_resource: dict[str, set[str]] = defaultdict(set)
     role_over_max: dict[str, list[str]] = {}
@@ -1043,7 +918,6 @@ def propose_cohorts(
             evaluate_selector(
                 selector,
                 list(index.resources.values()),
-                signals=index.signals,
             )
             for selector in role.selectors
         ]
@@ -1134,10 +1008,7 @@ def propose_cohorts(
     proposals: list[CohortProposal] = []
     for role in roles:
         role_key = role.role_id.casefold()
-        groups = _candidate_groups(
-            sorted(candidates_by_role.get(role_key, [])),
-            index.signals_by_resource,
-        )
+        groups = _candidate_groups(sorted(candidates_by_role.get(role_key, [])))
         for anchor, members in groups:
             conflicts = list(index.conflicts)
             if unbound_resources:
@@ -1324,7 +1195,7 @@ def propose_cohorts(
             )
 
     proposals.sort(key=lambda item: (item.role.role_id.casefold(), item.proposal_id))
-    input_digest = _request_digest(profile, snapshot, signals, as_of)
+    input_digest = _request_digest(profile, snapshot, as_of)
     proposal_set_digest = compute_artifact_digest(
         [
             proposal.model_dump(mode="json", by_alias=True, exclude_none=True)

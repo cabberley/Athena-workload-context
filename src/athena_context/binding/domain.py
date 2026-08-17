@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from athena_context.binding.normalization import normalize_resource_id
 from athena_context.contracts.common import AthenaValidationError, normalize_nfc_text
 from athena_context.contracts.manifest import ManifestRole, ManifestSelector
 from athena_context.contracts.models import AthenaBaseModel, EvidenceItemRef, UtcDateTime
@@ -51,85 +50,6 @@ type RejectionReason = Literal[
     "outOfSnapshotScope",
     "overMaxMatches",
     "staleEvidence",
-]
-
-
-class _ResourceSignalBase(AthenaBaseModel):
-    resource_id: str = Field(..., alias="resourceId", min_length=1, max_length=2048)
-    evidence_ref: EvidenceItemRef = Field(..., alias="evidenceRef")
-
-    @field_validator("resource_id")
-    @classmethod
-    def validate_resource_id(cls, value: str) -> str:
-        return normalize_resource_id(value)
-
-
-class VmssSignalEvidence(_ResourceSignalBase):
-    signal_type: Literal["vmScaleSet"] = Field(..., alias="signalType")
-    scale_set_resource_id: str = Field(
-        ..., alias="scaleSetResourceId", min_length=1, max_length=2048
-    )
-    instance_id: str | None = Field(
-        default=None, alias="instanceId", min_length=1, max_length=128
-    )
-
-    @field_validator("scale_set_resource_id")
-    @classmethod
-    def normalize_scale_set_resource_id(cls, value: str) -> str:
-        return normalize_resource_id(value)
-
-
-class LoadBalancerBackendSignalEvidence(_ResourceSignalBase):
-    signal_type: Literal["loadBalancerBackend"] = Field(..., alias="signalType")
-    load_balancer_resource_id: str = Field(
-        ..., alias="loadBalancerResourceId", min_length=1, max_length=2048
-    )
-    backend_pool_name: str = Field(
-        ..., alias="backendPoolName", min_length=1, max_length=128
-    )
-
-    @field_validator("load_balancer_resource_id")
-    @classmethod
-    def normalize_load_balancer_resource_id(cls, value: str) -> str:
-        return normalize_resource_id(value)
-
-
-class SubnetSignalEvidence(_ResourceSignalBase):
-    signal_type: Literal["subnet"] = Field(..., alias="signalType")
-    subnet_resource_id: str = Field(
-        ..., alias="subnetResourceId", min_length=1, max_length=2048
-    )
-
-    @field_validator("subnet_resource_id")
-    @classmethod
-    def normalize_subnet_resource_id(cls, value: str) -> str:
-        return normalize_resource_id(value)
-
-
-class ImageSignalEvidence(_ResourceSignalBase):
-    signal_type: Literal["image"] = Field(..., alias="signalType")
-    publisher: str = Field(..., min_length=1, max_length=128)
-    offer: str = Field(..., min_length=1, max_length=128)
-    sku: str = Field(..., min_length=1, max_length=128)
-    version: str | None = Field(default=None, min_length=1, max_length=64)
-
-
-class DeploymentProvenanceSignalEvidence(_ResourceSignalBase):
-    signal_type: Literal["deploymentProvenance"] = Field(..., alias="signalType")
-    deployment_id: str = Field(..., alias="deploymentId", min_length=1, max_length=256)
-    deployment_system: Literal["terraform", "bicep", "arm", "azurePolicy", "unknown"] = (
-        Field(..., alias="deploymentSystem")
-    )
-    identity_ref: str = Field(..., alias="identityRef", min_length=1, max_length=256)
-
-
-type CohortSignalEvidence = Annotated[
-    VmssSignalEvidence
-    | LoadBalancerBackendSignalEvidence
-    | SubnetSignalEvidence
-    | ImageSignalEvidence
-    | DeploymentProvenanceSignalEvidence,
-    Field(discriminator="signal_type"),
 ]
 
 
@@ -347,13 +267,9 @@ class CohortProposalBatch(AthenaBaseModel):
 __all__ = [
     "CohortProposal",
     "CohortProposalBatch",
-    "CohortSignalEvidence",
     "ConfidenceBand",
     "ConflictCode",
-    "DeploymentProvenanceSignalEvidence",
     "DissentingEvidence",
-    "ImageSignalEvidence",
-    "LoadBalancerBackendSignalEvidence",
     "ProposalConflict",
     "ProposalScope",
     "ProposalSnapshot",
@@ -363,7 +279,5 @@ __all__ = [
     "SelectorEvaluation",
     "SelectorPreview",
     "SignalType",
-    "SubnetSignalEvidence",
     "SupportingEvidence",
-    "VmssSignalEvidence",
 ]
