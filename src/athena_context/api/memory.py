@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import Literal
 
@@ -50,8 +50,10 @@ from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
     EvaluationCollectionAuthority,
     EvaluationCommitAuthorityCondition,
+    EvaluationTemporalValidity,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
+    SealedEvaluationCollectionAuthority,
     SealedEvaluationTrustedKeyAuthority,
     StoredEvaluation,
     StoredEvaluationMaterial,
@@ -59,13 +61,18 @@ from athena_context.api.evaluation_ports import (
     build_demo_evaluation_request_digest,
     build_evaluation_collection_authority,
     build_evaluation_evidence_binding_digest,
+    seal_evaluation_collection_authority,
     seal_evaluation_trusted_key_authority,
+    seal_timestamp_epoch_milliseconds,
 )
 from athena_context.api.evaluation_verification import (
     validate_evaluation_collection_binding,
     verify_and_evaluate_snapshot_for_publication,
 )
-from athena_context.api.ports import ClockPort, ContextTransactionPort
+from athena_context.api.ports import (
+    AuthoritativeCommitClockPort,
+    ContextTransactionPort,
+)
 from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.contracts import (
     AthenaValidationError,
@@ -86,35 +93,149 @@ def _version_key(version: str) -> tuple[int, int, int]:
     return (int(major), int(minor), int(patch))
 
 
-def _finalize_prepared_evaluation(
-    prepared: PreparedEvaluationArtifact,
-    *,
-    actor: Actor,
-    idempotency_key: str,
-    request_digest: str,
-    candidate_digest: str,
-    published_at: datetime,
-    trusted_key: SealedEvaluationTrustedKeyAuthority,
-    material: StoredEvaluationMaterial,
-) -> StoredEvaluation:
-    """Sealed, bounded finalizer: no callbacks, lookups, hooks, crypto, or policy."""
+@dataclass(frozen=True, slots=True)
+class _SealedEvaluationTemporalValidity:
+    approval_active_from: int
+    approval_expires_at: int
+    snapshot_active_from: int
+    snapshot_expires_at: int
+    governance_active_from: int | None
+    governance_expires_at: int | None
+    risk_active_from: int | None
+    risk_expires_at: int | None
+    evidence_fresh_until: int | None
 
-    if published_at.microsecond % 1000 != 0:
-        raise EvaluationFailedClosedError(
-            "authoritative publication time exceeds canonical millisecond "
-            "precision"
+
+@dataclass(frozen=True, slots=True)
+class _SealedEvaluationInsertion:
+    actor_id: str
+    idempotency_key: str
+    request_digest: str
+    candidate_digest: str
+    snapshot_id: str
+    approval_status: str
+    approval_revoked: bool
+    temporal_validity: _SealedEvaluationTemporalValidity
+    trusted_key: SealedEvaluationTrustedKeyAuthority
+    material: StoredEvaluationMaterial
+    envelope_attempt_id: str
+    envelope: ValidatedEnvelope
+
+
+def _exact_text(value: str, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} contains non-text state")
+    return str.__str__(value)
+
+
+def _optional_epoch_milliseconds(value: datetime | None) -> int | None:
+    return (
+        None
+        if value is None
+        else seal_timestamp_epoch_milliseconds(value)
+    )
+
+
+def _seal_temporal_validity(
+    validity: object,
+) -> _SealedEvaluationTemporalValidity:
+    """Read every potentially polymorphic datetime before the final clock."""
+
+    if type(validity) is not EvaluationTemporalValidity:
+        raise ValueError(
+            "evaluation temporal validity must use the exact base type"
         )
-    validity = prepared.temporal_validity
-    approval = prepared.approval
-    snapshot = prepared.snapshot
+    exact = validity
+    assert isinstance(exact, EvaluationTemporalValidity)
+    return _SealedEvaluationTemporalValidity(
+        approval_active_from=seal_timestamp_epoch_milliseconds(
+            exact.approval_active_from
+        ),
+        approval_expires_at=seal_timestamp_epoch_milliseconds(
+            exact.approval_expires_at
+        ),
+        snapshot_active_from=seal_timestamp_epoch_milliseconds(
+            exact.snapshot_active_from
+        ),
+        snapshot_expires_at=seal_timestamp_epoch_milliseconds(
+            exact.snapshot_expires_at
+        ),
+        governance_active_from=_optional_epoch_milliseconds(
+            exact.governance_active_from
+        ),
+        governance_expires_at=_optional_epoch_milliseconds(
+            exact.governance_expires_at
+        ),
+        risk_active_from=_optional_epoch_milliseconds(
+            exact.risk_active_from
+        ),
+        risk_expires_at=_optional_epoch_milliseconds(
+            exact.risk_expires_at
+        ),
+        evidence_fresh_until=_optional_epoch_milliseconds(
+            exact.evidence_fresh_until
+        ),
+    )
+
+
+def _temporal_validity_primitives(
+    validity: _SealedEvaluationTemporalValidity,
+) -> tuple[int | None, ...]:
+    return (
+        validity.approval_active_from,
+        validity.approval_expires_at,
+        validity.snapshot_active_from,
+        validity.snapshot_expires_at,
+        validity.governance_active_from,
+        validity.governance_expires_at,
+        validity.risk_active_from,
+        validity.risk_expires_at,
+        validity.evidence_fresh_until,
+    )
+
+
+def _collection_authority_primitives(
+    authority: SealedEvaluationCollectionAuthority,
+) -> tuple[str, ...]:
+    return (
+        authority.deployment_configuration_json,
+        authority.trust_configuration_json,
+        authority.reader_assignment_json,
+        authority.reader_assignment_revision,
+        authority.authority_digest,
+        authority.private_mcp_endpoint,
+        authority.evidence_identity_object_id,
+        authority.authorized_scope_json,
+    )
+
+
+def _published_datetime(epoch_milliseconds: int) -> datetime:
+    """Construct a base datetime without reading caller-controlled state."""
+
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+        milliseconds=epoch_milliseconds
+    )
+
+
+def _finalize_prepared_evaluation(
+    sealed: _SealedEvaluationInsertion,
+    *,
+    published_at_epoch_milliseconds: int,
+) -> StoredEvaluation:
+    """Primitive-only checks followed by construction of the staged insert."""
+
+    if type(published_at_epoch_milliseconds) is not int:
+        raise EvaluationFailedClosedError(
+            "authoritative publication clock returned non-primitive state"
+        )
+    validity = sealed.temporal_validity
+    trusted_key = sealed.trusted_key
     if (
-        validity.approval_active_from != approval.approved_at
-        or validity.approval_expires_at != approval.expires_at
-        or approval.status != "authorized"
-        or approval.revoked_at is not None
+        sealed.approval_status != "authorized"
+        or sealed.approval_revoked
         or not (
             validity.approval_active_from
-            <= published_at
+            <= published_at_epoch_milliseconds
             < validity.approval_expires_at
         )
     ):
@@ -124,18 +245,22 @@ def _finalize_prepared_evaluation(
 
     if (
         not trusted_key.enabled
-        or trusted_key.activated_at > published_at
+        or trusted_key.activated_at_epoch_milliseconds
+        > published_at_epoch_milliseconds
         or (
-            trusted_key.retired_at is not None
-            and trusted_key.retired_at <= published_at
+            trusted_key.retired_at_epoch_milliseconds is not None
+            and trusted_key.retired_at_epoch_milliseconds
+            <= published_at_epoch_milliseconds
         )
         or (
-            trusted_key.expires_at is not None
-            and trusted_key.expires_at <= published_at
+            trusted_key.expires_at_epoch_milliseconds is not None
+            and trusted_key.expires_at_epoch_milliseconds
+            <= published_at_epoch_milliseconds
         )
         or (
-            trusted_key.revoked_at is not None
-            and trusted_key.revoked_at <= published_at
+            trusted_key.revoked_at_epoch_milliseconds is not None
+            and trusted_key.revoked_at_epoch_milliseconds
+            <= published_at_epoch_milliseconds
         )
     ):
         raise EvaluationFailedClosedError(
@@ -143,24 +268,22 @@ def _finalize_prepared_evaluation(
             "or not active at publication time"
         )
 
-    if (
-        validity.snapshot_active_from != snapshot.collected_at
-        or validity.snapshot_expires_at != snapshot.expires_at
-        or not (
-            validity.snapshot_active_from
-            <= published_at
-            < validity.snapshot_expires_at
-        )
+    if not (
+        validity.snapshot_active_from
+        <= published_at_epoch_milliseconds
+        < validity.snapshot_expires_at
     ):
         raise EvaluationFailedClosedError(
             "snapshot became stale before publication"
         )
     if (
         validity.governance_active_from is not None
-        and published_at < validity.governance_active_from
+        and published_at_epoch_milliseconds
+        < validity.governance_active_from
     ) or (
         validity.governance_expires_at is not None
-        and published_at >= validity.governance_expires_at
+        and published_at_epoch_milliseconds
+        >= validity.governance_expires_at
     ):
         raise EvaluationFailedClosedError(
             "published context/profile is missing, ambiguous, a superseded "
@@ -168,10 +291,10 @@ def _finalize_prepared_evaluation(
         )
     if (
         validity.risk_active_from is not None
-        and published_at < validity.risk_active_from
+        and published_at_epoch_milliseconds < validity.risk_active_from
     ) or (
         validity.risk_expires_at is not None
-        and published_at >= validity.risk_expires_at
+        and published_at_epoch_milliseconds >= validity.risk_expires_at
     ):
         raise EvaluationFailedClosedError(
             "published context/profile is missing, ambiguous, a superseded "
@@ -179,22 +302,24 @@ def _finalize_prepared_evaluation(
         )
     if (
         validity.evidence_fresh_until is not None
-        and published_at > validity.evidence_fresh_until
+        and published_at_epoch_milliseconds > validity.evidence_fresh_until
     ):
         raise EvaluationFailedClosedError(
             "policy evidence freshness failed at the authoritative publication time"
         )
 
     return StoredEvaluation(
-        actor_id=actor.actor_id,
-        idempotency_key=idempotency_key,
-        request_digest=request_digest,
-        candidate_digest=candidate_digest,
-        snapshot_id=snapshot.snapshot_id,
-        published_at=published_at,
-        material=material,
-        envelope_attempt_id=prepared.collection_request.attempt_id,
-        envelope=prepared.envelope,
+        actor_id=sealed.actor_id,
+        idempotency_key=sealed.idempotency_key,
+        request_digest=sealed.request_digest,
+        candidate_digest=sealed.candidate_digest,
+        snapshot_id=sealed.snapshot_id,
+        published_at=_published_datetime(
+            published_at_epoch_milliseconds
+        ),
+        material=sealed.material,
+        envelope_attempt_id=sealed.envelope_attempt_id,
+        envelope=sealed.envelope,
     )
 
 
@@ -206,6 +331,8 @@ class _NormalizedEvaluationPreparation:
     material: StoredEvaluationMaterial
     evidence_binding_digest: str
     authorized_scope_json: str
+    temporal_validity: _SealedEvaluationTemporalValidity
+    findings_json: tuple[str, ...]
 
 
 _EVIDENCE_SCOPE_ADAPTER: TypeAdapter[EvidenceScope] = TypeAdapter(
@@ -216,6 +343,8 @@ _EVIDENCE_SCOPE_ADAPTER: TypeAdapter[EvidenceScope] = TypeAdapter(
 def _normalize_evaluation_preparation(
     prepared: PreparedEvaluationArtifact,
     condition: EvaluationCommitAuthorityCondition,
+    *,
+    sealed_collection_authority: SealedEvaluationCollectionAuthority,
 ) -> _NormalizedEvaluationPreparation:
     """Remove caller subclasses and exercise every untrusted serialization path."""
 
@@ -233,9 +362,16 @@ def _normalize_evaluation_preparation(
     approval = DemoEvaluationApproval.model_validate_json(
         prepared.approval.model_dump_json(by_alias=True)
     )
-    authorized_scope_json = condition.command.authorized_scope.canonical_json()
+    authorized_scope_json = _exact_text(
+        sealed_collection_authority.authorized_scope_json,
+        label="collection-authorized scope",
+    )
     authorized_scope = _EVIDENCE_SCOPE_ADAPTER.validate_json(
         authorized_scope_json
+    )
+    reason = _exact_text(
+        condition.command.reason,
+        label="evaluation reason",
     )
     findings = tuple(
         ManifestFinding.model_validate_json(
@@ -251,15 +387,68 @@ def _normalize_evaluation_preparation(
     collection_request = EvidenceTransportRequest.model_validate_json(
         prepared.collection_request.model_dump_json(by_alias=True)
     )
-    assertion = condition.collection_authority.deployment_configuration.assertion
+    temporal_validity = _seal_temporal_validity(
+        prepared.temporal_validity
+    )
     normalized = PreparedEvaluationArtifact(
         snapshot=snapshot,
         approval=approval,
-        resolved_profile_digest=str(prepared.resolved_profile_digest),
+        resolved_profile_digest=_exact_text(
+            prepared.resolved_profile_digest,
+            label="resolved profile digest",
+        ),
         findings=findings,
         collection_request=collection_request,
         envelope=envelope,
-        temporal_validity=prepared.temporal_validity,
+        temporal_validity=EvaluationTemporalValidity(
+            approval_active_from=_published_datetime(
+                temporal_validity.approval_active_from
+            ),
+            approval_expires_at=_published_datetime(
+                temporal_validity.approval_expires_at
+            ),
+            snapshot_active_from=_published_datetime(
+                temporal_validity.snapshot_active_from
+            ),
+            snapshot_expires_at=_published_datetime(
+                temporal_validity.snapshot_expires_at
+            ),
+            governance_active_from=(
+                None
+                if temporal_validity.governance_active_from is None
+                else _published_datetime(
+                    temporal_validity.governance_active_from
+                )
+            ),
+            governance_expires_at=(
+                None
+                if temporal_validity.governance_expires_at is None
+                else _published_datetime(
+                    temporal_validity.governance_expires_at
+                )
+            ),
+            risk_active_from=(
+                None
+                if temporal_validity.risk_active_from is None
+                else _published_datetime(
+                    temporal_validity.risk_active_from
+                )
+            ),
+            risk_expires_at=(
+                None
+                if temporal_validity.risk_expires_at is None
+                else _published_datetime(
+                    temporal_validity.risk_expires_at
+                )
+            ),
+            evidence_fresh_until=(
+                None
+                if temporal_validity.evidence_fresh_until is None
+                else _published_datetime(
+                    temporal_validity.evidence_fresh_until
+                )
+            ),
+        ),
     )
     evidence_binding_digest = build_evaluation_evidence_binding_digest(
         normalized.snapshot,
@@ -278,9 +467,9 @@ def _normalize_evaluation_preparation(
         publication_actor=publication_actor,
         published_at=validation_time,
         resolved_profile_digest=normalized.resolved_profile_digest,
-        endpoint=assertion.azure_mcp_internal_endpoint,
+        endpoint=sealed_collection_authority.private_mcp_endpoint,
         scope=authorized_scope,
-        reason=condition.command.reason,
+        reason=reason,
     )
     validation_result = build_demo_evaluation_result(
         publication=validation_publication,
@@ -318,13 +507,26 @@ def _normalize_evaluation_preparation(
             actor=actor,
             publication_actor=publication_actor,
             resolved_profile_digest=normalized.resolved_profile_digest,
-            private_mcp_endpoint=assertion.azure_mcp_internal_endpoint,
+            private_mcp_endpoint=(
+                sealed_collection_authority.private_mcp_endpoint
+            ),
             authorized_scope=authorized_scope,
-            reason=condition.command.reason,
+            reason=reason,
             findings=findings,
         ),
         evidence_binding_digest=evidence_binding_digest,
         authorized_scope_json=authorized_scope.canonical_json(),
+        temporal_validity=temporal_validity,
+        findings_json=tuple(
+            _exact_text(
+                finding.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                label="finding",
+            )
+            for finding in findings
+        ),
     )
 
 
@@ -342,7 +544,7 @@ class InMemoryContextStore:
     def __init__(
         self,
         *,
-        authoritative_clock: ClockPort | None = None,
+        authoritative_clock: AuthoritativeCommitClockPort | None = None,
         demo_evaluation_trusted_key: (
             EvaluationTrustedKeyAuthority | None
         ) = None,
@@ -852,13 +1054,33 @@ class _MemoryTransaction(ContextTransactionPort):
                     authorized_scope=condition.command.authorized_scope,
                 )
             )
-            if expected_collection_authority != condition.collection_authority:
+            sealed_expected_collection_authority = (
+                seal_evaluation_collection_authority(
+                    expected_collection_authority
+                )
+            )
+            sealed_supplied_collection_authority = (
+                seal_evaluation_collection_authority(
+                    condition.collection_authority
+                )
+            )
+            if (
+                _collection_authority_primitives(
+                    sealed_expected_collection_authority
+                )
+                != _collection_authority_primitives(
+                    sealed_supplied_collection_authority
+                )
+            ):
                 raise ValueError(
                     "configured Reader assignment revision does not match"
                 )
             normalized = _normalize_evaluation_preparation(
                 prepared,
                 condition,
+                sealed_collection_authority=(
+                    sealed_expected_collection_authority
+                ),
             )
             validate_evaluation_collection_binding(
                 command=condition.command,
@@ -875,9 +1097,9 @@ class _MemoryTransaction(ContextTransactionPort):
             ) from exc
         prepared = normalized.prepared
         collection_authority = expected_collection_authority
-        assertion = collection_authority.deployment_configuration.assertion
-        command_scope_json = (
-            condition.command.authorized_scope.canonical_json()
+        command_scope_json = _exact_text(
+            condition.command.authorized_scope.canonical_json(),
+            label="command scope",
         )
         request_digest = build_demo_evaluation_request_digest(
             actor=condition.actor,
@@ -905,10 +1127,12 @@ class _MemoryTransaction(ContextTransactionPort):
                 command=condition.command,
                 as_of=authority_checked_at,
                 private_mcp_endpoint=(
-                    assertion.azure_mcp_internal_endpoint
+                    sealed_expected_collection_authority
+                    .private_mcp_endpoint
                 ),
                 evidence_identity_object_id=(
-                    assertion.evidence_identity_object_id
+                    sealed_expected_collection_authority
+                    .evidence_identity_object_id
                 ),
                 trusted_key_anchor=condition.trusted_key_anchor,
                 expected_authority=condition.expected_authority,
@@ -936,7 +1160,8 @@ class _MemoryTransaction(ContextTransactionPort):
                 publication_actor=condition.publication_actor,
                 resolved=resolved,
                 private_mcp_endpoint=(
-                    assertion.azure_mcp_internal_endpoint
+                    sealed_expected_collection_authority
+                    .private_mcp_endpoint
                 ),
                 authorized_scope=condition.command.authorized_scope,
                 reason=condition.command.reason,
@@ -956,6 +1181,19 @@ class _MemoryTransaction(ContextTransactionPort):
             if current_trusted_key is None
             else _seal_trusted_key_for_finalization(current_trusted_key)
         )
+        sealed_expected_temporal_validity = _seal_temporal_validity(
+            expected_temporal_validity
+        )
+        authoritative_findings_json = tuple(
+            _exact_text(
+                finding.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                label="authoritative finding",
+            )
+            for finding in authoritative_findings
+        )
         if (
             current_trusted_key is None
             or sealed_current_trusted_key is None
@@ -967,12 +1205,23 @@ class _MemoryTransaction(ContextTransactionPort):
                 prepared.approval.authority_token()
             )
             != seal_approval_authority(authority.approval)
-            or prepared.resolved_profile_digest
-            != resolved.profile.resolved_profile_digest
+            or _exact_text(
+                prepared.resolved_profile_digest,
+                label="prepared resolved profile digest",
+            )
+            != _exact_text(
+                resolved.profile.resolved_profile_digest,
+                label="authoritative resolved profile digest",
+            )
             or normalized.authorized_scope_json
             != command_scope_json
-            or prepared.temporal_validity != expected_temporal_validity
-            or prepared.findings != authoritative_findings
+            or _temporal_validity_primitives(
+                normalized.temporal_validity
+            )
+            != _temporal_validity_primitives(
+                sealed_expected_temporal_validity
+            )
+            or normalized.findings_json != authoritative_findings_json
         ):
             raise StaleRevisionError(
                 "complete evaluation authority or evidence binding changed "
@@ -988,32 +1237,69 @@ class _MemoryTransaction(ContextTransactionPort):
             collection_authority=collection_authority,
             evidence_binding_digest=normalized.evidence_binding_digest,
         )
-        published_at = ensure_timestamp(clock.now())
-        # No caller-provided or overridable behavior executes after this read.
-        # The sealed finalizer only compares primitive captured bounds, binds
-        # the timestamp to prevalidated material, and immediately stages the
-        # artifact and receipt.
-        artifact = _finalize_prepared_evaluation(
-            prepared,
-            actor=condition.actor,
-            idempotency_key=condition.idempotency_key,
-            request_digest=request_digest,
-            candidate_digest=candidate_digest,
-            published_at=published_at,
+        sealed_insertion = _SealedEvaluationInsertion(
+            actor_id=_exact_text(
+                normalized.material.actor.actor_id,
+                label="publication actor",
+            ),
+            idempotency_key=_exact_text(
+                condition.idempotency_key,
+                label="idempotency key",
+            ),
+            request_digest=_exact_text(
+                request_digest,
+                label="request digest",
+            ),
+            candidate_digest=_exact_text(
+                candidate_digest,
+                label="candidate digest",
+            ),
+            snapshot_id=_exact_text(
+                normalized.material.snapshot.snapshot_id,
+                label="snapshot ID",
+            ),
+            approval_status=_exact_text(
+                normalized.material.approval.status,
+                label="approval status",
+            ),
+            approval_revoked=(
+                normalized.material.approval.revoked_at is not None
+            ),
+            temporal_validity=normalized.temporal_validity,
             trusted_key=sealed_current_trusted_key,
             material=normalized.material,
+            envelope_attempt_id=_exact_text(
+                normalized.prepared.collection_request.attempt_id,
+                label="collection attempt ID",
+            ),
+            envelope=normalized.prepared.envelope,
         )
-        receipt_key = (artifact.actor_id, artifact.idempotency_key)
+        receipt_key = (
+            sealed_insertion.actor_id,
+            sealed_insertion.idempotency_key,
+        )
         if receipt_key in self._evaluation_receipts:
             raise IdempotencyConflictError(
                 "evaluation idempotency key has already been recorded"
             )
-        if artifact.snapshot_id in self._evaluation_artifacts:
+        if sealed_insertion.snapshot_id in self._evaluation_artifacts:
             raise DuplicateVersionError(
-                f"evidence snapshot {artifact.snapshot_id!r} is already published"
+                f"evidence snapshot {sealed_insertion.snapshot_id!r} "
+                "is already published"
             )
+        published_at_epoch_milliseconds = (
+            clock.now_epoch_milliseconds()
+        )
+        # The clock returns an exact integer. From this point through staging,
+        # only private sealed primitives and built-in containers are touched.
+        artifact = _finalize_prepared_evaluation(
+            sealed_insertion,
+            published_at_epoch_milliseconds=(
+                published_at_epoch_milliseconds
+            ),
+        )
         self._evaluation_receipts[receipt_key] = artifact
-        self._evaluation_artifacts[artifact.snapshot_id] = artifact
+        self._evaluation_artifacts[sealed_insertion.snapshot_id] = artifact
         self._dirty = True
         return artifact
 

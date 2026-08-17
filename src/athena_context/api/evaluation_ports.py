@@ -154,10 +154,10 @@ class SealedEvaluationTrustedKeyAuthority:
     authority: SealedTrustedKeyAuthority
     authority_token: TrustedKeyAuthorityToken
     enabled: bool
-    activated_at: datetime
-    retired_at: datetime | None
-    expires_at: datetime | None
-    revoked_at: datetime | None
+    activated_at_epoch_milliseconds: int
+    retired_at_epoch_milliseconds: int | None
+    expires_at_epoch_milliseconds: int | None
+    revoked_at_epoch_milliseconds: int | None
 
 
 def _exact_utc_timestamp(value: datetime) -> datetime:
@@ -179,6 +179,20 @@ def _exact_key_text(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("trusted key authority contains non-text state")
     return str.__str__(value)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def seal_timestamp_epoch_milliseconds(value: datetime) -> int:
+    """Resolve arbitrary datetime behavior before commit and return an exact int."""
+
+    normalized = _exact_utc_timestamp(value)
+    delta = normalized - _EPOCH
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000
+        + normalized.microsecond // 1_000
+    )
 
 
 def seal_evaluation_trusted_key_authority(
@@ -248,10 +262,24 @@ def seal_evaluation_trusted_key_authority(
             authority_digest=authority_digest,
         ),
         enabled=enabled,
-        activated_at=activated_at,
-        retired_at=retired_at,
-        expires_at=expires_at,
-        revoked_at=revoked_at,
+        activated_at_epoch_milliseconds=(
+            seal_timestamp_epoch_milliseconds(activated_at)
+        ),
+        retired_at_epoch_milliseconds=(
+            None
+            if retired_at is None
+            else seal_timestamp_epoch_milliseconds(retired_at)
+        ),
+        expires_at_epoch_milliseconds=(
+            None
+            if expires_at is None
+            else seal_timestamp_epoch_milliseconds(expires_at)
+        ),
+        revoked_at_epoch_milliseconds=(
+            None
+            if revoked_at is None
+            else seal_timestamp_epoch_milliseconds(revoked_at)
+        ),
     )
 
 
@@ -330,6 +358,20 @@ class EvaluationCollectionAuthority:
     reader_assignment: McpReadAssignment
     reader_assignment_revision: str
     authority_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SealedEvaluationCollectionAuthority:
+    """Exact WC-008 primitives; no caller model equality participates."""
+
+    deployment_configuration_json: str
+    trust_configuration_json: str
+    reader_assignment_json: str
+    reader_assignment_revision: str
+    authority_digest: str
+    private_mcp_endpoint: str
+    evidence_identity_object_id: str
+    authorized_scope_json: str
 
 
 def build_evaluation_collection_authority(
@@ -413,6 +455,76 @@ def build_evaluation_collection_authority(
         reader_assignment=assignment,
         reader_assignment_revision=revision,
         authority_digest=compute_artifact_digest(authority_payload),
+    )
+
+
+def _exact_collection_text(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("collection authority contains non-text state")
+    return str.__str__(value)
+
+
+def seal_evaluation_collection_authority(
+    authority: EvaluationCollectionAuthority,
+) -> SealedEvaluationCollectionAuthority:
+    """Rebuild and seal one exact base collection authority."""
+
+    if type(authority) is not EvaluationCollectionAuthority:
+        raise ValueError(
+            "collection authority must be the exact service-owned base type"
+        )
+    configuration = VerifiedWc008DeploymentConfiguration.model_validate_json(
+        authority.deployment_configuration.model_dump_json(by_alias=True)
+    )
+    trust = CollectorTrustConfiguration.model_validate_json(
+        authority.trust_configuration.model_dump_json(by_alias=True)
+    )
+    assignment = McpReadAssignment.model_validate_json(
+        authority.reader_assignment.model_dump_json(by_alias=True)
+    )
+    rebuilt = build_evaluation_collection_authority(
+        configuration,
+        trust,
+        authorized_scope=assignment.scope,
+    )
+    supplied_revision = _exact_collection_text(
+        authority.reader_assignment_revision
+    )
+    supplied_digest = _exact_collection_text(authority.authority_digest)
+    if (
+        supplied_revision != rebuilt.reader_assignment_revision
+        or supplied_digest != rebuilt.authority_digest
+        or assignment.model_dump_json(by_alias=True)
+        != rebuilt.reader_assignment.model_dump_json(by_alias=True)
+    ):
+        raise ValueError(
+            "collection authority revision or digest does not match its "
+            "operator-pinned inputs"
+        )
+    assertion = rebuilt.deployment_configuration.assertion
+    return SealedEvaluationCollectionAuthority(
+        deployment_configuration_json=_exact_collection_text(
+            rebuilt.deployment_configuration.model_dump_json(by_alias=True)
+        ),
+        trust_configuration_json=_exact_collection_text(
+            rebuilt.trust_configuration.model_dump_json(by_alias=True)
+        ),
+        reader_assignment_json=_exact_collection_text(
+            rebuilt.reader_assignment.model_dump_json(by_alias=True)
+        ),
+        reader_assignment_revision=_exact_collection_text(
+            rebuilt.reader_assignment_revision
+        ),
+        authority_digest=_exact_collection_text(rebuilt.authority_digest),
+        private_mcp_endpoint=_exact_collection_text(
+            assertion.azure_mcp_internal_endpoint
+        ),
+        evidence_identity_object_id=_exact_collection_text(
+            assertion.evidence_identity_object_id
+        ),
+        authorized_scope_json=_exact_collection_text(
+            rebuilt.reader_assignment.scope.canonical_json()
+        ),
     )
 
 
@@ -678,6 +790,7 @@ __all__ = [
     "ContextServiceEvaluationPublicationStorePort",
     "EvaluationArtifactPreparation",
     "EvaluationCollectionAuthority",
+    "SealedEvaluationCollectionAuthority",
     "EvaluationCommitAuthorityCondition",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
@@ -693,5 +806,7 @@ __all__ = [
     "build_demo_evaluation_request_digest",
     "build_evaluation_collection_authority",
     "build_evaluation_evidence_binding_digest",
+    "seal_evaluation_collection_authority",
+    "seal_timestamp_epoch_milliseconds",
     "TrustedWc008DeploymentConfigurationPort",
 ]

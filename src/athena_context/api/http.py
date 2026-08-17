@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import time_ns
 from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, status
@@ -99,6 +100,11 @@ class SystemClock:
         return current.replace(
             microsecond=(current.microsecond // 1000) * 1000
         )
+
+    def now_epoch_milliseconds(self) -> int:
+        """Return the persistence timestamp as an exact, non-polymorphic value."""
+
+        return time_ns() // 1_000_000
 
 
 def _current_actor(

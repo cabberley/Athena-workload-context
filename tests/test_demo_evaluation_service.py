@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from email.message import Message
 from inspect import stack
 from io import BytesIO
@@ -47,10 +47,13 @@ from athena_context.api.evaluation_context import (
 )
 from athena_context.api.evaluation_domain import EvaluationAuthorityToken
 from athena_context.api.evaluation_ports import (
+    EvaluationCollectionAuthority,
     EvaluationCommitAuthorityCondition,
+    EvaluationTemporalValidity,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     SnapshotSigningRequest,
+    build_evaluation_collection_authority,
 )
 from athena_context.contracts import (
     EvidenceSnapshot,
@@ -854,6 +857,267 @@ def test_delay_in_former_post_timestamp_validation_is_sampled_before_commit_time
             idempotency_key,
             harness.command,
         )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+@pytest.mark.parametrize(
+    "temporal_field",
+    [
+        "approval_active_from",
+        "approval_expires_at",
+        "snapshot_active_from",
+        "snapshot_expires_at",
+        "governance_active_from",
+        "governance_expires_at",
+        "risk_active_from",
+        "risk_expires_at",
+        "evidence_fresh_until",
+    ],
+)
+def test_all_temporal_bounds_are_sealed_before_primitive_commit_clock(
+    temporal_field: str,
+) -> None:
+    """Adversarial datetime behavior cannot execute after the final clock read."""
+
+    expires_at = CURRENT_NOW + timedelta(seconds=30)
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            override_expires_at=expires_at,
+            risk_acceptance_expires_at=expires_at,
+            production_extends_development=True,
+            evidence_freshness_seconds=30,
+        ),
+        approval_expires_at=expires_at,
+        snapshot_freshness_seconds=30,
+    )
+    delayed = False
+    armed = False
+    final_clock_reads = 0
+    original_final_clock = harness.clock.now_epoch_milliseconds
+
+    def tracked_final_clock() -> int:
+        nonlocal final_clock_reads
+        final_clock_reads += 1
+        return original_final_clock()
+
+    harness.clock.now_epoch_milliseconds = tracked_final_clock  # type: ignore[method-assign]
+
+    class DelayingDateTime(datetime):
+        def astimezone(self, tz: object = None) -> datetime:
+            nonlocal delayed
+            if armed and not delayed:
+                assert final_clock_reads == 0
+                delayed = True
+                harness.clock.advance(timedelta(minutes=1))
+            return super().astimezone(tz)  # type: ignore[arg-type]
+
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def insert_with_adversarial_temporal_bound(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                def prepare(
+                    trusted_key: EvaluationTrustedKeyAuthority,
+                ) -> PreparedEvaluationArtifact:
+                    nonlocal armed
+                    prepared = artifact_preparation(trusted_key)
+                    values = {
+                        field: getattr(
+                            prepared.temporal_validity,
+                            field,
+                        )
+                        for field in (
+                            "approval_active_from",
+                            "approval_expires_at",
+                            "snapshot_active_from",
+                            "snapshot_expires_at",
+                            "governance_active_from",
+                            "governance_expires_at",
+                            "risk_active_from",
+                            "risk_expires_at",
+                            "evidence_fresh_until",
+                        )
+                    }
+                    original_bound = values[temporal_field]
+                    assert isinstance(original_bound, datetime)
+                    values[temporal_field] = DelayingDateTime(
+                        original_bound.year,
+                        original_bound.month,
+                        original_bound.day,
+                        original_bound.hour,
+                        original_bound.minute,
+                        original_bound.second,
+                        original_bound.microsecond,
+                        tzinfo=original_bound.tzinfo or UTC,
+                        fold=original_bound.fold,
+                    )
+                    validity = EvaluationTemporalValidity(**values)  # type: ignore[arg-type]
+                    armed = True
+                    return replace(
+                        prepared,
+                        temporal_validity=validity,
+                    )
+
+                return original_insert(
+                    capability,
+                    condition,
+                    prepare,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                insert_with_adversarial_temporal_bound
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = f"wc013-sealed-temporal-{temporal_field}"
+    try:
+        with pytest.raises(
+            (DemoEvaluationApprovalError, EvaluationFailedClosedError),
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+        harness.clock.now_epoch_milliseconds = original_final_clock  # type: ignore[method-assign]
+
+    assert delayed is True
+    assert final_clock_reads == 0
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_polymorphic_commit_clock_primitive_fails_before_insertion() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    original_final_clock = harness.clock.now_epoch_milliseconds
+
+    class PolymorphicEpoch(int):
+        def __le__(self, other: object) -> bool:
+            del other
+            harness.clock.advance(timedelta(minutes=1))
+            return True
+
+    harness.clock.now_epoch_milliseconds = (  # type: ignore[method-assign]
+        lambda: PolymorphicEpoch(original_final_clock())
+    )
+    idempotency_key = "wc013-polymorphic-final-clock"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="non-primitive",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        harness.clock.now_epoch_milliseconds = original_final_clock  # type: ignore[method-assign]
+
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_collection_authority_subclass_cannot_spoof_foreign_endpoint() -> None:
+    """Polymorphic equality cannot replace store-pinned WC-008 authority."""
+
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    foreign_configuration = verified_deployment_configuration(
+        "https://foreign-mcp.internal"
+    )
+    foreign = build_evaluation_collection_authority(
+        foreign_configuration,
+        trust_configuration(),
+        authorized_scope=harness.command.authorized_scope,
+    )
+
+    class AlwaysEqualCollectionAuthority(EvaluationCollectionAuthority):
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+    malicious = AlwaysEqualCollectionAuthority(
+        deployment_configuration=foreign.deployment_configuration,
+        trust_configuration=foreign.trust_configuration,
+        reader_assignment=foreign.reader_assignment,
+        reader_assignment_revision=foreign.reader_assignment_revision,
+        authority_digest=foreign.authority_digest,
+    )
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def insert_with_foreign_collection_authority(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                return original_insert(
+                    capability,
+                    replace(
+                        condition,
+                        collection_authority=malicious,
+                    ),
+                    artifact_preparation,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                insert_with_foreign_collection_authority
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = "wc013-polymorphic-foreign-collection-authority"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="canonical validation",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1

@@ -50,6 +50,7 @@ from athena_context.api.domain import (
 from athena_context.api.evaluation_ports import (
     EvaluationTrustedKeyAuthority,
     SnapshotSigningRequest,
+    seal_timestamp_epoch_milliseconds,
 )
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
@@ -123,6 +124,9 @@ class StepClock:
         current = self._value
         self._value += timedelta(seconds=1)
         return current
+
+    def now_epoch_milliseconds(self) -> int:
+        return seal_timestamp_epoch_milliseconds(self.now())
 
     def advance(self, delta: timedelta) -> None:
         self._value += delta

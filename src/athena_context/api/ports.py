@@ -23,6 +23,14 @@ class ClockPort(Protocol):
     def now(self) -> datetime: ...
 
 
+class AuthoritativeCommitClockPort(Protocol):
+    """Persistence clock whose commit read is already a sealed primitive."""
+
+    def now(self) -> datetime: ...
+
+    def now_epoch_milliseconds(self) -> int: ...
+
+
 class AuthenticationPort(Protocol):
     def authenticate_bearer(self, credential: str) -> VerifiedAuthentication: ...
 
