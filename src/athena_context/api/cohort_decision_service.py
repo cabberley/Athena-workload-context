@@ -63,6 +63,9 @@ from athena_context.api.errors import (
     VersionMismatchError,
 )
 from athena_context.api.ports import ClockPort
+from athena_context.api.selector_provenance import (
+    role_selector_provenance_digest,
+)
 from athena_context.api.service import ContextService
 from athena_context.binding import evaluate_selector, normalize_resource_id
 from athena_context.binding.domain import CohortProposal, ProposalScope, SelectorPreview
@@ -190,31 +193,6 @@ class CohortDecisionService:
                 tx.list_overlapping_cohort_decisions(version),
             )
 
-        resolved = self._proposal_service.resolve_for_decision(
-            actor,
-            CohortProposalQuery(
-                manifest_id=request.manifest_id,
-                manifest_version=request.manifest_version,
-                profile_id=request.profile_id,
-                draft_id=request.draft_id,
-                expected_revision=request.expected_revision,
-                expected_digest=request.expected_digest,
-            ),
-            scope=request.scope,
-        )
-        proposals = self._validate_request_binding(request, resolved)
-        decided_at = ensure_timestamp(self._clock.now())
-        if decided_at >= resolved.snapshot.expires_at:
-            raise StaleEvidenceSnapshotError(
-                "the exact decision snapshot expired before atomic apply"
-            )
-        candidate = self._resolve_candidate(
-            actor,
-            request,
-            resolved,
-            proposals,
-            decided_at=decided_at,
-        )
         decision_seed = request_digest.removeprefix("sha256:")[:32]
         decision_id = f"cohort-decision-{decision_seed}"
 
@@ -235,6 +213,32 @@ class CohortDecisionService:
                 tx.list_overlapping_cohort_decisions(version),
             )
 
+            decided_at = ensure_timestamp(self._clock.now())
+            resolved = self._proposal_service.resolve_for_decision(
+                actor,
+                CohortProposalQuery(
+                    manifest_id=request.manifest_id,
+                    manifest_version=request.manifest_version,
+                    profile_id=request.profile_id,
+                    draft_id=request.draft_id,
+                    expected_revision=request.expected_revision,
+                    expected_digest=request.expected_digest,
+                ),
+                scope=request.scope,
+                as_of=decided_at,
+            )
+            proposals = self._validate_request_binding(request, resolved)
+            if decided_at >= resolved.snapshot.expires_at:
+                raise StaleEvidenceSnapshotError(
+                    "the exact decision snapshot expired before atomic apply"
+                )
+            candidate = self._resolve_candidate(
+                actor,
+                request,
+                resolved,
+                proposals,
+                decided_at=decided_at,
+            )
             current = self._require_current_draft(tx, request, version)
             self._validate_candidate(
                 request,
@@ -941,6 +945,12 @@ class CohortDecisionService:
                         mode="json",
                         by_alias=True,
                         exclude_none=True,
+                    )
+                ),
+                replacement_selector_provenance_digest=(
+                    role_selector_provenance_digest(
+                        applied_role,
+                        profile_id=request.profile_id,
                     )
                 ),
                 retained_replacement_role_digests=tuple(

@@ -28,6 +28,7 @@ from athena_context.api.errors import (
     StaleRevisionError,
 )
 from athena_context.api.ports import ContextTransactionPort
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -49,6 +50,7 @@ class InMemoryContextStore:
     def __init__(self) -> None:
         self._lock = RLock()
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
@@ -68,6 +70,7 @@ class _MemoryTransaction(ContextTransactionPort):
     def __init__(self, store: InMemoryContextStore) -> None:
         self._store = store
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
@@ -82,6 +85,9 @@ class _MemoryTransaction(ContextTransactionPort):
     def __enter__(self) -> _MemoryTransaction:
         self._store._lock.acquire()
         self._drafts = dict(self._store._drafts)
+        self._draft_selector_baselines = dict(
+            self._store._draft_selector_baselines
+        )
         self._published = dict(self._store._published)
         self._supersessions = dict(self._store._supersessions)
         self._audit = list(self._store._audit)
@@ -104,6 +110,9 @@ class _MemoryTransaction(ContextTransactionPort):
         try:
             if exc_type is None:
                 self._store._drafts = self._drafts
+                self._store._draft_selector_baselines = (
+                    self._draft_selector_baselines
+                )
                 self._store._published = self._published
                 self._store._supersessions = self._supersessions
                 self._store._audit = self._audit
@@ -157,6 +166,45 @@ class _MemoryTransaction(ContextTransactionPort):
                 f"expected draft revision {expected_revision}, found {current.revision}"
             )
         self._drafts[draft.draft_id] = draft.model_copy(deep=True)
+
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None:
+        baseline = self._draft_selector_baselines.get(draft_id)
+        return None if baseline is None else baseline.model_copy(deep=True)
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]:
+        matches = sorted(
+            (
+                baseline
+                for baseline in self._draft_selector_baselines.values()
+                if baseline.manifest_id == manifest_id
+                and (
+                    manifest_version is None
+                    or baseline.manifest_version == manifest_version
+                )
+            ),
+            key=lambda baseline: (baseline.captured_at, baseline.draft_id),
+        )
+        return [baseline.model_copy(deep=True) for baseline in matches]
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        if baseline.draft_id in self._draft_selector_baselines:
+            raise PersistenceConflictError(
+                "draft selector baseline is immutable"
+            )
+        self._draft_selector_baselines[baseline.draft_id] = (
+            baseline.model_copy(deep=True)
+        )
 
     def get_published(
         self,

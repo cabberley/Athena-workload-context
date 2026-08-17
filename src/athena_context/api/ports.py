@@ -17,6 +17,7 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadIdentifier,
 )
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 
 if TYPE_CHECKING:
     from athena_context.api.cohort_decision_domain import CohortDecisionRecord
@@ -54,6 +55,23 @@ class ContextTransactionPort(Protocol):
         draft: DraftRecord,
         *,
         expected_revision: int | None,
+    ) -> None: ...
+
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None: ...
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]: ...
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
     ) -> None: ...
 
     def get_published(

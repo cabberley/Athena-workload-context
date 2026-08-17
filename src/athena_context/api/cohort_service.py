@@ -364,6 +364,7 @@ class CohortProposalService:
         query: CohortProposalQuery,
         *,
         scope: ProposalScope,
+        as_of: datetime | None = None,
     ) -> ResolvedCohortReview:
         """Revalidate the exact immutable batch and trusted snapshot for a decision."""
 
@@ -384,7 +385,9 @@ class CohortProposalService:
             raise CohortProfileMismatchError(
                 "the immutable decision scope does not match its source draft binding"
             )
-        as_of = ensure_timestamp(self._clock.now())
+        decision_time = ensure_timestamp(
+            self._clock.now() if as_of is None else as_of
+        )
         binding = CohortEvidenceBinding(
             manifest_id=query.manifest_id,
             manifest_version=query.manifest_version,
@@ -395,7 +398,10 @@ class CohortProposalService:
             draft_revision=query.expected_revision,
             draft_digest=query.expected_digest,
         )
-        snapshot = self._resolve_verified_snapshot(binding, as_of=as_of).snapshot
+        snapshot = self._resolve_verified_snapshot(
+            binding,
+            as_of=decision_time,
+        ).snapshot
         batch = self._proposal_cache.get_batch(
             CohortBatchCacheKey(
                 evidence_binding=binding,
@@ -418,7 +424,7 @@ class CohortProposalService:
             evidence_binding=binding,
             snapshot=snapshot,
             batch=batch,
-            as_of=as_of,
+            as_of=decision_time,
         )
 
     def _resolve_verified_snapshot(

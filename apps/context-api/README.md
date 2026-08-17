@@ -42,6 +42,12 @@ mutate it.
   It preserves role authority, never edits an ancestor or global role, and rejects candidates
   that cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.
+  Every draft also has an immutable, transactionally stored selector baseline. Generic create,
+  replace, validate, submit, approve, and publish paths compare selector identity, variant,
+  semantic digest, normalized role identity, and global/profile location against that baseline
+  plus exact persisted apply provenance. Removal/re-addition, role rename, profile/global
+  movement, same-ID variant changes, and fresh-draft/version laundering therefore cannot turn a
+  rejected or merely proposed candidate into a new baseline. Non-selector edits remain legal.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity
@@ -54,7 +60,9 @@ mutate it.
   reviewer's candidate. Rebased replacement starts from the current draft and therefore preserves
   every prior disjoint selector change. Applied selectors are exactly the final selectors shown in
   the approved candidate; selector IDs needed for a safe local override are finalized before human
-  review.
+  review. The final decision transaction samples a fresh authoritative timestamp after entering
+  the transaction, then reloads and revalidates the exact immutable candidate, proposal batch,
+  snapshot binding, and snapshot expiry before writing a decision, audit, draft, or receipt.
 - `GET /v1/cohort-proposals/decisions` and
   `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
   granted workload scope.

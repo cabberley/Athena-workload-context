@@ -62,6 +62,9 @@ class CohortDecisionApplyBinding(ApiModel):
     target_role_id: str
     inherited_role_digest: str
     replacement_role_digest: str
+    replacement_selector_provenance_digest: str = Field(
+        pattern=_DIGEST_PATTERN,
+    )
     retained_replacement_role_digests: tuple[tuple[str, str, str], ...]
     replacement_manifest_digest: str
 

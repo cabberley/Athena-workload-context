@@ -16,9 +16,16 @@ from athena_context.api.cohort_memory import (
     InMemoryCohortPersistence,
 )
 from athena_context.api.cohort_service import CohortProposalService
-from athena_context.api.domain import ReplaceDraftCommand, TransitionCommand
+from athena_context.api.domain import (
+    CreateDraftCommand,
+    ReplaceDraftCommand,
+    TransitionCommand,
+)
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
+from athena_context.api.selector_provenance import (
+    manifest_selector_provenance,
+)
 from athena_context.contracts import (
     AthenaValidationError,
     CanonicalWorkloadManifest,
@@ -642,6 +649,354 @@ def test_rejected_split_candidate_cannot_become_global_role_with_generic_put() -
     assert len(decisions) == 1
     assert decisions[0].decision.value == "reject"
     assert all(event.action.value != "draft_replaced" for event in audit)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "remove-global-role",
+        "same-id-new-variant",
+        "same-id-new-semantics",
+        "move-to-other-profile",
+        "move-to-other-role",
+    ],
+)
+def test_rejected_selectors_cannot_change_immutable_provenance(
+    attack: str,
+) -> None:
+    harness = _build_harness(profiles=("production", "development"))
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            idempotency_key=f"wc-034-provenance-{attack}-preview",
+        ),
+    )
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject selectors before a provenance laundering attempt.",
+        ),
+        f"wc-034-provenance-{attack}-reject",
+    )
+    assert preview.status_code == 200, preview.text
+    assert rejected.status_code == 201, rejected.text
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    target_role_id = candidate_role["roleId"]
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    target_global = next(
+        role for role in payload["roles"] if role["roleId"] == target_role_id
+    )
+    if attack == "remove-global-role":
+        payload["roles"] = [
+            role
+            for role in payload["roles"]
+            if role["roleId"] != target_role_id
+        ]
+    elif attack == "same-id-new-variant":
+        original_selector_id = target_global["selectors"][0]["selectorId"]
+        target_global["selectors"] = [
+            {
+                "selectorType": "resourceIdList",
+                "selectorId": original_selector_id,
+                "resourceIds": proposal["members"],
+                "maxMatches": len(proposal["members"]),
+            }
+        ]
+    elif attack == "same-id-new-semantics":
+        target_global["selectors"][0]["maxMatches"] += 1
+    elif attack == "move-to-other-profile":
+        development_roles = payload["profiles"]["development"]["roles"]
+        development_roles[:] = [
+            role
+            for role in development_roles
+            if role["roleId"] != target_role_id
+        ]
+        development_roles.append(candidate_role)
+    else:
+        other_role = next(
+            role
+            for role in payload["roles"]
+            if role["roleId"] != target_role_id
+        )
+        other_role["selectors"] = candidate_role["selectors"]
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    command = ReplaceDraftCommand(
+        expected_revision=harness.draft_revision,
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=harness.draft_digest,
+        replacement_manifest=replacement,
+        replacement_digest=replacement.compatibility.artifact_digest,
+        reason="Attempt to launder rejected selector provenance",
+    )
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    response = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key=f"wc-034-provenance-{attack}-put",
+        ),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id).manifest == (
+        harness.manifest
+    )
+    with harness.store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            f"wc-034-provenance-{attack}-put",
+        ) is None
+
+
+@pytest.mark.parametrize("fresh_version", ["1.0.0", "1.0.1"])
+def test_rejected_selectors_cannot_be_laundered_as_fresh_draft_baseline(
+    fresh_version: str,
+) -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-fresh-launder-preview"),
+    )
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject selectors before fresh draft laundering.",
+        ),
+        "wc-034-fresh-launder-reject",
+    )
+    assert preview.status_code == 200, preview.text
+    assert rejected.status_code == 201, rejected.text
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["manifestVersion"] = fresh_version
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    local_roles = payload["profiles"]["production"]["roles"]
+    local_roles[:] = [
+        role
+        for role in local_roles
+        if role["roleId"] != candidate_role["roleId"]
+    ]
+    local_roles.append(candidate_role)
+    laundering_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    command = CreateDraftCommand(
+        draft_id=(
+            "draft-wc-034-fresh-selector-launder-"
+            + fresh_version.replace(".", "-")
+        ),
+        manifest=laundering_manifest,
+        manifest_digest=(
+            laundering_manifest.compatibility.artifact_digest
+        ),
+        reason="Attempt rejected selectors as a fresh draft baseline",
+    )
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    response = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key=(
+                "wc-034-fresh-selector-launder-"
+                + fresh_version.replace(".", "-")
+            ),
+        ),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    with harness.store.transaction() as tx:
+        assert tx.get_draft(command.draft_id) is None
+        assert tx.get_draft_selector_baseline(command.draft_id) is None
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            "wc-034-fresh-selector-launder-"
+            + fresh_version.replace(".", "-"),
+        ) is None
+
+
+def test_remove_readd_and_lifecycle_cannot_escape_selector_baseline() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-baseline-preview"),
+    )
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject selectors before lifecycle baseline validation.",
+        ),
+        "wc-034-baseline-reject",
+    )
+    assert preview.status_code == 200, preview.text
+    assert rejected.status_code == 201, rejected.text
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    payload["roles"] = [
+        role
+        for role in payload["roles"]
+        if role["roleId"] != candidate_role["roleId"]
+    ]
+    removed_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    with harness.store.transaction() as tx:
+        current = tx.get_draft(harness.draft_id)
+        assert current is not None
+        tampered = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+                "manifest": removed_manifest,
+                "manifest_digest": (
+                    removed_manifest.compatibility.artifact_digest
+                ),
+            }
+        )
+        tx.put_draft(tampered, expected_revision=current.revision)
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    restore_payload = removed_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    restore_payload["roles"].append(candidate_role)
+    restored_candidate = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(restore_payload)
+    )
+    restore = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-baseline-readd-put",
+        ),
+        json=ReplaceDraftCommand(
+            expected_revision=tampered.revision,
+            expected_manifest_version=tampered.manifest.manifest_version,
+            expected_digest=tampered.manifest_digest,
+            replacement_manifest=restored_candidate,
+            replacement_digest=(
+                restored_candidate.compatibility.artifact_digest
+            ),
+            reason="Attempt to re-add exact rejected selectors after removal",
+        ).model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+    validate = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/validate",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-baseline-lifecycle-validate",
+        ),
+        json=TransitionCommand(
+            expected_revision=tampered.revision,
+            expected_manifest_version=(
+                tampered.manifest.manifest_version
+            ),
+            expected_digest=tampered.manifest_digest,
+            reason="Reject selector state without approved provenance",
+        ).model_dump(mode="json"),
+    )
+
+    assert restore.status_code == 422, restore.text
+    assert restore.json()["error"]["code"] == "manifest_validation_failed"
+    assert validate.status_code == 422, validate.text
+    assert validate.json()["error"]["code"] == "manifest_validation_failed"
+    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id) == tampered
+    with harness.store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            "wc-034-baseline-lifecycle-validate",
+        ) is None
+        assert tx.get_receipt(
+            HUMAN.actor_id,
+            "wc-034-baseline-readd-put",
+        ) is None
 
 
 def test_generic_put_allows_global_role_non_selector_edit() -> None:
@@ -1465,6 +1820,86 @@ def test_persisted_split_authority_survives_validate_and_submit_rechecks() -> No
     assert decisions[0].apply_authorization.status == "approved"
 
 
+def test_approved_selectors_survive_legal_non_selector_replacement() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-approved-edit-preview"),
+    )
+    applied = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-approved-edit-apply",
+    )
+    assert preview.status_code == 200, preview.text
+    assert applied.status_code == 201, applied.text
+    current = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    payload = current.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["workload"]["displayName"] += " reviewed"
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+
+    replaced = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-approved-non-selector-edit",
+        ),
+        json=ReplaceDraftCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            replacement_manifest=replacement,
+            replacement_digest=replacement.compatibility.artifact_digest,
+            reason="Apply a legal non-selector edit after cohort approval",
+        ).model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+    assert replaced.status_code == 200, replaced.text
+    updated = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert manifest_selector_provenance(updated.manifest) == (
+        manifest_selector_provenance(current.manifest)
+    )
+
+    validated = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/validate",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-approved-edit-validate",
+        ),
+        json=TransitionCommand(
+            expected_revision=updated.revision,
+            expected_manifest_version=updated.manifest.manifest_version,
+            expected_digest=updated.manifest_digest,
+            reason="Validate preserved approved selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert validated.status_code == 200, validated.text
+
+
 def test_preview_candidates_are_actor_bound_for_two_authorized_reviewers() -> None:
     harness = _build_harness()
     batch = _load(harness)
@@ -1615,6 +2050,123 @@ class _FailAfterDraftStore:
 
     def transaction(self) -> _FailAfterDraftTransaction:
         return _FailAfterDraftTransaction(self._store.transaction())
+
+
+class _AdvanceClockTransaction:
+    def __init__(
+        self,
+        inner,
+        *,
+        harness: Harness,
+        advance: bool,
+    ) -> None:
+        self._manager = inner
+        self._transaction = None
+        self._harness = harness
+        self._advance = advance
+
+    def __enter__(self):
+        self._transaction = self._manager.__enter__()
+        if self._advance:
+            self._harness.clock.value = (
+                self._harness.snapshot.expires_at
+                + timedelta(seconds=1)
+            )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        return self._manager.__exit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name: str):
+        if self._transaction is None:
+            raise AttributeError(name)
+        return getattr(self._transaction, name)
+
+
+class _AdvanceClockOnFinalDecisionStore:
+    def __init__(self, harness: Harness) -> None:
+        self._harness = harness
+        self._transactions = 0
+
+    @property
+    def transactions(self) -> int:
+        return self._transactions
+
+    def transaction(self) -> _AdvanceClockTransaction:
+        self._transactions += 1
+        return _AdvanceClockTransaction(
+            self._harness.store.transaction(),
+            harness=self._harness,
+            advance=self._transactions == 3,
+        )
+
+
+def test_snapshot_expiry_crossing_at_final_transaction_rolls_back() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    body = _decision_body(
+        harness,
+        batch,
+        rationale="Reject commit after the exact snapshot expiry boundary.",
+    )
+    harness.clock.value = (
+        harness.snapshot.expires_at - timedelta(seconds=1)
+    )
+    store = _AdvanceClockOnFinalDecisionStore(harness)
+    decisions = CohortDecisionService(
+        store=store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=harness.cohorts,
+        candidate_repository=harness.persistence,
+    )
+    client = TestClient(
+        create_app(
+            service=harness.lifecycle,
+            authentication=StaticTestAuthenticator(
+                {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
+            ),
+            cohort_service=harness.cohorts,
+            cohort_decision_service=decisions,
+        )
+    )
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    response = client.post(
+        "/v1/cohort-proposals/decisions",
+        json=body,
+        headers=_headers(
+            idempotency_key="wc-034-expiry-at-final-transaction",
+        ),
+    )
+
+    assert store.transactions == 3
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "stale_evidence_snapshot"
+    assert harness.lifecycle.get_draft(
+        HUMAN,
+        harness.draft_id,
+    ).revision == harness.draft_revision
+    with harness.store.transaction() as tx:
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == []
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            "wc-034-expiry-at-final-transaction",
+        ) is None
 
 
 def test_decision_and_draft_roll_back_together_on_persistence_failure() -> None:
