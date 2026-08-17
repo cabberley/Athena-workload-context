@@ -1,4 +1,9 @@
-import { createContextApiClient, ContextApiRequestError } from './client'
+import {
+  createContextApiClient,
+  ContextApiRequestError,
+  SupersessionRecoveryRequiredError,
+} from './client'
+import { refreshCanonicalManifestDigests } from './canonical'
 import { canonicalManifestFixture, mockAuthSession } from './test/mockClient'
 import type {
   AuthPort,
@@ -16,13 +21,21 @@ const authPort: AuthPort = {
 
 const actor = { actor_id: mockAuthSession.actorId, kind: mockAuthSession.kind }
 
-const published = (manifest: CanonicalWorkloadManifest = canonicalManifestFixture): WirePublishedManifest => ({
+const published = (
+  manifest: CanonicalWorkloadManifest = canonicalManifestFixture,
+  options: {
+    sourceDraftId?: string
+    sourceDraftRevision?: number
+    previousVersion?: string
+  } = {},
+): WirePublishedManifest => ({
   manifest_id: manifest.manifestId,
   manifest_version: manifest.manifestVersion,
   manifest_digest: manifest.compatibility.artifactDigest,
   manifest,
-  source_draft_id: 'draft-published-canonical',
-  source_draft_revision: 5,
+  source_draft_id: options.sourceDraftId ?? 'draft-published-canonical',
+  source_draft_revision: options.sourceDraftRevision ?? 5,
+  previous_version: options.previousVersion,
   approval: {
     decision_id: 'approval-published-canonical',
     approved_by: actor,
@@ -157,6 +170,217 @@ describe('WC-007 HTTP client', () => {
     expect(headers.get('Authorization')).toBe(`Bearer ${token}`)
     expect(headers.get('Content-Type')).toBe('application/json')
     expect(headers.get('Idempotency-Key')).toBe('mutation-idempotency-id')
+  })
+
+  it('integrates create successor, publish, supersede and reload with one active version', async () => {
+    let successorDraft: WireDraftRecord | null = null
+    let successorPublished: WirePublishedManifest | null = null
+    const predecessorView: WirePublishedManifestView = { published: published() }
+    const views: WirePublishedManifestView[] = [predecessorView]
+    let supersedeBody: Record<string, unknown> | null = null
+    let generatedId = 0
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'GET' && url.includes('/v1/drafts?')) {
+        return jsonResponse(successorDraft ? [successorDraft] : [])
+      }
+      if (method === 'GET' && url.endsWith('/versions')) {
+        return jsonResponse(views)
+      }
+      if (method === 'POST' && url.endsWith('/v1/drafts')) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        successorDraft = {
+          ...draft(body.manifest as CanonicalWorkloadManifest),
+          draft_id: String(body.draft_id),
+          manifest_digest: String(body.manifest_digest),
+          previous_version: String(body.previous_version),
+          reason: String(body.reason),
+        }
+        return jsonResponse(successorDraft, 201)
+      }
+      if (method === 'POST' && /\/(validate|submit|approve)$/.test(url)) {
+        const current = successorDraft!
+        const operation = url.split('/').at(-1)!
+        const state = operation === 'validate' ? 'validated' : operation === 'submit' ? 'in_review' : 'approved'
+        successorDraft = {
+          ...current,
+          state,
+          revision: current.revision + 1,
+          approval: state === 'approved'
+            ? {
+                decision_id: 'approval-successor',
+                approved_by: actor,
+                approved_at: '2026-08-17T00:00:04.000Z',
+                approved_revision: current.revision + 1,
+                manifest_version: current.manifest.manifestVersion,
+                manifest_digest: current.manifest_digest,
+                reason: 'Synthetic exact approval.',
+              }
+            : undefined,
+        }
+        return jsonResponse(successorDraft)
+      }
+      if (method === 'POST' && url.endsWith('/publish')) {
+        const current = successorDraft!
+        successorDraft = { ...current, state: 'published', revision: current.revision + 1 }
+        successorPublished = published(current.manifest, {
+          sourceDraftId: current.draft_id,
+          sourceDraftRevision: successorDraft.revision,
+          previousVersion: current.previous_version ?? undefined,
+        })
+        views.push({ published: successorPublished })
+        return jsonResponse(successorPublished, 201)
+      }
+      if (method === 'POST' && url.endsWith('/versions/1.0.0/supersede')) {
+        supersedeBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        predecessorView.supersession = {
+          manifest_id: canonicalManifestFixture.manifestId,
+          superseded_version: '1.0.0',
+          replacement_version: successorPublished!.manifest_version,
+          superseded_by: actor,
+          superseded_at: '2026-08-17T00:00:06.000Z',
+          reason: String(supersedeBody.reason),
+        }
+        return jsonResponse(predecessorView.supersession)
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`)
+    })
+    const client = createContextApiClient({
+      baseUrl: 'https://context.invalid',
+      authPort,
+      session: mockAuthSession,
+      fetchImpl: fetchMock as typeof fetch,
+      createId: () => `id-${++generatedId}`,
+    })
+
+    let current = await client.createSuccessorDraft(
+      canonicalManifestFixture.manifestId,
+      'Create integrated successor.',
+    )
+    current = await client.validateDraft({
+      workloadId: current.manifestId,
+      draftId: current.draftId,
+      expectedRevision: current.revision,
+      expectedManifestVersion: current.manifest.manifestVersion,
+      expectedDigest: current.manifestDigest,
+      reason: 'Validate integrated successor.',
+    })
+    current = await client.submitForReview({
+      workloadId: current.manifestId,
+      draftId: current.draftId,
+      expectedRevision: current.revision,
+      expectedManifestVersion: current.manifest.manifestVersion,
+      expectedDigest: current.manifestDigest,
+      reason: 'Submit integrated successor.',
+    })
+    current = await client.approveDraft({
+      workloadId: current.manifestId,
+      draftId: current.draftId,
+      expectedRevision: current.revision,
+      expectedManifestVersion: current.manifest.manifestVersion,
+      expectedDigest: current.manifestDigest,
+      reason: 'Approve integrated successor.',
+    })
+    const result = await client.publishDraft({
+      workloadId: current.manifestId,
+      draftId: current.draftId,
+      expectedRevision: current.revision,
+      expectedManifestVersion: current.manifest.manifestVersion,
+      expectedDigest: current.manifestDigest,
+      approvalId: current.approval!.decisionId,
+      reason: 'Publish integrated successor.',
+    })
+    const reloaded = await client.loadWorkloadContext(canonicalManifestFixture.manifestId)
+
+    expect(result.manifestVersion).toBe('1.0.1')
+    expect(reloaded.published?.manifestVersion).toBe('1.0.1')
+    expect(supersedeBody).toEqual({
+      expected_revision: 5,
+      expected_manifest_version: '1.0.0',
+      expected_digest: canonicalManifestFixture.compatibility.artifactDigest,
+      replacement_version: '1.0.1',
+      replacement_digest: result.manifestDigest,
+      reason: 'Supersede 1.0.0 with published successor 1.0.1.',
+    })
+    const supersedeCall = fetchMock.mock.calls.find((call) =>
+      String(call[0]).endsWith(
+        `/v1/manifests/${canonicalManifestFixture.manifestId}/versions/1.0.0/supersede`,
+      ),
+    )!
+    expect((supersedeCall[1] as RequestInit).method).toBe('POST')
+    expect(requestHeaders(supersedeCall).get('Authorization')).toBe(`Bearer ${token}`)
+    expect(requestHeaders(supersedeCall).get('Idempotency-Key')).toMatch(/^supersede-/)
+    expect(views.filter((view) => !view.supersession)).toHaveLength(1)
+  })
+
+  it('returns a blocking recoverable state when successor publish succeeds but supersede fails', async () => {
+    const successor = structuredClone(canonicalManifestFixture)
+    successor.manifestVersion = '1.0.1'
+    const canonicalSuccessor = await refreshCanonicalManifestDigests(successor)
+    const approvedDraft: WireDraftRecord = {
+      ...draft(canonicalSuccessor),
+      state: 'approved',
+      revision: 4,
+      approval: {
+        decision_id: 'approval-partial',
+        approved_by: actor,
+        approved_at: '2026-08-17T00:00:04.000Z',
+        approved_revision: 4,
+        manifest_version: '1.0.1',
+        manifest_digest: canonicalSuccessor.compatibility.artifactDigest,
+        reason: 'Synthetic partial approval.',
+      },
+    }
+    const successorPublication = published(canonicalSuccessor, {
+      sourceDraftId: approvedDraft.draft_id,
+      sourceDraftRevision: 5,
+      previousVersion: '1.0.0',
+    })
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET') === 'GET' && url.includes('/v1/drafts?')) {
+        return jsonResponse([approvedDraft])
+      }
+      if ((init?.method ?? 'GET') === 'GET' && url.endsWith('/versions')) {
+        return jsonResponse([{ published: published() }])
+      }
+      if (url.endsWith('/publish')) return jsonResponse(successorPublication, 201)
+      if (url.endsWith('/supersede')) {
+        return jsonResponse(
+          { error: { code: 'authorization_denied', message: 'Supersede permission is required.' } },
+          403,
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const client = createContextApiClient({
+      baseUrl: 'https://context.invalid',
+      authPort,
+      session: mockAuthSession,
+      fetchImpl: fetchMock as typeof fetch,
+      createId: () => 'partial-id',
+    })
+
+    const publication = client.publishDraft({
+      workloadId: approvedDraft.manifest_id,
+      draftId: approvedDraft.draft_id,
+      expectedRevision: approvedDraft.revision,
+      expectedManifestVersion: approvedDraft.manifest.manifestVersion,
+      expectedDigest: approvedDraft.manifest_digest,
+      approvalId: approvedDraft.approval!.decision_id,
+      reason: 'Publish partial successor.',
+    })
+
+    const error = await publication.catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(SupersessionRecoveryRequiredError)
+    const recoveryError = error as SupersessionRecoveryRequiredError
+    expect(recoveryError.published.manifestVersion).toBe('1.0.1')
+    expect(recoveryError.recovery).toMatchObject({
+      predecessorVersion: '1.0.0',
+      successorVersion: '1.0.1',
+    })
   })
 
   it('fails closed on 403 without rendering an unrestricted response body', async () => {

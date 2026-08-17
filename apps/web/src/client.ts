@@ -3,6 +3,8 @@ import type {
   ApprovalDecision,
   AuthSession,
   CanonicalControl,
+  CanonicalDeclaredRelationship,
+  CanonicalManifestEndpoint,
   CanonicalManifestProfile,
   CanonicalRelationship,
   CanonicalRiskAcceptance,
@@ -16,11 +18,11 @@ import type {
   DraftRecord,
   DraftState,
   EvidenceItem,
-  JsonObject,
   PublishRequest,
   PublishedManifest,
   RiskAcceptance,
   Supersession,
+  SupersessionRecovery,
   TopologyRelationship,
   WireActor,
   WireApprovalDecision,
@@ -34,6 +36,19 @@ import type {
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const DIGEST = /^sha256:[a-f0-9]{64}$/
+const DECLARED_RELATIONSHIP_TYPES = new Set<CanonicalDeclaredRelationship['kind']>([
+  'requires',
+  'dependsOn',
+  'calls',
+  'storesDataIn',
+  'replicatesTo',
+  'failsOverTo',
+  'sharesZoneWith',
+  'isolatedFrom',
+  'monitors',
+  'protectedBy',
+  'prohibited',
+])
 const EDITABLE_STATES = new Set<DraftState>(['draft', 'validated', 'in_review', 'approved'])
 const MAX_ERROR_BODY = 16_384
 const MAX_ERROR_MESSAGE = 300
@@ -47,6 +62,23 @@ export class ContextApiRequestError extends Error {
     this.name = 'ContextApiRequestError'
     this.status = status
     this.code = code
+  }
+}
+
+export class SupersessionRecoveryRequiredError extends Error {
+  readonly recovery: SupersessionRecovery
+  readonly published: PublishedManifest
+  readonly cause: unknown
+
+  constructor(recovery: SupersessionRecovery, published: PublishedManifest, cause: unknown) {
+    super(
+      `Successor ${recovery.successorVersion} is published, but predecessor ${recovery.predecessorVersion} ` +
+      'is still active or supersession could not be verified. Publication is blocked pending supersession recovery.',
+    )
+    this.name = 'SupersessionRecoveryRequiredError'
+    this.recovery = recovery
+    this.published = published
+    this.cause = cause
   }
 }
 
@@ -90,6 +122,102 @@ const parseActor = (value: unknown, label: string): WireActor => {
   return { actor_id: actorId, kind: kind as WireActor['kind'] }
 }
 
+const parseManifestEndpoint = (value: unknown, label: string): CanonicalManifestEndpoint => {
+  const endpoint = asRecord(value, label)
+  const endpointType = requiredString(endpoint, 'endpointType', label)
+  if (endpointType === 'role') {
+    return {
+      endpointType,
+      roleRef: requiredString(endpoint, 'roleRef', label),
+    }
+  }
+  if (endpointType === 'external') {
+    return {
+      endpointType,
+      externalRef: requiredString(endpoint, 'externalRef', label),
+    }
+  }
+  throw new Error(`Context API returned an invalid ${label}.endpointType.`)
+}
+
+const parseCanonicalRelationship = (value: unknown, label: string): CanonicalRelationship => {
+  const relationship = asRecord(value, label)
+  const relationshipClass = requiredString(relationship, 'relationshipClass', label)
+  if (relationshipClass === 'declared') {
+    const exceptionOnlyFields = [
+      'exceptionId',
+      'appliesToRelationshipRef',
+      'appliesToClauseRef',
+      'riskAcceptanceRef',
+      'governanceScope',
+      'rationale',
+      'expiresAt',
+    ]
+    if (exceptionOnlyFields.some((field) => field in relationship) || !Array.isArray(relationship.profiles)) {
+      throw new Error(`Context API returned an invalid declared ${label}.`)
+    }
+    const kind = requiredString(relationship, 'kind', label)
+    if (!DECLARED_RELATIONSHIP_TYPES.has(kind as CanonicalDeclaredRelationship['kind'])) {
+      throw new Error(`Context API returned an invalid ${label}.kind.`)
+    }
+    const parsed: CanonicalDeclaredRelationship = {
+      relationshipClass,
+      relationshipId: requiredString(relationship, 'relationshipId', label),
+      kind: kind as CanonicalDeclaredRelationship['kind'],
+      source: parseManifestEndpoint(relationship.source, `${label}.source`),
+      target: parseManifestEndpoint(relationship.target, `${label}.target`),
+      ownerRef: requiredString(relationship, 'ownerRef', label),
+      profiles: relationship.profiles.map((profile) => {
+        if (typeof profile !== 'string') throw new Error(`Context API returned invalid ${label}.profiles.`)
+        return profile as CanonicalDeclaredRelationship['profiles'][number]
+      }),
+      sourceClause: requiredString(relationship, 'sourceClause', label),
+    }
+    return parsed
+  }
+  if (relationshipClass === 'exception') {
+    const declaredOnlyFields = [
+      'relationshipId',
+      'kind',
+      'source',
+      'target',
+      'profiles',
+      'sourceClause',
+    ]
+    if (declaredOnlyFields.some((field) => field in relationship)) {
+      throw new Error(`Context API returned declared-only fields on exception ${label}.`)
+    }
+    const scope = asRecord(relationship.governanceScope, `${label}.governanceScope`)
+    if (scope.governanceScopeType !== 'clause') {
+      throw new Error(`Context API returned an invalid ${label}.governanceScopeType.`)
+    }
+    const appliesToRelationshipRef = optionalNullableString(relationship, 'appliesToRelationshipRef')
+    const appliesToClauseRef = optionalNullableString(relationship, 'appliesToClauseRef')
+    if ((appliesToRelationshipRef == null) === (appliesToClauseRef == null)) {
+      throw new Error(`Context API returned an exception ${label} without exactly one target.`)
+    }
+    const common = {
+      relationshipClass: 'exception' as const,
+      exceptionId: requiredString(relationship, 'exceptionId', label),
+      riskAcceptanceRef: requiredString(relationship, 'riskAcceptanceRef', label),
+      governanceScope: {
+        governanceScopeType: 'clause' as const,
+        manifestId: requiredString(scope, 'manifestId', `${label}.governanceScope`),
+        profileId: requiredString(scope, 'profileId', `${label}.governanceScope`),
+        clausePath: requiredString(scope, 'clausePath', `${label}.governanceScope`),
+        ownerRef: requiredString(scope, 'ownerRef', `${label}.governanceScope`),
+      },
+      ownerRef: requiredString(relationship, 'ownerRef', label),
+      rationale: requiredString(relationship, 'rationale', label),
+      expiresAt: requiredString(relationship, 'expiresAt', label),
+    }
+    return appliesToRelationshipRef == null
+      ? { ...common, appliesToClauseRef: appliesToClauseRef! }
+      : { ...common, appliesToRelationshipRef }
+  }
+  throw new Error(`Context API returned unsupported ${label}.relationshipClass.`)
+}
+
 const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
   const record = asRecord(value, 'canonical manifest')
   if ('manifestDigest' in record) {
@@ -125,6 +253,19 @@ const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
     Array.isArray(record.audit)
   ) {
     throw new Error('Context API returned a malformed canonical workload manifest.')
+  }
+  record.relationships.map((relationship, index) =>
+    parseCanonicalRelationship(relationship, `canonical manifest.relationships[${index}]`),
+  )
+  for (const [profileId, profileValue] of Object.entries(record.profiles as Record<string, unknown>)) {
+    const profile = asRecord(profileValue, `canonical manifest.profiles.${profileId}`)
+    asArray(profile.relationships, `canonical manifest.profiles.${profileId}.relationships`).map(
+      (relationship, index) =>
+        parseCanonicalRelationship(
+          relationship,
+          `canonical manifest.profiles.${profileId}.relationships[${index}]`,
+        ),
+    )
   }
   return structuredClone(record) as unknown as CanonicalWorkloadManifest
 }
@@ -337,26 +478,39 @@ const toViewSupersession = (wire: WireSupersession): Supersession => ({
   reason: wire.reason,
 })
 
-const endpointLabel = (endpoint: JsonObject): string => {
-  for (const key of ['roleRef', 'resourceRef', 'externalRef', 'endpointId']) {
-    if (typeof endpoint[key] === 'string') return endpoint[key]
-  }
-  return typeof endpoint.endpointType === 'string' ? endpoint.endpointType : 'unspecified endpoint'
-}
+const endpointLabel = (endpoint: CanonicalManifestEndpoint): string =>
+  endpoint.endpointType === 'role' ? endpoint.roleRef : endpoint.externalRef
 
 const toRelationship = (
   relationship: CanonicalRelationship,
   profileId: string | null,
-): TopologyRelationship => ({
-  id: relationship.relationshipId ?? relationship.exceptionId ?? 'unnamed-relationship',
-  kind: relationship.relationshipClass,
-  relationshipType: relationship.kind,
-  source: endpointLabel(relationship.source),
-  target: endpointLabel(relationship.target),
-  ownerRef: relationship.ownerRef ?? null,
-  clause: relationship.sourceClause ?? null,
-  profileId,
-})
+): TopologyRelationship => {
+  if (relationship.relationshipClass === 'declared') {
+    return {
+      id: relationship.relationshipId,
+      kind: 'declared',
+      relationshipType: relationship.kind,
+      source: endpointLabel(relationship.source),
+      target: endpointLabel(relationship.target),
+      ownerRef: relationship.ownerRef,
+      clause: relationship.sourceClause,
+      profileId,
+    }
+  }
+  const relationshipTarget = relationship.appliesToRelationshipRef
+  return {
+    id: relationship.exceptionId,
+    kind: 'exception',
+    targetType: relationshipTarget ? 'relationship' : 'clause',
+    targetRef: relationshipTarget ?? relationship.appliesToClauseRef!,
+    riskAcceptanceRef: relationship.riskAcceptanceRef,
+    governanceScope: structuredClone(relationship.governanceScope),
+    ownerRef: relationship.ownerRef,
+    rationale: relationship.rationale,
+    expiresAt: relationship.expiresAt,
+    profileId,
+  }
+}
 
 const toControl = (control: CanonicalControl): ControlRecord => ({
   id: control.controlId,
@@ -603,6 +757,7 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
   const requestJson = async (
     path: string,
     requestInit: RequestInit,
+    idempotencyKey?: string,
   ): Promise<unknown> => {
     const token = (await config.authPort.acquireAccessToken(config.session))?.trim()
     if (!token) {
@@ -614,7 +769,7 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
       headers.set('Content-Type', 'application/json')
     }
     if (requestInit.method && !['GET', 'HEAD'].includes(requestInit.method.toUpperCase())) {
-      headers.set('Idempotency-Key', safeId('mutation'))
+      headers.set('Idempotency-Key', idempotencyKey ?? safeId('mutation'))
     }
     const response = await fetchImpl(`${baseUrl}${path}`, { ...requestInit, headers })
     if (!response.ok) throw await safeError(response)
@@ -654,6 +809,59 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
       throw new Error('Context API returned a draft outside the authorized workload scope.')
     }
     return draft
+  }
+
+  const supersede = async (recovery: SupersessionRecovery): Promise<Supersession> => {
+    assertAuthorized(recovery.workloadId)
+    if (!IDENTIFIER.test(recovery.idempotencyKey)) {
+      throw new Error('Supersession recovery requires its original valid idempotency key.')
+    }
+    const response = await requestJson(
+      `/v1/manifests/${encodeURIComponent(recovery.workloadId)}/versions/` +
+        `${encodeURIComponent(recovery.predecessorVersion)}/supersede`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_revision: recovery.predecessorRevision,
+          expected_manifest_version: recovery.predecessorVersion,
+          expected_digest: recovery.predecessorDigest,
+          replacement_version: recovery.successorVersion,
+          replacement_digest: recovery.successorDigest,
+          reason: recovery.reason,
+        }),
+      },
+      recovery.idempotencyKey,
+    )
+    const relation = toViewSupersession(parseSupersession(response))
+    if (
+      relation.manifestId !== recovery.workloadId ||
+      relation.supersededVersion !== recovery.predecessorVersion ||
+      relation.replacementVersion !== recovery.successorVersion
+    ) {
+      throw new Error('Context API returned a supersession outside the exact publication lineage.')
+    }
+    return relation
+  }
+
+  const verifySupersession = async (recovery: SupersessionRecovery): Promise<void> => {
+    const lifecycle = await loadLifecycle(recovery.workloadId)
+    const active = lifecycle.publishedViews.filter((view) => !view.supersession)
+    if (
+      active.length !== 1 ||
+      active[0]!.published.manifest_version !== recovery.successorVersion ||
+      active[0]!.published.manifest_digest !== recovery.successorDigest
+    ) {
+      throw new Error('Reload did not yield exactly one active unsuperseded successor version.')
+    }
+    const predecessor = lifecycle.publishedViews.find(
+      (view) => view.published.manifest_version === recovery.predecessorVersion,
+    )
+    if (
+      predecessor?.supersession?.replacement_version !== recovery.successorVersion ||
+      predecessor.supersession.superseded_version !== recovery.predecessorVersion
+    ) {
+      throw new Error('Reload did not return the exact predecessor-to-successor supersession.')
+    }
   }
 
   return {
@@ -737,6 +945,37 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
     approveDraft: async (request) => transition(request, 'approve'),
     publishDraft: async (request: PublishRequest) => {
       assertAuthorized(request.workloadId)
+      const beforePublication = await loadLifecycle(request.workloadId)
+      const sourceDraft = selectUnique(
+        beforePublication.drafts.filter((draft) => draft.draft_id === request.draftId),
+        `publication source drafts for ${request.workloadId}`,
+      )
+      if (
+        !sourceDraft ||
+        sourceDraft.state !== 'approved' ||
+        sourceDraft.revision !== request.expectedRevision ||
+        sourceDraft.manifest.manifestVersion !== request.expectedManifestVersion ||
+        sourceDraft.manifest_digest !== request.expectedDigest
+      ) {
+        throw new Error('Publication source is not the exact current approved draft.')
+      }
+      const activeBefore = beforePublication.publishedViews.filter((view) => !view.supersession)
+      const predecessor =
+        sourceDraft.previous_version == null
+          ? null
+          : selectUnique(
+              activeBefore.filter(
+                (view) => view.published.manifest_version === sourceDraft.previous_version,
+              ),
+              `unsuperseded predecessors for ${request.workloadId}`,
+            )
+      if (
+        (sourceDraft.previous_version == null && activeBefore.length !== 0) ||
+        (sourceDraft.previous_version != null &&
+          (activeBefore.length !== 1 || predecessor == null))
+      ) {
+        throw new Error('Publication requires the exact unique unsuperseded predecessor from the draft lineage.')
+      }
       const response = await requestJson(`/v1/drafts/${encodeURIComponent(request.draftId)}/publish`, {
         method: 'POST',
         body: JSON.stringify({
@@ -751,7 +990,42 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
       if (published.manifestId !== request.workloadId) {
         throw new Error('Context API returned a publication outside the authorized workload scope.')
       }
+      if (published.previousVersion !== (predecessor?.published.manifest_version ?? null)) {
+        throw new Error('Published successor did not retain the exact predecessor version.')
+      }
+      if (predecessor) {
+        const recovery: SupersessionRecovery = {
+          workloadId: request.workloadId,
+          predecessorVersion: predecessor.published.manifest_version,
+          predecessorRevision: predecessor.published.source_draft_revision,
+          predecessorDigest: predecessor.published.manifest_digest,
+          successorVersion: published.manifestVersion,
+          successorDigest: published.manifestDigest,
+          reason: `Supersede ${predecessor.published.manifest_version} with published successor ${published.manifestVersion}.`,
+          idempotencyKey: safeId('supersede'),
+        }
+        try {
+          await supersede(recovery)
+          await verifySupersession(recovery)
+        } catch (error) {
+          throw new SupersessionRecoveryRequiredError(recovery, published, error)
+        }
+      } else {
+        const afterPublication = await loadLifecycle(request.workloadId)
+        const activeAfter = afterPublication.publishedViews.filter((view) => !view.supersession)
+        if (
+          activeAfter.length !== 1 ||
+          activeAfter[0]!.published.manifest_version !== published.manifestVersion
+        ) {
+          throw new Error('Initial publication reload did not yield exactly one active version.')
+        }
+      }
       return published
+    },
+    completeSupersession: async (recovery) => {
+      const relation = await supersede(recovery)
+      await verifySupersession(recovery)
+      return relation
     },
   }
 }

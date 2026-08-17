@@ -44,6 +44,14 @@ The client never uses unrestricted `GET /v1/drafts`.
 - Published list responses are unwrapped from `{ published, supersession }`. A successor requires
   one unsuperseded predecessor, no active draft, an unused higher version, an exact
   `previous_version`, and a newly computed digest.
+- Publishing a successor immediately calls
+  `POST /v1/manifests/{manifest_id}/versions/{predecessor_version}/supersede` with the predecessor
+  revision/version/digest and successor version/digest. Reload must confirm one active version.
+  If publication succeeds but supersession fails or cannot be verified, the UI enters a blocking
+  recovery state and retries the same command with its original idempotency key.
+- Canonical relationships are a discriminated `declared | exception` union. Exceptions render
+  their target, risk acceptance, governance scope, rationale, owner, and expiry; they never receive
+  fabricated endpoint or relationship-kind fields.
 - Authority, provenance, observed relationships, and confidence are never invented. Missing
   WC-007 evidence or confidence is displayed as not provided.
 - Agent sessions cannot approve or publish. Human users must explicitly confirm review of the exact

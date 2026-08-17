@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
+import { SupersessionRecoveryRequiredError } from './client'
 import type {
   AppRoute,
   CanonicalWorkloadManifest,
   ConcurrencyRequest,
   ContextApiClientPort,
+  SupersessionRecovery,
   WorkloadContext,
 } from './types'
 import './App.css'
@@ -45,6 +47,7 @@ function App({ client, initialContexts }: AppProps) {
     initial.manifest.profiles.production ? 'production' : Object.keys(initial.manifest.profiles)[0]!,
   )
   const [reviewedDigest, setReviewedDigest] = useState<string | null>(null)
+  const [supersessionRecovery, setSupersessionRecovery] = useState<SupersessionRecovery | null>(null)
   const [statusMessage, setStatusMessage] = useState('Authenticated workload context loaded from scoped WC-007 routes.')
   const [busy, setBusy] = useState(false)
   const routeHeadingRef = useRef<HTMLHeadingElement>(null)
@@ -192,10 +195,41 @@ function App({ client, initialContexts }: AppProps) {
         approvalId: draft.approval.decisionId,
       })
       setReviewedDigest(null)
+      setSupersessionRecovery(null)
       await refreshCurrentWorkload()
-      setStatusMessage(`Published version ${published.manifestVersion} for ${published.manifestId}.`)
+      setStatusMessage(
+        published.previousVersion
+          ? `Published version ${published.manifestVersion} and superseded predecessor ${published.previousVersion} for ${published.manifestId}.`
+          : `Published initial version ${published.manifestVersion} for ${published.manifestId}.`,
+      )
     } catch (error) {
-      setStatusMessage(errorMessage(error, 'Publication failed closed.'))
+      if (error instanceof SupersessionRecoveryRequiredError) {
+        setSupersessionRecovery(error.recovery)
+        setStatusMessage(error.message)
+      } else {
+        setStatusMessage(errorMessage(error, 'Publication failed closed.'))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const recoverSupersession = async (): Promise<void> => {
+    if (!supersessionRecovery) return
+    setBusy(true)
+    try {
+      await client.completeSupersession(supersessionRecovery)
+      const recovered = supersessionRecovery
+      setSupersessionRecovery(null)
+      setReviewedDigest(null)
+      await refreshCurrentWorkload()
+      setStatusMessage(
+        `Recovered publication: ${recovered.predecessorVersion} is superseded by ${recovered.successorVersion}.`,
+      )
+    } catch (error) {
+      setStatusMessage(
+        `Supersession recovery remains blocked. ${errorMessage(error, 'The exact recovery command failed.')}`,
+      )
     } finally {
       setBusy(false)
     }
@@ -205,12 +239,18 @@ function App({ client, initialContexts }: AppProps) {
   const selectedProfile = draftForm.profiles[selectedProfileId]
   const reviewConfirmed = Boolean(currentDraft && reviewedDigest === currentDraft.manifestDigest)
   const isHuman = client.auth.kind === 'human'
-  const canEdit = currentDraft?.state === 'draft'
-  const canCreateSuccessor = !currentDraft && Boolean(workloadContext.published)
-  const canValidate = currentDraft?.state === 'draft'
-  const canSubmit = currentDraft?.state === 'validated'
-  const canApprove = currentDraft?.state === 'in_review' && reviewConfirmed && isHuman
-  const canPublish = currentDraft?.state === 'approved' && Boolean(currentDraft.approval) && reviewConfirmed && isHuman
+  const lifecycleBlocked = supersessionRecovery !== null
+  const canEdit = !lifecycleBlocked && currentDraft?.state === 'draft'
+  const canCreateSuccessor = !lifecycleBlocked && !currentDraft && Boolean(workloadContext.published)
+  const canValidate = !lifecycleBlocked && currentDraft?.state === 'draft'
+  const canSubmit = !lifecycleBlocked && currentDraft?.state === 'validated'
+  const canApprove = !lifecycleBlocked && currentDraft?.state === 'in_review' && reviewConfirmed && isHuman
+  const canPublish =
+    !lifecycleBlocked &&
+    currentDraft?.state === 'approved' &&
+    Boolean(currentDraft.approval) &&
+    reviewConfirmed &&
+    isHuman
   const catalogue = [...contexts.values()].map((context) => context.catalogueItem)
 
   const setDisplayName = (displayName: string): void => {
@@ -375,10 +415,27 @@ function App({ client, initialContexts }: AppProps) {
                     <li key={`${relationship.profileId ?? 'root'}-${relationship.id}`} className={`relationship-item kind-${relationship.kind}`}>
                       <span className="relationship-kind">{relationship.kind}</span>
                       <strong>{relationship.id}</strong>
-                      <p>{relationship.source} {relationship.relationshipType} {relationship.target}</p>
-                      <small>
-                        Profile: {relationship.profileId ?? 'manifest'} • Owner: {relationship.ownerRef ?? 'not declared'} • Clause: {relationship.clause ?? 'not declared'}
-                      </small>
+                      {relationship.kind === 'exception' ? (
+                        <>
+                          <p>
+                            Exception target: {relationship.targetType} {relationship.targetRef}
+                          </p>
+                          <p>Rationale: {relationship.rationale}</p>
+                          <small>
+                            Risk acceptance: {relationship.riskAcceptanceRef} • Scope:{' '}
+                            {relationship.governanceScope.clausePath} • Expires: {relationship.expiresAt} • Owner:{' '}
+                            {relationship.ownerRef}
+                          </small>
+                        </>
+                      ) : (
+                        <>
+                          <p>{relationship.source} {relationship.relationshipType} {relationship.target}</p>
+                          <small>
+                            Profile: {relationship.profileId ?? 'manifest'} • Owner: {relationship.ownerRef} • Clause:{' '}
+                            {relationship.clause}
+                          </small>
+                        </>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -508,12 +565,37 @@ function App({ client, initialContexts }: AppProps) {
           <h2>Explicit human review</h2>
           <p>Agent proposals remain non-authoritative drafts. WC-007 server approval and an explicit review of the exact digest are both required before publication.</p>
 
+          {supersessionRecovery && (
+            <div className="recovery-state" role="alert">
+              <h3>Publication recovery required</h3>
+              <p>
+                Successor {supersessionRecovery.successorVersion} is published, but predecessor{' '}
+                {supersessionRecovery.predecessorVersion} has not been confirmed superseded. All other lifecycle
+                actions are blocked.
+              </p>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => void recoverSupersession()}
+                disabled={busy}
+              >
+                Retry exact supersession
+              </button>
+            </div>
+          )}
+
           <label className="review-confirmation">
             <input
               type="checkbox"
               checked={reviewConfirmed}
               onChange={(event) => setReviewedDigest(event.target.checked ? currentDraft?.manifestDigest ?? null : null)}
-              disabled={!isHuman || !currentDraft || !['in_review', 'approved'].includes(currentDraft.state) || busy}
+              disabled={
+                lifecycleBlocked ||
+                !isHuman ||
+                !currentDraft ||
+                !['in_review', 'approved'].includes(currentDraft.state) ||
+                busy
+              }
             />
             I reviewed this exact candidate digest for publication.
           </label>

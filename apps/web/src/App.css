@@ -456,6 +456,21 @@ legend {
   margin-top: 0.15rem;
 }
 
+.recovery-state {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  border: 2px solid #f59e0b;
+  border-radius: 12px;
+  background: rgba(120, 53, 15, 0.35);
+  padding: 0.9rem;
+}
+
+.recovery-state h3,
+.recovery-state p {
+  margin: 0;
+}
+
 .primary-action,
 .secondary-action,
 .small-button {

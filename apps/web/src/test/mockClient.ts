@@ -74,16 +74,35 @@ const makeContext = (
         relationshipKind: 'declared' as const,
       }
     }),
-    relationships: selectedManifest.relationships.map((relationship) => ({
-      id: relationship.relationshipId ?? relationship.exceptionId ?? 'unnamed',
-      kind: relationship.relationshipClass,
-      relationshipType: relationship.kind,
-      source: String(relationship.source.roleRef ?? relationship.source.endpointType ?? 'source'),
-      target: String(relationship.target.roleRef ?? relationship.target.endpointType ?? 'target'),
-      ownerRef: relationship.ownerRef ?? null,
-      clause: relationship.sourceClause ?? null,
-      profileId: null,
-    })),
+    relationships: selectedManifest.relationships.map((relationship) => {
+      if (relationship.relationshipClass === 'exception') {
+        const targetRef = relationship.appliesToRelationshipRef ?? relationship.appliesToClauseRef!
+        return {
+          id: relationship.exceptionId,
+          kind: 'exception' as const,
+          targetType: relationship.appliesToRelationshipRef ? 'relationship' as const : 'clause' as const,
+          targetRef,
+          riskAcceptanceRef: relationship.riskAcceptanceRef,
+          governanceScope: structuredClone(relationship.governanceScope),
+          ownerRef: relationship.ownerRef,
+          rationale: relationship.rationale,
+          expiresAt: relationship.expiresAt,
+          profileId: null,
+        }
+      }
+      const endpoint = (value: typeof relationship.source): string =>
+        value.endpointType === 'role' ? value.roleRef : value.externalRef
+      return {
+        id: relationship.relationshipId,
+        kind: 'declared' as const,
+        relationshipType: relationship.kind,
+        source: endpoint(relationship.source),
+        target: endpoint(relationship.target),
+        ownerRef: relationship.ownerRef,
+        clause: relationship.sourceClause,
+        profileId: null,
+      }
+    }),
     manifest: structuredClone(selectedManifest),
     controls: Object.values(selectedManifest.profiles).flatMap((profile) =>
       profile.controls.map((control) => ({
@@ -313,6 +332,14 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
       draft = { ...current, state: 'published', revision: current.revision + 1 }
       return published
     },
+    completeSupersession: async (recovery) => ({
+      manifestId: recovery.workloadId,
+      supersededVersion: recovery.predecessorVersion,
+      replacementVersion: recovery.successorVersion,
+      supersededBy: actor(session),
+      supersededAt: timestamp,
+      reason: recovery.reason,
+    }),
   }
 }
 

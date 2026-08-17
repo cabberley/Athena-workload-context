@@ -12,6 +12,18 @@ export type EnvironmentName =
   | 'disasterRecovery'
   | 'sandbox'
 export type RelationshipKind = 'declared' | 'observed' | 'inferred' | 'exception'
+export type DeclaredRelationshipType =
+  | 'requires'
+  | 'dependsOn'
+  | 'calls'
+  | 'storesDataIn'
+  | 'replicatesTo'
+  | 'failsOverTo'
+  | 'sharesZoneWith'
+  | 'isolatedFrom'
+  | 'monitors'
+  | 'protectedBy'
+  | 'prohibited'
 export type DraftState = 'draft' | 'validated' | 'in_review' | 'approved' | 'published' | 'superseded'
 export type AppRoute = 'overview' | 'catalogue' | 'manifest' | 'controls'
 export type ActorKind = 'human' | 'agent' | 'service'
@@ -65,16 +77,33 @@ export interface ComparisonRow {
   relationshipKind: 'declared'
 }
 
-export interface TopologyRelationship {
+export interface DeclaredTopologyRelationship {
   id: string
-  kind: RelationshipKind
+  kind: 'declared'
   relationshipType: string
   source: string
   target: string
-  ownerRef: string | null
-  clause: string | null
+  ownerRef: string
+  clause: string
   profileId: string | null
 }
+
+export interface ExceptionTopologyRelationship {
+  id: string
+  kind: 'exception'
+  targetType: 'relationship' | 'clause'
+  targetRef: string
+  riskAcceptanceRef: string
+  governanceScope: CanonicalClauseScope
+  ownerRef: string
+  rationale: string
+  expiresAt: string
+  profileId: string | null
+}
+
+export type TopologyRelationship =
+  | DeclaredTopologyRelationship
+  | ExceptionTopologyRelationship
 
 export interface ControlRecord {
   id: string
@@ -135,17 +164,65 @@ export interface CanonicalManifestAudit {
   approvalStatus: 'approved'
 }
 
-export interface CanonicalRelationship {
-  relationshipClass: RelationshipKind
-  relationshipId?: string
-  exceptionId?: string
-  kind: string
-  source: JsonObject
-  target: JsonObject
-  ownerRef?: string
-  sourceClause?: string
-  profiles: string[]
+export interface CanonicalRoleEndpoint {
+  endpointType: 'role'
+  roleRef: string
 }
+
+export interface CanonicalExternalEndpoint {
+  endpointType: 'external'
+  externalRef: string
+}
+
+export type CanonicalManifestEndpoint =
+  | CanonicalRoleEndpoint
+  | CanonicalExternalEndpoint
+
+export interface CanonicalClauseScope {
+  governanceScopeType: 'clause'
+  manifestId: string
+  profileId: string
+  clausePath: string
+  ownerRef: string
+}
+
+export interface CanonicalDeclaredRelationship {
+  relationshipClass: 'declared'
+  relationshipId: string
+  kind: DeclaredRelationshipType
+  source: CanonicalManifestEndpoint
+  target: CanonicalManifestEndpoint
+  ownerRef: string
+  profiles: EnvironmentName[]
+  sourceClause: string
+}
+
+interface CanonicalExceptionRelationshipBase {
+  relationshipClass: 'exception'
+  exceptionId: string
+  riskAcceptanceRef: string
+  governanceScope: CanonicalClauseScope
+  ownerRef: string
+  rationale: string
+  expiresAt: string
+}
+
+export type CanonicalExceptionRelationship =
+  CanonicalExceptionRelationshipBase &
+  (
+    | {
+        appliesToRelationshipRef: string
+        appliesToClauseRef?: never
+      }
+    | {
+        appliesToRelationshipRef?: never
+        appliesToClauseRef: string
+      }
+  )
+
+export type CanonicalRelationship =
+  | CanonicalDeclaredRelationship
+  | CanonicalExceptionRelationship
 
 export interface CanonicalControl {
   controlId: string
@@ -316,6 +393,17 @@ export interface PublishRequest extends ConcurrencyRequest {
   approvalId: string
 }
 
+export interface SupersessionRecovery {
+  workloadId: string
+  predecessorVersion: string
+  predecessorRevision: number
+  predecessorDigest: string
+  successorVersion: string
+  successorDigest: string
+  reason: string
+  idempotencyKey: string
+}
+
 export interface ContextApiClientOptions {
   baseUrl: string
   authPort: AuthPort
@@ -418,6 +506,7 @@ export interface ContextApiClientPort {
   submitForReview: (request: ConcurrencyRequest) => Promise<DraftRecord>
   approveDraft: (request: ConcurrencyRequest) => Promise<DraftRecord>
   publishDraft: (request: PublishRequest) => Promise<PublishedManifest>
+  completeSupersession: (recovery: SupersessionRecovery) => Promise<Supersession>
 }
 
 declare global {
