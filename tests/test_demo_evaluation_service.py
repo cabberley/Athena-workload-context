@@ -20,6 +20,7 @@ from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     Actor,
     ActorKind,
+    CreateDemoEvaluationApprovalCommand,
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
@@ -34,6 +35,7 @@ from athena_context.api import (
 )
 from athena_context.api.authorization import authorize_role_grants
 from athena_context.api.domain import (
+    AuditAction,
     Permission,
     Supersession,
     WorkloadGrantScope,
@@ -45,6 +47,7 @@ from athena_context.api.errors import (
     EvaluationFailedClosedError,
     EvidenceCollectionRejectedError,
     IdempotencyConflictError,
+    ResourceNotFoundError,
 )
 from athena_context.api.evaluation_context import (
     validate_published_context_binding,
@@ -189,6 +192,182 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     ) == result.publication.registry_record()
 
 
+def test_approval_read_authorization_uses_only_the_stored_workload() -> None:
+    harness = build_harness()
+    service = harness.context_resolver.service
+    unauthorized = Actor(
+        actor_id="wc013-ungranted-approval-reader",
+        kind=ActorKind.HUMAN,
+    )
+    cross_workload = Actor(
+        actor_id="wc013-foreign-workload-auditor",
+        kind=ActorKind.HUMAN,
+    )
+    foreign_grant = RoleGrant(
+        actor_id=cross_workload.actor_id,
+        role=Role.AUDITOR,
+        scope=WorkloadGrantScope(
+            workload_id="wl-foreign-approval-authority"
+        ),
+    )
+    harness.authorization.add_grant(foreign_grant)
+    original = harness.approval_registry.resolve(
+        harness.approval.decision_id
+    )
+
+    with pytest.raises(AuthorizationError):
+        service.get_demo_evaluation_approval(
+            unauthorized,
+            harness.approval.decision_id,
+        )
+    with pytest.raises(AuthorizationError):
+        service.get_demo_evaluation_approval(
+            cross_workload,
+            harness.approval.decision_id,
+        )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-service-approval-read-publication",
+        harness.command,
+    )
+    assert result.publication.approval_decision_id == (
+        harness.approval.decision_id
+    )
+    publisher_grant = RoleGrant(
+        actor_id=PUBLISHER.actor_id,
+        role=Role.PUBLISHER,
+    )
+    harness.authorization.remove_grant(publisher_grant)
+
+    with pytest.raises(AuthorizationError):
+        service.get_demo_evaluation_approval(
+            PUBLISHER,
+            harness.approval.decision_id,
+        )
+
+    assert harness.approval_registry.resolve(
+        harness.approval.decision_id
+    ) == original
+    harness.authorization.add_grant(publisher_grant)
+    assert harness.store.publication_count == 1
+
+
+def test_approval_creation_uses_authenticated_actor_and_millisecond_clock() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    harness.clock.advance(timedelta(milliseconds=123))
+    service = harness.context_resolver.service
+    decision_id = "approval-wc013-authoritative-provenance"
+    idempotency_key = "wc013-authoritative-provenance"
+    command_payload = {
+        "decision_id": decision_id,
+        "expires_at": harness.clock.value + timedelta(hours=1),
+        "manifest_id": harness.command.manifest_id,
+        "manifest_version": harness.approval.manifest_version,
+        "manifest_digest": harness.command.expected_manifest_digest,
+        "profile_id": harness.command.profile_id,
+        "authorized_scope": harness.command.authorized_scope,
+        "reason": "Authorize exact server-owned approval provenance",
+    }
+    forged_payload = {
+        **command_payload,
+        "approved_by": Actor(
+            actor_id="wc013-forged-human",
+            kind=ActorKind.HUMAN,
+        ),
+        "approved_at": datetime(2020, 1, 1, tzinfo=UTC),
+    }
+    audit_before = service.audit_history(
+        APPROVER,
+        harness.command.manifest_id,
+    )
+
+    with pytest.raises(ValidationError):
+        CreateDemoEvaluationApprovalCommand.model_validate(forged_payload)
+    assert not hasattr(service, "put_demo_evaluation_approval")
+    assert service.get_demo_evaluation_approval(APPROVER, decision_id) is None
+    assert harness.store.publication_count == 0
+    assert (
+        service.audit_history(APPROVER, harness.command.manifest_id)
+        == audit_before
+    )
+
+    command = CreateDemoEvaluationApprovalCommand.model_validate(
+        command_payload
+    )
+    expired = command.model_copy(
+        update={"expires_at": harness.clock.value - timedelta(seconds=1)}
+    )
+    with pytest.raises(
+        DemoEvaluationApprovalError,
+        match="expiry must be after",
+    ):
+        service.create_demo_evaluation_approval(
+            APPROVER,
+            idempotency_key,
+            expired,
+        )
+    assert service.get_demo_evaluation_approval(APPROVER, decision_id) is None
+    assert harness.store.publication_count == 0
+    assert (
+        service.audit_history(APPROVER, harness.command.manifest_id)
+        == audit_before
+    )
+
+    expected_time = harness.clock.value
+    approval = service.create_demo_evaluation_approval(
+        APPROVER,
+        idempotency_key,
+        command,
+    )
+    replay = service.create_demo_evaluation_approval(
+        APPROVER,
+        idempotency_key,
+        command,
+    )
+
+    assert replay == approval
+    assert approval.approved_by == APPROVER
+    assert approval.approved_at == expected_time
+    assert approval.approved_at.microsecond == 123_000
+    assert approval.revision == 1
+    assert approval.manifest_id == harness.command.manifest_id
+    assert approval.manifest_digest == (
+        harness.command.expected_manifest_digest
+    )
+    assert approval.profile_id == harness.command.profile_id
+    assert approval.authorized_scope == harness.command.authorized_scope
+    assert approval.private_mcp_endpoint == (
+        harness.deployment_configuration.assertion.azure_mcp_internal_endpoint
+    )
+    assert approval.evidence_identity_object_id == MCP_OBJECT_ID
+    approval_audit = service.audit_history(
+        APPROVER,
+        harness.command.manifest_id,
+    )[-1]
+    assert approval_audit.action is (
+        AuditAction.DEMO_EVALUATION_APPROVAL_CREATED
+    )
+    assert approval_audit.actor == APPROVER
+    assert approval_audit.occurred_at == expected_time
+
+    harness.clock.advance(timedelta(milliseconds=877))
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-authoritative-provenance-publication",
+        harness.command.model_copy(
+            update={"approval_decision_id": decision_id}
+        ),
+    )
+
+    assert result.publication.approved_by == APPROVER
+    assert result.publication.approved_at == expected_time
+    assert harness.store.publication_count == 1
+
+
 def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None:
     candidate = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(
@@ -318,14 +497,6 @@ def test_unknown_normalized_profile_rejects_before_mcp_collection() -> None:
             additional_profile_ids=("café-east",),
         ),
     )
-    changed_approval = type(harness.approval).model_validate(
-        {
-            **harness.approval.model_dump(mode="python"),
-            "profile_id": unknown_decomposed,
-            "revision": harness.approval.revision + 1,
-        }
-    )
-    harness.approval_registry.replace(changed_approval)
     command = type(harness.command).model_validate(
         {
             **harness.command.model_dump(mode="python"),
@@ -2049,8 +2220,7 @@ def test_approval_revoke_after_final_evaluation_aborts_conditional_commit() -> N
     )
     idempotency_key = "wc013-approval-revoke-race"
     harness.commit_hook.before_commit = lambda: harness.approval_registry.revoke(
-        harness.approval.decision_id,
-        revoked_at=harness.clock.value,
+        harness.approval.decision_id
     )
 
     with pytest.raises(DemoEvaluationApprovalError, match="not active"):
@@ -2070,8 +2240,7 @@ def test_approval_revocation_during_transaction_fails_before_insertion() -> None
 
     def revoke_after_initial_read() -> None:
         harness.approval_registry.revoke(
-            harness.approval.decision_id,
-            revoked_at=harness.clock.value,
+            harness.approval.decision_id
         )
 
     harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
@@ -2217,8 +2386,7 @@ def test_lying_commit_adapter_cannot_be_injected_into_evaluation_service() -> No
     )
 
     actual.commit_hook.before_commit = lambda: actual.approval_registry.revoke(
-        actual.approval.decision_id,
-        revoked_at=actual.clock.value,
+        actual.approval.decision_id
     )
 
     with pytest.raises(DemoEvaluationApprovalError, match="not active"):
@@ -2373,7 +2541,7 @@ def test_governance_expiry_during_transaction_aborts_conditional_commit(
 def test_expired_published_manifest_governance_rejects_before_collection(
     expired_governance: str,
 ) -> None:
-    expires_at = CURRENT_NOW - timedelta(days=1)
+    expires_at = CURRENT_NOW + timedelta(seconds=30)
     expiry_arguments = (
         {"override_expires_at": expires_at}
         if expired_governance == "override"
@@ -2386,8 +2554,8 @@ def test_expired_published_manifest_governance_rejects_before_collection(
     harness = build_harness(
         as_of=CURRENT_NOW,
         manifest=manifest,
-        profile_resolution_as_of=expires_at - timedelta(days=1),
     )
+    harness.clock.advance(timedelta(minutes=1))
 
     with pytest.raises(
         EvaluationFailedClosedError,
@@ -2409,10 +2577,27 @@ def test_empty_context_service_state_fails_before_collection() -> None:
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
         publish_context=False,
+        seed_approval=False,
     )
+    approval_intent = CreateDemoEvaluationApprovalCommand(
+        decision_id=harness.approval.decision_id,
+        expires_at=harness.approval.expires_at,
+        manifest_id=harness.approval.manifest_id,
+        manifest_version=harness.approval.manifest_version,
+        manifest_digest=harness.approval.manifest_digest,
+        profile_id=harness.approval.profile_id,
+        authorized_scope=harness.approval.authorized_scope,
+        reason=harness.approval.reason,
+    )
+    with pytest.raises(ResourceNotFoundError):
+        harness.context_resolver.service.create_demo_evaluation_approval(
+            APPROVER,
+            "wc013-empty-context-approval",
+            approval_intent,
+        )
     with pytest.raises(
-        EvaluationFailedClosedError,
-        match="missing, ambiguous",
+        DemoEvaluationApprovalError,
+        match="decision was not found",
     ):
         harness.service.evaluate(
             PUBLISHER,

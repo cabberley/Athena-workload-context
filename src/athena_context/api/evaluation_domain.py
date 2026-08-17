@@ -5,7 +5,13 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import AwareDatetime, BeforeValidator, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BeforeValidator,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from athena_context.api.domain import (
     Actor,
@@ -666,6 +672,50 @@ class DemoEvaluationApproval(ApiModel):
                 self.model_dump(mode="json", by_alias=True, exclude_none=True)
             ),
         )
+
+
+class CreateDemoEvaluationApprovalCommand(ApiModel):
+    """Approval intent; authenticated provenance and deployment binding are server-owned."""
+
+    decision_id: str = Field(pattern=_ID_PATTERN)
+    expires_at: AwareDatetime
+    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    profile_id: NormalizedProfileId
+    authorized_scope: EvidenceScope
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def parse_json_expiry(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        try:
+            return datetime.fromisoformat(
+                value[:-1] + "+00:00"
+                if value.endswith("Z")
+                else value
+            )
+        except ValueError:
+            return value
+
+    @model_validator(mode="after")
+    def validate_expiry_precision(
+        self,
+    ) -> CreateDemoEvaluationApprovalCommand:
+        if self.expires_at.microsecond % 1000:
+            raise ValueError(
+                "approval expiry must have millisecond precision"
+            )
+        return self
+
+
+class RevokeDemoEvaluationApprovalCommand(ApiModel):
+    """Optimistic revocation intent without caller-selected actor or time."""
+
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=3, max_length=500)
 
 
 class DemoEvaluationCommand(ApiModel):

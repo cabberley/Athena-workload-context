@@ -15,6 +15,7 @@ from athena_context.api import (
     ActorKind,
     ContextService,
     ContextServicePublishedContextResolver,
+    CreateDemoEvaluationApprovalCommand,
     CreateDraftCommand,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
@@ -844,6 +845,7 @@ def build_harness(
     trusted_key_expires_at: datetime | None = None,
     snapshot_freshness_seconds: int = 300,
     context_reader_actor: Actor = PUBLISHER,
+    seed_approval: bool = True,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -904,25 +906,18 @@ def build_harness(
         profile_id,
         as_of=profile_resolution_as_of or as_of,
     )
-    approval = DemoEvaluationApproval(
+    approval_command = CreateDemoEvaluationApprovalCommand(
         decision_id="approval-wc013-demo",
-        status="authorized",
-        approved_by=APPROVER,
-        approved_at=as_of - timedelta(minutes=5),
         expires_at=approval_expires_at or (as_of + timedelta(hours=1)),
         manifest_id=published_manifest.manifest_id,
         manifest_version=published_manifest.manifest_version,
         manifest_digest=published_manifest.compatibility.artifact_digest,
         profile_id=profile_id,
         authorized_scope=scope(),
-        private_mcp_endpoint=(
-            trusted_configuration.assertion.azure_mcp_internal_endpoint
-        ),
-        evidence_identity_object_id=MCP_OBJECT_ID,
         reason="Authorize one bounded synthetic private MCP demonstration",
     )
     command = DemoEvaluationCommand(
-        approval_decision_id=approval.decision_id,
+        approval_decision_id=approval_command.decision_id,
         attempt_id="attempt-013013013013",
         snapshot_id="snap-013013013013",
         manifest_id=published_manifest.manifest_id,
@@ -941,18 +936,24 @@ def build_harness(
         reason="Collect, publish, and evaluate the approved synthetic demo",
     )
     snapshot_signer = DeterministicSnapshotSigner(private_key)
-    approval_registry = InMemoryDemoEvaluationApprovalRegistry(
-        [approval],
-        context_service=context_resolver.service,
-        approval_actor=APPROVER,
+    dependencies = DemoEvaluationDependencies(
+        deployment_configuration=(
+            configuration_port
+            or _trusted_configuration_port(trusted_configuration)
+        ),
+        evidence_client=evidence_client,
+        snapshot_signer=snapshot_signer,
+        clock=clock,
+        context_reader_actor=context_reader_actor,
     )
-    trust_registry = InMemoryDemoEvaluationTrustRegistry(
+    service = DemoEvaluationService.from_dependencies(
         context_service=context_resolver.service,
-        administration_actor=APPROVER,
+        dependencies=dependencies,
     )
     authorization = InMemoryEvaluationAuthorizationRegistry(
         (
             RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
+            RoleGrant(actor_id=APPROVER.actor_id, role=Role.APPROVER),
             *(
                 (
                     RoleGrant(
@@ -969,24 +970,45 @@ def build_harness(
         context_service=context_resolver.service,
         administration_actor=PUBLISHER,
     )
+    if seed_approval:
+        approval = context_resolver.service.create_demo_evaluation_approval(
+            APPROVER,
+            "wc013-seed-demo-approval",
+            approval_command,
+        )
+    else:
+        approval = DemoEvaluationApproval(
+            decision_id=approval_command.decision_id,
+            status="authorized",
+            revision=1,
+            approved_by=APPROVER,
+            approved_at=as_of - timedelta(minutes=5),
+            expires_at=approval_command.expires_at,
+            manifest_id=approval_command.manifest_id,
+            manifest_version=approval_command.manifest_version,
+            manifest_digest=approval_command.manifest_digest,
+            profile_id=approval_command.profile_id,
+            authorized_scope=approval_command.authorized_scope,
+            private_mcp_endpoint=(
+                trusted_configuration.assertion.azure_mcp_internal_endpoint
+            ),
+            evidence_identity_object_id=(
+                trusted_configuration.assertion.evidence_identity_object_id
+            ),
+            reason=approval_command.reason,
+        )
+    approval_registry = InMemoryDemoEvaluationApprovalRegistry(
+        context_service=context_resolver.service,
+        approval_actor=APPROVER,
+    )
+    trust_registry = InMemoryDemoEvaluationTrustRegistry(
+        context_service=context_resolver.service,
+        administration_actor=APPROVER,
+    )
     store = InMemoryDemoEvaluationStateReader(
         context_service=context_resolver.service,
         reader_actor=PUBLISHER,
         manifest_id=published_manifest.manifest_id,
-    )
-    dependencies = DemoEvaluationDependencies(
-        deployment_configuration=(
-            configuration_port
-            or _trusted_configuration_port(trusted_configuration)
-        ),
-        evidence_client=evidence_client,
-        snapshot_signer=snapshot_signer,
-        clock=clock,
-        context_reader_actor=context_reader_actor,
-    )
-    service = DemoEvaluationService.from_dependencies(
-        context_service=context_resolver.service,
-        dependencies=dependencies,
     )
     commit_hook = EvaluationCommitHook()
     service._before_authoritative_commit = commit_hook.run  # type: ignore[method-assign]

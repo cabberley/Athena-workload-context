@@ -50,7 +50,11 @@ def _normalize_datetime_string(value: str) -> str:
             )
         return value
     fractional_seconds = lexical_match.group(1)
-    if fractional_seconds is not None and len(fractional_seconds) > 3:
+    if (
+        fractional_seconds is not None
+        and len(fractional_seconds) > 3
+        and any(digit != "0" for digit in fractional_seconds[3:])
+    ):
         raise AthenaValidationError(
             "timestamp precision must be exactly representable in milliseconds"
         )

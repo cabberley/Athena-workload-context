@@ -53,8 +53,11 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
 )
 from athena_context.api.evaluation_domain import (
+    CreateDemoEvaluationApprovalCommand,
+    DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
+    RevokeDemoEvaluationApprovalCommand,
 )
 from athena_context.api.evaluation_ports import (
     DemoEvaluationTrustConfiguration,
@@ -477,6 +480,60 @@ def create_app(
         return service.audit_history(actor, manifest_id)
 
     if bound_demo_evaluation is not None:
+
+        @application.post(
+            "/v1/demo-evaluation-approvals",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+            status_code=status.HTTP_201_CREATED,
+        )
+        def create_demo_evaluation_approval(
+            command: CreateDemoEvaluationApprovalCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            return service.create_demo_evaluation_approval(
+                actor,
+                idempotency_key,
+                command,
+            )
+
+        @application.get(
+            "/v1/demo-evaluation-approvals/{decision_id}",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+        )
+        def get_demo_evaluation_approval(
+            decision_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            approval = service.get_demo_evaluation_approval(
+                actor,
+                decision_id,
+            )
+            if approval is None:
+                raise ResourceNotFoundError(
+                    f"demo evaluation approval {decision_id!r} was not found"
+                )
+            return approval
+
+        @application.post(
+            "/v1/demo-evaluation-approvals/{decision_id}/revoke",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+        )
+        def revoke_demo_evaluation_approval(
+            decision_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+            command: RevokeDemoEvaluationApprovalCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            return service.revoke_demo_evaluation_approval(
+                actor,
+                decision_id,
+                idempotency_key,
+                command,
+            )
 
         @application.post(
             "/v1/demo-evaluations",

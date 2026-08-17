@@ -61,11 +61,14 @@ from athena_context.api.evaluation_authority import (
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
     AuthorizedSnapshotPublication,
+    CreateDemoEvaluationApprovalCommand,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
     EvaluationAuthorityToken,
+    PublishedContextSelection,
     ResolvedPublishedContext,
+    RevokeDemoEvaluationApprovalCommand,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     normalize_evaluation_authority_token,
@@ -306,23 +309,34 @@ class ContextService:
         """Run one narrow UoW on the actual configured persistence transaction."""
 
         with self._store.transaction() as transaction:
-            if not isinstance(
+            unit_of_work = self._evaluation_unit_of_work(
                 transaction,
-                EvaluationAuthorityTransactionPort,
-            ):
-                raise RuntimeError(
-                    "ContextService persistence does not implement the "
-                    "evaluation authority unit of work"
-                )
-            unit_of_work = TransactionEvaluationAuthorityUnitOfWork(
-                context_transaction=transaction,
-                evaluation_transaction=transaction,
                 reader_actor=reader_actor,
-                publication_capability=(
-                    self.__evaluation_publication_capability
-                ),
             )
             return operation(unit_of_work)
+
+    def _evaluation_unit_of_work(
+        self,
+        transaction: ContextTransactionPort,
+        *,
+        reader_actor: Actor,
+    ) -> EvaluationAuthorityUnitOfWorkPort:
+        if not isinstance(
+            transaction,
+            EvaluationAuthorityTransactionPort,
+        ):
+            raise RuntimeError(
+                "ContextService persistence does not implement the "
+                "evaluation authority unit of work"
+            )
+        return TransactionEvaluationAuthorityUnitOfWork(
+            context_transaction=transaction,
+            evaluation_transaction=transaction,
+            reader_actor=reader_actor,
+            publication_capability=(
+                self.__evaluation_publication_capability
+            ),
+        )
 
     def load_demo_evaluation_receipt(
         self,
@@ -745,6 +759,30 @@ class ContextService:
             )
         return trust
 
+    def _resolve_demo_approval_collection_authority(
+        self,
+        command: CreateDemoEvaluationApprovalCommand,
+    ) -> EvaluationCollectionAuthority:
+        with self.__evaluation_request_lock:
+            configured = self.__evaluation_collection_configuration
+        if configured is None:
+            raise DemoEvaluationConfigurationError(
+                "demo evaluation approvals require the ContextService-bound "
+                "collection configuration"
+            )
+        deployment_configuration, trust_configuration = configured
+        try:
+            return build_evaluation_collection_authority(
+                deployment_configuration,
+                trust_configuration,
+                authorized_scope=command.authorized_scope,
+            )
+        except ValueError as exc:
+            raise DemoEvaluationApprovalError(
+                "approval scope does not match one exact configured WC-008 "
+                "Reader assignment"
+            ) from exc
+
     def _evaluate_demo_snapshot_for_publication(
         self,
         request: _DemoEvaluationRequestRecord,
@@ -879,36 +917,317 @@ class ContextService:
             operation=list_authorized,
         )
 
-    def put_demo_evaluation_approval(
+    def create_demo_evaluation_approval(
         self,
         actor: Actor,
-        approval: DemoEvaluationApproval,
-        *,
-        expected_revision: int | None,
-    ) -> None:
-        self._authorization.require(
-            actor,
-            Permission.APPROVE,
-            approval.manifest_id,
+        idempotency_key: str,
+        command: CreateDemoEvaluationApprovalCommand,
+    ) -> DemoEvaluationApproval:
+        """Create approval provenance from authenticated identity and trusted time."""
+
+        normalized_actor = Actor.model_validate_json(
+            actor.model_dump_json(by_alias=True)
         )
-        self._run_evaluation_authority_transaction(
-            reader_actor=actor,
-            operation=lambda unit_of_work: unit_of_work.put_approval(
+        normalized_command = (
+            CreateDemoEvaluationApprovalCommand.model_validate_json(
+                command.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+        )
+        target = MutationTarget(
+            manifest_id=normalized_command.manifest_id,
+            manifest_version=normalized_command.manifest_version,
+        )
+        request_digest = compute_artifact_digest(
+            {
+                "operation": "create_demo_evaluation_approval",
+                "actorId": normalized_actor.actor_id,
+                "target": target.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                ),
+                "command": normalized_command.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            }
+        )
+
+        with self._store.transaction() as transaction:
+            unit_of_work = self._evaluation_unit_of_work(
+                transaction,
+                reader_actor=normalized_actor,
+            )
+            unit_of_work.authorize(
+                normalized_actor,
+                Permission.APPROVE,
+                normalized_command.manifest_id,
+            )
+            receipt = transaction.get_receipt(
+                normalized_actor.actor_id,
+                idempotency_key,
+            )
+            if receipt is not None:
+                if (
+                    receipt.operation
+                    != "create_demo_evaluation_approval"
+                    or receipt.target != target
+                    or receipt.request_digest != request_digest
+                    or receipt.response_type
+                    != DemoEvaluationApproval.__name__
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key was used for a different mutation"
+                    )
+                return DemoEvaluationApproval.model_validate_json(
+                    receipt.response_json
+                )
+
+            collection_authority = (
+                self._resolve_demo_approval_collection_authority(
+                    normalized_command
+                )
+            )
+            approved_at = self._now()
+            resolved, _ = unit_of_work.resolve_context(
+                PublishedContextSelection(
+                    manifest_id=normalized_command.manifest_id,
+                    manifest_version=normalized_command.manifest_version,
+                    profile_id=normalized_command.profile_id,
+                ),
+                as_of=approved_at,
+            )
+            published = resolved.view.published
+            if (
+                resolved.view.supersession is not None
+                or published.manifest_id
+                != normalized_command.manifest_id
+                or published.manifest_version
+                != normalized_command.manifest_version
+                or published.manifest_digest
+                != normalized_command.manifest_digest
+                or resolved.profile.profile_id
+                != normalized_command.profile_id
+            ):
+                raise DemoEvaluationApprovalError(
+                    "approval intent does not match one exact active "
+                    "published manifest profile"
+                )
+            if normalized_command.expires_at <= approved_at:
+                raise DemoEvaluationApprovalError(
+                    "demo evaluation approval expiry must be after the "
+                    "authoritative approval time"
+                )
+            assertion = (
+                collection_authority.deployment_configuration.assertion
+            )
+            approval = DemoEvaluationApproval(
+                decision_id=normalized_command.decision_id,
+                status="authorized",
+                revision=1,
+                approved_by=normalized_actor,
+                approved_at=approved_at,
+                expires_at=normalized_command.expires_at,
+                manifest_id=published.manifest_id,
+                manifest_version=published.manifest_version,
+                manifest_digest=published.manifest_digest,
+                profile_id=resolved.profile.profile_id,
+                authorized_scope=normalized_command.authorized_scope,
+                private_mcp_endpoint=(
+                    assertion.azure_mcp_internal_endpoint
+                ),
+                evidence_identity_object_id=(
+                    assertion.evidence_identity_object_id
+                ),
+                reason=normalized_command.reason,
+            )
+            unit_of_work.put_approval(
                 approval,
-                expected_revision=expected_revision,
-            ),
+                expected_revision=None,
+            )
+            transaction.append_audit(
+                PendingAuditEvent(
+                    occurred_at=approved_at,
+                    actor=normalized_actor,
+                    action=(
+                        AuditAction.DEMO_EVALUATION_APPROVAL_CREATED
+                    ),
+                    manifest_id=approval.manifest_id,
+                    revision=approval.revision,
+                    manifest_version=approval.manifest_version,
+                    manifest_digest=approval.manifest_digest,
+                    reason=normalized_command.reason,
+                )
+            )
+            transaction.put_receipt(
+                MutationReceipt(
+                    actor_id=normalized_actor.actor_id,
+                    idempotency_key=idempotency_key,
+                    operation="create_demo_evaluation_approval",
+                    target=target,
+                    request_digest=request_digest,
+                    response_type=DemoEvaluationApproval.__name__,
+                    response_json=approval.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                )
+            )
+            return approval
+
+    def revoke_demo_evaluation_approval(
+        self,
+        actor: Actor,
+        decision_id: str,
+        idempotency_key: str,
+        command: RevokeDemoEvaluationApprovalCommand,
+    ) -> DemoEvaluationApproval:
+        """Revoke one decision while preserving its server-owned provenance."""
+
+        normalized_actor = Actor.model_validate_json(
+            actor.model_dump_json(by_alias=True)
         )
+        normalized_command = (
+            RevokeDemoEvaluationApprovalCommand.model_validate_json(
+                command.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+        )
+        with self._store.transaction() as transaction:
+            unit_of_work = self._evaluation_unit_of_work(
+                transaction,
+                reader_actor=normalized_actor,
+            )
+            current = unit_of_work.resolve_approval(decision_id)
+            if current is None:
+                raise ResourceNotFoundError(
+                    f"demo evaluation approval {decision_id!r} was not found"
+                )
+            unit_of_work.authorize(
+                normalized_actor,
+                Permission.APPROVE,
+                current.manifest_id,
+            )
+            target = MutationTarget(
+                manifest_id=current.manifest_id,
+                manifest_version=current.manifest_version,
+            )
+            request_digest = compute_artifact_digest(
+                {
+                    "operation": "revoke_demo_evaluation_approval",
+                    "actorId": normalized_actor.actor_id,
+                    "decisionId": decision_id,
+                    "target": target.model_dump(
+                        mode="json",
+                        exclude_none=True,
+                    ),
+                    "command": normalized_command.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                }
+            )
+            receipt = transaction.get_receipt(
+                normalized_actor.actor_id,
+                idempotency_key,
+            )
+            if receipt is not None:
+                if (
+                    receipt.operation
+                    != "revoke_demo_evaluation_approval"
+                    or receipt.target != target
+                    or receipt.request_digest != request_digest
+                    or receipt.response_type
+                    != DemoEvaluationApproval.__name__
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key was used for a different mutation"
+                    )
+                return DemoEvaluationApproval.model_validate_json(
+                    receipt.response_json
+                )
+            if current.revision != normalized_command.expected_revision:
+                raise StaleRevisionError(
+                    "demo evaluation approval revision changed before "
+                    "revocation"
+                )
+            revoked_at = self._now()
+            if revoked_at < current.approved_at:
+                raise DemoEvaluationApprovalError(
+                    "authoritative approval clock moved backwards"
+                )
+            revoked = DemoEvaluationApproval.model_validate(
+                {
+                    **current.model_dump(mode="python"),
+                    "status": "revoked",
+                    "revision": current.revision + 1,
+                    "revoked_at": revoked_at,
+                }
+            )
+            unit_of_work.put_approval(
+                revoked,
+                expected_revision=current.revision,
+            )
+            transaction.append_audit(
+                PendingAuditEvent(
+                    occurred_at=revoked_at,
+                    actor=normalized_actor,
+                    action=(
+                        AuditAction.DEMO_EVALUATION_APPROVAL_REVOKED
+                    ),
+                    manifest_id=revoked.manifest_id,
+                    revision=revoked.revision,
+                    previous_revision=current.revision,
+                    manifest_version=revoked.manifest_version,
+                    manifest_digest=revoked.manifest_digest,
+                    reason=normalized_command.reason,
+                )
+            )
+            transaction.put_receipt(
+                MutationReceipt(
+                    actor_id=normalized_actor.actor_id,
+                    idempotency_key=idempotency_key,
+                    operation="revoke_demo_evaluation_approval",
+                    target=target,
+                    request_digest=request_digest,
+                    response_type=DemoEvaluationApproval.__name__,
+                    response_json=revoked.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                )
+            )
+            return revoked
 
     def get_demo_evaluation_approval(
         self,
         actor: Actor,
         decision_id: str,
     ) -> DemoEvaluationApproval | None:
+        """Load first, then authorize against only the stored workload."""
+
+        def get(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> DemoEvaluationApproval | None:
+            approval = unit_of_work.resolve_approval(decision_id)
+            if approval is None:
+                return None
+            unit_of_work.authorize(
+                actor,
+                Permission.AUDIT,
+                approval.manifest_id,
+            )
+            return approval
+
         return self._run_evaluation_authority_transaction(
             reader_actor=actor,
-            operation=lambda unit_of_work: unit_of_work.resolve_approval(
-                decision_id
-            ),
+            operation=get,
         )
 
     def get_demo_evaluation_trusted_key(

@@ -23,6 +23,15 @@ The mutation requires verified human publisher authority, an active trusted huma
 decision, an idempotency key, exact published canonical manifest/profile digests, and one explicit
 authorized evidence scope.
 
+Configured deployments also expose idempotent approval create/revoke operations and an
+approval read route. Approval input contains intent only: the Context API derives `approvedBy`
+from the verified human actor, obtains `approvedAt` from its injected authoritative clock, fixes
+the initial revision, and derives private endpoint and evidence-identity binding from the pinned
+WC-008 configuration. Caller-supplied provenance is rejected. Approval reads first load the
+authoritative decision and then require current audit authority for that stored workload, so a
+foreign-workload grant or a revoked grant cannot disclose approval metadata, even after
+publication.
+
 The integration composes the merged components without introducing direct Azure access:
 
 - A trusted WC-008 configuration port verifies a bounded deployment-output assertion against a

@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime
 from typing import Literal
 
 from athena_context.api.domain import Actor, Permission, RoleGrant
-from athena_context.api.errors import (
-    DemoEvaluationConfigurationError,
-    ResourceNotFoundError,
-)
+from athena_context.api.errors import ResourceNotFoundError
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
     DemoEvaluationApproval,
     DemoEvaluationResult,
+    RevokeDemoEvaluationApprovalCommand,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationTrustedKeyAuthority,
@@ -157,19 +154,12 @@ class InMemoryDemoEvaluationApprovalRegistry:
 
     def __init__(
         self,
-        approvals: Iterable[DemoEvaluationApproval],
         *,
         context_service: ContextService,
         approval_actor: Actor,
     ) -> None:
         self._context_service = context_service
         self._approval_actor = approval_actor
-        for approval in approvals:
-            context_service.put_demo_evaluation_approval(
-                approval_actor,
-                approval,
-                expected_revision=None,
-            )
 
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
         return self._context_service.get_demo_evaluation_approval(
@@ -177,7 +167,7 @@ class InMemoryDemoEvaluationApprovalRegistry:
             decision_id,
         )
 
-    def revoke(self, decision_id: str, *, revoked_at: datetime) -> None:
+    def revoke(self, decision_id: str) -> None:
         current = self.resolve(decision_id)
         if current is None:
             raise ResourceNotFoundError(
@@ -185,29 +175,14 @@ class InMemoryDemoEvaluationApprovalRegistry:
             )
         if current.status == "revoked":
             return
-        replacement = current.model_copy(
-            update={
-                "status": "revoked",
-                "revision": current.revision + 1,
-                "revoked_at": revoked_at,
-            }
-        )
-        self._context_service.put_demo_evaluation_approval(
+        self._context_service.revoke_demo_evaluation_approval(
             self._approval_actor,
-            replacement,
-            expected_revision=current.revision,
-        )
-
-    def replace(self, approval: DemoEvaluationApproval) -> None:
-        current = self.resolve(approval.decision_id)
-        if current is None or approval.revision != current.revision + 1:
-            raise DemoEvaluationConfigurationError(
-                "approval replacement requires the next registry revision"
-            )
-        self._context_service.put_demo_evaluation_approval(
-            self._approval_actor,
-            approval,
-            expected_revision=current.revision,
+            decision_id,
+            f"{decision_id}-revoke-r{current.revision}",
+            RevokeDemoEvaluationApprovalCommand(
+                expected_revision=current.revision,
+                reason="Revoke the synthetic demo evaluation approval",
+            ),
         )
 
 

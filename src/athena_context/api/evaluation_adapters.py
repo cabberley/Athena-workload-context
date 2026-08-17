@@ -29,6 +29,7 @@ from athena_context.api.evaluation_domain import (
 from athena_context.api.evaluation_ports import (
     SealedMcpTransportConfiguration,
     seal_mcp_transport_configuration,
+    sealed_mcp_transport_configuration_primitives,
 )
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
@@ -204,6 +205,16 @@ class EnvironmentContextApiPublishedContextReader:
 class PrivateMcpEvidenceTransport:
     """Own the immutable verified WC-008 identity used for every MCP invocation."""
 
+    _deployment_configuration: VerifiedWc008DeploymentConfiguration
+    _invoker: PrivateMcpInvokerPort
+    _transport_configuration: SealedMcpTransportConfiguration
+
+    __slots__ = (
+        "_deployment_configuration",
+        "_invoker",
+        "_transport_configuration",
+    )
+
     def __init__(
         self,
         *,
@@ -219,9 +230,13 @@ class PrivateMcpEvidenceTransport:
                 "private MCP transport requires an exact operator-verified "
                 "WC-008 configuration"
             ) from exc
-        self._deployment_configuration = normalized
-        self._transport_configuration = sealed
-        self._invoker = invoker
+        object.__setattr__(self, "_deployment_configuration", normalized)
+        object.__setattr__(self, "_transport_configuration", sealed)
+        object.__setattr__(self, "_invoker", invoker)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("private MCP transport composition is immutable")
 
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
@@ -246,6 +261,20 @@ class PrivateMcpEvidenceTransport:
 class Wc009EvidenceClientAdapter:
     """Construct WC-009 around the endpoint-owning transport; no independent label exists."""
 
+    _client: SyncEvidenceClient
+    _key_resolver: TrustedKeyResolver
+    _transport: PrivateMcpEvidenceTransport
+    _trust_configuration: CollectorTrustConfiguration
+    _trusted_key_anchor: TrustedKeyAnchor
+
+    __slots__ = (
+        "_client",
+        "_key_resolver",
+        "_transport",
+        "_trust_configuration",
+        "_trusted_key_anchor",
+    )
+
     def __init__(
         self,
         *,
@@ -261,26 +290,60 @@ class Wc009EvidenceClientAdapter:
             raise DemoEvaluationConfigurationError(
                 "WC-009 requires the exact endpoint-owning private MCP transport"
             )
-        self._transport = transport
-        self._trust_configuration = trust_configuration
-        self._key_resolver = key_resolver
-        self._trusted_key_anchor = trusted_key_anchor
-        self._client = SyncEvidenceClient(
-            transport=transport,
-            signer=signer,
-            replay_guard=replay_guard,
-            clock=clock,
-            trust_configuration=trust_configuration,
-            key_resolver=key_resolver,
-            trusted_key_anchor=trusted_key_anchor,
+        object.__setattr__(self, "_transport", transport)
+        object.__setattr__(self, "_trust_configuration", trust_configuration)
+        object.__setattr__(self, "_key_resolver", key_resolver)
+        object.__setattr__(self, "_trusted_key_anchor", trusted_key_anchor)
+        object.__setattr__(
+            self,
+            "_client",
+            SyncEvidenceClient(
+                transport=transport,
+                signer=signer,
+                replay_guard=replay_guard,
+                clock=clock,
+                trust_configuration=trust_configuration,
+                key_resolver=key_resolver,
+                trusted_key_anchor=trusted_key_anchor,
+            ),
         )
+        self._require_exact_runtime_transport()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("WC-009 evidence client composition is immutable")
+
+    def _require_exact_runtime_transport(self) -> None:
+        """Bind advertised configuration to the object WC-009 will invoke."""
+
+        if (
+            type(self) is not Wc009EvidenceClientAdapter
+            or type(self._transport) is not PrivateMcpEvidenceTransport
+            or type(self._client) is not SyncEvidenceClient
+            or self._client._transport is not self._transport
+            or "collect" in vars(self._client)
+        ):
+            raise DemoEvaluationConfigurationError(
+                "WC-009 runtime transport is not the exact sealed private "
+                "MCP transport"
+            )
+        try:
+            sealed_mcp_transport_configuration_primitives(
+                self._transport.transport_configuration
+            )
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "WC-009 runtime transport configuration is not sealed"
+            ) from exc
 
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
+        self._require_exact_runtime_transport()
         return self._transport.deployment_configuration
 
     @property
     def transport_configuration(self) -> SealedMcpTransportConfiguration:
+        self._require_exact_runtime_transport()
         return self._transport.transport_configuration
 
     @property
@@ -296,7 +359,8 @@ class Wc009EvidenceClientAdapter:
         return self._trusted_key_anchor
 
     def collect(self, command: EvidenceCollectionCommand) -> CollectedEvidence:
-        return self._client.collect(command)
+        self._require_exact_runtime_transport()
+        return SyncEvidenceClient.collect(self._client, command)
 
 
 class OperatorTrustedWc008ConfigurationPort:
