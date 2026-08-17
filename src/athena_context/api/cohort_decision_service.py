@@ -64,17 +64,17 @@ from athena_context.binding import evaluate_selector, normalize_resource_id
 from athena_context.binding.domain import CohortProposal, ProposalScope, SelectorPreview
 from athena_context.contracts.common import AthenaValidationError, compute_artifact_digest
 from athena_context.contracts.manifest import (
-    AtomicSelector,
     CanonicalWorkloadManifest,
-    CompositeAllSelector,
     ManifestRole,
+    ManifestSelector,
+    ResolvedManifestProfile,
     canonicalize_manifest_payload,
     resolve_manifest_profile,
 )
 from athena_context.contracts.models import ResourceEvidenceRecord
 
 _MAX_DECISIONS = 200
-_ATOMIC_SELECTOR_ADAPTER: TypeAdapter[AtomicSelector] = TypeAdapter(AtomicSelector)
+_SELECTOR_ADAPTER: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
 
 
 def _authority_projection(role: ManifestRole) -> dict[str, Any]:
@@ -714,99 +714,101 @@ class CohortDecisionService:
             by_alias=True,
             exclude_none=True,
         )
-        profile_key = next(
+        requested_profile = normalized_identifier(request.profile_id)
+        profile_match = next(
             (
-                key
+                (key, profile)
                 for key, profile in current.manifest.profiles.items()
-                if profile.profile_id == request.profile_id
+                if normalized_identifier(profile.profile_id) == requested_profile
             ),
             None,
         )
-        if profile_key is None:
+        if profile_match is None:
             raise CohortContractError(
                 "candidate profile is not present in the exact draft"
             )
+        profile_key, profile = profile_match
         update = candidate.role_updates[0]
         target = normalized_identifier(update.role.role_id)
-        applied_role = update.role
-        if request.action in {
-            CohortDecisionKind.SPLIT,
-            CohortDecisionKind.MERGE,
-        }:
-            applied_role = CohortDecisionService._scoped_partition_role(
+        before_profiles = CohortDecisionService._resolve_all_profiles(
+            current.manifest,
+            as_of=decided_at,
+        )
+        target_before = before_profiles.get(requested_profile)
+        if (
+            target_before is None
+            or target_before.resolved_profile_digest
+            != resolved.profile.resolved_profile_digest
+        ):
+            raise CohortContractError(
+                "requested profile changed before selector materialization"
+            )
+        applied_role, intended_selector_id = (
+            CohortDecisionService._materialize_local_role_override(
                 update.role,
                 resolved=resolved,
                 candidate=candidate,
             )
-        declaration_roles: list[Any] | None = None
-        profiles_by_id = {
-            normalized_identifier(profile.profile_id): (key, profile)
-            for key, profile in current.manifest.profiles.items()
-        }
-        declaration_profile = current.manifest.profiles[profile_key]
-        while True:
-            if any(
-                normalized_identifier(role.role_id) == target
-                for role in declaration_profile.roles
-            ):
-                profile_payload = payload["profiles"][profile_key]
-                if isinstance(profile_payload, dict):
-                    candidate_roles = profile_payload.get("roles")
-                    if isinstance(candidate_roles, list):
-                        declaration_roles = candidate_roles
-                break
-            if declaration_profile.extends is None:
-                break
-            parent = profiles_by_id.get(
-                normalized_identifier(declaration_profile.extends)
-            )
-            if parent is None:
-                break
-            profile_key, declaration_profile = parent
-        if declaration_roles is None and any(
-            normalized_identifier(role.role_id) == target
-            for role in current.manifest.roles
-        ):
-            root_roles = payload.get("roles")
-            if isinstance(root_roles, list):
-                declaration_roles = root_roles
-        if declaration_roles is None:
-            raise CohortContractError(
-                "candidate source role has no exact manifest declaration"
-            )
-        declaration_roles[:] = [
+        )
+        profile_payload = payload["profiles"].get(profile_key)
+        if not isinstance(profile_payload, dict):
+            raise CohortContractError("requested profile payload is invalid")
+        local_roles = profile_payload.get("roles")
+        if not isinstance(local_roles, list):
+            raise CohortContractError("requested profile roles are invalid")
+        profile_payload["roles"] = [
             role
-            for role in declaration_roles
+            for role in local_roles
             if isinstance(role, dict)
             and normalized_identifier(str(role.get("roleId", ""))) != target
         ]
-        declaration_roles.append(
-            applied_role.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            )
+        profile_payload["roles"].append(
+            applied_role.model_dump(mode="json", by_alias=True, exclude_none=True)
         )
         try:
             replacement = CanonicalWorkloadManifest.model_validate(
                 canonicalize_manifest_payload(payload)
             )
-            replacement_profile = resolve_manifest_profile(
+            after_profiles = CohortDecisionService._resolve_all_profiles(
                 replacement,
-                request.profile_id,
                 as_of=decided_at,
             )
         except (AthenaValidationError, ValidationError, ValueError) as exc:
             raise CohortContractError(
-                "selector-only candidate cannot form a canonical WC-007 draft"
+                "local selector override violates canonical or weakening governance rules"
             ) from exc
+        if replacement.roles != current.manifest.roles:
+            raise CohortContractError(
+                "profile-scoped decision attempted to mutate global roles"
+            )
+        if set(before_profiles) != set(after_profiles):
+            raise CohortContractError(
+                "profile-scoped decision changed the resolved profile set"
+            )
+        for profile_id, before_profile in before_profiles.items():
+            if profile_id == requested_profile:
+                continue
+            after_profile = after_profiles[profile_id]
+            if (
+                before_profile.compatibility.semantic_digest
+                != after_profile.compatibility.semantic_digest
+                or before_profile.resolved_profile_digest
+                != after_profile.resolved_profile_digest
+                or before_profile.roles != after_profile.roles
+                or before_profile != after_profile
+            ):
+                raise CohortContractError(
+                    "local selector override changed a non-target profile"
+                )
+
+        target_after = after_profiles[requested_profile]
         before_roles = {
             normalized_identifier(role.role_id): role
-            for role in resolved.profile.roles
+            for role in target_before.roles
         }
         after_roles = {
             normalized_identifier(role.role_id): role
-            for role in replacement_profile.roles
+            for role in target_after.roles
         }
         if (
             set(before_roles) != set(after_roles)
@@ -824,12 +826,26 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate attempted an update outside the exact role selectors"
             )
-        before = resolved.profile.model_dump(
+        before_selectors = _selector_projection(before_roles[target])
+        after_selectors = _selector_projection(after_roles[target])
+        if (
+            set(before_selectors) != set(after_selectors)
+            or intended_selector_id not in after_selectors
+            or any(
+                before_selectors[selector_id] != after_selectors[selector_id]
+                for selector_id in before_selectors
+                if selector_id != intended_selector_id
+            )
+        ):
+            raise CohortContractError(
+                "local override changed an unintended role selector"
+            )
+        before = target_before.model_dump(
             mode="json",
             by_alias=True,
             exclude_none=True,
         )
-        after = replacement_profile.model_dump(
+        after = target_after.model_dump(
             mode="json",
             by_alias=True,
             exclude_none=True,
@@ -845,13 +861,28 @@ class CohortDecisionService:
         return replacement
 
     @staticmethod
-    def _scoped_partition_role(
+    def _resolve_all_profiles(
+        manifest: CanonicalWorkloadManifest,
+        *,
+        as_of: datetime,
+    ) -> dict[str, ResolvedManifestProfile]:
+        return {
+            normalized_identifier(profile.profile_id): resolve_manifest_profile(
+                manifest,
+                profile.profile_id,
+                as_of=as_of,
+            )
+            for profile in manifest.profiles.values()
+        }
+
+    @staticmethod
+    def _materialize_local_role_override(
         role: ManifestRole,
         *,
         resolved: ResolvedCohortReview,
         candidate: CohortReviewCandidate,
-    ) -> ManifestRole:
-        """Conjoin transformed partitions with their declared selector scope."""
+    ) -> tuple[ManifestRole, str]:
+        """Translate one exact candidate selector into a local same-variant override."""
 
         baseline = next(
             (
@@ -863,99 +894,89 @@ class CohortDecisionService:
             None,
         )
         if baseline is None:
-            raise CohortContractError("split role has no exact declared baseline")
+            raise CohortContractError("candidate role has no exact resolved baseline")
+        update = candidate.role_updates[0]
+        if (
+            len(update.selector_previews) != 1
+            or len(role.selectors) != 1
+        ):
+            raise CohortContractError(
+                "candidate selector set cannot be represented as one local "
+                "same-variant override"
+            )
+        preview = update.selector_previews[0]
         resources = [
             record
             for record in resolved.snapshot.evidence_records
             if isinstance(record, ResourceEvidenceRecord)
         ]
-        source_members = {
+        intended_members = {
             normalize_resource_id(member)
-            for update in candidate.role_updates
-            for preview in update.selector_previews
             for member in preview.matched_resource_ids
         }
-        scope_selector = None
+        matches: list[ManifestSelector] = []
         for selector in baseline.selectors:
-            if selector.selector_type in {"compositeAll", "compositeAny"}:
+            if selector.selector_type != preview.selector.selector_type:
                 continue
             try:
                 evaluated = evaluate_selector(selector, resources)
-                matched = {
+                baseline_members = {
                     normalize_resource_id(member)
                     for member in evaluated.matched_resource_ids
                 }
             except AthenaValidationError:
                 continue
-            if source_members.issubset(matched):
-                scope_selector = selector
-                break
-        if scope_selector is None:
+            if baseline_members == intended_members:
+                matches.append(selector)
+        if len(matches) != 1:
             raise CohortContractError(
-                "split partitions cannot retain the exact declared selector scope"
+                "candidate selector has no unique same-variant baseline selector"
             )
-
-        seed = compute_artifact_digest(
-            {
-                "candidateId": candidate.candidate_id,
-                "roleId": role.role_id,
+        baseline_selector = matches[0]
+        selector_payload = preview.selector.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_none=True,
+        )
+        selector_payload["selectorId"] = baseline_selector.selector_id
+        try:
+            materialized_selector = _SELECTOR_ADAPTER.validate_python(
+                selector_payload
+            )
+            evaluated = evaluate_selector(materialized_selector, resources)
+            materialized_members = {
+                normalize_resource_id(member)
+                for member in evaluated.matched_resource_ids
             }
-        )[7:23]
-        selectors: list[CompositeAllSelector] = []
-        for index, preview in enumerate(
-            candidate.role_updates[0].selector_previews,
-            start=1,
+        except (AthenaValidationError, ValidationError) as exc:
+            raise CohortContractError(
+                "candidate selector cannot form a local same-variant override"
+            ) from exc
+        if (
+            materialized_selector.selector_type != baseline_selector.selector_type
+            or materialized_members != intended_members
+            or evaluated.max_match_violations
+            or evaluated.status != "matched"
+            or materialized_selector.max_matches != len(materialized_members)
         ):
-            if preview.selector.selector_type in {"compositeAll", "compositeAny"}:
-                raise CohortContractError(
-                    "split member selector cannot be nested as a scope guard"
-                )
-            scope_payload = scope_selector.model_dump(
-                mode="python",
-                by_alias=True,
-                exclude_none=True,
+            raise CohortContractError(
+                "local same-variant selector does not preserve exact membership"
             )
-            scope_payload["selectorId"] = f"scope-{index}-{seed}"
-            member_payload = preview.selector.model_dump(
-                mode="python",
-                by_alias=True,
-                exclude_none=True,
+        selectors = [
+            materialized_selector
+            if normalized_identifier(selector.selector_id)
+            == normalized_identifier(baseline_selector.selector_id)
+            else selector
+            for selector in baseline.selectors
+        ]
+        materialized_role = baseline.model_copy(update={"selectors": selectors})
+        if _authority_projection(materialized_role) != _authority_projection(role):
+            raise CohortContractError(
+                "local override attempted to change role authority metadata"
             )
-            member_payload["selectorId"] = f"members-{index}-{seed}"
-            try:
-                scoped = CompositeAllSelector(
-                    selectorType="compositeAll",
-                    selectorId=preview.selector.selector_id,
-                    children=[
-                        _ATOMIC_SELECTOR_ADAPTER.validate_python(scope_payload),
-                        _ATOMIC_SELECTOR_ADAPTER.validate_python(member_payload),
-                    ],
-                    maxMatches=preview.max_matches,
-                )
-                evaluated = evaluate_selector(scoped, resources)
-                expected = {
-                    normalize_resource_id(member)
-                    for member in preview.matched_resource_ids
-                }
-                actual = {
-                    normalize_resource_id(member)
-                    for member in evaluated.matched_resource_ids
-                }
-            except (AthenaValidationError, ValidationError) as exc:
-                raise CohortContractError(
-                    "split partition cannot retain exact selector scope"
-                ) from exc
-            if (
-                actual != expected
-                or evaluated.max_match_violations
-                or evaluated.status != "matched"
-                or scoped.max_matches != len(actual)
-            ):
-                raise CohortContractError(
-                    "scoped split selector does not preserve exact membership"
-                )
-            selectors.append(scoped)
-        return role.model_copy(update={"selectors": selectors})
+        return materialized_role, normalized_identifier(
+            baseline_selector.selector_id
+        )
 
     @staticmethod
     def _record(

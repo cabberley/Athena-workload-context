@@ -27,6 +27,10 @@ mutate it.
   `approve`, `reject`, `split`, or `merge` decision. Apply decisions revalidate the exact batch,
   proposal union, snapshot, profile, source draft, and immutable candidate before invoking the
   WC-007 `ContextService` selector-only replacement inside the same storage transaction.
+  The replacement materializes only a requested-profile local, same-variant role override. It
+  preserves role authority and unrelated selectors, never edits an ancestor or global role, and
+  rejects candidates that cannot satisfy canonical weakening-governance rules. Every profile is
+  resolved before and after; any non-target role or semantic-digest change fails closed.
 - `GET /v1/cohort-proposals/decisions` and
   `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
   granted workload scope.

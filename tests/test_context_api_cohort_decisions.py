@@ -12,10 +12,8 @@ from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.domain import ReplaceDraftCommand
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
-from athena_context.binding import evaluate_selector
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
-    ResourceEvidenceRecord,
     canonicalize_manifest_payload,
     resolve_manifest_profile,
 )
@@ -206,9 +204,13 @@ def test_approve_persists_audited_decision_and_atomically_replaces_selectors() -
         for role in profile.roles
         if role.role_id == proposal["role"]["roleId"]
     )
+    intended_selector = {
+        **proposal["selectorPreview"]["selector"],
+        "selectorId": proposal["role"]["selectors"][0]["selectorId"],
+    }
     assert role.model_dump(mode="json", by_alias=True, exclude_none=True) == {
         **proposal["role"],
-        "selectors": [proposal["selectorPreview"]["selector"]],
+        "selectors": [intended_selector],
     }
     with harness.store.transaction() as tx:
         audit = tx.list_audit(manifest_id=harness.manifest.manifest_id)
@@ -231,6 +233,121 @@ def test_approve_persists_audited_decision_and_atomically_replaces_selectors() -
     assert read.status_code == listed.status_code == 200
     assert read.json() == decision
     assert listed.json() == [decision]
+
+
+def test_global_role_fixture_materializes_only_production_local_override() -> None:
+    harness = _build_harness(profiles=("production", "development", "training"))
+    batch = _load(harness)
+    proposal = _proposal(batch)
+    as_of = harness.clock.now()
+    before_profiles = {
+        profile_id: resolve_manifest_profile(
+            harness.manifest,
+            profile_id,
+            as_of=as_of,
+        )
+        for profile_id in ("production", "development", "training")
+    }
+    before_global_roles = harness.manifest.roles
+
+    response = _post_decision(
+        harness,
+        _decision_body(harness, batch),
+        "wc-034-global-role-regression",
+    )
+
+    assert response.status_code == 201, response.text
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.manifest.roles == before_global_roles
+    production = draft.manifest.profiles["production"]
+    local_role = next(
+        role
+        for role in production.roles
+        if role.role_id == proposal["role"]["roleId"]
+    )
+    assert {
+        "kind": local_role.kind,
+        "cardinality": local_role.cardinality,
+        "owner_ref": local_role.owner_ref,
+        "status": local_role.status,
+    } == {
+        "kind": proposal["role"]["kind"],
+        "cardinality": next(
+            role.cardinality
+            for role in before_profiles["production"].roles
+            if role.role_id == local_role.role_id
+        ),
+        "owner_ref": proposal["role"]["ownerRef"],
+        "status": proposal["role"]["status"],
+    }
+    assert local_role.selectors[0].selector_id == (
+        proposal["role"]["selectors"][0]["selectorId"]
+    )
+    assert local_role.selectors[0].max_matches == len(proposal["members"])
+    assert all(
+        profile.weakening_overrides
+        == harness.manifest.profiles[profile_id].weakening_overrides
+        for profile_id, profile in draft.manifest.profiles.items()
+    )
+
+    after_profiles = {
+        profile_id: resolve_manifest_profile(
+            draft.manifest,
+            profile_id,
+            as_of=as_of,
+        )
+        for profile_id in ("production", "development", "training")
+    }
+    for profile_id in ("development", "training"):
+        assert after_profiles[profile_id].roles == before_profiles[profile_id].roles
+        assert (
+            after_profiles[profile_id].compatibility.semantic_digest
+            == before_profiles[profile_id].compatibility.semantic_digest
+        )
+        assert (
+            after_profiles[profile_id].resolved_profile_digest
+            == before_profiles[profile_id].resolved_profile_digest
+        )
+    before_production_roles = {
+        role.role_id: role for role in before_profiles["production"].roles
+    }
+    after_production_roles = {
+        role.role_id: role for role in after_profiles["production"].roles
+    }
+    assert set(after_production_roles) == set(before_production_roles)
+    assert all(
+        after_production_roles[role_id] == role
+        for role_id, role in before_production_roles.items()
+        if role_id != local_role.role_id
+    )
+    assert (
+        after_profiles["production"].compatibility.semantic_digest
+        != before_profiles["production"].compatibility.semantic_digest
+    )
+
+
+def test_local_override_rejects_when_it_would_change_descendant_profile() -> None:
+    payload = deepcopy(fixture_factory.load_canonical_manifest_resource())
+    payload["profiles"]["development"]["extends"] = "production"
+    manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    harness = _build_harness(manifest=manifest)
+    batch = _load(harness)
+
+    response = _post_decision(
+        harness,
+        _decision_body(harness, batch),
+        "wc-034-descendant-profile-block",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "cohort_contract_invalid"
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == 1
+    assert draft.manifest == manifest
+    with harness.store.transaction() as tx:
+        assert tx.list_cohort_decisions(manifest_id=manifest.manifest_id) == []
 
 
 def test_reject_is_durable_idempotent_and_permanently_blocks_apply() -> None:
@@ -393,7 +510,7 @@ def test_stale_batch_candidate_substitution_and_binding_changes_fail_closed() ->
     assert stale_response.json()["error"]["code"] == "stale_revision"
 
 
-def test_split_and_merge_revalidate_exact_unions_and_apply_atomically() -> None:
+def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> None:
     split = _build_harness()
     split_batch = _load(split)
     split_proposal = _proposal(split_batch, require_multiple_members=True)
@@ -420,36 +537,9 @@ def test_split_and_merge_revalidate_exact_unions_and_apply_atomically() -> None:
         "wc-034-split-apply",
     )
     assert split_preview.status_code == 200
-    assert split_apply.status_code == 201, split_apply.text
-    assert split_apply.json()["draftResult"]["revision"] == 2
-    split_draft = split.lifecycle.get_draft(HUMAN, split.draft_id)
-    split_profile = resolve_manifest_profile(
-        split_draft.manifest,
-        "production",
-        as_of=split.clock.now(),
-    )
-    split_role = next(
-        role
-        for role in split_profile.roles
-        if role.role_id == split_proposal["role"]["roleId"]
-    )
-    resources = [
-        record
-        for record in split.snapshot.evidence_records
-        if isinstance(record, ResourceEvidenceRecord)
-    ]
-    applied_members = [
-        member
-        for selector in split_role.selectors
-        for member in evaluate_selector(selector, resources).matched_resource_ids
-    ]
-    assert sorted(applied_members) == sorted(split_proposal["members"])
-    assert len(applied_members) == len(set(applied_members))
-    assert all(
-        selector.max_matches
-        == len(evaluate_selector(selector, resources).matched_resource_ids)
-        for selector in split_role.selectors
-    )
+    assert split_apply.status_code == 409
+    assert split_apply.json()["error"]["code"] == "cohort_contract_invalid"
+    assert split.lifecycle.get_draft(HUMAN, split.draft_id).revision == 1
 
     merge = _build_harness()
     binding = merge.register_profile("production")
@@ -485,8 +575,17 @@ def test_split_and_merge_revalidate_exact_unions_and_apply_atomically() -> None:
         "wc-034-merge-apply",
     )
     assert merge_preview.status_code == 200, merge_preview.text
-    assert merge_apply.status_code == 201, merge_apply.text
-    assert merge_apply.json()["draftResult"]["revision"] == 2
+    assert merge_apply.status_code == 409
+    assert merge_apply.json()["error"]["code"] == "cohort_contract_invalid"
+    assert merge.lifecycle.get_draft(HUMAN, merge.draft_id).revision == 1
+    with split.store.transaction() as tx:
+        assert tx.list_cohort_decisions(
+            manifest_id=split.manifest.manifest_id
+        ) == []
+    with merge.store.transaction() as tx:
+        assert tx.list_cohort_decisions(
+            manifest_id=merge.manifest.manifest_id
+        ) == []
 
 
 class _FailAfterDraftTransaction:
