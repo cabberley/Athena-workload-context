@@ -89,28 +89,6 @@ def _authority_projection(role: ManifestRole) -> dict[str, Any]:
     }
 
 
-def _selector_projection(role: ManifestRole) -> dict[str, dict[str, Any]]:
-    projected: dict[str, dict[str, Any]] = {}
-    for selector in role.selectors:
-        payload = selector.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude_none=True,
-        )
-        children = payload.get("children")
-        if isinstance(children, list):
-            payload["children"] = sorted(
-                children,
-                key=lambda child: normalized_identifier(
-                    str(child.get("selectorId", ""))
-                )
-                if isinstance(child, dict)
-                else "",
-            )
-        projected[normalized_identifier(selector.selector_id)] = payload
-    return projected
-
-
 class CohortDecisionService:
     """Persist human cohort decisions and atomically apply selector-only drafts."""
 
@@ -147,10 +125,6 @@ class CohortDecisionService:
             mode="json",
             by_alias=True,
             exclude_none=True,
-        )
-        command["proposal_ids"] = sorted(
-            normalized_identifier(proposal_id)
-            for proposal_id in request.proposal_ids
         )
         request_digest = compute_artifact_digest(
             {
@@ -440,10 +414,7 @@ class CohortDecisionService:
             ),
             proposal_set_digest=request.proposal_set_digest,
             snapshot_artifact_digest=request.snapshot_artifact_digest,
-            sourceProposalIds=sorted(
-                normalized_identifier(proposal_id)
-                for proposal_id in request.proposal_ids
-            ),
+            sourceProposalIds=request.proposal_ids,
         )
 
     @staticmethod
@@ -554,7 +525,10 @@ class CohortDecisionService:
                     "approve candidate does not match the exact WC-012 proposal"
                 )
             return submitted
-        stored = self._candidate_repository.get_candidate(submitted.candidate_id)
+        stored = self._candidate_repository.get_candidate(
+            actor.actor_id,
+            submitted.candidate_id,
+        )
         if (
             stored is None
             or stored.actor_id != actor.actor_id
@@ -965,30 +939,12 @@ class CohortDecisionService:
         baseline: ManifestRole,
         candidate: CohortReviewCandidate,
     ) -> ManifestRole:
-        """Require the approved role to already be a complete local override."""
+        """Require the approved role to be an exact canonical local override."""
 
         update = candidate.role_updates[0]
         if update.role != role:
             raise CohortContractError(
                 "candidate role update does not match its approved role"
-            )
-        baseline_selectors = _selector_projection(baseline)
-        approved_selectors = _selector_projection(role)
-        if set(baseline_selectors) != set(approved_selectors):
-            raise CohortContractError(
-                "approved candidate is not a complete local selector override"
-            )
-        baseline_variants = {
-            normalized_identifier(selector.selector_id): selector.selector_type
-            for selector in baseline.selectors
-        }
-        approved_variants = {
-            normalized_identifier(selector.selector_id): selector.selector_type
-            for selector in role.selectors
-        }
-        if baseline_variants != approved_variants:
-            raise CohortContractError(
-                "approved candidate is not a local same-variant selector override"
             )
         if _authority_projection(baseline) != _authority_projection(role):
             raise CohortContractError(
@@ -1050,6 +1006,7 @@ class CohortDecisionService:
                 actor=actor,
                 occurredAt=decided_at,
                 sourceRevision=request.expected_revision,
+                sourceProposalIds=request.proposal_ids,
                 resultingRevision=None if applied is None else applied.revision,
                 draftMutated=applied is not None,
             ),

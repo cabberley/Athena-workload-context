@@ -327,6 +327,7 @@ class CohortProposalService:
 
         proposals = self._select_proposals(batch, request)
         candidate = self._build_candidate(
+            actor,
             request,
             batch,
             proposals,
@@ -715,6 +716,7 @@ class CohortProposalService:
 
     def _build_candidate(
         self,
+        actor: Actor,
         request: CohortReviewPreviewRequest,
         batch: CohortProposalBatchResponse,
         proposals: list[CohortProposal],
@@ -756,6 +758,7 @@ class CohortProposalService:
         )
         candidate_seed = compute_artifact_digest(
             {
+                "actorId": actor.actor_id,
                 "action": request.action,
                 "draftId": request.draft_id,
                 "draftRevision": request.expected_revision,

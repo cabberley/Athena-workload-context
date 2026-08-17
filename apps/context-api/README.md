@@ -27,18 +27,22 @@ mutate it.
   `approve`, `reject`, `split`, or `merge` decision. Apply decisions revalidate the exact batch,
   proposal union, snapshot, profile, source draft, and immutable candidate before invoking the
   WC-007 `ContextService` selector-only replacement inside the same storage transaction.
-  The replacement materializes only a requested-profile local, same-variant role override. It
-  preserves role authority and unrelated selectors, never edits an ancestor or global role, and
-  rejects candidates that cannot satisfy canonical weakening-governance rules. Every profile is
+  The replacement materializes only a requested-profile local, complete role override. A
+  canonical disjoint selector-ID set represents an exact selector-set replacement, allowing the
+  final split/merge selectors shown during preview without post-approval transformation. It
+  preserves role authority, never edits an ancestor or global role, and rejects candidates that
+  cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.
-  Selected proposal IDs are part of the canonical decision version: disjoint selections in one
-  batch may be decided independently, while any overlap conflicts and a rejection blocks only its
-  selected proposals. This authority identity uses only the immutable draft, profile, snapshot,
-  and proposal-set bindings; proposal evaluation time and its derived input digest cannot bypass
-  a durable rejection after cache regeneration. Overlap arbitration occurs before mutable draft
-  freshness checks. A disjoint apply from the same immutable batch may atomically rebase only over
-  the contiguous draft revisions produced by earlier decisions from that batch; unrelated draft
-  changes remain stale. Rebased replacement starts from the current draft and therefore preserves
+  Selected proposal IDs are canonicalized once at the request boundary and are part of the
+  decision version: disjoint selections in one batch may be decided independently, while any
+  overlap conflicts and a rejection blocks only its selected proposals. This authority identity
+  uses only the immutable draft, profile, snapshot, and proposal-set bindings; proposal evaluation
+  time and its derived input digest cannot bypass a durable rejection after cache regeneration.
+  Overlap arbitration occurs before mutable draft freshness checks. A disjoint apply from the same
+  immutable batch may atomically rebase only over the contiguous draft revisions produced by
+  earlier decisions from that batch; unrelated draft changes remain stale. Preview candidate
+  identities and repository lookups are actor scoped, so one reviewer can never submit another
+  reviewer's candidate. Rebased replacement starts from the current draft and therefore preserves
   every prior disjoint selector change. Applied selectors are exactly the final selectors shown in
   the approved candidate; selector IDs needed for a safe local override are finalized before human
   review.

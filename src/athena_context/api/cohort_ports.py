@@ -74,10 +74,11 @@ class CohortPreviewReceiptPort(Protocol):
 
 
 class CohortCandidateRepositoryPort(Protocol):
-    """Immutable lookup of server-generated candidates by their stable identifier."""
+    """Actor-scoped immutable lookup of server-generated candidates."""
 
     def get_candidate(
         self,
+        actor_id: str,
         candidate_id: str,
     ) -> CohortPreviewReceipt | None: ...
 

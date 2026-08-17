@@ -1517,6 +1517,29 @@ def _normalized_filters_overlap(left: list[str], right: list[str]) -> bool:
     )
 
 
+def _resource_ids_may_match_name(
+    resource_ids: list[str],
+    selector: NamePredicateSelector,
+) -> bool:
+    prefix = (
+        None if selector.prefix is None else _normalized_id(selector.prefix)
+    )
+    suffix = (
+        None if selector.suffix is None else _normalized_id(selector.suffix)
+    )
+    return any(
+        (
+            prefix is None
+            or _normalized_id(resource_id.rsplit("/", 1)[-1]).startswith(prefix)
+        )
+        and (
+            suffix is None
+            or _normalized_id(resource_id.rsplit("/", 1)[-1]).endswith(suffix)
+        )
+        for resource_id in resource_ids
+    )
+
+
 def _selectors_may_overlap(
     left: ManifestSelector | AtomicSelector,
     right: ManifestSelector | AtomicSelector,
@@ -1536,6 +1559,14 @@ def _selectors_may_overlap(
             {_normalized_id(value) for value in left.resource_ids}
             & {_normalized_id(value) for value in right.resource_ids}
         )
+    if isinstance(left, ResourceIdListSelector) and isinstance(
+        right, NamePredicateSelector
+    ):
+        return _resource_ids_may_match_name(left.resource_ids, right)
+    if isinstance(left, NamePredicateSelector) and isinstance(
+        right, ResourceIdListSelector
+    ):
+        return _resource_ids_may_match_name(right.resource_ids, left)
     if isinstance(left, TagPredicateSelector) and isinstance(
         right, TagPredicateSelector
     ):
@@ -1711,8 +1742,14 @@ def _validate_inherited_semantics(
             _normalized_id(item.selector_id): item for item in current.selectors
         }
         if current_selectors.keys() != previous_selectors.keys():
+            if previous_selectors.keys().isdisjoint(current_selectors.keys()):
+                # A wholly new selector identity set is a complete role-local
+                # replacement. Partial overlap remains ambiguous because it
+                # would mix patch and replacement semantics.
+                continue
             raise AthenaValidationError(
-                f"direct selector set expansion is ambiguous for inherited role {current.role_id}"
+                f"partial selector set replacement is ambiguous for inherited role "
+                f"{current.role_id}"
             )
         for selector_id, previous_selector in previous_selectors.items():
             current_selector = current_selectors[selector_id]
@@ -1893,10 +1930,22 @@ def _merge_keyed[T: AthenaBaseModel](
                 f"protected constraint cannot be unprotected: {item.constraint_id}"
             )
         if isinstance(previous, ManifestRole) and isinstance(item, ManifestRole):
-            selectors = _merge_keyed(
-                list(previous.selectors),
-                list(item.selectors),
-                key_attribute="selector_id",
+            previous_selector_ids = {
+                _normalized_id(selector.selector_id)
+                for selector in previous.selectors
+            }
+            local_selector_ids = {
+                _normalized_id(selector.selector_id)
+                for selector in item.selectors
+            }
+            selectors = (
+                list(item.selectors)
+                if previous_selector_ids.isdisjoint(local_selector_ids)
+                else _merge_keyed(
+                    list(previous.selectors),
+                    list(item.selectors),
+                    key_attribute="selector_id",
+                )
             )
             payload = item.model_dump(mode="python", by_alias=True)
             payload["selectors"] = selectors

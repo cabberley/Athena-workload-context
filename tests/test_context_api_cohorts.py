@@ -61,12 +61,17 @@ from test_cohort_binding import _build_attested_snapshot
 
 AS_OF = datetime(2025, 6, 1, 12, tzinfo=UTC)
 HUMAN = Actor(actor_id="human-cohort-reviewer", kind=ActorKind.HUMAN)
+SECOND_REVIEWER = Actor(
+    actor_id="human-cohort-reviewer-two",
+    kind=ActorKind.HUMAN,
+)
 OUTSIDER = Actor(actor_id="human-cohort-outsider", kind=ActorKind.HUMAN)
 WILDCARD = Actor(actor_id="human-wildcard-reader", kind=ActorKind.HUMAN)
 AGENT = Actor(actor_id="cohort-agent", kind=ActorKind.AGENT)
 PUBLICATION_SERVICE = Actor(actor_id="context-api-service", kind=ActorKind.SERVICE)
 TOKENS = {
     HUMAN.actor_id: "cohort-human-token",
+    SECOND_REVIEWER.actor_id: "cohort-human-two-token",
     OUTSIDER.actor_id: "cohort-outsider-token",
     WILDCARD.actor_id: "cohort-wildcard-token",
     AGENT.actor_id: "cohort-agent-token",
@@ -162,6 +167,11 @@ def _build_harness(
             scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
         ),
         RoleGrant(
+            actor_id=SECOND_REVIEWER.actor_id,
+            role=Role.PROPOSER,
+            scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
+        ),
+        RoleGrant(
             actor_id=AGENT.actor_id,
             role=Role.READER,
             scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
@@ -220,7 +230,7 @@ def _build_harness(
     )
     identities = {
         TOKENS[actor.actor_id]: _verified(actor)
-        for actor in (HUMAN, OUTSIDER, WILDCARD, AGENT)
+        for actor in (HUMAN, SECOND_REVIEWER, OUTSIDER, WILDCARD, AGENT)
     }
     client = TestClient(
         create_app(

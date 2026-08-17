@@ -29,6 +29,7 @@ from test_context_api_cohorts import (
     AGENT,
     HUMAN,
     OUTSIDER,
+    SECOND_REVIEWER,
     TOKENS,
     WILDCARD,
     Harness,
@@ -591,6 +592,7 @@ def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
         == 201
     )
     assert first.json() == replay.json() == canonical_set_replay.json()
+    assert first.json()["proposalIds"] == sorted(first_selection)
     assert exact_new_receipt.status_code == overlapping.status_code == 409
     assert exact_new_receipt.json()["error"]["code"] == (
         "cohort_decision_conflict"
@@ -608,8 +610,11 @@ def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
         frozenset(proposal_ids[2:]),
     }
     assert all(
-        decision.proposal_set_version().source_proposal_ids
-        == sorted(decision.source_proposal_ids)
+        decision.source_proposal_ids == sorted(decision.source_proposal_ids)
+        and decision.audit.source_proposal_ids
+        == decision.source_proposal_ids
+        and decision.proposal_set_version().source_proposal_ids
+        == decision.source_proposal_ids
         for decision in decisions
     )
 
@@ -909,10 +914,18 @@ def test_stale_batch_candidate_substitution_and_binding_changes_fail_closed() ->
     assert stale_response.json()["error"]["code"] == "stale_revision"
 
 
-def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> None:
+def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> None:
     split = _build_harness()
     split_batch = _load(split)
     split_proposal = _proposal(split_batch, require_multiple_members=True)
+    split_before = {
+        profile_id: resolve_manifest_profile(
+            split.manifest,
+            profile_id,
+            as_of=split.clock.now(),
+        )
+        for profile_id in ("production", "development", "training")
+    }
     split_preview_body = _preview_body(
         split,
         split_batch,
@@ -940,11 +953,53 @@ def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> 
         selector["selectorType"]
         for selector in split_preview.json()["roleUpdates"][0]["role"]["selectors"]
     } == {"resourceIdList"}
-    assert split_apply.status_code == 409
-    assert split_apply.json()["error"]["code"] == "cohort_contract_invalid"
+    assert {
+        selector["selectorId"]
+        for selector in split_preview.json()["roleUpdates"][0]["role"]["selectors"]
+    }.isdisjoint(
+        {
+            selector["selectorId"]
+            for selector in split_proposal["role"]["selectors"]
+        }
+    )
+    assert split_apply.status_code == 201, split_apply.text
+    assert split_apply.json()["action"] == "split"
+    assert split_apply.json()["draftResult"]["revision"] == 2
     split_draft = split.lifecycle.get_draft(HUMAN, split.draft_id)
-    assert split_draft.revision == 1
-    assert split_draft.manifest == split.manifest
+    assert split_draft.revision == 2
+    assert split_draft.manifest.roles == split.manifest.roles
+    split_after = {
+        profile_id: resolve_manifest_profile(
+            split_draft.manifest,
+            profile_id,
+            as_of=split.clock.now(),
+        )
+        for profile_id in ("production", "development", "training")
+    }
+    split_role = next(
+        role
+        for role in split_after["production"].roles
+        if role.role_id == split_proposal["role"]["roleId"]
+    )
+    assert split_role.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    ) == split_preview.json()["roleUpdates"][0]["role"]
+    split_before_roles = {
+        role.role_id: role for role in split_before["production"].roles
+    }
+    split_after_roles = {
+        role.role_id: role for role in split_after["production"].roles
+    }
+    assert set(split_after_roles) == set(split_before_roles)
+    assert all(
+        split_after_roles[role_id] == role
+        for role_id, role in split_before_roles.items()
+        if role_id != split_role.role_id
+    )
+    for profile_id in ("development", "training"):
+        assert split_after[profile_id] == split_before[profile_id]
 
     merge = _build_harness()
     binding = merge.register_profile("production")
@@ -954,7 +1009,14 @@ def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> 
         by_alias=True,
         exclude_none=True,
     )
-    proposal_ids = [proposal["proposalId"] for proposal in merged_wire["proposals"]]
+    proposal_ids = list(
+        reversed(
+            [
+                proposal["proposalId"]
+                for proposal in merged_wire["proposals"]
+            ]
+        )
+    )
     merge_preview_body = _preview_body(
         merge,
         merged_wire,
@@ -966,6 +1028,14 @@ def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> 
         "/v1/cohort-proposals/preview",
         json=merge_preview_body,
         headers=_headers(idempotency_key="wc-034-merge-preview"),
+    )
+    canonical_merge_preview = merge.client.post(
+        "/v1/cohort-proposals/preview",
+        json={
+            **merge_preview_body,
+            "proposal_ids": sorted(proposal_ids),
+        },
+        headers=_headers(idempotency_key="wc-034-merge-preview-canonical"),
     )
     merge_apply = _post_decision(
         merge,
@@ -979,24 +1049,167 @@ def test_split_and_merge_reject_when_no_local_same_variant_override_exists() -> 
         ),
         "wc-034-merge-apply",
     )
-    assert merge_preview.status_code == 200, merge_preview.text
+    assert merge_preview.status_code == canonical_merge_preview.status_code == 200
+    assert merge_preview.json() == canonical_merge_preview.json()
+    assert merge_preview.json()["sourceProposalIds"] == sorted(proposal_ids)
     assert {
         selector["selectorType"]
         for selector in merge_preview.json()["roleUpdates"][0]["role"]["selectors"]
     } == {"resourceIdList"}
-    assert merge_apply.status_code == 409
-    assert merge_apply.json()["error"]["code"] == "cohort_contract_invalid"
+    assert {
+        selector["selectorId"]
+        for selector in merge_preview.json()["roleUpdates"][0]["role"]["selectors"]
+    }.isdisjoint(
+        {
+            selector["selectorId"]
+            for selector in merged_wire["proposals"][0]["role"]["selectors"]
+        }
+    )
+    assert merge_apply.status_code == 201, merge_apply.text
+    assert merge_apply.json()["action"] == "merge"
+    assert merge_apply.json()["proposalIds"] == sorted(proposal_ids)
+    assert merge_apply.json()["draftResult"]["revision"] == 2
     merge_draft = merge.lifecycle.get_draft(HUMAN, merge.draft_id)
-    assert merge_draft.revision == 1
-    assert merge_draft.manifest == merge.manifest
+    assert merge_draft.revision == 2
+    assert merge_draft.manifest.roles == merge.manifest.roles
+    merge_profile = resolve_manifest_profile(
+        merge_draft.manifest,
+        "production",
+        as_of=merge.clock.now(),
+    )
+    merge_role = next(
+        role
+        for role in merge_profile.roles
+        if role.role_id == merged_wire["proposals"][0]["role"]["roleId"]
+    )
+    assert merge_role.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    ) == merge_preview.json()["roleUpdates"][0]["role"]
     with split.store.transaction() as tx:
-        assert tx.list_cohort_decisions(
+        assert len(tx.list_cohort_decisions(
             manifest_id=split.manifest.manifest_id
-        ) == []
+        )) == 1
     with merge.store.transaction() as tx:
-        assert tx.list_cohort_decisions(
+        assert len(tx.list_cohort_decisions(
             manifest_id=merge.manifest.manifest_id
-        ) == []
+        )) == 1
+
+
+def test_preview_candidates_are_actor_bound_for_two_authorized_reviewers() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposals = [
+        proposal
+        for proposal in batch["proposals"]
+        if len(proposal["members"]) >= 2
+    ]
+    assert len(proposals) >= 2
+    first_proposal, second_proposal = proposals[:2]
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[first_proposal["proposalId"]],
+    )
+    second_own_preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[second_proposal["proposalId"]],
+    )
+
+    first_preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-first-reviewer-preview",
+        ),
+    )
+    second_preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            SECOND_REVIEWER,
+            idempotency_key="wc-034-second-reviewer-preview",
+        ),
+    )
+    second_own_preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=second_own_preview_body,
+        headers=_headers(
+            SECOND_REVIEWER,
+            idempotency_key="wc-034-second-reviewer-own-preview",
+        ),
+    )
+
+    assert (
+        first_preview.status_code
+        == second_preview.status_code
+        == second_own_preview.status_code
+        == 200
+    )
+    assert first_preview.json()["candidateId"] != (
+        second_preview.json()["candidateId"]
+    )
+    assert first_preview.json()["sourceProposalIds"] == (
+        second_preview.json()["sourceProposalIds"]
+    )
+
+    cross_actor = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[first_proposal["proposalId"]],
+            candidate=first_preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-cross-reviewer-candidate",
+        actor=SECOND_REVIEWER,
+    )
+    first_own_candidate = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[first_proposal["proposalId"]],
+            candidate=first_preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-first-reviewer-own-candidate",
+        actor=HUMAN,
+    )
+    second_own_candidate = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[second_proposal["proposalId"]],
+            candidate=second_own_preview.json(),
+            rationale=second_own_preview_body["resolution"],
+        ),
+        "wc-034-second-reviewer-own-candidate",
+        actor=SECOND_REVIEWER,
+    )
+
+    assert cross_actor.status_code == 409
+    assert cross_actor.json()["error"]["code"] == "cohort_contract_invalid"
+    assert first_own_candidate.status_code == 201, first_own_candidate.text
+    assert second_own_candidate.status_code == 201, second_own_candidate.text
+    assert first_own_candidate.json()["candidateId"] == (
+        first_preview.json()["candidateId"]
+    )
+    assert second_own_candidate.json()["candidateId"] == (
+        second_own_preview.json()["candidateId"]
+    )
+    assert first_own_candidate.json()["decidedBy"] == HUMAN.actor_id
+    assert second_own_candidate.json()["decidedBy"] == SECOND_REVIEWER.actor_id
+    assert first_own_candidate.json()["draftResult"]["revision"] == 2
+    assert second_own_candidate.json()["draftResult"]["revision"] == 3
 
 
 class _FailAfterDraftTransaction:

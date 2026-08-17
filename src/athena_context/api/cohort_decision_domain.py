@@ -9,7 +9,7 @@ from athena_context.api.cohort_domain import (
     CohortDraftBinding,
     CohortReviewCandidate,
     ProfileType,
-    normalized_identifier,
+    canonical_proposal_ids,
 )
 from athena_context.api.domain import Actor, ApiModel, WorkloadIdentifier
 from athena_context.binding.domain import ProposalScope, ProposalSnapshot
@@ -47,18 +47,7 @@ class CohortDecisionRequest(ApiModel):
     @field_validator("proposal_ids")
     @classmethod
     def validate_proposal_ids(cls, values: list[str]) -> list[str]:
-        for value in values:
-            if len(value) != 25 or not value.startswith("proposal-"):
-                raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
-            suffix = value.removeprefix("proposal-")
-            if len(suffix) != 16 or any(
-                character not in "0123456789abcdef" for character in suffix
-            ):
-                raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
-        normalized = [normalized_identifier(value) for value in values]
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("proposal_ids must be unique after normalization")
-        return values
+        return canonical_proposal_ids(values)
 
     @field_validator("rationale")
     @classmethod
@@ -121,8 +110,8 @@ class CohortProposalSetVersion(ApiModel):
     @field_validator("source_proposal_ids")
     @classmethod
     def validate_canonical_proposal_set(cls, values: list[str]) -> list[str]:
-        canonical = sorted(normalized_identifier(value) for value in values)
-        if values != canonical or len(canonical) != len(set(canonical)):
+        canonical = canonical_proposal_ids(values)
+        if values != canonical:
             raise ValueError(
                 "source_proposal_ids must be a canonical unique proposal set"
             )
@@ -138,12 +127,25 @@ class CohortDecisionAudit(ApiModel):
     actor: Actor
     occurred_at: AwareDatetime = Field(alias="occurredAt")
     source_revision: int = Field(alias="sourceRevision", ge=1)
+    source_proposal_ids: list[str] = Field(
+        alias="sourceProposalIds",
+        min_length=1,
+        max_length=200,
+    )
     resulting_revision: int | None = Field(
         default=None,
         alias="resultingRevision",
         ge=1,
     )
     draft_mutated: bool = Field(alias="draftMutated")
+
+    @field_validator("source_proposal_ids")
+    @classmethod
+    def validate_source_proposal_ids(cls, values: list[str]) -> list[str]:
+        canonical = canonical_proposal_ids(values)
+        if values != canonical:
+            raise ValueError("audit sourceProposalIds must use canonical proposal order")
+        return values
 
 
 class CohortDecisionRecord(ApiModel):
@@ -192,6 +194,14 @@ class CohortDecisionRecord(ApiModel):
     publication_allowed: Literal[False] = Field(False, alias="publicationAllowed")
     role_metadata_mutated: Literal[False] = Field(False, alias="roleMetadataMutated")
 
+    @field_validator("source_proposal_ids")
+    @classmethod
+    def validate_source_proposal_ids(cls, values: list[str]) -> list[str]:
+        canonical = canonical_proposal_ids(values)
+        if values != canonical:
+            raise ValueError("sourceProposalIds must use canonical proposal order")
+        return values
+
     @model_validator(mode="after")
     def validate_outcome(self) -> CohortDecisionRecord:
         rejected = self.decision is CohortDecisionKind.REJECT
@@ -206,6 +216,7 @@ class CohortDecisionRecord(ApiModel):
             or self.audit.actor != self.decided_by
             or self.audit.occurred_at != self.decided_at
             or self.audit.source_revision != self.source_draft.revision
+            or self.audit.source_proposal_ids != self.source_proposal_ids
             or self.audit.draft_mutated is rejected
             or self.audit.resulting_revision
             != (None if self.applied_draft is None else self.applied_draft.revision)
@@ -222,10 +233,7 @@ class CohortDecisionRecord(ApiModel):
             source_draft=self.source_draft,
             proposal_set_digest=self.proposal_set_digest,
             snapshot_artifact_digest=self.snapshot.artifact_digest,
-            sourceProposalIds=sorted(
-                normalized_identifier(proposal_id)
-                for proposal_id in self.source_proposal_ids
-            ),
+            sourceProposalIds=self.source_proposal_ids,
         )
 
 
