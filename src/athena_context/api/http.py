@@ -7,11 +7,12 @@ from fastapi import Depends, FastAPI, Header, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from athena_context.api.authorization import (
-    InMemoryActorDirectory,
+    RejectUnverifiedAuthentication,
     RoleBasedAuthorization,
 )
 from athena_context.api.domain import (
     Actor,
+    ActorKind,
     ApiModel,
     AuditEvent,
     CreateDraftCommand,
@@ -34,14 +35,14 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
 )
 from athena_context.api.memory import InMemoryContextStore
-from athena_context.api.ports import ActorDirectoryPort
+from athena_context.api.ports import AuthenticationPort
 from athena_context.api.service import ContextService
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _VERSION_PATTERN = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
-ActorHeader = Annotated[
-    str,
-    Header(alias="X-Athena-Actor", min_length=1, max_length=128, pattern=_ID_PATTERN),
+AuthorizationHeader = Annotated[
+    str | None,
+    Header(alias="Authorization", max_length=8192),
 ]
 IdempotencyHeader = Annotated[
     str,
@@ -66,9 +67,18 @@ class SystemClock:
         return datetime.now(tz=UTC).replace(microsecond=0)
 
 
-def _current_actor(request: Request, actor_id: ActorHeader) -> Actor:
-    directory = cast(ActorDirectoryPort, request.app.state.actor_directory)
-    return directory.resolve(actor_id)
+def _current_actor(
+    request: Request,
+    authorization: AuthorizationHeader = None,
+) -> Actor:
+    if authorization is None:
+        raise AuthenticationError("verified bearer credentials are required")
+    scheme, separator, credential = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not separator or not credential.strip():
+        raise AuthenticationError("verified bearer credentials are required")
+    authenticator = cast(AuthenticationPort, request.app.state.authenticator)
+    verified = authenticator.authenticate_bearer(credential.strip())
+    return verified.actor
 
 
 ActorDependency = Annotated[Actor, Depends(_current_actor)]
@@ -77,21 +87,25 @@ ActorDependency = Annotated[Actor, Depends(_current_actor)]
 def create_app(
     *,
     service: ContextService | None = None,
-    actors: ActorDirectoryPort | None = None,
+    authentication: AuthenticationPort | None = None,
 ) -> FastAPI:
     if service is None:
         service = ContextService(
             store=InMemoryContextStore(),
             authorization=RoleBasedAuthorization(),
             clock=SystemClock(),
+            publication_actor=Actor(
+                actor_id="athena-context-api",
+                kind=ActorKind.SERVICE,
+            ),
         )
-    actor_directory = actors or InMemoryActorDirectory()
+    authenticator = authentication or RejectUnverifiedAuthentication()
     application = FastAPI(
         title="Athena Context API",
         version="1.0.0",
         description="Authoritative, human-governed workload manifest lifecycle API.",
     )
-    application.state.actor_directory = actor_directory
+    application.state.authenticator = authenticator
 
     @application.exception_handler(ContextApiError)
     async def context_error_handler(

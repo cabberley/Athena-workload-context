@@ -29,6 +29,7 @@ APPROVER = Actor(actor_id="human-approver", kind=ActorKind.HUMAN)
 PUBLISHER = Actor(actor_id="human-publisher", kind=ActorKind.HUMAN)
 AUDITOR = Actor(actor_id="human-auditor", kind=ActorKind.HUMAN)
 OUTSIDER = Actor(actor_id="human-outsider", kind=ActorKind.HUMAN)
+PUBLICATION_SERVICE = Actor(actor_id="athena-context-api", kind=ActorKind.SERVICE)
 
 
 class StepClock:
@@ -56,6 +57,7 @@ def build_service() -> ContextService:
         store=InMemoryContextStore(),
         authorization=RoleBasedAuthorization(grants),
         clock=StepClock(),
+        publication_actor=PUBLICATION_SERVICE,
     )
 
 

@@ -14,6 +14,7 @@ from athena_context.api.domain import (
     Permission,
     PublishedManifest,
     Supersession,
+    VerifiedAuthentication,
 )
 
 
@@ -21,8 +22,8 @@ class ClockPort(Protocol):
     def now(self) -> datetime: ...
 
 
-class ActorDirectoryPort(Protocol):
-    def resolve(self, actor_id: str) -> Actor: ...
+class AuthenticationPort(Protocol):
+    def authenticate_bearer(self, credential: str) -> VerifiedAuthentication: ...
 
 
 class AuthorizationPort(Protocol):

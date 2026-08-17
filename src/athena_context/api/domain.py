@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from athena_context.contracts.manifest import CanonicalWorkloadManifest
 
@@ -25,6 +26,21 @@ class ActorKind(StrEnum):
 class Actor(ApiModel):
     actor_id: str = Field(pattern=_ID_PATTERN)
     kind: ActorKind
+
+
+class AuthenticationMethod(StrEnum):
+    ENTRA_JWT = "entra_jwt"
+    TEST = "test"
+
+
+class VerifiedAuthentication(ApiModel):
+    """Identity produced only after an authentication adapter verifies credentials."""
+
+    actor: Actor
+    subject_id: str = Field(min_length=1, max_length=256)
+    issuer: str = Field(min_length=1, max_length=512)
+    audience: str = Field(min_length=1, max_length=256)
+    method: AuthenticationMethod
 
 
 class Role(StrEnum):
@@ -85,7 +101,17 @@ class ReviewSubmission(ApiModel):
     submitted_by: Actor
     submitted_at: AwareDatetime
     submitted_revision: int = Field(ge=1)
+    publication_candidate_digest: str = Field(pattern=_DIGEST_PATTERN)
     reason: str = Field(min_length=3, max_length=500)
+
+
+class PublicationCandidate(ApiModel):
+    finalized_by: Actor
+    finalized_at: AwareDatetime
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    semantic_digest: str = Field(pattern=_DIGEST_PATTERN)
+    approval_status: Literal["approved"]
 
 
 class ApprovalDecision(ApiModel):
@@ -113,6 +139,7 @@ class DraftRecord(ApiModel):
     reason: str = Field(min_length=3, max_length=500)
     validation: ValidationRecord | None = None
     review: ReviewSubmission | None = None
+    publication_candidate: PublicationCandidate | None = None
     approval: ApprovalDecision | None = None
 
 
@@ -127,6 +154,8 @@ class PublishedManifest(ApiModel):
     approval: ApprovalDecision
     published_by: Actor
     published_at: AwareDatetime
+    publication_authorized_by: Actor
+    publication_authorized_at: AwareDatetime
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -155,6 +184,8 @@ class PendingAuditEvent(ApiModel):
     manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
     previous_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
     replacement_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    publication_actor: Actor | None = None
+    publication_timestamp: AwareDatetime | None = None
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     reason: str = Field(min_length=3, max_length=500)
 
@@ -164,10 +195,25 @@ class AuditEvent(PendingAuditEvent):
     event_id: str = Field(pattern=r"^audit-[0-9]{8}$")
 
 
+class MutationTarget(ApiModel):
+    draft_id: str | None = Field(default=None, pattern=_ID_PATTERN)
+    manifest_id: str | None = Field(default=None, min_length=1, max_length=128)
+    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> MutationTarget:
+        if self.draft_id is None and self.manifest_id is None:
+            raise ValueError("mutation target requires a draft_id or manifest_id")
+        if self.manifest_version is not None and self.manifest_id is None:
+            raise ValueError("manifest_version target requires manifest_id")
+        return self
+
+
 class MutationReceipt(ApiModel):
     actor_id: str = Field(pattern=_ID_PATTERN)
     idempotency_key: str = Field(pattern=_ID_PATTERN)
     operation: str = Field(min_length=1, max_length=64)
+    target: MutationTarget
     request_digest: str = Field(pattern=_DIGEST_PATTERN)
     response_type: str = Field(min_length=1, max_length=128)
     response_json: str = Field(min_length=2)

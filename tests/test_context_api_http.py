@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from athena_context.api.authorization import InMemoryActorDirectory
-from athena_context.api.domain import CreateDraftCommand, TransitionCommand
+from athena_context.api.authorization import StaticTestAuthenticator
+from athena_context.api.domain import (
+    Actor,
+    AuthenticationMethod,
+    CreateDraftCommand,
+    PublishCommand,
+    TransitionCommand,
+    VerifiedAuthentication,
+)
 from athena_context.api.http import create_app
 from athena_context.api.service import ContextService
 from context_api_support import (
@@ -22,20 +29,50 @@ from context_api_support import (
 )
 
 BAD_DIGEST = "sha256:" + ("0" * 64)
+_TOKENS = {
+    AGENT.actor_id: "synthetic-agent-token",
+    AUTHOR.actor_id: "synthetic-author-token",
+    APPROVER.actor_id: "synthetic-approver-token",
+    PUBLISHER.actor_id: "synthetic-publisher-token",
+    AUDITOR.actor_id: "synthetic-auditor-token",
+    OUTSIDER.actor_id: "synthetic-outsider-token",
+}
+
+
+def _verified(actor: Actor) -> VerifiedAuthentication:
+    return VerifiedAuthentication(
+        actor=actor,
+        subject_id=f"synthetic-subject-{actor.actor_id}",
+        issuer="https://issuer.invalid/synthetic",
+        audience="api://athena-context-test",
+        method=AuthenticationMethod.TEST,
+    )
 
 
 def _client() -> tuple[ContextService, TestClient]:
     service = build_service()
-    directory = InMemoryActorDirectory(
-        [AGENT, AUTHOR, APPROVER, PUBLISHER, AUDITOR, OUTSIDER]
+    authenticator = StaticTestAuthenticator(
+        {
+            _TOKENS[actor.actor_id]: _verified(actor)
+            for actor in [AGENT, AUTHOR, APPROVER, PUBLISHER, AUDITOR, OUTSIDER]
+        }
     )
-    return service, TestClient(create_app(service=service, actors=directory))
+    return service, TestClient(
+        create_app(service=service, authentication=authenticator)
+    )
 
 
-def _headers(actor_id: str, key: str | None = None) -> dict[str, str]:
-    headers = {"X-Athena-Actor": actor_id}
+def _headers(
+    actor_id: str,
+    key: str | None = None,
+    *,
+    spoofed_actor: str | None = None,
+) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {_TOKENS[actor_id]}"}
     if key is not None:
         headers["Idempotency-Key"] = key
+    if spoofed_actor is not None:
+        headers["X-Athena-Actor"] = spoofed_actor
     return headers
 
 
@@ -57,6 +94,27 @@ def test_openapi_exposes_typed_lifecycle_contracts() -> None:
         "manifest_digest",
         "reason",
     }
+
+
+def test_unverified_or_caller_asserted_identity_is_rejected() -> None:
+    _, client = _client()
+
+    header_only = client.get(
+        "/v1/drafts/nonexistent",
+        headers={"X-Athena-Actor": PUBLISHER.actor_id},
+    )
+    unverified_bearer = client.get(
+        "/v1/drafts/nonexistent",
+        headers={
+            "Authorization": "Bearer unverified-synthetic-token",
+            "X-Athena-Actor": PUBLISHER.actor_id,
+        },
+    )
+
+    assert header_only.status_code == 401
+    assert unverified_bearer.status_code == 401
+    assert header_only.json()["error"]["code"] == "authentication_required"
+    assert unverified_bearer.json()["error"]["code"] == "authentication_required"
 
 
 def test_http_create_get_list_and_stale_revision_mapping() -> None:
@@ -101,8 +159,10 @@ def test_http_create_get_list_and_stale_revision_mapping() -> None:
     assert len(listed.json()) == 1
     assert stale_response.status_code == 409
     assert stale_response.json()["error"]["code"] == "stale_revision"
-def test_http_digest_and_human_authority_failures_are_typed() -> None:
-    service, client = _client()
+
+
+def test_http_digest_failure_is_typed() -> None:
+    _, client = _client()
     manifest = canonical_manifest()
     bad_command = CreateDraftCommand(
         draft_id="bad-http-digest",
@@ -116,6 +176,13 @@ def test_http_digest_and_human_authority_failures_are_typed() -> None:
         json=bad_command.model_dump(mode="json", by_alias=True, exclude_none=True),
     )
 
+    assert digest_response.status_code == 409
+    assert digest_response.json()["error"]["code"] == "digest_mismatch"
+
+
+def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None:
+    service, client = _client()
+    manifest = canonical_manifest()
     draft = create_draft(service, manifest, draft_id="http-agent-approval")
     draft = service.validate_draft(
         AGENT,
@@ -131,14 +198,59 @@ def test_http_digest_and_human_authority_failures_are_typed() -> None:
     )
     approval_response = client.post(
         f"/v1/drafts/{draft.draft_id}/approve",
-        headers=_headers(AGENT.actor_id, "http-agent-approve"),
+        headers=_headers(
+            AGENT.actor_id,
+            "http-agent-approve",
+            spoofed_actor=APPROVER.actor_id,
+        ),
         json=transition(draft, "Agent must not approve").model_dump(mode="json"),
     )
+    publisher_spoof_approval_response = client.post(
+        f"/v1/drafts/{draft.draft_id}/approve",
+        headers=_headers(
+            AGENT.actor_id,
+            "http-agent-publisher-spoof-approve",
+            spoofed_actor=PUBLISHER.actor_id,
+        ),
+        json=transition(draft, "Publisher header must not replace agent").model_dump(
+            mode="json"
+        ),
+    )
+    approved = service.approve_draft(
+        APPROVER,
+        draft.draft_id,
+        "http-human-approve",
+        transition(draft, "Human approves exact candidate"),
+    )
+    assert approved.approval is not None
+    publication_response = client.post(
+        f"/v1/drafts/{approved.draft_id}/publish",
+        headers=_headers(
+            AGENT.actor_id,
+            "http-agent-publish",
+            spoofed_actor=PUBLISHER.actor_id,
+        ),
+        json=PublishCommand(
+            **transition(approved, "Agent must not publish").model_dump(),
+            approval_id=approved.approval.decision_id,
+        ).model_dump(mode="json"),
+    )
+    unverified_response = client.get(
+        f"/v1/drafts/{approved.draft_id}",
+        headers={"X-Athena-Actor": PUBLISHER.actor_id},
+    )
 
-    assert digest_response.status_code == 409
-    assert digest_response.json()["error"]["code"] == "digest_mismatch"
     assert approval_response.status_code == 403
     assert approval_response.json()["error"]["code"] == "authorization_denied"
+    assert publisher_spoof_approval_response.status_code == 403
+    assert (
+        publisher_spoof_approval_response.json()["error"]["code"]
+        == "authorization_denied"
+    )
+    assert publication_response.status_code == 403
+    assert publication_response.json()["error"]["code"] == "authorization_denied"
+    assert unverified_response.status_code == 401
+    assert unverified_response.json()["error"]["code"] == "authentication_required"
 
 
 def test_http_ambiguous_version_lookup_requires_manifest_identity() -> None:

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from athena_context.api.domain import (
     Actor,
+    ActorKind,
     ApiModel,
     ApprovalDecision,
     AuditAction,
@@ -16,8 +17,10 @@ from athena_context.api.domain import (
     DraftRecord,
     DraftState,
     MutationReceipt,
+    MutationTarget,
     PendingAuditEvent,
     Permission,
+    PublicationCandidate,
     PublishCommand,
     PublishedManifest,
     PublishedManifestView,
@@ -50,7 +53,10 @@ from athena_context.api.ports import (
     ContextTransactionPort,
 )
 from athena_context.contracts.common import compute_artifact_digest
-from athena_context.contracts.manifest import CanonicalWorkloadManifest
+from athena_context.contracts.manifest import (
+    CanonicalWorkloadManifest,
+    canonicalize_manifest_payload,
+)
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
 
@@ -95,10 +101,14 @@ class ContextService:
         store: ContextStorePort,
         authorization: AuthorizationPort,
         clock: ClockPort,
+        publication_actor: Actor,
     ) -> None:
+        if publication_actor.kind is not ActorKind.SERVICE:
+            raise ValueError("publication_actor must be a service actor")
         self._store = store
         self._authorization = authorization
         self._clock = clock
+        self._publication_actor = publication_actor
 
     def create_draft(
         self,
@@ -145,7 +155,19 @@ class ContextService:
             )
             return draft
 
-        return self._mutate(actor, idempotency_key, "create_draft", command, DraftRecord, create)
+        return self._mutate(
+            actor,
+            idempotency_key,
+            "create_draft",
+            MutationTarget(
+                draft_id=command.draft_id,
+                manifest_id=manifest_id,
+                manifest_version=command.manifest.manifest_version,
+            ),
+            command,
+            DraftRecord,
+            create,
+        )
 
     def replace_draft(
         self,
@@ -209,6 +231,7 @@ class ContextService:
             actor,
             idempotency_key,
             "replace_draft",
+            MutationTarget(draft_id=draft_id),
             command,
             DraftRecord,
             replace,
@@ -273,6 +296,7 @@ class ContextService:
             actor,
             idempotency_key,
             "validate_draft",
+            MutationTarget(draft_id=draft_id),
             command,
             DraftRecord,
             validate,
@@ -293,11 +317,18 @@ class ContextService:
             self._require_state(current, DraftState.VALIDATED)
             self._ensure_expected_command(current, command)
             now = self._now()
+            candidate_manifest = self._finalize_publication_candidate(
+                current.manifest,
+                finalized_at=now,
+            )
+            candidate_digest = candidate_manifest.compatibility.artifact_digest
             revision = current.revision + 1
             updated = current.model_copy(
                 update={
                     "state": DraftState.IN_REVIEW,
                     "revision": revision,
+                    "manifest": candidate_manifest,
+                    "manifest_digest": candidate_digest,
                     "updated_by": actor,
                     "updated_at": now,
                     "reason": command.reason,
@@ -305,7 +336,18 @@ class ContextService:
                         submitted_by=actor,
                         submitted_at=now,
                         submitted_revision=revision,
+                        publication_candidate_digest=candidate_digest,
                         reason=command.reason,
+                    ),
+                    "publication_candidate": PublicationCandidate(
+                        finalized_by=self._publication_actor,
+                        finalized_at=now,
+                        manifest_version=candidate_manifest.manifest_version,
+                        manifest_digest=candidate_digest,
+                        semantic_digest=(
+                            candidate_manifest.compatibility.semantic_digest
+                        ),
+                        approval_status="approved",
                     ),
                 }
             )
@@ -318,6 +360,8 @@ class ContextService:
                     draft=updated,
                     previous_revision=current.revision,
                     reason=command.reason,
+                    publication_actor=self._publication_actor,
+                    publication_timestamp=now,
                 )
             )
             return updated
@@ -326,6 +370,7 @@ class ContextService:
             actor,
             idempotency_key,
             "submit_for_review",
+            MutationTarget(draft_id=draft_id),
             command,
             DraftRecord,
             submit,
@@ -345,6 +390,7 @@ class ContextService:
             self._authorization.require(actor, Permission.APPROVE, current.manifest_id)
             self._require_state(current, DraftState.IN_REVIEW)
             self._ensure_expected_command(current, command)
+            self._require_current_publication_candidate(current)
             now = self._now()
             revision = current.revision + 1
             decision = ApprovalDecision(
@@ -383,6 +429,7 @@ class ContextService:
             actor,
             idempotency_key,
             "approve_draft",
+            MutationTarget(draft_id=draft_id),
             command,
             DraftRecord,
             approve,
@@ -402,6 +449,7 @@ class ContextService:
             self._authorization.require(actor, Permission.PUBLISH, current.manifest_id)
             self._require_state(current, DraftState.APPROVED)
             self._ensure_expected_command(current, command)
+            candidate = self._require_current_publication_candidate(current)
             approval = current.approval
             if (
                 approval is None
@@ -433,8 +481,10 @@ class ContextService:
                 source_draft_revision=revision,
                 previous_version=current.previous_version,
                 approval=approval,
-                published_by=actor,
-                published_at=now,
+                published_by=self._publication_actor,
+                published_at=candidate.finalized_at,
+                publication_authorized_by=actor,
+                publication_authorized_at=now,
                 reason=command.reason,
             )
             updated = current.model_copy(
@@ -456,6 +506,8 @@ class ContextService:
                     draft=updated,
                     previous_revision=current.revision,
                     reason=command.reason,
+                    publication_actor=self._publication_actor,
+                    publication_timestamp=candidate.finalized_at,
                 )
             )
             return published
@@ -464,6 +516,7 @@ class ContextService:
             actor,
             idempotency_key,
             "publish_draft",
+            MutationTarget(draft_id=draft_id),
             command,
             PublishedManifest,
             publish,
@@ -544,6 +597,10 @@ class ContextService:
             actor,
             idempotency_key,
             "supersede_version",
+            MutationTarget(
+                manifest_id=manifest_id,
+                manifest_version=superseded_version,
+            ),
             command,
             Supersession,
             supersede,
@@ -650,6 +707,7 @@ class ContextService:
         actor: Actor,
         idempotency_key: str,
         operation: str,
+        target: MutationTarget,
         command: ApiModel,
         response_type: type[TApiModel],
         mutation: Callable[[ContextTransactionPort], TApiModel],
@@ -658,6 +716,10 @@ class ContextService:
             {
                 "operation": operation,
                 "actorId": actor.actor_id,
+                "target": target.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                ),
                 "command": command.model_dump(
                     mode="json",
                     by_alias=True,
@@ -670,6 +732,7 @@ class ContextService:
             if receipt is not None:
                 if (
                     receipt.operation != operation
+                    or receipt.target != target
                     or receipt.request_digest != request_digest
                     or receipt.response_type != response_type.__name__
                 ):
@@ -683,6 +746,7 @@ class ContextService:
                     actor_id=actor.actor_id,
                     idempotency_key=idempotency_key,
                     operation=operation,
+                    target=target,
                     request_digest=request_digest,
                     response_type=response_type.__name__,
                     response_json=result.model_dump_json(
@@ -775,6 +839,56 @@ class ContextService:
         ):
             raise DigestMismatchError("manifest digest does not match the canonical manifest")
 
+    def _finalize_publication_candidate(
+        self,
+        manifest: CanonicalWorkloadManifest,
+        *,
+        finalized_at: datetime,
+    ) -> CanonicalWorkloadManifest:
+        payload = manifest.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        payload["audit"] = {
+            "publishedBy": self._publication_actor.actor_id,
+            "publishedAt": finalized_at,
+            "approvalStatus": "approved",
+        }
+        try:
+            finalized_payload = canonicalize_manifest_payload(payload)
+            return CanonicalWorkloadManifest.model_validate(finalized_payload)
+        except (ValidationError, ValueError) as exc:
+            raise ManifestValidationError(
+                "the server could not finalize the publication candidate"
+            ) from exc
+
+    def _require_current_publication_candidate(
+        self,
+        draft: DraftRecord,
+    ) -> PublicationCandidate:
+        candidate = draft.publication_candidate
+        audit = draft.manifest.audit
+        if (
+            candidate is None
+            or draft.review is None
+            or candidate.finalized_by != self._publication_actor
+            or candidate.manifest_version != draft.manifest.manifest_version
+            or candidate.manifest_digest != draft.manifest_digest
+            or candidate.semantic_digest
+            != draft.manifest.compatibility.semantic_digest
+            or candidate.approval_status != "approved"
+            or draft.review.publication_candidate_digest != draft.manifest_digest
+            or audit.published_by != self._publication_actor.actor_id
+            or audit.published_at != candidate.finalized_at
+            or audit.approval_status != candidate.approval_status
+        ):
+            raise StaleApprovalError(
+                "the publication candidate provenance does not match this draft"
+            )
+        self._ensure_manifest_digest(draft.manifest, draft.manifest_digest)
+        return candidate
+
     @staticmethod
     def _ensure_lineage(
         tx: ContextTransactionPort,
@@ -814,6 +928,8 @@ class ContextService:
         previous_revision: int | None,
         reason: str,
         replacement_version: str | None = None,
+        publication_actor: Actor | None = None,
+        publication_timestamp: datetime | None = None,
     ) -> PendingAuditEvent:
         return PendingAuditEvent(
             occurred_at=now,
@@ -826,6 +942,8 @@ class ContextService:
             manifest_version=draft.manifest.manifest_version,
             previous_version=draft.previous_version,
             replacement_version=replacement_version,
+            publication_actor=publication_actor,
+            publication_timestamp=publication_timestamp,
             manifest_digest=draft.manifest_digest,
             reason=reason,
         )

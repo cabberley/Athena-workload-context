@@ -152,6 +152,31 @@ def test_mutations_are_idempotent_and_key_reuse_fails_closed() -> None:
         )
 
 
+def test_idempotency_key_is_bound_to_the_draft_route_target() -> None:
+    service = build_service()
+    manifest = canonical_manifest()
+    first = create_draft(service, manifest, draft_id="target-one")
+    second = create_draft(service, manifest, draft_id="target-two")
+    shared_command = transition(first, "Validate one route target")
+
+    validated = service.validate_draft(
+        AGENT,
+        first.draft_id,
+        "shared-target-key",
+        shared_command,
+    )
+
+    assert validated.state is DraftState.VALIDATED
+    with pytest.raises(IdempotencyConflictError):
+        service.validate_draft(
+            AGENT,
+            second.draft_id,
+            "shared-target-key",
+            shared_command,
+        )
+    assert service.get_draft(AGENT, second.draft_id).state is DraftState.DRAFT
+
+
 def test_invalid_transition_and_stale_approval_fail_closed() -> None:
     service = build_service()
     draft = create_draft(service, canonical_manifest(), draft_id="approval-guard")

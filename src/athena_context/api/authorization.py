@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from athena_context.api.domain import (
     Actor,
@@ -8,6 +8,7 @@ from athena_context.api.domain import (
     Permission,
     Role,
     RoleGrant,
+    VerifiedAuthentication,
 )
 from athena_context.api.errors import AuthenticationError, AuthorizationError
 
@@ -43,17 +44,25 @@ _HUMAN_ONLY = frozenset(
 )
 
 
-class InMemoryActorDirectory:
-    """Server-owned principal metadata; clients cannot assert actor kind or roles."""
+class RejectUnverifiedAuthentication:
+    """Production-safe default that rejects credentials until a verifier is configured."""
 
-    def __init__(self, actors: Iterable[Actor] = ()) -> None:
-        self._actors = {actor.actor_id: actor for actor in actors}
+    def authenticate_bearer(self, credential: str) -> VerifiedAuthentication:
+        del credential
+        raise AuthenticationError("bearer credentials were not verified")
 
-    def resolve(self, actor_id: str) -> Actor:
-        actor = self._actors.get(actor_id)
-        if actor is None:
-            raise AuthenticationError("the supplied actor is not authenticated")
-        return actor
+
+class StaticTestAuthenticator:
+    """Deterministic test-only adapter returning pre-verified synthetic identities."""
+
+    def __init__(self, identities: Mapping[str, VerifiedAuthentication]) -> None:
+        self._identities = dict(identities)
+
+    def authenticate_bearer(self, credential: str) -> VerifiedAuthentication:
+        identity = self._identities.get(credential)
+        if identity is None:
+            raise AuthenticationError("bearer credentials were not verified")
+        return identity
 
 
 class RoleBasedAuthorization:

@@ -1,6 +1,7 @@
 from athena_context.api.authorization import (
-    InMemoryActorDirectory,
+    RejectUnverifiedAuthentication,
     RoleBasedAuthorization,
+    StaticTestAuthenticator,
 )
 from athena_context.api.domain import (
     Actor,
@@ -15,6 +16,7 @@ from athena_context.api.domain import (
     RoleGrant,
     SupersedeCommand,
     TransitionCommand,
+    VerifiedAuthentication,
 )
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
@@ -27,15 +29,17 @@ __all__ = [
     "CreateDraftCommand",
     "DraftRecord",
     "DraftState",
-    "InMemoryActorDirectory",
     "InMemoryContextStore",
     "PublishedManifest",
     "PublishCommand",
     "ReplaceDraftCommand",
     "Role",
     "RoleBasedAuthorization",
+    "RejectUnverifiedAuthentication",
     "RoleGrant",
     "SupersedeCommand",
+    "StaticTestAuthenticator",
     "TransitionCommand",
+    "VerifiedAuthentication",
     "create_app",
 ]
