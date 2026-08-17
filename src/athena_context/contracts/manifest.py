@@ -3071,6 +3071,74 @@ def validate_manifest_selector_identity_inheritance(
         roles_for(profile)
 
 
+def validate_manifest_selector_identity_transition(
+    current: CanonicalWorkloadManifest,
+    replacement: CanonicalWorkloadManifest,
+) -> None:
+    """Reject selector identity changes hidden by moving an existing role.
+
+    A generic draft replacement has no cohort-decision authority. Compare both
+    global roles and every profile-local override so a replacement cannot make
+    reviewed selector identities the new global inheritance baseline.
+    """
+
+    def inventory(
+        manifest: CanonicalWorkloadManifest,
+    ) -> tuple[
+        dict[str, frozenset[str]],
+        dict[tuple[str, str], frozenset[str]],
+    ]:
+        by_role: dict[str, set[str]] = {}
+        by_location: dict[tuple[str, str], frozenset[str]] = {}
+
+        def add_roles(location: str, roles: list[ManifestRole]) -> None:
+            for role in roles:
+                role_id = _normalized_id(role.role_id)
+                selector_ids = frozenset(
+                    _normalized_id(nested.selector_id)
+                    for selector in role.selectors
+                    for nested in _selector_tree(selector)
+                )
+                by_role.setdefault(role_id, set()).update(selector_ids)
+                by_location[(location, role_id)] = selector_ids
+
+        add_roles("global", list(manifest.roles))
+        for profile in manifest.profiles.values():
+            add_roles(
+                f"profile:{_normalized_id(profile.profile_id)}",
+                list(profile.roles),
+            )
+        return (
+            {
+                role_id: frozenset(selector_ids)
+                for role_id, selector_ids in by_role.items()
+            },
+            by_location,
+        )
+
+    current_by_role, current_by_location = inventory(current)
+    replacement_by_role, replacement_by_location = inventory(replacement)
+    for role_id in current_by_role.keys() & replacement_by_role.keys():
+        if current_by_role[role_id] != replacement_by_role[role_id]:
+            raise AthenaValidationError(
+                "selector identities for an existing role are immutable "
+                f"outside an exact cohort decision for role {role_id}"
+            )
+    for location_and_role in (
+        current_by_location.keys() & replacement_by_location.keys()
+    ):
+        if (
+            current_by_location[location_and_role]
+            != replacement_by_location[location_and_role]
+        ):
+            location, role_id = location_and_role
+            raise AthenaValidationError(
+                "selector identities for an existing role are immutable "
+                "outside an exact cohort decision for "
+                f"role {role_id} at {location}"
+            )
+
+
 def resolve_manifest_profile(
     manifest: CanonicalWorkloadManifest,
     profile_id: str,
@@ -3756,5 +3824,6 @@ __all__ = [
     "resolve_manifest_profile",
     "validate_resolved_manifest_profile",
     "validate_manifest_selector_identity_inheritance",
+    "validate_manifest_selector_identity_transition",
     "verified_snapshot_context_verifier",
 ]

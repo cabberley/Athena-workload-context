@@ -29,7 +29,10 @@ mutate it.
   WC-007 `ContextService` selector-only replacement inside the same storage transaction.
   The replacement materializes only a requested-profile local, complete role override. Generic
   resolution and ordinary draft replacement reject every disjoint selector identity, including
-  guarded conjunctions copied from a preview. Split/merge preview instead emits final guarded
+  guarded conjunctions copied from a preview. Ordinary replacement compares the current and
+  replacement global roles and every profile-local override by normalized role ID, so moving a
+  rejected candidate into a global role cannot establish a new inheritance baseline. Split/merge
+  preview instead emits final guarded
   conjunctions whose inherited selector child proves narrowing and whose exact child binds the
   reviewed cohort. Only the decision transaction receives a typed in-process capability bound to
   the authenticated actor, persisted decision, candidate digest, workload/profile, proposal set,

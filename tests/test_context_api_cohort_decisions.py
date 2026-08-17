@@ -499,6 +499,7 @@ def test_rejected_split_candidate_cannot_bypass_decision_api_with_generic_put() 
         "wc-034-rejected-before-generic-put",
     )
     assert rejected.status_code == 201, rejected.text
+    assert rejected.json()["state"] == "rejected"
 
     payload = harness.manifest.model_dump(
         mode="json",
@@ -550,6 +551,152 @@ def test_rejected_split_candidate_cannot_bypass_decision_api_with_generic_put() 
     assert len(decisions) == 1
     assert decisions[0].decision.value == "reject"
     assert all(event.action.value != "draft_replaced" for event in audit)
+
+
+def test_rejected_split_candidate_cannot_become_global_role_with_generic_put() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal = _proposal(batch, require_multiple_members=True)
+    preview_body = _preview_body(
+        harness,
+        batch,
+        proposal_ids=[proposal["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-034-rejected-global-preview"),
+    )
+    assert preview.status_code == 200, preview.text
+
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject this exact split proposal before a global PUT.",
+        ),
+        "wc-034-rejected-before-global-put",
+    )
+    assert rejected.status_code == 201, rejected.text
+    assert rejected.json()["state"] == "rejected"
+
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_role = preview.json()["roleUpdates"][0]["role"]
+    matching_global = next(
+        role
+        for role in payload["roles"]
+        if role["roleId"] == candidate_role["roleId"]
+    )
+    payload["roles"][payload["roles"].index(matching_global)] = candidate_role
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    assert next(
+        role
+        for role in replacement.roles
+        if role.role_id == candidate_role["roleId"]
+    ).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    ) == candidate_role
+    command = ReplaceDraftCommand(
+        expected_revision=harness.draft_revision,
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=harness.draft_digest,
+        replacement_manifest=replacement,
+        replacement_digest=replacement.compatibility.artifact_digest,
+        reason="Attempt rejected selectors as the global role baseline",
+    )
+    bypass = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-rejected-candidate-global-put",
+        ),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert bypass.status_code == 422, bypass.text
+    assert bypass.json()["error"]["code"] == "manifest_validation_failed"
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == harness.draft_revision
+    assert draft.manifest == harness.manifest
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit = tx.list_audit(manifest_id=harness.manifest.manifest_id)
+    assert len(decisions) == 1
+    assert decisions[0].decision.value == "reject"
+    assert all(event.action.value != "draft_replaced" for event in audit)
+
+
+def test_generic_put_allows_global_role_non_selector_edit() -> None:
+    harness = _build_harness()
+    payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["ownership"].append(
+        {
+            "ownerRef": "synthetic-platform-owner",
+            "ownerRole": "technicalOwner",
+            "authorityRef": "synthetic://authority/platform",
+        }
+    )
+    worker = next(
+        role for role in payload["roles"] if role["roleId"] == "worker"
+    )
+    original_selectors = deepcopy(worker["selectors"])
+    worker["ownerRef"] = "synthetic-platform-owner"
+    replacement = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    command = ReplaceDraftCommand(
+        expected_revision=harness.draft_revision,
+        expected_manifest_version=harness.manifest.manifest_version,
+        expected_digest=harness.draft_digest,
+        replacement_manifest=replacement,
+        replacement_digest=replacement.compatibility.artifact_digest,
+        reason="Apply a legal global non-selector role edit",
+    )
+
+    response = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-legal-global-non-selector-put",
+        ),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["revision"] == harness.draft_revision + 1
+    updated_worker = next(
+        role
+        for role in response.json()["manifest"]["roles"]
+        if role["roleId"] == "worker"
+    )
+    assert updated_worker["ownerRef"] == "synthetic-platform-owner"
+    assert updated_worker["selectors"] == original_selectors
 
 
 def test_reject_survives_proposal_cache_regeneration_at_a_later_time() -> None:

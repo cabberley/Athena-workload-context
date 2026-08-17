@@ -65,6 +65,7 @@ from athena_context.contracts.manifest import (
     _resolve_manifest_profile_for_cohort_decision,
     canonicalize_manifest_payload,
     validate_manifest_selector_identity_inheritance,
+    validate_manifest_selector_identity_transition,
 )
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
@@ -290,6 +291,10 @@ class ContextService:
         try:
             profile = next(iter(replacement.profiles.values()))
             if capability is None:
+                validate_manifest_selector_identity_transition(
+                    current.manifest,
+                    replacement,
+                )
                 validate_manifest_selector_identity_inheritance(
                     replacement,
                 )
