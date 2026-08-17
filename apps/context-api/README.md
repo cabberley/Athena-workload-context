@@ -55,7 +55,9 @@ mutate it.
   mutation. Inheritance-topology changes cannot make approved selectors effective in another
   profile; selector-neutral inheritance and non-selector edits remain legal. Fresh drafts compare
   every effective profile, including profile additions and removals, with the authoritative
-  same-version draft or published predecessor before any baseline, audit, receipt, or draft write.
+  same-version draft, declared published predecessor, or single latest workload baseline before
+  any baseline, audit, receipt, or draft write. Missing, invalid, or ambiguous predecessor lineage
+  fails closed.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity
@@ -91,9 +93,10 @@ state. Submission repeats that check before and after server finalization, and p
 the approved candidate again. Exact selector identities introduced by a cohort decision remain
 resolvable only from their persisted apply provenance. Proposal resolution recovers that immutable
 provenance, and publication carries it through the published source draft into an exact
-selector-preserving next-version baseline. This permits legitimate proposal and lifecycle work
-without granting generic selector-change authority. Any failure leaves draft state, revision,
-audit, and idempotency receipts unchanged.
+selector-preserving next-version baseline. Published recovery recursively validates the complete
+`previous_version` lineage and deduplicates exact decision bindings, so that authority survives
+multiple successor versions without granting generic selector-change authority. Any failure leaves
+draft state, revision, audit, and idempotency receipts unchanged.
 
 Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and
 candidate cache, actor-scoped idempotency ports, and a decision transaction port spanning WC-007

@@ -26,6 +26,7 @@ from athena_context.api.domain import (
     ReplaceDraftCommand,
     Role,
     RoleGrant,
+    SupersedeCommand,
     TransitionCommand,
     WorkloadGrantScope,
 )
@@ -2524,7 +2525,118 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
     )
     assert next_validated.status_code == 200, next_validated.text
 
-    laundering_payload = next_manifest.model_dump(
+    next_submitted = harness.client.post(
+        f"/v1/drafts/{next_draft_id}/submit",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-submit",
+        ),
+        json=TransitionCommand(
+            expected_revision=next_validated.json()["revision"],
+            expected_manifest_version="1.0.1",
+            expected_digest=next_validated.json()["manifest_digest"],
+            reason="Submit the first carried selector provenance successor",
+        ).model_dump(mode="json"),
+    )
+    assert next_submitted.status_code == 200, next_submitted.text
+    next_approved = harness.client.post(
+        f"/v1/drafts/{next_draft_id}/approve",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-approve",
+        ),
+        json=TransitionCommand(
+            expected_revision=next_submitted.json()["revision"],
+            expected_manifest_version="1.0.1",
+            expected_digest=next_submitted.json()["manifest_digest"],
+            reason="Approve the first carried selector provenance successor",
+        ).model_dump(mode="json"),
+    )
+    assert next_approved.status_code == 200, next_approved.text
+    next_published = harness.client.post(
+        f"/v1/drafts/{next_draft_id}/publish",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-publish",
+        ),
+        json=PublishCommand(
+            expected_revision=next_approved.json()["revision"],
+            expected_manifest_version="1.0.1",
+            expected_digest=next_approved.json()["manifest_digest"],
+            approval_id=next_approved.json()["approval"]["decision_id"],
+            reason="Publish the first carried selector provenance successor",
+        ).model_dump(mode="json"),
+    )
+    assert next_published.status_code == 201, next_published.text
+
+    source = harness.lifecycle.get_draft(
+        HUMAN,
+        published.json()["source_draft_id"],
+    )
+    superseded = harness.client.post(
+        (
+            f"/v1/manifests/{source.manifest_id}/versions/"
+            f"{source.manifest.manifest_version}/supersede"
+        ),
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-source-supersede",
+        ),
+        json=SupersedeCommand(
+            expected_revision=source.revision,
+            expected_manifest_version=source.manifest.manifest_version,
+            expected_digest=source.manifest_digest,
+            replacement_version="1.0.1",
+            replacement_digest=next_published.json()["manifest_digest"],
+            reason="Supersede the source after publishing its first successor",
+        ).model_dump(mode="json"),
+    )
+    assert superseded.status_code == 200, superseded.text
+
+    second_payload = deepcopy(next_published.json()["manifest"])
+    second_payload["manifestVersion"] = "1.0.2"
+    second_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(second_payload)
+    )
+    second_draft_id = "draft-wc-034-approved-provenance-second"
+    second_created = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-second-create",
+        ),
+        json=CreateDraftCommand(
+            draft_id=second_draft_id,
+            manifest=second_manifest,
+            manifest_digest=second_manifest.compatibility.artifact_digest,
+            previous_version="1.0.1",
+            reason="Create a two-hop successor from approved selector provenance",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert second_created.status_code == 201, second_created.text
+    _register_persisted_profile(harness, draft_id=second_draft_id)
+    second_proposals = harness.client.get(
+        "/v1/cohort-proposals",
+        params=_params(harness),
+        headers=_headers(),
+    )
+    assert second_proposals.status_code == 200, second_proposals.text
+    second_validated = harness.client.post(
+        f"/v1/drafts/{second_draft_id}/validate",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-second-validate",
+        ),
+        json=TransitionCommand(
+            expected_revision=second_created.json()["revision"],
+            expected_manifest_version="1.0.2",
+            expected_digest=second_created.json()["manifest_digest"],
+            reason="Validate recursively recovered selector provenance",
+        ).model_dump(mode="json"),
+    )
+    assert second_validated.status_code == 200, second_validated.text
+
+    laundering_payload = second_manifest.model_dump(
         mode="json",
         by_alias=True,
         exclude_none=True,
@@ -2555,7 +2667,7 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
             manifest_digest=(
                 laundering_manifest.compatibility.artifact_digest
             ),
-            previous_version=published_manifest.manifest_version,
+            previous_version="1.0.1",
             reason=(
                 "Attempt fresh-draft effective selector laundering through "
                 "profile inheritance"
@@ -2577,6 +2689,159 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
             manifest_id=harness.manifest.manifest_id
         ) == decisions_before
         assert tx.get_receipt(HUMAN.actor_id, laundering_key) is None
+
+
+def test_higher_version_without_declared_lineage_cannot_change_effective_profiles(
+) -> None:
+    source_payload = (
+        fixture_factory.make_canonical_fixture_from_resources()
+        .manifest.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    )
+    production_worker = deepcopy(
+        next(
+            role
+            for role in source_payload["roles"]
+            if role["roleId"] == "worker"
+        )
+    )
+    production_worker["selectors"][0]["prefix"] = "athena-worker-prod-"
+    production_worker["selectors"][0]["maxMatches"] = 10
+    source_payload["profiles"]["production"]["roles"] = [
+        production_worker
+    ]
+    source_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(source_payload)
+    )
+    harness = _build_harness(manifest=source_manifest)
+
+    candidate_payload = source_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_payload["manifestVersion"] = "1.0.1"
+    candidate_payload["profiles"]["development"]["extends"] = "production"
+    candidate = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(candidate_payload)
+    )
+    draft_id = "draft-wc-034-missing-selector-lineage"
+    idempotency_key = "wc-034-missing-selector-lineage-create"
+    with harness.store.transaction() as tx:
+        drafts_before = tx.list_drafts(
+            manifest_id=source_manifest.manifest_id
+        )
+        baselines_before = tx.list_draft_selector_baselines(
+            manifest_id=source_manifest.manifest_id
+        )
+        audit_before = tx.list_audit(
+            manifest_id=source_manifest.manifest_id
+        )
+
+    response = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key=idempotency_key,
+        ),
+        json=CreateDraftCommand(
+            draft_id=draft_id,
+            manifest=candidate,
+            manifest_digest=candidate.compatibility.artifact_digest,
+            reason=(
+                "Attempt to change effective selectors without declared "
+                "published lineage"
+            ),
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    with harness.store.transaction() as tx:
+        assert tx.get_draft(draft_id) is None
+        assert tx.get_draft_selector_baseline(draft_id) is None
+        assert tx.list_drafts(
+            manifest_id=source_manifest.manifest_id
+        ) == drafts_before
+        assert tx.list_draft_selector_baselines(
+            manifest_id=source_manifest.manifest_id
+        ) == baselines_before
+        assert tx.list_audit(
+            manifest_id=source_manifest.manifest_id
+        ) == audit_before
+        assert tx.get_receipt(HUMAN.actor_id, idempotency_key) is None
+
+
+def test_higher_version_without_unambiguous_draft_lineage_fails_atomically(
+) -> None:
+    harness = _build_harness()
+    sibling_id = "draft-wc-034-ambiguous-lineage-sibling"
+    sibling = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-ambiguous-lineage-sibling-create",
+        ),
+        json=CreateDraftCommand(
+            draft_id=sibling_id,
+            manifest=harness.manifest,
+            manifest_digest=harness.manifest.compatibility.artifact_digest,
+            reason="Create a second synthetic draft at the same version",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert sibling.status_code == 201, sibling.text
+
+    candidate_payload = harness.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    candidate_payload["manifestVersion"] = "1.0.1"
+    candidate = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(candidate_payload)
+    )
+    candidate_id = "draft-wc-034-ambiguous-lineage-candidate"
+    idempotency_key = "wc-034-ambiguous-lineage-candidate-create"
+    with harness.store.transaction() as tx:
+        drafts_before = tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        )
+        baselines_before = tx.list_draft_selector_baselines(
+            manifest_id=harness.manifest.manifest_id
+        )
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    response = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(HUMAN, idempotency_key=idempotency_key),
+        json=CreateDraftCommand(
+            draft_id=candidate_id,
+            manifest=candidate,
+            manifest_digest=candidate.compatibility.artifact_digest,
+            reason="Reject ambiguous inferred selector predecessor lineage",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ambiguous_lookup"
+    with harness.store.transaction() as tx:
+        assert tx.get_draft(candidate_id) is None
+        assert tx.get_draft_selector_baseline(candidate_id) is None
+        assert tx.list_drafts(
+            manifest_id=harness.manifest.manifest_id
+        ) == drafts_before
+        assert tx.list_draft_selector_baselines(
+            manifest_id=harness.manifest.manifest_id
+        ) == baselines_before
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.get_receipt(HUMAN.actor_id, idempotency_key) is None
 
 
 def test_display_name_only_put_after_approved_split_preserves_selectors() -> None:

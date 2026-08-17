@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar
 
@@ -86,6 +87,12 @@ from athena_context.contracts.manifest import (
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
 
 
+@dataclass(frozen=True, slots=True)
+class _NewDraftSelectorReference:
+    manifest: CanonicalWorkloadManifest
+    selector_authority: PersistedSelectorAuthority | None
+
+
 def _version_key(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
     return (int(major), int(minor), int(patch))
@@ -153,6 +160,23 @@ class ContextService:
                 previous_version=command.previous_version,
             )
             now = self._now()
+            selector_reference = self._new_draft_selector_reference(
+                tx,
+                command.manifest,
+                previous_version=command.previous_version,
+                as_of=now,
+            )
+            selector_authority = (
+                None
+                if selector_reference is None
+                or selector_reference.selector_authority is None
+                else PersistedSelectorAuthority(
+                    bindings=selector_reference.selector_authority.bindings,
+                    effective_manifest_version=(
+                        command.manifest.manifest_version
+                    ),
+                )
+            )
             selector_baseline = DraftSelectorBaseline.capture(
                 draft_id=command.draft_id,
                 manifest=command.manifest,
@@ -163,34 +187,17 @@ class ContextService:
             self._validate_new_draft_selector_baseline(
                 tx,
                 selector_baseline,
-                previous_version=command.previous_version,
+                selector_reference=selector_reference,
             )
-            selector_authority = None
-            if command.previous_version is not None:
-                previous = tx.get_published(
-                    manifest_id,
-                    command.previous_version,
-                )
-                if previous is not None:
-                    selector_authority = (
-                        persisted_selector_authority_for_published(
-                            tx,
-                            published=previous,
-                            effective_manifest_version=(
-                                command.manifest.manifest_version
-                            ),
-                        )
-                    )
             self._validate_generic_manifest_profiles(
                 command.manifest,
                 as_of=now,
                 selector_authority=selector_authority,
             )
             self._validate_new_draft_effective_selector_provenance(
-                tx,
                 command.manifest,
-                previous_version=command.previous_version,
                 as_of=now,
+                selector_reference=selector_reference,
                 selector_authority=selector_authority,
             )
             draft = DraftRecord(
@@ -628,7 +635,7 @@ class ContextService:
         tx: ContextTransactionPort,
         candidate: DraftSelectorBaseline,
         *,
-        previous_version: str | None,
+        selector_reference: _NewDraftSelectorReference | None,
     ) -> None:
         same_version = tx.list_draft_selector_baselines(
             manifest_id=candidate.manifest_id,
@@ -646,22 +653,11 @@ class ContextService:
             )
         if same_version:
             return
-        expected_entries = None
-        if previous_version is not None:
-            previous = tx.get_published(
-                candidate.manifest_id,
-                previous_version,
-            )
-            if previous is not None:
-                expected_entries = manifest_selector_provenance(
-                    previous.manifest
-                )
-        if expected_entries is None:
-            workload_baselines = tx.list_draft_selector_baselines(
-                manifest_id=candidate.manifest_id,
-            )
-            if workload_baselines:
-                expected_entries = workload_baselines[0].entries
+        expected_entries = (
+            None
+            if selector_reference is None
+            else manifest_selector_provenance(selector_reference.manifest)
+        )
         if (
             expected_entries is not None
             and candidate.entries != expected_entries
@@ -673,59 +669,22 @@ class ContextService:
 
     @staticmethod
     def _validate_new_draft_effective_selector_provenance(
-        tx: ContextTransactionPort,
         manifest: CanonicalWorkloadManifest,
         *,
-        previous_version: str | None,
         as_of: datetime,
+        selector_reference: _NewDraftSelectorReference | None,
         selector_authority: PersistedSelectorAuthority | None,
     ) -> None:
         """Keep every effective profile bound to its authoritative predecessor."""
 
-        reference_manifest: CanonicalWorkloadManifest | None = None
-        reference_authority: PersistedSelectorAuthority | None = None
-        if previous_version is not None:
-            published = tx.get_published(
-                manifest.manifest_id,
-                previous_version,
-            )
-            if published is not None:
-                reference_manifest = published.manifest
-                reference_authority = (
-                    persisted_selector_authority_for_published(
-                        tx,
-                        published=published,
-                        effective_manifest_version=(
-                            published.manifest.manifest_version
-                        ),
-                    )
-                )
-        else:
-            same_version = tx.list_draft_selector_baselines(
-                manifest_id=manifest.manifest_id,
-                manifest_version=manifest.manifest_version,
-            )
-            if same_version:
-                reference = tx.get_draft(same_version[0].draft_id)
-                if reference is None:
-                    raise PersistenceConflictError(
-                        "selector baseline references a missing draft"
-                    )
-                reference_manifest = reference.manifest
-                reference_authority = (
-                    persisted_selector_authority_for_draft(
-                        tx,
-                        current=reference,
-                    )
-                )
-        if reference_manifest is None:
+        if selector_reference is None:
             return
 
         try:
             expected = ContextService._resolve_effective_selector_provenance(
-                reference_manifest,
+                selector_reference.manifest,
                 as_of=as_of,
-                selector_authority=reference_authority,
+                selector_authority=selector_reference.selector_authority,
             )
             actual = ContextService._resolve_effective_selector_provenance(
                 manifest,
@@ -741,6 +700,109 @@ class ContextService:
                 "a fresh draft cannot add, remove, or change effective profile "
                 "selectors without exact persisted cohort decision provenance"
             )
+
+    @staticmethod
+    def _new_draft_selector_reference(
+        tx: ContextTransactionPort,
+        manifest: CanonicalWorkloadManifest,
+        *,
+        previous_version: str | None,
+        as_of: datetime,
+    ) -> _NewDraftSelectorReference | None:
+        """Resolve one authoritative selector predecessor before draft writes."""
+
+        if previous_version is not None:
+            published = tx.get_published(
+                manifest.manifest_id,
+                previous_version,
+            )
+            if published is None:
+                raise PersistenceConflictError(
+                    "declared selector predecessor is missing"
+                )
+            return _NewDraftSelectorReference(
+                manifest=published.manifest,
+                selector_authority=(
+                    persisted_selector_authority_for_published(
+                        tx,
+                        published=published,
+                        effective_manifest_version=(
+                            published.manifest.manifest_version
+                        ),
+                    )
+                ),
+            )
+
+        workload_baselines = tx.list_draft_selector_baselines(
+            manifest_id=manifest.manifest_id,
+        )
+        if not workload_baselines:
+            return None
+
+        same_version = [
+            baseline
+            for baseline in workload_baselines
+            if baseline.manifest_version == manifest.manifest_version
+        ]
+        if same_version:
+            candidates = same_version
+        else:
+            predecessor_versions = {
+                baseline.manifest_version
+                for baseline in workload_baselines
+                if _version_key(baseline.manifest_version)
+                < _version_key(manifest.manifest_version)
+            }
+            if not predecessor_versions:
+                raise VersionMismatchError(
+                    "new manifest version has no earlier selector predecessor"
+                )
+            latest_version = max(predecessor_versions, key=_version_key)
+            candidates = [
+                baseline
+                for baseline in workload_baselines
+                if baseline.manifest_version == latest_version
+            ]
+        if len(candidates) != 1:
+            raise AmbiguousLookupError(
+                "selector predecessor lineage has multiple candidate drafts"
+            )
+
+        baseline = candidates[0]
+        reference = tx.get_draft(baseline.draft_id)
+        if (
+            reference is None
+            or reference.manifest_id != manifest.manifest_id
+            or reference.manifest.manifest_id != manifest.manifest_id
+            or reference.manifest.manifest_version
+            != baseline.manifest_version
+        ):
+            raise PersistenceConflictError(
+                "selector predecessor baseline is inconsistent"
+            )
+        authority = persisted_selector_authority_for_draft(
+            tx,
+            current=reference,
+        )
+        try:
+            ContextService._validate_manifest_selector_provenance(
+                baseline,
+                reference.manifest,
+                authority,
+            )
+            ContextService._validate_generic_manifest_profiles(
+                reference.manifest,
+                as_of=as_of,
+                selector_authority=authority,
+            )
+        except AthenaValidationError as exc:
+            raise ManifestValidationError(
+                "selector predecessor provenance is not valid"
+            ) from exc
+        return _NewDraftSelectorReference(
+            manifest=reference.manifest,
+            selector_authority=authority,
+        )
 
     @staticmethod
     def _require_selector_baseline(
