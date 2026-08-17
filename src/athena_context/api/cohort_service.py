@@ -64,14 +64,19 @@ from athena_context.binding.domain import (
 )
 from athena_context.contracts.common import AthenaValidationError, compute_artifact_digest
 from athena_context.contracts.manifest import (
+    AtomicSelector,
+    CompositeAllSelector,
+    CompositeAnySelector,
     ManifestRole,
     ManifestSelector,
     ResolvedManifestProfile,
     ResourceIdListSelector,
+    is_guarded_selector_replacement_narrower,
     resolve_manifest_profile,
 )
 from athena_context.contracts.models import EvidenceSnapshot, ResourceEvidenceRecord
 
+_ATOMIC_SELECTOR_ADAPTER: TypeAdapter[AtomicSelector] = TypeAdapter(AtomicSelector)
 _SELECTOR_ADAPTER: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_PROPOSALS = 200
@@ -726,6 +731,7 @@ class CohortProposalService:
         if len(source_members) > 1000:
             raise CohortBoundaryError("preview source union exceeds 1,000 members")
         resources = _resource_records(resolved.snapshot)
+        baseline = proposals[0].role
         if request.action == "split":
             previews = self._split_previews(
                 source_members,
@@ -738,7 +744,11 @@ class CohortProposalService:
                 request=request,
                 resources=resources,
             )
-        baseline = proposals[0].role
+        previews = self._guard_selector_replacements(
+            previews,
+            baseline=baseline,
+            resources=resources,
+        )
         role_payload = baseline.model_dump(
             mode="python",
             by_alias=True,
@@ -886,6 +896,142 @@ class CohortProposalService:
         return previews
 
     @staticmethod
+    def _guard_selector_replacements(
+        previews: list[SelectorPreview],
+        *,
+        baseline: ManifestRole,
+        resources: list[ResourceEvidenceRecord],
+    ) -> list[SelectorPreview]:
+        """Bind every exact selector to one inherited atomic selector."""
+
+        inherited_results: list[tuple[ManifestSelector, set[str]]] = []
+        for selector in baseline.selectors:
+            try:
+                result = evaluate_selector(selector, resources)
+            except AthenaValidationError:
+                continue
+            if result.status == "matched" and not result.max_match_violations:
+                inherited_results.append(
+                    (
+                        selector,
+                        {
+                            normalize_resource_id(resource_id)
+                            for resource_id in result.matched_resource_ids
+                        },
+                    )
+                )
+
+        guarded: list[SelectorPreview] = []
+        for preview in previews:
+            if isinstance(
+                preview.selector,
+                (CompositeAllSelector, CompositeAnySelector),
+            ):
+                raise CohortContractError(
+                    "cohort replacement requires an exact atomic selector"
+                )
+            members = {
+                normalize_resource_id(resource_id)
+                for resource_id in preview.matched_resource_ids
+            }
+            guards = [
+                selector
+                for selector, inherited_members in inherited_results
+                if members.issubset(inherited_members)
+            ]
+            if len(guards) != 1:
+                raise CohortContractError(
+                    "cohort replacement is not bound to exactly one inherited selector"
+                )
+            guard = guards[0]
+            guard_atoms: list[AtomicSelector]
+            if isinstance(guard, CompositeAllSelector):
+                guard_atoms = list(guard.children)
+            elif isinstance(guard, CompositeAnySelector):
+                matching_atoms: list[AtomicSelector] = []
+                for child in guard.children:
+                    try:
+                        child_result = evaluate_selector(child, resources)
+                    except AthenaValidationError:
+                        continue
+                    child_members = {
+                        normalize_resource_id(resource_id)
+                        for resource_id in child_result.matched_resource_ids
+                    }
+                    if (
+                        not child_result.max_match_violations
+                        and members.issubset(child_members)
+                    ):
+                        matching_atoms.append(child)
+                if len(matching_atoms) != 1:
+                    raise CohortContractError(
+                        "cohort replacement is not bound to exactly one "
+                        "inherited composite alternative"
+                    )
+                guard_atoms = matching_atoms
+            else:
+                guard_atoms = [guard]
+            if len(guard_atoms) >= 10:
+                raise CohortContractError(
+                    "cohort replacement exceeds the guarded selector child bound"
+                )
+            seed = compute_artifact_digest(
+                {
+                    "replacementSelectorId": preview.selector.selector_id,
+                    "guardSelectorId": guard.selector_id,
+                    "members": sorted(members),
+                }
+            )[7:31]
+            guard_children: list[AtomicSelector] = []
+            for index, guard_atom in enumerate(guard_atoms, start=1):
+                guard_payload = guard_atom.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                guard_payload["selectorId"] = (
+                    f"cohort-guard-{index:02d}-{seed}"
+                )
+                guard_children.append(
+                    _ATOMIC_SELECTOR_ADAPTER.validate_python(guard_payload)
+                )
+            exact_payload = preview.selector.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+            exact_payload["selectorId"] = f"cohort-exact-{seed}"
+            exact_child = _ATOMIC_SELECTOR_ADAPTER.validate_python(
+                exact_payload
+            )
+            guarded_selector = CompositeAllSelector(
+                selectorType="compositeAll",
+                selectorId=preview.selector.selector_id,
+                children=sorted(
+                    [exact_child, *guard_children],
+                    key=lambda child: child.selector_id.casefold(),
+                ),
+                maxMatches=preview.max_matches,
+            )
+            guarded_preview = CohortProposalService._evaluate_exact_preview(
+                guarded_selector,
+                resources,
+            )
+            if guarded_preview.matched_resource_ids != preview.matched_resource_ids:
+                raise CohortContractError(
+                    "guarded cohort selector changed the exact reviewed membership"
+                )
+            guarded.append(guarded_preview)
+        if not is_guarded_selector_replacement_narrower(
+            baseline.selectors,
+            [preview.selector for preview in guarded],
+        ):
+            raise CohortContractError(
+                "cohort replacement is not a provably narrower guarded selector set"
+            )
+        return guarded
+
+    @staticmethod
     def _evaluate_exact_preview(
         selector: ManifestSelector,
         resources: list[ResourceEvidenceRecord],
@@ -925,6 +1071,13 @@ class CohortProposalService:
             if _authority_projection(update.role) != _authority_projection(baseline):
                 raise CohortContractError(
                     "preview attempted to alter role kind, cardinality, owner, or status"
+                )
+            if not is_guarded_selector_replacement_narrower(
+                baseline.selectors,
+                update.role.selectors,
+            ):
+                raise CohortContractError(
+                    "preview selector replacement is not canonically guarded"
                 )
             update_union: set[str] = set()
             for preview in update.selector_previews:

@@ -68,6 +68,7 @@ from athena_context.contracts.manifest import (
     ManifestRole,
     ResolvedManifestProfile,
     canonicalize_manifest_payload,
+    is_guarded_selector_replacement_narrower,
     resolve_manifest_profile,
 )
 from athena_context.contracts.models import ResourceEvidenceRecord
@@ -591,6 +592,16 @@ class CohortDecisionService:
             if _authority_projection(update.role) != _authority_projection(baseline):
                 raise CohortContractError(
                     "candidate attempted to alter role kind, cardinality, owner, or status"
+                )
+            if request.action in {
+                CohortDecisionKind.SPLIT,
+                CohortDecisionKind.MERGE,
+            } and not is_guarded_selector_replacement_narrower(
+                baseline.selectors,
+                update.role.selectors,
+            ):
+                raise CohortContractError(
+                    "split or merge candidate is not a guarded exact selector replacement"
                 )
             update_union: set[str] = set()
             for preview in update.selector_previews:

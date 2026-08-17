@@ -1730,6 +1730,45 @@ def test_direct_selector_control_and_applicability_weakening_fail_closed() -> No
         )
 
 
+@pytest.mark.parametrize(
+    "replacement_selector",
+    [
+        {
+            "selectorType": "namePredicate",
+            "selectorId": "replacement-broad",
+            "prefix": "athena-worker",
+            "maxMatches": 1000,
+        },
+        {
+            "selectorType": "resourceIdList",
+            "selectorId": "replacement-explicit",
+            "resourceIds": [f"{RESOURCE_PREFIX}athena-worker-001"],
+            "maxMatches": 1,
+        },
+    ],
+    ids=["broadening", "unguarded-new-identity"],
+)
+def test_generic_disjoint_selector_replacement_fails_closed(
+    replacement_selector: dict[str, object],
+) -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    worker = next(role for role in payload["roles"] if role["roleId"] == "worker")
+    worker["selectors"][0]["maxMatches"] = 20
+    replacement = deepcopy(worker)
+    replacement["selectors"] = [replacement_selector]
+    payload["profiles"]["production"]["roles"] = [replacement]
+
+    with pytest.raises(
+        AthenaValidationError,
+        match="not a provably narrower guarded replacement",
+    ):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
 def test_inherited_control_fields_require_exact_governance_and_keep_provenance() -> None:
     def development_backup() -> dict[str, object]:
         control = _control_payload("backup")

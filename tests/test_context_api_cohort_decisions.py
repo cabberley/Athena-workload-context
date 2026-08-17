@@ -952,7 +952,15 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
     assert {
         selector["selectorType"]
         for selector in split_preview.json()["roleUpdates"][0]["role"]["selectors"]
-    } == {"resourceIdList"}
+    } == {"compositeAll"}
+    assert all(
+        {
+            child["selectorType"]
+            for child in selector["children"]
+        }
+        == {"namePredicate", "resourceIdList"}
+        for selector in split_preview.json()["roleUpdates"][0]["role"]["selectors"]
+    )
     assert {
         selector["selectorId"]
         for selector in split_preview.json()["roleUpdates"][0]["role"]["selectors"]
@@ -1055,7 +1063,15 @@ def test_split_and_merge_apply_exact_profile_local_selector_replacements() -> No
     assert {
         selector["selectorType"]
         for selector in merge_preview.json()["roleUpdates"][0]["role"]["selectors"]
-    } == {"resourceIdList"}
+    } == {"compositeAll"}
+    assert all(
+        {
+            child["selectorType"]
+            for child in selector["children"]
+        }
+        == {"namePredicate", "resourceIdList"}
+        for selector in merge_preview.json()["roleUpdates"][0]["role"]["selectors"]
+    )
     assert {
         selector["selectorId"]
         for selector in merge_preview.json()["roleUpdates"][0]["role"]["selectors"]

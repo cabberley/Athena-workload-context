@@ -27,11 +27,12 @@ mutate it.
   `approve`, `reject`, `split`, or `merge` decision. Apply decisions revalidate the exact batch,
   proposal union, snapshot, profile, source draft, and immutable candidate before invoking the
   WC-007 `ContextService` selector-only replacement inside the same storage transaction.
-  The replacement materializes only a requested-profile local, complete role override. A
-  canonical disjoint selector-ID set represents an exact selector-set replacement, allowing the
-  final split/merge selectors shown during preview without post-approval transformation. It
-  preserves role authority, never edits an ancestor or global role, and rejects candidates that
-  cannot satisfy canonical weakening-governance rules. Every profile is
+  The replacement materializes only a requested-profile local, complete role override. Generic
+  disjoint selector identities fail closed. Split/merge preview instead emits final guarded
+  conjunctions whose inherited selector child proves narrowing and whose exact child binds the
+  reviewed cohort; the candidate is actor scoped and applied without post-approval transformation.
+  It preserves role authority, never edits an ancestor or global role, and rejects candidates
+  that cannot satisfy canonical weakening-governance rules. Every profile is
   resolved before and after; any non-target role or semantic-digest change fails closed.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any

@@ -1398,10 +1398,37 @@ def _selector_override_is_narrower(
     previous: ManifestSelector | AtomicSelector,
     current: ManifestSelector | AtomicSelector,
 ) -> bool:
-    if (
-        previous.selector_type != current.selector_type
-        or current.max_matches > previous.max_matches
-    ):
+    if current.max_matches > previous.max_matches:
+        return False
+    if isinstance(current, CompositeAllSelector):
+        # A conjunction remains within an inherited selector when it retains
+        # every inherited conjunct, one inherited alternative, or the complete
+        # semantics of an inherited atomic selector.
+        if isinstance(previous, CompositeAllSelector):
+            return all(
+                any(
+                    _selector_override_is_narrower(
+                        previous_child,
+                        current_child,
+                    )
+                    for current_child in current.children
+                )
+                for previous_child in previous.children
+            )
+        if isinstance(previous, CompositeAnySelector):
+            return any(
+                _selector_override_is_narrower(
+                    previous_child,
+                    current_child,
+                )
+                for previous_child in previous.children
+                for current_child in current.children
+            )
+        return any(
+            _selector_override_is_narrower(previous, child)
+            for child in current.children
+        )
+    if previous.selector_type != current.selector_type:
         return False
     if isinstance(previous, ResourceIdListSelector) and isinstance(
         current, ResourceIdListSelector
@@ -1506,6 +1533,34 @@ def _selector_override_is_narrower(
             for child_id in previous_children
         )
     return False
+
+
+def is_guarded_selector_replacement_narrower(
+    previous: list[ManifestSelector],
+    current: list[ManifestSelector],
+) -> bool:
+    """Return whether a complete selector replacement is provably narrowing.
+
+    New selector identities are accepted only as guarded conjunctions. Each
+    conjunction must retain one inherited selector's complete semantics, and
+    the aggregate match bound cannot increase. Raw disjoint selectors remain
+    invalid even when their identifiers or payloads appear innocuous.
+    """
+
+    return (
+        bool(previous)
+        and bool(current)
+        and all(isinstance(selector, CompositeAllSelector) for selector in current)
+        and sum(selector.max_matches for selector in current)
+        <= sum(selector.max_matches for selector in previous)
+        and all(
+            any(
+                _selector_override_is_narrower(inherited, replacement)
+                for inherited in previous
+            )
+            for replacement in current
+        )
+    )
 
 
 def _normalized_filters_overlap(left: list[str], right: list[str]) -> bool:
@@ -1742,14 +1797,17 @@ def _validate_inherited_semantics(
             _normalized_id(item.selector_id): item for item in current.selectors
         }
         if current_selectors.keys() != previous_selectors.keys():
-            if previous_selectors.keys().isdisjoint(current_selectors.keys()):
-                # A wholly new selector identity set is a complete role-local
-                # replacement. Partial overlap remains ambiguous because it
-                # would mix patch and replacement semantics.
+            if (
+                previous_selectors.keys().isdisjoint(current_selectors.keys())
+                and is_guarded_selector_replacement_narrower(
+                    list(previous_selectors.values()),
+                    list(current_selectors.values()),
+                )
+            ):
                 continue
             raise AthenaValidationError(
-                f"partial selector set replacement is ambiguous for inherited role "
-                f"{current.role_id}"
+                f"direct selector set replacement is not a provably narrower "
+                f"guarded replacement for inherited role {current.role_id}"
             )
         for selector_id, previous_selector in previous_selectors.items():
             current_selector = current_selectors[selector_id]
@@ -1938,15 +1996,23 @@ def _merge_keyed[T: AthenaBaseModel](
                 _normalized_id(selector.selector_id)
                 for selector in item.selectors
             }
-            selectors = (
-                list(item.selectors)
-                if previous_selector_ids.isdisjoint(local_selector_ids)
-                else _merge_keyed(
+            if previous_selector_ids.isdisjoint(local_selector_ids):
+                if not is_guarded_selector_replacement_narrower(
+                    list(previous.selectors),
+                    list(item.selectors),
+                ):
+                    raise AthenaValidationError(
+                        "direct selector set replacement is not a provably "
+                        f"narrower guarded replacement for inherited role "
+                        f"{item.role_id}"
+                    )
+                selectors = list(item.selectors)
+            else:
+                selectors = _merge_keyed(
                     list(previous.selectors),
                     list(item.selectors),
                     key_attribute="selector_id",
                 )
-            )
             payload = item.model_dump(mode="python", by_alias=True)
             payload["selectors"] = selectors
             item = ManifestRole.model_validate(payload)  # type: ignore[assignment]
@@ -3507,6 +3573,7 @@ __all__ = [
     "EvidenceContextVerifier",
     "GovernedWeakeningOverride",
     "ImageSelector",
+    "is_guarded_selector_replacement_narrower",
     "LoadBalancerBackendSelector",
     "ManifestConstraint",
     "ManifestControl",
