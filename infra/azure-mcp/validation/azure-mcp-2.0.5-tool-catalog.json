@@ -1,20 +1,50 @@
 {
   "schemaVersion": "1.0",
   "serverVersion": "2.0.5",
+  "package": {
+    "name": "@azure/mcp",
+    "version": "2.0.5",
+    "distShasum": "452a78462f94a97317ce017219d4db58c6499e01",
+    "repository": "https://github.com/microsoft/mcp.git"
+  },
   "image": {
     "repository": "mcr.microsoft.com/azure-sdk/azure-mcp",
-    "manifestDigest": "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a"
+    "tag": "2.0.5",
+    "manifestDigest": "sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a",
+    "amd64ManifestDigest": "sha256:794bc5b27979af6b1699a9031622df6e42270ba48079089b83bb90776e8a2db6",
+    "amd64ConfigDigest": "sha256:869717c98f63ed683af8913e817a9f336b1722e3f224e40231a3a18ba9ddc85a",
+    "sourceRevisionLabel": {
+      "name": "com.azure.dev.image.build.sourceversion",
+      "value": "2712e19ddf1c55f8e73ead8fb671915ec92801cc"
+    }
+  },
+  "source": {
+    "repository": "https://github.com/microsoft/mcp",
+    "revision": "2712e19ddf1c55f8e73ead8fb671915ec92801cc",
+    "releaseVersion": "2.0.5",
+    "releaseVersionSource": "servers/Azure.Mcp.Server/CHANGELOG.md",
+    "releaseVersionEvidence": "## 2.0.5 (2026-07-09)",
+    "gitBlobs": {
+      "servers/Azure.Mcp.Server/CHANGELOG.md": "8855f9e6bfd5e181952d90ea3a36f7e2fce2c02d",
+      "core/Microsoft.Mcp.Core/src/Areas/Server/Commands/ServiceStartCommand.cs": "6d20d0ab6ec9d57168785ad96f2750ecf641ddd0",
+      "core/Microsoft.Mcp.Core/src/Commands/CommandFactory.cs": "670e2d733aa3cfc4a7c3c7e673e141a67397502b",
+      "core/Microsoft.Mcp.Core/src/Areas/Server/Commands/ToolLoading/CommandFactoryToolLoader.cs": "7fd58903eb8d550c3393b5567aaae4c43421553e"
+    }
   },
   "httpRoute": "/",
   "provenance": {
     "package": "@azure/mcp@2.0.5",
     "catalogCommand": "npx -y @azure/mcp@2.0.5 tools list",
     "catalogRecordCount": 235,
-    "catalogCanonicalSha256": "2629c825868a1456c2370bf31f160ae0779a65e3971d19d9103a1cc41b019c29",
-    "sourceRepository": "https://github.com/microsoft/mcp",
-    "sourceCommit": "f43b47a21545e5f3f87b3bceee35986442217bb4",
+    "catalogHashScope": "results",
+    "catalogCanonicalization": "UTF-8 JSON; keys sorted; compact separators; array order preserved",
+    "catalogCanonicalSha256": "032b52ae4214b9df410182292b2bf0a82f9a84eec7b64cc5c8c40f726c4d4a0c",
     "routeSource": "core/Microsoft.Mcp.Core/src/Areas/Server/Commands/ServiceStartCommand.cs",
     "routeMapping": "app.MapMcp()",
+    "toolNameSource": "core/Microsoft.Mcp.Core/src/Commands/CommandFactory.cs",
+    "toolNameSeparator": "_",
+    "toolExposureSource": "core/Microsoft.Mcp.Core/src/Areas/Server/Commands/ToolLoading/CommandFactoryToolLoader.cs",
+    "toolExposureAssignment": "Name = fullName",
     "retrievedAt": "2026-08-17T00:01:53Z"
   },
   "tools": [

@@ -51,7 +51,6 @@ def test_http_endpoint_uses_pinned_server_root_route() -> None:
     assert TOOL_CATALOG["httpRoute"] == "/"
     assert provenance["routeMapping"] == "app.MapMcp()"
     assert provenance["routeSource"].endswith("ServiceStartCommand.cs")
-    assert re.fullmatch(r"[0-9a-f]{40}", provenance["sourceCommit"])
     assert (
         "output internalEndpoint string = "
         "'https://${azureMcp.properties.configuration.ingress.fqdn}'"
@@ -62,11 +61,33 @@ def test_http_endpoint_uses_pinned_server_root_route() -> None:
 
 
 def test_image_is_reviewed_and_immutable() -> None:
+    package = TOOL_CATALOG["package"]
     image = TOOL_CATALOG["image"]
-    assert TOOL_CATALOG["serverVersion"] == "2.0.5"
-    assert f"param azureMcpVersion string = '{TOOL_CATALOG['serverVersion']}'" in MAIN
+    source = TOOL_CATALOG["source"]
+    version = TOOL_CATALOG["serverVersion"]
+    assert version == package["version"] == image["tag"] == source["releaseVersion"]
+    assert package["name"] == "@azure/mcp"
+    assert package["repository"] == f"{source['repository']}.git"
+    assert re.fullmatch(r"[0-9a-f]{40}", package["distShasum"])
+    assert source["revision"] == image["sourceRevisionLabel"]["value"]
+    assert source["revision"] == "2712e19ddf1c55f8e73ead8fb671915ec92801cc"
+    assert image["sourceRevisionLabel"]["name"] == (
+        "com.azure.dev.image.build.sourceversion"
+    )
+    assert source["releaseVersionEvidence"].startswith(f"## {version} ")
+    assert set(source["gitBlobs"]) == {
+        source["releaseVersionSource"],
+        TOOL_CATALOG["provenance"]["routeSource"],
+        TOOL_CATALOG["provenance"]["toolNameSource"],
+        TOOL_CATALOG["provenance"]["toolExposureSource"],
+    }
+    assert all(
+        re.fullmatch(r"[0-9a-f]{40}", blob_id)
+        for blob_id in source["gitBlobs"].values()
+    )
+    assert f"param azureMcpVersion string = '{version}'" in MAIN
     assert image["manifestDigest"] in MAIN
-    assert "@allowed([\n  '2.0.5'\n])" in MAIN
+    assert f"@allowed([\n  '{version}'\n])" in MAIN
     assert "azureMcpVersion}@${azureMcpImageDigest}" in CONTAINER_APP
     assert ":latest" not in "\n".join(
         path.read_text(encoding="utf-8") for path in MCP_ROOT.rglob("*.bicep")
@@ -76,14 +97,18 @@ def test_image_is_reviewed_and_immutable() -> None:
 def test_pinned_tool_catalog_has_runtime_provenance() -> None:
     provenance = TOOL_CATALOG["provenance"]
     tools = TOOL_CATALOG["tools"]
-    assert provenance["package"] == "@azure/mcp@2.0.5"
-    assert provenance["catalogCommand"] == "npx -y @azure/mcp@2.0.5 tools list"
+    package_label = f"{TOOL_CATALOG['package']['name']}@{TOOL_CATALOG['package']['version']}"
+    assert provenance["package"] == package_label
+    assert provenance["catalogCommand"] == f"npx -y {package_label} tools list"
     assert provenance["catalogRecordCount"] == 235
+    assert provenance["catalogHashScope"] == "results"
+    assert "keys sorted" in provenance["catalogCanonicalization"]
     assert (
         provenance["catalogCanonicalSha256"]
-        == "2629c825868a1456c2370bf31f160ae0779a65e3971d19d9103a1cc41b019c29"
+        == "032b52ae4214b9df410182292b2bf0a82f9a84eec7b64cc5c8c40f726c4d4a0c"
     )
-    assert provenance["sourceCommit"] == "f43b47a21545e5f3f87b3bceee35986442217bb4"
+    assert provenance["toolNameSeparator"] == "_"
+    assert provenance["toolExposureAssignment"] == "Name = fullName"
     assert len(tools) == 7
     assert len({tool["id"] for tool in tools}) == len(tools)
     assert len({tool["name"] for tool in tools}) == len(tools)
