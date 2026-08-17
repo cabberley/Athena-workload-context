@@ -15,6 +15,7 @@ from athena_context.api.domain import (
     PublishedManifest,
     RoleGrant,
     Supersession,
+    ensure_timestamp,
 )
 from athena_context.api.errors import (
     AlreadySupersededError,
@@ -25,8 +26,11 @@ from athena_context.api.errors import (
     StaleRevisionError,
 )
 from athena_context.api.evaluation_domain import DemoEvaluationApproval
-from athena_context.api.evaluation_ports import StoredEvaluation
-from athena_context.api.ports import ContextTransactionPort
+from athena_context.api.evaluation_ports import (
+    EvaluationArtifactFactory,
+    StoredEvaluation,
+)
+from athena_context.api.ports import ClockPort, ContextTransactionPort
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -37,9 +41,14 @@ def _version_key(version: str) -> tuple[int, int, int]:
 class InMemoryContextStore:
     """Transactional, deterministic in-memory implementation of the storage port."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        authoritative_clock: ClockPort | None = None,
+    ) -> None:
         self._transaction_lock = InMemoryTransactionLock()
         self._lock = self._transaction_lock.lock
+        self._authoritative_clock = authoritative_clock
         self._drafts: dict[str, DraftRecord] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
@@ -54,6 +63,9 @@ class InMemoryContextStore:
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
+
+    def _before_evaluation_commit_timestamp(self) -> None:
+        """Test seam for delay inside persistence before authoritative time."""
 
 
 class InMemoryTransactionLock:
@@ -322,7 +334,19 @@ class _MemoryTransaction(ContextTransactionPort):
     ) -> StoredEvaluation | None:
         return self._evaluation_artifacts.get(snapshot_id)
 
-    def put_evaluation(self, artifact: StoredEvaluation) -> None:
+    def put_evaluation_conditionally(
+        self,
+        artifact_factory: EvaluationArtifactFactory,
+    ) -> StoredEvaluation:
+        clock = self._store._authoritative_clock
+        if clock is None:
+            raise RuntimeError(
+                "evaluation persistence has no authoritative commit clock"
+            )
+        # Any storage wait happens before the timestamp. The callback is a pure,
+        # transaction-local finalizer, and the insert below has no external hook.
+        self._store._before_evaluation_commit_timestamp()
+        artifact = artifact_factory(ensure_timestamp(clock.now()))
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
         if receipt_key in self._evaluation_receipts:
             raise IdempotencyConflictError(
@@ -335,6 +359,7 @@ class _MemoryTransaction(ContextTransactionPort):
         self._evaluation_receipts[receipt_key] = artifact
         self._evaluation_artifacts[artifact.snapshot_id] = artifact
         self._dirty = True
+        return artifact
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
         return tuple(

@@ -59,6 +59,12 @@ class DemoEvaluationTrustConfiguration:
     key_resolver: TrustedKeyResolver
 
 
+class EvaluationArtifactFactory(Protocol):
+    """Pure finalizer invoked with the persistence-owned commit timestamp."""
+
+    def __call__(self, published_at: datetime) -> StoredEvaluation: ...
+
+
 @runtime_checkable
 class EvaluationAuthorityTransactionPort(Protocol):
     """Evaluation state implemented by the actual Context API transaction."""
@@ -95,7 +101,12 @@ class EvaluationAuthorityTransactionPort(Protocol):
         snapshot_id: str,
     ) -> StoredEvaluation | None: ...
 
-    def put_evaluation(self, artifact: StoredEvaluation) -> None: ...
+    def put_evaluation_conditionally(
+        self,
+        artifact_factory: EvaluationArtifactFactory,
+    ) -> StoredEvaluation:
+        """Finalize and insert after obtaining authoritative persistence time."""
+        ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
 
@@ -146,7 +157,10 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
 
     def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None: ...
 
-    def insert_evaluation(self, artifact: StoredEvaluation) -> None: ...
+    def insert_evaluation_conditionally(
+        self,
+        artifact_factory: EvaluationArtifactFactory,
+    ) -> StoredEvaluation: ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
 
@@ -202,6 +216,7 @@ class SnapshotSigningPort(Protocol):
 
 __all__ = [
     "ConfiguredEvidenceClientPort",
+    "EvaluationArtifactFactory",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",

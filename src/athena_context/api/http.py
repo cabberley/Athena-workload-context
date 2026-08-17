@@ -128,11 +128,14 @@ def create_app(
         )
     default_store: InMemoryContextStore | None = None
     if service is None:
-        default_store = InMemoryContextStore()
+        default_clock = SystemClock()
+        default_store = InMemoryContextStore(
+            authoritative_clock=default_clock,
+        )
         service = ContextService(
             store=default_store,
             authorization=RoleBasedAuthorization(),
-            clock=SystemClock(),
+            clock=default_clock,
             publication_actor=Actor(
                 actor_id="athena-context-api",
                 kind=ActorKind.SERVICE,

@@ -73,6 +73,7 @@ from athena_context.api.evaluation_domain import (
 )
 from athena_context.api.evaluation_ports import (
     DemoEvaluationTrustConfiguration,
+    EvaluationArtifactFactory,
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
     EvaluationCommitCandidate,
@@ -90,6 +91,7 @@ from athena_context.contracts import (
     ManifestFinding,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
+    TrustedKeyRecord,
     resolve_manifest_profile,
 )
 from athena_context.contracts.common import compute_artifact_digest
@@ -275,8 +277,13 @@ class _ContextServiceEvaluationAuthorityUnitOfWork:
     def load_artifact(self, snapshot_id: str) -> StoredEvaluation | None:
         return self._evaluation_transaction.get_evaluation_artifact(snapshot_id)
 
-    def insert_evaluation(self, artifact: StoredEvaluation) -> None:
-        self._evaluation_transaction.put_evaluation(artifact)
+    def insert_evaluation_conditionally(
+        self,
+        artifact_factory: EvaluationArtifactFactory,
+    ) -> StoredEvaluation:
+        return self._evaluation_transaction.put_evaluation_conditionally(
+            artifact_factory
+        )
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
         return self._evaluation_transaction.list_evaluations()
@@ -477,63 +484,105 @@ class ContextService:
 
         self._before_evaluation_artifact_insert(unit_of_work)
 
-        # This is the authoritative commit timestamp. Re-sample it after every
-        # hook or potentially slow operation, then use it for all final
-        # authority, freshness, publication, and evaluation timestamps.
-        published_at = self._now()
-        approval, resolved, _ = self._resolve_evaluation_authority(
+        # Perform every authoritative store read and potentially blocking trust
+        # lookup before persistence obtains the final timestamp. The immutable
+        # records are revalidated by a pure callback at that later time.
+        authority_read_at = self._now()
+        approval, resolved, authority = self._resolve_evaluation_authority(
             unit_of_work,
             actor=candidate.actor,
             command=candidate.command,
-            as_of=published_at,
+            as_of=authority_read_at,
             private_mcp_endpoint=candidate.private_mcp_endpoint,
             evidence_identity_object_id=candidate.evidence_identity_object_id,
             expected_authority=candidate.expected_authority,
         )
-        if published_at >= candidate.snapshot.expires_at:
-            raise EvaluationFailedClosedError(
-                "snapshot became stale before publication"
+        trusted_key_record = self._resolve_demo_evaluation_key()
+
+        def finalize_at_persistence_time(
+            published_at: datetime,
+        ) -> StoredEvaluation:
+            final_approval, final_resolved, _ = (
+                self._validate_loaded_evaluation_authority(
+                    actor=candidate.actor,
+                    command=candidate.command,
+                    approval=approval,
+                    resolved=resolved,
+                    authorization=authority.authorization,
+                    as_of=published_at,
+                    private_mcp_endpoint=candidate.private_mcp_endpoint,
+                    evidence_identity_object_id=(
+                        candidate.evidence_identity_object_id
+                    ),
+                    expected_authority=candidate.expected_authority,
+                )
             )
-        publication = build_authorized_publication(
-            snapshot=candidate.snapshot,
-            approval=approval,
-            publisher=candidate.actor,
-            publication_actor=self._publication_actor,
-            published_at=published_at,
-            resolved_profile_digest=resolved.profile.resolved_profile_digest,
-            endpoint=candidate.private_mcp_endpoint,
-            scope=candidate.command.authorized_scope,
-            reason=candidate.command.reason,
+            if published_at >= candidate.snapshot.expires_at:
+                raise EvaluationFailedClosedError(
+                    "snapshot became stale before publication"
+                )
+            publication = build_authorized_publication(
+                snapshot=candidate.snapshot,
+                approval=final_approval,
+                publisher=candidate.actor,
+                publication_actor=self._publication_actor,
+                published_at=published_at,
+                resolved_profile_digest=(
+                    final_resolved.profile.resolved_profile_digest
+                ),
+                endpoint=candidate.private_mcp_endpoint,
+                scope=candidate.command.authorized_scope,
+                reason=candidate.command.reason,
+            )
+            findings = self._evaluate_demo_snapshot_for_publication(
+                candidate,
+                resolved=final_resolved,
+                publication=publication,
+                trusted_key_record=trusted_key_record,
+                as_of=published_at,
+            )
+            result = build_demo_evaluation_result(
+                publication=publication,
+                snapshot=candidate.snapshot,
+                findings=findings,
+                evaluated_at=published_at,
+            )
+            artifact = StoredEvaluation(
+                actor_id=candidate.actor.actor_id,
+                idempotency_key=candidate.idempotency_key,
+                request_digest=candidate.request_digest,
+                snapshot_id=candidate.snapshot.snapshot_id,
+                result_json=result.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                snapshot_json=candidate.snapshot.canonical_json(),
+                publication_json=publication.model_dump_json(exclude_none=True),
+                envelope_attempt_id=candidate.envelope_attempt_id,
+                envelope=candidate.envelope,
+            )
+            self._validate_evaluation_components(artifact)
+            return artifact
+
+        artifact = unit_of_work.insert_evaluation_conditionally(
+            finalize_at_persistence_time
         )
-        findings = self._evaluate_demo_snapshot_for_publication(
-            candidate,
-            resolved=resolved,
-            publication=publication,
-            as_of=published_at,
-        )
-        result = build_demo_evaluation_result(
-            publication=publication,
-            snapshot=candidate.snapshot,
-            findings=findings,
-            evaluated_at=published_at,
-        )
-        artifact = StoredEvaluation(
-            actor_id=candidate.actor.actor_id,
-            idempotency_key=candidate.idempotency_key,
-            request_digest=candidate.request_digest,
-            snapshot_id=candidate.snapshot.snapshot_id,
-            result_json=result.model_dump_json(
-                by_alias=True,
-                exclude_none=True,
-            ),
-            snapshot_json=candidate.snapshot.canonical_json(),
-            publication_json=publication.model_dump_json(exclude_none=True),
-            envelope_attempt_id=candidate.envelope_attempt_id,
-            envelope=candidate.envelope,
-        )
-        self._validate_evaluation_components(artifact)
-        unit_of_work.insert_evaluation(artifact)
-        return result
+        return DemoEvaluationResult.model_validate_json(artifact.result_json)
+
+    def _resolve_demo_evaluation_key(self) -> TrustedKeyRecord:
+        """Complete the potentially blocking trust lookup before final time."""
+
+        trust = self._demo_evaluation_trust
+        if trust is None:
+            raise EvaluationFailedClosedError(
+                "ContextService has no authoritative demo evaluation trust"
+            )
+        record = trust.key_resolver(trust.trusted_key_anchor)
+        if record is None:
+            raise EvaluationFailedClosedError(
+                "authoritative demo evaluation signing key was not found"
+            )
+        return record
 
     def _evaluate_demo_snapshot_for_publication(
         self,
@@ -541,6 +590,7 @@ class ContextService:
         *,
         resolved: ResolvedPublishedContext,
         publication: AuthorizedSnapshotPublication,
+        trusted_key_record: TrustedKeyRecord,
         as_of: datetime,
     ) -> tuple[ManifestFinding, ...]:
         """Cryptographically verify and evaluate at the final transaction time."""
@@ -590,7 +640,11 @@ class ContextService:
                     candidate.snapshot.compatibility.artifact_digest
                 ),
                 publication_resolver=publication_resolver,
-                key_resolver=trust.key_resolver,
+                key_resolver=lambda requested: (
+                    trusted_key_record
+                    if requested == trust.trusted_key_anchor
+                    else None
+                ),
                 trusted_key_anchor=trust.trusted_key_anchor,
                 envelope_resolver=envelope_resolver,
             )
@@ -650,6 +704,55 @@ class ContextService:
             raise DemoEvaluationApprovalError(
                 "trusted demo evaluation approval decision was not found"
             )
+
+        selection = PublishedContextSelection(
+            manifest_id=command.manifest_id,
+            manifest_version=command.manifest_version,
+            profile_id=command.profile_id,
+        )
+        try:
+            resolved = unit_of_work.resolve_context(selection, as_of=as_of)
+        except (
+            AmbiguousLookupError,
+            AthenaValidationError,
+            ResourceNotFoundError,
+            ValueError,
+        ) as exc:
+            raise EvaluationFailedClosedError(
+                "published context/profile is missing, ambiguous, a superseded "
+                "context, or has inactive governance"
+            ) from exc
+        return self._validate_loaded_evaluation_authority(
+            actor=actor,
+            command=command,
+            approval=approval,
+            resolved=resolved,
+            authorization=authorization,
+            as_of=as_of,
+            private_mcp_endpoint=private_mcp_endpoint,
+            evidence_identity_object_id=evidence_identity_object_id,
+            expected_authority=expected_authority,
+        )
+
+    def _validate_loaded_evaluation_authority(
+        self,
+        *,
+        actor: Actor,
+        command: DemoEvaluationCommand,
+        approval: DemoEvaluationApproval,
+        resolved: ResolvedPublishedContext,
+        authorization: AuthorizationGrantToken,
+        as_of: datetime,
+        private_mcp_endpoint: str,
+        evidence_identity_object_id: str,
+        expected_authority: EvaluationAuthorityToken | None,
+    ) -> tuple[
+        DemoEvaluationApproval,
+        ResolvedPublishedContext,
+        EvaluationAuthorityToken,
+    ]:
+        """Purely revalidate exact loaded authority at persistence time."""
+
         validate_demo_evaluation_approval(
             actor,
             command,
@@ -658,7 +761,6 @@ class ContextService:
             private_mcp_endpoint=private_mcp_endpoint,
             evidence_identity_object_id=evidence_identity_object_id,
         )
-
         selection = PublishedContextSelection(
             manifest_id=command.manifest_id,
             manifest_version=command.manifest_version,
@@ -675,7 +777,6 @@ class ContextService:
                     "published context authority token changed selection mode"
                 )
         try:
-            resolved = unit_of_work.resolve_context(selection, as_of=as_of)
             if resolved.view.supersession is not None:
                 raise AthenaValidationError(
                     "superseded context cannot authorize evaluation"
@@ -685,12 +786,7 @@ class ContextService:
                 selection.profile_id,
                 as_of=as_of,
             )
-        except (
-            AmbiguousLookupError,
-            AthenaValidationError,
-            ResourceNotFoundError,
-            ValueError,
-        ) as exc:
+        except (AthenaValidationError, ValueError) as exc:
             raise EvaluationFailedClosedError(
                 "published context/profile is missing, ambiguous, a superseded "
                 "context, or has inactive governance"

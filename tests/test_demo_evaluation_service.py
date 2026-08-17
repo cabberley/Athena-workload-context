@@ -319,6 +319,97 @@ def _assert_no_artifact(
     assert harness.store.publication_count == 0
 
 
+def _delay_final_authority_or_persistence(
+    harness: DemoHarness,
+    *,
+    location: str,
+    delay: timedelta,
+) -> None:
+    if location == "finalAuthorityResolution":
+        service = harness.context_resolver.service
+        original = service._resolve_evaluation_authority
+        commit_resolutions = 0
+
+        def delayed_resolution(*args: object, **kwargs: object) -> object:
+            nonlocal commit_resolutions
+            result = original(*args, **kwargs)  # type: ignore[arg-type]
+            if kwargs.get("expected_authority") is not None:
+                commit_resolutions += 1
+                if commit_resolutions == 2:
+                    harness.clock.advance(delay)
+            return result
+
+        service._resolve_evaluation_authority = delayed_resolution  # type: ignore[assignment]
+        return
+    if location == "persistence":
+        harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
+            lambda: harness.clock.advance(delay)
+        )
+        return
+    raise AssertionError(f"unsupported commit delay location: {location}")
+
+
+@pytest.mark.parametrize(
+    ("authority_expiry", "expected_error", "expected_message"),
+    [
+        ("approval", DemoEvaluationApprovalError, "not active"),
+        ("governance", EvaluationFailedClosedError, "inactive governance"),
+        ("riskAcceptance", EvaluationFailedClosedError, "inactive governance"),
+        ("snapshot", EvaluationFailedClosedError, "snapshot became stale"),
+    ],
+)
+@pytest.mark.parametrize(
+    "delay_location",
+    ["finalAuthorityResolution", "persistence"],
+)
+def test_expiry_during_final_authority_or_persistence_rolls_back_atomically(
+    authority_expiry: str,
+    expected_error: type[Exception],
+    expected_message: str,
+    delay_location: str,
+) -> None:
+    expiring_at = CURRENT_NOW + timedelta(seconds=30)
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        override_expires_at=(
+            expiring_at if authority_expiry == "governance" else None
+        ),
+        risk_acceptance_expires_at=(
+            expiring_at if authority_expiry == "riskAcceptance" else None
+        ),
+        production_extends_development=authority_expiry == "governance",
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        approval_expires_at=(
+            expiring_at if authority_expiry == "approval" else None
+        ),
+        snapshot_freshness_seconds=(
+            30 if authority_expiry == "snapshot" else 300
+        ),
+    )
+    idempotency_key = (
+        f"wc013-{authority_expiry}-{delay_location}-commit-expiry"
+    )
+    _delay_final_authority_or_persistence(
+        harness,
+        location=delay_location,
+        delay=timedelta(minutes=1),
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
 def test_approval_expiry_during_transaction_aborts_conditional_commit() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(
@@ -327,8 +418,8 @@ def test_approval_expiry_during_transaction_aborts_conditional_commit() -> None:
         approval_expires_at=CURRENT_NOW + timedelta(seconds=30),
     )
     idempotency_key = "wc013-approval-expiry-race"
-    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
-        lambda _: harness.clock.advance(timedelta(minutes=1))
+    harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
+        lambda: harness.clock.advance(timedelta(minutes=1))
     )
 
     with pytest.raises(
@@ -356,8 +447,8 @@ def test_policy_evidence_freshness_expiry_during_commit_rolls_back() -> None:
         manifest=manifest,
     )
     idempotency_key = "wc013-policy-freshness-expiry-race"
-    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
-        lambda _: harness.clock.advance(timedelta(minutes=1))
+    harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
+        lambda: harness.clock.advance(timedelta(minutes=1))
     )
 
     with pytest.raises(
@@ -382,8 +473,8 @@ def test_signing_key_expiry_during_commit_rolls_back() -> None:
         trusted_key_expires_at=CURRENT_NOW + timedelta(seconds=30),
     )
     idempotency_key = "wc013-signing-key-expiry-race"
-    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
-        lambda _: harness.clock.advance(timedelta(minutes=1))
+    harness.context_resolver.store._before_evaluation_commit_timestamp = (  # type: ignore[method-assign]
+        lambda: harness.clock.advance(timedelta(minutes=1))
     )
 
     with pytest.raises(

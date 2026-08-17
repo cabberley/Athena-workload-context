@@ -456,7 +456,10 @@ class LifecycleContextResolver:
         clock: StepClock | None = None,
         demo_evaluation_trust: DemoEvaluationTrustConfiguration | None = None,
     ) -> None:
-        self.store = InMemoryContextStore()
+        lifecycle_clock = clock or StepClock(lifecycle_start)
+        self.store = InMemoryContextStore(
+            authoritative_clock=lifecycle_clock,
+        )
         self.authorization = RoleBasedAuthorization(
             [
                 RoleGrant(actor_id=PROPOSER.actor_id, role=Role.PROPOSER),
@@ -469,7 +472,7 @@ class LifecycleContextResolver:
         self.service = ContextService(
             store=self.store,
             authorization=self.authorization,
-            clock=clock or StepClock(lifecycle_start),
+            clock=lifecycle_clock,
             publication_actor=PUBLICATION_SERVICE,
             demo_evaluation_trust=demo_evaluation_trust,
         )
@@ -826,6 +829,7 @@ def build_harness(
     profile_id: str = "production",
     publish_context: bool = True,
     trusted_key_expires_at: datetime | None = None,
+    snapshot_freshness_seconds: int = 300,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -912,7 +916,7 @@ def build_harness(
             maxResponseBytes=65_536,
             maxItems=10,
             maxRecordBytes=8_192,
-            freshnessSeconds=300,
+            freshnessSeconds=snapshot_freshness_seconds,
             timeoutMilliseconds=1_000,
         ),
         reason="Collect, publish, and evaluate the approved synthetic demo",
