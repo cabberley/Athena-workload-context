@@ -2,10 +2,13 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { axe } from 'jest-axe'
 import App from './App'
+import { createMockContextApiClient } from './client'
+
+const renderStudio = () => render(<App client={createMockContextApiClient()} />)
 
 describe('Context Studio shell', () => {
   it('renders the authenticated shell and workload catalogue', async () => {
-    render(<App />)
+    renderStudio()
 
     expect(await screen.findByRole('heading', { name: /athena context studio/i })).toBeInTheDocument()
     expect(screen.getByText(/authenticated shell/i)).toBeInTheDocument()
@@ -17,7 +20,7 @@ describe('Context Studio shell', () => {
 
   it('supports keyboard-only navigation and activation', async () => {
     const user = userEvent.setup()
-    render(<App />)
+    renderStudio()
 
     const catalogueButton = screen.getByRole('button', { name: /catalogue/i })
     catalogueButton.focus()
@@ -30,7 +33,7 @@ describe('Context Studio shell', () => {
 
   it('creates, validates, approves and publishes a draft through the WC-007 lifecycle', async () => {
     const user = userEvent.setup()
-    render(<App />)
+    renderStudio()
 
     await user.click(screen.getByRole('button', { name: /save draft/i }))
     await waitFor(() => {
@@ -59,7 +62,7 @@ describe('Context Studio shell', () => {
   })
 
   it('exposes a structured manifest editor and relationship data', async () => {
-    render(<App />)
+    renderStudio()
 
     expect(await screen.findByLabelText(/workload name/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/manifest version/i)).toBeInTheDocument()
@@ -68,13 +71,13 @@ describe('Context Studio shell', () => {
   })
 
   it('blocks stale or mismatched publication requests', async () => {
-    render(<App />)
+    renderStudio()
     const publishButton = await screen.findByRole('button', { name: /^publish$/i })
     expect(publishButton).toBeDisabled()
   })
 
   it('passes accessibility checks', async () => {
-    const { container } = render(<App />)
+    const { container } = renderStudio()
 
     expect((await axe(container)).violations).toHaveLength(0)
   })

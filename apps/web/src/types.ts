@@ -8,7 +8,6 @@ export type RoleName = 'proposer' | 'reviewer' | 'approver' | 'publisher' | 'rea
 export interface Actor {
   actorId: string
   kind: ActorKind
-  role: RoleName
 }
 
 export interface AuthState {
@@ -17,6 +16,7 @@ export interface AuthState {
   role: RoleName
   userLabel: string
   port: string
+  bearerToken: string
 }
 
 export interface CatalogItem {
@@ -67,6 +67,17 @@ export interface EvidenceItem {
   confidence: number
 }
 
+export interface CompatibilityMetadata {
+  artifactKind: 'workloadManifest'
+  artifactDigest: string
+  semanticDigest: string
+  schemaVersion: string
+  semanticContractVersion: string
+  policyContractVersion: string
+  minimumReaderVersion: string
+  requiresCapabilities: string[]
+}
+
 export interface ManifestDraft {
   manifestId: string
   manifestVersion: string
@@ -78,6 +89,8 @@ export interface ManifestDraft {
   optionalRelationships: string[]
   controls: ControlRecord[]
   riskAcceptances: RiskAcceptance[]
+  manifestDigest?: string
+  compatibility?: CompatibilityMetadata
 }
 
 export interface ValidationRecord {
@@ -178,6 +191,12 @@ export interface PublishRequest {
   reason: string
   workloadId?: string
   manifestId?: string
+}
+
+export interface ContextApiClientOptions {
+  baseUrl?: string
+  auth?: AuthState
+  fetchImpl?: typeof fetch
 }
 
 export interface ContextApiClientPort {

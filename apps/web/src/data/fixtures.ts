@@ -6,6 +6,7 @@ export const authFixture: AuthState = {
   role: 'publisher',
   userLabel: 'Human publisher',
   port: 'context-api://wc-007',
+  bearerToken: 'synthetic-context-bearer-token',
 }
 
 export const workloadCatalogueFixture: CatalogItem[] = [
@@ -111,6 +112,17 @@ const atlasManifest: ManifestDraft = {
       accepted: true,
     },
   ],
+  manifestDigest: 'sha256:7b080b2f1c19ef0f2a12a4dc7fba4fba5d1584d7c1d38f76fa71e9af66b5f7a4',
+  compatibility: {
+    artifactKind: 'workloadManifest',
+    artifactDigest: 'sha256:7b080b2f1c19ef0f2a12a4dc7fba4fba5d1584d7c1d38f76fa71e9af66b5f7a4',
+    semanticDigest: 'sha256:81d0e1b8a1d7d00cf7b1144d0f7eeab8ec7b4b89d7c1c4f59b2dcac7cfbf045',
+    schemaVersion: '1.0.0',
+    semanticContractVersion: '1.0.0',
+    policyContractVersion: '1.0.0',
+    minimumReaderVersion: '1.0.0',
+    requiresCapabilities: [],
+  },
 }
 
 const atlasComparison: ComparisonRow[] = [
@@ -209,6 +221,17 @@ const tradeManifest: ManifestDraft = {
       accepted: true,
     },
   ],
+  manifestDigest: 'sha256:2d8b7c5d09c60f80ace77f4dfe27969ba798074efb9d8d31ab9c327fee54bc5d',
+  compatibility: {
+    artifactKind: 'workloadManifest',
+    artifactDigest: 'sha256:2d8b7c5d09c60f80ace77f4dfe27969ba798074efb9d8d31ab9c327fee54bc5d',
+    semanticDigest: 'sha256:4d87d71d7a1d32e4ca619a8d3f86b312f6d53cbeb4d0b27d3d951f7af813f3fa',
+    schemaVersion: '1.0.0',
+    semanticContractVersion: '1.0.0',
+    policyContractVersion: '1.0.0',
+    minimumReaderVersion: '1.0.0',
+    requiresCapabilities: [],
+  },
 }
 
 const trainingManifest: ManifestDraft = {
@@ -237,6 +260,17 @@ const trainingManifest: ManifestDraft = {
       accepted: true,
     },
   ],
+  manifestDigest: 'sha256:73d7fcb90574465d4f91d16bb2a6a3c5ef1f2e8e4e1a63a4a93926f0dbb7b36d',
+  compatibility: {
+    artifactKind: 'workloadManifest',
+    artifactDigest: 'sha256:73d7fcb90574465d4f91d16bb2a6a3c5ef1f2e8e4e1a63a4a93926f0dbb7b36d',
+    semanticDigest: 'sha256:5b93cfe1959edeaac5c5bf8458f5150333d7b8124f4a28a01f6afc2ecede42a6',
+    schemaVersion: '1.0.0',
+    semanticContractVersion: '1.0.0',
+    policyContractVersion: '1.0.0',
+    minimumReaderVersion: '1.0.0',
+    requiresCapabilities: [],
+  },
 }
 
 export const workloadFixtureMap: Record<string, WorkloadContext> = {
@@ -332,4 +366,68 @@ export const workloadFixtureMap: Record<string, WorkloadContext> = {
     draft: null,
     published: null,
   },
+}
+
+export const wc007CanonicalManifestFixture = {
+  manifestId: atlasManifest.manifestId,
+  manifestVersion: atlasManifest.manifestVersion,
+  workloadName: atlasManifest.workloadName,
+  environment: atlasManifest.environment,
+  businessOwner: atlasManifest.businessOwner,
+  runbook: atlasManifest.runbook,
+  requiredRelationships: atlasManifest.requiredRelationships,
+  optionalRelationships: atlasManifest.optionalRelationships,
+  controls: atlasManifest.controls,
+  riskAcceptances: atlasManifest.riskAcceptances,
+  compatibility: atlasManifest.compatibility,
+}
+
+export const wc007DraftApiFixture = {
+  draft_id: 'draft-atlas-api',
+  manifest_id: atlasManifest.manifestId,
+  state: 'approved',
+  revision: 5,
+  manifest: wc007CanonicalManifestFixture,
+  manifest_digest: atlasManifest.manifestDigest,
+  previous_version: null,
+  created_by: { actor_id: authFixture.actorId, kind: authFixture.kind },
+  created_at: '2026-08-17T00:00:00.000Z',
+  updated_by: { actor_id: authFixture.actorId, kind: authFixture.kind },
+  updated_at: '2026-08-17T00:00:00.000Z',
+  reason: 'Approved by the authoritative Context API.',
+  validation: null,
+  review: null,
+  publication_candidate: {
+    finalized_by: { actor_id: 'human-approver', kind: 'human' },
+    finalized_at: '2026-08-17T00:00:00.000Z',
+    manifest_version: atlasManifest.manifestVersion,
+    manifest_digest: atlasManifest.manifestDigest,
+    semantic_digest: atlasManifest.compatibility?.semanticDigest ?? atlasManifest.manifestDigest,
+    approval_status: 'approved',
+  },
+  approval: {
+    decision_id: 'approval-draft-atlas-api',
+    approved_by: { actor_id: 'human-approver', kind: 'human' },
+    approved_at: '2026-08-17T00:00:00.000Z',
+    approved_revision: 5,
+    manifest_version: atlasManifest.manifestVersion,
+    manifest_digest: atlasManifest.manifestDigest,
+    reason: 'Server-authorized approval decision.',
+  },
+}
+
+export const wc007PublishedApiFixture = {
+  manifest_id: atlasManifest.manifestId,
+  manifest_version: atlasManifest.manifestVersion,
+  manifest_digest: atlasManifest.manifestDigest,
+  manifest: wc007CanonicalManifestFixture,
+  source_draft_id: 'draft-atlas-api',
+  source_draft_revision: 5,
+  previous_version: null,
+  approval: wc007DraftApiFixture.approval,
+  published_by: { actor_id: 'human-publisher', kind: 'human' },
+  published_at: '2026-08-17T00:00:00.000Z',
+  publication_authorized_by: { actor_id: 'athena-context-api', kind: 'service' },
+  publication_authorized_at: '2026-08-17T00:00:00.000Z',
+  reason: 'Published by the authoritative Context API.',
 }

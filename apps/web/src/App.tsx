@@ -1,9 +1,7 @@
 import { useState } from 'react'
 import { createContextApiClient } from './client'
-import type { AppRoute, ManifestDraft, WorkloadContext } from './types'
+import type { AppRoute, ContextApiClientPort, ManifestDraft, WorkloadContext } from './types'
 import './App.css'
-
-const apiClient = createContextApiClient()
 
 const cloneManifest = (context: WorkloadContext): ManifestDraft => ({
   ...context.manifest,
@@ -13,7 +11,8 @@ const cloneManifest = (context: WorkloadContext): ManifestDraft => ({
   riskAcceptances: context.manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
 })
 
-function App() {
+function App({ client = createContextApiClient() }: { client?: ContextApiClientPort }) {
+  const apiClient = client
   const [route, setRoute] = useState<AppRoute>('overview')
   const [selectedWorkloadId, setSelectedWorkloadId] = useState('atlas-api')
   const [workloadContext, setWorkloadContext] = useState<WorkloadContext>(() =>
@@ -73,10 +72,13 @@ function App() {
     setBusy(true)
     try {
       const currentDraft = workloadContext.draft
+      if (currentDraft?.state === 'published') {
+        throw new Error('Published manifests are immutable. Create a new draft version before editing.')
+      }
       if (!currentDraft) {
         const created = await apiClient.createDraft(
           selectedWorkloadId,
-          draftForm,
+          { ...draftForm, manifestDigest: draftForm.manifestDigest ?? workloadContext.manifest.manifestDigest ?? workloadContext.manifestVersion },
           'Create draft from the structured editor.',
         )
         await refreshCurrentWorkload()
@@ -89,13 +91,37 @@ function App() {
         expectedRevision: currentDraft.revision,
         expectedManifestVersion: currentDraft.manifest.manifestVersion,
         expectedDigest: currentDraft.manifestDigest,
-        replacementManifest: draftForm,
+        replacementManifest: {
+          ...draftForm,
+          manifestDigest: currentDraft.manifestDigest,
+        },
         reason: 'Save manifest changes with optimistic concurrency checks.',
       })
       await refreshCurrentWorkload()
       setStatusMessage(`Draft ${updated.draftId} saved. Revision ${updated.revision}.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : 'Unable to save the draft.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const createDraftVersion = async () => {
+    setBusy(true)
+    try {
+      const sourceManifest = workloadContext.published?.manifest ?? workloadContext.manifest
+      const created = await apiClient.createDraft(
+        selectedWorkloadId,
+        {
+          ...cloneManifest({ ...workloadContext, manifest: sourceManifest }),
+          manifestDigest: sourceManifest.manifestDigest ?? sourceManifest.compatibility?.artifactDigest ?? workloadContext.manifestVersion,
+        },
+        'Create a new draft version from the current published or working manifest.',
+      )
+      await refreshCurrentWorkload()
+      setStatusMessage(`Draft version ${created.draftId} created. Revision ${created.revision}.`)
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Unable to create a new draft version.')
     } finally {
       setBusy(false)
     }
@@ -200,6 +226,7 @@ function App() {
   }
 
   const currentDraft = workloadContext.draft
+  const publishedManifest = workloadContext.published
   const publishDisabled =
     busy ||
     !currentDraft ||
@@ -207,9 +234,11 @@ function App() {
     !currentDraft.approval ||
     currentDraft.manifestId !== selectedWorkloadId
 
+  const saveDisabled = busy || currentDraft?.state === 'published' || publishedManifest !== null
   const validateDisabled = busy || !currentDraft || currentDraft.state !== 'draft'
   const submitDisabled = busy || !currentDraft || currentDraft.state !== 'validated'
   const approveDisabled = busy || !currentDraft || currentDraft.state !== 'in_review'
+  const newVersionDisabled = busy || currentDraft?.state === 'published' || publishedManifest !== null
 
   return (
     <div className="studio-shell">
@@ -513,8 +542,11 @@ function App() {
           <p>Agent proposals remain drafts until the server-derived approval record exists.</p>
 
           <div className="action-stack">
-            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={busy}>
+            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={saveDisabled}>
               Save draft
+            </button>
+            <button type="button" className="secondary-action" onClick={() => void createDraftVersion()} disabled={newVersionDisabled}>
+              Create new version draft
             </button>
             <button type="button" className="secondary-action" onClick={() => void validateDraft()} disabled={validateDisabled}>
               Validate draft
