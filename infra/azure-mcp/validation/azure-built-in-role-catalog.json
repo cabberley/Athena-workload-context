@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "1.0",
+  "provenance": {
+    "source": "Azure built-in role definitions",
+    "command": "az role definition list --name <role-definition-guid>",
+    "retrievedAt": "2026-08-17T00:01:53Z"
+  },
+  "requiredPermissions": {
+    "resourceHealthAvailability": "Microsoft.ResourceHealth/availabilityStatuses/read"
+  },
+  "roles": [
+    {
+      "name": "Reader",
+      "id": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+      "roleType": "BuiltInRole",
+      "actions": [
+        "*/read"
+      ],
+      "dataActions": [],
+      "notActions": [],
+      "notDataActions": []
+    },
+    {
+      "name": "Log Analytics Data Reader",
+      "id": "3b03c2da-16b3-4a49-8834-0f8130efdd3b",
+      "roleType": "BuiltInRole",
+      "actions": [
+        "Microsoft.OperationalInsights/workspaces/query/read",
+        "Microsoft.OperationalInsights/workspaces/read"
+      ],
+      "dataActions": [
+        "Microsoft.OperationalInsights/workspaces/tables/data/read"
+      ],
+      "notActions": [],
+      "notDataActions": []
+    }
+  ]
+}
