@@ -5,10 +5,12 @@ from typing import Literal
 
 from athena_context.api.domain import Actor, ActorKind, Permission, ensure_timestamp
 from athena_context.api.errors import (
+    AmbiguousLookupError,
     DemoEvaluationApprovalError,
     DuplicateVersionError,
     EvaluationFailedClosedError,
     IdempotencyConflictError,
+    ResourceNotFoundError,
 )
 from athena_context.api.evaluation_context import (
     resolve_active_manifest_profile,
@@ -128,19 +130,34 @@ class InMemoryEvaluationCommitPort:
             )
 
             expected_context = candidate.expected_authority.context
+            expected_selection_mode = (
+                "uniqueActiveVersion"
+                if candidate.command.manifest_version is None
+                else "exactVersion"
+            )
+            if expected_context.selection_mode != expected_selection_mode:
+                raise EvaluationFailedClosedError(
+                    "published context authority token changed selection mode"
+                )
             selection = PublishedContextSelection(
-                manifest_id=expected_context.manifest_id,
-                manifest_version=expected_context.manifest_version,
-                profile_id=expected_context.profile_id,
+                manifest_id=candidate.command.manifest_id,
+                manifest_version=candidate.command.manifest_version,
+                profile_id=candidate.command.profile_id,
             )
             try:
                 resolved = self._context_resolver.resolve(
                     selection,
                     as_of=published_at,
                 )
-            except (AthenaValidationError, ValueError) as exc:
+            except (
+                AmbiguousLookupError,
+                AthenaValidationError,
+                ResourceNotFoundError,
+                ValueError,
+            ) as exc:
                 raise EvaluationFailedClosedError(
-                    "published profile has inactive governance at commit time"
+                    "published context is missing, ambiguous, or has inactive "
+                    "governance at commit time"
                 ) from exc
             if resolved.view.supersession is not None:
                 raise EvaluationFailedClosedError(
@@ -162,6 +179,7 @@ class InMemoryEvaluationCommitPort:
                 authority_token=build_published_context_authority_token(
                     resolved.view,
                     profile,
+                    requested_manifest_version=selection.manifest_version,
                 ),
             )
             validate_published_context_binding(

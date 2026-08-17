@@ -239,6 +239,7 @@ class PublishedContextSelection(ApiModel):
 class PublishedContextAuthorityToken(ApiModel):
     """Opaque-revision contract for a resolved immutable WC-007 publication."""
 
+    selection_mode: Literal["exactVersion", "uniqueActiveVersion"]
     manifest_id: str = Field(min_length=1, max_length=128)
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -278,12 +279,28 @@ class EvaluationAuthorityToken(ApiModel):
 def build_published_context_authority_token(
     view: PublishedManifestView,
     profile: ResolvedManifestProfile,
+    *,
+    requested_manifest_version: str | None,
 ) -> PublishedContextAuthorityToken:
     published = view.published
+    if (
+        requested_manifest_version is not None
+        and requested_manifest_version != published.manifest_version
+    ):
+        raise ValueError(
+            "explicit context selection does not match the resolved version"
+        )
+    selection_mode: Literal["exactVersion", "uniqueActiveVersion"] = (
+        "uniqueActiveVersion"
+        if requested_manifest_version is None
+        else "exactVersion"
+    )
     revision = published.source_draft_revision + (
         1 if view.supersession is not None else 0
     )
     payload = {
+        "selectionMode": selection_mode,
+        "requestedManifestVersion": requested_manifest_version,
         "manifestId": published.manifest_id,
         "manifestVersion": published.manifest_version,
         "manifestDigest": published.manifest_digest,
@@ -298,6 +315,7 @@ def build_published_context_authority_token(
         "resolvedProfileDigest": profile.resolved_profile_digest,
     }
     return PublishedContextAuthorityToken(
+        selection_mode=selection_mode,
         manifest_id=published.manifest_id,
         manifest_version=published.manifest_version,
         manifest_digest=published.manifest_digest,
@@ -323,7 +341,16 @@ class ResolvedPublishedContext(ApiModel):
             self.profile.manifest_id != published.manifest_id
             or self.profile.manifest_version != published.manifest_version
             or self.authority_token
-            != build_published_context_authority_token(self.view, self.profile)
+            != build_published_context_authority_token(
+                self.view,
+                self.profile,
+                requested_manifest_version=(
+                    None
+                    if self.authority_token.selection_mode
+                    == "uniqueActiveVersion"
+                    else self.authority_token.manifest_version
+                ),
+            )
         ):
             raise ValueError(
                 "resolved profile or authority token does not match the publication"

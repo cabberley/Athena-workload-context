@@ -415,6 +415,7 @@ class ContextApiPublishedContextResolver:
             authority_token=build_published_context_authority_token(
                 view,
                 profile,
+                requested_manifest_version=selection.manifest_version,
             ),
         )
 

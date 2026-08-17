@@ -321,6 +321,7 @@ class DemoEvaluationService:
                 authority_token=build_published_context_authority_token(
                     resolved.view,
                     canonical_profile,
+                    requested_manifest_version=command.manifest_version,
                 ),
             )
         except (

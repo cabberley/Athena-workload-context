@@ -53,6 +53,9 @@ The integration composes the merged components without introducing direct Azure 
   change. The in-memory adapter uses the same coordinator lock as `ContextService`, its approval
   registry, and its grant registry. Approval revoke/expiry, inherited override expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
+  Authority tokens bind whether the caller selected an exact version or the unique active version.
+  A unique-active commit repeats that lookup with no version inside the transaction, so a
+  concurrently published second active version aborts rather than silently pinning the first.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
   RS256 attestation; production composition must back it with the configured versioned Key Vault
   key and managed identity rather than key material in configuration.

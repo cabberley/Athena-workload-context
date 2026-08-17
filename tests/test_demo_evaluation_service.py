@@ -321,6 +321,54 @@ def test_supersession_after_final_evaluation_aborts_conditional_commit() -> None
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
+def test_unique_active_selection_becoming_ambiguous_aborts_conditional_commit() -> None:
+    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    harness = build_harness(as_of=CURRENT_NOW, manifest=manifest)
+    command = harness.command.model_copy(update={"manifest_version": None})
+    concurrent = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        manifest_version="2.1.0",
+    )
+    idempotency_key = "wc013-unique-selection-ambiguity-race"
+    harness.commit_hook.before_commit = lambda: (
+        harness.context_resolver.publish_additional_active(concurrent)
+    )
+
+    with pytest.raises(EvaluationFailedClosedError, match="ambiguous"):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            command,
+        )
+
+    assert harness.context_resolver.calls == 2
+    assert harness.transport.calls == 1
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_explicit_selection_remains_exact_when_another_version_is_published() -> None:
+    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    harness = build_harness(as_of=CURRENT_NOW, manifest=manifest)
+    concurrent = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        manifest_version="2.1.0",
+    )
+    harness.commit_hook.before_commit = lambda: (
+        harness.context_resolver.publish_additional_active(concurrent)
+    )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-exact-selection-concurrent-version",
+        harness.command,
+    )
+
+    assert result.publication.manifest_version == "2.0.0"
+    assert harness.context_resolver.calls == 2
+    assert harness.store.publication_count == 1
+
+
 def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None:
     harness = build_harness(
         as_of=CURRENT_NOW,
@@ -520,6 +568,18 @@ def test_wc007_resolver_can_select_the_unique_active_published_version() -> None
     assert resolved.profile.resolved_profile_digest == (
         harness.command.expected_resolved_profile_digest
     )
+    assert resolved.authority_token.selection_mode == "uniqueActiveVersion"
+
+    explicit = harness.context_resolver.resolve(
+        PublishedContextSelection(
+            manifest_id=harness.command.manifest_id,
+            manifest_version=harness.command.manifest_version,
+            profile_id=harness.command.profile_id,
+        ),
+        as_of=NOW,
+    )
+    assert explicit.authority_token.selection_mode == "exactVersion"
+    assert explicit.authority_token.etag != resolved.authority_token.etag
 
 
 def test_success_result_is_idempotent_before_any_repeat_collection_or_signing() -> None:
