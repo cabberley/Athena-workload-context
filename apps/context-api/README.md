@@ -14,3 +14,21 @@ Published manifest values are immutable. Supersession is stored as a separate ap
 Submission replaces untrusted draft audit values with a server-finalized publication candidate and
 recomputes canonical digests. Human approval binds that exact candidate; publication does not
 mutate it.
+
+## Cohort proposal routes
+
+- `GET /v1/cohort-proposals` resolves one exact active draft/profile binding, retrieves an
+  immutable workload-scoped snapshot through a typed repository port, cryptographically verifies
+  it through the trusted verifier port, and returns the bounded WC-010 batch with `sourceDraft`.
+- `POST /v1/cohort-proposals/preview` accepts only exact split/merge bindings and returns
+  deterministic selector-only candidates. It never mutates a manifest, validates a draft,
+  approves, or publishes.
+
+Both routes require a verified human identity and a concrete workload grant; wildcard grants do
+not cross this boundary. Deployments must inject the snapshot repository, cryptographic verifier,
+immutable proposal cache, and actor-scoped idempotency receipt ports. The default composition
+contains no evidence and grants no access.
+
+The literal `*` is reserved and is never a valid manifest or workload identifier at an HTTP or
+command boundary. Cross-workload WC-007 access uses the typed `AllWorkloadsGrantScope`; cohort
+routes require an exact `WorkloadGrantScope`.

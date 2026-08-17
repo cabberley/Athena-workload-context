@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
-from athena_context.api.domain import PublishCommand
+from athena_context.api.authorization import RoleBasedAuthorization
+from athena_context.api.domain import (
+    AllWorkloadsGrantScope,
+    Permission,
+    PublishCommand,
+    Role,
+    RoleGrant,
+    WorkloadGrantScope,
+)
 from athena_context.api.errors import AuthorizationError
 from context_api_support import (
     AGENT,
@@ -96,3 +105,33 @@ def test_human_roles_are_separated_and_manifest_access_is_denied_by_default() ->
             "approver-cannot-author",
             transition(draft, "Approver attempts author action"),
         )
+
+
+def test_typed_all_workloads_scope_cannot_alias_a_concrete_workload_grant() -> None:
+    workload_id = canonical_manifest().manifest_id
+    wildcard_only = RoleBasedAuthorization(
+        [
+            RoleGrant(
+                actor_id=OUTSIDER.actor_id,
+                role=Role.READER,
+                scope=AllWorkloadsGrantScope(),
+            )
+        ]
+    )
+    explicit = RoleBasedAuthorization(
+        [
+            RoleGrant(
+                actor_id=OUTSIDER.actor_id,
+                role=Role.READER,
+                scope=WorkloadGrantScope(workload_id=workload_id),
+            )
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="reserved"):
+        WorkloadGrantScope(workload_id="*")
+    with pytest.raises(AuthorizationError):
+        wildcard_only.require_explicit(OUTSIDER, Permission.READ, workload_id)
+    with pytest.raises(AuthorizationError, match="not a workload identifier"):
+        wildcard_only.require_explicit(OUTSIDER, Permission.READ, "*")
+    explicit.require_explicit(OUTSIDER, Permission.READ, workload_id)

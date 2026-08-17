@@ -69,3 +69,23 @@ class AlreadySupersededError(ContextApiError):
 
 class PersistenceConflictError(ContextApiError):
     code = "persistence_conflict"
+
+
+class CohortProfileMismatchError(ContextApiError):
+    code = "cohort_profile_mismatch"
+
+
+class EvidenceSnapshotMismatchError(ContextApiError):
+    code = "evidence_snapshot_mismatch"
+
+
+class StaleEvidenceSnapshotError(ContextApiError):
+    code = "stale_evidence_snapshot"
+
+
+class CohortBoundaryError(ContextApiError):
+    code = "cohort_boundary_exceeded"
+
+
+class CohortContractError(ContextApiError):
+    code = "cohort_contract_invalid"

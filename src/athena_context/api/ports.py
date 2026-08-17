@@ -15,6 +15,7 @@ from athena_context.api.domain import (
     PublishedManifest,
     Supersession,
     VerifiedAuthentication,
+    WorkloadIdentifier,
 )
 
 
@@ -27,7 +28,12 @@ class AuthenticationPort(Protocol):
 
 
 class AuthorizationPort(Protocol):
-    def require(self, actor: Actor, permission: Permission, manifest_id: str) -> None: ...
+    def require(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: WorkloadIdentifier | None,
+    ) -> None: ...
 
 
 class ContextTransactionPort(Protocol):
