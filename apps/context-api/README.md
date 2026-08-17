@@ -60,12 +60,17 @@ mutate it.
   fails closed.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
-  overlap conflicts and a rejection blocks only its selected proposals. This authority identity
-  uses the normalized workload plus canonical selector/role/member fingerprints for each selected
-  proposal. Draft ID, revision, digest, manifest version, inheritance topology, resolved-profile
-  digest, snapshot, proposal-set regeneration, proposal evaluation time, and input digest cannot
-  bypass a durable rejection. Exact batch, snapshot, profile, and draft coordinates remain
-  mandatory only for candidate and stale-application validation.
+  overlap conflicts and a rejection blocks only its covered authority members. Durable authority
+  groups normalized immutable member fingerprints under a canonical workload, profile, role, and
+  selector fingerprint rather than proposal boundaries. Transactional overlap checks therefore
+  reject whole, subset, superset, split, merge, and partial-overlap repartitioning while
+  preserving decisions on member-disjoint proposals, including disjoint members under the same
+  role.
+  Draft ID, revision, digest, manifest version, inheritance topology, resolved-profile digest,
+  snapshot, proposal-set regeneration, proposal evaluation time, input digest, and proposal shape
+  cannot bypass a durable rejection. Exact batch, snapshot, profile, and draft coordinates remain
+  mandatory only for candidate and stale-application validation; no rejection is released without
+  a separately audited reconsideration workflow.
   Overlap arbitration occurs before mutable draft freshness checks. A disjoint apply from the same
   immutable batch may atomically rebase only over the contiguous draft revisions produced by
   earlier decisions from that batch; unrelated draft changes remain stale. Preview candidate

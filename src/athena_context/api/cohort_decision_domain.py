@@ -243,14 +243,72 @@ class CohortDecisionRequest(ApiModel):
         return self
 
 
+class CohortRejectionAuthority(ApiModel):
+    """Partition-independent role/selector and member rejection authority."""
+
+    selector_role_fingerprint: str = Field(
+        alias="selectorRoleFingerprint",
+        pattern=_DIGEST_PATTERN,
+    )
+    member_fingerprints: list[str] = Field(
+        alias="memberFingerprints",
+        min_length=1,
+        max_length=1000,
+    )
+
+    @field_validator("member_fingerprints")
+    @classmethod
+    def validate_member_fingerprints(
+        cls,
+        values: list[str],
+    ) -> list[str]:
+        if (
+            values != sorted(values)
+            or len(values) != len(set(values))
+            or any(
+                not value.startswith("sha256:")
+                or len(value) != 71
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value[7:]
+                )
+                for value in values
+            )
+        ):
+            raise ValueError(
+                "member_fingerprints must be canonical unique digests"
+            )
+        return values
+
+
+def rejection_authorities_overlap(
+    left: list[CohortRejectionAuthority],
+    right: list[CohortRejectionAuthority],
+) -> bool:
+    """Return whether two selections cover any member under the same authority."""
+
+    right_members = {
+        authority.selector_role_fingerprint: set(
+            authority.member_fingerprints
+        )
+        for authority in right
+    }
+    return any(
+        set(authority.member_fingerprints).intersection(
+            right_members.get(authority.selector_role_fingerprint, set())
+        )
+        for authority in left
+    )
+
+
 class CohortProposalSetVersion(ApiModel):
     """Exact stale-apply binding plus stable authority fingerprints.
 
     The batch input digest is retained on the decision record for audit, but is
     intentionally absent here because it includes proposal evaluation time.
     Exact batch, snapshot, profile, and source-draft coordinates remain stale
-    application bindings.  Rejection and overlap arbitration uses only the
-    normalized workload and proposal selector/role/member fingerprints.
+    application bindings. Rejection and overlap arbitration uses only the
+    normalized workload/profile and selector/role/member fingerprints.
     """
 
     manifest_id: WorkloadIdentifier
@@ -265,8 +323,8 @@ class CohortProposalSetVersion(ApiModel):
         min_length=1,
         max_length=200,
     )
-    source_rejection_fingerprints: list[str] = Field(
-        alias="sourceRejectionFingerprints",
+    source_rejection_authorities: list[CohortRejectionAuthority] = Field(
+        alias="sourceRejectionAuthorities",
         min_length=1,
         max_length=200,
     )
@@ -281,44 +339,52 @@ class CohortProposalSetVersion(ApiModel):
             )
         return values
 
-    @field_validator("source_rejection_fingerprints")
+    @field_validator("source_rejection_authorities")
     @classmethod
-    def validate_canonical_rejection_fingerprints(
+    def validate_canonical_rejection_authorities(
         cls,
-        values: list[str],
-    ) -> list[str]:
-        canonical = sorted(values)
+        values: list[CohortRejectionAuthority],
+    ) -> list[CohortRejectionAuthority]:
+        fingerprints = [
+            authority.selector_role_fingerprint
+            for authority in values
+        ]
         if (
-            values != canonical
-            or len(values) != len(set(values))
-            or any(
-                not value.startswith("sha256:")
-                or len(value) != 71
-                or any(character not in "0123456789abcdef" for character in value[7:])
-                for value in values
-            )
+            fingerprints != sorted(fingerprints)
+            or len(fingerprints) != len(set(fingerprints))
         ):
             raise ValueError(
-                "source_rejection_fingerprints must be canonical unique digests"
+                "source_rejection_authorities must use canonical unique "
+                "selector/role fingerprints"
             )
         return values
 
     @model_validator(mode="after")
-    def validate_fingerprint_count(self) -> CohortProposalSetVersion:
-        if len(self.source_rejection_fingerprints) != len(
-            self.source_proposal_ids
+    def validate_authority_members(self) -> CohortProposalSetVersion:
+        member_fingerprints = [
+            member
+            for authority in self.source_rejection_authorities
+            for member in authority.member_fingerprints
+        ]
+        if (
+            len(member_fingerprints) > 1000
+            or len(member_fingerprints) != len(set(member_fingerprints))
         ):
             raise ValueError(
-                "every selected proposal requires one rejection fingerprint"
+                "selected rejection authority members must be globally unique "
+                "and bounded"
             )
         return self
 
     def authority_overlap_identity(
         self,
-    ) -> tuple[str]:
-        """Return the stable workload scope for durable rejection arbitration."""
+    ) -> tuple[str, str]:
+        """Return stable workload/profile scope for rejection arbitration."""
 
-        return (normalized_identifier(self.manifest_id),)
+        return (
+            normalized_identifier(self.manifest_id),
+            normalized_identifier(self.profile_id),
+        )
 
     def batch_overlap_identity(
         self,
@@ -401,8 +467,8 @@ class CohortDecisionRecord(ApiModel):
         min_length=1,
         max_length=200,
     )
-    source_rejection_fingerprints: list[str] = Field(
-        alias="sourceRejectionFingerprints",
+    source_rejection_authorities: list[CohortRejectionAuthority] = Field(
+        alias="sourceRejectionAuthorities",
         min_length=1,
         max_length=200,
     )
@@ -436,36 +502,41 @@ class CohortDecisionRecord(ApiModel):
             raise ValueError("sourceProposalIds must use canonical proposal order")
         return values
 
-    @field_validator("source_rejection_fingerprints")
+    @field_validator("source_rejection_authorities")
     @classmethod
-    def validate_source_rejection_fingerprints(
+    def validate_source_rejection_authorities(
         cls,
-        values: list[str],
-    ) -> list[str]:
-        canonical = sorted(values)
+        values: list[CohortRejectionAuthority],
+    ) -> list[CohortRejectionAuthority]:
+        fingerprints = [
+            authority.selector_role_fingerprint
+            for authority in values
+        ]
         if (
-            values != canonical
-            or len(values) != len(set(values))
-            or any(
-                not value.startswith("sha256:")
-                or len(value) != 71
-                or any(character not in "0123456789abcdef" for character in value[7:])
-                for value in values
-            )
+            fingerprints != sorted(fingerprints)
+            or len(fingerprints) != len(set(fingerprints))
         ):
             raise ValueError(
-                "sourceRejectionFingerprints must be canonical unique digests"
+                "sourceRejectionAuthorities must use canonical unique "
+                "selector/role fingerprints"
             )
         return values
 
     @model_validator(mode="after")
     def validate_outcome(self) -> CohortDecisionRecord:
         rejected = self.decision is CohortDecisionKind.REJECT
-        if len(self.source_rejection_fingerprints) != len(
-            self.source_proposal_ids
+        member_fingerprints = [
+            member
+            for authority in self.source_rejection_authorities
+            for member in authority.member_fingerprints
+        ]
+        if (
+            len(member_fingerprints) > 1000
+            or len(member_fingerprints) != len(set(member_fingerprints))
         ):
             raise ValueError(
-                "every selected proposal requires one rejection fingerprint"
+                "selected rejection authority members must be globally unique "
+                "and bounded"
             )
         if rejected != (self.applied_draft is None):
             raise ValueError("only reject decisions may omit an applied draft")
@@ -528,7 +599,7 @@ class CohortDecisionRecord(ApiModel):
             proposal_set_digest=self.proposal_set_digest,
             snapshot_artifact_digest=self.snapshot.artifact_digest,
             sourceProposalIds=self.source_proposal_ids,
-            sourceRejectionFingerprints=self.source_rejection_fingerprints,
+            sourceRejectionAuthorities=self.source_rejection_authorities,
         )
 
 
@@ -622,5 +693,7 @@ __all__ = [
     "CohortDecisionRequest",
     "CohortDecisionResponse",
     "CohortProposalSetVersion",
+    "CohortRejectionAuthority",
     "decision_response",
+    "rejection_authorities_overlap",
 ]

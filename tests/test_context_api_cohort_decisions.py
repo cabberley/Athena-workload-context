@@ -14,7 +14,12 @@ from athena_context.api.authorization import (
     StaticTestAuthenticator,
 )
 from athena_context.api.cohort_decision_service import CohortDecisionService
-from athena_context.api.cohort_domain import CohortEvidenceBinding
+from athena_context.api.cohort_domain import (
+    CohortBatchCacheKey,
+    CohortEvidenceBinding,
+    CohortProposalBatchResponse,
+    CohortProposalQuery,
+)
 from athena_context.api.cohort_memory import (
     CallableTrustedEvidenceSnapshotVerifier,
     InMemoryCohortPersistence,
@@ -40,14 +45,18 @@ from athena_context.api.selector_provenance import (
     resolved_profile_selector_provenance,
 )
 from athena_context.api.service import ContextService
+from athena_context.binding import evaluate_selector
+from athena_context.binding.domain import CohortProposal, SelectorPreview
 from athena_context.contracts import (
     AthenaValidationError,
     CanonicalWorkloadManifest,
+    ResourceEvidenceRecord,
     canonicalize_manifest_payload,
     compute_artifact_digest,
     resolve_manifest_profile,
 )
 from athena_context.contracts.manifest import (
+    ResourceIdListSelector,
     _resolve_manifest_profile_for_cohort_decision,
 )
 from test_cohort_binding import _build_attested_snapshot
@@ -211,6 +220,249 @@ def _replace_only_proposal_cache(harness: Harness) -> None:
             cohort_decision_service=decisions,
         )
     )
+
+
+def _install_partitioned_role_batch(
+    harness: Harness,
+    *,
+    role_id: str,
+    partitions: list[list[str]],
+) -> dict[str, Any]:
+    """Install a valid typed batch with one role's members repartitioned."""
+
+    binding = harness.register_profile("production")
+    base = harness.cohorts.get_proposals(
+        HUMAN,
+        CohortProposalQuery(**_params(harness)),
+    )
+    source = next(
+        proposal
+        for proposal in base.proposals
+        if proposal.role.role_id == role_id
+    )
+    source_members = set(source.members)
+    if (
+        not partitions
+        or any(not partition for partition in partitions)
+        or any(
+            member not in source_members
+            for partition in partitions
+            for member in partition
+        )
+    ):
+        raise AssertionError("synthetic partitions must use source role members")
+    resources = [
+        record
+        for record in harness.snapshot.evidence_records
+        if isinstance(record, ResourceEvidenceRecord)
+    ]
+    proposals: list[CohortProposal] = []
+    for index, partition in enumerate(partitions, start=1):
+        members = sorted(partition)
+        selector = ResourceIdListSelector(
+            selectorType="resourceIdList",
+            selectorId=f"repartition-source-{index}",
+            resourceIds=members,
+            maxMatches=len(members),
+        )
+        result = evaluate_selector(selector, resources)
+        preview = SelectorPreview(
+            selector=selector,
+            matchedResourceIds=result.matched_resource_ids,
+            selectorResultDigest=result.selector_result_digest,
+            maxMatches=len(members),
+        )
+        proposal_seed = compute_artifact_digest(
+            {
+                "operation": "wc_034_repartitioned_test_proposal",
+                "roleId": role_id,
+                "index": index,
+                "members": members,
+                "draftId": harness.draft_id,
+            }
+        )[7:23]
+        payload = source.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_none=True,
+        )
+        payload.update(
+            {
+                "proposalId": f"proposal-{proposal_seed}",
+                "members": members,
+                "confidence": 0.5,
+                "confidenceBand": "low",
+                "supportingEvidence": [],
+                "dissent": [],
+                "rejectedCandidates": [],
+                "conflicts": [],
+                "selectorPreview": preview,
+                "disposition": "humanResolution",
+                "bulkReviewEligible": False,
+            }
+        )
+        proposals.append(CohortProposal.model_validate(payload))
+
+    proposal_set_digest = compute_artifact_digest(
+        [
+            proposal.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            for proposal in proposals
+        ]
+    )
+    batch_payload = base.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    batch_payload["proposals"] = proposals
+    batch_payload["proposalSetDigest"] = proposal_set_digest
+    repartitioned = CohortProposalBatchResponse.model_validate(batch_payload)
+    fresh_persistence = InMemoryCohortPersistence()
+    fresh_persistence.put_batch_if_absent(
+        CohortBatchCacheKey(
+            evidence_binding=binding,
+            snapshot_artifact_digest=(
+                harness.snapshot.compatibility.artifact_digest
+            ),
+        ),
+        repartitioned,
+    )
+    cohorts = CohortProposalService(
+        context_store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        snapshot_repository=harness.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            harness.verifier
+        ),
+        proposal_cache=fresh_persistence,
+        preview_receipts=fresh_persistence,
+    )
+    decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=fresh_persistence,
+    )
+    harness.persistence = fresh_persistence
+    harness.cohorts = cohorts
+    harness.decisions = decisions
+    harness.client = TestClient(
+        create_app(
+            service=harness.lifecycle,
+            authentication=StaticTestAuthenticator(
+                {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
+            ),
+            cohort_service=cohorts,
+            cohort_decision_service=decisions,
+        )
+    )
+    expected = repartitioned.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    loaded = _load(harness)
+    assert loaded == expected
+    return loaded
+
+
+def _move_to_identical_fresh_draft(
+    harness: Harness,
+    *,
+    draft_id: str,
+    idempotency_key: str,
+) -> None:
+    response = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(HUMAN, idempotency_key=idempotency_key),
+        json=CreateDraftCommand(
+            draft_id=draft_id,
+            manifest=harness.manifest,
+            manifest_digest=harness.manifest.compatibility.artifact_digest,
+            reason="Create an identical synthetic draft for repartition testing",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert response.status_code == 201, response.text
+    fresh = harness.lifecycle.get_draft(HUMAN, draft_id)
+    harness.draft_id = fresh.draft_id
+    harness.draft_revision = fresh.revision
+    harness.draft_digest = fresh.manifest_digest
+    harness.manifest = fresh.manifest
+    harness.register_profile("production")
+
+
+def _five_member_web_harness() -> Harness:
+    payload = deepcopy(fixture_factory.load_canonical_manifest_resource())
+    web = next(role for role in payload["roles"] if role["roleId"] == "web")
+    worker = next(
+        role for role in payload["roles"] if role["roleId"] == "worker"
+    )
+    web["selectors"][0]["prefix"] = "athena-worker-"
+    worker["selectors"][0]["prefix"] = "athena-background-"
+    manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    trusted = _build_attested_snapshot(
+        5,
+        workload_role="web-service",
+    )
+    return _build_harness(
+        manifest=manifest,
+        snapshot=trusted.snapshot,
+        verifier=trusted.verifier,
+    )
+
+
+def _decision_failure_state(
+    harness: Harness,
+    *receipt_keys: str,
+) -> tuple[Any, ...]:
+    with harness.store.transaction() as tx:
+        return (
+            tx.list_drafts(manifest_id=harness.manifest.manifest_id),
+            tx.list_draft_selector_baselines(
+                manifest_id=harness.manifest.manifest_id,
+            ),
+            tx.list_audit(manifest_id=harness.manifest.manifest_id),
+            tx.list_cohort_decisions(
+                manifest_id=harness.manifest.manifest_id
+            ),
+            tuple(
+                (
+                    key,
+                    tx.get_cohort_decision_receipt(HUMAN.actor_id, key),
+                    tx.get_receipt(HUMAN.actor_id, key),
+                )
+                for key in receipt_keys
+            ),
+        )
+
+
+def _assert_failed_decision_is_atomic(
+    harness: Harness,
+    *,
+    idempotency_key: str,
+    state_before: tuple[Any, ...],
+    preserved_receipt_keys: tuple[str, ...],
+    preview_key: str,
+    preview_receipt_before: object,
+) -> None:
+    assert _decision_failure_state(
+        harness,
+        *preserved_receipt_keys,
+        idempotency_key,
+    ) == state_before
+    assert harness.persistence.get_preview_receipt(
+        HUMAN.actor_id,
+        preview_key,
+    ) == preview_receipt_before
 
 
 def _register_persisted_profile(
@@ -1726,6 +1978,390 @@ def test_reject_survives_unused_ownership_edit_and_regeneration() -> None:
             failed_key,
         ) is None
         assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
+
+
+def test_reject_blocks_same_union_repartitioned_into_split_singletons() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    worker = next(
+        proposal
+        for proposal in original_batch["proposals"]
+        if proposal["role"]["roleId"] == "worker"
+    )
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            original_batch,
+            decision="reject",
+            proposal_ids=[worker["proposalId"]],
+            candidate=None,
+            rationale="Reject the complete synthetic worker member authority.",
+        ),
+        "wc-034-repartition-split-reject",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    _move_to_identical_fresh_draft(
+        harness,
+        draft_id="draft-wc-034-repartition-split",
+        idempotency_key="wc-034-repartition-split-create",
+    )
+    split_batch = _install_partitioned_role_batch(
+        harness,
+        role_id="worker",
+        partitions=[[member] for member in worker["members"]],
+    )
+    singleton_ids = [
+        proposal["proposalId"] for proposal in split_batch["proposals"]
+    ]
+    preview_body = _preview_body(
+        harness,
+        split_batch,
+        action="merge",
+        proposal_ids=singleton_ids,
+        resolution="Human reviewed the regenerated singleton merge candidate.",
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-repartition-split-preview",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    preview_key = "wc-034-repartition-split-preview"
+    failed_key = "wc-034-repartition-split-apply"
+    preserved_receipt_keys = ("wc-034-repartition-split-reject",)
+    state_before = _decision_failure_state(
+        harness,
+        *preserved_receipt_keys,
+        failed_key,
+    )
+    preview_receipt_before = harness.persistence.get_preview_receipt(
+        HUMAN.actor_id,
+        preview_key,
+    )
+    assert preview_receipt_before is not None
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            split_batch,
+            decision="merge",
+            proposal_ids=singleton_ids,
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    _assert_failed_decision_is_atomic(
+        harness,
+        idempotency_key=failed_key,
+        state_before=state_before,
+        preserved_receipt_keys=preserved_receipt_keys,
+        preview_key=preview_key,
+        preview_receipt_before=preview_receipt_before,
+    )
+
+
+def test_reject_blocks_singleton_regenerated_inside_merged_proposal() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    worker = next(
+        proposal
+        for proposal in original_batch["proposals"]
+        if proposal["role"]["roleId"] == "worker"
+    )
+    split_batch = _install_partitioned_role_batch(
+        harness,
+        role_id="worker",
+        partitions=[[member] for member in worker["members"]],
+    )
+    singleton_ids = [
+        proposal["proposalId"] for proposal in split_batch["proposals"]
+    ]
+    first_reject_key = "wc-034-repartition-merged-reject-one"
+    second_reject_key = "wc-034-repartition-merged-reject-two"
+    first_rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            split_batch,
+            decision="reject",
+            proposal_ids=[singleton_ids[0]],
+            candidate=None,
+            rationale="Reject the first synthetic worker singleton authority.",
+        ),
+        first_reject_key,
+    )
+    second_rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            split_batch,
+            decision="reject",
+            proposal_ids=[singleton_ids[1]],
+            candidate=None,
+            rationale="Reject the second synthetic worker singleton authority.",
+        ),
+        second_reject_key,
+    )
+    assert first_rejected.status_code == second_rejected.status_code == 201
+
+    _move_to_identical_fresh_draft(
+        harness,
+        draft_id="draft-wc-034-repartition-merged",
+        idempotency_key="wc-034-repartition-merged-create",
+    )
+    merged_batch = _load(harness)
+    merged_worker = next(
+        proposal
+        for proposal in merged_batch["proposals"]
+        if proposal["role"]["roleId"] == "worker"
+    )
+    preview_body = _preview_body(
+        harness,
+        merged_batch,
+        proposal_ids=[merged_worker["proposalId"]],
+        resolution="Human reviewed the regenerated merged worker candidate.",
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-repartition-merged-preview",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    preview_key = "wc-034-repartition-merged-preview"
+    failed_key = "wc-034-repartition-merged-apply"
+    preserved_receipt_keys = (first_reject_key, second_reject_key)
+    state_before = _decision_failure_state(
+        harness,
+        *preserved_receipt_keys,
+        failed_key,
+    )
+    preview_receipt_before = harness.persistence.get_preview_receipt(
+        HUMAN.actor_id,
+        preview_key,
+    )
+    assert preview_receipt_before is not None
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            merged_batch,
+            decision="split",
+            proposal_ids=[merged_worker["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    _assert_failed_decision_is_atomic(
+        harness,
+        idempotency_key=failed_key,
+        state_before=state_before,
+        preserved_receipt_keys=preserved_receipt_keys,
+        preview_key=preview_key,
+        preview_receipt_before=preview_receipt_before,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overlap_kind", "candidate_indexes"),
+    [
+        ("subset", (0, 1)),
+        ("superset", (0, 1, 2, 3)),
+        ("partial", (0, 3)),
+    ],
+)
+def test_reject_blocks_subset_superset_and_partial_member_overlap(
+    overlap_kind: str,
+    candidate_indexes: tuple[int, ...],
+) -> None:
+    harness = _five_member_web_harness()
+    original_batch = _load(harness)
+    web = next(
+        proposal
+        for proposal in original_batch["proposals"]
+        if proposal["role"]["roleId"] == "web"
+    )
+    members = web["members"]
+    rejected_batch = _install_partitioned_role_batch(
+        harness,
+        role_id="web",
+        partitions=[members[:3], members[3:]],
+    )
+    rejected_proposal = rejected_batch["proposals"][0]
+    reject_key = f"wc-034-repartition-{overlap_kind}-reject"
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            rejected_batch,
+            decision="reject",
+            proposal_ids=[rejected_proposal["proposalId"]],
+            candidate=None,
+            rationale="Reject three covered synthetic web members.",
+        ),
+        reject_key,
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    _move_to_identical_fresh_draft(
+        harness,
+        draft_id=f"draft-wc-034-repartition-{overlap_kind}",
+        idempotency_key=f"wc-034-repartition-{overlap_kind}-create",
+    )
+    candidate_members = [members[index] for index in candidate_indexes]
+    candidate_batch = _install_partitioned_role_batch(
+        harness,
+        role_id="web",
+        partitions=[candidate_members],
+    )
+    candidate_proposal = candidate_batch["proposals"][0]
+    preview_key = f"wc-034-repartition-{overlap_kind}-preview"
+    preview_body = _preview_body(
+        harness,
+        candidate_batch,
+        proposal_ids=[candidate_proposal["proposalId"]],
+        resolution=(
+            f"Human reviewed the regenerated {overlap_kind} split candidate."
+        ),
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(HUMAN, idempotency_key=preview_key),
+    )
+    assert preview.status_code == 200, preview.text
+    failed_key = f"wc-034-repartition-{overlap_kind}-apply"
+    preserved_receipt_keys = (reject_key,)
+    state_before = _decision_failure_state(
+        harness,
+        *preserved_receipt_keys,
+        failed_key,
+    )
+    preview_receipt_before = harness.persistence.get_preview_receipt(
+        HUMAN.actor_id,
+        preview_key,
+    )
+    assert preview_receipt_before is not None
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            candidate_batch,
+            decision="split",
+            proposal_ids=[candidate_proposal["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    _assert_failed_decision_is_atomic(
+        harness,
+        idempotency_key=failed_key,
+        state_before=state_before,
+        preserved_receipt_keys=preserved_receipt_keys,
+        preview_key=preview_key,
+        preview_receipt_before=preview_receipt_before,
+    )
+
+
+def test_reject_allows_unrelated_member_under_same_role_authority() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    web = next(
+        proposal
+        for proposal in original_batch["proposals"]
+        if proposal["role"]["roleId"] == "web"
+    )
+    split_batch = _install_partitioned_role_batch(
+        harness,
+        role_id="web",
+        partitions=[[web["members"][0]], web["members"][1:]],
+    )
+    first, second = split_batch["proposals"]
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            split_batch,
+            decision="reject",
+            proposal_ids=[first["proposalId"]],
+            candidate=None,
+            rationale="Reject only the first synthetic web member.",
+        ),
+        "wc-034-repartition-unrelated-reject",
+    )
+    preview_body = _preview_body(
+        harness,
+        split_batch,
+        proposal_ids=[second["proposalId"]],
+        resolution="Human reviewed the disjoint two-member web split.",
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-repartition-unrelated-preview",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    allowed = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            split_batch,
+            decision="split",
+            proposal_ids=[second["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        "wc-034-repartition-unrelated-apply",
+    )
+
+    assert rejected.status_code == allowed.status_code == 201
+    assert allowed.json()["state"] == "applied"
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == 2
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+    assert len(decisions) == 2
+    first_authority, second_authority = (
+        decision.source_rejection_authorities[0]
+        for decision in decisions
+    )
+    assert first_authority.selector_role_fingerprint == (
+        second_authority.selector_role_fingerprint
+    )
+    assert not set(first_authority.member_fingerprints).intersection(
+        second_authority.member_fingerprints
+    )
+    assert len(
+        first_authority.member_fingerprints
+        + second_authority.member_fingerprints
+    ) == 3
 
 
 def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:

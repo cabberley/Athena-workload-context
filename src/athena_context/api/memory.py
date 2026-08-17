@@ -5,10 +5,10 @@ from types import TracebackType
 from typing import Literal
 
 from athena_context.api.cohort_decision_domain import (
-    CohortDecisionKind,
     CohortDecisionReceipt,
     CohortDecisionRecord,
     CohortProposalSetVersion,
+    rejection_authorities_overlap,
 )
 from athena_context.api.domain import (
     AuditEvent,
@@ -39,8 +39,8 @@ def _version_key(version: str) -> tuple[int, int, int]:
 
 def _cohort_overlap_binding_key(
     version: CohortProposalSetVersion,
-) -> tuple[str]:
-    """Stable workload scope; mutable proposal-generation coordinates are absent."""
+) -> tuple[str, str]:
+    """Stable workload/profile scope without mutable generation coordinates."""
 
     return version.authority_overlap_identity()
 
@@ -330,9 +330,6 @@ class _MemoryTransaction(ContextTransactionPort):
     ) -> list[CohortDecisionRecord]:
         binding_key = _cohort_overlap_binding_key(version)
         batch_key = version.batch_overlap_identity()
-        selected_fingerprints = set(
-            version.source_rejection_fingerprints
-        )
         selected_proposal_ids = set(version.source_proposal_ids)
         matches = sorted(
             (
@@ -340,13 +337,13 @@ class _MemoryTransaction(ContextTransactionPort):
                 for decision in self._cohort_decisions.values()
                 if (
                     (
-                        decision.decision is CohortDecisionKind.REJECT
-                        and _cohort_overlap_binding_key(
+                        _cohort_overlap_binding_key(
                             decision.proposal_set_version()
                         )
                         == binding_key
-                        and selected_fingerprints.intersection(
-                            decision.source_rejection_fingerprints
+                        and rejection_authorities_overlap(
+                            version.source_rejection_authorities,
+                            decision.source_rejection_authorities,
                         )
                     )
                     or (

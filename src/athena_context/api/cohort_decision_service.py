@@ -15,6 +15,7 @@ from athena_context.api.cohort_decision_domain import (
     CohortDecisionRecord,
     CohortDecisionRequest,
     CohortProposalSetVersion,
+    CohortRejectionAuthority,
     _selector_binding_permits,
 )
 from athena_context.api.cohort_decision_ports import (
@@ -123,11 +124,12 @@ def _authority_projection(role: ManifestRole) -> dict[str, Any]:
     }
 
 
-def _proposal_rejection_fingerprint(
+def _selector_role_rejection_fingerprint(
     manifest_id: str,
+    profile_id: str,
     proposal: CohortProposal,
 ) -> str:
-    """Bind durable authority to stable workload, role, selector, and members."""
+    """Bind durable authority to stable workload/profile/role selectors."""
 
     selectors = [
         _stable_selector_payload(
@@ -141,17 +143,25 @@ def _proposal_rejection_fingerprint(
     ]
     return compute_artifact_digest(
         {
-            "operation": "cohort_rejection_fingerprint",
+            "operation": "cohort_rejection_authority",
             "manifestId": normalized_identifier(manifest_id),
+            "profileId": normalized_identifier(profile_id),
             "roleRef": normalized_identifier(proposal.role.role_id),
             "selectors": sorted(
                 selectors,
                 key=compute_artifact_digest,
             ),
-            "members": sorted(
-                normalize_resource_id(member)
-                for member in proposal.members
-            ),
+        }
+    )
+
+
+def _member_rejection_fingerprint(member: str) -> str:
+    """Hash one normalized immutable member identity for durable comparison."""
+
+    return compute_artifact_digest(
+        {
+            "operation": "cohort_rejection_member",
+            "resourceId": normalize_resource_id(member),
         }
     )
 
@@ -285,13 +295,13 @@ class CohortDecisionService:
                 as_of=validation_time,
             )
             proposals = self._validate_request_binding(request, resolved)
-            rejection_fingerprints = self._rejection_fingerprints(
+            rejection_authorities = self._rejection_authorities(
                 request,
                 proposals,
             )
             version = self._proposal_set_version(
                 request,
-                rejection_fingerprints=rejection_fingerprints,
+                rejection_authorities=rejection_authorities,
             )
             self._arbitrate_overlap(
                 request,
@@ -406,7 +416,7 @@ class CohortDecisionService:
                 candidate_digest=candidate_digest,
                 applied_binding=applied_binding,
                 apply_authorization=apply_authorization,
-                rejection_fingerprints=rejection_fingerprints,
+                rejection_authorities=rejection_authorities,
                 audit_id=audit_event.event_id,
             )
             tx.put_cohort_decision(record)
@@ -551,7 +561,7 @@ class CohortDecisionService:
     def _proposal_set_version(
         request: CohortDecisionRequest,
         *,
-        rejection_fingerprints: list[str],
+        rejection_authorities: list[CohortRejectionAuthority],
     ) -> CohortProposalSetVersion:
         return CohortProposalSetVersion(
             manifest_id=request.manifest_id,
@@ -566,26 +576,42 @@ class CohortDecisionService:
             proposal_set_digest=request.proposal_set_digest,
             snapshot_artifact_digest=request.snapshot_artifact_digest,
             sourceProposalIds=request.proposal_ids,
-            sourceRejectionFingerprints=rejection_fingerprints,
+            sourceRejectionAuthorities=rejection_authorities,
         )
 
-    @staticmethod
-    def _rejection_fingerprints(
+    @classmethod
+    def _rejection_authorities(
+        cls,
         request: CohortDecisionRequest,
         proposals: list[CohortProposal],
-    ) -> list[str]:
-        fingerprints = sorted(
-            _proposal_rejection_fingerprint(
-                request.manifest_id,
-                proposal,
+    ) -> list[CohortRejectionAuthority]:
+        cls._source_union(proposals)
+        grouped: dict[str, set[str]] = {}
+        for proposal in proposals:
+            selector_role_fingerprint = (
+                _selector_role_rejection_fingerprint(
+                    request.manifest_id,
+                    request.profile_id,
+                    proposal,
+                )
             )
-            for proposal in proposals
-        )
-        if len(fingerprints) != len(set(fingerprints)):
-            raise CohortContractError(
-                "selected proposals do not have unique stable authority fingerprints"
+            member_fingerprints = grouped.setdefault(
+                selector_role_fingerprint,
+                set(),
             )
-        return fingerprints
+            member_fingerprints.update(
+                _member_rejection_fingerprint(member)
+                for member in proposal.members
+            )
+        return [
+            CohortRejectionAuthority(
+                selectorRoleFingerprint=selector_role_fingerprint,
+                memberFingerprints=sorted(member_fingerprints),
+            )
+            for selector_role_fingerprint, member_fingerprints in sorted(
+                grouped.items()
+            )
+        ]
 
     @staticmethod
     def _arbitrate_overlap(
@@ -895,7 +921,7 @@ class CohortDecisionService:
             exclude_none=True,
             exclude={
                 "source_proposal_ids",
-                "source_rejection_fingerprints",
+                "source_rejection_authorities",
             },
         )
         applied_by_revision: dict[int, CohortDecisionRecord] = {}
@@ -910,7 +936,7 @@ class CohortDecisionService:
                 exclude_none=True,
                 exclude={
                     "source_proposal_ids",
-                    "source_rejection_fingerprints",
+                    "source_rejection_authorities",
                 },
             )
             applied = decision.applied_draft
@@ -1253,7 +1279,7 @@ class CohortDecisionService:
         candidate_digest: str | None,
         applied_binding: CohortDraftBinding | None,
         apply_authorization: CohortDecisionApplyAuthorization | None,
-        rejection_fingerprints: list[str],
+        rejection_authorities: list[CohortRejectionAuthority],
         audit_id: str,
     ) -> CohortDecisionRecord:
         return CohortDecisionRecord(
@@ -1276,7 +1302,7 @@ class CohortDecisionService:
                     if proposal.proposal_id in request.proposal_ids
                 )
             ),
-            sourceRejectionFingerprints=rejection_fingerprints,
+            sourceRejectionAuthorities=rejection_authorities,
             snapshot=resolved.batch.snapshot,
             candidateId=None if candidate is None else candidate.candidate_id,
             candidateDigest=candidate_digest,
