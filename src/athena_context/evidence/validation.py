@@ -35,6 +35,7 @@ from athena_context.contracts import (
     ToolUnavailableCollectorAttempt,
     TrustedKeyAnchor,
     TrustedKeyResolver,
+    UtcDateTime,
     canonicalize_json,
     compute_artifact_digest,
     compute_evidence_record_digest,
@@ -57,6 +58,7 @@ from athena_context.evidence.models import (
     McpTimeoutNoResponse,
     McpToolUnavailable,
     McpTransportOutcome,
+    ResourceResponseItem,
     SnapshotReferenceBinding,
     TrustedIngestionError,
     ValidatedEnvelope,
@@ -124,16 +126,6 @@ _ALLOWED_TAGS: dict[str, set[str] | None] = {
         "unknown",
     },
 }
-_RESOURCE_ITEM_KEYS = {
-    "recordType",
-    "observedAt",
-    "resourceId",
-    "resourceType",
-    "location",
-    "availabilityZone",
-    "tags",
-    "state",
-}
 _SUCCESS_ENVELOPE_KEYS = {
     "schemaVersion",
     "toolName",
@@ -168,6 +160,8 @@ type ConcreteEvidenceRecord = (
     | AdvisorRecommendationEvidenceRecord
 )
 _AZURE_GUID_ADAPTER: TypeAdapter[AzureGuid] = TypeAdapter(AzureGuid)
+_UTC_DATETIME_ADAPTER: TypeAdapter[UtcDateTime] = TypeAdapter(UtcDateTime)
+_MAX_JSON_NESTING_DEPTH = 32
 
 
 def _require_utc_millisecond(value: datetime, *, field_name: str) -> None:
@@ -383,22 +377,33 @@ def _parse_json_object(body: bytes) -> dict[str, Any]:
                 ValueError(f"invalid JSON constant: {value}")
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise EvidenceBoundaryError("response is not canonicalizable strict JSON") from exc
     if not isinstance(value, dict):
         raise EvidenceBoundaryError("response envelope must be a JSON object")
+    _validate_json_nesting(value)
     return value
 
 
+def _validate_json_nesting(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise EvidenceBoundaryError("response exceeds the maximum JSON nesting depth")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
 def _parse_datetime(value: object, *, field_name: str) -> datetime:
-    if not isinstance(value, str):
-        raise EvidenceBoundaryError(f"{field_name} must be an RFC 3339 UTC timestamp")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise EvidenceBoundaryError(f"{field_name} is not a valid timestamp") from exc
-    _require_utc_millisecond(parsed, field_name=field_name)
-    return parsed
+        return _UTC_DATETIME_ADAPTER.validate_python(value)
+    except ValidationError as exc:
+        raise EvidenceBoundaryError(
+            f"{field_name} must use the exact UtcDateTime lexical grammar"
+        ) from exc
 
 
 def _is_fresh(
@@ -705,6 +710,38 @@ def _normalized_scope_payload(payload: object) -> dict[str, object]:
     return cast(dict[str, object], normalized)
 
 
+type _ItemGapReason = Literal[
+    "malformed", "stale", "scopeMismatch", "responseOversized"
+]
+
+
+def _validate_resource_response_item(item: object) -> ResourceResponseItem:
+    if not isinstance(item, dict):
+        raise EvidenceBoundaryError("resource response item must be an object")
+    normalized = dict(item)
+    resource_type = item.get("resourceType")
+    resource_id = item.get("resourceId")
+    if isinstance(resource_type, str) and isinstance(resource_id, str):
+        normalized["resourceId"] = normalize_resource_id(resource_id, resource_type)
+    try:
+        return ResourceResponseItem.model_validate(normalized)
+    except ValidationError as exc:
+        raise EvidenceBoundaryError(
+            "resource response item failed the closed semantic schema"
+        ) from exc
+
+
+def _resource_source_projection(item: ResourceResponseItem) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        item.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"observed_at"},
+        ),
+    )
+
+
 def _success_projection(
     request: EvidenceTransportRequest,
     outcome: McpSuccessResponse,
@@ -819,7 +856,42 @@ def _success_projection(
             failure_status="invalid",
             gap_reason="stale",
         )
-    safe_items = [_sanitize_resource_item(item) for item in items]
+    envelope_items: list[dict[str, object]] = []
+    item_projections: list[dict[str, object] | None] = []
+    item_gap_reasons: list[_ItemGapReason | None] = []
+    for item in items:
+        try:
+            validated_item = _validate_resource_response_item(item)
+        except EvidenceBoundaryError:
+            envelope_items.append(_sanitize_resource_item(item))
+            item_projections.append(None)
+            item_gap_reasons.append("malformed")
+            continue
+        source_projection = _resource_source_projection(validated_item)
+        envelope_items.append(source_projection)
+        item_projections.append(source_projection)
+        try:
+            item_size = len(canonicalize_json(item).encode("utf-8"))
+        except (TypeError, ValueError):
+            item_size = request.bounds.max_record_bytes + 1
+        if item_size > request.bounds.max_record_bytes:
+            item_gap_reasons.append("responseOversized")
+        elif not _is_fresh(
+            validated_item.observed_at,
+            received_at=outcome.response_received_at,
+            validated_at=validated_at,
+            freshness_seconds=request.bounds.freshness_seconds,
+        ):
+            item_gap_reasons.append("stale")
+        elif not _resource_in_scope(
+            validated_item.resource_id, request.evidence_scope
+        ) or not any(
+            _resource_in_scope(validated_item.resource_id, scope)
+            for scope in request.authorized_scopes
+        ):
+            item_gap_reasons.append("scopeMismatch")
+        else:
+            item_gap_reasons.append(None)
     safe_envelope: dict[str, object] = {
         "schemaVersion": AZURE_MCP_RESPONSE_SCHEMA_VERSION,
         "toolName": request.tool_name,
@@ -828,7 +900,7 @@ def _success_projection(
         "requestDigest": request.request_digest,
         "evidenceScope": response_scope.model_dump(mode="json", by_alias=True),
         "observedAt": response_observed_at,
-        "items": safe_items,
+        "items": envelope_items,
     }
     response_digest = compute_response_envelope_digest(safe_envelope)
     attempt = SuccessResponseCollectorAttempt.model_validate(
@@ -858,95 +930,26 @@ def _success_projection(
         return EvidenceProjection(request, attempt, (gap,), envelope)
 
     records: list[EvidenceRecord] = []
-    for index, (item, safe_item) in enumerate(zip(items, safe_items, strict=True)):
+    for index, (candidate_projection, gap_reason) in enumerate(
+        zip(item_projections, item_gap_reasons, strict=True)
+    ):
         pointer = f"/items/{index}"
+        if gap_reason is not None:
+            records.append(
+                _gap_record(
+                    request,
+                    attempt,
+                    reason=gap_reason,
+                    observed_at=outcome.response_received_at,
+                    payload_digest=response_digest,
+                    payload_pointer=pointer,
+                )
+            )
+            continue
+        if candidate_projection is None:
+            raise EvidenceBoundaryError("validated response item projection is missing")
         try:
-            item_size = len(canonicalize_json(item).encode("utf-8"))
-        except (TypeError, ValueError):
-            item_size = request.bounds.max_record_bytes + 1
-        if item_size > request.bounds.max_record_bytes:
-            records.append(
-                _gap_record(
-                    request,
-                    attempt,
-                    reason="responseOversized",
-                    observed_at=outcome.response_received_at,
-                    payload_digest=response_digest,
-                    payload_pointer=pointer,
-                )
-            )
-            continue
-        if not isinstance(item, dict) or set(item) != _RESOURCE_ITEM_KEYS:
-            records.append(
-                _gap_record(
-                    request,
-                    attempt,
-                    reason="malformed",
-                    observed_at=outcome.response_received_at,
-                    payload_digest=response_digest,
-                    payload_pointer=pointer,
-                )
-            )
-            continue
-        try:
-            item_observed_at = _parse_datetime(
-                item.get("observedAt"), field_name=f"items[{index}].observedAt"
-            )
-        except EvidenceBoundaryError:
-            records.append(
-                _gap_record(
-                    request,
-                    attempt,
-                    reason="malformed",
-                    observed_at=outcome.response_received_at,
-                    payload_digest=response_digest,
-                    payload_pointer=pointer,
-                )
-            )
-            continue
-        if not _is_fresh(
-            item_observed_at,
-            received_at=outcome.response_received_at,
-            validated_at=validated_at,
-            freshness_seconds=request.bounds.freshness_seconds,
-        ):
-            records.append(
-                _gap_record(
-                    request,
-                    attempt,
-                    reason="stale",
-                    observed_at=outcome.response_received_at,
-                    payload_digest=response_digest,
-                    payload_pointer=pointer,
-                )
-            )
-            continue
-        try:
-            resource_type = item["resourceType"]
-            resource_id = item["resourceId"]
-            if not isinstance(resource_type, str) or not isinstance(resource_id, str):
-                raise EvidenceBoundaryError("resource fields must be strings")
-            normalized_id = normalize_resource_id(resource_id, resource_type)
-            if not _resource_in_scope(normalized_id, request.evidence_scope) or not any(
-                _resource_in_scope(normalized_id, scope)
-                for scope in request.authorized_scopes
-            ):
-                records.append(
-                    _gap_record(
-                        request,
-                        attempt,
-                        reason="scopeMismatch",
-                        observed_at=outcome.response_received_at,
-                        payload_digest=response_digest,
-                        payload_pointer=pointer,
-                    )
-                )
-                continue
-            record_payload = {
-                key: value
-                for key, value in safe_item.items()
-                if key != "observedAt"
-            }
+            record_payload = dict(candidate_projection)
             record_payload["provenance"] = {
                 "collectorAttemptId": attempt.attempt_id,
                 "collectorIdentityEvidenceRef": (

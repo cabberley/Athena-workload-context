@@ -8,8 +8,10 @@ from typing import Annotated, Final, Literal
 from pydantic import Field, StringConstraints, model_validator
 
 from athena_context.contracts import (
+    ApprovedResourceTags,
     AttemptIdentifier,
     AzureGuid,
+    AzureResourceIdentifier,
     CollectorAttempt,
     CollectorIdentityEvidence,
     EvidenceRecord,
@@ -25,7 +27,14 @@ from athena_context.contracts import (
     canonicalize_json,
     compute_artifact_digest,
 )
-from athena_context.contracts.models import AthenaBaseModel
+from athena_context.contracts.models import (
+    AthenaBaseModel,
+    EvidenceAvailabilityZone,
+    EvidenceLocation,
+    EvidenceResourceType,
+    ResourceState,
+    UtcDateTime,
+)
 
 AZURE_RESOURCE_INVENTORY_TOOL: Final = "azure.resourceInventory.read"
 AZURE_RESOURCE_INVENTORY_VERSION: Final = "1.0.0"
@@ -49,6 +58,19 @@ MAX_TIMEOUT_MILLISECONDS = 120_000
 
 type ToolName = Literal["azure.resourceInventory.read"]
 type ToolVersion = Annotated[str, StringConstraints(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")]
+
+
+class ResourceResponseItem(AthenaBaseModel):
+    """Closed Azure MCP resource item before provenance is attached."""
+
+    record_type: Literal["resource"] = Field(..., alias="recordType")
+    observed_at: UtcDateTime = Field(..., alias="observedAt")
+    resource_id: AzureResourceIdentifier = Field(..., alias="resourceId")
+    resource_type: EvidenceResourceType = Field(..., alias="resourceType")
+    location: EvidenceLocation
+    availability_zone: EvidenceAvailabilityZone = Field(..., alias="availabilityZone")
+    tags: ApprovedResourceTags
+    state: ResourceState
 
 
 class EvidenceResponseBounds(AthenaBaseModel):

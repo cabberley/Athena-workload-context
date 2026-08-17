@@ -4,6 +4,7 @@ import asyncio
 import base64
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -15,20 +16,32 @@ from athena_context.contracts import (
     EvidenceGapRecord,
     EvidenceGapRef,
     EvidenceItemRef,
+    EvidenceSnapshot,
     ResourceEvidenceRecord,
     ResourceGroupScope,
+    SnapshotCollector,
+    SnapshotPublicationRecord,
     SubscriptionScope,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
     compute_artifact_digest,
+    compute_authorized_scopes_digest,
+    compute_collector_attempt_set_digest,
     compute_collector_identity_evidence_digest,
+    compute_evidence_record_set_digest,
+    compute_evidence_reference_set_digest,
+    compute_evidence_snapshot_artifact_digest,
+    compute_evidence_snapshot_semantic_digest,
     compute_failure_envelope_digest,
+    compute_identity_evidence_set_digest,
     compute_jti_digest,
     compute_response_envelope_digest,
+    compute_snapshot_attestation_preimage_digest,
     compute_token_verification_digest,
     compute_verified_claims_digest,
     sha256_hex,
+    snapshot_attestation_preimage,
 )
 from athena_context.evidence import (
     AZURE_RESOURCE_INVENTORY_TOOL,
@@ -36,6 +49,7 @@ from athena_context.evidence import (
     REVIEWED_TOOL_ALLOWLIST,
     REVIEWED_TOOL_ALLOWLIST_DIGEST,
     AsyncEvidenceClient,
+    CollectedEvidence,
     CollectorTrustConfiguration,
     EvidenceBoundaryError,
     EvidenceCollectionCommand,
@@ -479,6 +493,266 @@ def _sync_client(
     )
 
 
+def _attempt_observed_at(result: CollectedEvidence) -> datetime:
+    attempt = result.collector_attempt
+    if attempt.attempt_type in {"successResponse", "failedResponse"}:
+        return attempt.response_received_at
+    if attempt.attempt_type == "timeoutNoResponse":
+        return attempt.timed_out_at
+    return attempt.observed_at
+
+
+def _validate_result_as_snapshot(
+    result: CollectedEvidence,
+    private_key: rsa.RSAPrivateKey,
+    *,
+    snapshot_suffix: str,
+) -> EvidenceSnapshot:
+    snapshot_id = f"snap-{snapshot_suffix}"
+    placeholder = "sha256:" + "0" * 64
+    references = result.references(
+        SnapshotReferenceBinding(
+            snapshotId=snapshot_id,
+            snapshotArtifactDigest=placeholder,
+            snapshotSemanticDigest=placeholder,
+        )
+    )
+    trust = _trust()
+    expires_at = result.request.attempt_started_at + timedelta(hours=1)
+    payload: dict[str, object] = {
+        "snapshotId": snapshot_id,
+        "compatibility": {
+            "artifactKind": "evidenceSnapshot",
+            "schemaVersion": trust.schema_version,
+            "semanticContractVersion": trust.semantic_contract_version,
+            "policyContractVersion": trust.policy_contract_version,
+            "minimumReaderVersion": "1.0.0",
+            "requiresCapabilities": [],
+            "producedBy": {
+                "producerId": "athena.contracts",
+                "version": "1.0.0",
+            },
+            "extensionPolicy": "rejectUnknownDecisionFields",
+            "artifactDigest": placeholder,
+            "semanticDigest": placeholder,
+        },
+        "authorizedScopes": [
+            scope.model_dump(mode="json", by_alias=True)
+            for scope in result.request.authorized_scopes
+        ],
+        "collectedAt": result.request.attempt_started_at,
+        "expiresAt": expires_at,
+        "collector": SnapshotCollector(
+            collectorType="azureMcpHost",
+            collectorIdentityEvidenceRef=trust.collector_identity_evidence_ref,
+            mcpHostId=trust.mcp_host_id,
+            tenantId=trust.tenant_id,
+            trustAnchorRef=trust.trust_anchor_ref,
+            ingestionServiceId=trust.ingestion_service_id,
+            ingestionAudience=trust.ingestion_audience,
+            toolAllowlistDigest=trust.tool_allowlist_digest,
+        ).model_dump(mode="python", by_alias=True),
+        "collectorAttempts": [
+            result.collector_attempt.model_dump(mode="python", by_alias=True)
+        ],
+        "evidenceRecords": [
+            record.model_dump(mode="python", by_alias=True)
+            for record in result.evidence_records
+        ],
+        "evidenceRefs": [
+            reference.model_dump(mode="python", by_alias=True)
+            for reference in references
+        ],
+        "identityEvidence": [
+            result.collector_identity_evidence.model_dump(
+                mode="python", by_alias=True
+            )
+        ],
+    }
+    semantic_digest = compute_evidence_snapshot_semantic_digest(payload)
+    compatibility = payload["compatibility"]
+    assert isinstance(compatibility, dict)
+    compatibility["semanticDigest"] = semantic_digest
+    reference_payloads = payload["evidenceRefs"]
+    assert isinstance(reference_payloads, list)
+    for reference in reference_payloads:
+        assert isinstance(reference, dict)
+        reference["snapshotSemanticDigest"] = semantic_digest
+    artifact_digest = compute_evidence_snapshot_artifact_digest(payload)
+    compatibility["artifactDigest"] = artifact_digest
+    for reference in reference_payloads:
+        assert isinstance(reference, dict)
+        reference["snapshotArtifactDigest"] = artifact_digest
+
+    attested_at = max(
+        _attempt_observed_at(result),
+        result.collector_identity_evidence.ingestion_signature.signed_at,
+    ) + timedelta(seconds=1)
+    anchor = _key_anchor(private_key.public_key())
+    identity_digest = result.collector_identity_evidence.identity_evidence_digest
+    attestation: dict[str, object] = {
+        "attestationType": "trustedSnapshotPublication",
+        "attestationVersion": "1.0.0",
+        "artifactKind": "evidenceSnapshot",
+        "schemaVersion": trust.schema_version,
+        "semanticContractVersion": trust.semantic_contract_version,
+        "policyContractVersion": trust.policy_contract_version,
+        "snapshotId": snapshot_id,
+        "artifactDigest": artifact_digest,
+        "semanticDigest": semantic_digest,
+        "identityEvidenceDigests": [identity_digest],
+        "identityEvidenceSetDigest": compute_identity_evidence_set_digest(payload),
+        "collectedAt": result.request.attempt_started_at,
+        "expiresAt": expires_at,
+        "authorizedScopesDigest": compute_authorized_scopes_digest(payload),
+        "collectorAttemptSetDigest": compute_collector_attempt_set_digest(payload),
+        "evidenceRecordSetDigest": compute_evidence_record_set_digest(payload),
+        "evidenceReferenceSetDigest": compute_evidence_reference_set_digest(payload),
+        "attestedAt": attested_at,
+        "signatureAlgorithm": "RS256",
+        "keyVaultKeyId": anchor.key_vault_key_id,
+        "keyName": anchor.key_name,
+        "keyVersion": anchor.key_version,
+        "trustAnchorRef": anchor.key_vault_key_id,
+    }
+    attestation["signedPreimageDigest"] = (
+        compute_snapshot_attestation_preimage_digest(attestation)
+    )
+    signature = private_key.sign(
+        canonicalize_json(snapshot_attestation_preimage(attestation)).encode("utf-8"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+    attestation["signature"] = base64.b64encode(signature).decode("ascii")
+    payload["snapshotAttestation"] = attestation
+    snapshot = EvidenceSnapshot.model_validate(payload)
+    publication = SnapshotPublicationRecord(
+        snapshot_id=snapshot.snapshot_id,
+        artifact_digest=snapshot.compatibility.artifact_digest,
+        semantic_digest=snapshot.compatibility.semantic_digest,
+        schema_version=snapshot.compatibility.schema_version,
+        semantic_contract_version=snapshot.compatibility.semantic_contract_version,
+        published_at=attested_at + timedelta(seconds=1),
+    )
+
+    def resolve_publication(
+        requested_snapshot_id: str,
+    ) -> SnapshotPublicationRecord | None:
+        return publication if requested_snapshot_id == snapshot.snapshot_id else None
+
+    def resolve_envelope(
+        attempt_id: str,
+        envelope_kind: Literal["response", "failure"],
+        digest: str,
+    ) -> object | None:
+        envelope = result.envelope
+        if (
+            envelope is not None
+            and attempt_id == result.collector_attempt.attempt_id
+            and envelope_kind == envelope.kind
+            and digest == envelope.digest
+        ):
+            return envelope.payload()
+        return None
+
+    return snapshot.validate_for_evaluation(
+        as_of=publication.published_at + timedelta(seconds=1),
+        expected_artifact_digest=snapshot.compatibility.artifact_digest,
+        publication_resolver=resolve_publication,
+        key_resolver=_key_resolver(private_key.public_key()),
+        trusted_key_anchor=anchor,
+        envelope_resolver=resolve_envelope,
+    )
+
+
+_OUTCOME_MATRIX: dict[str, tuple[str, str | None]] = {
+    "success": ("successResponse", None),
+    "failure": ("failedResponse", "collectorUnavailable"),
+    "timeout": ("timeoutNoResponse", "missing"),
+    "authorization": ("authorizationFailure", "unauthorized"),
+    "unavailable": ("toolUnavailable", "collectorUnavailable"),
+    "malformed": ("successResponse", "malformed"),
+    "stale": ("successResponse", "stale"),
+    "oversized": ("failedResponse", "responseOversized"),
+    "scopeMismatch": ("successResponse", "scopeMismatch"),
+    "replayMismatch": ("failedResponse", "malformed"),
+}
+
+
+def _matrix_outcome(
+    scenario: str, request: EvidenceTransportRequest
+) -> McpTransportOutcome:
+    if scenario == "failure":
+        return McpFailedResponse(
+            body=_body(_failed_payload(request)),
+            response_received_at=NOW,
+        )
+    if scenario == "timeout":
+        return McpTimeoutNoResponse(
+            deadline_at=NOW + timedelta(seconds=1),
+            timed_out_at=NOW + timedelta(seconds=2),
+        )
+    if scenario == "authorization":
+        return McpAuthorizationFailure(
+            authorization_status="denied",
+            observed_at=NOW,
+        )
+    if scenario == "unavailable":
+        return McpToolUnavailable(
+            unavailable_reason="networkUnavailable",
+            observed_at=NOW,
+        )
+    items = [_item()]
+    if scenario == "malformed":
+        items[0]["availabilityZone"] = "4"
+    elif scenario == "stale":
+        items = [_item(observed_at=NOW - timedelta(seconds=61))]
+    elif scenario == "scopeMismatch":
+        items = [
+            _item(resource_id=RESOURCE_ID.replace("rg-synthetic", "rg-outside"))
+        ]
+    payload = _success_payload(request, items=items)
+    if scenario == "replayMismatch":
+        payload["attemptId"] = "attempt-ffffffffffff"
+    return McpSuccessResponse(body=_body(payload), response_received_at=NOW)
+
+
+def _collect_matrix_result(
+    mode: Literal["sync", "async"],
+    scenario: str,
+    private_key: rsa.RSAPrivateKey,
+    *,
+    attempt_suffix: str,
+) -> CollectedEvidence:
+    bounds = _bounds(response_bytes=64) if scenario == "oversized" else _bounds()
+    command = _command(
+        attempt_id=f"attempt-{attempt_suffix}",
+        bounds=bounds,
+    )
+    if mode == "sync":
+        transport = FakeSyncTransport(
+            lambda request: _matrix_outcome(scenario, request)
+        )
+        return _sync_client(
+            transport,
+            signer=RealTestSigner(private_key),
+        ).collect(command)
+    transport = FakeAsyncTransport(
+        lambda request: _matrix_outcome(scenario, request)
+    )
+    public_key = private_key.public_key()
+    client = AsyncEvidenceClient(
+        transport=transport,
+        signer=AsyncRealTestSigner(RealTestSigner(private_key)),
+        replay_guard=AsyncReplayGuard(),
+        clock=FrozenClock(),
+        trust_configuration=_trust(),
+        key_resolver=_key_resolver(public_key),
+        trusted_key_anchor=_key_anchor(public_key),
+    )
+    return asyncio.run(client.collect(command))
+
+
 def test_reviewed_tool_allowlist_is_exact_and_digest_bound() -> None:
     assert REVIEWED_TOOL_ALLOWLIST == (("azure.resourceInventory.read", "1.0.0"),)
     assert compute_artifact_digest(
@@ -524,6 +798,17 @@ def test_success_projects_normalized_record_digests_envelope_and_reference() -> 
     assert projection.envelope.digest == compute_response_envelope_digest(
         projection.envelope.payload()
     )
+    response_item = projection.envelope.payload()["items"][0]
+    record_projection = record.model_dump(mode="json", by_alias=True)
+    for field_name in (
+        "provenance",
+        "itemDigest",
+        "collectorAttemptDigest",
+        "collectorIdentityEvidenceRef",
+    ):
+        record_projection.pop(field_name)
+    assert response_item == record_projection
+    assert "observedAt" not in response_item
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     identity = RealTestSigner(private_key).bind_attempt(
@@ -534,8 +819,6 @@ def test_success_projects_normalized_record_digests_envelope_and_reference() -> 
             as_of=NOW,
         )
     )
-    from athena_context.evidence.models import CollectedEvidence
-
     result = CollectedEvidence(
         request=request,
         collector_attempt=projection.collector_attempt,
@@ -658,6 +941,93 @@ def test_malformed_stale_and_scope_mismatched_items_are_exactly_pointed() -> Non
     ]
     assert projection.envelope is not None
     assert "rawLogBody" not in projection.envelope.canonical_bytes.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("availabilityZone", "4"),
+        ("resourceType", "Microsoft.Compute/disks"),
+        ("observedAt", "2026-08-17 01:00:00+00:00"),
+    ],
+)
+def test_original_closed_item_is_validated_before_safe_redaction(
+    field_name: str, invalid_value: str
+) -> None:
+    request = _request()
+    item = _item()
+    item[field_name] = invalid_value
+    projection = _project_success(
+        _success_payload(request, items=[item]), request=request
+    )
+    assert projection.collector_attempt.attempt_type == "successResponse"
+    assert _gap(projection).gap_reason == "malformed"
+
+
+def test_unknown_nested_tag_is_malformed_and_never_retained() -> None:
+    request = _request()
+    item = _item()
+    tags = item["tags"]
+    assert isinstance(tags, dict)
+    tags["owner"] = "untrusted-free-form"
+    projection = _project_success(
+        _success_payload(request, items=[item]), request=request
+    )
+    assert _gap(projection).gap_reason == "malformed"
+    assert projection.envelope is not None
+    assert "owner" not in projection.envelope.canonical_bytes.decode("utf-8")
+
+
+def test_invalid_closed_tag_value_is_malformed_not_defaulted() -> None:
+    request = _request()
+    item = _item()
+    tags = item["tags"]
+    assert isinstance(tags, dict)
+    tags["environment"] = "prod-untrusted"
+    projection = _project_success(
+        _success_payload(request, items=[item]), request=request
+    )
+    assert _gap(projection).gap_reason == "malformed"
+    assert projection.envelope is not None
+    assert "prod-untrusted" not in projection.envelope.canonical_bytes.decode("utf-8")
+
+
+def test_invalid_top_level_timestamp_uses_closed_utc_lexical_grammar() -> None:
+    request = _request()
+    body = _body(_success_payload(request)).replace(
+        b"2026-08-17T01:00:00.000Z",
+        b"2026-08-17T01:00:00+0000",
+    )
+    projection = project_transport_outcome(
+        request,
+        McpSuccessResponse(body=body, response_received_at=NOW),
+        validated_at=NOW,
+    )
+    assert projection.collector_attempt.attempt_type == "failedResponse"
+    assert _gap(projection).gap_reason == "malformed"
+
+
+@pytest.mark.parametrize("depth", [40, 1_100])
+def test_excessive_or_parser_recursive_json_maps_to_bounded_malformed_gap(
+    depth: int,
+) -> None:
+    request = _request()
+    body = (
+        b'{"nested":'
+        + (b"[" * depth)
+        + b"0"
+        + (b"]" * depth)
+        + b"}"
+    )
+    projection = project_transport_outcome(
+        request,
+        McpSuccessResponse(body=body, response_received_at=NOW),
+        validated_at=NOW,
+    )
+    assert projection.collector_attempt.attempt_type == "failedResponse"
+    attempt = projection.collector_attempt
+    assert attempt.failure_code == "schemaMismatch"
+    assert _gap(projection).gap_reason == "malformed"
 
 
 def test_response_scope_mismatch_points_to_digest_covered_root() -> None:
@@ -822,6 +1192,40 @@ def test_async_client_uses_separate_async_transport_and_signer_ports() -> None:
     result = asyncio.run(client.collect(_command(attempt_id="attempt-dddddddddddd")))
     assert isinstance(result.evidence_records[0], ResourceEvidenceRecord)
     assert transport.calls == 1
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("scenario", list(_OUTCOME_MATRIX))
+def test_transport_outcome_matrix_builds_evaluation_valid_snapshot(
+    mode: Literal["sync", "async"],
+    scenario: str,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    scenario_index = list(_OUTCOME_MATRIX).index(scenario) + 1
+    if mode == "async":
+        scenario_index += 0x100
+    suffix = f"{scenario_index:012x}"
+    result = _collect_matrix_result(
+        mode,
+        scenario,
+        private_key,
+        attempt_suffix=suffix,
+    )
+    expected_attempt_type, expected_gap_reason = _OUTCOME_MATRIX[scenario]
+    assert result.collector_attempt.attempt_type == expected_attempt_type
+    if expected_gap_reason is None:
+        assert isinstance(result.evidence_records[0], ResourceEvidenceRecord)
+    else:
+        gap = result.evidence_records[0]
+        assert isinstance(gap, EvidenceGapRecord)
+        assert gap.gap_reason == expected_gap_reason
+    validated = _validate_result_as_snapshot(
+        result,
+        private_key,
+        snapshot_suffix=suffix,
+    )
+    assert validated.snapshot_id == f"snap-{suffix}"
+    assert len(validated.evidence_refs) == len(validated.evidence_records)
 
 
 def test_mismatched_or_unverifiable_signer_output_is_rejected() -> None:
