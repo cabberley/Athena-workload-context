@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from athena_context.api import (
@@ -8,6 +9,7 @@ from athena_context.api import (
     create_app,
 )
 from athena_context.api.domain import AuthenticationMethod
+from athena_context.api.errors import DemoEvaluationConfigurationError
 from wc013_support import (
     MCP_SERVICE_ACTOR,
     PUBLISHER,
@@ -41,8 +43,9 @@ def _client(scenario: str = "success") -> tuple[object, TestClient]:
     )
     return harness, TestClient(
         create_app(
+            service=harness.context_resolver.service,
             authentication=authentication,
-            demo_evaluation_service=harness.service,
+            demo_evaluation_dependencies=harness.dependencies,
         )
     )
 
@@ -152,3 +155,20 @@ def test_openapi_only_exposes_demo_mutation_when_service_is_configured() -> None
     assert "DemoEvaluationCommand" in configured_schema["components"]["schemas"]
     assert "DemoEvaluationResult" in configured_schema["components"]["schemas"]
     assert "/v1/demo-evaluations" not in default_schema["paths"]
+
+
+def test_app_rejects_prebuilt_demo_service_from_foreign_context_store() -> None:
+    authoritative = build_harness()
+    foreign = build_harness()
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="preconstructed demo evaluation services are rejected",
+    ):
+        create_app(
+            service=authoritative.context_resolver.service,
+            demo_evaluation_service=foreign.service,
+        )
+
+    assert authoritative.store.publication_count == 0
+    assert foreign.store.publication_count == 0

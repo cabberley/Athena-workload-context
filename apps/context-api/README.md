@@ -37,32 +37,36 @@ The integration composes the merged components without introducing direct Azure 
   the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
-- The `EvaluationCommitPort` owns the typed WC-007 resolver used before collection. For the
-  in-process adapter that resolver is created from the actual `ContextService`; callers cannot
-  inject or relabel a resolver with an advertised coordinator. The evaluation rejects missing,
-  ambiguous, or superseded context and requires every applicable weakening override and every
-  resolved risk acceptance to be approved and active at the trusted evaluation time before MCP
+- The app-owned `ContextService` resolves WC-007 context, approvals, and evaluation grants before
+  collection directly through its configured persistence transaction. `DemoEvaluationService`
+  has no commit, resolver, approval, authorization, store, lock, or backend adapter injection
+  point. The evaluation rejects missing, ambiguous, or superseded context and requires every
+  applicable weakening override and resolved risk acceptance to be approved and active before MCP
   collection. The service never renews, edits, approves, or publishes a manifest on an agent's
   behalf.
 - WC-007 profile IDs are bounded NFC+casefold-normalized strings rather than a closed environment
   enum. The selected ID must resolve in the published manifest; manifest-defined IDs such as
   `prod-east` use the same canonical inheritance and governance checks.
-- An `EvaluationCommitPort` owns the final conditional transaction. It assigns `publishedAt`
-  inside the transaction, reads the exact active unsuperseded WC-007 context revision/ETag,
-  approval revision/status/expiry, and actor grant revision, canonically resolves the full profile
-  inheritance chain at that time, compares typed authority tokens captured before collection, and
+- `ContextService.commit_demo_evaluation` owns the final conditional transaction. It opens the
+  actual configured persistence transaction and creates a narrow transaction-scoped unit of work
+  from that exact transaction. It reads the active unsuperseded WC-007 context revision/ETag,
+  approval revision/status/expiry, and actor grant revision, canonically resolves the complete
+  profile inheritance chain, and compares typed authority tokens captured before collection.
+  Immediately before final validation it re-samples the service-owned trusted clock and uses that
+  same value for approval/governance/freshness checks, `publishedAt`, and `evaluatedAt`. It then
   inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
-change. `ContextService` opens the actual configured persistence transaction and constructs a
-narrow transaction-scoped evaluation unit of work from that transaction. Context, approval,
-evaluation-grant, receipt, and artifact operations are methods on that same unit of work; the
-commit adapter cannot inject an approval resolver, authorization registry, lock, coordinator,
-store label, or backend identity for final validation. The in-memory store snapshots and commits
-all five state sets under its internally owned lock, including rollback on failure. Production
-implementations must provide the same operations on the transaction returned by the actual
-Context API persistence adapter or one equivalent database conditional batch. Object identity,
-advertised backend equality, and nested independently locked registries are not accepted as
-evidence of atomicity. Approval
-revoke/expiry, inherited override expiry,
+  change. No independently supplied commit capability can redirect publication to a foreign
+  store. The HTTP composition root accepts only non-authoritative evidence/configuration/signing
+  dependencies and constructs the demo service with the exact app-owned `ContextService`;
+  preconstructed demo services are rejected.
+
+  Context, approval, evaluation-grant, receipt, and artifact operations are methods on the same
+  unit of work. The in-memory store snapshots and commits all five state sets under its internally
+  owned lock, including rollback on failure. Production implementations must provide the same
+  operations on the transaction returned by the actual Context API persistence adapter or one
+  equivalent database conditional batch. Object identity, advertised backend equality, and nested
+  independently locked registries are not accepted as evidence of atomicity. Approval
+  revoke/expiry, inherited override or risk-acceptance expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
   Authority tokens bind whether the caller selected an exact version or the unique active version.
   A unique-active commit repeats that lookup with no version inside the transaction, so a

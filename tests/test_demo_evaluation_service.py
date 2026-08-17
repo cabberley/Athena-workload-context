@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from threading import Event, Thread
 
@@ -13,11 +13,9 @@ from athena_context.api import (
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
-    InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
     PublishedContextSelection,
-    ResolvedPublishedContext,
     Role,
     RoleGrant,
     Wc008DeploymentOutputAssertion,
@@ -35,6 +33,7 @@ from athena_context.api.evaluation_context import (
 )
 from athena_context.api.evaluation_ports import (
     EvaluationAuthorityUnitOfWorkPort,
+    EvaluationCommitCandidate,
     SnapshotSigningRequest,
 )
 from athena_context.contracts import (
@@ -54,7 +53,6 @@ from wc013_support import (
     PUBLICATION_SERVICE,
     PUBLISHER,
     DemoHarness,
-    LifecycleContextResolver,
     build_current_synthetic_manifest,
     build_harness,
     deployment_assertion,
@@ -170,7 +168,7 @@ def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None
     assert candidate.audit.published_by == "synthetic-unpublished-candidate"
     assert published.manifest.manifest_id == "wl-athena-wc013-current-demo"
     assert published.manifest.manifest_version == "2.0.0"
-    assert published.manifest.audit.published_by == "human-approved-context-api"
+    assert published.manifest.audit.published_by == "athena-context-api"
     assert published.manifest.audit.published_at == published.published_at
     assert published.manifest_digest == (
         published.manifest.compute_artifact_digest_value()
@@ -320,7 +318,7 @@ def _assert_no_artifact(
     assert harness.store.publication_count == 0
 
 
-def test_approval_expiry_after_final_evaluation_aborts_conditional_commit() -> None:
+def test_approval_expiry_during_transaction_aborts_conditional_commit() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(
         as_of=CURRENT_NOW,
@@ -328,8 +326,8 @@ def test_approval_expiry_after_final_evaluation_aborts_conditional_commit() -> N
         approval_expires_at=CURRENT_NOW + timedelta(seconds=30),
     )
     idempotency_key = "wc013-approval-expiry-race"
-    harness.commit_hook.before_commit = lambda: harness.clock.advance(
-        timedelta(minutes=1)
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
+        lambda _: harness.clock.advance(timedelta(minutes=1))
     )
 
     with pytest.raises(
@@ -382,7 +380,7 @@ def test_approval_revocation_during_transaction_fails_before_insertion() -> None
             revoked_at=harness.clock.value,
         )
 
-    harness.store._before_artifact_insert = (  # type: ignore[method-assign]
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
         revoke_after_initial_read
     )
 
@@ -476,8 +474,9 @@ def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
     )
     idempotency_key = "wc013-authorization-removal-race"
-    harness.commit_hook.before_commit = lambda: harness.authorization.remove_grant(
-        RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    grant = RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)
+    harness.commit_hook.before_commit = lambda: (
+        harness.authorization.remove_grant(grant)
     )
 
     with pytest.raises(AuthorizationError, match="not authorized"):
@@ -485,10 +484,11 @@ def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
+    harness.authorization.add_grant(grant)
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
-def test_malicious_independent_authority_store_cannot_substitute_commit_uow() -> None:
+def test_lying_commit_adapter_cannot_be_injected_into_evaluation_service() -> None:
     actual = build_harness(
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
@@ -497,30 +497,36 @@ def test_malicious_independent_authority_store_cannot_substitute_commit_uow() ->
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
     )
-    idempotency_key = "wc013-malicious-independent-authority"
 
-    class MaliciousApprovalResolver:
-        advertised_backend = actual.context_resolver.store
+    class LyingCommitAdapter:
+        context_resolver = actual.context_resolver
 
-        def resolve(self, decision_id: str):
-            return foreign.approval_registry.resolve(decision_id)
+        def load_receipt(self, actor_id: str, key: str) -> object | None:
+            return foreign.store.load_receipt(actor_id, key)
 
-    class MaliciousAuthorization:
-        advertised_backend = actual.context_resolver.store
-
-        def authorize(self, actor, permission, manifest_id):
-            return foreign.authorization.authorize(
-                actor,
-                permission,
-                manifest_id,
+        def commit(
+            self,
+            candidate: EvaluationCommitCandidate,
+        ) -> object:
+            return foreign.context_resolver.service.commit_demo_evaluation(
+                reader_actor=PUBLISHER,
+                candidate=candidate,
             )
 
-    # A caller can influence pre-collection adapters, but the final commit has
-    # no resolver/backend injection points and reads only its service-owned UoW.
-    actual.service._approval_resolver = (  # type: ignore[attr-defined]
-        MaliciousApprovalResolver()
-    )
-    actual.service._authorization = MaliciousAuthorization()  # type: ignore[attr-defined]
+        def resolve_result(self, snapshot_id: str) -> object | None:
+            return foreign.store.resolve_result(snapshot_id)
+
+    with pytest.raises(TypeError, match="evaluation_commit"):
+        type(actual.service)(  # type: ignore[call-arg]
+            context_service=actual.context_resolver.service,
+            context_reader_actor=PUBLISHER,
+            deployment_configuration=actual.dependencies.deployment_configuration,
+            evidence_client=actual.dependencies.evidence_client,
+            snapshot_signer=actual.dependencies.snapshot_signer,
+            clock=actual.clock,
+            evaluation_commit=LyingCommitAdapter(),
+        )
+
     actual.commit_hook.before_commit = lambda: actual.approval_registry.revoke(
         actual.approval.decision_id,
         revoked_at=actual.clock.value,
@@ -529,66 +535,31 @@ def test_malicious_independent_authority_store_cannot_substitute_commit_uow() ->
     with pytest.raises(DemoEvaluationApprovalError, match="not active"):
         actual.service.evaluate(
             PUBLISHER,
-            idempotency_key,
+            "wc013-lying-commit-adapter",
             actual.command,
         )
 
-    foreign_approval = foreign.approval_registry.resolve(
-        foreign.approval.decision_id
+    assert foreign.store.publication_count == 0
+    _assert_no_artifact(
+        harness=actual,
+        idempotency_key="wc013-lying-commit-adapter",
     )
-    assert foreign_approval is not None
-    assert foreign_approval.status == "authorized"
-    _assert_no_artifact(harness=actual, idempotency_key=idempotency_key)
 
 
-def test_commit_rejects_independent_authority_store_injection() -> None:
+def test_service_rejects_all_independent_authority_dependencies() -> None:
     actual = build_harness()
     foreign = build_harness()
 
     with pytest.raises(TypeError, match="approval_resolver"):
-        InMemoryEvaluationCommitPort(  # type: ignore[call-arg]
+        type(actual.service)(  # type: ignore[call-arg]
             context_service=actual.context_resolver.service,
             context_reader_actor=PUBLISHER,
+            deployment_configuration=actual.dependencies.deployment_configuration,
+            evidence_client=actual.dependencies.evidence_client,
+            snapshot_signer=actual.dependencies.snapshot_signer,
+            clock=actual.clock,
             approval_resolver=foreign.approval_registry,
             authorization=foreign.authorization,
-            clock=actual.clock,
-            publication_actor=PUBLICATION_SERVICE,
-            evidence_identity_object_id=MCP_OBJECT_ID,
-        )
-
-
-def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() -> None:
-    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
-    store_a = LifecycleContextResolver(
-        manifest,
-        lifecycle_start=CURRENT_NOW - timedelta(minutes=5),
-    )
-
-    class MaliciousResolver:
-        def __init__(self, advertised_backend: object) -> None:
-            self.authority_coordinator = advertised_backend
-
-        def resolve(
-            self,
-            selection: PublishedContextSelection,
-            *,
-            as_of: datetime,
-        ) -> ResolvedPublishedContext:
-            return store_a.resolve(selection, as_of=as_of)
-
-    def malicious_factory(
-        store_b: LifecycleContextResolver,
-    ) -> MaliciousResolver:
-        return MaliciousResolver(store_b.store)
-
-    with pytest.raises(
-        DemoEvaluationConfigurationError,
-        match="resolver must be owned",
-    ):
-        build_harness(
-            as_of=CURRENT_NOW,
-            manifest=manifest,
-            service_context_resolver_factory=malicious_factory,
         )
 
 
@@ -626,7 +597,7 @@ def test_context_mutation_waits_until_authority_reads_and_artifact_insert_comple
         assert mutation_attempted.wait(timeout=5)
         assert not mutation_completed.wait(timeout=0.1)
 
-    harness.store._before_artifact_insert = (  # type: ignore[method-assign]
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
         hold_between_authority_and_insert
     )
     mutation_thread = Thread(target=mutate_context, daemon=True)
@@ -647,10 +618,25 @@ def test_context_mutation_waits_until_authority_reads_and_artifact_insert_comple
     assert harness.context_resolver.view.published.manifest_version == "2.1.0"
 
 
-def test_inherited_override_expiry_after_evaluation_aborts_conditional_commit() -> None:
+@pytest.mark.parametrize(
+    "authority_expiry",
+    ["inheritedOverride", "riskAcceptance"],
+)
+def test_governance_expiry_during_transaction_aborts_conditional_commit(
+    authority_expiry: str,
+) -> None:
     manifest = build_current_synthetic_manifest(
         as_of=CURRENT_NOW,
-        override_expires_at=CURRENT_NOW + timedelta(seconds=30),
+        override_expires_at=(
+            CURRENT_NOW + timedelta(seconds=30)
+            if authority_expiry == "inheritedOverride"
+            else None
+        ),
+        risk_acceptance_expires_at=(
+            CURRENT_NOW + timedelta(seconds=30)
+            if authority_expiry == "riskAcceptance"
+            else None
+        ),
         production_extends_development=True,
     )
     harness = build_harness(
@@ -675,9 +661,9 @@ def test_inherited_override_expiry_after_evaluation_aborts_conditional_commit() 
         for override in parent.weakening_overrides
     )
 
-    idempotency_key = "wc013-inherited-override-expiry-race"
-    harness.commit_hook.before_commit = lambda: harness.clock.advance(
-        timedelta(minutes=1)
+    idempotency_key = f"wc013-{authority_expiry}-expiry-race"
+    harness.context_resolver.service._before_evaluation_artifact_insert = (  # type: ignore[method-assign]
+        lambda _: harness.clock.advance(timedelta(minutes=1))
     )
     with pytest.raises(
         EvaluationFailedClosedError,

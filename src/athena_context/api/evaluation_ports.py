@@ -13,7 +13,6 @@ from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
-    DemoEvaluationResult,
     EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
@@ -22,7 +21,6 @@ from athena_context.api.evaluation_domain import (
 from athena_context.contracts import (
     EvidenceSnapshot,
     ManifestFinding,
-    SnapshotPublicationRecord,
     TrustedKeyAnchor,
     TrustedKeyResolver,
 )
@@ -160,6 +158,7 @@ class EvaluationCommitCandidate:
     envelope: ValidatedEnvelope
     expected_authority: EvaluationAuthorityToken
     private_mcp_endpoint: str
+    evidence_identity_object_id: str
 
 
 class ConfiguredEvidenceClientPort(Protocol):
@@ -191,53 +190,15 @@ class PublishedContextResolverPort(Protocol):
     ) -> ResolvedPublishedContext: ...
 
 
-class DemoEvaluationApprovalResolverPort(Protocol):
-    def resolve(self, decision_id: str) -> DemoEvaluationApproval | None: ...
-
-
 class SnapshotSigningPort(Protocol):
     def sign(self, request: SnapshotSigningRequest) -> str: ...
 
 
-class EvaluationCommitPort(Protocol):
-    """Conditionally finalize and insert an evaluation in one authority transaction.
-
-    Production adapters must own the resolver used before collection, compare
-    every typed authority revision/ETag, and perform commit-time authority reads
-    plus artifact insertion in the same backing-store transaction or conditional
-    batch. A caller-supplied resolver or a resolver call followed by an
-    independent write does not implement this port.
-    """
-
-    @property
-    def context_resolver(self) -> PublishedContextResolverPort: ...
-
-    def load_receipt(self, actor_id: str, idempotency_key: str) -> StoredEvaluation | None: ...
-
-    def commit(self, candidate: EvaluationCommitCandidate) -> DemoEvaluationResult: ...
-
-    def resolve_publication(self, snapshot_id: str) -> SnapshotPublicationRecord | None: ...
-
-    def resolve_result(self, snapshot_id: str) -> DemoEvaluationResult | None: ...
-
-
-class EvaluationAuthorizationPort(Protocol):
-    def authorize(
-        self,
-        actor: Actor,
-        permission: Permission,
-        manifest_id: str,
-    ) -> AuthorizationGrantToken: ...
-
-
 __all__ = [
     "ConfiguredEvidenceClientPort",
-    "DemoEvaluationApprovalResolverPort",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
     "EvaluationCommitCandidate",
-    "EvaluationCommitPort",
-    "EvaluationAuthorizationPort",
     "PublishedContextResolverPort",
     "SnapshotSigningPort",
     "SnapshotSigningRequest",

@@ -55,7 +55,10 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationCommand,
     DemoEvaluationResult,
 )
-from athena_context.api.evaluation_service import DemoEvaluationService
+from athena_context.api.evaluation_service import (
+    DemoEvaluationDependencies,
+    DemoEvaluationService,
+)
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.ports import AuthenticationPort
 from athena_context.api.service import ContextService
@@ -112,9 +115,16 @@ def create_app(
     *,
     service: ContextService | None = None,
     authentication: AuthenticationPort | None = None,
+    demo_evaluation_dependencies: DemoEvaluationDependencies | None = None,
     demo_evaluation_service: DemoEvaluationService | None = None,
     cohort_service: CohortProposalService | None = None,
 ) -> FastAPI:
+    if demo_evaluation_service is not None:
+        raise DemoEvaluationConfigurationError(
+            "preconstructed demo evaluation services are rejected; provide only "
+            "non-authoritative dependencies for composition with the app-owned "
+            "ContextService"
+        )
     default_store: InMemoryContextStore | None = None
     if service is None:
         default_store = InMemoryContextStore()
@@ -139,6 +149,14 @@ def create_app(
             preview_receipts=cohort_persistence,
         )
     authenticator = authentication or RejectUnverifiedAuthentication()
+    bound_demo_evaluation = (
+        None
+        if demo_evaluation_dependencies is None
+        else DemoEvaluationService.from_dependencies(
+            context_service=service,
+            dependencies=demo_evaluation_dependencies,
+        )
+    )
     application = FastAPI(
         title="Athena Context API",
         version="1.0.0",
@@ -422,7 +440,7 @@ def create_app(
     ) -> list[AuditEvent]:
         return service.audit_history(actor, manifest_id)
 
-    if demo_evaluation_service is not None:
+    if bound_demo_evaluation is not None:
 
         @application.post(
             "/v1/demo-evaluations",
@@ -435,7 +453,7 @@ def create_app(
             idempotency_key: IdempotencyHeader,
             actor: ActorDependency,
         ) -> DemoEvaluationResult:
-            return demo_evaluation_service.evaluate(
+            return bound_demo_evaluation.evaluate(
                 actor,
                 idempotency_key,
                 command,
@@ -450,7 +468,7 @@ def create_app(
             snapshot_id: str,
             actor: ActorDependency,
         ) -> DemoEvaluationResult:
-            return demo_evaluation_service.get_result(actor, snapshot_id)
+            return bound_demo_evaluation.get_result(actor, snapshot_id)
 
     return application
 

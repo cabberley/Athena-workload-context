@@ -43,11 +43,9 @@ from athena_context.api.evaluation_adapters import (
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
-    InMemoryDemoEvaluationApprovalRegistry,
     OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
     PrivateMcpInvokerPort,
-    StaticDemoEvaluationApprovalResolver,
     Wc009EvidenceClientAdapter,
 )
 from athena_context.api.evaluation_domain import (
@@ -71,10 +69,14 @@ from athena_context.api.evaluation_domain import (
     build_wc008_deployment_assertion,
 )
 from athena_context.api.evaluation_memory import (
+    InMemoryDemoEvaluationApprovalRegistry,
+    InMemoryDemoEvaluationStateReader,
     InMemoryEvaluationAuthorizationRegistry,
-    InMemoryEvaluationCommitPort,
 )
-from athena_context.api.evaluation_service import DemoEvaluationService
+from athena_context.api.evaluation_service import (
+    DemoEvaluationDependencies,
+    DemoEvaluationService,
+)
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
@@ -107,6 +109,7 @@ __all__ = [
     "DraftState",
     "DemoEvaluationApproval",
     "DemoEvaluationCommand",
+    "DemoEvaluationDependencies",
     "DemoEvaluationResult",
     "DemoEvaluationService",
     "EvaluationAuthorityToken",
@@ -115,8 +118,8 @@ __all__ = [
     "EnvironmentContextApiPublishedContextReader",
     "InMemoryContextStore",
     "InMemoryDemoEvaluationApprovalRegistry",
+    "InMemoryDemoEvaluationStateReader",
     "InMemoryEvaluationAuthorizationRegistry",
-    "InMemoryEvaluationCommitPort",
     "McpReadAssignment",
     "OperatorDeploymentApproval",
     "OperatorTrustedWc008ConfigurationPort",
@@ -136,7 +139,6 @@ __all__ = [
     "ResolvedPublishedContext",
     "SupersedeCommand",
     "StaticTestAuthenticator",
-    "StaticDemoEvaluationApprovalResolver",
     "TransitionCommand",
     "VerifiedAuthentication",
     "VerifiedWc008DeploymentConfiguration",

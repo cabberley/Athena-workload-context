@@ -18,12 +18,12 @@ from athena_context.api import (
     CreateDraftCommand,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
-    DemoEvaluationResult,
+    DemoEvaluationDependencies,
     DemoEvaluationService,
     InMemoryContextStore,
     InMemoryDemoEvaluationApprovalRegistry,
+    InMemoryDemoEvaluationStateReader,
     InMemoryEvaluationAuthorizationRegistry,
-    InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorDeploymentApproval,
     OperatorTrustedWc008ConfigurationPort,
@@ -45,17 +45,11 @@ from athena_context.api.domain import (
     PublishedManifestView,
     SupersedeCommand,
 )
-from athena_context.api.evaluation_ports import (
-    EvaluationCommitCandidate,
-    PublishedContextResolverPort,
-    SnapshotSigningRequest,
-    StoredEvaluation,
-)
+from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
     ResourceGroupScope,
-    SnapshotPublicationRecord,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
@@ -456,6 +450,7 @@ class LifecycleContextResolver:
         *,
         lifecycle_start: datetime,
         publish_manifest: bool = True,
+        clock: StepClock | None = None,
     ) -> None:
         self.store = InMemoryContextStore()
         self.authorization = RoleBasedAuthorization(
@@ -470,11 +465,8 @@ class LifecycleContextResolver:
         self.service = ContextService(
             store=self.store,
             authorization=self.authorization,
-            clock=StepClock(lifecycle_start),
-            publication_actor=Actor(
-                actor_id="human-approved-context-api",
-                kind=ActorKind.SERVICE,
-            ),
+            clock=clock or StepClock(lifecycle_start),
+            publication_actor=PUBLICATION_SERVICE,
         )
         self._manifest_id = manifest.manifest_id
         self._manifest_version = manifest.manifest_version
@@ -683,48 +675,24 @@ def _transition(draft: DraftRecord, reason: str) -> TransitionCommand:
     )
 
 
-class HookedEvaluationCommitPort:
-    """Test barrier that mutates authority after evaluation but before commit."""
+class EvaluationCommitHook:
+    """Test-only callback before ContextService opens the commit transaction."""
 
-    def __init__(self, delegate: InMemoryEvaluationCommitPort) -> None:
-        self._delegate = delegate
+    def __init__(self) -> None:
         self.before_commit: Callable[[], None] | None = None
 
-    @property
-    def context_resolver(self) -> PublishedContextResolverPort:
-        return self._delegate.context_resolver
-
-    def load_receipt(
-        self,
-        actor_id: str,
-        idempotency_key: str,
-    ) -> StoredEvaluation | None:
-        return self._delegate.load_receipt(actor_id, idempotency_key)
-
-    def commit(
-        self,
-        candidate: EvaluationCommitCandidate,
-    ) -> DemoEvaluationResult:
+    def run(self) -> None:
         if self.before_commit is not None:
             self.before_commit()
-        return self._delegate.commit(candidate)
-
-    def resolve_publication(
-        self,
-        snapshot_id: str,
-    ) -> SnapshotPublicationRecord | None:
-        return self._delegate.resolve_publication(snapshot_id)
-
-    def resolve_result(self, snapshot_id: str) -> DemoEvaluationResult | None:
-        return self._delegate.resolve_result(snapshot_id)
 
 
 @dataclass(frozen=True, slots=True)
 class DemoHarness:
     service: DemoEvaluationService
+    dependencies: DemoEvaluationDependencies
     command: DemoEvaluationCommand
-    store: InMemoryEvaluationCommitPort
-    commit_hook: HookedEvaluationCommitPort
+    store: InMemoryDemoEvaluationStateReader
+    commit_hook: EvaluationCommitHook
     transport: ScenarioTransport
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: LifecycleContextResolver
@@ -818,9 +786,6 @@ def build_harness(
     approval_expires_at: datetime | None = None,
     profile_id: str = "production",
     publish_context: bool = True,
-    service_context_resolver_factory: (
-        Callable[[LifecycleContextResolver], PublishedContextResolverPort] | None
-    ) = None,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -855,6 +820,7 @@ def build_harness(
         source_manifest,
         lifecycle_start=lifecycle_start,
         publish_manifest=publish_context,
+        clock=clock,
     )
     published_manifest = (
         context_resolver.view.published.manifest
@@ -906,7 +872,7 @@ def build_harness(
     approval_registry = InMemoryDemoEvaluationApprovalRegistry(
         [approval],
         context_service=context_resolver.service,
-        context_reader_actor=PUBLISHER,
+        approval_actor=APPROVER,
     )
     authorization = InMemoryEvaluationAuthorizationRegistry(
         (
@@ -915,36 +881,32 @@ def build_harness(
             RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
         ),
         context_service=context_resolver.service,
-        context_reader_actor=PUBLISHER,
+        administration_actor=PUBLISHER,
     )
-    store = InMemoryEvaluationCommitPort(
+    store = InMemoryDemoEvaluationStateReader(
         context_service=context_resolver.service,
-        context_reader_actor=PUBLISHER,
-        clock=clock,
-        publication_actor=PUBLICATION_SERVICE,
-        evidence_identity_object_id=MCP_OBJECT_ID,
+        reader_actor=PUBLISHER,
+        manifest_id=published_manifest.manifest_id,
     )
-    commit_hook = HookedEvaluationCommitPort(store)
-    service = DemoEvaluationService(
+    dependencies = DemoEvaluationDependencies(
         deployment_configuration=(
             configuration_port
             or _trusted_configuration_port(trusted_configuration)
         ),
         evidence_client=evidence_client,
-        context_resolver=(
-            store.context_resolver
-            if service_context_resolver_factory is None
-            else service_context_resolver_factory(context_resolver)
-        ),
-        approval_resolver=approval_registry,
         snapshot_signer=snapshot_signer,
-        evaluation_commit=commit_hook,
-        authorization=authorization,
         clock=clock,
-        publication_actor=PUBLICATION_SERVICE,
+        context_reader_actor=PUBLISHER,
     )
+    service = DemoEvaluationService.from_dependencies(
+        context_service=context_resolver.service,
+        dependencies=dependencies,
+    )
+    commit_hook = EvaluationCommitHook()
+    service._before_authoritative_commit = commit_hook.run  # type: ignore[method-assign]
     return DemoHarness(
         service=service,
+        dependencies=dependencies,
         command=command,
         store=store,
         commit_hook=commit_hook,
