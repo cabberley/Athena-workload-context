@@ -99,12 +99,17 @@ class CohortDecisionRequest(ApiModel):
 
 
 class CohortProposalSetVersion(ApiModel):
+    """Immutable authority identity for one selected proposal-set version.
+
+    The batch input digest is retained on the decision record for audit, but is
+    intentionally absent here because it includes the proposal evaluation time.
+    """
+
     manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     resolved_profile_digest: str = Field(pattern=_DIGEST_PATTERN)
     source_draft: CohortDraftBinding
-    batch_input_digest: str = Field(pattern=_DIGEST_PATTERN)
     proposal_set_digest: str = Field(pattern=_DIGEST_PATTERN)
     snapshot_artifact_digest: str = Field(pattern=_DIGEST_PATTERN)
     source_proposal_ids: list[str] = Field(
@@ -215,7 +220,6 @@ class CohortDecisionRecord(ApiModel):
             profile_id=self.profile_id,
             resolved_profile_digest=self.resolved_profile_digest,
             source_draft=self.source_draft,
-            batch_input_digest=self.batch_input_digest,
             proposal_set_digest=self.proposal_set_digest,
             snapshot_artifact_digest=self.snapshot.artifact_digest,
             sourceProposalIds=sorted(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import timedelta
 from types import TracebackType
 from typing import Any
 
@@ -9,6 +10,11 @@ from fastapi.testclient import TestClient
 import athena_context.fixtures as fixture_factory
 from athena_context.api.authorization import StaticTestAuthenticator
 from athena_context.api.cohort_decision_service import CohortDecisionService
+from athena_context.api.cohort_memory import (
+    CallableTrustedEvidenceSnapshotVerifier,
+    InMemoryCohortPersistence,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import ReplaceDraftCommand
 from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
@@ -142,6 +148,41 @@ def _decision_list_params(
         "proposal_set_digest": batch["proposalSetDigest"],
         "snapshot_artifact_digest": batch["snapshot"]["artifactDigest"],
     }
+
+
+def _replace_only_proposal_cache(harness: Harness) -> None:
+    fresh_cache = InMemoryCohortPersistence()
+    cohorts = CohortProposalService(
+        context_store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        snapshot_repository=harness.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            harness.verifier
+        ),
+        proposal_cache=fresh_cache,
+        preview_receipts=harness.persistence,
+    )
+    decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=harness.persistence,
+    )
+    harness.cohorts = cohorts
+    harness.decisions = decisions
+    harness.client = TestClient(
+        create_app(
+            service=harness.lifecycle,
+            authentication=StaticTestAuthenticator(
+                {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
+            ),
+            cohort_service=cohorts,
+            cohort_decision_service=decisions,
+        )
+    )
 
 
 def test_approve_persists_audited_decision_and_atomically_replaces_selectors() -> None:
@@ -424,6 +465,67 @@ def test_reject_is_durable_idempotent_and_permanently_blocks_apply() -> None:
         audit = tx.list_audit(manifest_id=harness.manifest.manifest_id)
         assert audit[-1].action == "cohort_decision_recorded"
         assert first.json()["decisionId"] in audit[-1].reason
+
+
+def test_reject_survives_proposal_cache_regeneration_at_a_later_time() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    proposal_id = _proposal(original_batch)["proposalId"]
+    reject_body = _decision_body(
+        harness,
+        original_batch,
+        decision="reject",
+        proposal_ids=[proposal_id],
+        rationale="Reject this proposal across deterministic cache regeneration.",
+    )
+    rejected = _post_decision(
+        harness,
+        reject_body,
+        "wc-034-reject-before-cache-regeneration",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    harness.clock.value += timedelta(seconds=1)
+    _replace_only_proposal_cache(harness)
+    regenerated_batch = _load(harness)
+
+    assert regenerated_batch["evaluatedAt"] != original_batch["evaluatedAt"]
+    assert regenerated_batch["inputDigest"] != original_batch["inputDigest"]
+    assert regenerated_batch["proposalSetDigest"] == (
+        original_batch["proposalSetDigest"]
+    )
+    assert [
+        proposal["proposalId"] for proposal in regenerated_batch["proposals"]
+    ] == [
+        proposal["proposalId"] for proposal in original_batch["proposals"]
+    ]
+
+    replay = _post_decision(
+        harness,
+        reject_body,
+        "wc-034-reject-before-cache-regeneration",
+    )
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            regenerated_batch,
+            proposal_ids=[proposal_id],
+        ),
+        "wc-034-apply-after-cache-regeneration",
+    )
+
+    assert replay.status_code == 201
+    assert replay.json() == rejected.json()
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id).revision == 1
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+    assert len(decisions) == 1
+    assert decisions[0].batch_input_digest == original_batch["inputDigest"]
 
 
 def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:

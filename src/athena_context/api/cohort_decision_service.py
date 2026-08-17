@@ -432,7 +432,6 @@ class CohortDecisionService:
                 revision=request.expected_revision,
                 manifestDigest=request.expected_digest,
             ),
-            batch_input_digest=resolved.batch.input_digest,
             proposal_set_digest=request.proposal_set_digest,
             snapshot_artifact_digest=request.snapshot_artifact_digest,
             sourceProposalIds=sorted(
