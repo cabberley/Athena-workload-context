@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -8,19 +9,23 @@ from pydantic import ValidationError
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
+    EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
+    PublishedContextSelection,
     Wc008DeploymentOutputAssertion,
 )
 from athena_context.api.domain import Supersession
 from athena_context.api.errors import (
+    AmbiguousLookupError,
     AuthorizationError,
     DemoEvaluationApprovalError,
     DemoEvaluationConfigurationError,
     EvaluationFailedClosedError,
     EvidenceCollectionRejectedError,
     IdempotencyConflictError,
+    ResourceNotFoundError,
 )
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.contracts import (
@@ -28,12 +33,16 @@ from athena_context.contracts import (
     compute_artifact_digest,
 )
 from wc013_support import (
+    APPROVER,
     CONTEXT_OBJECT_ID,
+    CURRENT_NOW,
     MCP_OBJECT_ID,
     MCP_SERVICE_ACTOR,
+    NOW,
     PRIVATE_ENDPOINT,
     PUBLICATION_SERVICE,
     PUBLISHER,
+    build_current_synthetic_manifest,
     build_harness,
     deployment_assertion,
     operator_approval,
@@ -130,6 +139,130 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     assert harness.store.resolve_publication(
         result.snapshot.snapshot_id
     ) == result.publication.registry_record()
+
+
+def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None:
+    candidate = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=candidate,
+    )
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-current-2026",
+        harness.command,
+    )
+
+    published = harness.context_resolver.view.published
+    assert candidate.audit.published_by == "synthetic-unpublished-candidate"
+    assert published.manifest.manifest_id == "wl-athena-wc013-current-demo"
+    assert published.manifest.manifest_version == "2.0.0"
+    assert published.manifest.audit.published_by == "human-approved-context-api"
+    assert published.manifest.audit.published_at == published.published_at
+    assert published.manifest_digest == (
+        published.manifest.compute_artifact_digest_value()
+    )
+    assert published.approval.approved_by == APPROVER
+    assert published.publication_authorized_by == PUBLISHER
+    assert harness.transport.calls == 1
+    assert harness.store.publication_count == 1
+    assert {
+        finding.clause_id: finding.verdict for finding in result.findings
+    } == EXPECTED_VERDICTS
+
+
+@pytest.mark.parametrize(
+    "expired_governance",
+    ["override", "riskAcceptance"],
+)
+def test_expired_published_manifest_governance_rejects_before_collection(
+    expired_governance: str,
+) -> None:
+    expires_at = CURRENT_NOW - timedelta(days=1)
+    expiry_arguments = (
+        {"override_expires_at": expires_at}
+        if expired_governance == "override"
+        else {"risk_acceptance_expires_at": expires_at}
+    )
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        **expiry_arguments,
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        profile_resolution_as_of=expires_at - timedelta(days=1),
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="inactive governance",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            "wc013-expired-current-manifest",
+            harness.command,
+        )
+
+    assert harness.context_resolver.calls == 1
+    assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.publication_count == 0
+
+
+@pytest.mark.parametrize(
+    "resolution_error",
+    [
+        ResourceNotFoundError("selected published context is missing"),
+        AmbiguousLookupError("selected published context is ambiguous"),
+    ],
+)
+def test_missing_or_ambiguous_published_context_fails_before_collection(
+    resolution_error: Exception,
+) -> None:
+    harness = build_harness()
+
+    class FailingPublishedContextResolver:
+        def resolve(self, *_args: object, **_kwargs: object) -> object:
+            raise resolution_error
+
+    harness.service._context_resolver = (  # type: ignore[attr-defined]
+        FailingPublishedContextResolver()
+    )
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="missing, ambiguous",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            "wc013-context-resolution-failed",
+            harness.command,
+        )
+
+    assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.publication_count == 0
+
+
+def test_wc007_resolver_can_select_the_unique_active_published_version() -> None:
+    harness = build_harness()
+
+    resolved = harness.context_resolver.resolve(
+        PublishedContextSelection(
+            manifest_id=harness.command.manifest_id,
+            manifest_version=None,
+            profile_id=harness.command.profile_id,
+        ),
+        as_of=NOW,
+    )
+
+    assert resolved.view.published.manifest_version == (
+        harness.command.manifest_version
+    )
+    assert resolved.profile.resolved_profile_digest == (
+        harness.command.expected_resolved_profile_digest
+    )
 
 
 def test_success_result_is_idempotent_before_any_repeat_collection_or_signing() -> None:
@@ -436,6 +569,30 @@ def test_live_configuration_adapter_loads_exact_bounded_operator_outputs(
 
     assert configuration.assertion == assertion
     assert configuration.operator_approval == approval
+
+
+def test_live_context_selection_requires_exact_manifest_version_and_profile() -> None:
+    selection = EnvironmentWc007PublishedContextSelectionPort(
+        {
+            "ATHENA_WC013_MANIFEST_ID": "wl-synthetic-current",
+            "ATHENA_WC013_MANIFEST_VERSION": "2.1.0",
+            "ATHENA_WC013_PROFILE_ID": "production",
+        }
+    ).load()
+
+    assert selection.manifest_id == "wl-synthetic-current"
+    assert selection.manifest_version == "2.1.0"
+    assert selection.profile_id == "production"
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="ATHENA_WC013_MANIFEST_VERSION",
+    ):
+        EnvironmentWc007PublishedContextSelectionPort(
+            {
+                "ATHENA_WC013_MANIFEST_ID": "wl-synthetic-current",
+                "ATHENA_WC013_PROFILE_ID": "production",
+            }
+        ).load()
 
 
 def test_live_configuration_adapter_fails_closed_for_missing_or_malformed_input(

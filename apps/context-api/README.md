@@ -20,7 +20,7 @@ mutate it.
 An explicitly composed Context API may expose `POST /v1/demo-evaluations` and
 `GET /v1/demo-evaluations/{snapshot_id}`. The default composition does not expose these routes.
 The mutation requires verified human publisher authority, an active trusted human approval
-decision, an idempotency key, the exact published WC-005 manifest/profile digests, and one explicit
+decision, an idempotency key, exact published canonical manifest/profile digests, and one explicit
 authorized evidence scope.
 
 The integration composes the merged components without introducing direct Azure access:
@@ -37,28 +37,43 @@ The integration composes the merged components without introducing direct Azure 
   the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
+- A typed WC-007 resolver loads the explicitly selected published manifest ID, version, and profile
+  through `ContextService`. The evaluation rejects missing, ambiguous, or superseded context and
+  requires every applicable weakening override and every resolved risk acceptance to be approved
+  and active at the trusted evaluation time before MCP collection. The service never renews,
+  edits, approves, or publishes a manifest on an agent's behalf.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
   RS256 attestation; production composition must back it with the configured versioned Key Vault
   key and managed identity rather than key material in configuration.
 - A typed artifact store atomically appends the canonical snapshot, source envelope, human-bound
   publication record, exact findings, and idempotency receipt only after cryptographic verification
-  and WC-004/WC-005 evaluation succeed.
+  and authoritative WC-004 evaluation of the resolved canonical profile succeeds.
 
 Authorization failure, stale or malformed output, endpoint/tool unavailability, scope mismatch,
-gaps, superseded context, signature failure, or golden-oracle mismatch produces no publication.
+gaps, inactive governance, missing or ambiguous context, superseded context, signature failure, or
+policy-evaluation failure produces no publication.
 The context identity configuration forbids Azure workload roles. The MCP identity configuration
 permits only reviewed read roles and forbids Context API permissions.
 
 The deterministic tests use a clearly synthetic endpoint, operator-pinned configuration port, and
-fake invoker. The optional live authentication probe is marked `live` and skipped unless explicitly
-enabled. The live path loads bounded WC-008 assertion and operator-approval JSON files and requires
-the independently pinned assertion digest:
+fake invoker. The WC-005 golden fixture is evaluated only at its historical June 2025 proof time.
+A separate 2026 test creates a new synthetic manifest version with bounded governance dates and
+publishes it through the complete WC-007 proposer, validation, review, human approval, and
+human-authorized publication lifecycle.
+
+The optional live authentication probe is marked `live` and skipped unless explicitly enabled. The
+live path requires an exact published context identity in addition to bounded WC-008 assertion and
+operator-approval JSON files. Full evaluation composition must resolve this selection through
+WC-007 and rejects an expired, missing, ambiguous, or superseded selection:
 
 ```powershell
 $env:ATHENA_WC013_LIVE = '1'
 $env:ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE = '<bounded WC-008 assertion JSON>'
 $env:ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE = '<operator approval JSON>'
 $env:ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST = 'sha256:<exact assertion digest>'
+$env:ATHENA_WC013_MANIFEST_ID = '<active published manifest ID>'
+$env:ATHENA_WC013_MANIFEST_VERSION = '<active published manifest version>'
+$env:ATHENA_WC013_PROFILE_ID = '<active profile ID>'
 python -m pytest tests/test_wc013_live.py -m live
 ```
 

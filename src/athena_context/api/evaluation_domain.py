@@ -6,11 +6,17 @@ from urllib.parse import urlsplit
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from athena_context.api.domain import Actor, ActorKind, ApiModel
+from athena_context.api.domain import (
+    Actor,
+    ActorKind,
+    ApiModel,
+    PublishedManifestView,
+)
 from athena_context.contracts import (
     EvidenceScope,
     EvidenceSnapshot,
     ManifestFinding,
+    ResolvedManifestProfile,
     SnapshotPublicationRecord,
     canonicalize_json,
     compute_artifact_digest,
@@ -200,6 +206,36 @@ class VerifiedWc008DeploymentConfiguration(ApiModel):
         ):
             raise ValueError(
                 "operator trust decision does not bind the exact WC-008 assertion"
+            )
+        return self
+
+
+class PublishedContextSelection(ApiModel):
+    """Exact WC-007 context identity, or one manifest with a unique active version."""
+
+    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_version: str | None = Field(
+        default=None,
+        pattern=_VERSION_PATTERN,
+    )
+    profile_id: str = Field(min_length=1, max_length=128)
+
+
+class ResolvedPublishedContext(ApiModel):
+    """Published WC-007 record and its profile resolved at trusted application time."""
+
+    view: PublishedManifestView
+    profile: ResolvedManifestProfile
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> ResolvedPublishedContext:
+        published = self.view.published
+        if (
+            self.profile.manifest_id != published.manifest_id
+            or self.profile.manifest_version != published.manifest_version
+        ):
+            raise ValueError(
+                "resolved profile does not match the published manifest identity"
             )
         return self
 
@@ -510,6 +546,8 @@ __all__ = [
     "DemoEvaluationResult",
     "McpReadAssignment",
     "OperatorDeploymentApproval",
+    "PublishedContextSelection",
+    "ResolvedPublishedContext",
     "VerifiedWc008DeploymentConfiguration",
     "Wc008DeploymentOutputAssertion",
     "build_authorized_publication",

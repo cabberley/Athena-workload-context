@@ -2,21 +2,32 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import ValidationError
 
-from athena_context.api.domain import Actor, PublishedManifestView
-from athena_context.api.errors import DemoEvaluationConfigurationError
+from athena_context.api.domain import Actor
+from athena_context.api.errors import (
+    AmbiguousLookupError,
+    DemoEvaluationConfigurationError,
+    ResourceNotFoundError,
+)
 from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     OperatorDeploymentApproval,
+    PublishedContextSelection,
+    ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
     Wc008DeploymentOutputAssertion,
 )
 from athena_context.api.service import ContextService
-from athena_context.contracts import TrustedKeyAnchor, TrustedKeyResolver
+from athena_context.contracts import (
+    TrustedKeyAnchor,
+    TrustedKeyResolver,
+    resolve_manifest_profile,
+)
 from athena_context.evidence import (
     AZURE_RESOURCE_INVENTORY_TOOL,
     Clock,
@@ -212,6 +223,28 @@ class EnvironmentWc008DeploymentConfigurationPort:
             ) from exc
 
 
+class EnvironmentWc007PublishedContextSelectionPort:
+    """Load an exact live WC-007 manifest version and profile selection."""
+
+    def __init__(self, environment: Mapping[str, str] | None = None) -> None:
+        self._environment = dict(os.environ if environment is None else environment)
+
+    def load(self) -> PublishedContextSelection:
+        return PublishedContextSelection(
+            manifest_id=self._required("ATHENA_WC013_MANIFEST_ID"),
+            manifest_version=self._required("ATHENA_WC013_MANIFEST_VERSION"),
+            profile_id=self._required("ATHENA_WC013_PROFILE_ID"),
+        )
+
+    def _required(self, variable: str) -> str:
+        value = self._environment.get(variable)
+        if value is None or not value.strip():
+            raise DemoEvaluationConfigurationError(
+                f"live WC-007 context variable {variable} is required"
+            )
+        return value
+
+
 class ContextServicePublishedContextResolver:
     """Resolve context only through the authorized WC-007 service, never its store."""
 
@@ -221,13 +254,42 @@ class ContextServicePublishedContextResolver:
 
     def resolve(
         self,
-        manifest_id: str,
-        manifest_version: str,
-    ) -> PublishedManifestView:
-        return self._service.get_published(
-            self._reader_actor,
-            manifest_version,
-            manifest_id=manifest_id,
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext:
+        if selection.manifest_version is None:
+            active = [
+                view
+                for view in self._service.list_published(
+                    self._reader_actor,
+                    selection.manifest_id,
+                )
+                if view.supersession is None
+            ]
+            if not active:
+                raise ResourceNotFoundError(
+                    "published manifest has no active version"
+                )
+            if len(active) != 1:
+                raise AmbiguousLookupError(
+                    "published manifest has multiple active versions"
+                )
+            view = active[0]
+        else:
+            view = self._service.get_published(
+                self._reader_actor,
+                selection.manifest_version,
+                manifest_id=selection.manifest_id,
+            )
+        profile = resolve_manifest_profile(
+            view.published.manifest,
+            selection.profile_id,
+            as_of=as_of,
+        )
+        return ResolvedPublishedContext(
+            view=view,
+            profile=profile,
         )
 
 
@@ -244,6 +306,7 @@ class StaticDemoEvaluationApprovalResolver:
 __all__ = [
     "AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL",
     "ContextServicePublishedContextResolver",
+    "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
     "OperatorTrustedWc008ConfigurationPort",
     "PrivateMcpEvidenceTransport",

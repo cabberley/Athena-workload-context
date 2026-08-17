@@ -10,6 +10,7 @@ from athena_context.api.domain import (
     ensure_timestamp,
 )
 from athena_context.api.errors import (
+    AmbiguousLookupError,
     DemoEvaluationApprovalError,
     DemoEvaluationConfigurationError,
     EvaluationFailedClosedError,
@@ -17,10 +18,16 @@ from athena_context.api.errors import (
     IdempotencyConflictError,
     ResourceNotFoundError,
 )
+from athena_context.api.evaluation_context import (
+    build_resource_evidence_context,
+    make_resource_snapshot_context_verifier,
+    require_active_manifest_governance,
+)
 from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationCommand,
     DemoEvaluationResult,
+    PublishedContextSelection,
     VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     build_demo_evaluation_result,
@@ -45,18 +52,11 @@ from athena_context.contracts import (
     EvidenceGapRecord,
     SnapshotPublicationRecord,
     compute_artifact_digest,
-    resolve_manifest_profile,
 )
 from athena_context.evidence import (
     CollectedEvidence,
     EvidenceClientError,
     EvidenceCollectionCommand,
-)
-from athena_context.golden import (
-    build_resource_evidence_context,
-    make_resource_snapshot_context_verifier,
-    validate_approved_golden_manifest,
-    validate_golden_profile_findings,
 )
 from athena_context.policy import evaluate_manifest_profile
 
@@ -151,35 +151,50 @@ class DemoEvaluationService:
             )
         self._validate_approval(actor, command, approval, as_of=as_of)
 
-        published_view = self._context_resolver.resolve(
-            command.manifest_id,
-            command.manifest_version,
-        )
-        if published_view.supersession is not None:
-            raise EvaluationFailedClosedError(
-                "superseded context cannot authorize authoritative evaluation"
+        try:
+            resolved_context = self._context_resolver.resolve(
+                PublishedContextSelection(
+                    manifest_id=command.manifest_id,
+                    manifest_version=command.manifest_version,
+                    profile_id=command.profile_id,
+                ),
+                as_of=as_of,
             )
+            published_view = resolved_context.view
+            if published_view.supersession is not None:
+                raise AthenaValidationError(
+                    "superseded context cannot authorize evaluation"
+                )
+            require_active_manifest_governance(
+                published_view.published.manifest,
+                resolved_context.profile,
+                as_of=as_of,
+            )
+        except (
+            AmbiguousLookupError,
+            AthenaValidationError,
+            ResourceNotFoundError,
+            ValueError,
+        ) as exc:
+            raise EvaluationFailedClosedError(
+                "published context/profile is missing, ambiguous, a superseded "
+                "context, or has inactive governance"
+            ) from exc
         published = published_view.published
+        profile = resolved_context.profile
         if (
             published.manifest_id != command.manifest_id
             or published.manifest_version != command.manifest_version
             or published.manifest_digest != command.expected_manifest_digest
             or published.manifest_digest != approval.manifest_digest
+            or profile.manifest_id != command.manifest_id
+            or profile.manifest_version != command.manifest_version
+            or profile.profile_id.casefold() != command.profile_id.casefold()
         ):
             raise EvaluationFailedClosedError(
-                "resolved published context does not match the approved immutable version"
+                "resolved published context/profile does not match the approved "
+                "immutable selection"
             )
-        try:
-            validate_approved_golden_manifest(published.manifest)
-            profile = resolve_manifest_profile(
-                published.manifest,
-                command.profile_id,
-                as_of=as_of,
-            )
-        except AthenaValidationError as exc:
-            raise EvaluationFailedClosedError(
-                "published context is not an active approved WC-005 golden manifest"
-            ) from exc
         if profile.resolved_profile_digest != command.expected_resolved_profile_digest:
             raise EvaluationFailedClosedError(
                 "resolved profile digest does not match the requested authoritative context"
@@ -211,6 +226,16 @@ class DemoEvaluationService:
         published_at = self._now()
         if published_at >= snapshot.expires_at:
             raise EvaluationFailedClosedError("snapshot became stale before publication")
+        try:
+            require_active_manifest_governance(
+                published.manifest,
+                profile,
+                as_of=published_at,
+            )
+        except AthenaValidationError as exc:
+            raise EvaluationFailedClosedError(
+                "manifest governance expired before snapshot publication"
+            ) from exc
         publication = build_authorized_publication(
             snapshot=snapshot,
             approval=approval,
@@ -263,14 +288,9 @@ class DemoEvaluationService:
                 as_of=published_at,
                 verify_evidence_context=verifier,
             )
-            validate_golden_profile_findings(
-                profile,
-                evidence,
-                findings_by_clause,
-            )
         except AthenaValidationError as exc:
             raise EvaluationFailedClosedError(
-                "verified evidence did not satisfy authoritative WC-005 evaluation"
+                "verified evidence did not satisfy authoritative manifest evaluation"
             ) from exc
 
         findings = tuple(

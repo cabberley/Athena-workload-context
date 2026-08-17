@@ -7,13 +7,17 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from athena_context.api import EnvironmentWc008DeploymentConfigurationPort
+from athena_context.api import (
+    EnvironmentWc007PublishedContextSelectionPort,
+    EnvironmentWc008DeploymentConfigurationPort,
+)
 
 
 @pytest.mark.live
 def test_optional_private_mcp_rejects_unauthenticated_tools_request() -> None:
     if os.getenv("ATHENA_WC013_LIVE") != "1":
         pytest.skip("set ATHENA_WC013_LIVE=1 for explicit private endpoint validation")
+    EnvironmentWc007PublishedContextSelectionPort().load()
     deployment = EnvironmentWc008DeploymentConfigurationPort().load_verified()
     endpoint = deployment.assertion.azure_mcp_internal_endpoint
 

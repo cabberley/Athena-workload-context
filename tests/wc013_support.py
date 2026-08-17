@@ -25,6 +25,8 @@ from athena_context.api import (
     OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
     PublishCommand,
+    PublishedContextSelection,
+    ResolvedPublishedContext,
     Role,
     RoleBasedAuthorization,
     RoleGrant,
@@ -43,11 +45,13 @@ from athena_context.api.evaluation_ports import (
     SnapshotSigningRequest,
 )
 from athena_context.contracts import (
+    CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
     ResourceGroupScope,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
+    canonicalize_manifest_payload,
     compute_artifact_digest,
     compute_collector_identity_evidence_digest,
     compute_jti_digest,
@@ -71,10 +75,12 @@ from athena_context.evidence.models import McpTransportOutcome
 from athena_context.fixtures import (
     CANONICAL_PRIVATE_KEY,
     load_canonical_snapshot_resource,
+    make_canonical_fixture_from_resources,
 )
 from athena_context.golden import GOLDEN_PROOF_AS_OF, load_golden_manifest
 
-NOW = datetime(2025, 6, 1, 11, 45, tzinfo=UTC)
+NOW = GOLDEN_PROOF_AS_OF
+CURRENT_NOW = datetime(2026, 8, 17, 5, 30, tzinfo=UTC)
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 SUBSCRIPTION_ID = TENANT_ID
 MCP_OBJECT_ID = "22222222-2222-2222-2222-222222222222"
@@ -146,7 +152,7 @@ def key_resolver(
         public_key=public_key,
         enabled=True,
         activated_at=datetime(2025, 5, 1, tzinfo=UTC),
-        expires_at=datetime(2026, 5, 1, tzinfo=UTC),
+        expires_at=datetime(2027, 5, 1, tzinfo=UTC),
     )
 
     def resolve(requested: TrustedKeyAnchor) -> TrustedKeyRecord | None:
@@ -428,9 +434,13 @@ def _golden_resource_items(observed_at: datetime) -> list[dict[str, object]]:
     return items
 
 
-class GoldenContextResolver:
-    def __init__(self) -> None:
-        manifest = load_golden_manifest()
+class LifecycleContextResolver:
+    def __init__(
+        self,
+        manifest: CanonicalWorkloadManifest,
+        *,
+        lifecycle_start: datetime,
+    ) -> None:
         authorization = RoleBasedAuthorization(
             [
                 RoleGrant(actor_id=PROPOSER.actor_id, role=Role.PROPOSER),
@@ -441,50 +451,51 @@ class GoldenContextResolver:
         service = ContextService(
             store=InMemoryContextStore(),
             authorization=authorization,
-            clock=StepClock(datetime(2025, 6, 1, 0, 4, 58, tzinfo=UTC)),
+            clock=StepClock(lifecycle_start),
             publication_actor=Actor(
                 actor_id="human-approved-context-api",
                 kind=ActorKind.SERVICE,
             ),
         )
+        version_key = manifest.manifest_version.replace(".", "-")
         draft = service.create_draft(
             PROPOSER,
-            "wc013-golden-create",
+            f"wc013-{version_key}-create",
             CreateDraftCommand(
-                draft_id="draft-wc005-golden",
+                draft_id=f"draft-wc013-{version_key}",
                 manifest=manifest,
                 manifest_digest=manifest.compatibility.artifact_digest,
                 previous_version=None,
-                reason="Create the immutable WC-005 synthetic golden draft",
+                reason="Create the explicitly governed synthetic manifest draft",
             ),
         )
         draft = service.validate_draft(
             PROPOSER,
             draft.draft_id,
-            "wc013-golden-validate",
-            _transition(draft, "Validate the WC-005 golden manifest"),
+            f"wc013-{version_key}-validate",
+            _transition(draft, "Validate the synthetic canonical manifest"),
         )
         draft = service.submit_for_review(
             PROPOSER,
             draft.draft_id,
-            "wc013-golden-submit",
-            _transition(draft, "Submit the WC-005 golden manifest"),
+            f"wc013-{version_key}-submit",
+            _transition(draft, "Submit the synthetic manifest for human review"),
         )
         draft = service.approve_draft(
             APPROVER,
             draft.draft_id,
-            "wc013-golden-approve",
-            _transition(draft, "Approve the WC-005 golden manifest"),
+            f"wc013-{version_key}-approve",
+            _transition(draft, "Human-approve the exact publication candidate"),
         )
         assert draft.approval is not None
         service.publish_draft(
             PUBLISHER,
             draft.draft_id,
-            "wc013-golden-publish",
+            f"wc013-{version_key}-publish",
             PublishCommand(
                 **_transition(
                     draft,
-                    "Publish the approved WC-005 golden manifest",
+                    "Human-authorize Context API publication",
                 ).model_dump(),
                 approval_id=draft.approval.decision_id,
             ),
@@ -493,9 +504,10 @@ class GoldenContextResolver:
             service=service,
             reader_actor=PUBLISHER,
         )
-        self._view = self._adapter.resolve(
-            manifest.manifest_id,
+        self._view = service.get_published(
+            PUBLISHER,
             manifest.manifest_version,
+            manifest_id=manifest.manifest_id,
         )
         self.calls = 0
 
@@ -509,18 +521,78 @@ class GoldenContextResolver:
 
     def resolve(
         self,
-        manifest_id: str,
-        manifest_version: str,
-    ) -> PublishedManifestView:
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext:
         self.calls += 1
         if (
-            manifest_id != self.view.published.manifest_id
-            or manifest_version != self.view.published.manifest_version
+            selection.manifest_id != self.view.published.manifest_id
+            or (
+                selection.manifest_version is not None
+                and selection.manifest_version
+                != self.view.published.manifest_version
+            )
         ):
             raise AssertionError("test requested unexpected published context")
         if self.view.supersession is not None:
-            return self.view
-        return self._adapter.resolve(manifest_id, manifest_version)
+            return ResolvedPublishedContext(
+                view=self.view,
+                profile=resolve_manifest_profile(
+                    self.view.published.manifest,
+                    selection.profile_id,
+                    as_of=as_of,
+                ),
+            )
+        return self._adapter.resolve(selection, as_of=as_of)
+
+
+def build_current_synthetic_manifest(
+    *,
+    as_of: datetime = CURRENT_NOW,
+    override_expires_at: datetime | None = None,
+    risk_acceptance_expires_at: datetime | None = None,
+) -> CanonicalWorkloadManifest:
+    """Build a new test version; only WC-007 humans may publish it."""
+
+    override_expiry = override_expires_at or (as_of + timedelta(days=30))
+    risk_expiry = risk_acceptance_expires_at or (as_of + timedelta(days=30))
+    payload = make_canonical_fixture_from_resources().canonical_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=False,
+        exclude_unset=True,
+    )
+    source_manifest_id = payload["manifestId"]
+
+    def replace_manifest_identity(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "manifestId" and child == source_manifest_id:
+                    value[key] = "wl-athena-wc013-current-demo"
+                else:
+                    replace_manifest_identity(child)
+        elif isinstance(value, list):
+            for child in value:
+                replace_manifest_identity(child)
+
+    replace_manifest_identity(payload)
+    payload["manifestVersion"] = "2.0.0"
+    payload["audit"] = {
+        "publishedBy": "synthetic-unpublished-candidate",
+        "publishedAt": min(override_expiry, risk_expiry) - timedelta(days=60),
+        "approvalStatus": "approved",
+    }
+    for profile in payload["profiles"].values():
+        for override in profile["weakeningOverrides"]:
+            override["acceptedAt"] = override_expiry - timedelta(days=60)
+            override["expiresAt"] = override_expiry
+        for acceptance in profile["riskAcceptances"]:
+            acceptance["acceptedAt"] = risk_expiry - timedelta(days=60)
+            acceptance["expiresAt"] = risk_expiry
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
 
 
 def _transition(draft: DraftRecord, reason: str) -> TransitionCommand:
@@ -539,7 +611,7 @@ class DemoHarness:
     store: InMemoryEvaluationArtifactStore
     transport: ScenarioTransport
     snapshot_signer: DeterministicSnapshotSigner
-    context_resolver: GoldenContextResolver
+    context_resolver: LifecycleContextResolver
     approval: DemoEvaluationApproval
     deployment_configuration: VerifiedWc008DeploymentConfiguration
 
@@ -621,8 +693,11 @@ def build_harness(
     service_configuration: VerifiedWc008DeploymentConfiguration | None = None,
     transport_configuration: VerifiedWc008DeploymentConfiguration | None = None,
     configuration_port: Any | None = None,
+    as_of: datetime = NOW,
+    manifest: CanonicalWorkloadManifest | None = None,
+    profile_resolution_as_of: datetime | None = None,
 ) -> DemoHarness:
-    clock = StepClock()
+    clock = StepClock(as_of)
     trust = trust_configuration()
     private_key = CANONICAL_PRIVATE_KEY
     trusted_configuration = (
@@ -645,22 +720,31 @@ def build_harness(
         key_resolver=key_resolver(private_key.public_key()),
         trusted_key_anchor=key_anchor(private_key.public_key()),
     )
-    context_resolver = GoldenContextResolver()
-    manifest = context_resolver.view.published.manifest
+    source_manifest = manifest or load_golden_manifest()
+    lifecycle_start = (
+        datetime(2025, 6, 1, 0, 4, 58, tzinfo=UTC)
+        if manifest is None
+        else as_of - timedelta(minutes=5)
+    )
+    context_resolver = LifecycleContextResolver(
+        source_manifest,
+        lifecycle_start=lifecycle_start,
+    )
+    published_manifest = context_resolver.view.published.manifest
     profile = resolve_manifest_profile(
-        manifest,
+        published_manifest,
         "production",
-        as_of=GOLDEN_PROOF_AS_OF,
+        as_of=profile_resolution_as_of or as_of,
     )
     approval = DemoEvaluationApproval(
         decision_id="approval-wc013-demo",
         status="authorized",
         approved_by=APPROVER,
-        approved_at=NOW - timedelta(minutes=5),
-        expires_at=NOW + timedelta(hours=1),
-        manifest_id=manifest.manifest_id,
-        manifest_version=manifest.manifest_version,
-        manifest_digest=manifest.compatibility.artifact_digest,
+        approved_at=as_of - timedelta(minutes=5),
+        expires_at=as_of + timedelta(hours=1),
+        manifest_id=published_manifest.manifest_id,
+        manifest_version=published_manifest.manifest_version,
+        manifest_digest=published_manifest.compatibility.artifact_digest,
         profile_id="production",
         authorized_scope=scope(),
         private_mcp_endpoint=(
@@ -673,9 +757,9 @@ def build_harness(
         approval_decision_id=approval.decision_id,
         attempt_id="attempt-013013013013",
         snapshot_id="snap-013013013013",
-        manifest_id=manifest.manifest_id,
-        manifest_version=manifest.manifest_version,
-        expected_manifest_digest=manifest.compatibility.artifact_digest,
+        manifest_id=published_manifest.manifest_id,
+        manifest_version=published_manifest.manifest_version,
+        expected_manifest_digest=published_manifest.compatibility.artifact_digest,
         profile_id="production",
         expected_resolved_profile_digest=profile.resolved_profile_digest,
         authorized_scope=scope(),
@@ -726,6 +810,7 @@ def build_harness(
 __all__ = [
     "APPROVER",
     "CONTEXT_OBJECT_ID",
+    "CURRENT_NOW",
     "DemoHarness",
     "MCP_OBJECT_ID",
     "MCP_SERVICE_ACTOR",
@@ -735,6 +820,7 @@ __all__ = [
     "PUBLISHER",
     "TENANT_ID",
     "build_harness",
+    "build_current_synthetic_manifest",
     "deployment_assertion",
     "operator_approval",
     "scope",

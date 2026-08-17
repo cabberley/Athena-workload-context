@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from athena_context.api.domain import (
     Actor,
     Permission,
-    PublishedManifestView,
 )
 from athena_context.api.evaluation_domain import (
     DemoEvaluationApproval,
     DemoEvaluationResult,
+    PublishedContextSelection,
+    ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
 )
 from athena_context.contracts import (
@@ -69,9 +71,10 @@ class TrustedWc008DeploymentConfigurationPort(Protocol):
 class PublishedContextResolverPort(Protocol):
     def resolve(
         self,
-        manifest_id: str,
-        manifest_version: str,
-    ) -> PublishedManifestView: ...
+        selection: PublishedContextSelection,
+        *,
+        as_of: datetime,
+    ) -> ResolvedPublishedContext: ...
 
 
 class DemoEvaluationApprovalResolverPort(Protocol):
