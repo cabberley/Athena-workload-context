@@ -35,9 +35,13 @@ mutate it.
   batch may be decided independently, while any overlap conflicts and a rejection blocks only its
   selected proposals. This authority identity uses only the immutable draft, profile, snapshot,
   and proposal-set bindings; proposal evaluation time and its derived input digest cannot bypass
-  a durable rejection after cache regeneration. Applied selectors are exactly the final selectors
-  shown in the approved candidate; selector IDs needed for a safe local override are finalized
-  before human review.
+  a durable rejection after cache regeneration. Overlap arbitration occurs before mutable draft
+  freshness checks. A disjoint apply from the same immutable batch may atomically rebase only over
+  the contiguous draft revisions produced by earlier decisions from that batch; unrelated draft
+  changes remain stale. Rebased replacement starts from the current draft and therefore preserves
+  every prior disjoint selector change. Applied selectors are exactly the final selectors shown in
+  the approved candidate; selector IDs needed for a safe local override are finalized before human
+  review.
 - `GET /v1/cohort-proposals/decisions` and
   `GET /v1/cohort-proposals/decisions/{decision_id}` return only decisions under an explicitly
   granted workload scope.

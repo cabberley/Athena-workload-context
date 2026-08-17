@@ -168,6 +168,23 @@ class CohortDecisionService:
         if replay is not None:
             return replay
 
+        version = self._proposal_set_version(request)
+        with self._store.transaction() as tx:
+            receipt = tx.get_cohort_decision_receipt(
+                actor.actor_id,
+                idempotency_key,
+            )
+            if receipt is not None:
+                return self._replay_from_receipt(
+                    receipt,
+                    request_digest=request_digest,
+                    manifest_id=request.manifest_id,
+                )
+            self._arbitrate_overlap(
+                request,
+                tx.list_overlapping_cohort_decisions(version),
+            )
+
         resolved = self._proposal_service.resolve_for_decision(
             actor,
             CohortProposalQuery(
@@ -178,6 +195,7 @@ class CohortDecisionService:
                 expected_revision=request.expected_revision,
                 expected_digest=request.expected_digest,
             ),
+            scope=request.scope,
         )
         proposals = self._validate_request_binding(request, resolved)
         decided_at = ensure_timestamp(self._clock.now())
@@ -192,7 +210,6 @@ class CohortDecisionService:
             proposals,
             decided_at=decided_at,
         )
-        version = self._proposal_set_version(request, resolved)
         decision_seed = request_digest.removeprefix("sha256:")[:32]
         decision_id = f"cohort-decision-{decision_seed}"
 
@@ -208,22 +225,12 @@ class CohortDecisionService:
                     manifest_id=request.manifest_id,
                 )
 
-            existing = tx.list_overlapping_cohort_decisions(version)
-            if existing:
-                if request.action is not CohortDecisionKind.REJECT and any(
-                    decision.decision is CohortDecisionKind.REJECT
-                    for decision in existing
-                ):
-                    raise RejectedProposalSetError(
-                        "a durable reject permanently blocks apply for an "
-                        "overlapping selected proposal"
-                    )
-                raise CohortDecisionConflictError(
-                    "an overlapping selected proposal already has an "
-                    "authoritative decision"
-                )
+            self._arbitrate_overlap(
+                request,
+                tx.list_overlapping_cohort_decisions(version),
+            )
 
-            current = self._require_current_draft(tx, request)
+            current = self._require_current_draft(tx, request, version)
             self._validate_candidate(
                 request,
                 resolved,
@@ -237,8 +244,8 @@ class CohortDecisionService:
                 replacement = self._selector_only_replacement(
                     current,
                     request,
-                    resolved,
                     candidate,
+                    proposals,
                     decided_at=decided_at,
                 )
                 candidate_digest = compute_artifact_digest(
@@ -257,9 +264,9 @@ class CohortDecisionService:
                     actor=actor,
                     draft_id=request.draft_id,
                     command=ReplaceDraftCommand(
-                        expected_revision=request.expected_revision,
+                        expected_revision=current.revision,
                         expected_manifest_version=request.manifest_version,
-                        expected_digest=request.expected_digest,
+                        expected_digest=current.manifest_digest,
                         replacement_manifest=replacement,
                         replacement_digest=replacement.compatibility.artifact_digest,
                         reason=reason,
@@ -420,7 +427,6 @@ class CohortDecisionService:
     @staticmethod
     def _proposal_set_version(
         request: CohortDecisionRequest,
-        resolved: ResolvedCohortReview,
     ) -> CohortProposalSetVersion:
         return CohortProposalSetVersion(
             manifest_id=request.manifest_id,
@@ -438,6 +444,26 @@ class CohortDecisionService:
                 normalized_identifier(proposal_id)
                 for proposal_id in request.proposal_ids
             ),
+        )
+
+    @staticmethod
+    def _arbitrate_overlap(
+        request: CohortDecisionRequest,
+        existing: list[CohortDecisionRecord],
+    ) -> None:
+        if not existing:
+            return
+        if request.action is not CohortDecisionKind.REJECT and any(
+            decision.decision is CohortDecisionKind.REJECT
+            for decision in existing
+        ):
+            raise RejectedProposalSetError(
+                "a durable reject permanently blocks apply for an "
+                "overlapping selected proposal"
+            )
+        raise CohortDecisionConflictError(
+            "an overlapping selected proposal already has an "
+            "authoritative decision"
         )
 
     @staticmethod
@@ -677,24 +703,16 @@ class CohortDecisionService:
     def _require_current_draft(
         tx: CohortDecisionTransactionPort,
         request: CohortDecisionRequest,
+        version: CohortProposalSetVersion,
     ) -> DraftRecord:
         draft = tx.get_draft(request.draft_id)
         if draft is None:
             raise ResourceNotFoundError(f"draft {request.draft_id!r} was not found")
         if draft.manifest_id != request.manifest_id:
             raise VersionMismatchError("draft belongs to a different workload")
-        if draft.revision != request.expected_revision:
-            raise StaleRevisionError(
-                f"expected draft revision {request.expected_revision}, "
-                f"found {draft.revision}"
-            )
         if draft.manifest.manifest_version != request.manifest_version:
             raise VersionMismatchError(
                 "expected manifest version does not match the draft"
-            )
-        if draft.manifest_digest != request.expected_digest:
-            raise DigestMismatchError(
-                "expected manifest digest does not match the draft"
             )
         if draft.state is not DraftState.DRAFT:
             raise InvalidTransitionError(
@@ -705,14 +723,78 @@ class CohortDecisionService:
             != draft.manifest_digest
         ):
             raise DigestMismatchError("draft manifest digest is not canonical")
+        source = version.source_draft
+        if draft.revision == source.revision:
+            if draft.manifest_digest != source.manifest_digest:
+                raise DigestMismatchError(
+                    "expected manifest digest does not match the draft"
+                )
+            return draft
+        if draft.revision < source.revision:
+            raise StaleRevisionError(
+                f"expected draft revision {source.revision}, "
+                f"found {draft.revision}"
+            )
+
+        binding = version.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+            exclude={"source_proposal_ids"},
+        )
+        applied_by_revision: dict[int, CohortDecisionRecord] = {}
+        for decision in tx.list_cohort_decisions(
+            manifest_id=request.manifest_id,
+            profile_id=request.profile_id,
+            draft_id=request.draft_id,
+            proposal_set_digest=request.proposal_set_digest,
+        ):
+            decision_binding = decision.proposal_set_version().model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+                exclude={"source_proposal_ids"},
+            )
+            applied = decision.applied_draft
+            if decision_binding != binding or applied is None:
+                continue
+            if (
+                applied.draft_id != source.draft_id
+                or applied.revision <= source.revision
+                or applied.revision in applied_by_revision
+            ):
+                raise StaleRevisionError(
+                    "cohort decision apply history is not a valid revision chain"
+                )
+            applied_by_revision[applied.revision] = decision
+
+        expected_digest = source.manifest_digest
+        expected_revision = source.revision + 1
+        for revision in sorted(applied_by_revision):
+            applied_decision = applied_by_revision[revision]
+            if (
+                revision != expected_revision
+                or revision > draft.revision
+                or applied_decision.applied_draft is None
+            ):
+                raise StaleRevisionError(
+                    "draft advanced outside this immutable cohort decision batch"
+                )
+            expected_digest = applied_decision.applied_draft.manifest_digest
+            expected_revision += 1
+        if (
+            expected_revision != draft.revision + 1
+            or draft.manifest_digest != expected_digest
+        ):
+            raise StaleRevisionError(
+                "draft digest does not match the atomic cohort decision apply chain"
+            )
         return draft
 
     @staticmethod
     def _selector_only_replacement(
         current: DraftRecord,
         request: CohortDecisionRequest,
-        resolved: ResolvedCohortReview,
         candidate: CohortReviewCandidate,
+        proposals: list[CohortProposal],
         *,
         decided_at: datetime,
     ) -> CanonicalWorkloadManifest:
@@ -742,17 +824,26 @@ class CohortDecisionService:
             as_of=decided_at,
         )
         target_before = before_profiles.get(requested_profile)
-        if (
-            target_before is None
-            or target_before.resolved_profile_digest
-            != resolved.profile.resolved_profile_digest
-        ):
+        source_role = proposals[0].role
+        if target_before is None:
             raise CohortContractError(
                 "requested profile changed before selector materialization"
             )
+        target_before_role = next(
+            (
+                role
+                for role in target_before.roles
+                if normalized_identifier(role.role_id) == target
+            ),
+            None,
+        )
+        if target_before_role != source_role:
+            raise CohortContractError(
+                "requested role changed outside this disjoint decision apply chain"
+            )
         applied_role = CohortDecisionService._materialize_local_role_override(
             update.role,
-            resolved=resolved,
+            baseline=source_role,
             candidate=candidate,
         )
         profile_payload = payload["profiles"].get(profile_key)
@@ -871,22 +962,11 @@ class CohortDecisionService:
     def _materialize_local_role_override(
         role: ManifestRole,
         *,
-        resolved: ResolvedCohortReview,
+        baseline: ManifestRole,
         candidate: CohortReviewCandidate,
     ) -> ManifestRole:
         """Require the approved role to already be a complete local override."""
 
-        baseline = next(
-            (
-                item
-                for item in resolved.profile.roles
-                if normalized_identifier(item.role_id)
-                == normalized_identifier(role.role_id)
-            ),
-            None,
-        )
-        if baseline is None:
-            raise CohortContractError("candidate role has no exact resolved baseline")
         update = candidate.role_updates[0]
         if update.role != role:
             raise CohortContractError(
@@ -944,7 +1024,7 @@ class CohortDecisionService:
             manifestId=request.manifest_id,
             manifestVersion=request.manifest_version,
             profileId=request.profile_id,
-            profileType=resolved.profile.profile_type,
+            profileType=resolved.batch.scope.profile_type,
             resolvedProfileDigest=request.scope.resolved_profile_digest,
             sourceDraft=resolved.batch.source_draft,
             appliedDraft=applied_binding,

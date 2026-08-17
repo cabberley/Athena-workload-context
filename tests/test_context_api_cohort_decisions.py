@@ -614,6 +614,118 @@ def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
     )
 
 
+def test_four_proposal_batch_rebases_disjoint_applies_and_preserves_both() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposals = batch["proposals"]
+    assert len(proposals) == 4
+    first_body = _decision_body(
+        harness,
+        batch,
+        proposal_ids=[proposals[0]["proposalId"]],
+        rationale="Apply the first disjoint synthetic selector.",
+    )
+    second_body = _decision_body(
+        harness,
+        batch,
+        proposal_ids=[proposals[1]["proposalId"]],
+        rationale="Apply the second disjoint synthetic selector.",
+    )
+
+    first = _post_decision(
+        harness,
+        first_body,
+        "wc-034-four-apply-first",
+    )
+    second = _post_decision(
+        harness,
+        second_body,
+        "wc-034-four-apply-second",
+    )
+    replay_after_rebase = _post_decision(
+        harness,
+        first_body,
+        "wc-034-four-apply-first",
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert replay_after_rebase.status_code == 201
+    assert replay_after_rebase.json() == first.json()
+    assert first.json()["sourceDraft"] == second.json()["sourceDraft"]
+    assert first.json()["draftResult"]["revision"] == 2
+    assert second.json()["draftResult"]["revision"] == 3
+
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    assert draft.revision == 3
+    profile = resolve_manifest_profile(
+        draft.manifest,
+        "production",
+        as_of=harness.clock.now(),
+    )
+    roles = {role.role_id: role for role in profile.roles}
+    for proposal, body in (
+        (proposals[0], first_body),
+        (proposals[1], second_body),
+    ):
+        assert [
+            selector.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            for selector in roles[proposal["role"]["roleId"]].selectors
+        ] == body["candidate"]["roleUpdates"][0]["role"]["selectors"]
+
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+    assert {
+        decision.source_proposal_ids[0]: decision.applied_draft.revision
+        for decision in decisions
+        if decision.applied_draft is not None
+    } == {
+        proposals[0]["proposalId"]: 2,
+        proposals[1]["proposalId"]: 3,
+    }
+
+
+def test_apply_then_new_key_overlap_conflicts_before_draft_freshness() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    proposal_id = batch["proposals"][0]["proposalId"]
+    body = _decision_body(
+        harness,
+        batch,
+        proposal_ids=[proposal_id],
+        rationale="Apply one exact synthetic proposal once.",
+    )
+
+    first = _post_decision(harness, body, "wc-034-apply-overlap-first")
+    overlap = _post_decision(
+        harness,
+        body,
+        "wc-034-apply-overlap-new-key",
+    )
+    replay = _post_decision(
+        harness,
+        body,
+        "wc-034-apply-overlap-first",
+    )
+
+    assert first.status_code == replay.status_code == 201
+    assert replay.json() == first.json()
+    assert overlap.status_code == 409
+    assert overlap.json()["error"]["code"] == "cohort_decision_conflict"
+    assert harness.lifecycle.get_draft(HUMAN, harness.draft_id).revision == 2
+    with harness.store.transaction() as tx:
+        decisions = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+    assert len(decisions) == 1
+    assert decisions[0].source_proposal_ids == [proposal_id]
+
+
 def test_four_proposal_rejection_blocks_only_overlapping_apply() -> None:
     harness = _build_harness()
     batch = _load(harness)

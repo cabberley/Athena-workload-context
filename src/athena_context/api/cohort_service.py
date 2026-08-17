@@ -59,6 +59,7 @@ from athena_context.binding import (
 from athena_context.binding.domain import (
     CohortProposal,
     CohortProposalBatch,
+    ProposalScope,
     SelectorPreview,
 )
 from athena_context.contracts.common import AthenaValidationError, compute_artifact_digest
@@ -100,8 +101,6 @@ class _ResolvedCohortContext:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedCohortReview:
-    draft: DraftRecord
-    profile: ResolvedManifestProfile
     evidence_binding: CohortEvidenceBinding
     snapshot: EvidenceSnapshot
     batch: CohortProposalBatchResponse
@@ -357,26 +356,107 @@ class CohortProposalService:
         self,
         actor: Actor,
         query: CohortProposalQuery,
+        *,
+        scope: ProposalScope,
     ) -> ResolvedCohortReview:
         """Revalidate the exact immutable batch and trusted snapshot for a decision."""
 
-        resolved = self._resolve_context(actor, query)
-        batch = self._proposal_cache.get_batch(resolved.cache_key)
+        if actor.kind is not ActorKind.HUMAN:
+            raise AuthorizationError(
+                "cohort proposal APIs require a verified human actor"
+            )
+        self._authorization.require_explicit(
+            actor,
+            Permission.READ,
+            query.manifest_id,
+        )
+        if (
+            scope.manifest_id != query.manifest_id
+            or scope.manifest_version != query.manifest_version
+            or scope.profile_id != query.profile_id
+        ):
+            raise CohortProfileMismatchError(
+                "the immutable decision scope does not match its source draft binding"
+            )
+        as_of = ensure_timestamp(self._clock.now())
+        binding = CohortEvidenceBinding(
+            manifest_id=query.manifest_id,
+            manifest_version=query.manifest_version,
+            profile_id=query.profile_id,
+            profile_type=scope.profile_type,
+            resolved_profile_digest=scope.resolved_profile_digest,
+            draft_id=query.draft_id,
+            draft_revision=query.expected_revision,
+            draft_digest=query.expected_digest,
+        )
+        snapshot = self._resolve_verified_snapshot(binding, as_of=as_of).snapshot
+        batch = self._proposal_cache.get_batch(
+            CohortBatchCacheKey(
+                evidence_binding=binding,
+                snapshot_artifact_digest=(
+                    snapshot.compatibility.artifact_digest
+                ),
+            )
+        )
         if batch is None:
             raise CohortContractError(
                 "the exact proposal batch must be loaded before recording a decision"
             )
-        self._validate_batch_binding(batch, resolved)
-        self._enforce_batch_bounds(batch)
-        self._ensure_current_draft(query)
-        return ResolvedCohortReview(
-            draft=resolved.draft,
-            profile=resolved.profile,
-            evidence_binding=resolved.evidence_binding,
-            snapshot=resolved.snapshot,
-            batch=batch,
-            as_of=resolved.as_of,
+        self._validate_decision_batch_binding(
+            batch,
+            binding=binding,
+            snapshot=snapshot,
         )
+        self._enforce_batch_bounds(batch)
+        return ResolvedCohortReview(
+            evidence_binding=binding,
+            snapshot=snapshot,
+            batch=batch,
+            as_of=as_of,
+        )
+
+    def _resolve_verified_snapshot(
+        self,
+        binding: CohortEvidenceBinding,
+        *,
+        as_of: datetime,
+    ) -> VerifiedCohortSnapshot:
+        stored = self._snapshot_repository.get_snapshot(binding)
+        if stored is None:
+            raise ResourceNotFoundError(
+                "no trusted evidence snapshot exists for the exact draft "
+                "and profile binding"
+            )
+        if stored.binding != binding:
+            raise EvidenceSnapshotMismatchError(
+                "snapshot repository returned a cross-binding result"
+            )
+        self._enforce_snapshot_bounds(stored.snapshot)
+        try:
+            verified = verify_cohort_snapshot(
+                stored.snapshot,
+                as_of=as_of,
+                verifier=lambda snapshot, verified_at: self._snapshot_verifier.verify(
+                    snapshot,
+                    as_of=verified_at,
+                ),
+            )
+        except AthenaValidationError as exc:
+            if as_of >= stored.snapshot.expires_at:
+                raise StaleEvidenceSnapshotError(
+                    "the trusted evidence snapshot has expired"
+                ) from exc
+            raise EvidenceSnapshotMismatchError(
+                "trusted evidence snapshot cryptographic verification failed"
+            ) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise EvidenceSnapshotMismatchError(
+                "trusted evidence snapshot cryptographic verification failed"
+            ) from exc
+        snapshot = verified.snapshot
+        if as_of < snapshot.collected_at or as_of >= snapshot.expires_at:
+            raise StaleEvidenceSnapshotError("the trusted evidence snapshot is stale")
+        return verified
 
     def _resolve_context(
         self,
@@ -428,40 +508,8 @@ class CohortProposalService:
             draft_revision=query.expected_revision,
             draft_digest=query.expected_digest,
         )
-        stored = self._snapshot_repository.get_snapshot(binding)
-        if stored is None:
-            raise ResourceNotFoundError(
-                "no trusted evidence snapshot exists for the exact draft and profile binding"
-            )
-        if stored.binding != binding:
-            raise EvidenceSnapshotMismatchError(
-                "snapshot repository returned a cross-binding result"
-            )
-        self._enforce_snapshot_bounds(stored.snapshot)
-        try:
-            verified = verify_cohort_snapshot(
-                stored.snapshot,
-                as_of=as_of,
-                verifier=lambda snapshot, verified_at: self._snapshot_verifier.verify(
-                    snapshot,
-                    as_of=verified_at,
-                ),
-            )
-        except AthenaValidationError as exc:
-            if as_of >= stored.snapshot.expires_at:
-                raise StaleEvidenceSnapshotError(
-                    "the trusted evidence snapshot has expired"
-                ) from exc
-            raise EvidenceSnapshotMismatchError(
-                "trusted evidence snapshot cryptographic verification failed"
-            ) from exc
-        except (RuntimeError, ValueError) as exc:
-            raise EvidenceSnapshotMismatchError(
-                "trusted evidence snapshot cryptographic verification failed"
-            ) from exc
+        verified = self._resolve_verified_snapshot(binding, as_of=as_of)
         snapshot = verified.snapshot
-        if as_of < snapshot.collected_at or as_of >= snapshot.expires_at:
-            raise StaleEvidenceSnapshotError("the trusted evidence snapshot is stale")
         profile_scopes = {
             scope.canonical_json() for scope in profile.allowed_evidence_scopes
         }
@@ -537,6 +585,46 @@ class CohortProposalService:
             )
         if any(
             proposal.scope != scope or proposal.snapshot != snapshot
+            for proposal in batch.proposals
+        ):
+            raise CohortContractError(
+                "cohort proposal batch contains a cross-profile or cross-snapshot result"
+            )
+
+    @staticmethod
+    def _validate_decision_batch_binding(
+        batch: CohortProposalBatchResponse,
+        *,
+        binding: CohortEvidenceBinding,
+        snapshot: EvidenceSnapshot,
+    ) -> None:
+        """Validate an immutable source batch without requiring the mutable draft head."""
+
+        scope = batch.scope
+        batch_snapshot = batch.snapshot
+        source = batch.source_draft
+        if (
+            source.draft_id != binding.draft_id
+            or source.revision != binding.draft_revision
+            or source.manifest_digest != binding.draft_digest
+            or scope.manifest_id != binding.manifest_id
+            or scope.manifest_version != binding.manifest_version
+            or scope.profile_id != binding.profile_id
+            or scope.profile_type != binding.profile_type
+            or scope.resolved_profile_digest != binding.resolved_profile_digest
+            or batch_snapshot.snapshot_id != snapshot.snapshot_id
+            or batch_snapshot.artifact_digest
+            != snapshot.compatibility.artifact_digest
+            or batch_snapshot.semantic_digest
+            != snapshot.compatibility.semantic_digest
+            or batch_snapshot.collected_at != snapshot.collected_at
+            or batch_snapshot.expires_at != snapshot.expires_at
+        ):
+            raise EvidenceSnapshotMismatchError(
+                "cohort proposal batch escaped its immutable decision binding"
+            )
+        if any(
+            proposal.scope != scope or proposal.snapshot != batch_snapshot
             for proposal in batch.proposals
         ):
             raise CohortContractError(
