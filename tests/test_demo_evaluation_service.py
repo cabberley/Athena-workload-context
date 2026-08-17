@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from pydantic import ValidationError
@@ -9,10 +11,12 @@ from pydantic import ValidationError
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
+    ContextService,
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
     InMemoryContextStore,
+    InMemoryDemoEvaluationApprovalRegistry,
     InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
@@ -34,6 +38,10 @@ from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
+from athena_context.api.ports import (
+    ContextAuthorityTransactionBackendPort,
+    ContextTransactionPort,
+)
 from athena_context.contracts import (
     NormalizationCollisionError,
     canonicalize_json,
@@ -100,7 +108,7 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     assert harness.snapshot_signer.calls == 1
     assert (
         harness.store.transaction_backend_identity
-        is harness.context_resolver.service.authority_transaction_backend.identity
+        is harness.context_resolver.service.authority_transaction_backend_identity
     )
     assert harness.store.publication_count == 1
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
@@ -475,6 +483,62 @@ def test_in_memory_commit_rejects_independent_authority_locks() -> None:
         )
 
 
+def test_lying_store_cannot_advertise_a_different_transaction_backend() -> None:
+    harness = build_harness()
+    advertised_store = InMemoryContextStore()
+
+    class LyingStore:
+        def __init__(
+            self,
+            actual_store: InMemoryContextStore,
+            advertised_backend: ContextAuthorityTransactionBackendPort,
+        ) -> None:
+            self._actual_store = actual_store
+            self.authority_transaction_backend = advertised_backend
+
+        def transaction(
+            self,
+        ) -> AbstractContextManager[ContextTransactionPort]:
+            return self._actual_store.transaction()
+
+    authorization = type(harness.authorization)(
+        [RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)],
+        transaction_backend=advertised_store.authority_transaction_backend,
+    )
+    approval_registry = InMemoryDemoEvaluationApprovalRegistry(
+        [harness.approval],
+        transaction_backend=advertised_store.authority_transaction_backend,
+    )
+    lying_service = ContextService(
+        store=LyingStore(
+            harness.context_resolver.store,
+            advertised_store.authority_transaction_backend,
+        ),
+        authorization=authorization,
+        clock=harness.clock,
+        publication_actor=PUBLICATION_SERVICE,
+    )
+
+    assert (
+        lying_service.authority_transaction_backend_identity
+        is harness.context_resolver.service.authority_transaction_backend_identity
+    )
+    assert (
+        lying_service.authority_transaction_backend_identity
+        is not advertised_store.authority_transaction_backend.identity
+    )
+    with pytest.raises(ValueError, match="does not share"):
+        InMemoryEvaluationCommitPort(
+            context_service=lying_service,
+            context_reader_actor=PUBLISHER,
+            approval_resolver=approval_registry,
+            authorization=authorization,
+            clock=harness.clock,
+            publication_actor=PUBLICATION_SERVICE,
+            evidence_identity_object_id=MCP_OBJECT_ID,
+        )
+
+
 def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     store_a = LifecycleContextResolver(
@@ -498,11 +562,11 @@ def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() ->
         store_b: LifecycleContextResolver,
     ) -> MaliciousResolver:
         assert (
-            store_a.service.authority_transaction_backend.identity
-            is not store_b.service.authority_transaction_backend.identity
+            store_a.service.authority_transaction_backend_identity
+            is not store_b.service.authority_transaction_backend_identity
         )
         return MaliciousResolver(
-            store_b.service.authority_transaction_backend
+            store_b.store.authority_transaction_backend
         )
 
     with pytest.raises(
@@ -514,6 +578,58 @@ def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() ->
             manifest=manifest,
             service_context_resolver_factory=malicious_factory,
         )
+
+
+def test_context_mutation_waits_until_authority_reads_and_artifact_insert_complete() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    barrier_reached = Event()
+    mutation_attempted = Event()
+    mutation_completed = Event()
+    mutation_errors: list[BaseException] = []
+    replacement = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        manifest_version="2.1.0",
+    )
+
+    def mutate_context() -> None:
+        if not barrier_reached.wait(timeout=5):
+            mutation_errors.append(AssertionError("commit barrier was not reached"))
+            return
+        mutation_attempted.set()
+        try:
+            harness.context_resolver.supersede_with(replacement)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            mutation_errors.append(exc)
+        finally:
+            mutation_completed.set()
+
+    def hold_between_authority_and_insert() -> None:
+        barrier_reached.set()
+        assert mutation_attempted.wait(timeout=5)
+        assert not mutation_completed.wait(timeout=0.1)
+
+    harness.store._before_artifact_insert = (  # type: ignore[method-assign]
+        hold_between_authority_and_insert
+    )
+    mutation_thread = Thread(target=mutate_context, daemon=True)
+    mutation_thread.start()
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-context-transaction-lock",
+        harness.command,
+    )
+    mutation_thread.join(timeout=10)
+
+    assert not mutation_thread.is_alive()
+    assert mutation_completed.is_set()
+    assert not mutation_errors
+    assert result.publication.manifest_version == "2.0.0"
+    assert harness.store.publication_count == 1
+    assert harness.context_resolver.view.published.manifest_version == "2.1.0"
 
 
 def test_inherited_override_expiry_after_evaluation_aborts_conditional_commit() -> None:

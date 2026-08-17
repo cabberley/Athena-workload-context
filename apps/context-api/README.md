@@ -52,13 +52,14 @@ The integration composes the merged components without introducing direct Azure 
   approval revision/status/expiry, and actor grant revision, canonically resolves the full profile
   inheritance chain at that time, compares typed authority tokens captured before collection, and
   inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
-  change. `ContextService` derives an opaque transaction-backend identity from its actual
-  persistence store. The in-memory commit adapter accepts no independent coordinator or resolver;
-  it derives the store-owned backend from `ContextService`, creates its resolver itself, and
-  requires the approval and grant registries to carry that exact identity before using the same
-  underlying lock for authority reads and artifact insertion. Production implementations have the
-  same typed contract: the commit adapter owns its resolver and performs both authority reads and
-  insertion in its identified backing-store transaction or conditional batch. Approval
+  change. `ContextService` opens the actual persistence transaction and derives its opaque backend
+  identity from that opened transaction, never from a store- or resolver-advertised coordinator.
+  The in-memory commit adapter accepts no independent coordinator or resolver; it creates its
+  resolver itself, rejects approval or grant registries not bound to that transaction-derived
+  identity, and asks `ContextService` to hold the actual store transaction across authority reads
+  and artifact insertion. Production implementations have the same typed contract: the commit
+  adapter owns its resolver and performs both authority reads and insertion in its identified
+  backing-store transaction or conditional batch. Approval
   revoke/expiry, inherited override expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
   Authority tokens bind whether the caller selected an exact version or the unique active version.

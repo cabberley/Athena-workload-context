@@ -36,7 +36,6 @@ from athena_context.api.evaluation_ports import (
     EvaluationCommitCandidate,
     StoredEvaluation,
 )
-from athena_context.api.memory import InMemoryAuthorityCoordinator
 from athena_context.api.ports import (
     ClockPort,
     ContextTransactionBackendIdentity,
@@ -71,25 +70,23 @@ class InMemoryEvaluationCommitPort:
     ) -> None:
         if publication_actor.kind is not ActorKind.SERVICE:
             raise ValueError("publication_actor must be a service actor")
-        transaction_backend = context_service.authority_transaction_backend
-        if not isinstance(transaction_backend, InMemoryAuthorityCoordinator):
-            raise ValueError(
-                "in-memory evaluation commit requires the ContextService "
-                "in-memory persistence transaction backend"
-            )
+        transaction_backend_identity = (
+            context_service.authority_transaction_backend_identity
+        )
         for dependency, label in (
             (approval_resolver, "approval registry"),
             (authorization, "authorization registry"),
         ):
             if (
                 dependency.transaction_backend_identity
-                is not transaction_backend.identity
+                is not transaction_backend_identity
             ):
                 raise ValueError(
                     f"in-memory {label} does not share the ContextService "
                     "persistence transaction backend"
                 )
-        self._transaction_backend = transaction_backend
+        self._context_service = context_service
+        self._transaction_backend_identity = transaction_backend_identity
         self._context_resolver = ContextServicePublishedContextResolver(
             service=context_service,
             reader_actor=context_reader_actor,
@@ -107,14 +104,16 @@ class InMemoryEvaluationCommitPort:
 
     @property
     def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
-        return self._transaction_backend.identity
+        return self._transaction_backend_identity
 
     def load_receipt(
         self,
         actor_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None:
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             return self._state.receipts.get((actor_id, idempotency_key))
 
     def commit(
@@ -124,7 +123,9 @@ class InMemoryEvaluationCommitPort:
         """Read all authority and insert all artifacts under one transaction lock."""
 
         receipt_key = (candidate.actor.actor_id, candidate.idempotency_key)
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             replay = self._state.receipts.get(receipt_key)
             if replay is not None:
                 if replay.request_digest != candidate.request_digest:
@@ -227,6 +228,7 @@ class InMemoryEvaluationCommitPort:
                     "snapshot became stale before publication"
                 )
 
+            self._before_artifact_insert()
             publication = build_authorized_publication(
                 snapshot=candidate.snapshot,
                 approval=approval,
@@ -273,6 +275,9 @@ class InMemoryEvaluationCommitPort:
             )
             return result
 
+    def _before_artifact_insert(self) -> None:
+        """Test seam reached while the actual ContextService transaction is held."""
+
     @staticmethod
     def _validate_canonical_components(artifact: StoredEvaluation) -> None:
         result = DemoEvaluationResult.model_validate_json(artifact.result_json)
@@ -293,7 +298,9 @@ class InMemoryEvaluationCommitPort:
         self,
         snapshot_id: str,
     ) -> SnapshotPublicationRecord | None:
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             artifact = self._state.artifacts.get(snapshot_id)
         if artifact is None:
             return None
@@ -303,7 +310,9 @@ class InMemoryEvaluationCommitPort:
         return publication.registry_record()
 
     def resolve_result(self, snapshot_id: str) -> DemoEvaluationResult | None:
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             artifact = self._state.artifacts.get(snapshot_id)
         if artifact is None:
             return None
@@ -315,7 +324,9 @@ class InMemoryEvaluationCommitPort:
         kind: Literal["response", "failure"],
         digest: str,
     ) -> object | None:
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             matches = [
                 artifact
                 for artifact in self._state.artifacts.values()
@@ -329,7 +340,9 @@ class InMemoryEvaluationCommitPort:
 
     @property
     def publication_count(self) -> int:
-        with self._transaction_backend.transaction():
+        with self._context_service.authority_transaction(
+            self._transaction_backend_identity
+        ):
             return len(self._state.artifacts)
 
 

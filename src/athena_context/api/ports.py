@@ -56,6 +56,11 @@ class ContextAuthorityTransactionBackendPort(Protocol):
 
 
 class ContextTransactionPort(Protocol):
+    @property
+    def authority_transaction_backend_identity(
+        self,
+    ) -> ContextTransactionBackendIdentity: ...
+
     def get_draft(self, draft_id: str) -> DraftRecord | None: ...
 
     def list_drafts(
@@ -100,15 +105,4 @@ class ContextTransactionPort(Protocol):
 
 
 class ContextStorePort(Protocol):
-    """Authoritative store whose backend capability identifies its real transaction.
-
-    Implementations must issue the identity from the same physical transaction
-    backend used by ``transaction``; a caller-selected label is not conformant.
-    """
-
-    @property
-    def authority_transaction_backend(
-        self,
-    ) -> ContextAuthorityTransactionBackendPort: ...
-
     def transaction(self) -> AbstractContextManager[ContextTransactionPort]: ...

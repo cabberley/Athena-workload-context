@@ -115,6 +115,14 @@ class _MemoryTransaction(ContextTransactionPort):
             self._store._lock.release()
         return False
 
+    @property
+    def authority_transaction_backend_identity(
+        self,
+    ) -> ContextTransactionBackendIdentity:
+        """Identify the lock actually acquired by this transaction instance."""
+
+        return self._store._coordinator.identity
+
     def get_draft(self, draft_id: str) -> DraftRecord | None:
         draft = self._drafts.get(draft_id)
         return None if draft is None else draft.model_copy(deep=True)

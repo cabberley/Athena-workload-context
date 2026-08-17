@@ -911,9 +911,7 @@ def build_harness(
     authorization = context_resolver.authorization
     approval_registry = InMemoryDemoEvaluationApprovalRegistry(
         [approval],
-        transaction_backend=(
-            context_resolver.service.authority_transaction_backend
-        ),
+        transaction_backend=context_resolver.store.authority_transaction_backend,
     )
     store = InMemoryEvaluationCommitPort(
         context_service=context_resolver.service,

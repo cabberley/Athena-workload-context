@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import TypeVar
 
@@ -49,8 +50,8 @@ from athena_context.api.errors import (
 from athena_context.api.ports import (
     AuthorizationPort,
     ClockPort,
-    ContextAuthorityTransactionBackendPort,
     ContextStorePort,
+    ContextTransactionBackendIdentity,
     ContextTransactionPort,
 )
 from athena_context.contracts.common import compute_artifact_digest
@@ -112,12 +113,30 @@ class ContextService:
         self._publication_actor = publication_actor
 
     @property
-    def authority_transaction_backend(
+    def authority_transaction_backend_identity(
         self,
-    ) -> ContextAuthorityTransactionBackendPort:
-        """Return only the transaction backend owned by this service's store."""
+    ) -> ContextTransactionBackendIdentity:
+        """Derive identity from a transaction opened on the actual store."""
 
-        return self._store.authority_transaction_backend
+        with self._store.transaction() as transaction:
+            return transaction.authority_transaction_backend_identity
+
+    @contextmanager
+    def authority_transaction(
+        self,
+        expected_identity: ContextTransactionBackendIdentity,
+    ) -> Iterator[None]:
+        """Open the actual store transaction without exposing storage mutation."""
+
+        with self._store.transaction() as transaction:
+            if (
+                transaction.authority_transaction_backend_identity
+                is not expected_identity
+            ):
+                raise RuntimeError(
+                    "ContextService persistence transaction backend changed"
+                )
+            yield
 
     def create_draft(
         self,
