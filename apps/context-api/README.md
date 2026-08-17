@@ -53,7 +53,9 @@ mutate it.
   non-selector edits remain legal without accepting caller-supplied authority. Replacement also
   compares the effective resolved selector provenance of every profile before and after the
   mutation. Inheritance-topology changes cannot make approved selectors effective in another
-  profile; selector-neutral inheritance and non-selector edits remain legal.
+  profile; selector-neutral inheritance and non-selector edits remain legal. Fresh drafts compare
+  every effective profile, including profile additions and removals, with the authoritative
+  same-version draft or published predecessor before any baseline, audit, receipt, or draft write.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its selected proposals. This authority identity

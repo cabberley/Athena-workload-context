@@ -186,6 +186,13 @@ class ContextService:
                 as_of=now,
                 selector_authority=selector_authority,
             )
+            self._validate_new_draft_effective_selector_provenance(
+                tx,
+                command.manifest,
+                previous_version=command.previous_version,
+                as_of=now,
+                selector_authority=selector_authority,
+            )
             draft = DraftRecord(
                 draft_id=command.draft_id,
                 manifest_id=manifest_id,
@@ -662,6 +669,77 @@ class ContextService:
             raise ManifestValidationError(
                 "a fresh draft cannot introduce, relocate, or change selectors "
                 "outside exact approved cohort provenance"
+            )
+
+    @staticmethod
+    def _validate_new_draft_effective_selector_provenance(
+        tx: ContextTransactionPort,
+        manifest: CanonicalWorkloadManifest,
+        *,
+        previous_version: str | None,
+        as_of: datetime,
+        selector_authority: PersistedSelectorAuthority | None,
+    ) -> None:
+        """Keep every effective profile bound to its authoritative predecessor."""
+
+        reference_manifest: CanonicalWorkloadManifest | None = None
+        reference_authority: PersistedSelectorAuthority | None = None
+        if previous_version is not None:
+            published = tx.get_published(
+                manifest.manifest_id,
+                previous_version,
+            )
+            if published is not None:
+                reference_manifest = published.manifest
+                reference_authority = (
+                    persisted_selector_authority_for_published(
+                        tx,
+                        published=published,
+                        effective_manifest_version=(
+                            published.manifest.manifest_version
+                        ),
+                    )
+                )
+        else:
+            same_version = tx.list_draft_selector_baselines(
+                manifest_id=manifest.manifest_id,
+                manifest_version=manifest.manifest_version,
+            )
+            if same_version:
+                reference = tx.get_draft(same_version[0].draft_id)
+                if reference is None:
+                    raise PersistenceConflictError(
+                        "selector baseline references a missing draft"
+                    )
+                reference_manifest = reference.manifest
+                reference_authority = (
+                    persisted_selector_authority_for_draft(
+                        tx,
+                        current=reference,
+                    )
+                )
+        if reference_manifest is None:
+            return
+
+        try:
+            expected = ContextService._resolve_effective_selector_provenance(
+                reference_manifest,
+                as_of=as_of,
+                selector_authority=reference_authority,
+            )
+            actual = ContextService._resolve_effective_selector_provenance(
+                manifest,
+                as_of=as_of,
+                selector_authority=selector_authority,
+            )
+        except (AthenaValidationError, StopIteration) as exc:
+            raise ManifestValidationError(
+                "fresh draft effective selector provenance is not valid"
+            ) from exc
+        if expected != actual:
+            raise ManifestValidationError(
+                "a fresh draft cannot add, remove, or change effective profile "
+                "selectors without exact persisted cohort decision provenance"
             )
 
     @staticmethod

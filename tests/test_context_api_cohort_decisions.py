@@ -1592,6 +1592,141 @@ def test_reject_survives_selector_neutral_profile_topology_regeneration() -> Non
         assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
 
 
+def test_reject_survives_unused_ownership_edit_and_regeneration() -> None:
+    harness = _build_harness()
+    original_batch = _load(harness)
+    proposal = _proposal(original_batch, require_multiple_members=True)
+    rejected = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            original_batch,
+            decision="reject",
+            proposal_ids=[proposal["proposalId"]],
+            candidate=None,
+            rationale=(
+                "Reject this selector authority independently of unrelated "
+                "manifest semantics."
+            ),
+        ),
+        "wc-034-ownership-reject",
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    current = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    payload = current.manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["ownership"].append(
+        {
+            "ownerRef": "synthetic-unused-security-owner",
+            "ownerRole": "technicalOwner",
+            "authorityRef": "synthetic://authority/unused-security-owner",
+        }
+    )
+    ownership_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+    ownership_update = harness.client.put(
+        f"/v1/drafts/{harness.draft_id}",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-ownership-neutral-put",
+        ),
+        json=ReplaceDraftCommand(
+            expected_revision=current.revision,
+            expected_manifest_version=current.manifest.manifest_version,
+            expected_digest=current.manifest_digest,
+            replacement_manifest=ownership_manifest,
+            replacement_digest=(
+                ownership_manifest.compatibility.artifact_digest
+            ),
+            reason="Add an unused synthetic ownership declaration",
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+    assert ownership_update.status_code == 200, ownership_update.text
+
+    rebound = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    harness.manifest = rebound.manifest
+    harness.draft_revision = rebound.revision
+    harness.draft_digest = rebound.manifest_digest
+    harness.register_profile("production")
+    regenerated_batch = _load(harness)
+    regenerated = next(
+        item
+        for item in regenerated_batch["proposals"]
+        if item["role"]["roleId"] == proposal["role"]["roleId"]
+        and item["members"] == proposal["members"]
+    )
+    assert regenerated["proposalId"] != proposal["proposalId"]
+    assert regenerated_batch["proposalSetDigest"] != (
+        original_batch["proposalSetDigest"]
+    )
+    assert regenerated_batch["scope"]["resolvedProfileDigest"] != (
+        original_batch["scope"]["resolvedProfileDigest"]
+    )
+    assert regenerated_batch["snapshot"]["artifactDigest"] == (
+        original_batch["snapshot"]["artifactDigest"]
+    )
+
+    preview_body = _preview_body(
+        harness,
+        regenerated_batch,
+        proposal_ids=[regenerated["proposalId"]],
+    )
+    preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-ownership-preview",
+        ),
+    )
+    assert preview.status_code == 200, preview.text
+    failed_key = "wc-034-ownership-blocked-apply"
+    with harness.store.transaction() as tx:
+        draft_before = tx.get_draft(harness.draft_id)
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    blocked = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            regenerated_batch,
+            decision="split",
+            proposal_ids=[regenerated["proposalId"]],
+            candidate=preview.json(),
+            rationale=preview_body["resolution"],
+        ),
+        failed_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "cohort_proposal_set_rejected"
+    with harness.store.transaction() as tx:
+        assert tx.get_draft(harness.draft_id) == draft_before
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert len(decisions_before) == 1
+        assert decisions_before[0].decision.value == "reject"
+        assert tx.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            failed_key,
+        ) is None
+        assert tx.get_receipt(HUMAN.actor_id, failed_key) is None
+
+
 def test_four_proposal_batch_allows_disjoint_authoritative_decisions() -> None:
     harness = _build_harness()
     batch = _load(harness)
@@ -2360,7 +2495,7 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
             draft_id=next_draft_id,
             manifest=next_manifest,
             manifest_digest=next_manifest.compatibility.artifact_digest,
-            previous_version=harness.manifest.manifest_version,
+            previous_version=published_manifest.manifest_version,
             reason="Create the next version from published selector provenance",
         ).model_dump(mode="json", by_alias=True, exclude_none=True),
     )
@@ -2388,6 +2523,60 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
         ).model_dump(mode="json"),
     )
     assert next_validated.status_code == 200, next_validated.text
+
+    laundering_payload = next_manifest.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    laundering_payload["profiles"]["development"]["extends"] = "production"
+    laundering_manifest = CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(laundering_payload)
+    )
+    laundering_draft_id = "draft-wc-034-effective-inheritance-fresh"
+    laundering_key = "wc-034-effective-inheritance-fresh-create"
+    with harness.store.transaction() as tx:
+        audit_before = tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        )
+        decisions_before = tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        )
+
+    laundering_create = harness.client.post(
+        "/v1/drafts",
+        headers=_headers(
+            HUMAN,
+            idempotency_key=laundering_key,
+        ),
+        json=CreateDraftCommand(
+            draft_id=laundering_draft_id,
+            manifest=laundering_manifest,
+            manifest_digest=(
+                laundering_manifest.compatibility.artifact_digest
+            ),
+            previous_version=published_manifest.manifest_version,
+            reason=(
+                "Attempt fresh-draft effective selector laundering through "
+                "profile inheritance"
+            ),
+        ).model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert laundering_create.status_code == 422, laundering_create.text
+    assert laundering_create.json()["error"]["code"] == (
+        "manifest_validation_failed"
+    )
+    with harness.store.transaction() as tx:
+        assert tx.get_draft(laundering_draft_id) is None
+        assert tx.get_draft_selector_baseline(laundering_draft_id) is None
+        assert tx.list_audit(
+            manifest_id=harness.manifest.manifest_id
+        ) == audit_before
+        assert tx.list_cohort_decisions(
+            manifest_id=harness.manifest.manifest_id
+        ) == decisions_before
+        assert tx.get_receipt(HUMAN.actor_id, laundering_key) is None
 
 
 def test_display_name_only_put_after_approved_split_preserves_selectors() -> None:
