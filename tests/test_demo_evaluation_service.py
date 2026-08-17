@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -9,17 +9,15 @@ from pydantic import ValidationError
 from athena_context.api import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     ActorKind,
-    ContextService,
-    ContextServicePublishedContextResolver,
     EnvironmentContextApiPublishedContextReader,
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
-    InMemoryAuthorityCoordinator,
     InMemoryContextStore,
     InMemoryEvaluationCommitPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
     PublishedContextSelection,
+    ResolvedPublishedContext,
     Role,
     RoleGrant,
     Wc008DeploymentOutputAssertion,
@@ -53,6 +51,7 @@ from wc013_support import (
     PUBLICATION_SERVICE,
     PUBLISHER,
     DemoHarness,
+    LifecycleContextResolver,
     build_current_synthetic_manifest,
     build_harness,
     deployment_assertion,
@@ -99,7 +98,10 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
         AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL
     ]
     assert harness.snapshot_signer.calls == 1
-    assert harness.context_resolver.calls == 2
+    assert (
+        harness.store.transaction_backend_identity
+        is harness.context_resolver.service.authority_transaction_backend.identity
+    )
     assert harness.store.publication_count == 1
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
     assert result.publication.approval_decision_id == harness.approval.decision_id
@@ -255,7 +257,6 @@ def test_unicode_profile_normalization_succeeds_with_versionless_atomic_commit()
 
     assert command.profile_id == composed
     assert result.publication.profile_id == composed
-    assert harness.context_resolver.calls == 3
     assert harness.store.publication_count == 1
 
 
@@ -385,7 +386,6 @@ def test_supersession_after_final_evaluation_aborts_conditional_commit() -> None
             harness.command,
         )
 
-    assert harness.context_resolver.calls == 2
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
@@ -411,7 +411,6 @@ def test_unique_active_selection_becoming_ambiguous_aborts_conditional_commit() 
             command,
         )
 
-    assert harness.context_resolver.calls == 2
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
@@ -435,7 +434,6 @@ def test_explicit_selection_remains_exact_when_another_version_is_published() ->
     )
 
     assert result.publication.manifest_version == "2.0.0"
-    assert harness.context_resolver.calls == 2
     assert harness.store.publication_count == 1
 
 
@@ -459,16 +457,62 @@ def test_auth_removal_after_final_evaluation_aborts_conditional_commit() -> None
 
 def test_in_memory_commit_rejects_independent_authority_locks() -> None:
     harness = build_harness()
+    foreign_store = InMemoryContextStore()
+    foreign_authorization = type(harness.authorization)(
+        [RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER)],
+        transaction_backend=foreign_store.authority_transaction_backend,
+    )
 
     with pytest.raises(ValueError, match="does not share"):
         InMemoryEvaluationCommitPort(
-            coordinator=InMemoryAuthorityCoordinator(),
-            context_resolver=harness.context_resolver,
+            context_service=harness.context_resolver.service,
+            context_reader_actor=PUBLISHER,
             approval_resolver=harness.approval_registry,
-            authorization=harness.authorization,
+            authorization=foreign_authorization,
             clock=harness.clock,
             publication_actor=PUBLICATION_SERVICE,
             evidence_identity_object_id=MCP_OBJECT_ID,
+        )
+
+
+def test_malicious_store_a_resolver_advertising_store_b_backend_is_rejected() -> None:
+    manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
+    store_a = LifecycleContextResolver(
+        manifest,
+        lifecycle_start=CURRENT_NOW - timedelta(minutes=5),
+    )
+
+    class MaliciousResolver:
+        def __init__(self, advertised_backend: object) -> None:
+            self.authority_coordinator = advertised_backend
+
+        def resolve(
+            self,
+            selection: PublishedContextSelection,
+            *,
+            as_of: datetime,
+        ) -> ResolvedPublishedContext:
+            return store_a.resolve(selection, as_of=as_of)
+
+    def malicious_factory(
+        store_b: LifecycleContextResolver,
+    ) -> MaliciousResolver:
+        assert (
+            store_a.service.authority_transaction_backend.identity
+            is not store_b.service.authority_transaction_backend.identity
+        )
+        return MaliciousResolver(
+            store_b.service.authority_transaction_backend
+        )
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="resolver must be owned",
+    ):
+        build_harness(
+            as_of=CURRENT_NOW,
+            manifest=manifest,
+            service_context_resolver_factory=malicious_factory,
         )
 
 
@@ -514,7 +558,6 @@ def test_inherited_override_expiry_after_evaluation_aborts_conditional_commit() 
             harness.command,
         )
 
-    assert harness.context_resolver.calls == 2
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
@@ -553,7 +596,6 @@ def test_expired_published_manifest_governance_rejects_before_collection(
             harness.command,
         )
 
-    assert harness.context_resolver.calls == 1
     assert harness.transport.calls == 0
     assert harness.snapshot_signer.calls == 0
     assert harness.store.publication_count == 0
@@ -563,19 +605,7 @@ def test_empty_context_service_state_fails_before_collection() -> None:
     harness = build_harness(
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
-    )
-    empty_service = ContextService(
-        store=InMemoryContextStore(
-            coordinator=harness.context_resolver.coordinator
-        ),
-        authorization=harness.authorization,
-        clock=harness.clock,
-        publication_actor=PUBLICATION_SERVICE,
-    )
-    harness.service._context_resolver = ContextServicePublishedContextResolver(  # type: ignore[attr-defined]
-        service=empty_service,
-        reader_actor=PUBLISHER,
-        authority_coordinator=harness.context_resolver.coordinator,
+        publish_context=False,
     )
     with pytest.raises(
         EvaluationFailedClosedError,
@@ -614,7 +644,6 @@ def test_multiple_real_active_versions_execute_production_ambiguity_branch() -> 
             unique_selection,
         )
 
-    assert harness.context_resolver.calls == 1
     assert harness.transport.calls == 0
     assert harness.snapshot_signer.calls == 0
     assert harness.store.publication_count == 0

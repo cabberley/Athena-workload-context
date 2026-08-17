@@ -18,6 +18,7 @@ from athena_context.api.evaluation_domain import (
     ResolvedPublishedContext,
     VerifiedWc008DeploymentConfiguration,
 )
+from athena_context.api.ports import ContextTransactionBackendIdentity
 from athena_context.contracts import (
     EvidenceSnapshot,
     ManifestFinding,
@@ -101,6 +102,9 @@ class PublishedContextResolverPort(Protocol):
 class DemoEvaluationApprovalResolverPort(Protocol):
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None: ...
 
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
+
 
 class SnapshotSigningPort(Protocol):
     def sign(self, request: SnapshotSigningRequest) -> str: ...
@@ -109,11 +113,18 @@ class SnapshotSigningPort(Protocol):
 class EvaluationCommitPort(Protocol):
     """Conditionally finalize and insert an evaluation in one authority transaction.
 
-    Production adapters must compare every typed authority revision/ETag and
-    perform the artifact insert in the same backing-store transaction or
-    conditional batch. A resolver call followed by an independent write does
-    not implement this port.
+    Production adapters must own the resolver used before collection, compare
+    every typed authority revision/ETag, and perform commit-time authority reads
+    plus artifact insertion in the same backing-store transaction or conditional
+    batch. A caller-supplied resolver or a resolver call followed by an
+    independent write does not implement this port.
     """
+
+    @property
+    def context_resolver(self) -> PublishedContextResolverPort: ...
+
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
 
     def load_receipt(self, actor_id: str, idempotency_key: str) -> StoredEvaluation | None: ...
 
@@ -131,6 +142,9 @@ class EvaluationAuthorizationPort(Protocol):
         permission: Permission,
         manifest_id: str,
     ) -> AuthorizationGrantToken: ...
+
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity: ...
 
 
 __all__ = [

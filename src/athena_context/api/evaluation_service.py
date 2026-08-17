@@ -109,6 +109,11 @@ class DemoEvaluationService:
             raise DemoEvaluationConfigurationError(
                 "snapshot publication actor must be the Context API service"
             )
+        if self._context_resolver is not self._evaluation_commit.context_resolver:
+            raise DemoEvaluationConfigurationError(
+                "published context resolver must be owned by the transactional "
+                "evaluation commit adapter"
+            )
         if self._evidence_client.deployment_configuration != configuration:
             raise DemoEvaluationConfigurationError(
                 "actual evidence transport is not bound to the trusted WC-008 "

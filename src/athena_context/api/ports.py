@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -34,6 +35,24 @@ class AuthorizationPort(Protocol):
         permission: Permission,
         manifest_id: WorkloadIdentifier | None,
     ) -> None: ...
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class ContextTransactionBackendIdentity:
+    """Opaque identity for one authoritative persistence transaction backend.
+
+    Equality is deliberately object identity. Recreating a value cannot impersonate
+    the backend-owned capability issued to its transaction participants.
+    """
+
+
+class ContextAuthorityTransactionBackendPort(Protocol):
+    """Backend-owned transaction capability used by conditional publications."""
+
+    @property
+    def identity(self) -> ContextTransactionBackendIdentity: ...
+
+    def transaction(self) -> AbstractContextManager[None]: ...
 
 
 class ContextTransactionPort(Protocol):
@@ -81,4 +100,15 @@ class ContextTransactionPort(Protocol):
 
 
 class ContextStorePort(Protocol):
+    """Authoritative store whose backend capability identifies its real transaction.
+
+    Implementations must issue the identity from the same physical transaction
+    backend used by ``transaction``; a caller-selected label is not conformant.
+    """
+
+    @property
+    def authority_transaction_backend(
+        self,
+    ) -> ContextAuthorityTransactionBackendPort: ...
+
     def transaction(self) -> AbstractContextManager[ContextTransactionPort]: ...

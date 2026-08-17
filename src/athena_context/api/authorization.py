@@ -16,6 +16,10 @@ from athena_context.api.domain import (
 from athena_context.api.errors import AuthenticationError, AuthorizationError
 from athena_context.api.evaluation_domain import AuthorizationGrantToken
 from athena_context.api.memory import InMemoryAuthorityCoordinator
+from athena_context.api.ports import (
+    ContextAuthorityTransactionBackendPort,
+    ContextTransactionBackendIdentity,
+)
 from athena_context.contracts import compute_artifact_digest
 
 _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
@@ -78,9 +82,11 @@ class RoleBasedAuthorization:
         self,
         grants: Iterable[RoleGrant] = (),
         *,
-        coordinator: InMemoryAuthorityCoordinator | None = None,
+        transaction_backend: ContextAuthorityTransactionBackendPort | None = None,
     ) -> None:
-        self._coordinator = coordinator or InMemoryAuthorityCoordinator()
+        self._transaction_backend = (
+            transaction_backend or InMemoryAuthorityCoordinator()
+        )
         self._grants = tuple(grants)
         self._grant_revision = 1
 
@@ -90,7 +96,7 @@ class RoleBasedAuthorization:
         permission: Permission,
         manifest_id: str | None,
     ) -> None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             self._require_actor_kind(actor, permission)
             self._require_concrete_manifest_id(manifest_id)
             if not self._matching_grants(
@@ -110,7 +116,7 @@ class RoleBasedAuthorization:
         permission: Permission,
         manifest_id: str,
     ) -> AuthorizationGrantToken:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             self._require_actor_kind(actor, permission)
             self._require_concrete_manifest_id(manifest_id)
             matching = self._matching_grants(
@@ -154,7 +160,7 @@ class RoleBasedAuthorization:
     ) -> None:
         """Require a concrete workload grant; wildcard grants never satisfy this boundary."""
 
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             self._require_actor_kind(actor, permission)
             self._require_concrete_manifest_id(manifest_id)
             if not self._matching_grants(
@@ -211,7 +217,7 @@ class RoleBasedAuthorization:
     def remove_grant(self, grant: RoleGrant) -> None:
         """Revoke one exact in-memory grant under the shared authority lock."""
 
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             remaining = tuple(candidate for candidate in self._grants if candidate != grant)
             if len(remaining) == len(self._grants):
                 return
@@ -219,5 +225,5 @@ class RoleBasedAuthorization:
             self._grant_revision += 1
 
     @property
-    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
-        return self._coordinator
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
+        return self._transaction_backend.identity

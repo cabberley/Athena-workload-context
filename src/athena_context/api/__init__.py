@@ -73,10 +73,7 @@ from athena_context.api.evaluation_domain import (
 from athena_context.api.evaluation_memory import InMemoryEvaluationCommitPort
 from athena_context.api.evaluation_service import DemoEvaluationService
 from athena_context.api.http import create_app
-from athena_context.api.memory import (
-    InMemoryAuthorityCoordinator,
-    InMemoryContextStore,
-)
+from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
 
 __all__ = [
@@ -113,7 +110,6 @@ __all__ = [
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
     "EnvironmentContextApiPublishedContextReader",
-    "InMemoryAuthorityCoordinator",
     "InMemoryContextStore",
     "InMemoryDemoEvaluationApprovalRegistry",
     "InMemoryEvaluationCommitPort",

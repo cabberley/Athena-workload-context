@@ -37,11 +37,13 @@ The integration composes the merged components without introducing direct Azure 
   the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
-- A typed WC-007 resolver loads the explicitly selected published manifest ID, version, and profile
-  through `ContextService`. The evaluation rejects missing, ambiguous, or superseded context and
-  requires every applicable weakening override and every resolved risk acceptance to be approved
-  and active at the trusted evaluation time before MCP collection. The service never renews,
-  edits, approves, or publishes a manifest on an agent's behalf.
+- The `EvaluationCommitPort` owns the typed WC-007 resolver used before collection. For the
+  in-process adapter that resolver is created from the actual `ContextService`; callers cannot
+  inject or relabel a resolver with an advertised coordinator. The evaluation rejects missing,
+  ambiguous, or superseded context and requires every applicable weakening override and every
+  resolved risk acceptance to be approved and active at the trusted evaluation time before MCP
+  collection. The service never renews, edits, approves, or publishes a manifest on an agent's
+  behalf.
 - WC-007 profile IDs are bounded NFC+casefold-normalized strings rather than a closed environment
   enum. The selected ID must resolve in the published manifest; manifest-defined IDs such as
   `prod-east` use the same canonical inheritance and governance checks.
@@ -50,8 +52,14 @@ The integration composes the merged components without introducing direct Azure 
   approval revision/status/expiry, and actor grant revision, canonically resolves the full profile
   inheritance chain at that time, compares typed authority tokens captured before collection, and
   inserts the idempotency receipt, snapshot, source envelope, publication, and result as one state
-  change. The in-memory adapter uses the same coordinator lock as `ContextService`, its approval
-  registry, and its grant registry. Approval revoke/expiry, inherited override expiry,
+  change. `ContextService` derives an opaque transaction-backend identity from its actual
+  persistence store. The in-memory commit adapter accepts no independent coordinator or resolver;
+  it derives the store-owned backend from `ContextService`, creates its resolver itself, and
+  requires the approval and grant registries to carry that exact identity before using the same
+  underlying lock for authority reads and artifact insertion. Production implementations have the
+  same typed contract: the commit adapter owns its resolver and performs both authority reads and
+  insertion in its identified backing-store transaction or conditional batch. Approval
+  revoke/expiry, inherited override expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
   Authority tokens bind whether the caller selected an exact version or the unique active version.
   A unique-active commit repeats that lookup with no version inside the transaction, so a

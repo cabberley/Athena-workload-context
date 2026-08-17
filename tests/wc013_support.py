@@ -46,10 +46,11 @@ from athena_context.api.domain import (
 )
 from athena_context.api.evaluation_ports import (
     EvaluationCommitCandidate,
+    PublishedContextResolverPort,
     SnapshotSigningRequest,
     StoredEvaluation,
 )
-from athena_context.api.memory import InMemoryAuthorityCoordinator
+from athena_context.api.ports import ContextTransactionBackendIdentity
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
     CollectorIdentityEvidence,
@@ -454,8 +455,9 @@ class LifecycleContextResolver:
         manifest: CanonicalWorkloadManifest,
         *,
         lifecycle_start: datetime,
+        publish_manifest: bool = True,
     ) -> None:
-        self.coordinator = InMemoryAuthorityCoordinator()
+        self.store = InMemoryContextStore()
         self.authorization = RoleBasedAuthorization(
             [
                 RoleGrant(actor_id=PROPOSER.actor_id, role=Role.PROPOSER),
@@ -464,9 +466,8 @@ class LifecycleContextResolver:
                 # Deliberate grant proves actor-kind checks still reject MCP writes.
                 RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
             ],
-            coordinator=self.coordinator,
+            transaction_backend=self.store.authority_transaction_backend,
         )
-        self.store = InMemoryContextStore(coordinator=self.coordinator)
         self.service = ContextService(
             store=self.store,
             authorization=self.authorization,
@@ -478,11 +479,11 @@ class LifecycleContextResolver:
         )
         self._manifest_id = manifest.manifest_id
         self._manifest_version = manifest.manifest_version
-        self._publish(manifest, previous_version=None)
+        if publish_manifest:
+            self._publish(manifest, previous_version=None)
         self._adapter = ContextServicePublishedContextResolver(
             service=self.service,
             reader_actor=PUBLISHER,
-            authority_coordinator=self.coordinator,
         )
         self.calls = 0
 
@@ -545,10 +546,6 @@ class LifecycleContextResolver:
             self._manifest_version,
             manifest_id=self._manifest_id,
         )
-
-    @property
-    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
-        return self.coordinator
 
     def publish_additional_active(
         self,
@@ -694,6 +691,14 @@ class HookedEvaluationCommitPort:
         self._delegate = delegate
         self.before_commit: Callable[[], None] | None = None
 
+    @property
+    def context_resolver(self) -> PublishedContextResolverPort:
+        return self._delegate.context_resolver
+
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
+        return self._delegate.transaction_backend_identity
+
     def load_receipt(
         self,
         actor_id: str,
@@ -817,6 +822,10 @@ def build_harness(
     profile_resolution_as_of: datetime | None = None,
     approval_expires_at: datetime | None = None,
     profile_id: str = "production",
+    publish_context: bool = True,
+    service_context_resolver_factory: (
+        Callable[[LifecycleContextResolver], PublishedContextResolverPort] | None
+    ) = None,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -850,8 +859,13 @@ def build_harness(
     context_resolver = LifecycleContextResolver(
         source_manifest,
         lifecycle_start=lifecycle_start,
+        publish_manifest=publish_context,
     )
-    published_manifest = context_resolver.view.published.manifest
+    published_manifest = (
+        context_resolver.view.published.manifest
+        if publish_context
+        else source_manifest
+    )
     profile = resolve_manifest_profile(
         published_manifest,
         profile_id,
@@ -897,11 +911,13 @@ def build_harness(
     authorization = context_resolver.authorization
     approval_registry = InMemoryDemoEvaluationApprovalRegistry(
         [approval],
-        coordinator=context_resolver.coordinator,
+        transaction_backend=(
+            context_resolver.service.authority_transaction_backend
+        ),
     )
     store = InMemoryEvaluationCommitPort(
-        coordinator=context_resolver.coordinator,
-        context_resolver=context_resolver,
+        context_service=context_resolver.service,
+        context_reader_actor=PUBLISHER,
         approval_resolver=approval_registry,
         authorization=authorization,
         clock=clock,
@@ -915,7 +931,11 @@ def build_harness(
             or _trusted_configuration_port(trusted_configuration)
         ),
         evidence_client=evidence_client,
-        context_resolver=context_resolver,
+        context_resolver=(
+            store.context_resolver
+            if service_context_resolver_factory is None
+            else service_context_resolver_factory(context_resolver)
+        ),
         approval_resolver=approval_registry,
         snapshot_signer=snapshot_signer,
         evaluation_commit=commit_hook,
@@ -944,6 +964,7 @@ __all__ = [
     "CONTEXT_OBJECT_ID",
     "CURRENT_NOW",
     "DemoHarness",
+    "LifecycleContextResolver",
     "MCP_OBJECT_ID",
     "MCP_SERVICE_ACTOR",
     "NOW",

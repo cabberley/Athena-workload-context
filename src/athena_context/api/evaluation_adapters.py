@@ -27,7 +27,10 @@ from athena_context.api.evaluation_domain import (
     Wc008DeploymentOutputAssertion,
     build_published_context_authority_token,
 )
-from athena_context.api.memory import InMemoryAuthorityCoordinator
+from athena_context.api.ports import (
+    ContextAuthorityTransactionBackendPort,
+    ContextTransactionBackendIdentity,
+)
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
     TrustedKeyAnchor,
@@ -458,7 +461,6 @@ class ContextServicePublishedContextResolver:
         *,
         service: ContextService,
         reader_actor: Actor,
-        authority_coordinator: InMemoryAuthorityCoordinator | None = None,
     ) -> None:
         self._resolver = ContextApiPublishedContextResolver(
             ContextServicePublishedContextReader(
@@ -466,7 +468,6 @@ class ContextServicePublishedContextResolver:
                 reader_actor=reader_actor,
             )
         )
-        self._authority_coordinator = authority_coordinator
 
     def resolve(
         self,
@@ -476,19 +477,25 @@ class ContextServicePublishedContextResolver:
     ) -> ResolvedPublishedContext:
         return self._resolver.resolve(selection, as_of=as_of)
 
-    @property
-    def authority_coordinator(self) -> InMemoryAuthorityCoordinator | None:
-        return self._authority_coordinator
-
-
 class StaticDemoEvaluationApprovalResolver:
     """Deterministic adapter for tests and explicitly injected local demo configuration."""
 
-    def __init__(self, approvals: Iterable[DemoEvaluationApproval]) -> None:
+    def __init__(
+        self,
+        approvals: Iterable[DemoEvaluationApproval],
+        *,
+        transaction_backend: ContextAuthorityTransactionBackendPort,
+    ) -> None:
+        self._transaction_backend = transaction_backend
         self._approvals = {approval.decision_id: approval for approval in approvals}
 
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
-        return self._approvals.get(decision_id)
+        with self._transaction_backend.transaction():
+            return self._approvals.get(decision_id)
+
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
+        return self._transaction_backend.identity
 
 
 class InMemoryDemoEvaluationApprovalRegistry:
@@ -498,19 +505,19 @@ class InMemoryDemoEvaluationApprovalRegistry:
         self,
         approvals: Iterable[DemoEvaluationApproval],
         *,
-        coordinator: InMemoryAuthorityCoordinator,
+        transaction_backend: ContextAuthorityTransactionBackendPort,
     ) -> None:
-        self._coordinator = coordinator
+        self._transaction_backend = transaction_backend
         self._approvals = {
             approval.decision_id: approval for approval in approvals
         }
 
     def resolve(self, decision_id: str) -> DemoEvaluationApproval | None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             return self._approvals.get(decision_id)
 
     def revoke(self, decision_id: str, *, revoked_at: datetime) -> None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             current = self._approvals.get(decision_id)
             if current is None:
                 raise ResourceNotFoundError(
@@ -529,7 +536,7 @@ class InMemoryDemoEvaluationApprovalRegistry:
     def replace(self, approval: DemoEvaluationApproval) -> None:
         """Replace one decision only with its next monotonic registry revision."""
 
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             current = self._approvals.get(approval.decision_id)
             if current is None or approval.revision != current.revision + 1:
                 raise DemoEvaluationConfigurationError(
@@ -538,8 +545,8 @@ class InMemoryDemoEvaluationApprovalRegistry:
             self._approvals[approval.decision_id] = approval
 
     @property
-    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
-        return self._coordinator
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
+        return self._transaction_backend.identity
 
 
 __all__ = [

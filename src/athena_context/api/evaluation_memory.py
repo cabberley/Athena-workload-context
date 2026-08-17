@@ -12,6 +12,9 @@ from athena_context.api.errors import (
     IdempotencyConflictError,
     ResourceNotFoundError,
 )
+from athena_context.api.evaluation_adapters import (
+    ContextServicePublishedContextResolver,
+)
 from athena_context.api.evaluation_context import (
     resolve_active_manifest_profile,
     validate_demo_evaluation_approval,
@@ -31,11 +34,14 @@ from athena_context.api.evaluation_ports import (
     DemoEvaluationApprovalResolverPort,
     EvaluationAuthorizationPort,
     EvaluationCommitCandidate,
-    PublishedContextResolverPort,
     StoredEvaluation,
 )
 from athena_context.api.memory import InMemoryAuthorityCoordinator
-from athena_context.api.ports import ClockPort
+from athena_context.api.ports import (
+    ClockPort,
+    ContextTransactionBackendIdentity,
+)
+from athena_context.api.service import ContextService
 from athena_context.contracts import (
     AthenaValidationError,
     EvidenceSnapshot,
@@ -55,8 +61,8 @@ class InMemoryEvaluationCommitPort:
     def __init__(
         self,
         *,
-        coordinator: InMemoryAuthorityCoordinator,
-        context_resolver: PublishedContextResolverPort,
+        context_service: ContextService,
+        context_reader_actor: Actor,
         approval_resolver: DemoEvaluationApprovalResolverPort,
         authorization: EvaluationAuthorizationPort,
         clock: ClockPort,
@@ -65,17 +71,29 @@ class InMemoryEvaluationCommitPort:
     ) -> None:
         if publication_actor.kind is not ActorKind.SERVICE:
             raise ValueError("publication_actor must be a service actor")
+        transaction_backend = context_service.authority_transaction_backend
+        if not isinstance(transaction_backend, InMemoryAuthorityCoordinator):
+            raise ValueError(
+                "in-memory evaluation commit requires the ContextService "
+                "in-memory persistence transaction backend"
+            )
         for dependency, label in (
-            (context_resolver, "published context resolver"),
             (approval_resolver, "approval registry"),
             (authorization, "authorization registry"),
         ):
-            if getattr(dependency, "authority_coordinator", None) is not coordinator:
+            if (
+                dependency.transaction_backend_identity
+                is not transaction_backend.identity
+            ):
                 raise ValueError(
-                    f"in-memory {label} does not share the commit authority coordinator"
+                    f"in-memory {label} does not share the ContextService "
+                    "persistence transaction backend"
                 )
-        self._coordinator = coordinator
-        self._context_resolver = context_resolver
+        self._transaction_backend = transaction_backend
+        self._context_resolver = ContextServicePublishedContextResolver(
+            service=context_service,
+            reader_actor=context_reader_actor,
+        )
         self._approval_resolver = approval_resolver
         self._authorization = authorization
         self._clock = clock
@@ -83,12 +101,20 @@ class InMemoryEvaluationCommitPort:
         self._evidence_identity_object_id = evidence_identity_object_id
         self._state = _EvaluationState(receipts={}, artifacts={})
 
+    @property
+    def context_resolver(self) -> ContextServicePublishedContextResolver:
+        return self._context_resolver
+
+    @property
+    def transaction_backend_identity(self) -> ContextTransactionBackendIdentity:
+        return self._transaction_backend.identity
+
     def load_receipt(
         self,
         actor_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             return self._state.receipts.get((actor_id, idempotency_key))
 
     def commit(
@@ -98,7 +124,7 @@ class InMemoryEvaluationCommitPort:
         """Read all authority and insert all artifacts under one transaction lock."""
 
         receipt_key = (candidate.actor.actor_id, candidate.idempotency_key)
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             replay = self._state.receipts.get(receipt_key)
             if replay is not None:
                 if replay.request_digest != candidate.request_digest:
@@ -267,7 +293,7 @@ class InMemoryEvaluationCommitPort:
         self,
         snapshot_id: str,
     ) -> SnapshotPublicationRecord | None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             artifact = self._state.artifacts.get(snapshot_id)
         if artifact is None:
             return None
@@ -277,7 +303,7 @@ class InMemoryEvaluationCommitPort:
         return publication.registry_record()
 
     def resolve_result(self, snapshot_id: str) -> DemoEvaluationResult | None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             artifact = self._state.artifacts.get(snapshot_id)
         if artifact is None:
             return None
@@ -289,7 +315,7 @@ class InMemoryEvaluationCommitPort:
         kind: Literal["response", "failure"],
         digest: str,
     ) -> object | None:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             matches = [
                 artifact
                 for artifact in self._state.artifacts.values()
@@ -303,7 +329,7 @@ class InMemoryEvaluationCommitPort:
 
     @property
     def publication_count(self) -> int:
-        with self._coordinator.transaction():
+        with self._transaction_backend.transaction():
             return len(self._state.artifacts)
 
 

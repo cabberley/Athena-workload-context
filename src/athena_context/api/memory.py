@@ -23,7 +23,11 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
     StaleRevisionError,
 )
-from athena_context.api.ports import ContextTransactionPort
+from athena_context.api.ports import (
+    ContextAuthorityTransactionBackendPort,
+    ContextTransactionBackendIdentity,
+    ContextTransactionPort,
+)
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -34,12 +38,8 @@ def _version_key(version: str) -> tuple[int, int, int]:
 class InMemoryContextStore:
     """Transactional, deterministic in-memory implementation of the storage port."""
 
-    def __init__(
-        self,
-        *,
-        coordinator: InMemoryAuthorityCoordinator | None = None,
-    ) -> None:
-        self._coordinator = coordinator or InMemoryAuthorityCoordinator()
+    def __init__(self) -> None:
+        self._coordinator = InMemoryAuthorityCoordinator()
         self._lock = self._coordinator.lock
         self._drafts: dict[str, DraftRecord] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
@@ -51,8 +51,10 @@ class InMemoryContextStore:
         return _MemoryTransaction(self)
 
     @property
-    def authority_coordinator(self) -> InMemoryAuthorityCoordinator:
-        """Return the coordinator required by conditional evaluation commits."""
+    def authority_transaction_backend(
+        self,
+    ) -> ContextAuthorityTransactionBackendPort:
+        """Return this store's backend-owned conditional transaction capability."""
 
         return self._coordinator
 
@@ -62,6 +64,11 @@ class InMemoryAuthorityCoordinator:
 
     def __init__(self) -> None:
         self._lock = RLock()
+        self._identity = ContextTransactionBackendIdentity()
+
+    @property
+    def identity(self) -> ContextTransactionBackendIdentity:
+        return self._identity
 
     @property
     def lock(self) -> RLock:

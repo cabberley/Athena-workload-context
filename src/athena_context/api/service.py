@@ -49,6 +49,7 @@ from athena_context.api.errors import (
 from athena_context.api.ports import (
     AuthorizationPort,
     ClockPort,
+    ContextAuthorityTransactionBackendPort,
     ContextStorePort,
     ContextTransactionPort,
 )
@@ -109,6 +110,14 @@ class ContextService:
         self._authorization = authorization
         self._clock = clock
         self._publication_actor = publication_actor
+
+    @property
+    def authority_transaction_backend(
+        self,
+    ) -> ContextAuthorityTransactionBackendPort:
+        """Return only the transaction backend owned by this service's store."""
+
+        return self._store.authority_transaction_backend
 
     def create_draft(
         self,
