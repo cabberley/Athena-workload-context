@@ -1,31 +1,22 @@
-import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App.tsx'
-import { createContextApiClient } from './client'
+import { bootstrapContextStudio, renderStartupFailure } from './bootstrap'
 
-const baseUrl = import.meta.env.VITE_CONTEXT_API_BASE_URL?.trim() ?? ''
-const actorId = import.meta.env.VITE_CONTEXT_API_ACTOR_ID?.trim() ?? ''
-const token = import.meta.env.VITE_CONTEXT_API_BEARER_TOKEN?.trim() ?? ''
-
-if (!baseUrl || !actorId || !token) {
-  throw new Error('Runtime configuration requires VITE_CONTEXT_API_BASE_URL, VITE_CONTEXT_API_ACTOR_ID, and VITE_CONTEXT_API_BEARER_TOKEN.')
+const rootElement = document.getElementById('root')
+if (!rootElement) {
+  throw new Error('Athena Context Studio root element is missing.')
 }
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App
-      client={createContextApiClient({
-        baseUrl,
-        auth: {
-          actorId,
-          kind: 'human',
-          role: 'reviewer',
-          userLabel: 'Authenticated operator',
-          port: 'context-studio',
-          bearerToken: token,
-        },
-      })}
-    />
-  </StrictMode>,
-)
+const runtime = window.athenaContextStudioRuntime
+if (!runtime) {
+  const root = createRoot(rootElement)
+  renderStartupFailure(root, 'The approved runtime authentication integration is not configured.')
+} else {
+  void bootstrapContextStudio(runtime, rootElement).catch((error: unknown) => {
+    const replacement = rootElement.cloneNode(false) as HTMLElement
+    rootElement.replaceWith(replacement)
+    const root = createRoot(replacement)
+    const message = error instanceof Error ? error.message : 'Startup failed closed.'
+    renderStartupFailure(root, message)
+  })
+}

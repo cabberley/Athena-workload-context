@@ -1,141 +1,272 @@
-import { authFixture, wc007DraftApiFixture, wc007PublishedApiFixture, workloadFixtureMap } from './data/fixtures'
+import { refreshCanonicalManifestDigests } from './canonical'
 import type {
   ApprovalDecision,
-  AuthState,
+  AuthSession,
+  CanonicalControl,
+  CanonicalManifestProfile,
+  CanonicalRelationship,
+  CanonicalRiskAcceptance,
+  CanonicalWorkloadManifest,
   CatalogItem,
   ComparisonRow,
+  ConcurrencyRequest,
   ContextApiClientOptions,
   ContextApiClientPort,
+  ControlRecord,
   DraftRecord,
-  ManifestDraft,
+  DraftState,
+  EvidenceItem,
+  JsonObject,
   PublishRequest,
   PublishedManifest,
+  RiskAcceptance,
+  Supersession,
   TopologyRelationship,
-  WorkloadContext,
+  WireActor,
+  WireApprovalDecision,
   WireDraftRecord,
   WirePublishedManifest,
+  WirePublishedManifestView,
+  WireSupersession,
+  WorkloadContext,
 } from './types'
 
-const cloneManifest = (manifest: ManifestDraft): ManifestDraft => ({
-  ...manifest,
-  requiredRelationships: [...manifest.requiredRelationships],
-  optionalRelationships: [...manifest.optionalRelationships],
-  controls: manifest.controls.map((control) => ({ ...control })),
-  riskAcceptances: manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
-  compatibility: manifest.compatibility
-    ? {
-        ...manifest.compatibility,
-        requiresCapabilities: [...manifest.compatibility.requiresCapabilities],
-      }
-    : undefined,
-})
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+const DIGEST = /^sha256:[a-f0-9]{64}$/
+const EDITABLE_STATES = new Set<DraftState>(['draft', 'validated', 'in_review', 'approved'])
+const MAX_ERROR_BODY = 16_384
+const MAX_ERROR_MESSAGE = 300
 
-const resolveManifestDigest = (manifest?: ManifestDraft | null): string => {
-  if (!manifest) {
-    return ''
+export class ContextApiRequestError extends Error {
+  readonly status: number
+  readonly code: string
+
+  constructor(message: string, status: number, code: string) {
+    super(message)
+    this.name = 'ContextApiRequestError'
+    this.status = status
+    this.code = code
   }
-  return manifest.manifestDigest ?? manifest.compatibility?.artifactDigest ?? ''
 }
 
-const compareRows = (environment: string): ComparisonRow[] => {
-  const envName = environment === 'Production' ? 'Production' : environment
-  return [
-    {
-      environment: 'Production',
-      topology: envName === 'Production'
-        ? 'Web tier spans two zones; database VM remains singleton in one zone.'
-        : 'Production profile keeps the fail-safe topology and private data plane.',
-      policy: 'Protect recovery posture; no unsupported HA recommendation.',
-      residualRisk: 'Single-zone database loss remains accepted with restore and failover posture.',
-      confidence: 0.93,
-    },
-    {
-      environment: 'Development',
-      topology: 'One-zone web and singleton database remain acceptable for the lower-risk profile.',
-      policy: 'Developer operations stay in the sandbox profile and do not assume production continuity.',
-      residualRisk: 'Residual risk is limited to the control-tested local sandbox range.',
-      confidence: 0.89,
-    },
-    {
-      environment: 'Training',
-      topology: 'Synthetic training data remains isolated and reset to a known-good baseline.',
-      policy: 'No production continuity expectation and no customer data persistence are allowed.',
-      residualRisk: 'Training residual risk is intentionally disposable and limited to synthetic scope.',
-      confidence: 0.94,
-    },
-  ]
+const asRecord = (value: unknown, label: string): Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`Context API returned an invalid ${label}.`)
+  }
+  return value as Record<string, unknown>
 }
 
-const buildRelationships = (manifest: ManifestDraft): TopologyRelationship[] => {
-  const declared = manifest.requiredRelationships.map((item, index) => ({
-    kind: 'declared' as const,
-    title: item,
-    detail: `Declared intent ${index + 1} for ${manifest.workloadName}.`,
-    clause: `intent.${manifest.manifestId}.${index + 1}`,
-  }))
-
-  const observed = manifest.optionalRelationships.map((item, index) => ({
-    kind: 'observed' as const,
-    title: item,
-    detail: `Observed context record for ${manifest.workloadName}.`,
-    clause: `observed.${manifest.manifestId}.${index + 1}`,
-  }))
-
-  return [
-    ...declared,
-    ...observed,
-    {
-      kind: 'inferred',
-      title: 'Residual risk remains visible and bounded by explicit risk acceptance.',
-      detail: 'The policy engine retains real residual risk without inventing unsupported HA advice.',
-      clause: 'risk.residual.visible',
-    },
-    {
-      kind: 'exception',
-      title: 'Unsupported generic high-availability advice is suppressed.',
-      detail: 'Athena preserves the actual risk posture and avoids spurious production guidance.',
-      clause: 'context.policy.no_generic_ha',
-    },
-  ]
+const asArray = (value: unknown, label: string): unknown[] => {
+  if (!Array.isArray(value)) {
+    throw new Error(`Context API returned an invalid ${label}.`)
+  }
+  return value
 }
 
-const canonicalManifestPayload = (manifest: ManifestDraft): Record<string, unknown> => ({
-  manifestId: manifest.manifestId,
-  manifestVersion: manifest.manifestVersion,
-  workloadName: manifest.workloadName,
-  environment: manifest.environment,
-  businessOwner: manifest.businessOwner,
-  runbook: manifest.runbook,
-  requiredRelationships: [...manifest.requiredRelationships],
-  optionalRelationships: [...manifest.optionalRelationships],
-  controls: manifest.controls.map((control) => ({ ...control })),
-  riskAcceptances: manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
-  manifestDigest: resolveManifestDigest(manifest),
-  compatibility: manifest.compatibility
-    ? {
-        artifactKind: manifest.compatibility.artifactKind,
-        artifactDigest: manifest.compatibility.artifactDigest,
-        semanticDigest: manifest.compatibility.semanticDigest,
-        schemaVersion: manifest.compatibility.schemaVersion,
-        semanticContractVersion: manifest.compatibility.semanticContractVersion,
-        policyContractVersion: manifest.compatibility.policyContractVersion,
-        minimumReaderVersion: manifest.compatibility.minimumReaderVersion,
-        requiresCapabilities: [...manifest.compatibility.requiresCapabilities],
-      }
-    : undefined,
-})
+const requiredString = (record: Record<string, unknown>, key: string, label: string): string => {
+  const value = record[key]
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`Context API returned an invalid ${label}.${key}.`)
+  }
+  return value
+}
 
-const toViewActor = (actor: { actor_id: string; kind: 'human' | 'agent' | 'service' }): { actorId: string; kind: 'human' | 'agent' | 'service' } => ({
+const requiredNumber = (record: Record<string, unknown>, key: string, label: string): number => {
+  const value = record[key]
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new Error(`Context API returned an invalid ${label}.${key}.`)
+  }
+  return value
+}
+
+const parseActor = (value: unknown, label: string): WireActor => {
+  const record = asRecord(value, label)
+  const actorId = requiredString(record, 'actor_id', label)
+  const kind = requiredString(record, 'kind', label)
+  if (!IDENTIFIER.test(actorId) || !['human', 'agent', 'service'].includes(kind)) {
+    throw new Error(`Context API returned an invalid ${label}.`)
+  }
+  return { actor_id: actorId, kind: kind as WireActor['kind'] }
+}
+
+const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
+  const record = asRecord(value, 'canonical manifest')
+  if ('manifestDigest' in record) {
+    throw new Error('Context API returned a forbidden manifestDigest member inside the canonical manifest.')
+  }
+  const manifestId = requiredString(record, 'manifestId', 'canonical manifest')
+  const manifestVersion = requiredString(record, 'manifestVersion', 'canonical manifest')
+  const workload = asRecord(record.workload, 'canonical manifest workload')
+  const compatibility = asRecord(record.compatibility, 'canonical manifest compatibility')
+  if (
+    manifestId.length > 128 ||
+    !VERSION.test(manifestVersion) ||
+    typeof workload.displayName !== 'string' ||
+    !Array.isArray(workload.environments) ||
+    !Array.isArray(workload.allowedEvidenceScopes) ||
+    typeof record.profiles !== 'object' ||
+    record.profiles === null ||
+    Array.isArray(record.profiles) ||
+    !Array.isArray(record.roles) ||
+    !Array.isArray(record.relationships) ||
+    !Array.isArray(record.constraints) ||
+    !Array.isArray(record.controls) ||
+    !Array.isArray(record.riskAcceptances) ||
+    !Array.isArray(record.objectives) ||
+    !Array.isArray(record.ownership) ||
+    compatibility.artifactKind !== 'workloadManifest' ||
+    typeof compatibility.artifactDigest !== 'string' ||
+    !DIGEST.test(compatibility.artifactDigest) ||
+    typeof compatibility.semanticDigest !== 'string' ||
+    !DIGEST.test(compatibility.semanticDigest) ||
+    typeof record.audit !== 'object' ||
+    record.audit === null ||
+    Array.isArray(record.audit)
+  ) {
+    throw new Error('Context API returned a malformed canonical workload manifest.')
+  }
+  return structuredClone(record) as unknown as CanonicalWorkloadManifest
+}
+
+const parseApproval = (value: unknown, label: string): WireApprovalDecision => {
+  const record = asRecord(value, label)
+  return {
+    decision_id: requiredString(record, 'decision_id', label),
+    approved_by: parseActor(record.approved_by, `${label}.approved_by`),
+    approved_at: requiredString(record, 'approved_at', label),
+    approved_revision: requiredNumber(record, 'approved_revision', label),
+    manifest_version: requiredString(record, 'manifest_version', label),
+    manifest_digest: requiredString(record, 'manifest_digest', label),
+    reason: requiredString(record, 'reason', label),
+  }
+}
+
+const optionalNullableString = (record: Record<string, unknown>, key: string): string | null | undefined => {
+  const value = record[key]
+  if (value === undefined || value === null || typeof value === 'string') {
+    return value
+  }
+  throw new Error(`Context API returned an invalid ${key}.`)
+}
+
+const parseDraft = (value: unknown): WireDraftRecord => {
+  const record = asRecord(value, 'draft record')
+  const state = requiredString(record, 'state', 'draft record')
+  if (!['draft', 'validated', 'in_review', 'approved', 'published', 'superseded'].includes(state)) {
+    throw new Error('Context API returned an invalid draft state.')
+  }
+  const wire: WireDraftRecord = {
+    draft_id: requiredString(record, 'draft_id', 'draft record'),
+    manifest_id: requiredString(record, 'manifest_id', 'draft record'),
+    state: state as DraftState,
+    revision: requiredNumber(record, 'revision', 'draft record'),
+    manifest: parseCanonicalManifest(record.manifest),
+    manifest_digest: requiredString(record, 'manifest_digest', 'draft record'),
+    previous_version: optionalNullableString(record, 'previous_version'),
+    created_by: parseActor(record.created_by, 'draft record.created_by'),
+    created_at: requiredString(record, 'created_at', 'draft record'),
+    updated_by: parseActor(record.updated_by, 'draft record.updated_by'),
+    updated_at: requiredString(record, 'updated_at', 'draft record'),
+    reason: requiredString(record, 'reason', 'draft record'),
+  }
+  if (record.validation !== undefined && record.validation !== null) {
+    const validation = asRecord(record.validation, 'draft validation')
+    wire.validation = {
+      validated_by: parseActor(validation.validated_by, 'draft validation.validated_by'),
+      validated_at: requiredString(validation, 'validated_at', 'draft validation'),
+      validated_revision: requiredNumber(validation, 'validated_revision', 'draft validation'),
+      manifest_digest: requiredString(validation, 'manifest_digest', 'draft validation'),
+    }
+  }
+  if (record.review !== undefined && record.review !== null) {
+    const review = asRecord(record.review, 'draft review')
+    wire.review = {
+      submitted_by: parseActor(review.submitted_by, 'draft review.submitted_by'),
+      submitted_at: requiredString(review, 'submitted_at', 'draft review'),
+      submitted_revision: requiredNumber(review, 'submitted_revision', 'draft review'),
+      publication_candidate_digest: requiredString(review, 'publication_candidate_digest', 'draft review'),
+      reason: requiredString(review, 'reason', 'draft review'),
+    }
+  }
+  if (record.publication_candidate !== undefined && record.publication_candidate !== null) {
+    const candidate = asRecord(record.publication_candidate, 'publication candidate')
+    if (candidate.approval_status !== 'approved') {
+      throw new Error('Context API returned an invalid publication candidate approval status.')
+    }
+    wire.publication_candidate = {
+      finalized_by: parseActor(candidate.finalized_by, 'publication candidate.finalized_by'),
+      finalized_at: requiredString(candidate, 'finalized_at', 'publication candidate'),
+      manifest_version: requiredString(candidate, 'manifest_version', 'publication candidate'),
+      manifest_digest: requiredString(candidate, 'manifest_digest', 'publication candidate'),
+      semantic_digest: requiredString(candidate, 'semantic_digest', 'publication candidate'),
+      approval_status: 'approved',
+    }
+  }
+  if (record.approval !== undefined && record.approval !== null) {
+    wire.approval = parseApproval(record.approval, 'draft approval')
+  }
+  return wire
+}
+
+const parsePublished = (value: unknown): WirePublishedManifest => {
+  const record = asRecord(value, 'published manifest')
+  return {
+    manifest_id: requiredString(record, 'manifest_id', 'published manifest'),
+    manifest_version: requiredString(record, 'manifest_version', 'published manifest'),
+    manifest_digest: requiredString(record, 'manifest_digest', 'published manifest'),
+    manifest: parseCanonicalManifest(record.manifest),
+    source_draft_id: requiredString(record, 'source_draft_id', 'published manifest'),
+    source_draft_revision: requiredNumber(record, 'source_draft_revision', 'published manifest'),
+    previous_version: optionalNullableString(record, 'previous_version'),
+    approval: parseApproval(record.approval, 'published manifest.approval'),
+    published_by: parseActor(record.published_by, 'published manifest.published_by'),
+    published_at: requiredString(record, 'published_at', 'published manifest'),
+    publication_authorized_by: parseActor(
+      record.publication_authorized_by,
+      'published manifest.publication_authorized_by',
+    ),
+    publication_authorized_at: requiredString(record, 'publication_authorized_at', 'published manifest'),
+    reason: requiredString(record, 'reason', 'published manifest'),
+  }
+}
+
+const parseSupersession = (value: unknown): WireSupersession => {
+  const record = asRecord(value, 'supersession')
+  return {
+    manifest_id: requiredString(record, 'manifest_id', 'supersession'),
+    superseded_version: requiredString(record, 'superseded_version', 'supersession'),
+    replacement_version: requiredString(record, 'replacement_version', 'supersession'),
+    superseded_by: parseActor(record.superseded_by, 'supersession.superseded_by'),
+    superseded_at: requiredString(record, 'superseded_at', 'supersession'),
+    reason: requiredString(record, 'reason', 'supersession'),
+  }
+}
+
+const parsePublishedView = (value: unknown): WirePublishedManifestView => {
+  const record = asRecord(value, 'published manifest view')
+  return {
+    published: parsePublished(record.published),
+    supersession:
+      record.supersession === undefined || record.supersession === null
+        ? undefined
+        : parseSupersession(record.supersession),
+  }
+}
+
+const toViewActor = (actor: WireActor): { actorId: string; kind: WireActor['kind'] } => ({
   actorId: actor.actor_id,
   kind: actor.kind,
 })
 
-const toViewManifest = (manifest: ManifestDraft): ManifestDraft => ({
-  ...cloneManifest(manifest),
-  requiredRelationships: [...manifest.requiredRelationships],
-  optionalRelationships: [...manifest.optionalRelationships],
-  controls: manifest.controls.map((control) => ({ ...control })),
-  riskAcceptances: manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
+const toViewApproval = (approval: WireApprovalDecision): ApprovalDecision => ({
+  decisionId: approval.decision_id,
+  approvedBy: toViewActor(approval.approved_by),
+  approvedAt: approval.approved_at,
+  approvedRevision: approval.approved_revision,
+  manifestVersion: approval.manifest_version,
+  manifestDigest: approval.manifest_digest,
+  reason: approval.reason,
 })
 
 const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
@@ -143,9 +274,9 @@ const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
   manifestId: wire.manifest_id,
   state: wire.state,
   revision: wire.revision,
-  manifest: toViewManifest(wire.manifest),
+  manifest: structuredClone(wire.manifest),
   manifestDigest: wire.manifest_digest,
-  previousVersion: wire.previous_version,
+  previousVersion: wire.previous_version ?? null,
   createdBy: toViewActor(wire.created_by),
   createdAt: wire.created_at,
   updatedBy: toViewActor(wire.updated_by),
@@ -175,39 +306,21 @@ const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
         manifestVersion: wire.publication_candidate.manifest_version,
         manifestDigest: wire.publication_candidate.manifest_digest,
         semanticDigest: wire.publication_candidate.semantic_digest,
-        approvalStatus: 'approved',
+        approvalStatus: wire.publication_candidate.approval_status,
       }
     : null,
-  approval: wire.approval
-    ? {
-        decisionId: wire.approval.decision_id,
-        approvedBy: toViewActor(wire.approval.approved_by),
-        approvedAt: wire.approval.approved_at,
-        approvedRevision: wire.approval.approved_revision,
-        manifestVersion: wire.approval.manifest_version,
-        manifestDigest: wire.approval.manifest_digest,
-        reason: wire.approval.reason,
-      }
-    : null,
+  approval: wire.approval ? toViewApproval(wire.approval) : null,
 })
 
 const toViewPublished = (wire: WirePublishedManifest): PublishedManifest => ({
   manifestId: wire.manifest_id,
   manifestVersion: wire.manifest_version,
   manifestDigest: wire.manifest_digest,
-  manifest: toViewManifest(wire.manifest),
+  manifest: structuredClone(wire.manifest),
   sourceDraftId: wire.source_draft_id,
   sourceDraftRevision: wire.source_draft_revision,
-  previousVersion: wire.previous_version,
-  approval: {
-    decisionId: wire.approval.decision_id,
-    approvedBy: toViewActor(wire.approval.approved_by),
-    approvedAt: wire.approval.approved_at,
-    approvedRevision: wire.approval.approved_revision,
-    manifestVersion: wire.approval.manifest_version,
-    manifestDigest: wire.approval.manifest_digest,
-    reason: wire.approval.reason,
-  },
+  previousVersion: wire.previous_version ?? null,
+  approval: toViewApproval(wire.approval),
   publishedBy: toViewActor(wire.published_by),
   publishedAt: wire.published_at,
   publicationAuthorizedBy: toViewActor(wire.publication_authorized_by),
@@ -215,598 +328,437 @@ const toViewPublished = (wire: WirePublishedManifest): PublishedManifest => ({
   reason: wire.reason,
 })
 
-const requestJson = async <T>(
-  baseUrl: string,
-  path: string,
-  requestInit: RequestInit,
-  authState: AuthState,
-  fetchImpl: typeof fetch,
-): Promise<T> => {
-  const headers = new Headers(requestInit.headers ?? {})
-  if (!headers.has('Content-Type') && requestInit.body != null) {
-    headers.set('Content-Type', 'application/json')
-  }
-  if (authState.bearerToken) {
-    headers.set('Authorization', `Bearer ${authState.bearerToken}`)
-  }
-  if (
-    requestInit.method &&
-    !['GET', 'HEAD'].includes(requestInit.method.toUpperCase()) &&
-    !headers.has('Idempotency-Key')
-  ) {
-    headers.set('Idempotency-Key', crypto.randomUUID())
-  }
+const toViewSupersession = (wire: WireSupersession): Supersession => ({
+  manifestId: wire.manifest_id,
+  supersededVersion: wire.superseded_version,
+  replacementVersion: wire.replacement_version,
+  supersededBy: toViewActor(wire.superseded_by),
+  supersededAt: wire.superseded_at,
+  reason: wire.reason,
+})
 
-  const response = await fetchImpl(`${baseUrl.replace(/\/+$/, '')}${path}`, {
-    ...requestInit,
-    headers,
-  })
-
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => '')
-    let errorMessage = `Request failed (${response.status})`
-    if (errorBody) {
-      try {
-        const parsed = JSON.parse(errorBody) as { error?: { message?: string }; message?: string }
-        errorMessage = parsed?.error?.message ?? parsed?.message ?? errorMessage
-      } catch {
-        errorMessage = errorBody || errorMessage
-      }
-    }
-    throw new Error(errorMessage)
+const endpointLabel = (endpoint: JsonObject): string => {
+  for (const key of ['roleRef', 'resourceRef', 'externalRef', 'endpointId']) {
+    if (typeof endpoint[key] === 'string') return endpoint[key]
   }
-
-  if (response.status === 204) {
-    return undefined as T
-  }
-
-  return (await response.json()) as T
+  return typeof endpoint.endpointType === 'string' ? endpoint.endpointType : 'unspecified endpoint'
 }
 
-const ensureHttpClientOptions = (options: ContextApiClientOptions): ContextApiClientOptions => {
-  if (!options || !options.auth || !options.baseUrl) {
-    throw new Error('Context API client requires an injected auth state and baseUrl. Do not use fixture defaults in runtime.')
+const toRelationship = (
+  relationship: CanonicalRelationship,
+  profileId: string | null,
+): TopologyRelationship => ({
+  id: relationship.relationshipId ?? relationship.exceptionId ?? 'unnamed-relationship',
+  kind: relationship.relationshipClass,
+  relationshipType: relationship.kind,
+  source: endpointLabel(relationship.source),
+  target: endpointLabel(relationship.target),
+  ownerRef: relationship.ownerRef ?? null,
+  clause: relationship.sourceClause ?? null,
+  profileId,
+})
+
+const toControl = (control: CanonicalControl): ControlRecord => ({
+  id: control.controlId,
+  ownerRef: control.ownerRef,
+  health: control.health,
+  runbookRef: control.runbookRef ?? null,
+  profiles: [...control.profiles],
+})
+
+const toRisk = (risk: CanonicalRiskAcceptance): RiskAcceptance => ({
+  id: risk.riskAcceptanceId,
+  residualRiskStatement: risk.residualRiskStatement,
+  ownedBy: risk.ownedBy,
+  status: risk.status,
+  profiles: [...risk.profiles],
+})
+
+const profileControls = (manifest: CanonicalWorkloadManifest): CanonicalControl[] => [
+  ...manifest.controls,
+  ...Object.values(manifest.profiles).flatMap((profile) => profile.controls),
+]
+
+const profileRisks = (manifest: CanonicalWorkloadManifest): CanonicalRiskAcceptance[] => [
+  ...manifest.riskAcceptances,
+  ...Object.values(manifest.profiles).flatMap((profile) => profile.riskAcceptances),
+]
+
+const compareProfile = (profile: CanonicalManifestProfile): ComparisonRow => ({
+  environment: profile.profileType,
+  topology: `${profile.roles.length} profile roles and ${profile.relationships.length} profile relationships declared.`,
+  policy: `${profile.constraints.length} constraints and ${profile.controls.length} controls declared.`,
+  residualRisk:
+    profile.riskAcceptances.map((risk) => risk.residualRiskStatement).join(' ') ||
+    'No residual-risk statement is declared for this profile.',
+  confidence: null,
+  relationshipKind: 'declared',
+})
+
+const provenanceFrom = (
+  manifest: CanonicalWorkloadManifest,
+  published: PublishedManifest | null,
+): EvidenceItem[] => {
+  const items: EvidenceItem[] = [
+    {
+      id: `manifest-audit-${manifest.manifestVersion}`,
+      source: 'Canonical manifest audit',
+      summary: `Published by ${manifest.audit.publishedBy} at ${manifest.audit.publishedAt}; approval status ${manifest.audit.approvalStatus}.`,
+      clause: '/audit',
+      manifestVersion: manifest.manifestVersion,
+      confidence: null,
+    },
+  ]
+  if (published) {
+    items.push({
+      id: `wc007-publication-${published.sourceDraftId}`,
+      source: 'WC-007 publication record',
+      summary: `Published by ${published.publishedBy.actorId} at ${published.publishedAt}; authorization recorded by ${published.publicationAuthorizedBy.actorId}.`,
+      clause: '/v1/manifests/{manifest_id}/versions',
+      manifestVersion: published.manifestVersion,
+      confidence: null,
+    })
   }
-  if (typeof options.baseUrl !== 'string' || !options.baseUrl.trim()) {
-    throw new Error('Context API client baseUrl must be configured explicitly.')
+  return items
+}
+
+const selectUnique = <T>(items: T[], label: string): T | null => {
+  if (items.length > 1) {
+    throw new Error(`Context API returned ambiguous ${label}; human review is required.`)
   }
-  if (!options.auth.bearerToken || !options.auth.actorId) {
-    throw new Error('Context API client requires an authenticated actor and bearer token.')
+  return items[0] ?? null
+}
+
+interface LifecycleState {
+  drafts: WireDraftRecord[]
+  publishedViews: WirePublishedManifestView[]
+}
+
+const buildContext = (
+  session: AuthSession,
+  workloadId: string,
+  lifecycle: LifecycleState,
+): WorkloadContext => {
+  const activeDraftWire = selectUnique(
+    lifecycle.drafts.filter((draft) => EDITABLE_STATES.has(draft.state)),
+    `active drafts for ${workloadId}`,
+  )
+  const activePublishedWire = selectUnique(
+    lifecycle.publishedViews.filter((view) => !view.supersession).map((view) => view.published),
+    `unsuperseded published versions for ${workloadId}`,
+  )
+  const draft = activeDraftWire ? toViewDraft(activeDraftWire) : null
+  const published = activePublishedWire ? toViewPublished(activePublishedWire) : null
+  if (draft && published) {
+    if (
+      draft.previousVersion !== published.manifestVersion ||
+      compareVersions(draft.manifest.manifestVersion, published.manifestVersion) <= 0
+    ) {
+      throw new Error(`Active draft lineage for ${workloadId} does not match the unique unsuperseded predecessor.`)
+    }
+  } else if (draft?.previousVersion) {
+    throw new Error(`Active draft lineage for ${workloadId} has no unsuperseded published predecessor.`)
+  }
+  const manifest = draft?.manifest ?? published?.manifest
+  if (!manifest) {
+    throw new Error(`Unknown workload or no active lifecycle state for ${workloadId}.`)
+  }
+  if (manifest.manifestId !== workloadId) {
+    throw new Error(`Context API returned a manifest identity mismatch for ${workloadId}.`)
+  }
+
+  const environment = manifest.workload.environments[0]
+  if (!environment) {
+    throw new Error(`Context API returned no declared environment for ${workloadId}.`)
+  }
+  const relationships = [
+    ...manifest.relationships.map((relationship) => toRelationship(relationship, null)),
+    ...Object.values(manifest.profiles).flatMap((profile) =>
+      profile.relationships.map((relationship) => toRelationship(relationship, profile.profileId)),
+    ),
+  ]
+  const owner = manifest.ownership[0]?.ownerRef ?? null
+  const approvalState = draft?.state ?? 'published'
+  const catalogueItem: CatalogItem = {
+    id: workloadId,
+    name: manifest.workload.displayName,
+    owner,
+    criticality: null,
+    zoneCount: null,
+    status: approvalState,
+  }
+
+  return {
+    workloadId,
+    auth: session,
+    environment,
+    evidenceSource: 'WC-007 Context API lifecycle response; observed Azure evidence is not provided by this route.',
+    confidence: null,
+    manifestVersion: manifest.manifestVersion,
+    approvalState,
+    catalogueItem,
+    comparison: ['production', 'development', 'training']
+      .map((profileId) => manifest.profiles[profileId])
+      .filter((profile): profile is CanonicalManifestProfile => profile !== undefined)
+      .map(compareProfile),
+    relationships,
+    manifest,
+    controls: profileControls(manifest).map(toControl),
+    riskAcceptances: profileRisks(manifest).map(toRisk),
+    provenance: provenanceFrom(manifest, published),
+    validationMessages: draft?.validation ? [] : ['No WC-007 validation record exists for the active draft.'],
+    draft,
+    published,
+  }
+}
+
+const safeError = async (response: Response): Promise<ContextApiRequestError> => {
+  let message = `Context API request failed with status ${response.status}.`
+  let code = response.status === 403 ? 'authorization_denied' : 'request_failed'
+  const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? ''
+  const declaredLength = Number(response.headers.get('Content-Length') ?? '0')
+  if (contentType.includes('application/json') && (!declaredLength || declaredLength <= MAX_ERROR_BODY)) {
+    const body = await response.text()
+    if (body.length <= MAX_ERROR_BODY) {
+      try {
+        const parsed = asRecord(JSON.parse(body), 'error response')
+        const detail = asRecord(parsed.error, 'error detail')
+        if (typeof detail.code === 'string') code = detail.code.slice(0, 128)
+        if (typeof detail.message === 'string') message = detail.message.slice(0, MAX_ERROR_MESSAGE)
+      } catch {
+        // Keep the bounded generic message. Raw response bodies are never rendered.
+      }
+    }
+  }
+  return new ContextApiRequestError(message, response.status, code)
+}
+
+const ensureOptions = (options: ContextApiClientOptions): ContextApiClientOptions => {
+  if (!options.baseUrl?.trim() || !options.authPort || !options.session) {
+    throw new Error('Context API client requires an injected base URL, AuthPort, and authenticated session.')
+  }
+  if (
+    !IDENTIFIER.test(options.session.actorId) ||
+    options.session.authorizedWorkloadIds.length === 0 ||
+    new Set(options.session.authorizedWorkloadIds).size !== options.session.authorizedWorkloadIds.length ||
+    options.session.authorizedWorkloadIds.some((id) => id === '*' || id.length > 128 || id.trim() !== id)
+  ) {
+    throw new Error('Authenticated session has invalid or ambiguous authorized workload IDs.')
   }
   return options
 }
 
+const versionTuple = (version: string): [number, number, number] => {
+  const match = VERSION.exec(version)
+  if (!match) throw new Error(`Context API returned invalid manifest version ${version}.`)
+  const result: [number, number, number] = [Number(match[1]), Number(match[2]), Number(match[3])]
+  if (result.some((part) => !Number.isSafeInteger(part))) {
+    throw new Error(`Manifest version ${version} exceeds browser-safe integer bounds.`)
+  }
+  return result
+}
+
+const compareVersions = (left: string, right: string): number => {
+  const leftTuple = versionTuple(left)
+  const rightTuple = versionTuple(right)
+  for (let index = 0; index < 3; index += 1) {
+    const difference = leftTuple[index]! - rightTuple[index]!
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+const nextUniqueVersion = (predecessor: string, existing: Set<string>): string => {
+  const highest = [...existing, predecessor].sort(compareVersions).at(-1)!
+  const [major, minor, patch] = versionTuple(highest)
+  let candidate = `${major}.${minor}.${patch + 1}`
+  while (existing.has(candidate) || compareVersions(candidate, predecessor) <= 0) {
+    const [, , candidatePatch] = versionTuple(candidate)
+    candidate = `${major}.${minor}.${candidatePatch + 1}`
+  }
+  return candidate
+}
+
 export const createContextApiClient = (options: ContextApiClientOptions): ContextApiClientPort => {
-  const config = ensureHttpClientOptions(options)
-  const authState = config.auth
-  const baseUrl = config.baseUrl
+  const config = ensureOptions(options)
+  const baseUrl = config.baseUrl.replace(/\/+$/, '')
   const fetchImpl = config.fetchImpl ?? globalThis.fetch
-  const draftStore = new Map<string, DraftRecord>()
-  const publishedStore = new Map<string, PublishedManifest>()
-  const contextCache = new Map<string, WorkloadContext>()
+  const createId = config.createId ?? (() => crypto.randomUUID())
+  const authorizedIds = new Set(config.session.authorizedWorkloadIds)
 
-  const buildWorkloadCatalogue = async (): Promise<CatalogItem[]> => {
-    const drafts = await requestJson<WireDraftRecord[]>(baseUrl, '/v1/drafts', { method: 'GET' }, authState, fetchImpl)
-    const workloadIds = Array.from(
-      new Set(drafts.map((draft) => draft.manifest_id)),
-    )
-
-    if (workloadIds.length === 0) {
-      return []
+  const assertAuthorized = (workloadId: string): void => {
+    if (!authorizedIds.has(workloadId)) {
+      throw new ContextApiRequestError(`Workload ${workloadId} is not authorized for this session.`, 403, 'authorization_denied')
     }
-
-    return workloadIds.map((workloadId) => {
-      const source = drafts.find((draft) => draft.manifest_id === workloadId)
-      const manifest = source?.manifest
-      return {
-        id: workloadId,
-        name: manifest?.workloadName ?? workloadId,
-        owner: manifest?.businessOwner ?? 'Service owner',
-        criticality: 'Tier-1',
-        zoneCount: 2,
-        status: 'Healthy',
-      }
-    })
   }
 
-  const buildContext = async (workloadId: string): Promise<WorkloadContext> => {
-    const drafts = await requestJson<WireDraftRecord[]>(
-      baseUrl,
-      `/v1/drafts?manifest_id=${encodeURIComponent(workloadId)}`,
-      { method: 'GET' },
-      authState,
-      fetchImpl,
+  const safeId = (prefix: string): string => {
+    const normalizedPrefix = prefix.replace(/[^A-Za-z0-9._-]/g, '-')
+    const suffix = createId().replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80)
+    const value = `${normalizedPrefix}-${suffix}`.slice(0, 128)
+    if (!IDENTIFIER.test(value)) throw new Error('Injected ID generator returned an invalid identifier.')
+    return value
+  }
+
+  const requestJson = async (
+    path: string,
+    requestInit: RequestInit,
+  ): Promise<unknown> => {
+    const token = (await config.authPort.acquireAccessToken(config.session))?.trim()
+    if (!token) {
+      throw new ContextApiRequestError('Authentication is required before Context Studio can access workload state.', 401, 'authentication_required')
+    }
+    const headers = new Headers(requestInit.headers)
+    headers.set('Authorization', `Bearer ${token}`)
+    if (requestInit.body !== undefined && requestInit.body !== null) {
+      headers.set('Content-Type', 'application/json')
+    }
+    if (requestInit.method && !['GET', 'HEAD'].includes(requestInit.method.toUpperCase())) {
+      headers.set('Idempotency-Key', safeId('mutation'))
+    }
+    const response = await fetchImpl(`${baseUrl}${path}`, { ...requestInit, headers })
+    if (!response.ok) throw await safeError(response)
+    return response.status === 204 ? undefined : response.json()
+  }
+
+  const loadLifecycle = async (workloadId: string): Promise<LifecycleState> => {
+    assertAuthorized(workloadId)
+    const encoded = encodeURIComponent(workloadId)
+    const draftPayload = await requestJson(`/v1/drafts?manifest_id=${encoded}`, { method: 'GET' })
+    const publishedPayload = await requestJson(`/v1/manifests/${encoded}/versions`, { method: 'GET' })
+    return {
+      drafts: asArray(draftPayload, 'draft list').map(parseDraft),
+      publishedViews: asArray(publishedPayload, 'published manifest view list').map(parsePublishedView),
+    }
+  }
+
+  const transition = async (
+    request: ConcurrencyRequest,
+    operation: 'validate' | 'submit' | 'approve',
+  ): Promise<DraftRecord> => {
+    assertAuthorized(request.workloadId)
+    const response = await requestJson(
+      `/v1/drafts/${encodeURIComponent(request.draftId)}/${operation}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_revision: request.expectedRevision,
+          expected_manifest_version: request.expectedManifestVersion,
+          expected_digest: request.expectedDigest,
+          reason: request.reason,
+        }),
+      },
     )
-    const publishedVersions = await requestJson<WirePublishedManifest[]>(
-      baseUrl,
-      `/v1/manifests/${encodeURIComponent(workloadId)}/versions`,
-      { method: 'GET' },
-      authState,
-      fetchImpl,
-    )
-
-    if (drafts.length === 0 && publishedVersions.length === 0) {
-      throw new Error(`Unknown workload or no lifecycle state available for ${workloadId}.`)
+    const draft = toViewDraft(parseDraft(response))
+    if (draft.manifestId !== request.workloadId) {
+      throw new Error('Context API returned a draft outside the authorized workload scope.')
     }
-
-    const draft = drafts.length > 0
-      ? toViewDraft(drafts.reduce((current, candidate) => (candidate.revision > current.revision ? candidate : current)))
-      : null
-
-    const published = publishedVersions.length > 0
-      ? toViewPublished(publishedVersions.reduce((current, candidate) => (candidate.source_draft_revision > current.source_draft_revision ? candidate : current)))
-      : null
-
-    const manifest = draft?.manifest ?? published?.manifest ?? null
-    if (!manifest) {
-      throw new Error(`No manifest payload was returned for ${workloadId}.`)
-    }
-
-    const catalogue = await buildWorkloadCatalogue()
-    const workloadCatalogue = catalogue.length > 0
-      ? catalogue
-      : [{
-          id: workloadId,
-          name: manifest.workloadName,
-          owner: manifest.businessOwner,
-          criticality: 'Tier-1',
-          zoneCount: 2,
-          status: 'Healthy',
-        }]
-
-    const lookupDraft = draft ?? null
-    const nextContext: WorkloadContext = {
-      workloadId,
-      auth: authState,
-      environment: manifest.environment,
-      evidenceSource: published ? 'WC-007 published manifest' : 'WC-007 draft state',
-      confidence: published ? 0.96 : 0.91,
-      manifestVersion: manifest.manifestVersion,
-      approvalState: lookupDraft?.state ?? 'draft',
-      workloadCatalogue,
-      comparison: compareRows(manifest.environment),
-      relationships: buildRelationships(manifest),
-      manifest,
-      controls: manifest.controls,
-      riskAcceptances: manifest.riskAcceptances,
-      provenance: [{
-        id: `prov-${workloadId}`,
-        source: 'WC-007 Context API',
-        summary: 'Manifest and draft lifecycle state were loaded from the authenticated context API.',
-        clause: 'context.lifecycle.api',
-        manifestVersion: manifest.manifestVersion,
-        confidence: 0.94,
-      }],
-      validationMessages: lookupDraft?.validation ? [] : ['Draft requires validation before review.'],
-      draft: lookupDraft,
-      published,
-    }
-
-    contextCache.set(workloadId, nextContext)
-    if (draft) {
-      draftStore.set(draft.draftId, draft)
-    }
-    if (published) {
-      publishedStore.set(workloadId, published)
-    }
-
-    return nextContext
+    return draft
   }
 
   return {
-    auth: authState,
-    loadWorkloads: async () => buildWorkloadCatalogue(),
-    loadWorkloadContext: async (workloadId: string) => buildContext(workloadId),
-    loadWorkloadSync: (workloadId: string) => {
-      const cached = contextCache.get(workloadId)
-      if (!cached) {
-        throw new Error(`Workload ${workloadId} has not been loaded yet.`)
+    auth: config.session,
+    loadAuthorizedWorkloads: async () =>
+      Promise.all(
+        config.session.authorizedWorkloadIds.map(async (workloadId) =>
+          buildContext(config.session, workloadId, await loadLifecycle(workloadId)),
+        ),
+      ),
+    loadWorkloadContext: async (workloadId) =>
+      buildContext(config.session, workloadId, await loadLifecycle(workloadId)),
+    createSuccessorDraft: async (workloadId, reason) => {
+      const lifecycle = await loadLifecycle(workloadId)
+      const activeDrafts = lifecycle.drafts.filter((draft) => EDITABLE_STATES.has(draft.state))
+      if (activeDrafts.length > 0) {
+        throw new Error('An active draft already exists; reload and update that draft instead.')
       }
-      return cached
-    },
-    reloadWorkload: async (workloadId: string) => buildContext(workloadId),
-    createDraft: async (workloadId: string, manifest: ManifestDraft, reason: string) => {
-      const draftId = `draft-${workloadId}-${Date.now()}`
-      const activePublished = publishedStore.get(workloadId)
-      const previousVersion = activePublished?.manifestVersion ?? null
-      const manifestVersion = manifest.manifestVersion || '1.0.0'
-      const targetDraftManifest: ManifestDraft = {
-        ...cloneManifest(manifest),
-        manifestVersion,
-        manifestDigest: resolveManifestDigest(manifest) || manifest.compatibility?.artifactDigest || 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+      const activePublished = selectUnique(
+        lifecycle.publishedViews.filter((view) => !view.supersession),
+        `unsuperseded published versions for ${workloadId}`,
+      )
+      if (!activePublished) {
+        throw new Error('A unique unsuperseded published predecessor is required to create a successor draft.')
       }
+      const predecessor = activePublished.published
+      if (predecessor.manifest_id !== workloadId) {
+        throw new Error('Published predecessor identity does not match the authorized workload.')
+      }
+      const existingVersions = new Set([
+        ...lifecycle.drafts.map((draft) => draft.manifest.manifestVersion),
+        ...lifecycle.publishedViews.map((view) => view.published.manifest_version),
+      ])
+      const candidate = structuredClone(predecessor.manifest)
+      candidate.manifestVersion = nextUniqueVersion(predecessor.manifest_version, existingVersions)
+      const canonicalCandidate = await refreshCanonicalManifestDigests(candidate)
 
-      const response = await requestJson<WireDraftRecord>(
-        baseUrl,
-        '/v1/drafts',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            draft_id: draftId,
-            manifest: canonicalManifestPayload(targetDraftManifest),
-            manifest_digest: resolveManifestDigest(targetDraftManifest),
-            previous_version: previousVersion,
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
+      let draftId = ''
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const candidateId = safeId(`draft-${workloadId.slice(0, 36)}`)
+        if (!lifecycle.drafts.some((draft) => draft.draft_id === candidateId)) {
+          draftId = candidateId
+          break
+        }
+      }
+      if (!draftId) throw new Error('Unable to allocate a unique successor draft identifier.')
 
-      const draft = toViewDraft(response)
-      draftStore.set(draft.draftId, draft)
-      const nextContext = await buildContext(workloadId)
-      contextCache.set(workloadId, nextContext)
-      return draft
-    },
-    updateDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, replacementManifest, reason }) => {
-      const response = await requestJson<WireDraftRecord>(
-        baseUrl,
-        `/v1/drafts/${encodeURIComponent(draftId)}`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({
-            expected_revision: expectedRevision,
-            expected_manifest_version: expectedManifestVersion,
-            expected_digest: expectedDigest,
-            replacement_manifest: canonicalManifestPayload(replacementManifest),
-            replacement_digest: resolveManifestDigest(replacementManifest),
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
-      const draft = toViewDraft(response)
-      draftStore.set(draft.draftId, draft)
-      return draft
-    },
-    validateDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const response = await requestJson<WireDraftRecord>(
-        baseUrl,
-        `/v1/drafts/${encodeURIComponent(draftId)}/validate`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            expected_revision: expectedRevision,
-            expected_manifest_version: expectedManifestVersion,
-            expected_digest: expectedDigest,
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
-      const draft = toViewDraft(response)
-      draftStore.set(draft.draftId, draft)
-      return draft
-    },
-    submitForReview: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const response = await requestJson<WireDraftRecord>(
-        baseUrl,
-        `/v1/drafts/${encodeURIComponent(draftId)}/submit`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            expected_revision: expectedRevision,
-            expected_manifest_version: expectedManifestVersion,
-            expected_digest: expectedDigest,
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
-      const draft = toViewDraft(response)
-      draftStore.set(draft.draftId, draft)
-      return draft
-    },
-    approveDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const response = await requestJson<WireDraftRecord>(
-        baseUrl,
-        `/v1/drafts/${encodeURIComponent(draftId)}/approve`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            expected_revision: expectedRevision,
-            expected_manifest_version: expectedManifestVersion,
-            expected_digest: expectedDigest,
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
-      const draft = toViewDraft(response)
-      draftStore.set(draft.draftId, draft)
-      return draft
-    },
-    publishDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, approvalId, reason }) => {
-      const response = await requestJson<WirePublishedManifest>(
-        baseUrl,
-        `/v1/drafts/${encodeURIComponent(draftId)}/publish`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            expected_revision: expectedRevision,
-            expected_manifest_version: expectedManifestVersion,
-            expected_digest: expectedDigest,
-            approval_id: approvalId,
-            reason,
-          }),
-        },
-        authState,
-        fetchImpl,
-      )
-      const published = toViewPublished(response)
-      publishedStore.set(published.manifestId, published)
-      return published
-    },
-  }
-}
-
-export const createMockContextApiClient = (authState: AuthState = authFixture): ContextApiClientPort => {
-  const localDraftStore = new Map<string, DraftRecord>()
-  const localPublishedStore = new Map<string, PublishedManifest>()
-  const localContextCache = new Map<string, WorkloadContext>()
-
-  const toContext = (workloadId: string): WorkloadContext => {
-    const seed = workloadFixtureMap[workloadId] ?? workloadFixtureMap['atlas-api']
-    const currentDraft = localDraftStore.get(`draft-${workloadId}`) ?? null
-    const published = localPublishedStore.get(workloadId) ?? null
-    const manifest = currentDraft?.manifest ?? published?.manifest ?? seed.manifest
-    const manifestVersion = currentDraft?.manifest.manifestVersion ?? published?.manifestVersion ?? seed.manifest.manifestVersion
-    const comparison = compareRows(manifest.environment)
-    const relationships = buildRelationships(manifest)
-    const context: WorkloadContext = {
-      ...seed,
-      workloadId,
-      auth: authState,
-      environment: manifest.environment,
-      evidenceSource: published ? 'WC-007 published manifest' : 'WC-007 fixture draft',
-      confidence: 0.92,
-      manifestVersion,
-      approvalState: currentDraft?.state ?? seed.approvalState,
-      workloadCatalogue: seed.workloadCatalogue,
-      comparison,
-      relationships,
-      manifest,
-      controls: manifest.controls,
-      riskAcceptances: manifest.riskAcceptances,
-      provenance: [
-        {
-          id: `prov-${workloadId}`,
-          source: 'Synthetic fixture snapshot',
-          summary: 'Synthetic fixture data is clearly fake and isolated to the WC-011 prototype.',
-          clause: 'synthetic.fixture.wc-011',
-          manifestVersion: manifest.manifestVersion,
-          confidence: 0.9,
-        },
-      ],
-      validationMessages: currentDraft?.validation ? [] : ['Draft requires validation before human review.'],
-      draft: currentDraft,
-      published,
-    }
-    localContextCache.set(workloadId, context)
-    return context
-  }
-
-  return {
-    auth: authState,
-    loadWorkloads: async () => Object.values(workloadFixtureMap).map((entry) => entry.workloadCatalogue[0] ?? {
-      id: entry.workloadId,
-      name: entry.manifest.workloadName,
-      owner: entry.manifest.businessOwner,
-      criticality: 'Tier-1',
-      zoneCount: 2,
-      status: 'Healthy',
-    }),
-    loadWorkloadContext: async (workloadId: string) => toContext(workloadId),
-    loadWorkloadSync: (workloadId: string) => {
-      const cached = localContextCache.get(workloadId)
-      if (!cached) {
-        return toContext(workloadId)
-      }
-      return cached
-    },
-    reloadWorkload: async (workloadId: string) => toContext(workloadId),
-    createDraft: async (workloadId: string, manifest: ManifestDraft, reason: string) => {
-      const key = `draft-${workloadId}`
-      if (localDraftStore.has(key)) {
-        throw new Error('A draft already exists for this workload; reload and update it instead.')
-      }
-      const created: DraftRecord = {
-        draftId: key,
-        manifestId: workloadId,
-        state: 'draft',
-        revision: 1,
-        manifest: cloneManifest(manifest),
-        manifestDigest: resolveManifestDigest(manifest) || wc007DraftApiFixture.manifest_digest || '',
-        previousVersion: localPublishedStore.get(workloadId)?.manifestVersion ?? null,
-        createdBy: { actorId: authState.actorId, kind: authState.kind },
-        createdAt: '2026-08-17T00:00:00.000Z',
-        updatedBy: { actorId: authState.actorId, kind: authState.kind },
-        updatedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-        validation: null,
-        review: null,
-        publicationCandidate: null,
-        approval: null,
-      }
-      localDraftStore.set(key, created)
-      return created
-    },
-    updateDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, replacementManifest, reason }) => {
-      const current = localDraftStore.get(draftId)
-      if (!current) {
-        throw new Error('Draft not found; create a new draft before updating.')
-      }
-      if (
-        current.revision !== expectedRevision ||
-        current.manifest.manifestVersion !== expectedManifestVersion ||
-        current.manifestDigest !== expectedDigest
-      ) {
-        throw new Error('Concurrent change detected. Reload the draft and apply your edit against the latest revision.')
-      }
-      const nextDraft: DraftRecord = {
-        ...current,
-        revision: current.revision + 1,
-        manifest: cloneManifest(replacementManifest),
-        manifestDigest: resolveManifestDigest(replacementManifest) || expectedDigest,
-        updatedBy: { actorId: authState.actorId, kind: authState.kind },
-        updatedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-        validation: null,
-        review: null,
-        publicationCandidate: null,
-        approval: null,
-        state: 'draft',
-      }
-      localDraftStore.set(draftId, nextDraft)
-      return nextDraft
-    },
-    validateDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const current = localDraftStore.get(draftId)
-      if (!current) {
-        throw new Error('Draft not found while validating.')
-      }
-      if (
-        current.revision !== expectedRevision ||
-        current.manifest.manifestVersion !== expectedManifestVersion ||
-        current.manifestDigest !== expectedDigest
-      ) {
-        throw new Error('Concurrent change detected. Reload the draft before validation.')
-      }
-      const updated: DraftRecord = {
-        ...current,
-        state: 'validated',
-        revision: current.revision + 1,
-        updatedBy: { actorId: authState.actorId, kind: authState.kind },
-        updatedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-        validation: {
-          validatedBy: { actorId: authState.actorId, kind: authState.kind },
-          validatedAt: '2026-08-17T00:00:00.000Z',
-          validatedRevision: current.revision + 1,
-          manifestDigest: current.manifestDigest,
-        },
-        publicationCandidate: null,
-      }
-      localDraftStore.set(draftId, updated)
-      return updated
-    },
-    submitForReview: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const current = localDraftStore.get(draftId)
-      if (!current) {
-        throw new Error('Draft not found while submitting for review.')
-      }
-      if (
-        current.revision !== expectedRevision ||
-        current.manifest.manifestVersion !== expectedManifestVersion ||
-        current.manifestDigest !== expectedDigest
-      ) {
-        throw new Error('Concurrent change detected. Reload the draft before review submission.')
-      }
-      const updated: DraftRecord = {
-        ...current,
-        state: 'in_review',
-        revision: current.revision + 1,
-        updatedBy: { actorId: authState.actorId, kind: authState.kind },
-        updatedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-        review: {
-          submittedBy: { actorId: authState.actorId, kind: authState.kind },
-          submittedAt: '2026-08-17T00:00:00.000Z',
-          submittedRevision: current.revision + 1,
-          publicationCandidateDigest: current.manifestDigest,
+      const response = await requestJson('/v1/drafts', {
+        method: 'POST',
+        body: JSON.stringify({
+          draft_id: draftId,
+          manifest: canonicalCandidate,
+          manifest_digest: canonicalCandidate.compatibility.artifactDigest,
+          previous_version: predecessor.manifest_version,
           reason,
-        },
-        publicationCandidate: null,
-      }
-      localDraftStore.set(draftId, updated)
-      return updated
+        }),
+      })
+      return toViewDraft(parseDraft(response))
     },
-    approveDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, reason }) => {
-      const current = localDraftStore.get(draftId)
-      if (!current) {
-        throw new Error('Draft not found while approving.')
+    updateDraft: async (request) => {
+      assertAuthorized(request.workloadId)
+      if (request.replacementManifest.manifestId !== request.workloadId) {
+        throw new Error('A replacement manifest cannot change the authorized workload identity.')
       }
-      if (
-        current.revision !== expectedRevision ||
-        current.manifest.manifestVersion !== expectedManifestVersion ||
-        current.manifestDigest !== expectedDigest
-      ) {
-        throw new Error('Concurrent change detected. Reload the draft before approval.')
-      }
-      const approval: ApprovalDecision = {
-        decisionId: `approval-${draftId}`,
-        approvedBy: { actorId: 'human-approver', kind: 'human' as const },
-        approvedAt: '2026-08-17T00:00:00.000Z',
-        approvedRevision: current.revision + 1,
-        manifestVersion: current.manifest.manifestVersion,
-        manifestDigest: current.manifestDigest,
-        reason,
-      }
-      const publicationCandidate = {
-        finalizedBy: { actorId: 'human-approver', kind: 'human' as const },
-        finalizedAt: '2026-08-17T00:00:00.000Z',
-        manifestVersion: current.manifest.manifestVersion,
-        manifestDigest: current.manifestDigest,
-        semanticDigest: current.manifestDigest,
-        approvalStatus: 'approved' as const,
-      }
-      const updated: DraftRecord = {
-        ...current,
-        state: 'approved',
-        revision: current.revision + 1,
-        updatedBy: { actorId: 'human-approver', kind: 'human' as const },
-        updatedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-        approval,
-        publicationCandidate,
-      }
-      localDraftStore.set(draftId, updated)
-      return updated
+      const canonicalReplacement = await refreshCanonicalManifestDigests(request.replacementManifest)
+      const response = await requestJson(`/v1/drafts/${encodeURIComponent(request.draftId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          expected_revision: request.expectedRevision,
+          expected_manifest_version: request.expectedManifestVersion,
+          expected_digest: request.expectedDigest,
+          replacement_manifest: canonicalReplacement,
+          replacement_digest: canonicalReplacement.compatibility.artifactDigest,
+          reason: request.reason,
+        }),
+      })
+      return toViewDraft(parseDraft(response))
     },
-    publishDraft: async ({ draftId, expectedRevision, expectedManifestVersion, expectedDigest, approvalId, reason }) => {
-      const draft = localDraftStore.get(draftId)
-      if (!draft) {
-        throw new Error('Draft not found before publication.')
+    validateDraft: async (request) => transition(request, 'validate'),
+    submitForReview: async (request) => transition(request, 'submit'),
+    approveDraft: async (request) => transition(request, 'approve'),
+    publishDraft: async (request: PublishRequest) => {
+      assertAuthorized(request.workloadId)
+      const response = await requestJson(`/v1/drafts/${encodeURIComponent(request.draftId)}/publish`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expected_revision: request.expectedRevision,
+          expected_manifest_version: request.expectedManifestVersion,
+          expected_digest: request.expectedDigest,
+          reason: request.reason,
+          approval_id: request.approvalId,
+        }),
+      })
+      const published = toViewPublished(parsePublished(response))
+      if (published.manifestId !== request.workloadId) {
+        throw new Error('Context API returned a publication outside the authorized workload scope.')
       }
-      if (
-        draft.revision !== expectedRevision ||
-        draft.manifest.manifestVersion !== expectedManifestVersion ||
-        draft.manifestDigest !== expectedDigest
-      ) {
-        throw new Error('Concurrent change detected. Reload the draft before publication.')
-      }
-      if (!draft.approval) {
-        throw new Error('Publication requires a server-derived approval decision.')
-      }
-      if (draft.approval.decisionId !== approvalId) {
-        throw new Error('The approval record is invalid for this draft revision.')
-      }
-      const published: PublishedManifest = {
-        manifestId: draft.manifestId,
-        manifestVersion: draft.manifest.manifestVersion,
-        manifestDigest: draft.manifestDigest,
-        manifest: cloneManifest(draft.manifest),
-        sourceDraftId: draftId,
-        sourceDraftRevision: draft.revision + 1,
-        previousVersion: draft.previousVersion,
-        approval: draft.approval,
-        publishedBy: { actorId: 'human-publisher', kind: 'human' as const },
-        publishedAt: '2026-08-17T00:00:00.000Z',
-        publicationAuthorizedBy: { actorId: 'athena-context-api', kind: 'service' as const },
-        publicationAuthorizedAt: '2026-08-17T00:00:00.000Z',
-        reason,
-      }
-      localDraftStore.set(draftId, { ...draft, state: 'published', revision: draft.revision + 1 })
-      localPublishedStore.set(draft.manifestId, published)
       return published
     },
   }
 }
 
-export { wc007DraftApiFixture, wc007PublishedApiFixture }
-export type { PublishRequest }
+export const unwrapPublishedManifestView = (
+  value: WirePublishedManifestView,
+): { published: PublishedManifest; supersession: Supersession | null } => ({
+  published: toViewPublished(value.published),
+  supersession: value.supersession ? toViewSupersession(value.supersession) : null,
+})

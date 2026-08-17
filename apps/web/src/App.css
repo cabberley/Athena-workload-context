@@ -257,7 +257,7 @@
 }
 
 .table-head span,
-.table-row span {
+.table-cell {
   padding: 0.85rem 0.9rem;
   border-right: 1px solid #334155;
   border-bottom: 1px solid #334155;
@@ -269,12 +269,16 @@
   color: #f8fafc;
 }
 
-.table-row:last-child span {
+.table-row:last-child .table-cell {
   border-bottom: 0;
 }
 
-.table-row span:last-child {
+.table-row .table-cell:last-child {
   border-right: 0;
+}
+
+.mobile-cell-label {
+  display: none;
 }
 
 .manifest-form {
@@ -392,9 +396,14 @@ legend {
 .stack-item p,
 .provenance-list p,
 .status-message,
-.review-panel p {
+.review-panel p,
+.source-note {
   margin: 0;
   color: #dbeafe;
+}
+
+.source-note {
+  margin-bottom: 1rem;
 }
 
 .relationship-kind {
@@ -429,6 +438,22 @@ legend {
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
+}
+
+.review-confirmation {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 0.65rem;
+  border: 1px solid #475569;
+  border-radius: 12px;
+  padding: 0.8rem;
+}
+
+.review-confirmation input {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.15rem;
 }
 
 .primary-action,
@@ -488,13 +513,22 @@ legend {
   color: #bfdbfe;
 }
 
-.loading-state {
+.loading-state,
+.startup-failure {
   min-height: 100vh;
   display: grid;
   place-items: center;
   background: #020817;
   color: #e2e8f0;
   font-size: 1.1rem;
+}
+
+.startup-failure > div {
+  width: min(42rem, calc(100vw - 2rem));
+  border: 1px solid #475569;
+  border-radius: 18px;
+  background: #0f172a;
+  padding: 1.5rem;
 }
 
 button:focus-visible,
@@ -540,8 +574,20 @@ textarea:focus-visible {
     border-bottom: 1px solid #334155;
   }
 
-  .table-row span {
+  .table-cell {
     border-right: 0;
     border-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .mobile-cell-label {
+    display: inline;
+    color: #7dd3fc;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
   }
 }

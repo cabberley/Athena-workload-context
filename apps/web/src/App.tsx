@@ -1,293 +1,267 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { AppRoute, ContextApiClientPort, ManifestDraft, WorkloadContext } from './types'
+import { useEffect, useRef, useState } from 'react'
+import type {
+  AppRoute,
+  CanonicalWorkloadManifest,
+  ConcurrencyRequest,
+  ContextApiClientPort,
+  WorkloadContext,
+} from './types'
 import './App.css'
 
-const cloneManifest = (context: WorkloadContext): ManifestDraft => ({
-  ...context.manifest,
-  requiredRelationships: [...context.manifest.requiredRelationships],
-  optionalRelationships: [...context.manifest.optionalRelationships],
-  controls: context.manifest.controls.map((control) => ({ ...control })),
-  riskAcceptances: context.manifest.riskAcceptances.map((acceptance) => ({ ...acceptance })),
-})
+const cloneManifest = (manifest: CanonicalWorkloadManifest): CanonicalWorkloadManifest =>
+  structuredClone(manifest)
 
-const bumpVersion = (value: string): string => {
-  const match = /^([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(value.trim())
-  if (!match) {
-    return value
+const displayEnvironment = (value: string): string =>
+  value === 'disasterRecovery' ? 'Disaster Recovery' : `${value.charAt(0).toUpperCase()}${value.slice(1)}`
+
+const errorMessage = (error: unknown, fallback: string): string =>
+  error instanceof Error ? error.message : fallback
+
+const concurrencyRequest = (context: WorkloadContext, reason: string): ConcurrencyRequest => {
+  if (!context.draft) throw new Error('The active draft is unavailable.')
+  return {
+    workloadId: context.workloadId,
+    draftId: context.draft.draftId,
+    expectedRevision: context.draft.revision,
+    expectedManifestVersion: context.draft.manifest.manifestVersion,
+    expectedDigest: context.draft.manifestDigest,
+    reason,
   }
-  const [, major, minor, patch] = match
-  return `${Number(major)}.${Number(minor)}.${Number(patch) + 1}`
 }
 
-function App({ client }: { client: ContextApiClientPort }) {
+interface AppProps {
+  client: ContextApiClientPort
+  initialContexts: WorkloadContext[]
+}
+
+function App({ client, initialContexts }: AppProps) {
+  const initial = initialContexts[0]!
   const [route, setRoute] = useState<AppRoute>('overview')
-  const [selectedWorkloadId, setSelectedWorkloadId] = useState('atlas-api')
-  const [workloadContext, setWorkloadContext] = useState<WorkloadContext | null>(() => {
-    try {
-      return client.loadWorkloadSync('atlas-api')
-    } catch {
-      return null
-    }
-  })
-  const [draftForm, setDraftForm] = useState<ManifestDraft | null>(() => {
-    try {
-      const initial = client.loadWorkloadSync('atlas-api')
-      return cloneManifest(initial)
-    } catch {
-      return null
-    }
-  })
-  const [statusMessage, setStatusMessage] = useState('Ready to create a draft or load the selected workload.')
+  const [contexts, setContexts] = useState(() => new Map(initialContexts.map((context) => [context.workloadId, context])))
+  const [selectedWorkloadId, setSelectedWorkloadId] = useState(initial.workloadId)
+  const [workloadContext, setWorkloadContext] = useState(initial)
+  const [draftForm, setDraftForm] = useState(() => cloneManifest(initial.manifest))
+  const [selectedProfileId, setSelectedProfileId] = useState(
+    initial.manifest.profiles.production ? 'production' : Object.keys(initial.manifest.profiles)[0]!,
+  )
+  const [reviewedDigest, setReviewedDigest] = useState<string | null>(null)
+  const [statusMessage, setStatusMessage] = useState('Authenticated workload context loaded from scoped WC-007 routes.')
   const [busy, setBusy] = useState(false)
+  const routeHeadingRef = useRef<HTMLHeadingElement>(null)
 
   useEffect(() => {
-    if (workloadContext) {
-      setDraftForm(cloneManifest(workloadContext))
-    }
-  }, [workloadContext])
+    routeHeadingRef.current?.focus()
+  }, [route])
 
-  const currentDraft = workloadContext?.draft ?? null
-  const publishDisabled =
-    busy ||
-    !currentDraft ||
-    currentDraft.state !== 'approved' ||
-    !currentDraft.approval ||
-    selectedWorkloadId !== currentDraft.manifestId
-
-  const validateDisabled = busy || !currentDraft || currentDraft.state !== 'draft'
-  const submitDisabled = busy || !currentDraft || currentDraft.state !== 'validated'
-  const approveDisabled = busy || !currentDraft || currentDraft.state !== 'in_review'
-
-  const applyContext = (nextContext: WorkloadContext) => {
-    setSelectedWorkloadId(nextContext.workloadId)
-    setWorkloadContext(nextContext)
-    setDraftForm(cloneManifest(nextContext))
+  const applyContext = (next: WorkloadContext): void => {
+    setContexts((current) => new Map(current).set(next.workloadId, next))
+    setSelectedWorkloadId(next.workloadId)
+    setWorkloadContext(next)
+    setDraftForm(cloneManifest(next.manifest))
+    setSelectedProfileId(next.manifest.profiles.production ? 'production' : Object.keys(next.manifest.profiles)[0]!)
+    if (reviewedDigest !== next.draft?.manifestDigest) setReviewedDigest(null)
   }
 
-  const refreshCurrentWorkload = async (nextWorkloadId = selectedWorkloadId) => {
-    const nextContext = await client.reloadWorkload(nextWorkloadId)
-    applyContext(nextContext)
-    return nextContext
+  const refreshCurrentWorkload = async (): Promise<WorkloadContext> => {
+    const next = await client.loadWorkloadContext(selectedWorkloadId)
+    applyContext(next)
+    return next
   }
 
-  const handleSelectWorkload = async (nextWorkloadId: string) => {
+  const handleSelectWorkload = async (workloadId: string): Promise<void> => {
     setBusy(true)
     try {
-      const nextContext = await client.loadWorkloadContext(nextWorkloadId)
-      applyContext(nextContext)
-      setStatusMessage(`Loaded ${nextContext.manifest.workloadName} context.`)
+      const cached = contexts.get(workloadId)
+      if (cached) {
+        applyContext(cached)
+        setStatusMessage(`Selected authorized workload ${cached.manifest.workload.displayName}.`)
+      } else {
+        const next = await client.loadWorkloadContext(workloadId)
+        applyContext(next)
+        setStatusMessage(`Loaded authorized workload ${next.manifest.workload.displayName}.`)
+      }
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : `Unable to load workload ${nextWorkloadId}.`)
+      setStatusMessage(errorMessage(error, `Unable to load workload ${workloadId}.`))
     } finally {
       setBusy(false)
     }
   }
 
-  const updateField = <K extends keyof ManifestDraft>(field: K, value: ManifestDraft[K]) => {
-    setDraftForm((current) => {
-      if (!current) {
-        return current
-      }
-      return { ...current, [field]: value }
-    })
-  }
-
-  const updateRelationshipList = (field: 'requiredRelationships' | 'optionalRelationships', value: string) => {
-    setDraftForm((current) => {
-      if (!current) {
-        return current
-      }
-      return {
-        ...current,
-        [field]: value
-          .split(/\r?\n/)
-          .map((item) => item.trim())
-          .filter(Boolean),
-      }
-    })
-  }
-
-  const saveDraft = async () => {
-    if (!draftForm || !workloadContext) {
-      setStatusMessage('No draft content is currently loaded.')
+  const saveDraft = async (): Promise<void> => {
+    if (!workloadContext.draft || workloadContext.draft.state !== 'draft') {
+      setStatusMessage('Only a WC-007 draft in draft state can be edited.')
       return
     }
     setBusy(true)
     try {
-      if (!currentDraft) {
-        const created = await client.createDraft(selectedWorkloadId, draftForm, 'Create draft from the structured manifest editor.')
-        await refreshCurrentWorkload(selectedWorkloadId)
-        setStatusMessage(`Draft ${created.draftId} created. Revision ${created.revision}.`)
-        return
-      }
-
       const updated = await client.updateDraft({
-        draftId: currentDraft.draftId,
-        expectedRevision: currentDraft.revision,
-        expectedManifestVersion: currentDraft.manifest.manifestVersion,
-        expectedDigest: currentDraft.manifestDigest,
+        ...concurrencyRequest(workloadContext, 'Save structured canonical manifest edits for explicit review.'),
         replacementManifest: draftForm,
-        reason: 'Save the manifest with optimistic concurrency checks.',
       })
-      await refreshCurrentWorkload(selectedWorkloadId)
-      setStatusMessage(`Draft ${updated.draftId} saved. Revision ${updated.revision}.`)
+      setReviewedDigest(null)
+      await refreshCurrentWorkload()
+      setStatusMessage(`Draft ${updated.draftId} saved at revision ${updated.revision}.`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Unable to save the draft.')
+      setStatusMessage(errorMessage(error, 'Unable to save the draft.'))
     } finally {
       setBusy(false)
     }
   }
 
-  const createDraftVersion = async () => {
-    if (!workloadContext || !draftForm) {
-      setStatusMessage('No manifest context is currently loaded.')
+  const createSuccessorDraft = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      const created = await client.createSuccessorDraft(
+        selectedWorkloadId,
+        'Create a unique successor from the current unsuperseded published version.',
+      )
+      setReviewedDigest(null)
+      await refreshCurrentWorkload()
+      setStatusMessage(
+        `Successor draft ${created.draftId} created at ${created.manifest.manifestVersion}; previous version ${created.previousVersion}.`,
+      )
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'Unable to create a successor draft.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const validateDraft = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      const validated = await client.validateDraft(
+        concurrencyRequest(workloadContext, 'Validate the exact canonical candidate digest.'),
+      )
+      await refreshCurrentWorkload()
+      setStatusMessage(`WC-007 validated draft ${validated.draftId}.`)
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'Validation failed closed.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submitForReview = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      const submitted = await client.submitForReview(
+        concurrencyRequest(workloadContext, 'Submit the validated candidate for explicit human review.'),
+      )
+      setReviewedDigest(null)
+      await refreshCurrentWorkload()
+      setStatusMessage(`Draft ${submitted.draftId} is awaiting explicit human review.`)
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'Review submission failed closed.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const approveDraft = async (): Promise<void> => {
+    const draft = workloadContext.draft
+    if (!draft || reviewedDigest !== draft.manifestDigest || client.auth.kind !== 'human') {
+      setStatusMessage('A human must explicitly review this exact candidate digest before approval.')
       return
     }
     setBusy(true)
     try {
-      const source = workloadContext.published?.manifest ?? workloadContext.manifest
-      const nextVersion = bumpVersion(source.manifestVersion)
-      const nextManifest: ManifestDraft = {
-        ...source,
-        manifestVersion: nextVersion,
-        manifestDigest: source.manifestDigest ?? source.compatibility?.artifactDigest,
-      }
-      const created = await client.createDraft(selectedWorkloadId, nextManifest, 'Create a new draft version from the active published manifest.')
-      await refreshCurrentWorkload(selectedWorkloadId)
-      setStatusMessage(`Draft version ${created.draftId} created. Revision ${created.revision}.`)
+      const approved = await client.approveDraft(
+        concurrencyRequest(workloadContext, 'Human reviewed and approved the exact candidate digest.'),
+      )
+      await refreshCurrentWorkload()
+      setReviewedDigest(approved.manifestDigest)
+      setStatusMessage(`Server approval ${approved.approval?.decisionId ?? 'record'} is ready for publication review.`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Unable to create a new draft version.')
+      setStatusMessage(errorMessage(error, 'Approval failed closed.'))
     } finally {
       setBusy(false)
     }
   }
 
-  const validateDraft = async () => {
-    if (!currentDraft) {
-      setStatusMessage('Create a draft before validation.')
-      return
-    }
-    setBusy(true)
-    try {
-      const validated = await client.validateDraft({
-        draftId: currentDraft.draftId,
-        expectedRevision: currentDraft.revision,
-        expectedManifestVersion: currentDraft.manifest.manifestVersion,
-        expectedDigest: currentDraft.manifestDigest,
-        reason: 'Validate the structured manifest and confirm the digest matches the current draft.',
-      })
-      await refreshCurrentWorkload(selectedWorkloadId)
-      setStatusMessage(`Validation checks passed for ${validated.draftId}.`)
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Validation failed.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const submitForReview = async () => {
-    if (!currentDraft) {
-      setStatusMessage('Create a draft before review submission.')
-      return
-    }
-    setBusy(true)
-    try {
-      const submitted = await client.submitForReview({
-        draftId: currentDraft.draftId,
-        expectedRevision: currentDraft.revision,
-        expectedManifestVersion: currentDraft.manifest.manifestVersion,
-        expectedDigest: currentDraft.manifestDigest,
-        reason: 'Submit the validated draft for human review.',
-      })
-      await refreshCurrentWorkload(selectedWorkloadId)
-      setStatusMessage(`Review submission accepted. Draft ${submitted.draftId} is in review.`)
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Submission failed.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const approveDraft = async () => {
-    if (!currentDraft) {
-      setStatusMessage('Create a draft before approval.')
-      return
-    }
-    setBusy(true)
-    try {
-      const approved = await client.approveDraft({
-        draftId: currentDraft.draftId,
-        expectedRevision: currentDraft.revision,
-        expectedManifestVersion: currentDraft.manifest.manifestVersion,
-        expectedDigest: currentDraft.manifestDigest,
-        reason: 'Approve the draft for publication using the server-authoritative approval decision.',
-      })
-      await refreshCurrentWorkload(selectedWorkloadId)
-      setStatusMessage(`Approval record ${approved.approval?.decisionId ?? 'created'} is ready for publication.`)
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Approval failed.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const publishDraft = async () => {
-    if (!currentDraft) {
-      setStatusMessage('Create a draft before publication.')
-      return
-    }
-    if (!currentDraft.approval) {
-      setStatusMessage('Publication requires a server-derived approval record.')
+  const publishDraft = async (): Promise<void> => {
+    const draft = workloadContext.draft
+    if (!draft?.approval || reviewedDigest !== draft.manifestDigest || client.auth.kind !== 'human') {
+      setStatusMessage('Publication requires an explicit human review of the exact server-approved candidate.')
       return
     }
     setBusy(true)
     try {
       const published = await client.publishDraft({
-        draftId: currentDraft.draftId,
-        expectedRevision: currentDraft.revision,
-        expectedManifestVersion: currentDraft.manifest.manifestVersion,
-        expectedDigest: currentDraft.manifestDigest,
-        approvalId: currentDraft.approval.decisionId,
-        reason: 'Publish the approved manifest version to the authoritative registry.',
-        workloadId: selectedWorkloadId,
-        manifestId: currentDraft.manifestId,
+        ...concurrencyRequest(workloadContext, 'Publish the explicitly reviewed, server-approved candidate.'),
+        approvalId: draft.approval.decisionId,
       })
-      await refreshCurrentWorkload(selectedWorkloadId)
+      setReviewedDigest(null)
+      await refreshCurrentWorkload()
       setStatusMessage(`Published version ${published.manifestVersion} for ${published.manifestId}.`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Publication failed.')
+      setStatusMessage(errorMessage(error, 'Publication failed closed.'))
     } finally {
       setBusy(false)
     }
   }
 
-  const comparisonRows = useMemo(() => workloadContext?.comparison ?? [], [workloadContext])
+  const currentDraft = workloadContext.draft
+  const selectedProfile = draftForm.profiles[selectedProfileId]
+  const reviewConfirmed = Boolean(currentDraft && reviewedDigest === currentDraft.manifestDigest)
+  const isHuman = client.auth.kind === 'human'
+  const canEdit = currentDraft?.state === 'draft'
+  const canCreateSuccessor = !currentDraft && Boolean(workloadContext.published)
+  const canValidate = currentDraft?.state === 'draft'
+  const canSubmit = currentDraft?.state === 'validated'
+  const canApprove = currentDraft?.state === 'in_review' && reviewConfirmed && isHuman
+  const canPublish = currentDraft?.state === 'approved' && Boolean(currentDraft.approval) && reviewConfirmed && isHuman
+  const catalogue = [...contexts.values()].map((context) => context.catalogueItem)
 
-  if (!workloadContext || !draftForm) {
-    return (
-      <div className="loading-state" aria-live="polite">
-        Loading Athena Context Studio…
-      </div>
-    )
+  const setDisplayName = (displayName: string): void => {
+    setDraftForm((current) => ({
+      ...current,
+      workload: { ...current.workload, displayName },
+    }))
+    setReviewedDigest(null)
+  }
+
+  const setResidualRisk = (riskId: string, statement: string): void => {
+    setDraftForm((current) => {
+      const profile = current.profiles[selectedProfileId]
+      if (!profile) return current
+      return {
+        ...current,
+        profiles: {
+          ...current.profiles,
+          [selectedProfileId]: {
+            ...profile,
+            riskAcceptances: profile.riskAcceptances.map((risk) =>
+              risk.riskAcceptanceId === riskId ? { ...risk, residualRiskStatement: statement } : risk,
+            ),
+          },
+        },
+      }
+    })
+    setReviewedDigest(null)
+  }
+
+  const navigate = (nextRoute: AppRoute): void => {
+    setRoute(nextRoute)
   }
 
   return (
     <div className="studio-shell">
       <header className="topbar" aria-label="Studio header">
         <div>
-          <p className="eyebrow">Authenticated shell</p>
+          <p className="eyebrow">Authenticated, workload-scoped session</p>
           <h1>Athena Context Studio</h1>
         </div>
-
-        <div className="topbar-meta" aria-label="Session metadata">
+        <div className="topbar-meta" aria-label="Session and manifest metadata">
           <span className={`pill state-${currentDraft?.state ?? workloadContext.approvalState}`}>
-            {currentDraft?.state?.toUpperCase() ?? workloadContext.approvalState.toUpperCase()}
+            Approval: {(currentDraft?.state ?? workloadContext.approvalState).replace('_', ' ')}
           </span>
           <span>Authenticated as {workloadContext.auth.userLabel}</span>
           <span>Role: {workloadContext.auth.role}</span>
-          <span>Port: {workloadContext.auth.port}</span>
-          <span>Environment: {workloadContext.environment}</span>
-          <span>Manifest {workloadContext.manifest.manifestVersion}</span>
+          <span>Environment: {displayEnvironment(workloadContext.environment)}</span>
+          <span>Manifest version: {workloadContext.manifestVersion}</span>
+          <span>Evidence source: {workloadContext.evidenceSource}</span>
+          <span>Confidence: {workloadContext.confidence === null ? 'Not provided' : `${Math.round(workloadContext.confidence * 100)}%`}</span>
         </div>
       </header>
 
@@ -297,7 +271,7 @@ function App({ client }: { client: ContextApiClientPort }) {
             key={item}
             type="button"
             className={route === item ? 'nav-button is-selected' : 'nav-button'}
-            onClick={() => setRoute(item)}
+            onClick={() => navigate(item)}
             aria-current={route === item ? 'page' : undefined}
           >
             {item[0].toUpperCase() + item.slice(1)}
@@ -306,26 +280,24 @@ function App({ client }: { client: ContextApiClientPort }) {
       </nav>
 
       <main className="studio-layout">
-        <aside className="panel catalogue-panel" aria-label="Workload catalogue">
+        <aside className="panel catalogue-panel" aria-label="Authorized workload catalogue">
           <div className="panel-heading">
-            <h2>Workload catalogue</h2>
-            <span className="meta-pill">{workloadContext.workloadCatalogue.length} workloads</span>
+            <h2>Authorized workloads</h2>
+            <span className="meta-pill">{catalogue.length} scoped</span>
           </div>
-
           <ul className="catalogue-list">
-            {workloadContext.workloadCatalogue.map((workload) => (
+            {catalogue.map((workload) => (
               <li key={workload.id}>
                 <button
                   type="button"
                   className={workload.id === selectedWorkloadId ? 'catalogue-button is-selected' : 'catalogue-button'}
                   onClick={() => void handleSelectWorkload(workload.id)}
                   aria-pressed={workload.id === selectedWorkloadId}
+                  disabled={busy}
                 >
                   <span className="catalogue-name">{workload.name}</span>
-                  <span className="catalogue-owner">{workload.owner}</span>
-                  <span className="catalogue-meta">
-                    {workload.criticality} • {workload.zoneCount} zones
-                  </span>
+                  <span className="catalogue-owner">Owner: {workload.owner ?? 'Not declared'}</span>
+                  <span className="catalogue-meta">Lifecycle: {workload.status.replace('_', ' ')}</span>
                 </button>
               </li>
             ))}
@@ -335,199 +307,193 @@ function App({ client }: { client: ContextApiClientPort }) {
         <div className="content-stack">
           {route === 'overview' && (
             <>
-              <section className="panel overview-panel" aria-label="Context overview">
+              <section className="panel overview-panel" aria-labelledby="overview-heading">
+                <div className="panel-heading">
+                  <h2 id="overview-heading" tabIndex={-1} ref={routeHeadingRef}>Context overview</h2>
+                </div>
                 <div className="status-grid">
                   <div className="stat-card">
-                    <span className="stat-label">Evidence source</span>
-                    <strong>{workloadContext.evidenceSource}</strong>
+                    <span className="stat-label">Environment</span>
+                    <strong>{displayEnvironment(workloadContext.environment)}</strong>
+                  </div>
+                  <div className="stat-card">
+                    <span className="stat-label">Manifest version</span>
+                    <strong>{workloadContext.manifestVersion}</strong>
+                  </div>
+                  <div className="stat-card">
+                    <span className="stat-label">Approval state</span>
+                    <strong>{workloadContext.approvalState.replace('_', ' ')}</strong>
                   </div>
                   <div className="stat-card">
                     <span className="stat-label">Confidence</span>
-                    <strong>{Math.round(workloadContext.confidence * 100)}%</strong>
-                  </div>
-                  <div className="stat-card">
-                    <span className="stat-label">Environment</span>
-                    <strong>{workloadContext.environment}</strong>
-                  </div>
-                  <div className="stat-card">
-                    <span className="stat-label">Workload</span>
-                    <strong>{workloadContext.manifest.workloadName}</strong>
+                    <strong>{workloadContext.confidence === null ? 'Not provided by WC-007' : `${workloadContext.confidence}`}</strong>
                   </div>
                 </div>
               </section>
 
-              <section className="panel comparison-panel" aria-label="Production and environment comparison">
+              <section className="panel comparison-panel" aria-labelledby="comparison-heading">
                 <div className="panel-heading">
-                  <h2>Production / Development / Training comparison</h2>
+                  <h2 id="comparison-heading">Declared Production / Development / Training comparison</h2>
                 </div>
-
                 <div role="table" aria-label="Production, Development and Training comparison" className="comparison-table">
                   <div className="table-head" role="row">
                     <span role="columnheader">Environment</span>
-                    <span role="columnheader">Topology</span>
-                    <span role="columnheader">Policy</span>
+                    <span role="columnheader">Declared topology</span>
+                    <span role="columnheader">Declared policy</span>
                     <span role="columnheader">Residual risk</span>
                   </div>
-
-                  {comparisonRows.map((row) => (
+                  {workloadContext.comparison.map((row) => (
                     <div className="table-row" role="row" key={row.environment}>
-                      <span role="cell" data-label="Environment">{row.environment}</span>
-                      <span role="cell" data-label="Topology">{row.topology}</span>
-                      <span role="cell" data-label="Policy">{row.policy}</span>
-                      <span role="cell" data-label="Residual risk">{row.residualRisk}</span>
+                      <div role="cell" className="table-cell" aria-label={`Environment: ${displayEnvironment(row.environment)}`}>
+                        <span className="mobile-cell-label" aria-hidden="true">Environment</span>
+                        {displayEnvironment(row.environment)}
+                      </div>
+                      <div role="cell" className="table-cell" aria-label={`Declared topology: ${row.topology}`}>
+                        <span className="mobile-cell-label" aria-hidden="true">Declared topology</span>
+                        {row.topology}
+                      </div>
+                      <div role="cell" className="table-cell" aria-label={`Declared policy: ${row.policy}`}>
+                        <span className="mobile-cell-label" aria-hidden="true">Declared policy</span>
+                        {row.policy}
+                      </div>
+                      <div role="cell" className="table-cell" aria-label={`Residual risk: ${row.residualRisk}`}>
+                        <span className="mobile-cell-label" aria-hidden="true">Residual risk</span>
+                        {row.residualRisk}
+                      </div>
                     </div>
                   ))}
                 </div>
+              </section>
+
+              <section className="panel editor-panel" aria-labelledby="relationship-heading">
+                <div className="panel-heading">
+                  <h2 id="relationship-heading">Declared, observed, inferred and exception relationships</h2>
+                </div>
+                <p className="source-note">Only relationship classes present in the canonical server response are shown; Context Studio does not infer missing relationships.</p>
+                <ul className="relationship-list">
+                  {workloadContext.relationships.map((relationship) => (
+                    <li key={`${relationship.profileId ?? 'root'}-${relationship.id}`} className={`relationship-item kind-${relationship.kind}`}>
+                      <span className="relationship-kind">{relationship.kind}</span>
+                      <strong>{relationship.id}</strong>
+                      <p>{relationship.source} {relationship.relationshipType} {relationship.target}</p>
+                      <small>
+                        Profile: {relationship.profileId ?? 'manifest'} • Owner: {relationship.ownerRef ?? 'not declared'} • Clause: {relationship.clause ?? 'not declared'}
+                      </small>
+                    </li>
+                  ))}
+                </ul>
               </section>
             </>
           )}
 
           {route === 'catalogue' && (
-            <section className="panel catalogue-overview" aria-label="Catalogue summary">
+            <section className="panel catalogue-overview" aria-labelledby="catalogue-heading">
               <div className="panel-heading">
-                <h2>Catalogue summary</h2>
+                <h2 id="catalogue-heading" tabIndex={-1} ref={routeHeadingRef}>Workload catalogue</h2>
               </div>
-
               <dl className="summary-list">
-                <div>
-                  <dt>Selected workload</dt>
-                  <dd>{workloadContext.manifest.workloadName}</dd>
-                </div>
-                <div>
-                  <dt>Criticality</dt>
-                  <dd>{workloadContext.workloadCatalogue.find((item) => item.id === selectedWorkloadId)?.criticality ?? 'Tier-1'}</dd>
-                </div>
-                <div>
-                  <dt>Zone count</dt>
-                  <dd>{workloadContext.workloadCatalogue.find((item) => item.id === selectedWorkloadId)?.zoneCount ?? 2}</dd>
-                </div>
+                <div><dt>Selected workload</dt><dd>{workloadContext.manifest.workload.displayName}</dd></div>
+                <div><dt>Authorized workload ID</dt><dd>{workloadContext.workloadId}</dd></div>
+                <div><dt>Criticality</dt><dd>{workloadContext.catalogueItem.criticality ?? 'Not provided by WC-007'}</dd></div>
+                <div><dt>Zone count</dt><dd>{workloadContext.catalogueItem.zoneCount ?? 'Not provided by WC-007'}</dd></div>
               </dl>
             </section>
           )}
 
-          {(route === 'overview' || route === 'manifest') && (
-            <section className="panel editor-panel" aria-label="Manifest editor section">
+          {route === 'manifest' && (
+            <section className="panel editor-panel" aria-labelledby="manifest-heading">
               <div className="panel-heading">
-                <h2>Manifest editor</h2>
-                <button type="button" className="small-button" onClick={() => void refreshCurrentWorkload()}>
-                  Reload context
+                <h2 id="manifest-heading" tabIndex={-1} ref={routeHeadingRef}>Structured manifest editor</h2>
+                <button type="button" className="small-button" onClick={() => void refreshCurrentWorkload()} disabled={busy}>
+                  Reload scoped context
                 </button>
               </div>
-
-              <form className="manifest-form" aria-label="Manifest editor">
+              <p className="source-note">All unedited canonical sections are retained. Digests are recomputed with RFC 8785 canonical JSON and Web Crypto before a request is sent.</p>
+              <form className="manifest-form" aria-label="Structured manifest editor">
                 <div className="editor-grid">
                   <label htmlFor="workload-name">
-                    Workload name
+                    Workload display name
                     <input
                       id="workload-name"
-                      value={draftForm.workloadName}
-                      onChange={(event) => updateField('workloadName', event.target.value)}
+                      value={draftForm.workload.displayName}
+                      onChange={(event) => setDisplayName(event.target.value)}
+                      disabled={!canEdit || busy}
                     />
                   </label>
-
                   <label htmlFor="manifest-version">
                     Manifest version
-                    <input
-                      id="manifest-version"
-                      value={draftForm.manifestVersion}
-                      onChange={(event) => updateField('manifestVersion', event.target.value)}
-                    />
+                    <input id="manifest-version" value={draftForm.manifestVersion} readOnly />
                   </label>
-
-                  <label htmlFor="business-owner">
-                    Business owner
-                    <input
-                      id="business-owner"
-                      value={draftForm.businessOwner}
-                      onChange={(event) => updateField('businessOwner', event.target.value)}
-                    />
+                  <label htmlFor="profile">
+                    Environment profile
+                    <select id="profile" value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>
+                      {Object.values(draftForm.profiles).map((profile) => (
+                        <option key={profile.profileId} value={profile.profileId}>{displayEnvironment(profile.profileType)}</option>
+                      ))}
+                    </select>
                   </label>
-
-                  <label htmlFor="environment">
-                    Environment
-                    <input
-                      id="environment"
-                      value={draftForm.environment}
-                      onChange={(event) => updateField('environment', event.target.value as ManifestDraft['environment'])}
-                    />
-                  </label>
-
-                  <label htmlFor="runbook" className="row-span-2">
-                    Runbook
-                    <input
-                      id="runbook"
-                      value={draftForm.runbook}
-                      onChange={(event) => updateField('runbook', event.target.value)}
-                    />
+                  <label htmlFor="authority">
+                    Declared authority reference
+                    <input id="authority" value={draftForm.ownership[0]?.authorityRef ?? 'Not declared'} readOnly />
                   </label>
                 </div>
-
-                <div className="editor-grid">
-                  <fieldset>
-                    <legend>Required relationships</legend>
-                    <textarea
-                      aria-label="Required relationships"
-                      value={draftForm.requiredRelationships.join('\\n')}
-                      onChange={(event) => updateRelationshipList('requiredRelationships', event.target.value)}
-                    />
-                  </fieldset>
-
-                  <fieldset>
-                    <legend>Optional relationships</legend>
-                    <textarea
-                      aria-label="Optional relationships"
-                      value={draftForm.optionalRelationships.join('\\n')}
-                      onChange={(event) => updateRelationshipList('optionalRelationships', event.target.value)}
-                    />
-                  </fieldset>
-                </div>
+                <fieldset>
+                  <legend>Declared residual risk — {selectedProfile ? displayEnvironment(selectedProfile.profileType) : selectedProfileId}</legend>
+                  {selectedProfile?.riskAcceptances.map((risk) => (
+                    <label key={risk.riskAcceptanceId} htmlFor={`risk-${risk.riskAcceptanceId}`}>
+                      {risk.riskAcceptanceId}
+                      <textarea
+                        id={`risk-${risk.riskAcceptanceId}`}
+                        value={risk.residualRiskStatement}
+                        onChange={(event) => setResidualRisk(risk.riskAcceptanceId, event.target.value)}
+                        disabled={!canEdit || busy}
+                      />
+                    </label>
+                  ))}
+                  {!selectedProfile?.riskAcceptances.length && <p>No residual-risk acceptance is declared for this profile.</p>}
+                </fieldset>
               </form>
             </section>
           )}
 
           {route === 'controls' && (
-            <section className="panel evidence-panel" aria-label="Controls and provenance section">
+            <section className="panel evidence-panel" aria-labelledby="controls-heading">
               <div className="panel-heading">
-                <h2>Controls and provenance</h2>
+                <h2 id="controls-heading" tabIndex={-1} ref={routeHeadingRef}>Controls and lifecycle provenance</h2>
               </div>
-
               <div className="two-column-grid">
                 <div>
-                  <h3>Controls</h3>
+                  <h3>Declared controls</h3>
                   <ul className="stack-list">
                     {workloadContext.controls.map((control) => (
-                      <li key={control.id} className="stack-item">
-                        <span className="stack-name">{control.name}</span>
-                        <span className="stack-meta">{control.owner}</span>
-                        <p>{control.description}</p>
+                      <li key={`${control.id}-${control.profiles.join('-')}`} className="stack-item">
+                        <span className="stack-name">{control.id}</span>
+                        <span className="stack-meta">Owner: {control.ownerRef} • Health: {control.health}</span>
+                        <p>Runbook: {control.runbookRef ?? 'Not declared'}</p>
                       </li>
                     ))}
                   </ul>
                 </div>
-
                 <div>
-                  <h3>Risk acceptances</h3>
+                  <h3>Declared residual risk</h3>
                   <ul className="stack-list">
-                    {workloadContext.riskAcceptances.map((item) => (
-                      <li key={item.id} className="stack-item">
-                        <span className="stack-name">{item.owner}</span>
-                        <span className="stack-meta">{item.accepted ? 'Accepted' : 'Pending'}</span>
-                        <p>{item.description}</p>
+                    {workloadContext.riskAcceptances.map((risk) => (
+                      <li key={`${risk.id}-${risk.profiles.join('-')}`} className="stack-item">
+                        <span className="stack-name">{risk.id}</span>
+                        <span className="stack-meta">Owner: {risk.ownedBy} • Status: {risk.status}</span>
+                        <p>{risk.residualRiskStatement}</p>
                       </li>
                     ))}
                   </ul>
                 </div>
-
                 <div className="span-two">
-                  <h3>Provenance</h3>
+                  <h3>Lifecycle provenance</h3>
                   <ul className="provenance-list">
                     {workloadContext.provenance.map((item) => (
                       <li key={item.id}>
                         <span className="provenance-source">{item.source}</span>
                         <p>{item.summary}</p>
-                        <small>
-                          {item.clause} • {item.manifestVersion}
-                        </small>
+                        <small>{item.clause} • Manifest {item.manifestVersion} • Confidence {item.confidence ?? 'not provided'}</small>
                       </li>
                     ))}
                   </ul>
@@ -535,79 +501,41 @@ function App({ client }: { client: ContextApiClientPort }) {
               </div>
             </section>
           )}
-
-          {route !== 'manifest' && route !== 'controls' && (
-            <section className="panel editor-panel" aria-label="Context review panel">
-              <div className="panel-heading">
-                <h2>Declared vs observed</h2>
-              </div>
-
-              <ul className="relationship-list">
-                {workloadContext.relationships.map((relationship) => (
-                  <li key={relationship.title} className={`relationship-item kind-${relationship.kind}`}>
-                    <span className="relationship-kind">{relationship.kind}</span>
-                    <strong>{relationship.title}</strong>
-                    <p>{relationship.detail}</p>
-                    <small>{relationship.clause}</small>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
         </div>
 
-        <aside className="panel review-panel" aria-label="Draft review panel">
+        <aside className="panel review-panel" aria-label="Draft review and publication">
           <div className="panel-kicker">Lifecycle state</div>
-          <h2>Draft review</h2>
-          <p>Agent proposals remain drafts until the authenticated server approval record exists.</p>
+          <h2>Explicit human review</h2>
+          <p>Agent proposals remain non-authoritative drafts. WC-007 server approval and an explicit review of the exact digest are both required before publication.</p>
+
+          <label className="review-confirmation">
+            <input
+              type="checkbox"
+              checked={reviewConfirmed}
+              onChange={(event) => setReviewedDigest(event.target.checked ? currentDraft?.manifestDigest ?? null : null)}
+              disabled={!isHuman || !currentDraft || !['in_review', 'approved'].includes(currentDraft.state) || busy}
+            />
+            I reviewed this exact candidate digest for publication.
+          </label>
 
           <div className="action-stack">
-            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={busy || !draftForm}>
-              Save draft
-            </button>
-            <button type="button" className="secondary-action" onClick={() => void createDraftVersion()} disabled={busy || !workloadContext}>
-              Create new version draft
-            </button>
-            <button type="button" className="secondary-action" onClick={() => void validateDraft()} disabled={validateDisabled}>
-              Validate draft
-            </button>
-            <button type="button" className="secondary-action" onClick={() => void submitForReview()} disabled={submitDisabled}>
-              Submit for review
-            </button>
-            <button type="button" className="secondary-action" onClick={() => void approveDraft()} disabled={approveDisabled}>
-              Approve draft
-            </button>
-            <button type="button" className="primary-action" onClick={() => void publishDraft()} disabled={publishDisabled}>
-              Publish
-            </button>
+            <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={busy || !canEdit}>Save structured edits</button>
+            <button type="button" className="secondary-action" onClick={() => void createSuccessorDraft()} disabled={busy || !canCreateSuccessor}>Create successor draft</button>
+            <button type="button" className="secondary-action" onClick={() => void validateDraft()} disabled={busy || !canValidate}>Validate draft</button>
+            <button type="button" className="secondary-action" onClick={() => void submitForReview()} disabled={busy || !canSubmit}>Submit for review</button>
+            <button type="button" className="secondary-action" onClick={() => void approveDraft()} disabled={busy || !canApprove}>Approve reviewed candidate</button>
+            <button type="button" className="primary-action" onClick={() => void publishDraft()} disabled={busy || !canPublish}>Publish reviewed candidate</button>
           </div>
 
-          <div className="status-message" aria-live="polite">
-            {statusMessage}
-          </div>
-
+          <div className="status-message" aria-live="polite">{statusMessage}</div>
           <div className="approval-record">
             <h3>Approval record</h3>
-            <p>{currentDraft?.approval ? currentDraft.approval.decisionId : 'Awaiting server approval decision.'}</p>
+            <p>{currentDraft?.approval?.decisionId ?? 'Awaiting WC-007 approval decision.'}</p>
             <small>
               {currentDraft?.approval
                 ? `${currentDraft.approval.manifestVersion} • ${currentDraft.approval.manifestDigest}`
-                : 'Requires approval before publication.'}
+                : 'No publication authority is inferred by the browser.'}
             </small>
-          </div>
-
-          <div className="declared-panel">
-            <h3>Relationship context</h3>
-            <ul className="relationship-list">
-              {workloadContext.relationships.map((relationship) => (
-                <li key={relationship.title} className={`relationship-item kind-${relationship.kind}`}>
-                  <span className="relationship-kind">{relationship.kind}</span>
-                  <strong>{relationship.title}</strong>
-                  <p>{relationship.detail}</p>
-                  <small>{relationship.clause}</small>
-                </li>
-              ))}
-            </ul>
           </div>
         </aside>
       </main>

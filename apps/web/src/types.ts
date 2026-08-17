@@ -1,4 +1,16 @@
-export type EnvironmentName = 'Production' | 'Development' | 'Training'
+export type JsonScalar = string | number | boolean | null
+export type JsonValue = JsonScalar | JsonObject | JsonValue[]
+export interface JsonObject {
+  [key: string]: JsonValue
+}
+
+export type EnvironmentName =
+  | 'production'
+  | 'development'
+  | 'training'
+  | 'test'
+  | 'disasterRecovery'
+  | 'sandbox'
 export type RelationshipKind = 'declared' | 'observed' | 'inferred' | 'exception'
 export type DraftState = 'draft' | 'validated' | 'in_review' | 'approved' | 'published' | 'superseded'
 export type AppRoute = 'overview' | 'catalogue' | 'manifest' | 'controls'
@@ -10,22 +22,38 @@ export interface Actor {
   kind: ActorKind
 }
 
-export interface AuthState {
+/**
+ * Verified identity metadata returned by the host authentication integration.
+ * Access tokens are deliberately absent and are acquired just-in-time through AuthPort.
+ */
+export interface AuthSession {
   actorId: string
   kind: ActorKind
   role: RoleName
   userLabel: string
   port: string
-  bearerToken: string
+  authorizedWorkloadIds: string[]
+}
+
+export interface AuthPort {
+  acquireSession: () => Promise<AuthSession | null>
+  acquireAccessToken: (session: AuthSession) => Promise<string | null>
+}
+
+export interface ContextStudioRuntime {
+  apiBaseUrl: string
+  authPort: AuthPort
+  fetchImpl?: typeof fetch
+  createId?: () => string
 }
 
 export interface CatalogItem {
   id: string
   name: string
-  owner: string
-  criticality: string
-  zoneCount: number
-  status: string
+  owner: string | null
+  criticality: string | null
+  zoneCount: number | null
+  status: DraftState
 }
 
 export interface ComparisonRow {
@@ -33,29 +61,35 @@ export interface ComparisonRow {
   topology: string
   policy: string
   residualRisk: string
-  confidence: number
+  confidence: number | null
+  relationshipKind: 'declared'
 }
 
 export interface TopologyRelationship {
+  id: string
   kind: RelationshipKind
-  title: string
-  detail: string
-  clause: string
+  relationshipType: string
+  source: string
+  target: string
+  ownerRef: string | null
+  clause: string | null
+  profileId: string | null
 }
 
 export interface ControlRecord {
   id: string
-  name: string
-  owner: string
-  description: string
-  status: 'active' | 'review' | 'accepted'
+  ownerRef: string
+  health: string
+  runbookRef: string | null
+  profiles: string[]
 }
 
 export interface RiskAcceptance {
   id: string
-  description: string
-  owner: string
-  accepted: boolean
+  residualRiskStatement: string
+  ownedBy: string
+  status: string
+  profiles: string[]
 }
 
 export interface EvidenceItem {
@@ -64,33 +98,111 @@ export interface EvidenceItem {
   summary: string
   clause: string
   manifestVersion: string
-  confidence: number
+  confidence: number | null
+}
+
+export interface CapabilityRequirement {
+  capabilityId: string
+  minimumVersion: string
+  requiredFor: 'read' | 'publish' | 'evaluate' | 'render'
 }
 
 export interface CompatibilityMetadata {
   artifactKind: 'workloadManifest'
-  artifactDigest: string
-  semanticDigest: string
   schemaVersion: string
   semanticContractVersion: string
   policyContractVersion: string
   minimumReaderVersion: string
-  requiresCapabilities: string[]
+  requiresCapabilities: CapabilityRequirement[]
+  producedBy: {
+    producerId: string
+    version: string
+  }
+  extensionPolicy: 'rejectUnknownDecisionFields'
+  artifactDigest: string
+  semanticDigest: string
 }
 
-export interface ManifestDraft {
+export interface CanonicalWorkloadIdentity {
+  displayName: string
+  environments: EnvironmentName[]
+  allowedEvidenceScopes: JsonObject[]
+}
+
+export interface CanonicalManifestAudit {
+  publishedBy: string
+  publishedAt: string
+  approvalStatus: 'approved'
+}
+
+export interface CanonicalRelationship {
+  relationshipClass: RelationshipKind
+  relationshipId?: string
+  exceptionId?: string
+  kind: string
+  source: JsonObject
+  target: JsonObject
+  ownerRef?: string
+  sourceClause?: string
+  profiles: string[]
+}
+
+export interface CanonicalControl {
+  controlId: string
+  ownerRef: string
+  health: string
+  runbookRef?: string
+  profiles: string[]
+}
+
+export interface CanonicalRiskAcceptance {
+  riskAcceptanceId: string
+  residualRiskStatement: string
+  ownedBy: string
+  status: string
+  profiles: string[]
+}
+
+export interface CanonicalManifestOwner {
+  ownerRef: string
+  ownerRole: string
+  authorityRef: string
+}
+
+export interface CanonicalManifestProfile {
+  profileId: string
+  profileType: EnvironmentName
+  settings: JsonObject
+  roles: JsonObject[]
+  relationships: CanonicalRelationship[]
+  constraints: JsonObject[]
+  controls: CanonicalControl[]
+  riskAcceptances: CanonicalRiskAcceptance[]
+  objectives: JsonObject[]
+  ownership: CanonicalManifestOwner[]
+  weakeningOverrides: JsonObject[]
+  disabledRefs: JsonObject[]
+}
+
+/**
+ * Exact camelCase WC-001 canonical manifest nested inside the snake_case WC-007 API records.
+ * Every section is retained when an editable field changes.
+ */
+export interface CanonicalWorkloadManifest {
   manifestId: string
   manifestVersion: string
-  workloadName: string
-  environment: EnvironmentName
-  businessOwner: string
-  runbook: string
-  requiredRelationships: string[]
-  optionalRelationships: string[]
-  controls: ControlRecord[]
-  riskAcceptances: RiskAcceptance[]
-  manifestDigest?: string
-  compatibility?: CompatibilityMetadata
+  cloud: string
+  workload: CanonicalWorkloadIdentity
+  profiles: Record<string, CanonicalManifestProfile>
+  roles: JsonObject[]
+  relationships: CanonicalRelationship[]
+  constraints: JsonObject[]
+  controls: CanonicalControl[]
+  riskAcceptances: CanonicalRiskAcceptance[]
+  objectives: JsonObject[]
+  ownership: CanonicalManifestOwner[]
+  compatibility: CompatibilityMetadata
+  audit: CanonicalManifestAudit
 }
 
 export interface ValidationRecord {
@@ -132,7 +244,7 @@ export interface DraftRecord {
   manifestId: string
   state: DraftState
   revision: number
-  manifest: ManifestDraft
+  manifest: CanonicalWorkloadManifest
   manifestDigest: string
   previousVersion: string | null
   createdBy: Actor
@@ -150,7 +262,7 @@ export interface PublishedManifest {
   manifestId: string
   manifestVersion: string
   manifestDigest: string
-  manifest: ManifestDraft
+  manifest: CanonicalWorkloadManifest
   sourceDraftId: string
   sourceDraftRevision: number
   previousVersion: string | null
@@ -162,18 +274,27 @@ export interface PublishedManifest {
   reason: string
 }
 
+export interface Supersession {
+  manifestId: string
+  supersededVersion: string
+  replacementVersion: string
+  supersededBy: Actor
+  supersededAt: string
+  reason: string
+}
+
 export interface WorkloadContext {
   workloadId: string
-  auth: AuthState
+  auth: AuthSession
   environment: EnvironmentName
   evidenceSource: string
-  confidence: number
+  confidence: number | null
   manifestVersion: string
   approvalState: DraftState
-  workloadCatalogue: CatalogItem[]
+  catalogueItem: CatalogItem
   comparison: ComparisonRow[]
   relationships: TopologyRelationship[]
-  manifest: ManifestDraft
+  manifest: CanonicalWorkloadManifest
   controls: ControlRecord[]
   riskAcceptances: RiskAcceptance[]
   provenance: EvidenceItem[]
@@ -182,52 +303,40 @@ export interface WorkloadContext {
   published: PublishedManifest | null
 }
 
-export interface PublishRequest {
+export interface ConcurrencyRequest {
+  workloadId: string
   draftId: string
   expectedRevision: number
   expectedManifestVersion: string
   expectedDigest: string
-  approvalId: string
   reason: string
-  workloadId?: string
-  manifestId?: string
+}
+
+export interface PublishRequest extends ConcurrencyRequest {
+  approvalId: string
 }
 
 export interface ContextApiClientOptions {
   baseUrl: string
-  auth: AuthState
+  authPort: AuthPort
+  session: AuthSession
   fetchImpl?: typeof fetch
+  createId?: () => string
 }
 
 export interface WireActor {
   actor_id: string
-  kind: 'human' | 'agent' | 'service'
+  kind: ActorKind
 }
 
-export interface WireCompatibility {
-  artifact_kind: 'workloadManifest'
-  artifact_digest: string
-  semantic_digest: string
-  schema_version: string
-  semantic_contract_version: string
-  policy_contract_version: string
-  minimum_reader_version: string
-  requires_capabilities: string[]
-}
-
-export interface WireManifest {
-  manifestId: string
-  manifestVersion: string
-  workloadName: string
-  environment: EnvironmentName
-  businessOwner: string
-  runbook: string
-  requiredRelationships: string[]
-  optionalRelationships: string[]
-  controls: ControlRecord[]
-  riskAcceptances: RiskAcceptance[]
-  manifestDigest?: string
-  compatibility?: CompatibilityMetadata
+export interface WireApprovalDecision {
+  decision_id: string
+  approved_by: WireActor
+  approved_at: string
+  approved_revision: number
+  manifest_version: string
+  manifest_digest: string
+  reason: string
 }
 
 export interface WireDraftRecord {
@@ -235,63 +344,47 @@ export interface WireDraftRecord {
   manifest_id: string
   state: DraftState
   revision: number
-  manifest: WireManifest
+  manifest: CanonicalWorkloadManifest
   manifest_digest: string
-  previous_version: string | null
+  previous_version?: string | null
   created_by: WireActor
   created_at: string
   updated_by: WireActor
   updated_at: string
   reason: string
-  validation: {
+  validation?: {
     validated_by: WireActor
     validated_at: string
     validated_revision: number
     manifest_digest: string
-  } | null
-  review: {
+  }
+  review?: {
     submitted_by: WireActor
     submitted_at: string
     submitted_revision: number
     publication_candidate_digest: string
     reason: string
-  } | null
-  publication_candidate: {
+  }
+  publication_candidate?: {
     finalized_by: WireActor
     finalized_at: string
     manifest_version: string
     manifest_digest: string
     semantic_digest: string
     approval_status: 'approved'
-  } | null
-  approval: {
-    decision_id: string
-    approved_by: WireActor
-    approved_at: string
-    approved_revision: number
-    manifest_version: string
-    manifest_digest: string
-    reason: string
-  } | null
+  }
+  approval?: WireApprovalDecision
 }
 
 export interface WirePublishedManifest {
   manifest_id: string
   manifest_version: string
   manifest_digest: string
-  manifest: WireManifest
+  manifest: CanonicalWorkloadManifest
   source_draft_id: string
   source_draft_revision: number
-  previous_version: string | null
-  approval: {
-    decision_id: string
-    approved_by: WireActor
-    approved_at: string
-    approved_revision: number
-    manifest_version: string
-    manifest_digest: string
-    reason: string
-  }
+  previous_version?: string | null
+  approval: WireApprovalDecision
   published_by: WireActor
   published_at: string
   publication_authorized_by: WireActor
@@ -299,47 +392,36 @@ export interface WirePublishedManifest {
   reason: string
 }
 
+export interface WireSupersession {
+  manifest_id: string
+  superseded_version: string
+  replacement_version: string
+  superseded_by: WireActor
+  superseded_at: string
+  reason: string
+}
+
+export interface WirePublishedManifestView {
+  published: WirePublishedManifest
+  supersession?: WireSupersession
+}
+
 export interface ContextApiClientPort {
-  auth: AuthState
-  loadWorkloads: () => Promise<CatalogItem[]>
+  auth: AuthSession
+  loadAuthorizedWorkloads: () => Promise<WorkloadContext[]>
   loadWorkloadContext: (workloadId: string) => Promise<WorkloadContext>
-  loadWorkloadSync: (workloadId: string) => WorkloadContext
-  reloadWorkload: (workloadId: string) => Promise<WorkloadContext>
-  createDraft: (
-    workloadId: string,
-    manifest: ManifestDraft,
-    reason: string,
+  createSuccessorDraft: (workloadId: string, reason: string) => Promise<DraftRecord>
+  updateDraft: (
+    request: ConcurrencyRequest & { replacementManifest: CanonicalWorkloadManifest },
   ) => Promise<DraftRecord>
-  updateDraft: (request: {
-    draftId: string
-    expectedRevision: number
-    expectedManifestVersion: string
-    expectedDigest: string
-    replacementManifest: ManifestDraft
-    reason: string
-  }) => Promise<DraftRecord>
-  validateDraft: (request: {
-    draftId: string
-    expectedRevision: number
-    expectedManifestVersion: string
-    expectedDigest: string
-    reason: string
-  }) => Promise<DraftRecord>
-  submitForReview: (request: {
-    draftId: string
-    expectedRevision: number
-    expectedManifestVersion: string
-    expectedDigest: string
-    reason: string
-  }) => Promise<DraftRecord>
-  approveDraft: (request: {
-    draftId: string
-    expectedRevision: number
-    expectedManifestVersion: string
-    expectedDigest: string
-    reason: string
-  }) => Promise<DraftRecord>
+  validateDraft: (request: ConcurrencyRequest) => Promise<DraftRecord>
+  submitForReview: (request: ConcurrencyRequest) => Promise<DraftRecord>
+  approveDraft: (request: ConcurrencyRequest) => Promise<DraftRecord>
   publishDraft: (request: PublishRequest) => Promise<PublishedManifest>
 }
 
-export type ContextStudioSnapshot = WorkloadContext
+declare global {
+  interface Window {
+    athenaContextStudioRuntime?: ContextStudioRuntime
+  }
+}
