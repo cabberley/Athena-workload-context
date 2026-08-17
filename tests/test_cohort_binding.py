@@ -484,6 +484,45 @@ def test_proposal_boundary_requires_exact_trusted_snapshot_verification() -> Non
         )
 
 
+@pytest.mark.parametrize("mutation", ["selector", "scope"])
+def test_proposal_boundary_rejects_profile_changed_after_resolution(
+    mutation: str,
+) -> None:
+    _, verified = _verified_bundle()
+    profile = _profile().model_copy(deep=True)
+    if mutation == "selector":
+        worker = next(role for role in profile.roles if role.role_id == "worker")
+        worker.selectors[0].prefix = "mutated-worker-"
+    else:
+        scope = profile.allowed_evidence_scopes[0]
+        scope.resource_group_name = "rg-mutated-synthetic"
+
+    with pytest.raises(AthenaValidationError, match="changed after digest validation"):
+        propose_cohorts(profile, verified, as_of=AS_OF)
+
+
+def test_proposal_roles_and_selectors_are_detached_from_approved_profile() -> None:
+    _, verified = _verified_bundle()
+    profile = _profile()
+    original_digest = profile.resolved_profile_digest
+    profile_worker = next(role for role in profile.roles if role.role_id == "worker")
+    profile_selector = profile_worker.selectors[0]
+
+    result = propose_cohorts(profile, verified, as_of=AS_OF)
+    proposal_worker = _worker_proposal(result)
+    proposal_selector = proposal_worker.role.selectors[0]
+
+    assert proposal_worker.role is not profile_worker
+    assert proposal_worker.role.selectors is not profile_worker.selectors
+    assert proposal_selector is not profile_selector
+
+    proposal_selector.prefix = "review-only-worker-"
+    assert proposal_selector.prefix == "review-only-worker-"
+    assert profile_selector.prefix == "athena-worker-"
+    assert profile.resolved_profile_digest == original_digest
+    assert profile.recompute_semantic_digest() == original_digest
+
+
 def test_cross_tenant_same_subscription_and_resource_group_is_out_of_scope() -> None:
     def cross_tenant_scope(payload: dict[str, Any]) -> None:
         payload["workload"]["allowedEvidenceScopes"][0]["tenantId"] = CROSS_TENANT_ID

@@ -49,6 +49,7 @@ from athena_context.contracts.manifest import (
     TagEquals,
     TagPredicateSelector,
     VmssSelector,
+    validate_resolved_manifest_profile,
 )
 from athena_context.contracts.models import (
     EvidenceGapRecord,
@@ -861,6 +862,14 @@ def _proposal_id(
     return "proposal-" + digest.removeprefix("sha256:")[:16]
 
 
+def _detached_role(role: ManifestRole) -> ManifestRole:
+    """Reconstruct proposal intent so review edits cannot alias approved intent."""
+
+    return ManifestRole.model_validate(
+        role.model_dump(mode="python", by_alias=True, exclude_none=False)
+    )
+
+
 def _request_digest(
     profile: ResolvedManifestProfile,
     snapshot: EvidenceSnapshot,
@@ -899,6 +908,7 @@ def propose_cohorts(
         )
     if as_of.utcoffset() != UTC.utcoffset(as_of):
         raise AthenaValidationError("as_of must use UTC")
+    validate_resolved_manifest_profile(profile, as_of=as_of)
     snapshot = require_current_verified_snapshot(verified_snapshot, as_of=as_of)
     roles = sorted(
         (role for role in profile.roles if role.status == "approved"),
@@ -1169,7 +1179,7 @@ def propose_cohorts(
                 CohortProposal(
                     proposalId=_proposal_id(profile, snapshot, role, members, anchor),
                     scope=scope,
-                    role=role,
+                    role=_detached_role(role),
                     members=members,
                     confidence=confidence,
                     confidenceBand=band,
