@@ -34,6 +34,7 @@ from athena_context.contracts import (
     validate_resolved_manifest_profile,
     verified_snapshot_context_verifier,
 )
+from athena_context.contracts.common import normalize_nfc_text
 from athena_context.contracts.manifest import ProofFact
 
 
@@ -156,7 +157,8 @@ def validate_published_context_binding(
         or published.manifest_digest != approval.manifest_digest
         or profile.manifest_id != command.manifest_id
         or profile.manifest_version != published.manifest_version
-        or profile.profile_id.casefold() != command.profile_id
+        or normalize_nfc_text(profile.profile_id).casefold()
+        != command.profile_id
     ):
         raise EvaluationFailedClosedError(
             "resolved published context/profile does not match the approved "

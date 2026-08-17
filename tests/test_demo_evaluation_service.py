@@ -32,8 +32,12 @@ from athena_context.api.errors import (
     EvidenceCollectionRejectedError,
     IdempotencyConflictError,
 )
+from athena_context.api.evaluation_context import (
+    validate_published_context_binding,
+)
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.contracts import (
+    NormalizationCollisionError,
     canonicalize_json,
     compute_artifact_digest,
     resolve_manifest_profile,
@@ -204,18 +208,84 @@ def test_manifest_defined_prod_east_profile_normalizes_and_evaluates() -> None:
     } == EXPECTED_VERDICTS
 
 
+def test_unicode_profile_normalization_succeeds_with_versionless_atomic_commit() -> None:
+    composed = "café-east"
+    decomposed = "cafe\u0301-east"
+    manifest = build_current_synthetic_manifest(
+        as_of=CURRENT_NOW,
+        additional_profile_ids=(composed,),
+    )
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=manifest,
+        profile_id=decomposed,
+    )
+    command = type(harness.command).model_validate(
+        {
+            **harness.command.model_dump(mode="python"),
+            "manifest_version": None,
+            "profile_id": decomposed,
+        }
+    )
+    resolved = harness.context_resolver.resolve(
+        PublishedContextSelection(
+            manifest_id=command.manifest_id,
+            manifest_version=None,
+            profile_id=decomposed,
+        ),
+        as_of=CURRENT_NOW,
+    )
+    decomposed_profile = resolved.profile.model_copy(
+        update={"profile_id": decomposed}
+    )
+    decomposed_context = resolved.model_copy(
+        update={"profile": decomposed_profile}
+    )
+
+    validate_published_context_binding(
+        command,
+        harness.approval,
+        decomposed_context,
+    )
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-unicode-versionless-profile",
+        command,
+    )
+
+    assert command.profile_id == composed
+    assert result.publication.profile_id == composed
+    assert harness.context_resolver.calls == 3
+    assert harness.store.publication_count == 1
+
+
+def test_unicode_profile_normalization_collision_is_rejected() -> None:
+    with pytest.raises(
+        NormalizationCollisionError,
+        match="duplicate normalized",
+    ):
+        build_current_synthetic_manifest(
+            as_of=CURRENT_NOW,
+            additional_profile_ids=(
+                "café-east",
+                "cafe\u0301-east",
+            ),
+        )
+
+
 def test_unknown_normalized_profile_rejects_before_mcp_collection() -> None:
+    unknown_decomposed = "cafe\u0301-unknown"
     harness = build_harness(
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(
             as_of=CURRENT_NOW,
-            add_prod_east=True,
+            additional_profile_ids=("café-east",),
         ),
     )
     changed_approval = type(harness.approval).model_validate(
         {
             **harness.approval.model_dump(mode="python"),
-            "profile_id": "unknown-region",
+            "profile_id": unknown_decomposed,
             "revision": harness.approval.revision + 1,
         }
     )
@@ -223,7 +293,7 @@ def test_unknown_normalized_profile_rejects_before_mcp_collection() -> None:
     command = type(harness.command).model_validate(
         {
             **harness.command.model_dump(mode="python"),
-            "profile_id": "UNKNOWN-REGION",
+            "profile_id": unknown_decomposed,
         }
     )
 
@@ -234,7 +304,7 @@ def test_unknown_normalized_profile_rejects_before_mcp_collection() -> None:
             command,
         )
 
-    assert command.profile_id == "unknown-region"
+    assert command.profile_id == "café-unknown"
     assert harness.transport.calls == 0
     assert harness.store.publication_count == 0
 

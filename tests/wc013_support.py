@@ -601,6 +601,7 @@ def build_current_synthetic_manifest(
     production_extends_development: bool = False,
     manifest_version: str = "2.0.0",
     add_prod_east: bool = False,
+    additional_profile_ids: tuple[str, ...] = (),
 ) -> CanonicalWorkloadManifest:
     """Build a new test version; only WC-007 humans may publish it."""
 
@@ -641,20 +642,27 @@ def build_current_synthetic_manifest(
             acceptance["expiresAt"] = risk_expiry
     if production_extends_development:
         payload["profiles"]["production"]["extends"] = "development"
-    if add_prod_east:
-        prod_east = deepcopy(payload["profiles"]["production"])
+    profile_ids = (
+        (("prod-east",) if add_prod_east else ())
+        + additional_profile_ids
+    )
+    for profile_id in profile_ids:
+        additional_profile = deepcopy(payload["profiles"]["production"])
 
-        def replace_profile_references(value: object) -> None:
+        def replace_profile_references(
+            value: object,
+            custom_profile_id: str = profile_id,
+        ) -> None:
             if isinstance(value, dict):
                 for key, child in value.items():
                     if (
                         key in {"profileId", "extends"}
                         and child == "production"
                     ):
-                        value[key] = "prod-east"
+                        value[key] = custom_profile_id
                     elif key == "profiles" and isinstance(child, list):
                         value[key] = [
-                            "prod-east" if item == "production" else item
+                            custom_profile_id if item == "production" else item
                             for item in child
                         ]
                     else:
@@ -663,8 +671,8 @@ def build_current_synthetic_manifest(
                 for child in value:
                     replace_profile_references(child)
 
-        replace_profile_references(prod_east)
-        payload["profiles"]["prod-east"] = prod_east
+        replace_profile_references(additional_profile)
+        payload["profiles"][profile_id] = additional_profile
     return CanonicalWorkloadManifest.model_validate(
         canonicalize_manifest_payload(payload)
     )
