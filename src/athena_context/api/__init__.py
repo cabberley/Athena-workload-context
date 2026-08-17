@@ -20,6 +20,7 @@ from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    AllWorkloadsGrantScope,
     CreateDraftCommand,
     DraftRecord,
     DraftState,
@@ -31,6 +32,8 @@ from athena_context.api.domain import (
     SupersedeCommand,
     TransitionCommand,
     VerifiedAuthentication,
+    WorkloadGrantScope,
+    WorkloadIdentifier,
 )
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
@@ -39,6 +42,7 @@ from athena_context.api.service import ContextService
 __all__ = [
     "Actor",
     "ActorKind",
+    "AllWorkloadsGrantScope",
     "CallableTrustedEvidenceSnapshotVerifier",
     "CohortDraftBinding",
     "CohortEvidenceBinding",
@@ -65,5 +69,7 @@ __all__ = [
     "StaticTestAuthenticator",
     "TransitionCommand",
     "VerifiedAuthentication",
+    "WorkloadGrantScope",
+    "WorkloadIdentifier",
     "create_app",
 ]

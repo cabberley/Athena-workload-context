@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, cast
 
-from fastapi import Depends, FastAPI, Header, Query, Request, status
+from fastapi import Depends, FastAPI, Header, Path, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from athena_context.api.authorization import (
@@ -38,6 +38,7 @@ from athena_context.api.domain import (
     Supersession,
     TransitionCommand,
     VersionComparison,
+    WorkloadIdentifier,
 )
 from athena_context.api.errors import (
     AuthenticationError,
@@ -62,6 +63,8 @@ IdempotencyHeader = Annotated[
     Header(alias="Idempotency-Key", min_length=1, max_length=128, pattern=_ID_PATTERN),
 ]
 VersionQuery = Annotated[str, Query(pattern=_VERSION_PATTERN)]
+WorkloadQuery = Annotated[WorkloadIdentifier, Query()]
+WorkloadPath = Annotated[WorkloadIdentifier, Path()]
 
 
 class ErrorDetail(ApiModel):
@@ -169,7 +172,7 @@ def create_app(
     )
     def get_cohort_proposals(
         actor: ActorDependency,
-        manifest_id: Annotated[str, Query(min_length=1, max_length=128)],
+        manifest_id: WorkloadQuery,
         manifest_version: Annotated[str, Query(pattern=_VERSION_PATTERN)],
         profile_id: Annotated[str, Query(pattern=_ID_PATTERN)],
         draft_id: Annotated[str, Query(pattern=_ID_PATTERN)],
@@ -246,7 +249,7 @@ def create_app(
     )
     def list_drafts(
         actor: ActorDependency,
-        manifest_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        manifest_id: Annotated[WorkloadIdentifier | None, Query()] = None,
         draft_state: Annotated[DraftState | None, Query(alias="state")] = None,
     ) -> list[DraftRecord]:
         return service.list_drafts(actor, manifest_id=manifest_id, state=draft_state)
@@ -323,7 +326,7 @@ def create_app(
         response_model_exclude_none=True,
     )
     def get_published(
-        manifest_id: str,
+        manifest_id: WorkloadPath,
         manifest_version: str,
         actor: ActorDependency,
     ) -> PublishedManifestView:
@@ -339,7 +342,7 @@ def create_app(
         response_model_exclude_none=True,
     )
     def list_published(
-        manifest_id: str,
+        manifest_id: WorkloadPath,
         actor: ActorDependency,
     ) -> list[PublishedManifestView]:
         return service.list_published(actor, manifest_id)
@@ -352,7 +355,7 @@ def create_app(
     def resolve_published(
         manifest_version: str,
         actor: ActorDependency,
-        manifest_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        manifest_id: Annotated[WorkloadIdentifier | None, Query()] = None,
     ) -> PublishedManifestView:
         return service.get_published(
             actor,
@@ -365,7 +368,7 @@ def create_app(
         response_model=Supersession,
     )
     def supersede_version(
-        manifest_id: str,
+        manifest_id: WorkloadPath,
         manifest_version: str,
         command: SupersedeCommand,
         idempotency_key: IdempotencyHeader,
@@ -384,7 +387,7 @@ def create_app(
         response_model=VersionComparison,
     )
     def compare_versions(
-        manifest_id: str,
+        manifest_id: WorkloadPath,
         from_version: VersionQuery,
         to_version: VersionQuery,
         actor: ActorDependency,
@@ -396,7 +399,7 @@ def create_app(
         response_model=list[AuditEvent],
     )
     def audit_history(
-        manifest_id: str,
+        manifest_id: WorkloadPath,
         actor: ActorDependency,
     ) -> list[AuditEvent]:
         return service.audit_history(actor, manifest_id)

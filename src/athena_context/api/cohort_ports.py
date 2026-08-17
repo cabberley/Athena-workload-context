@@ -10,7 +10,7 @@ from athena_context.api.cohort_domain import (
     CohortProposalBatchResponse,
     StoredEvidenceSnapshot,
 )
-from athena_context.api.domain import Actor, Permission
+from athena_context.api.domain import Actor, Permission, WorkloadIdentifier
 from athena_context.contracts.models import EvidenceSnapshot
 
 
@@ -19,7 +19,7 @@ class ExplicitWorkloadAuthorizationPort(Protocol):
         self,
         actor: Actor,
         permission: Permission,
-        manifest_id: str,
+        manifest_id: WorkloadIdentifier,
     ) -> None: ...
 
 

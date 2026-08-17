@@ -30,12 +30,14 @@ from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    AllWorkloadsGrantScope,
     AuthenticationMethod,
     CreateDraftCommand,
     ReplaceDraftCommand,
     Role,
     RoleGrant,
     VerifiedAuthentication,
+    WorkloadGrantScope,
 )
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
@@ -155,14 +157,18 @@ def _build_harness(
         RoleGrant(
             actor_id=HUMAN.actor_id,
             role=Role.PROPOSER,
-            manifest_id=selected_manifest.manifest_id,
+            scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
         ),
         RoleGrant(
             actor_id=AGENT.actor_id,
             role=Role.READER,
-            manifest_id=selected_manifest.manifest_id,
+            scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
         ),
-        RoleGrant(actor_id=WILDCARD.actor_id, role=Role.READER),
+        RoleGrant(
+            actor_id=WILDCARD.actor_id,
+            role=Role.READER,
+            scope=AllWorkloadsGrantScope(),
+        ),
     ]
     authorization = RoleBasedAuthorization(grants)
     store = InMemoryContextStore()
@@ -336,6 +342,8 @@ def test_routes_return_exact_wc012_batch_wire_model_and_source_bindings() -> Non
 def test_verified_human_requires_explicit_workload_grant_without_wildcard() -> None:
     harness = _build_harness()
     path = "/v1/cohort-proposals"
+    batch = _load(harness)
+    preview_body = _preview_body(harness, batch)
 
     unauthenticated = harness.client.get(path, params=_params(harness))
     outsider = harness.client.get(
@@ -353,15 +361,50 @@ def test_verified_human_requires_explicit_workload_grant_without_wildcard() -> N
         params=_params(harness),
         headers=_headers(AGENT),
     )
+    wildcard_preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(
+            WILDCARD,
+            idempotency_key="wc-031-wildcard-preview-denied",
+        ),
+    )
+    explicit_preview = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json=preview_body,
+        headers=_headers(idempotency_key="wc-031-explicit-preview-allowed"),
+    )
 
     assert unauthenticated.status_code == 401
     assert outsider.status_code == 403
     assert wildcard.status_code == 403
     assert agent.status_code == 403
+    assert wildcard_preview.status_code == 403
+    assert explicit_preview.status_code == 200
     assert all(
         response.json()["error"]["code"] == "authorization_denied"
-        for response in (outsider, wildcard, agent)
+        for response in (outsider, wildcard, agent, wildcard_preview)
     )
+
+
+def test_reserved_wildcard_is_rejected_by_both_cohort_endpoint_models() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    get_response = harness.client.get(
+        "/v1/cohort-proposals",
+        params={**_params(harness), "manifest_id": "*"},
+        headers=_headers(),
+    )
+    preview_response = harness.client.post(
+        "/v1/cohort-proposals/preview",
+        json={**_preview_body(harness, batch), "manifest_id": "*"},
+        headers=_headers(idempotency_key="wc-031-reserved-wildcard"),
+    )
+
+    assert get_response.status_code == 422
+    assert preview_response.status_code == 422
+    assert get_response.json()["detail"][0]["loc"][-1] == "manifest_id"
+    assert preview_response.json()["detail"][0]["loc"][-1] == "manifest_id"
 
 
 @pytest.mark.parametrize(

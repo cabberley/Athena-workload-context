@@ -5,10 +5,13 @@ from collections.abc import Iterable, Mapping
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    AllWorkloadsGrantScope,
     Permission,
     Role,
     RoleGrant,
     VerifiedAuthentication,
+    WorkloadGrantScope,
+    ensure_concrete_workload_id,
 )
 from athena_context.api.errors import AuthenticationError, AuthorizationError
 
@@ -71,13 +74,30 @@ class RoleBasedAuthorization:
     def __init__(self, grants: Iterable[RoleGrant] = ()) -> None:
         self._grants = tuple(grants)
 
-    def require(self, actor: Actor, permission: Permission, manifest_id: str) -> None:
+    def require(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str | None,
+    ) -> None:
         if permission in _HUMAN_ONLY and actor.kind is not ActorKind.HUMAN:
             raise AuthorizationError(f"{permission.value} requires a human actor")
+        if manifest_id is not None:
+            try:
+                ensure_concrete_workload_id(manifest_id)
+            except ValueError as exc:
+                raise AuthorizationError("'*' is not a workload identifier") from exc
         authorized = any(
             grant.actor_id == actor.actor_id
             and permission in _ROLE_PERMISSIONS[grant.role]
-            and grant.manifest_id in {"*", manifest_id}
+            and (
+                isinstance(grant.scope, AllWorkloadsGrantScope)
+                or (
+                    manifest_id is not None
+                    and isinstance(grant.scope, WorkloadGrantScope)
+                    and grant.scope.workload_id == manifest_id
+                )
+            )
             for grant in self._grants
         )
         if not authorized:
@@ -95,10 +115,15 @@ class RoleBasedAuthorization:
 
         if permission in _HUMAN_ONLY and actor.kind is not ActorKind.HUMAN:
             raise AuthorizationError(f"{permission.value} requires a human actor")
+        try:
+            ensure_concrete_workload_id(manifest_id)
+        except ValueError as exc:
+            raise AuthorizationError("'*' is not a workload identifier") from exc
         authorized = any(
             grant.actor_id == actor.actor_id
             and permission in _ROLE_PERMISSIONS[grant.role]
-            and grant.manifest_id == manifest_id
+            and isinstance(grant.scope, WorkloadGrantScope)
+            and grant.scope.workload_id == manifest_id
             for grant in self._grants
         )
         if not authorized:

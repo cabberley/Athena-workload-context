@@ -28,3 +28,7 @@ Both routes require a verified human identity and a concrete workload grant; wil
 not cross this boundary. Deployments must inject the snapshot repository, cryptographic verifier,
 immutable proposal cache, and actor-scoped idempotency receipt ports. The default composition
 contains no evidence and grants no access.
+
+The literal `*` is reserved and is never a valid manifest or workload identifier at an HTTP or
+command boundary. Cross-workload WC-007 access uses the typed `AllWorkloadsGrantScope`; cohort
+routes require an exact `WorkloadGrantScope`.

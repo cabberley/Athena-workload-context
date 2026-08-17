@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
-from athena_context.api.domain import ApiModel
+from athena_context.api.domain import ApiModel, WorkloadIdentifier
 from athena_context.binding.domain import (
     CohortProposalBatch,
     ProposalScope,
@@ -41,7 +41,7 @@ class CohortDraftBinding(ApiModel):
 
 
 class CohortProposalQuery(ApiModel):
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     draft_id: str = Field(pattern=_ID_PATTERN)
@@ -50,7 +50,7 @@ class CohortProposalQuery(ApiModel):
 
 
 class CohortEvidenceBinding(ApiModel):
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     profile_type: ProfileType
@@ -76,7 +76,7 @@ class CohortProposalBatchResponse(CohortProposalBatch):
 
 class CohortReviewPreviewRequest(ApiModel):
     action: CohortPreviewAction
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     draft_id: str = Field(pattern=_ID_PATTERN)
