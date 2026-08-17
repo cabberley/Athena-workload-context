@@ -21,10 +21,12 @@ from athena_context.api import (
     EnvironmentWc008DeploymentConfigurationPort,
     McpReadAssignment,
     OperatorTrustedWc008ConfigurationPort,
+    PrivateMcpEvidenceTransport,
     PublishedContextSelection,
     Role,
     RoleGrant,
     Wc008DeploymentOutputAssertion,
+    Wc009EvidenceClientAdapter,
 )
 from athena_context.api.domain import Permission, Supersession
 from athena_context.api.errors import (
@@ -40,19 +42,20 @@ from athena_context.api.evaluation_context import (
 )
 from athena_context.api.evaluation_ports import (
     EvaluationCommitAuthorityCondition,
-    EvaluationCommitCandidate,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     SnapshotSigningRequest,
-    build_evaluation_evidence_binding_digest,
 )
 from athena_context.contracts import (
     EvidenceSnapshot,
     NormalizationCollisionError,
+    SubscriptionScope,
     canonicalize_json,
     compute_artifact_digest,
     resolve_manifest_profile,
 )
+from athena_context.evidence import EvidenceCollectionCommand
+from athena_context.fixtures import CANONICAL_PRIVATE_KEY
 from wc013_support import (
     APPROVER,
     CONTEXT_OBJECT_ID,
@@ -64,11 +67,17 @@ from wc013_support import (
     PUBLICATION_SERVICE,
     PUBLISHER,
     DemoHarness,
+    DeterministicIngestionSigner,
+    ReplayGuard,
+    ScenarioTransport,
     build_current_synthetic_manifest,
     build_harness,
     deployment_assertion,
+    key_anchor,
+    key_resolver,
     operator_approval,
     scope,
+    trust_configuration,
     verified_deployment_configuration,
 )
 
@@ -111,6 +120,9 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     ]
     assert harness.snapshot_signer.calls == 1
     assert harness.store.publication_count == 1
+    receipt = harness.store.load_receipt(PUBLISHER.actor_id, "wc013-success")
+    assert receipt is not None
+    assert receipt.candidate_digest.startswith("sha256:")
     assert result.publication.snapshot_id == result.snapshot.snapshot_id
     assert result.publication.approval_decision_id == harness.approval.decision_id
     assert result.publication.approved_by == harness.approval.approved_by
@@ -802,18 +814,15 @@ def test_context_reader_revocation_during_final_policy_work_rolls_back() -> None
     )
     idempotency_key = "wc013-context-reader-revocation-during-policy"
     context_service = harness.context_resolver.service
-    _, _, authority = context_service.prepare_demo_evaluation_authority(
-        reader_actor=context_reader,
-        actor=PUBLISHER,
-        command=harness.command,
-        as_of=harness.clock.now(),
-        private_mcp_endpoint=PRIVATE_ENDPOINT,
-        evidence_identity_object_id=MCP_OBJECT_ID,
+    reader_authorization = harness.authorization.authorize(
+        context_reader,
+        Permission.READ,
+        harness.command.manifest_id,
     )
-    assert authority.context_reader_authorization.actor_id == (
+    assert reader_authorization.actor_id == (
         context_reader.actor_id
     )
-    assert authority.context_reader_authorization.permission is Permission.READ
+    assert reader_authorization.permission is Permission.READ
     original_evaluation = (
         context_service._evaluate_demo_snapshot_for_publication
     )
@@ -1127,21 +1136,9 @@ def test_persistence_reverifies_signature_after_service_preparation() -> None:
                     prepared,
                     snapshot=invalid_snapshot,
                 )
-                invalid_condition = replace(
-                    condition,
-                    evidence_binding_digest=(
-                        build_evaluation_evidence_binding_digest(
-                            invalid_snapshot,
-                            envelope_attempt_id=(
-                                invalid_prepared.envelope_attempt_id
-                            ),
-                            envelope=invalid_prepared.envelope,
-                        )
-                    ),
-                )
                 return original_insert(
                     transaction_capability,
-                    invalid_condition,
+                    condition,
                     lambda _: invalid_prepared,
                 )
 
@@ -1463,15 +1460,6 @@ def test_lying_commit_adapter_cannot_be_injected_into_evaluation_service() -> No
         def load_receipt(self, actor_id: str, key: str) -> object | None:
             return foreign.store.load_receipt(actor_id, key)
 
-        def commit(
-            self,
-            candidate: EvaluationCommitCandidate,
-        ) -> object:
-            return foreign.context_resolver.service.commit_demo_evaluation(
-                reader_actor=PUBLISHER,
-                candidate=candidate,
-            )
-
         def resolve_result(self, snapshot_id: str) -> object | None:
             return foreign.store.resolve_result(snapshot_id)
 
@@ -1485,6 +1473,10 @@ def test_lying_commit_adapter_cannot_be_injected_into_evaluation_service() -> No
             clock=actual.clock,
             evaluation_commit=LyingCommitAdapter(),
         )
+    assert not hasattr(
+        actual.context_resolver.service,
+        "commit_demo_evaluation",
+    )
 
     actual.commit_hook.before_commit = lambda: actual.approval_registry.revoke(
         actual.approval.decision_id,
@@ -1815,6 +1807,253 @@ def test_scope_and_approval_mismatch_fail_before_mcp_collection() -> None:
 
     assert harness.transport.calls == 0
     assert harness.store.publication_count == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["snapshotId", "attemptId", "scope", "bounds", "all"],
+)
+def test_cryptographically_valid_foreign_snapshot_binding_fails_in_owned_uow(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    """A valid signature cannot authorize a different scope/attempt/ID/bounds."""
+
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    subscription_scope = SubscriptionScope(
+        scopeType="subscription",
+        tenantId=harness.command.authorized_scope.tenant_id,
+        subscriptionId=harness.command.authorized_scope.subscription_id,
+    )
+    foreign_scope = (
+        subscription_scope
+        if mismatch in {"scope", "all"}
+        else harness.command.authorized_scope
+    )
+    foreign_bounds = (
+        harness.command.bounds.model_copy(
+            update={"freshness_seconds": 240}
+        )
+        if mismatch in {"bounds", "all"}
+        else harness.command.bounds
+    )
+    foreign_attempt_id = (
+        "attempt-bbbbbbbbbbbb"
+        if mismatch in {"attemptId", "all"}
+        else harness.command.attempt_id
+    )
+    foreign_collected = harness.dependencies.evidence_client.collect(
+        EvidenceCollectionCommand(
+            attemptId=foreign_attempt_id,
+            evidenceScope=foreign_scope,
+            authorizedScopes=(foreign_scope,),
+            bounds=foreign_bounds,
+        )
+    )
+    harness.service._collect = (  # type: ignore[method-assign]
+        lambda _command: foreign_collected
+    )
+
+    from athena_context.api import evaluation_service as service_module
+
+    original_prepare = service_module.prepare_snapshot_signing_material
+
+    def prepare_foreign_snapshot(*args: object, **kwargs: object) -> object:
+        if mismatch in {"snapshotId", "all"}:
+            kwargs["snapshot_id"] = "snap-bbbbbbbbbbbb"
+        return original_prepare(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        service_module,
+        "prepare_snapshot_signing_material",
+        prepare_foreign_snapshot,
+    )
+    # Even a compromised/non-authoritative preflight cannot bypass the owned
+    # transaction's independent collection binding and cryptographic checks.
+    monkeypatch.setattr(
+        service_module,
+        "evaluate_manifest_profile",
+        lambda *args, **kwargs: {},
+    )
+    idempotency_key = f"wc013-valid-foreign-snapshot-{mismatch}"
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="approved snapshot ID, attempt, scope, or collection bounds",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_cryptographically_valid_foreign_evidence_identity_fails_in_owned_uow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    foreign_object_id = "55555555-5555-5555-5555-555555555555"
+    foreign_client_id = "66666666-6666-6666-6666-666666666666"
+    foreign_assertion = Wc008DeploymentOutputAssertion.model_validate(
+        _changed_assertion_payload(
+            evidence_identity_object_id=foreign_object_id,
+            evidence_identity_resource_id=(
+                f"/subscriptions/{harness.command.authorized_scope.subscription_id}/"
+                "resourceGroups/rg-athena-fixture/providers/"
+                "Microsoft.ManagedIdentity/userAssignedIdentities/foreign-mcp"
+            ),
+        )
+    )
+    foreign_configuration = OperatorTrustedWc008ConfigurationPort(
+        assertion=foreign_assertion,
+        pinned_assertion_digest=foreign_assertion.assertion_digest,
+        operator_approval=operator_approval(foreign_assertion),
+    ).load_verified()
+    foreign_trust = trust_configuration().model_copy(
+        update={
+            "managed_identity_object_id": foreign_object_id,
+            "managed_identity_client_id": foreign_client_id,
+        }
+    )
+    private_key = CANONICAL_PRIVATE_KEY
+    anchor = key_anchor(private_key.public_key())
+    foreign_client = Wc009EvidenceClientAdapter(
+        transport=PrivateMcpEvidenceTransport(
+            deployment_configuration=foreign_configuration,
+            invoker=ScenarioTransport(),
+        ),
+        signer=DeterministicIngestionSigner(private_key),
+        replay_guard=ReplayGuard(),
+        clock=harness.clock,
+        trust_configuration=foreign_trust,
+        key_resolver=key_resolver(private_key.public_key()),
+        trusted_key_anchor=anchor,
+    )
+    foreign_collected = foreign_client.collect(
+        EvidenceCollectionCommand(
+            attemptId=harness.command.attempt_id,
+            evidenceScope=harness.command.authorized_scope,
+            authorizedScopes=(harness.command.authorized_scope,),
+            bounds=harness.command.bounds,
+        )
+    )
+    harness.service._collect = (  # type: ignore[method-assign]
+        lambda _command: foreign_collected
+    )
+    from athena_context.api import evaluation_service as service_module
+
+    monkeypatch.setattr(
+        service_module,
+        "evaluate_manifest_profile",
+        lambda *args, **kwargs: {},
+    )
+    idempotency_key = "wc013-valid-foreign-evidence-identity"
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="evidence identity or resource authority",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_public_commit_candidate_fabrication_has_no_authoritative_surface() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    from athena_context.api import evaluation_ports as ports_module
+
+    context_service = harness.context_resolver.service
+    assert not hasattr(context_service, "commit_demo_evaluation")
+    assert not hasattr(ports_module, "EvaluationCommitCandidate")
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="fabricated or not service-issued",
+    ):
+        context_service._commit_prepared_demo_evaluation(
+            prepared_request=object(),  # type: ignore[arg-type]
+            snapshot=object(),  # type: ignore[arg-type]
+            collected=object(),  # type: ignore[arg-type]
+        )
+
+    assert harness.store.publication_count == 0
+
+
+def test_fabricated_reader_assignment_revision_fails_in_persistence() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def replace_reader_revision(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                forged_authority = replace(
+                    condition.collection_authority,
+                    reader_assignment_revision="sha256:" + ("0" * 64),
+                    authority_digest="sha256:" + ("1" * 64),
+                )
+                return original_insert(
+                    capability,
+                    replace(
+                        condition,
+                        collection_authority=forged_authority,
+                    ),
+                    artifact_preparation,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                replace_reader_revision
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = "wc013-forged-reader-assignment-revision"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="canonical validation",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
 def test_mcp_service_identity_cannot_publish_even_with_accidental_role_grant() -> None:

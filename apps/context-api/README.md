@@ -47,9 +47,15 @@ The integration composes the merged components without introducing direct Azure 
 - WC-007 profile IDs are bounded NFC+casefold-normalized strings rather than a closed environment
   enum. The selected ID must resolve in the published manifest; manifest-defined IDs such as
   `prod-east` use the same canonical inheritance and governance checks.
-- `ContextService.commit_demo_evaluation` owns the final conditional transaction. It opens the
-  actual configured persistence transaction and creates a narrow transaction-scoped unit of work
-  from that exact transaction. It reads the active unsuperseded WC-007 context revision/ETag,
+- `ContextService` exposes no public evaluation commit or caller-constructible commit candidate.
+  During app-owned composition it pins the exact operator-trusted WC-008 configuration and
+  collector trust into the same persistence backend that owns publication. For each request it
+  issues a private, single-use orchestration handle whose immutable actor, command, idempotency
+  input, collection authority, and pre-collection authority token remain in a service-private
+  registry. Fabricated, reused, or foreign handles fail before a transaction is opened.
+  The service-owned final operation opens the actual configured persistence transaction and
+  creates a narrow transaction-scoped unit of work from that exact transaction. It reads the
+  active unsuperseded WC-007 context revision/ETag,
   approval revision/status/expiry, publisher grant revision, and context-reader identity/grant
   revision, canonically resolves the complete profile inheritance chain, and compares typed
   authority tokens captured before collection. Both publisher and reader authorization are read
@@ -67,8 +73,17 @@ The integration composes the merged components without introducing direct Azure 
   and all associated revisions and digests from the transaction's current local state. No
   overridable hook receives the active unit of work. A mutation staged through that same unit of
   work during preparation therefore aborts and rolls back with the artifact and receipt.
-  Persistence independently reverifies the exact RSA snapshot/envelope proof against the
-  transaction-owned key and recomputes WC-004 findings rather than trusting a prepared artifact.
+  Persistence independently reconstructs its WC-008 Reader authority from its own pinned
+  configuration. It requires the signed snapshot ID, sole collector attempt ID, exact authorized
+  scope, bounded transport request, request digest, freshness/timeout/size/count limits, source
+  envelope, collector identity claims, evidence identity resource, and Reader assignment revision
+  to match the service-issued command exactly. A valid signature from another snapshot, attempt,
+  scope, identity, assignment revision, or collection bound has no publication authority.
+  Persistence computes the idempotency request digest and complete candidate digest itself from
+  transaction-resolved authority and normalized evidence; neither digest is accepted from a
+  caller or prepared artifact. It then independently reverifies the exact RSA snapshot/envelope
+  proof against the transaction-owned key and recomputes WC-004 findings rather than trusting a
+  prepared artifact.
   Before obtaining its authoritative insertion timestamp it removes caller model subclasses,
   canonicalizes the snapshot/scope/envelope, constructs every digest, validates and round-trips
   the publication/result schemas, and packages base-model-only immutable storage material.

@@ -40,19 +40,25 @@ from athena_context.api.evaluation_domain import (
     AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
     DemoEvaluationResult,
+    VerifiedWc008DeploymentConfiguration,
     build_authorized_publication,
     build_demo_evaluation_result,
 )
 from athena_context.api.evaluation_ports import (
     EvaluationArtifactPreparation,
+    EvaluationCollectionAuthority,
     EvaluationCommitAuthorityCondition,
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     StoredEvaluation,
     StoredEvaluationMaterial,
+    build_demo_evaluation_candidate_digest,
+    build_demo_evaluation_request_digest,
+    build_evaluation_collection_authority,
     build_evaluation_evidence_binding_digest,
 )
 from athena_context.api.evaluation_verification import (
+    validate_evaluation_collection_binding,
     verify_and_evaluate_snapshot_for_publication,
 )
 from athena_context.api.ports import ClockPort, ContextTransactionPort
@@ -64,7 +70,11 @@ from athena_context.contracts import (
     ManifestFinding,
     TrustedKeyAnchor,
 )
-from athena_context.evidence import ValidatedEnvelope
+from athena_context.evidence import (
+    CollectorTrustConfiguration,
+    EvidenceTransportRequest,
+    ValidatedEnvelope,
+)
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -75,6 +85,10 @@ def _version_key(version: str) -> tuple[int, int, int]:
 def _finalize_prepared_evaluation(
     prepared: PreparedEvaluationArtifact,
     *,
+    actor: Actor,
+    idempotency_key: str,
+    request_digest: str,
+    candidate_digest: str,
     published_at: datetime,
     trusted_key: EvaluationTrustedKeyAuthority,
     material: StoredEvaluationMaterial,
@@ -169,13 +183,14 @@ def _finalize_prepared_evaluation(
         )
 
     return StoredEvaluation(
-        actor_id=prepared.actor.actor_id,
-        idempotency_key=prepared.idempotency_key,
-        request_digest=prepared.request_digest,
+        actor_id=actor.actor_id,
+        idempotency_key=idempotency_key,
+        request_digest=request_digest,
+        candidate_digest=candidate_digest,
         snapshot_id=snapshot.snapshot_id,
         published_at=published_at,
         material=material,
-        envelope_attempt_id=prepared.envelope_attempt_id,
+        envelope_attempt_id=prepared.collection_request.attempt_id,
         envelope=prepared.envelope,
     )
 
@@ -197,6 +212,7 @@ _EVIDENCE_SCOPE_ADAPTER: TypeAdapter[EvidenceScope] = TypeAdapter(
 
 def _normalize_evaluation_preparation(
     prepared: PreparedEvaluationArtifact,
+    condition: EvaluationCommitAuthorityCondition,
 ) -> _NormalizedEvaluationPreparation:
     """Remove caller subclasses and exercise every untrusted serialization path."""
 
@@ -206,15 +222,15 @@ def _normalize_evaluation_preparation(
     snapshot = EvidenceSnapshot.model_validate_json(supplied_snapshot_json)
     snapshot_json = snapshot.canonical_json()
     actor = Actor.model_validate_json(
-        prepared.actor.model_dump_json(by_alias=True)
+        condition.actor.model_dump_json(by_alias=True)
     )
     publication_actor = Actor.model_validate_json(
-        prepared.publication_actor.model_dump_json(by_alias=True)
+        condition.publication_actor.model_dump_json(by_alias=True)
     )
     approval = DemoEvaluationApproval.model_validate_json(
         prepared.approval.model_dump_json(by_alias=True)
     )
-    authorized_scope_json = prepared.authorized_scope.canonical_json()
+    authorized_scope_json = condition.command.authorized_scope.canonical_json()
     authorized_scope = _EVIDENCE_SCOPE_ADAPTER.validate_json(
         authorized_scope_json
     )
@@ -229,26 +245,22 @@ def _normalize_evaluation_preparation(
         digest=prepared.envelope.digest,
         payload=prepared.envelope.payload(),
     )
+    collection_request = EvidenceTransportRequest.model_validate_json(
+        prepared.collection_request.model_dump_json(by_alias=True)
+    )
+    assertion = condition.collection_authority.deployment_configuration.assertion
     normalized = PreparedEvaluationArtifact(
-        actor=actor,
-        publication_actor=publication_actor,
-        idempotency_key=str(prepared.idempotency_key),
-        request_digest=str(prepared.request_digest),
         snapshot=snapshot,
         approval=approval,
         resolved_profile_digest=str(prepared.resolved_profile_digest),
-        private_mcp_endpoint=str(prepared.private_mcp_endpoint),
-        authorized_scope=authorized_scope,
-        reason=str(prepared.reason),
         findings=findings,
-        envelope_attempt_id=str(prepared.envelope_attempt_id),
+        collection_request=collection_request,
         envelope=envelope,
-        authority=prepared.authority.model_copy(deep=True),
         temporal_validity=prepared.temporal_validity,
     )
     evidence_binding_digest = build_evaluation_evidence_binding_digest(
         normalized.snapshot,
-        envelope_attempt_id=normalized.envelope_attempt_id,
+        collection_request=normalized.collection_request,
         envelope=normalized.envelope,
     )
 
@@ -263,9 +275,9 @@ def _normalize_evaluation_preparation(
         publication_actor=publication_actor,
         published_at=validation_time,
         resolved_profile_digest=normalized.resolved_profile_digest,
-        endpoint=normalized.private_mcp_endpoint,
+        endpoint=assertion.azure_mcp_internal_endpoint,
         scope=authorized_scope,
-        reason=normalized.reason,
+        reason=condition.command.reason,
     )
     validation_result = build_demo_evaluation_result(
         publication=validation_publication,
@@ -303,9 +315,9 @@ def _normalize_evaluation_preparation(
             actor=actor,
             publication_actor=publication_actor,
             resolved_profile_digest=normalized.resolved_profile_digest,
-            private_mcp_endpoint=normalized.private_mcp_endpoint,
+            private_mcp_endpoint=assertion.azure_mcp_internal_endpoint,
             authorized_scope=authorized_scope,
-            reason=normalized.reason,
+            reason=condition.command.reason,
             findings=findings,
         ),
         evidence_binding_digest=evidence_binding_digest,
@@ -348,6 +360,13 @@ class InMemoryContextStore:
             )
         self._transaction_generation = 0
         self.__context_service_evaluation_capability: object | None = None
+        self.__evaluation_collection_configuration: (
+            tuple[
+                VerifiedWc008DeploymentConfiguration,
+                CollectorTrustConfiguration,
+            ]
+            | None
+        ) = None
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
@@ -371,6 +390,52 @@ class InMemoryContextStore:
         return (
             self.__context_service_evaluation_capability is not None
             and capability is self.__context_service_evaluation_capability
+        )
+
+    def _bind_context_service_evaluation_collection_authority(
+        self,
+        capability: object,
+        deployment_configuration: VerifiedWc008DeploymentConfiguration,
+        trust_configuration: CollectorTrustConfiguration,
+    ) -> None:
+        """Pin immutable collection authority beside the publication capability."""
+
+        if not self._owns_context_service_evaluation_capability(capability):
+            raise EvaluationFailedClosedError(
+                "collection authority requires the owning ContextService capability"
+            )
+        normalized = (
+            VerifiedWc008DeploymentConfiguration.model_validate_json(
+                deployment_configuration.model_dump_json(by_alias=True)
+            ),
+            CollectorTrustConfiguration.model_validate_json(
+                trust_configuration.model_dump_json(by_alias=True)
+            ),
+        )
+        if (
+            self.__evaluation_collection_configuration is not None
+            and self.__evaluation_collection_configuration != normalized
+        ):
+            raise DemoEvaluationConfigurationError(
+                "evaluation collection authority is already bound differently"
+            )
+        self.__evaluation_collection_configuration = normalized
+
+    def _evaluation_collection_authority(
+        self,
+        *,
+        authorized_scope: EvidenceScope,
+    ) -> EvaluationCollectionAuthority:
+        configured = self.__evaluation_collection_configuration
+        if configured is None:
+            raise EvaluationFailedClosedError(
+                "evaluation persistence has no bound collection authority"
+            )
+        configuration, trust = configured
+        return build_evaluation_collection_authority(
+            configuration,
+            trust,
+            authorized_scope=authorized_scope,
         )
 
     def _before_evaluation_commit_timestamp(self) -> None:
@@ -744,14 +809,42 @@ class _MemoryTransaction(ContextTransactionPort):
                 "authoritative persistence changed during evaluation preparation"
             )
         try:
-            normalized = _normalize_evaluation_preparation(prepared)
+            expected_collection_authority = (
+                self._store._evaluation_collection_authority(
+                    authorized_scope=condition.command.authorized_scope,
+                )
+            )
+            if expected_collection_authority != condition.collection_authority:
+                raise ValueError(
+                    "configured Reader assignment revision does not match"
+                )
+            normalized = _normalize_evaluation_preparation(
+                prepared,
+                condition,
+            )
+            validate_evaluation_collection_binding(
+                command=condition.command,
+                snapshot=normalized.prepared.snapshot,
+                collection_request=(
+                    normalized.prepared.collection_request
+                ),
+                envelope=normalized.prepared.envelope,
+                collection_authority=expected_collection_authority,
+            )
         except (AthenaValidationError, ValueError) as exc:
             raise EvaluationFailedClosedError(
                 "prepared evaluation artifact failed canonical validation"
             ) from exc
         prepared = normalized.prepared
+        collection_authority = expected_collection_authority
+        assertion = collection_authority.deployment_configuration.assertion
         command_scope_json = (
             condition.command.authorized_scope.canonical_json()
+        )
+        request_digest = build_demo_evaluation_request_digest(
+            actor=condition.actor,
+            command=condition.command,
+            collection_authority=collection_authority,
         )
         if self._store._transaction_generation != self._base_generation:
             raise StaleRevisionError(
@@ -773,9 +866,11 @@ class _MemoryTransaction(ContextTransactionPort):
                 actor=condition.actor,
                 command=condition.command,
                 as_of=authority_checked_at,
-                private_mcp_endpoint=condition.private_mcp_endpoint,
+                private_mcp_endpoint=(
+                    assertion.azure_mcp_internal_endpoint
+                ),
                 evidence_identity_object_id=(
-                    condition.evidence_identity_object_id
+                    assertion.evidence_identity_object_id
                 ),
                 trusted_key_anchor=condition.trusted_key_anchor,
                 expected_authority=condition.expected_authority,
@@ -802,10 +897,14 @@ class _MemoryTransaction(ContextTransactionPort):
                 publisher=condition.actor,
                 publication_actor=condition.publication_actor,
                 resolved=resolved,
-                private_mcp_endpoint=condition.private_mcp_endpoint,
+                private_mcp_endpoint=(
+                    assertion.azure_mcp_internal_endpoint
+                ),
                 authorized_scope=condition.command.authorized_scope,
                 reason=condition.command.reason,
-                envelope_attempt_id=prepared.envelope_attempt_id,
+                envelope_attempt_id=(
+                    prepared.collection_request.attempt_id
+                ),
                 envelope=prepared.envelope,
                 trusted_key=current_trusted_key,
                 trusted_key_anchor=condition.trusted_key_anchor,
@@ -818,25 +917,15 @@ class _MemoryTransaction(ContextTransactionPort):
             current_trusted_key is None
             or current_trusted_key.authority_token()
             != condition.expected_authority.trusted_key
-            or prepared.authority != authority
+            or authority != condition.expected_authority
             or prepared.approval.authority_token()
             != authority.approval
             or prepared.resolved_profile_digest
             != resolved.profile.resolved_profile_digest
-            or prepared.actor != condition.actor
-            or prepared.publication_actor
-            != condition.publication_actor
-            or prepared.idempotency_key != condition.idempotency_key
-            or prepared.request_digest != condition.request_digest
-            or prepared.private_mcp_endpoint
-            != condition.private_mcp_endpoint
             or normalized.authorized_scope_json
             != command_scope_json
-            or prepared.reason != condition.command.reason
             or prepared.temporal_validity != expected_temporal_validity
             or prepared.findings != authoritative_findings
-            or normalized.evidence_binding_digest
-            != condition.evidence_binding_digest
         ):
             raise StaleRevisionError(
                 "complete evaluation authority or evidence binding changed "
@@ -846,6 +935,12 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 "authoritative persistence changed during final authority check"
             )
+        candidate_digest = build_demo_evaluation_candidate_digest(
+            request_digest=request_digest,
+            authority=authority,
+            collection_authority=collection_authority,
+            evidence_binding_digest=normalized.evidence_binding_digest,
+        )
         published_at = ensure_timestamp(clock.now())
         # No caller-provided or overridable behavior executes after this read.
         # The sealed finalizer only compares primitive captured bounds, binds
@@ -853,6 +948,10 @@ class _MemoryTransaction(ContextTransactionPort):
         # artifact and receipt.
         artifact = _finalize_prepared_evaluation(
             prepared,
+            actor=condition.actor,
+            idempotency_key=condition.idempotency_key,
+            request_digest=request_digest,
+            candidate_digest=candidate_digest,
             published_at=published_at,
             trusted_key=current_trusted_key,
             material=normalized.material,

@@ -9,7 +9,6 @@ from athena_context.api.errors import (
     DemoEvaluationConfigurationError,
     EvaluationFailedClosedError,
     EvidenceCollectionRejectedError,
-    IdempotencyConflictError,
     ResourceNotFoundError,
 )
 from athena_context.api.evaluation_context import (
@@ -24,7 +23,6 @@ from athena_context.api.evaluation_domain import (
 )
 from athena_context.api.evaluation_ports import (
     ConfiguredEvidenceClientPort,
-    EvaluationCommitCandidate,
     SnapshotSigningPort,
     SnapshotSigningRequest,
     TrustedWc008DeploymentConfigurationPort,
@@ -39,7 +37,6 @@ from athena_context.contracts import (
     AthenaValidationError,
     EvidenceGapRecord,
     SnapshotPublicationRecord,
-    compute_artifact_digest,
 )
 from athena_context.evidence import (
     CollectedEvidence,
@@ -89,6 +86,12 @@ class DemoEvaluationService:
         self._snapshot_signer = snapshot_signer
         self._clock = clock
         self._validate_composition()
+        self.__orchestrator_capability = (
+            self._context_service._bind_demo_evaluation_orchestrator(
+                deployment_configuration=self._deployment_configuration,
+                trust_configuration=self._evidence_client.trust_configuration,
+            )
+        )
 
     @classmethod
     def from_dependencies(
@@ -141,142 +144,131 @@ class DemoEvaluationService:
         idempotency_key: str,
         command: DemoEvaluationCommand,
     ) -> DemoEvaluationResult:
-        request_digest = self._request_digest(actor, command)
-        replay = self._context_service.load_demo_evaluation_receipt(
-            actor,
-            idempotency_key,
-            manifest_id=command.manifest_id,
-        )
-        if replay is not None:
-            if replay.request_digest != request_digest:
-                raise IdempotencyConflictError(
-                    "idempotency key was used for a different demo evaluation"
-                )
-            return DemoEvaluationResult.model_validate_json(replay.result_json)
-
-        approval, resolved_context, expected_authority = (
-            self._context_service.prepare_demo_evaluation_authority(
+        prepared_request = (
+            self._context_service._prepare_demo_evaluation_request(
+                orchestrator_capability=self.__orchestrator_capability,
                 reader_actor=self._context_reader_actor,
                 actor=actor,
+                idempotency_key=idempotency_key,
                 command=command,
                 as_of=self._now(),
-                private_mcp_endpoint=self._actual_private_mcp_endpoint,
-                evidence_identity_object_id=(
-                    self._deployment_configuration.assertion
-                    .evidence_identity_object_id
-                ),
             )
         )
+        if prepared_request.replay is not None:
+            return DemoEvaluationResult.model_validate_json(
+                prepared_request.replay.result_json
+            )
+        approval = prepared_request.approval
+        resolved_context = prepared_request.resolved
+        if approval is None or resolved_context is None:
+            self._context_service._discard_demo_evaluation_request(
+                prepared_request
+            )
+            raise EvaluationFailedClosedError(
+                "ContextService returned an incomplete evaluation request"
+            )
         profile = resolved_context.profile
-        collected = self._collect(command)
-        attested_at = self._now()
         try:
-            material = prepare_snapshot_signing_material(
-                collected,
-                snapshot_id=command.snapshot_id,
-                trust_configuration=self._evidence_client.trust_configuration,
-                trusted_key_anchor=self._evidence_client.trusted_key_anchor,
-                attested_at=attested_at,
-            )
-            signature = self._snapshot_signer.sign(
-                SnapshotSigningRequest(
-                    canonical_preimage=material.canonical_signing_preimage,
-                    preimage_digest=material.signing_preimage_digest,
+            collected = self._collect(command)
+            attested_at = self._now()
+            try:
+                material = prepare_snapshot_signing_material(
+                    collected,
+                    snapshot_id=command.snapshot_id,
+                    trust_configuration=self._evidence_client.trust_configuration,
                     trusted_key_anchor=self._evidence_client.trusted_key_anchor,
+                    attested_at=attested_at,
                 )
-            )
-            snapshot = finalize_signed_snapshot(material, signature=signature)
-        except (AthenaValidationError, ValueError) as exc:
-            raise EvaluationFailedClosedError(
-                "canonical evidence snapshot assembly or signing failed"
-            ) from exc
+                signature = self._snapshot_signer.sign(
+                    SnapshotSigningRequest(
+                        canonical_preimage=material.canonical_signing_preimage,
+                        preimage_digest=material.signing_preimage_digest,
+                        trusted_key_anchor=self._evidence_client.trusted_key_anchor,
+                    )
+                )
+                snapshot = finalize_signed_snapshot(
+                    material,
+                    signature=signature,
+                )
+            except (AthenaValidationError, ValueError) as exc:
+                raise EvaluationFailedClosedError(
+                    "canonical evidence snapshot assembly or signing failed"
+                ) from exc
 
-        evaluated_at = self._now()
-        if evaluated_at >= snapshot.expires_at:
-            raise EvaluationFailedClosedError(
-                "snapshot became stale before publication"
+            evaluated_at = self._now()
+            if evaluated_at >= snapshot.expires_at:
+                raise EvaluationFailedClosedError(
+                    "snapshot became stale before publication"
+                )
+            provisional_publication = build_authorized_publication(
+                snapshot=snapshot,
+                approval=approval,
+                publisher=actor,
+                publication_actor=self._context_service.publication_actor,
+                published_at=evaluated_at,
+                resolved_profile_digest=profile.resolved_profile_digest,
+                endpoint=self._actual_private_mcp_endpoint,
+                scope=command.authorized_scope,
+                reason=command.reason,
             )
-        provisional_publication = build_authorized_publication(
-            snapshot=snapshot,
-            approval=approval,
-            publisher=actor,
-            publication_actor=self._context_service.publication_actor,
-            published_at=evaluated_at,
-            resolved_profile_digest=profile.resolved_profile_digest,
-            endpoint=self._actual_private_mcp_endpoint,
-            scope=command.authorized_scope,
-            reason=command.reason,
-        )
-        registry_record = provisional_publication.registry_record()
+            registry_record = provisional_publication.registry_record()
 
-        def publication_resolver(
-            snapshot_id: str,
-        ) -> SnapshotPublicationRecord | None:
-            return registry_record if snapshot_id == snapshot.snapshot_id else None
+            def publication_resolver(
+                snapshot_id: str,
+            ) -> SnapshotPublicationRecord | None:
+                return registry_record if snapshot_id == snapshot.snapshot_id else None
 
-        def envelope_resolver(
-            attempt_id: str,
-            kind: Literal["response", "failure"],
-            digest: str,
-        ) -> object | None:
-            envelope = collected.envelope
-            if (
-                envelope is not None
-                and attempt_id == collected.collector_attempt.attempt_id
-                and kind == envelope.kind
-                and digest == envelope.digest
-            ):
-                return envelope.payload()
-            return None
+            def envelope_resolver(
+                attempt_id: str,
+                kind: Literal["response", "failure"],
+                digest: str,
+            ) -> object | None:
+                envelope = collected.envelope
+                if (
+                    envelope is not None
+                    and attempt_id == collected.collector_attempt.attempt_id
+                    and kind == envelope.kind
+                    and digest == envelope.digest
+                ):
+                    return envelope.payload()
+                return None
 
-        try:
-            evidence = build_resource_evidence_context(profile, snapshot)
-            verifier = make_resource_snapshot_context_verifier(
-                snapshot,
-                profile,
-                as_of=evaluated_at,
-                expected_artifact_digest=snapshot.compatibility.artifact_digest,
-                publication_resolver=publication_resolver,
-                key_resolver=self._evidence_client.key_resolver,
-                trusted_key_anchor=self._evidence_client.trusted_key_anchor,
-                envelope_resolver=envelope_resolver,
+            try:
+                evidence = build_resource_evidence_context(profile, snapshot)
+                verifier = make_resource_snapshot_context_verifier(
+                    snapshot,
+                    profile,
+                    as_of=evaluated_at,
+                    expected_artifact_digest=snapshot.compatibility.artifact_digest,
+                    publication_resolver=publication_resolver,
+                    key_resolver=self._evidence_client.key_resolver,
+                    trusted_key_anchor=self._evidence_client.trusted_key_anchor,
+                    envelope_resolver=envelope_resolver,
+                )
+                evaluate_manifest_profile(
+                    profile,
+                    evidence,
+                    as_of=evaluated_at,
+                    verify_evidence_context=verifier,
+                )
+            except AthenaValidationError as exc:
+                raise EvaluationFailedClosedError(
+                    "verified evidence did not satisfy preflight manifest evaluation"
+                ) from exc
+            if collected.envelope is None:
+                raise EvaluationFailedClosedError(
+                    "successful evidence publication requires a validated source envelope"
+                )
+            self._before_authoritative_commit()
+            return self._context_service._commit_prepared_demo_evaluation(
+                prepared_request=prepared_request,
+                snapshot=snapshot,
+                collected=collected,
             )
-            evaluate_manifest_profile(
-                profile,
-                evidence,
-                as_of=evaluated_at,
-                verify_evidence_context=verifier,
+        finally:
+            self._context_service._discard_demo_evaluation_request(
+                prepared_request
             )
-        except AthenaValidationError as exc:
-            raise EvaluationFailedClosedError(
-                "verified evidence did not satisfy preflight manifest evaluation"
-            ) from exc
-
-        envelope = collected.envelope
-        if envelope is None:
-            raise EvaluationFailedClosedError(
-                "successful evidence publication requires a validated source envelope"
-            )
-        candidate = EvaluationCommitCandidate(
-            actor=actor,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
-            command=command,
-            snapshot=snapshot,
-            envelope_attempt_id=collected.collector_attempt.attempt_id,
-            envelope=envelope,
-            expected_authority=expected_authority,
-            private_mcp_endpoint=self._actual_private_mcp_endpoint,
-            evidence_identity_object_id=(
-                self._deployment_configuration.assertion
-                .evidence_identity_object_id
-            ),
-        )
-        self._before_authoritative_commit()
-        return self._context_service.commit_demo_evaluation(
-            reader_actor=self._context_reader_actor,
-            candidate=candidate,
-        )
 
     def _before_authoritative_commit(self) -> None:
         """Test seam before ContextService opens its authoritative transaction."""
@@ -343,30 +335,6 @@ class DemoEvaluationService:
                 f"evidence collection produced a fail-closed outcome: {detail}"
             )
         return collected
-
-    def _request_digest(self, actor: Actor, command: DemoEvaluationCommand) -> str:
-        return compute_artifact_digest(
-            {
-                "operation": "evaluate_demo_workload",
-                "actor": actor.model_dump(mode="json"),
-                "command": command.model_dump(
-                    mode="json",
-                    by_alias=True,
-                    exclude_none=True,
-                ),
-                "wc008DeploymentAssertionDigest": (
-                    self._deployment_configuration.assertion.assertion_digest
-                ),
-                "actualPrivateMcpEndpoint": self._actual_private_mcp_endpoint,
-                "trustConfiguration": (
-                    self._evidence_client.trust_configuration
-                ).model_dump(
-                    mode="json",
-                    by_alias=True,
-                    exclude_none=True,
-                ),
-            }
-        )
 
     def _now(self) -> datetime:
         return ensure_timestamp(self._clock.now())

@@ -18,6 +18,7 @@ from athena_context.api.evaluation_domain import (
     DemoEvaluationCommand,
     DemoEvaluationResult,
     EvaluationAuthorityToken,
+    McpReadAssignment,
     PublishedContextSelection,
     ResolvedPublishedContext,
     TrustedKeyAuthorityToken,
@@ -38,6 +39,7 @@ from athena_context.evidence import (
     CollectedEvidence,
     CollectorTrustConfiguration,
     EvidenceCollectionCommand,
+    EvidenceTransportRequest,
     ValidatedEnvelope,
 )
 
@@ -94,6 +96,7 @@ class StoredEvaluation:
     actor_id: str
     idempotency_key: str
     request_digest: str
+    candidate_digest: str
     snapshot_id: str
     published_at: datetime
     material: StoredEvaluationMaterial
@@ -197,27 +200,19 @@ class EvaluationTemporalValidity:
 class PreparedEvaluationArtifact:
     """Fully evaluated immutable inputs for persistence-owned finalization."""
 
-    actor: Actor
-    publication_actor: Actor
-    idempotency_key: str
-    request_digest: str
     snapshot: EvidenceSnapshot
     approval: DemoEvaluationApproval
     resolved_profile_digest: str
-    private_mcp_endpoint: str
-    authorized_scope: EvidenceScope
-    reason: str
     findings: tuple[ManifestFinding, ...]
-    envelope_attempt_id: str
+    collection_request: EvidenceTransportRequest
     envelope: ValidatedEnvelope
-    authority: EvaluationAuthorityToken
     temporal_validity: EvaluationTemporalValidity
 
 
 def build_evaluation_evidence_binding_digest(
     snapshot: EvidenceSnapshot,
     *,
-    envelope_attempt_id: str,
+    collection_request: EvidenceTransportRequest,
     envelope: ValidatedEnvelope,
 ) -> str:
     """Bind the exact immutable snapshot and source envelope checked by policy."""
@@ -227,9 +222,157 @@ def build_evaluation_evidence_binding_digest(
             "snapshotCanonicalJson": snapshot.canonical_json(),
             "snapshotArtifactDigest": snapshot.compatibility.artifact_digest,
             "snapshotSemanticDigest": snapshot.compatibility.semantic_digest,
-            "envelopeAttemptId": envelope_attempt_id,
+            "collectionRequest": collection_request.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
             "envelopeKind": envelope.kind,
             "envelopeDigest": envelope.digest,
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationCollectionAuthority:
+    """Operator-pinned WC-008 Reader authority bound before collection."""
+
+    deployment_configuration: VerifiedWc008DeploymentConfiguration
+    trust_configuration: CollectorTrustConfiguration
+    reader_assignment: McpReadAssignment
+    reader_assignment_revision: str
+    authority_digest: str
+
+
+def build_evaluation_collection_authority(
+    deployment_configuration: VerifiedWc008DeploymentConfiguration,
+    trust_configuration: CollectorTrustConfiguration,
+    *,
+    authorized_scope: EvidenceScope,
+) -> EvaluationCollectionAuthority:
+    """Normalize and bind the exact configured Reader assignment revision."""
+
+    configuration = VerifiedWc008DeploymentConfiguration.model_validate_json(
+        deployment_configuration.model_dump_json(by_alias=True)
+    )
+    trust = CollectorTrustConfiguration.model_validate_json(
+        trust_configuration.model_dump_json(by_alias=True)
+    )
+    assertion = configuration.assertion
+    expected_scope = authorized_scope.canonical_json()
+    assignments = tuple(
+        assignment
+        for assignment in assertion.evidence_read_assignments
+        if assignment.role == "Reader"
+        and assignment.scope.canonical_json() == expected_scope
+    )
+    if len(assignments) != 1:
+        raise ValueError(
+            "evaluation requires one exact operator-pinned WC-008 Reader assignment"
+        )
+    if (
+        trust.managed_identity_object_id
+        != assertion.evidence_identity_object_id
+        or trust.context_identity_object_id
+        != assertion.context_identity_object_id
+        or trust.tenant_id
+        != getattr(assignments[0].scope, "tenant_id", None)
+    ):
+        raise ValueError(
+            "evaluation collection trust does not match its WC-008 Reader assignment"
+        )
+    assignment = McpReadAssignment.model_validate_json(
+        assignments[0].model_dump_json(by_alias=True)
+    )
+    approval_digest = compute_artifact_digest(
+        configuration.operator_approval.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    )
+    revision = compute_artifact_digest(
+        {
+            "deploymentAssertionDigest": assertion.assertion_digest,
+            "operatorApprovalDigest": approval_digest,
+            "readerAssignment": assignment.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
+        }
+    )
+    authority_payload = {
+        "deploymentAssertion": assertion.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+        "operatorApprovalDigest": approval_digest,
+        "trustConfiguration": trust.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+        "readerAssignment": assignment.model_dump(
+            mode="json",
+            by_alias=True,
+        ),
+        "readerAssignmentRevision": revision,
+    }
+    return EvaluationCollectionAuthority(
+        deployment_configuration=configuration,
+        trust_configuration=trust,
+        reader_assignment=assignment,
+        reader_assignment_revision=revision,
+        authority_digest=compute_artifact_digest(authority_payload),
+    )
+
+
+def build_demo_evaluation_request_digest(
+    *,
+    actor: Actor,
+    command: DemoEvaluationCommand,
+    collection_authority: EvaluationCollectionAuthority,
+) -> str:
+    """Build the idempotency digest only from service-bound authority."""
+
+    return compute_artifact_digest(
+        {
+            "operation": "evaluate_demo_workload",
+            "actor": actor.model_dump(mode="json"),
+            "command": command.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "collectionAuthorityDigest": collection_authority.authority_digest,
+            "readerAssignmentRevision": (
+                collection_authority.reader_assignment_revision
+            ),
+        }
+    )
+
+
+def build_demo_evaluation_candidate_digest(
+    *,
+    request_digest: str,
+    authority: EvaluationAuthorityToken,
+    collection_authority: EvaluationCollectionAuthority,
+    evidence_binding_digest: str,
+) -> str:
+    """Bind the exact authority and signed evidence selected for insertion."""
+
+    return compute_artifact_digest(
+        {
+            "requestDigest": request_digest,
+            "evaluationAuthority": authority.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
+            "collectionAuthorityDigest": collection_authority.authority_digest,
+            "readerAssignmentRevision": (
+                collection_authority.reader_assignment_revision
+            ),
+            "evidenceBindingDigest": evidence_binding_digest,
         }
     )
 
@@ -243,12 +386,9 @@ class EvaluationCommitAuthorityCondition:
     publication_actor: Actor
     command: DemoEvaluationCommand
     expected_authority: EvaluationAuthorityToken
-    private_mcp_endpoint: str
-    evidence_identity_object_id: str
+    collection_authority: EvaluationCollectionAuthority
     trusted_key_anchor: TrustedKeyAnchor
     idempotency_key: str
-    request_digest: str
-    evidence_binding_digest: str
 
 
 # Delay-capable verification returns data, never executable post-time behavior.
@@ -401,21 +541,14 @@ class ContextServiceEvaluationPublicationStorePort(Protocol):
         capability: object,
     ) -> None: ...
 
-
-@dataclass(frozen=True, slots=True)
-class EvaluationCommitCandidate:
-    """Evaluated immutable inputs awaiting one conditional authority transaction."""
-
-    actor: Actor
-    idempotency_key: str
-    request_digest: str
-    command: DemoEvaluationCommand
-    snapshot: EvidenceSnapshot
-    envelope_attempt_id: str
-    envelope: ValidatedEnvelope
-    expected_authority: EvaluationAuthorityToken
-    private_mcp_endpoint: str
-    evidence_identity_object_id: str
+    def _bind_context_service_evaluation_collection_authority(
+        self,
+        capability: object,
+        deployment_configuration: VerifiedWc008DeploymentConfiguration,
+        trust_configuration: CollectorTrustConfiguration,
+    ) -> None:
+        """Pin the configuration used by the same publication backend."""
+        ...
 
 
 class ConfiguredEvidenceClientPort(Protocol):
@@ -455,10 +588,10 @@ __all__ = [
     "ConfiguredEvidenceClientPort",
     "ContextServiceEvaluationPublicationStorePort",
     "EvaluationArtifactPreparation",
+    "EvaluationCollectionAuthority",
     "EvaluationCommitAuthorityCondition",
     "EvaluationAuthorityTransactionPort",
     "EvaluationAuthorityUnitOfWorkPort",
-    "EvaluationCommitCandidate",
     "EvaluationTemporalValidity",
     "EvaluationTrustedKeyAuthority",
     "PreparedEvaluationArtifact",
@@ -467,6 +600,9 @@ __all__ = [
     "SnapshotSigningPort",
     "SnapshotSigningRequest",
     "StoredEvaluation",
+    "build_demo_evaluation_candidate_digest",
+    "build_demo_evaluation_request_digest",
+    "build_evaluation_collection_authority",
     "build_evaluation_evidence_binding_digest",
     "TrustedWc008DeploymentConfigurationPort",
 ]
