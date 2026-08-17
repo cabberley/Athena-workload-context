@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from types import TracebackType
 from typing import Literal
 
+from pydantic import TypeAdapter
+
 from athena_context.api.domain import (
+    Actor,
     AuditEvent,
     DraftRecord,
     DraftState,
@@ -18,6 +23,7 @@ from athena_context.api.domain import (
 from athena_context.api.errors import (
     AlreadySupersededError,
     DemoEvaluationApprovalError,
+    DemoEvaluationConfigurationError,
     DuplicateDraftError,
     DuplicateVersionError,
     EvaluationFailedClosedError,
@@ -43,11 +49,22 @@ from athena_context.api.evaluation_ports import (
     EvaluationTrustedKeyAuthority,
     PreparedEvaluationArtifact,
     StoredEvaluation,
+    StoredEvaluationMaterial,
     build_evaluation_evidence_binding_digest,
+)
+from athena_context.api.evaluation_verification import (
+    verify_and_evaluate_snapshot_for_publication,
 )
 from athena_context.api.ports import ClockPort, ContextTransactionPort
 from athena_context.api.transaction_lock import InMemoryTransactionLock
-from athena_context.contracts import EvidenceSnapshot, TrustedKeyAnchor
+from athena_context.contracts import (
+    AthenaValidationError,
+    EvidenceScope,
+    EvidenceSnapshot,
+    ManifestFinding,
+    TrustedKeyAnchor,
+)
+from athena_context.evidence import ValidatedEnvelope
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -60,9 +77,15 @@ def _finalize_prepared_evaluation(
     *,
     published_at: datetime,
     trusted_key: EvaluationTrustedKeyAuthority,
+    material: StoredEvaluationMaterial,
 ) -> StoredEvaluation:
     """Sealed, bounded finalizer: no callbacks, lookups, hooks, crypto, or policy."""
 
+    if published_at.microsecond % 1000 != 0:
+        raise EvaluationFailedClosedError(
+            "authoritative publication time exceeds canonical millisecond "
+            "precision"
+        )
     validity = prepared.temporal_validity
     approval = prepared.approval
     snapshot = prepared.snapshot
@@ -145,56 +168,149 @@ def _finalize_prepared_evaluation(
             "policy evidence freshness failed at the authoritative publication time"
         )
 
-    publication = build_authorized_publication(
-        snapshot=snapshot,
-        approval=approval,
-        publisher=prepared.actor,
-        publication_actor=prepared.publication_actor,
-        published_at=published_at,
-        resolved_profile_digest=prepared.resolved_profile_digest,
-        endpoint=prepared.private_mcp_endpoint,
-        scope=prepared.authorized_scope,
-        reason=prepared.reason,
-    )
-    result = build_demo_evaluation_result(
-        publication=publication,
-        snapshot=snapshot,
-        findings=prepared.findings,
-        evaluated_at=published_at,
-    )
-    artifact = StoredEvaluation(
+    return StoredEvaluation(
         actor_id=prepared.actor.actor_id,
         idempotency_key=prepared.idempotency_key,
         request_digest=prepared.request_digest,
         snapshot_id=snapshot.snapshot_id,
-        result_json=result.model_dump_json(
-            by_alias=True,
-            exclude_none=True,
-        ),
-        snapshot_json=snapshot.canonical_json(),
-        publication_json=publication.model_dump_json(exclude_none=True),
+        published_at=published_at,
+        material=material,
         envelope_attempt_id=prepared.envelope_attempt_id,
         envelope=prepared.envelope,
     )
-    stored_result = DemoEvaluationResult.model_validate_json(
-        artifact.result_json
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedEvaluationPreparation:
+    """Base-model-only inputs serialized and validated before final time."""
+
+    prepared: PreparedEvaluationArtifact
+    material: StoredEvaluationMaterial
+    evidence_binding_digest: str
+    authorized_scope_json: str
+
+
+_EVIDENCE_SCOPE_ADAPTER: TypeAdapter[EvidenceScope] = TypeAdapter(
+    EvidenceScope
+)
+
+
+def _normalize_evaluation_preparation(
+    prepared: PreparedEvaluationArtifact,
+) -> _NormalizedEvaluationPreparation:
+    """Remove caller subclasses and exercise every untrusted serialization path."""
+
+    # This call is intentionally before the authoritative insertion timestamp:
+    # a hostile model override can delay or fail, but can never backdate commit.
+    supplied_snapshot_json = prepared.snapshot.canonical_json()
+    snapshot = EvidenceSnapshot.model_validate_json(supplied_snapshot_json)
+    snapshot_json = snapshot.canonical_json()
+    actor = Actor.model_validate_json(
+        prepared.actor.model_dump_json(by_alias=True)
     )
-    stored_snapshot = EvidenceSnapshot.model_validate_json(
-        artifact.snapshot_json
+    publication_actor = Actor.model_validate_json(
+        prepared.publication_actor.model_dump_json(by_alias=True)
     )
+    approval = DemoEvaluationApproval.model_validate_json(
+        prepared.approval.model_dump_json(by_alias=True)
+    )
+    authorized_scope_json = prepared.authorized_scope.canonical_json()
+    authorized_scope = _EVIDENCE_SCOPE_ADAPTER.validate_json(
+        authorized_scope_json
+    )
+    findings = tuple(
+        ManifestFinding.model_validate_json(
+            finding.model_dump_json(by_alias=True)
+        )
+        for finding in prepared.findings
+    )
+    envelope = ValidatedEnvelope.from_payload(
+        kind=prepared.envelope.kind,
+        digest=prepared.envelope.digest,
+        payload=prepared.envelope.payload(),
+    )
+    normalized = PreparedEvaluationArtifact(
+        actor=actor,
+        publication_actor=publication_actor,
+        idempotency_key=str(prepared.idempotency_key),
+        request_digest=str(prepared.request_digest),
+        snapshot=snapshot,
+        approval=approval,
+        resolved_profile_digest=str(prepared.resolved_profile_digest),
+        private_mcp_endpoint=str(prepared.private_mcp_endpoint),
+        authorized_scope=authorized_scope,
+        reason=str(prepared.reason),
+        findings=findings,
+        envelope_attempt_id=str(prepared.envelope_attempt_id),
+        envelope=envelope,
+        authority=prepared.authority.model_copy(deep=True),
+        temporal_validity=prepared.temporal_validity,
+    )
+    evidence_binding_digest = build_evaluation_evidence_binding_digest(
+        normalized.snapshot,
+        envelope_attempt_id=normalized.envelope_attempt_id,
+        envelope=normalized.envelope,
+    )
+
+    # Exercise publication/result model validation, digest construction, JSON
+    # serialization, and round-trip parsing before the final clock read. The
+    # sealed finalizer later receives only exact base models and primitives.
+    validation_time = snapshot.collected_at
+    validation_publication = build_authorized_publication(
+        snapshot=snapshot,
+        approval=approval,
+        publisher=actor,
+        publication_actor=publication_actor,
+        published_at=validation_time,
+        resolved_profile_digest=normalized.resolved_profile_digest,
+        endpoint=normalized.private_mcp_endpoint,
+        scope=authorized_scope,
+        reason=normalized.reason,
+    )
+    validation_result = build_demo_evaluation_result(
+        publication=validation_publication,
+        snapshot=snapshot,
+        findings=findings,
+        evaluated_at=validation_time,
+    )
+    result_json = validation_result.model_dump_json(
+        by_alias=True,
+        exclude_none=True,
+    )
+    publication_json = validation_publication.model_dump_json(
+        exclude_none=True
+    )
+    stored_result = DemoEvaluationResult.model_validate_json(result_json)
+    stored_snapshot = EvidenceSnapshot.model_validate_json(snapshot_json)
     stored_publication = AuthorizedSnapshotPublication.model_validate_json(
-        artifact.publication_json
+        publication_json
     )
     if (
         stored_result.snapshot.canonical_json()
         != stored_snapshot.canonical_json()
         or stored_result.publication != stored_publication
-        or stored_result.publication.snapshot_id != artifact.snapshot_id
+        or stored_result.publication.snapshot_id != snapshot.snapshot_id
     ):
         raise ValueError(
             "stored evaluation components are not canonically identical"
         )
-    return artifact
+    return _NormalizedEvaluationPreparation(
+        prepared=normalized,
+        material=StoredEvaluationMaterial(
+            snapshot=snapshot,
+            snapshot_json=snapshot_json,
+            approval=approval,
+            actor=actor,
+            publication_actor=publication_actor,
+            resolved_profile_digest=normalized.resolved_profile_digest,
+            private_mcp_endpoint=normalized.private_mcp_endpoint,
+            authorized_scope=authorized_scope,
+            reason=normalized.reason,
+            findings=findings,
+        ),
+        evidence_binding_digest=evidence_binding_digest,
+        authorized_scope_json=authorized_scope.canonical_json(),
+    )
 
 
 class InMemoryContextStore:
@@ -231,9 +347,31 @@ class InMemoryContextStore:
                 demo_evaluation_trusted_key
             )
         self._transaction_generation = 0
+        self.__context_service_evaluation_capability: object | None = None
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
+
+    def _bind_context_service_evaluation_publication(
+        self,
+        capability: object,
+    ) -> None:
+        """Bind one opaque capability to this concrete store instance."""
+
+        if self.__context_service_evaluation_capability is not None:
+            raise DemoEvaluationConfigurationError(
+                "evaluation publication is already bound to a ContextService"
+            )
+        self.__context_service_evaluation_capability = capability
+
+    def _owns_context_service_evaluation_capability(
+        self,
+        capability: object,
+    ) -> bool:
+        return (
+            self.__context_service_evaluation_capability is not None
+            and capability is self.__context_service_evaluation_capability
+        )
 
     def _before_evaluation_commit_timestamp(self) -> None:
         """Test seam for delay inside persistence before authoritative time."""
@@ -258,6 +396,8 @@ class _MemoryTransaction(ContextTransactionPort):
         ] = {}
         self._base_generation = 0
         self._dirty = False
+        self.__evaluation_publication_capability: object | None = None
+        self.__evaluation_publication_consumed = False
 
     def __enter__(self) -> _MemoryTransaction:
         self._store._lock.acquire()
@@ -491,13 +631,17 @@ class _MemoryTransaction(ContextTransactionPort):
         actor_id: str,
         idempotency_key: str,
     ) -> StoredEvaluation | None:
-        return self._evaluation_receipts.get((actor_id, idempotency_key))
+        artifact = self._evaluation_receipts.get(
+            (actor_id, idempotency_key)
+        )
+        return None if artifact is None else deepcopy(artifact)
 
     def get_evaluation_artifact(
         self,
         snapshot_id: str,
     ) -> StoredEvaluation | None:
-        return self._evaluation_artifacts.get(snapshot_id)
+        artifact = self._evaluation_artifacts.get(snapshot_id)
+        return None if artifact is None else deepcopy(artifact)
 
     def get_demo_evaluation_trusted_key(
         self,
@@ -539,11 +683,41 @@ class _MemoryTransaction(ContextTransactionPort):
         self._demo_evaluation_trusted_keys[anchor.key_vault_key_id] = authority
         self._dirty = True
 
-    def put_evaluation_conditionally(
+    def _open_context_service_evaluation_publication(
         self,
+        service_capability: object,
+    ) -> object:
+        if not self._store._owns_context_service_evaluation_capability(
+            service_capability
+        ):
+            raise EvaluationFailedClosedError(
+                "evaluation publication requires the ContextService-owned "
+                "transaction capability"
+            )
+        if self.__evaluation_publication_capability is not None:
+            raise EvaluationFailedClosedError(
+                "evaluation publication capability was already opened"
+            )
+        transaction_capability = object()
+        self.__evaluation_publication_capability = transaction_capability
+        return transaction_capability
+
+    def _put_context_service_evaluation(
+        self,
+        transaction_capability: object,
         condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
+        if (
+            self.__evaluation_publication_consumed
+            or transaction_capability
+            is not self.__evaluation_publication_capability
+        ):
+            raise EvaluationFailedClosedError(
+                "evaluation publication requires an unused transaction-bound "
+                "ContextService capability"
+            )
+        self.__evaluation_publication_consumed = True
         clock = self._store._authoritative_clock
         if clock is None:
             raise RuntimeError(
@@ -569,10 +743,24 @@ class _MemoryTransaction(ContextTransactionPort):
             raise StaleRevisionError(
                 "authoritative persistence changed during evaluation preparation"
             )
-        # The preparation callback is the last extensible operation. Resolve
-        # the complete authority again from this transaction's current local
-        # state so mutations staged through this same UoW cannot evade the
-        # store-generation check.
+        try:
+            normalized = _normalize_evaluation_preparation(prepared)
+        except (AthenaValidationError, ValueError) as exc:
+            raise EvaluationFailedClosedError(
+                "prepared evaluation artifact failed canonical validation"
+            ) from exc
+        prepared = normalized.prepared
+        command_scope_json = (
+            condition.command.authorized_scope.canonical_json()
+        )
+        if self._store._transaction_generation != self._base_generation:
+            raise StaleRevisionError(
+                "authoritative persistence changed during evaluation "
+                "normalization"
+            )
+        # Preparation and every untrusted/delay-capable serialization are now
+        # complete. Resolve authority from this transaction's current local
+        # state so same-UoW mutations cannot evade the generation check.
         authority_checked_at = ensure_timestamp(clock.now())
         authority_unit_of_work = TransactionEvaluationAuthorityUnitOfWork(
             context_transaction=self,
@@ -603,6 +791,29 @@ class _MemoryTransaction(ContextTransactionPort):
             manifest=resolved.view.published.manifest,
             as_of=authority_checked_at,
         )
+        if authority_checked_at >= prepared.snapshot.expires_at:
+            raise EvaluationFailedClosedError(
+                "snapshot became stale before publication"
+            )
+        authoritative_findings = (
+            verify_and_evaluate_snapshot_for_publication(
+                snapshot=prepared.snapshot,
+                approval=approval,
+                publisher=condition.actor,
+                publication_actor=condition.publication_actor,
+                resolved=resolved,
+                private_mcp_endpoint=condition.private_mcp_endpoint,
+                authorized_scope=condition.command.authorized_scope,
+                reason=condition.command.reason,
+                envelope_attempt_id=prepared.envelope_attempt_id,
+                envelope=prepared.envelope,
+                trusted_key=current_trusted_key,
+                trusted_key_anchor=condition.trusted_key_anchor,
+                as_of=authority_checked_at,
+            )
+            if current_trusted_key is not None
+            else ()
+        )
         if (
             current_trusted_key is None
             or current_trusted_key.authority_token()
@@ -613,19 +824,18 @@ class _MemoryTransaction(ContextTransactionPort):
             or prepared.resolved_profile_digest
             != resolved.profile.resolved_profile_digest
             or prepared.actor != condition.actor
+            or prepared.publication_actor
+            != condition.publication_actor
             or prepared.idempotency_key != condition.idempotency_key
             or prepared.request_digest != condition.request_digest
             or prepared.private_mcp_endpoint
             != condition.private_mcp_endpoint
-            or prepared.authorized_scope.canonical_json()
-            != condition.command.authorized_scope.canonical_json()
+            or normalized.authorized_scope_json
+            != command_scope_json
             or prepared.reason != condition.command.reason
             or prepared.temporal_validity != expected_temporal_validity
-            or build_evaluation_evidence_binding_digest(
-                prepared.snapshot,
-                envelope_attempt_id=prepared.envelope_attempt_id,
-                envelope=prepared.envelope,
-            )
+            or prepared.findings != authoritative_findings
+            or normalized.evidence_binding_digest
             != condition.evidence_binding_digest
         ):
             raise StaleRevisionError(
@@ -638,12 +848,14 @@ class _MemoryTransaction(ContextTransactionPort):
             )
         published_at = ensure_timestamp(clock.now())
         # No caller-provided or overridable behavior executes after this read.
-        # The sealed finalizer only compares captured bounds, builds canonical
-        # records, and immediately stages both artifact and receipt.
+        # The sealed finalizer only compares primitive captured bounds, binds
+        # the timestamp to prevalidated material, and immediately stages the
+        # artifact and receipt.
         artifact = _finalize_prepared_evaluation(
             prepared,
             published_at=published_at,
             trusted_key=current_trusted_key,
+            material=normalized.material,
         )
         receipt_key = (artifact.actor_id, artifact.idempotency_key)
         if receipt_key in self._evaluation_receipts:
@@ -661,6 +873,6 @@ class _MemoryTransaction(ContextTransactionPort):
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]:
         return tuple(
-            self._evaluation_artifacts[snapshot_id]
+            deepcopy(self._evaluation_artifacts[snapshot_id])
             for snapshot_id in sorted(self._evaluation_artifacts)
         )

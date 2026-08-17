@@ -13,13 +13,17 @@ from athena_context.api.domain import (
 )
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
+    AuthorizedSnapshotPublication,
     DemoEvaluationApproval,
     DemoEvaluationCommand,
+    DemoEvaluationResult,
     EvaluationAuthorityToken,
     PublishedContextSelection,
     ResolvedPublishedContext,
     TrustedKeyAuthorityToken,
     VerifiedWc008DeploymentConfiguration,
+    build_authorized_publication,
+    build_demo_evaluation_result,
 )
 from athena_context.contracts import (
     EvidenceScope,
@@ -46,16 +50,72 @@ class SnapshotSigningRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredEvaluationMaterial:
+    """Validated immutable columns rendered only outside the commit operation."""
+
+    snapshot: EvidenceSnapshot
+    snapshot_json: str
+    approval: DemoEvaluationApproval
+    actor: Actor
+    publication_actor: Actor
+    resolved_profile_digest: str
+    private_mcp_endpoint: str
+    authorized_scope: EvidenceScope
+    reason: str
+    findings: tuple[ManifestFinding, ...]
+
+    def publication(
+        self,
+        published_at: datetime,
+    ) -> AuthorizedSnapshotPublication:
+        return build_authorized_publication(
+            snapshot=self.snapshot,
+            approval=self.approval,
+            publisher=self.actor,
+            publication_actor=self.publication_actor,
+            published_at=published_at,
+            resolved_profile_digest=self.resolved_profile_digest,
+            endpoint=self.private_mcp_endpoint,
+            scope=self.authorized_scope,
+            reason=self.reason,
+        )
+
+    def result(self, published_at: datetime) -> DemoEvaluationResult:
+        return build_demo_evaluation_result(
+            publication=self.publication(published_at),
+            snapshot=self.snapshot,
+            findings=self.findings,
+            evaluated_at=published_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StoredEvaluation:
     actor_id: str
     idempotency_key: str
     request_digest: str
     snapshot_id: str
-    result_json: str
-    snapshot_json: str
-    publication_json: str
+    published_at: datetime
+    material: StoredEvaluationMaterial
     envelope_attempt_id: str
     envelope: ValidatedEnvelope
+
+    @property
+    def result_json(self) -> str:
+        return self.material.result(self.published_at).model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
+
+    @property
+    def snapshot_json(self) -> str:
+        return self.material.snapshot_json
+
+    @property
+    def publication_json(self) -> str:
+        return self.material.publication(self.published_at).model_dump_json(
+            exclude_none=True
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +240,7 @@ class EvaluationCommitAuthorityCondition:
 
     reader_actor: Actor
     actor: Actor
+    publication_actor: Actor
     command: DemoEvaluationCommand
     expected_authority: EvaluationAuthorityToken
     private_mcp_endpoint: str
@@ -200,6 +261,13 @@ type EvaluationArtifactPreparation = Callable[
 @runtime_checkable
 class EvaluationAuthorityTransactionPort(Protocol):
     """Evaluation state implemented by the actual Context API transaction."""
+
+    def _open_context_service_evaluation_publication(
+        self,
+        service_capability: object,
+    ) -> object:
+        """Create one transaction-bound, single-use publication permit."""
+        ...
 
     def get_demo_evaluation_approval(
         self,
@@ -245,12 +313,13 @@ class EvaluationAuthorityTransactionPort(Protocol):
         expected_revision: int,
     ) -> None: ...
 
-    def put_evaluation_conditionally(
+    def _put_context_service_evaluation(
         self,
+        transaction_capability: object,
         condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
-        """Re-resolve complete authority, seal-finalize, and atomically insert."""
+        """Service-private conditional publication; never a general store write."""
         ...
 
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
@@ -323,6 +392,16 @@ class EvaluationAuthorityUnitOfWorkPort(Protocol):
     def list_evaluations(self) -> tuple[StoredEvaluation, ...]: ...
 
 
+@runtime_checkable
+class ContextServiceEvaluationPublicationStorePort(Protocol):
+    """Backend contract that binds publication to one ContextService owner."""
+
+    def _bind_context_service_evaluation_publication(
+        self,
+        capability: object,
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class EvaluationCommitCandidate:
     """Evaluated immutable inputs awaiting one conditional authority transaction."""
@@ -374,6 +453,7 @@ class SnapshotSigningPort(Protocol):
 
 __all__ = [
     "ConfiguredEvidenceClientPort",
+    "ContextServiceEvaluationPublicationStorePort",
     "EvaluationArtifactPreparation",
     "EvaluationCommitAuthorityCondition",
     "EvaluationAuthorityTransactionPort",

@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+from inspect import stack
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
@@ -38,11 +39,15 @@ from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
 from athena_context.api.evaluation_ports import (
+    EvaluationCommitAuthorityCondition,
     EvaluationCommitCandidate,
     EvaluationTrustedKeyAuthority,
+    PreparedEvaluationArtifact,
     SnapshotSigningRequest,
+    build_evaluation_evidence_binding_digest,
 )
 from athena_context.contracts import (
+    EvidenceSnapshot,
     NormalizationCollisionError,
     canonicalize_json,
     compute_artifact_digest,
@@ -337,10 +342,11 @@ def _mutate_same_uow_after_extensible_preparation(
     def transaction() -> Iterator[Any]:
         with original_transaction() as active_transaction:
             original_insert = (
-                active_transaction.put_evaluation_conditionally
+                active_transaction._put_context_service_evaluation
             )
 
             def insert_with_same_uow_mutation(
+                capability: object,
                 condition: object,
                 artifact_preparation: Callable[[object], object],
             ) -> object:
@@ -352,11 +358,12 @@ def _mutate_same_uow_after_extensible_preparation(
                     return prepared
 
                 return original_insert(
+                    capability,
                     condition,
                     mutate_after_preparation,
                 )
 
-            active_transaction.put_evaluation_conditionally = (  # type: ignore[method-assign]
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
                 insert_with_same_uow_mutation
             )
             yield active_transaction
@@ -382,6 +389,77 @@ def _delay_final_authority_or_persistence(
         )
         return
     raise AssertionError(f"unsupported commit delay location: {location}")
+
+
+def _capture_conditional_publication_inputs(
+    harness: DemoHarness,
+) -> tuple[
+    EvaluationCommitAuthorityCondition,
+    PreparedEvaluationArtifact,
+]:
+    """Capture a valid request while forcing the owning service to roll back."""
+
+    captured: dict[str, object] = {}
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def capture_before_insert(
+                capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                del capability
+                trusted_key = (
+                    active_transaction.get_demo_evaluation_trusted_key(
+                        condition.trusted_key_anchor
+                    )
+                )
+                assert trusted_key is not None
+                captured["condition"] = condition
+                captured["prepared"] = artifact_preparation(trusted_key)
+                raise EvaluationFailedClosedError(
+                    "captured direct transaction test inputs"
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                capture_before_insert
+            )
+            try:
+                yield active_transaction
+            finally:
+                active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                    original_insert
+                )
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="captured direct transaction",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                "wc013-capture-private-publication-inputs",
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+
+    condition = captured["condition"]
+    prepared = captured["prepared"]
+    assert isinstance(condition, EvaluationCommitAuthorityCondition)
+    assert isinstance(prepared, PreparedEvaluationArtifact)
+    return condition, prepared
 
 
 @pytest.mark.parametrize(
@@ -903,6 +981,260 @@ def test_same_uow_authority_mutation_after_preparation_rolls_back(
     assert harness.context_resolver.view.supersession is None
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
+    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+
+
+def test_direct_transaction_cannot_publish_with_no_grant_and_forged_approval() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    condition, prepared = _capture_conditional_publication_inputs(harness)
+    forged_approval = harness.approval.model_copy(
+        update={
+            "decision_id": "approval-wc013-direct-forged",
+            "revision": 1,
+        }
+    )
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="ContextService capability",
+    ), harness.context_resolver.store.transaction() as transaction:
+        assert not hasattr(transaction, "put_evaluation_conditionally")
+        grants, revision = transaction.get_evaluation_grants()
+        assert grants
+        transaction.replace_evaluation_grants(
+            (),
+            expected_revision=revision,
+        )
+        transaction.put_demo_evaluation_approval(
+            forged_approval,
+            expected_revision=None,
+        )
+        transaction._put_context_service_evaluation(
+            object(),
+            condition,
+            lambda trusted_key: prepared,
+        )
+
+    current_grants, _ = (
+        harness.context_resolver.service.get_demo_evaluation_grants(
+            PUBLISHER
+        )
+    )
+    assert current_grants
+    assert harness.approval_registry.resolve(
+        forged_approval.decision_id
+    ) is None
+    _assert_no_artifact(
+        harness=harness,
+        idempotency_key=condition.idempotency_key,
+    )
+
+
+def test_direct_transaction_cannot_publish_invalid_snapshot_signature() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    condition, prepared = _capture_conditional_publication_inputs(harness)
+    invalid_attestation = prepared.snapshot.snapshot_attestation.model_copy(
+        update={
+            "signature": "A"
+            * len(prepared.snapshot.snapshot_attestation.signature)
+        }
+    )
+    invalid_snapshot = prepared.snapshot.model_copy(
+        update={"snapshot_attestation": invalid_attestation}
+    )
+    EvidenceSnapshot.model_validate_json(invalid_snapshot.canonical_json())
+    invalid_prepared = replace(prepared, snapshot=invalid_snapshot)
+    preparation_called = False
+
+    def supply_invalid_artifact(
+        trusted_key: EvaluationTrustedKeyAuthority,
+    ) -> PreparedEvaluationArtifact:
+        nonlocal preparation_called
+        del trusted_key
+        preparation_called = True
+        return invalid_prepared
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="ContextService capability",
+    ), harness.context_resolver.store.transaction() as transaction:
+        transaction._put_context_service_evaluation(
+            object(),
+            condition,
+            supply_invalid_artifact,
+        )
+
+    assert preparation_called is False
+    _assert_no_artifact(
+        harness=harness,
+        idempotency_key=condition.idempotency_key,
+    )
+
+
+def test_persistence_reverifies_signature_after_service_preparation() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    store = harness.context_resolver.store
+    original_transaction = store.transaction
+
+    @contextmanager
+    def transaction() -> Iterator[Any]:
+        with original_transaction() as active_transaction:
+            original_insert = (
+                active_transaction._put_context_service_evaluation
+            )
+
+            def replace_with_invalid_signature(
+                transaction_capability: object,
+                condition: EvaluationCommitAuthorityCondition,
+                artifact_preparation: Callable[
+                    [EvaluationTrustedKeyAuthority],
+                    PreparedEvaluationArtifact,
+                ],
+            ) -> object:
+                trusted_key = (
+                    active_transaction.get_demo_evaluation_trusted_key(
+                        condition.trusted_key_anchor
+                    )
+                )
+                assert trusted_key is not None
+                prepared = artifact_preparation(trusted_key)
+                invalid_attestation = (
+                    prepared.snapshot.snapshot_attestation.model_copy(
+                        update={
+                            "signature": "A"
+                            * len(
+                                prepared.snapshot
+                                .snapshot_attestation.signature
+                            )
+                        }
+                    )
+                )
+                invalid_snapshot = prepared.snapshot.model_copy(
+                    update={
+                        "snapshot_attestation": invalid_attestation
+                    }
+                )
+                invalid_prepared = replace(
+                    prepared,
+                    snapshot=invalid_snapshot,
+                )
+                invalid_condition = replace(
+                    condition,
+                    evidence_binding_digest=(
+                        build_evaluation_evidence_binding_digest(
+                            invalid_snapshot,
+                            envelope_attempt_id=(
+                                invalid_prepared.envelope_attempt_id
+                            ),
+                            envelope=invalid_prepared.envelope,
+                        )
+                    ),
+                )
+                return original_insert(
+                    transaction_capability,
+                    invalid_condition,
+                    lambda _: invalid_prepared,
+                )
+
+            active_transaction._put_context_service_evaluation = (  # type: ignore[method-assign]
+                replace_with_invalid_signature
+            )
+            yield active_transaction
+
+    store.transaction = transaction  # type: ignore[method-assign]
+    idempotency_key = "wc013-persistence-invalid-signature"
+    try:
+        with pytest.raises(
+            EvaluationFailedClosedError,
+            match="snapshot verification or policy evaluation failed",
+        ):
+            harness.service.evaluate(
+                PUBLISHER,
+                idempotency_key,
+                harness.command,
+            )
+    finally:
+        store.transaction = original_transaction  # type: ignore[method-assign]
+
+    _assert_no_artifact(
+        harness=harness,
+        idempotency_key=idempotency_key,
+    )
+
+
+def test_adversarial_snapshot_canonicalization_delay_cannot_backdate_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    from athena_context.api import evaluation_service as service_module
+
+    original_finalize = service_module.finalize_signed_snapshot
+    delayed = False
+
+    class DelayingSnapshot(EvidenceSnapshot):
+        def canonical_json(self) -> str:
+            nonlocal delayed
+            if (
+                not delayed
+                and any(
+                    frame.function == "_normalize_evaluation_preparation"
+                    for frame in stack()
+                )
+            ):
+                delayed = True
+                # Align the deterministic clock one second before expiry,
+                # then reproduce the reviewer's 1001 ms serialization delay.
+                harness.clock.advance(
+                    self.expires_at
+                    - harness.clock.value
+                    - timedelta(seconds=1)
+                )
+                harness.clock.advance(timedelta(milliseconds=1001))
+            return super().canonical_json()
+
+    def finalize_with_adversarial_snapshot(
+        *args: object,
+        **kwargs: object,
+    ) -> EvidenceSnapshot:
+        snapshot = original_finalize(*args, **kwargs)  # type: ignore[arg-type]
+        return DelayingSnapshot.model_validate(
+            snapshot.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+
+    monkeypatch.setattr(
+        service_module,
+        "finalize_signed_snapshot",
+        finalize_with_adversarial_snapshot,
+    )
+    idempotency_key = "wc013-adversarial-canonical-delay"
+
+    with pytest.raises(
+        EvaluationFailedClosedError,
+        match="snapshot became stale",
+    ):
+        harness.service.evaluate(
+            PUBLISHER,
+            idempotency_key,
+            harness.command,
+        )
+
+    assert delayed is True
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 

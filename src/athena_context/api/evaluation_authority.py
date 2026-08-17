@@ -133,10 +133,12 @@ class TransactionEvaluationAuthorityUnitOfWork:
         context_transaction: ContextTransactionPort,
         evaluation_transaction: EvaluationAuthorityTransactionPort,
         reader_actor: Actor,
+        publication_capability: object | None = None,
     ) -> None:
         self._context_transaction = context_transaction
         self._evaluation_transaction = evaluation_transaction
         self._reader_actor = reader_actor
+        self._publication_capability = publication_capability
 
     def resolve_context(
         self,
@@ -290,7 +292,18 @@ class TransactionEvaluationAuthorityUnitOfWork:
         condition: EvaluationCommitAuthorityCondition,
         artifact_preparation: EvaluationArtifactPreparation,
     ) -> StoredEvaluation:
-        return self._evaluation_transaction.put_evaluation_conditionally(
+        capability = self._publication_capability
+        if capability is None:
+            raise EvaluationFailedClosedError(
+                "evaluation publication requires the ContextService-owned "
+                "transaction capability"
+            )
+        transaction_capability = (
+            self._evaluation_transaction
+            ._open_context_service_evaluation_publication(capability)
+        )
+        return self._evaluation_transaction._put_context_service_evaluation(
+            transaction_capability,
             condition,
             artifact_preparation,
         )

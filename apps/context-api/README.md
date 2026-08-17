@@ -67,19 +67,28 @@ The integration composes the merged components without introducing direct Azure 
   and all associated revisions and digests from the transaction's current local state. No
   overridable hook receives the active unit of work. A mutation staged through that same unit of
   work during preparation therefore aborts and rolls back with the artifact and receipt.
-  Persistence then obtains its authoritative insertion timestamp and runs its own sealed,
-  bounded, no-I/O finalizer. No caller-supplied callback runs after the timestamp. The finalizer
-  revalidates the already loaded exact approval,
+  Persistence independently reverifies the exact RSA snapshot/envelope proof against the
+  transaction-owned key and recomputes WC-004 findings rather than trusting a prepared artifact.
+  Before obtaining its authoritative insertion timestamp it removes caller model subclasses,
+  canonicalizes the snapshot/scope/envelope, constructs every digest, validates and round-trips
+  the publication/result schemas, and packages base-model-only immutable storage material.
+  It then obtains its authoritative insertion timestamp and runs its own sealed, bounded, no-I/O
+  finalizer. No caller-supplied callback, model serialization, canonicalization, cryptography, or
+  policy work runs after the timestamp. The finalizer revalidates the already loaded exact approval,
   complete profile governance and risk acceptances, bound key trust, snapshot expiry, and every
   policy evidence-freshness bound at that exact value. Prepared findings are accepted only when
-  those immutable findings are proven temporally unchanged at insertion; the same value is used
-  for `publishedAt` and `evaluatedAt`. No hook, authority read, trust lookup, cryptographic
+  they exactly equal the persistence-recomputed findings and are proven temporally unchanged at
+  insertion; the same value is used for `publishedAt` and `evaluatedAt`. No hook, authority read, trust lookup, cryptographic
   operation, policy evaluator, or independently supplied persistence call can run between
-  timestamp acquisition and insertion. Findings supplied by preflight orchestration are never
-  accepted as commit inputs.
+  timestamp acquisition and insertion. Timestamp-dependent JSON and digests are deterministic
+  projections of the immutable committed columns and are rendered only after the transaction has
+  committed, so output serialization cannot backdate the state change.
   The operation inserts the idempotency receipt, snapshot, source envelope, publication, and final
   recomputed result as one state change. No independently supplied commit capability can redirect
-  publication to a foreign store. The HTTP composition root accepts only non-authoritative
+  publication to a foreign store. The store binds one opaque root capability to its owning
+  `ContextService`; only the service can exchange it, after full validation, for a transaction-local
+  single-use permit. The public transaction surface has no general evaluation-artifact write, and
+  fabricated permits or prepared artifacts fail before callbacks or state mutation. The HTTP composition root accepts only non-authoritative
   evidence/configuration/signing dependencies and constructs the demo service with the exact
   app-owned `ContextService`; preconstructed demo services are rejected.
 

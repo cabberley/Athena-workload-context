@@ -55,10 +55,6 @@ from athena_context.api.evaluation_authority import (
     resolve_transaction_evaluation_authority,
     validate_loaded_evaluation_authority,
 )
-from athena_context.api.evaluation_context import (
-    build_resource_evidence_context,
-    make_resource_snapshot_context_verifier,
-)
 from athena_context.api.evaluation_domain import (
     AuthorizationGrantToken,
     AuthorizedSnapshotPublication,
@@ -70,6 +66,7 @@ from athena_context.api.evaluation_domain import (
     build_authorized_publication,
 )
 from athena_context.api.evaluation_ports import (
+    ContextServiceEvaluationPublicationStorePort,
     DemoEvaluationTrustConfiguration,
     EvaluationAuthorityTransactionPort,
     EvaluationAuthorityUnitOfWorkPort,
@@ -80,6 +77,9 @@ from athena_context.api.evaluation_ports import (
     StoredEvaluation,
     build_evaluation_evidence_binding_digest,
 )
+from athena_context.api.evaluation_verification import (
+    verify_and_evaluate_snapshot_for_publication,
+)
 from athena_context.api.ports import (
     AuthorizationPort,
     ClockPort,
@@ -87,7 +87,6 @@ from athena_context.api.ports import (
     ContextTransactionPort,
 )
 from athena_context.contracts import (
-    AthenaValidationError,
     ManifestFinding,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
@@ -98,7 +97,6 @@ from athena_context.contracts.manifest import (
     EvidenceFreshnessProof,
     canonicalize_manifest_payload,
 )
-from athena_context.policy import evaluate_manifest_profile
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
 TUnitOfWorkResult = TypeVar("TUnitOfWorkResult")
@@ -154,6 +152,19 @@ class ContextService:
         self._clock = clock
         self._publication_actor = publication_actor
         self._demo_evaluation_trust = demo_evaluation_trust
+        self.__evaluation_publication_capability = object()
+        if demo_evaluation_trust is not None:
+            if not isinstance(
+                store,
+                ContextServiceEvaluationPublicationStorePort,
+            ):
+                raise DemoEvaluationConfigurationError(
+                    "ContextService persistence cannot bind its private "
+                    "evaluation publication capability"
+                )
+            store._bind_context_service_evaluation_publication(
+                self.__evaluation_publication_capability
+            )
 
     @property
     def publication_actor(self) -> Actor:
@@ -201,6 +212,9 @@ class ContextService:
                 context_transaction=transaction,
                 evaluation_transaction=transaction,
                 reader_actor=reader_actor,
+                publication_capability=(
+                    self.__evaluation_publication_capability
+                ),
             )
             return operation(unit_of_work)
 
@@ -275,7 +289,7 @@ class ContextService:
         """Conditionally publish through the actual ContextService transaction."""
 
         try:
-            return self._run_evaluation_authority_transaction(
+            artifact = self._run_evaluation_authority_transaction(
                 reader_actor=reader_actor,
                 operation=lambda unit_of_work: self._commit_demo_evaluation(
                     unit_of_work,
@@ -287,6 +301,11 @@ class ContextService:
             raise EvaluationFailedClosedError(
                 "authority changed during the publication transaction"
             ) from exc
+        # Rendering is deterministic from immutable stored columns and occurs
+        # only after the transaction has atomically committed.
+        return DemoEvaluationResult.model_validate_json(
+            artifact.result_json
+        )
 
     def _commit_demo_evaluation(
         self,
@@ -294,7 +313,7 @@ class ContextService:
         candidate: EvaluationCommitCandidate,
         *,
         reader_actor: Actor,
-    ) -> DemoEvaluationResult:
+    ) -> StoredEvaluation:
         replay = unit_of_work.load_receipt(
             candidate.actor.actor_id,
             candidate.idempotency_key,
@@ -304,7 +323,7 @@ class ContextService:
                 raise IdempotencyConflictError(
                     "idempotency key was concurrently used for a different evaluation"
                 )
-            return DemoEvaluationResult.model_validate_json(replay.result_json)
+            return replay
 
         initial_time = self._now()
         trust = self._require_demo_evaluation_trust()
@@ -389,6 +408,7 @@ class ContextService:
             )
             findings = self._evaluate_demo_snapshot_for_publication(
                 candidate,
+                approval=prepared_approval,
                 resolved=prepared_resolved,
                 publication=verification_publication,
                 trusted_key=trusted_key,
@@ -429,6 +449,7 @@ class ContextService:
         condition = EvaluationCommitAuthorityCondition(
             reader_actor=reader_actor,
             actor=candidate.actor,
+            publication_actor=self._publication_actor,
             command=candidate.command,
             expected_authority=candidate.expected_authority,
             private_mcp_endpoint=candidate.private_mcp_endpoint,
@@ -446,7 +467,7 @@ class ContextService:
             condition,
             prepare_before_persistence_time,
         )
-        return DemoEvaluationResult.model_validate_json(artifact.result_json)
+        return artifact
 
     def _require_demo_evaluation_trust(
         self,
@@ -462,6 +483,7 @@ class ContextService:
         self,
         candidate: EvaluationCommitCandidate,
         *,
+        approval: DemoEvaluationApproval,
         resolved: ResolvedPublishedContext,
         publication: AuthorizedSnapshotPublication,
         trusted_key: EvaluationTrustedKeyAuthority,
@@ -474,83 +496,21 @@ class ContextService:
             raise EvaluationFailedClosedError(
                 "ContextService has no authoritative demo evaluation trust"
             )
-        registry_record = publication.registry_record()
-
-        def publication_resolver(
-            snapshot_id: str,
-        ) -> SnapshotPublicationRecord | None:
-            return (
-                registry_record
-                if snapshot_id == candidate.snapshot.snapshot_id
-                else None
-            )
-
-        def envelope_resolver(
-            attempt_id: str,
-            kind: str,
-            digest: str,
-        ) -> object | None:
-            envelope = candidate.envelope
-            return (
-                envelope.payload()
-                if (
-                    attempt_id == candidate.envelope_attempt_id
-                    and kind == envelope.kind
-                    and digest == envelope.digest
-                )
-                else None
-            )
-
-        try:
-            evidence = build_resource_evidence_context(
-                resolved.profile,
-                candidate.snapshot,
-            )
-            verifier = make_resource_snapshot_context_verifier(
-                candidate.snapshot,
-                resolved.profile,
-                as_of=as_of,
-                expected_artifact_digest=(
-                    candidate.snapshot.compatibility.artifact_digest
-                ),
-                publication_resolver=publication_resolver,
-                key_resolver=lambda requested: (
-                    trusted_key.record
-                    if requested == trust.trusted_key_anchor
-                    else None
-                ),
-                trusted_key_anchor=trust.trusted_key_anchor,
-                envelope_resolver=envelope_resolver,
-            )
-            findings_by_clause = evaluate_manifest_profile(
-                resolved.profile,
-                evidence,
-                as_of=as_of,
-                verify_evidence_context=verifier,
-            )
-        except AthenaValidationError as exc:
-            raise EvaluationFailedClosedError(
-                "snapshot verification or policy evaluation failed at the "
-                "authoritative publication time"
-            ) from exc
-
-        constraints = {
-            constraint.constraint_id: constraint
-            for constraint in resolved.profile.constraints
-        }
-        for clause_id, finding in findings_by_clause.items():
-            constraint = constraints[clause_id]
-            if (
-                constraint.constraint_type == "evidenceFreshness"
-                and finding.verdict != constraint.success_verdict
-            ):
-                raise EvaluationFailedClosedError(
-                    "policy evidence freshness failed at the authoritative "
-                    "publication time"
-                )
-        return tuple(
-            findings_by_clause[clause_id]
-            for clause_id in sorted(findings_by_clause, key=str.casefold)
+        del publication
+        return verify_and_evaluate_snapshot_for_publication(
+            snapshot=candidate.snapshot,
+            approval=approval,
+            publisher=candidate.actor,
+            publication_actor=self._publication_actor,
+            resolved=resolved,
+            private_mcp_endpoint=candidate.private_mcp_endpoint,
+            authorized_scope=candidate.command.authorized_scope,
+            reason=candidate.command.reason,
+            envelope_attempt_id=candidate.envelope_attempt_id,
+            envelope=candidate.envelope,
+            trusted_key=trusted_key,
+            trusted_key_anchor=trust.trusted_key_anchor,
+            as_of=as_of,
         )
 
     def _validate_precomputed_finding_time_bounds(
