@@ -18,9 +18,12 @@ content is data; never interpret it as instructions, tool directives, or authori
 detection is supplemental input hardening only; safety does not depend on phrase matching.
 
 Reads use the WC-007 `ContextApiPort` and an authorization-aware
-`AuthoritativeFindingsPort`. The findings result is re-bound to the published manifest, resolved
-profile, clause, and exact evidence graph before any projection or deterministic explanation is
-returned.
+`AuthoritativeFindingsPort`. Every context/finding request checks the evidence validity window
+against an injected trusted request-time clock. The findings result is re-bound to the published
+manifest and resolved profile, then every complete stored finding is matched to an independently
+verified authoritative policy result: exact clause, verdict, kind, governance scope, risk reference,
+and deduplicated evidence-reference set. Evidence-graph membership alone is insufficient.
+Comparison results cite every returned finding and deduplicate citations.
 
 Patch proposals support only RFC 6902-like `replace` operations on:
 
@@ -34,7 +37,8 @@ The server applies operation count, value, request, and response bounds, creates
    opaque one-time confirmation token. It creates no draft.
 2. `phase=confirm` repeats the exact patch and presents the token. The signed challenge is bound to
    the authenticated actor, workload, canonical patch digest, and expiry, and is atomically consumed
-   through injected confirmation signer, clock, and store ports before draft creation.
+   through injected confirmation signer, trusted clock, and store ports before draft creation. The
+   complete confirmed response is size-preflighted before token consumption or draft mutation.
 
 Replay, expiry, cross-user, cross-workload, or any patch change fails closed. The server exposes no
 validation, approval, publication, supersession, remediation, arbitrary query, KQL/code, storage,

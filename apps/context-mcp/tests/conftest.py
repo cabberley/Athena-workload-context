@@ -33,6 +33,7 @@ from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
+    ManifestFinding,
     canonicalize_manifest_payload,
     resolve_manifest_profile,
 )
@@ -139,6 +140,13 @@ class FindingsPort:
     ) -> None:
         self.views = views
         self.calls: list[tuple[str, str, str, str]] = []
+        self.verification_calls: list[tuple[str, str, str]] = []
+        self.verified_findings = {
+            key: tuple(
+                finding.model_copy(deep=True) for finding in view.findings
+            )
+            for key, view in views.items()
+        }
 
     def get_policy_view(
         self,
@@ -154,6 +162,31 @@ class FindingsPort:
         if actor != AGENT or manifest_id != WORKLOAD_ID:
             raise AssertionError("findings port received an unauthorized scope")
         return self.views[(manifest_id, manifest_version, profile_id.casefold())]
+
+    def verify_policy_result(
+        self,
+        actor: Actor,
+        *,
+        view: AuthoritativePolicyView,
+    ) -> tuple[ManifestFinding, ...]:
+        self.verification_calls.append(
+            (
+                actor.actor_id,
+                view.profile.manifest_id,
+                view.profile.profile_id,
+            )
+        )
+        if actor != AGENT or view.profile.manifest_id != WORKLOAD_ID:
+            raise AssertionError("policy verifier received an unauthorized scope")
+        key = (
+            view.profile.manifest_id,
+            view.profile.manifest_version,
+            view.profile.profile_id.casefold(),
+        )
+        return tuple(
+            finding.model_copy(deep=True)
+            for finding in self.verified_findings[key]
+        )
 
 
 @dataclass(frozen=True)
@@ -341,7 +374,7 @@ def harness() -> Harness:
             findings=findings_port,
             confirmation_signer=confirmation_signer,
             confirmation_store=confirmation_store,
-            confirmation_clock=confirmation_clock,
+            trusted_clock=confirmation_clock,
         ),
         service=service,
         findings=findings_port,

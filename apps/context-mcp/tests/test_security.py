@@ -190,7 +190,7 @@ def test_patch_count_and_input_output_byte_bounds_fail_closed(
         findings=harness.findings,
         confirmation_signer=harness.confirmation_signer,
         confirmation_store=harness.confirmation_store,
-        confirmation_clock=harness.confirmation_clock,
+        trusted_clock=harness.confirmation_clock,
         max_output_bytes=256,
     )
     with pytest.raises(ToolResponseTooLargeError, match="byte bound"):
@@ -227,6 +227,138 @@ def test_fabricated_finding_reference_is_rejected_before_explanation(
                 "manifest_version": "1.1.0",
                 "profile_id": "production",
                 "clause_id": finding.clause_id,
+            },
+            harness.context,
+        )
+
+
+def test_fabricated_verdict_is_rejected_by_authoritative_verification(
+    harness: Harness,
+) -> None:
+    original = harness.policy_views["production"]
+    finding = original.findings[0]
+    altered_finding = finding.model_copy(
+        update={"verdict": "violation" if finding.verdict != "violation" else "pass"}
+    )
+    harness.findings.views[(WORKLOAD_ID, "1.1.0", "production")] = (
+        original.model_copy(
+            update={"findings": (altered_finding, *original.findings[1:])}
+        )
+    )
+
+    with pytest.raises(ToolGroundingError, match="authoritative verified result"):
+        harness.server.call_tool(
+            "explain_finding",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_id": "production",
+                "clause_id": finding.clause_id,
+            },
+            harness.context,
+        )
+
+
+def test_unrelated_graph_valid_evidence_reference_is_rejected(
+    harness: Harness,
+) -> None:
+    original = harness.policy_views["production"]
+    finding = original.findings[0]
+    finding_refs = {
+        reference.canonical_json() for reference in finding.evidence_refs
+    }
+    graph_refs = tuple(
+        item.evidence_ref
+        for collection in (
+            original.evidence.resources,
+            original.evidence.relationships,
+            original.evidence.controls,
+            original.evidence.objectives,
+        )
+        for item in collection
+    )
+    unrelated = next(
+        reference
+        for reference in graph_refs
+        if reference.canonical_json() not in finding_refs
+    )
+    altered_finding = finding.model_copy(update={"evidence_refs": [unrelated]})
+    harness.findings.views[(WORKLOAD_ID, "1.1.0", "production")] = (
+        original.model_copy(
+            update={"findings": (altered_finding, *original.findings[1:])}
+        )
+    )
+
+    with pytest.raises(ToolGroundingError, match="authoritative verified result"):
+        harness.server.call_tool(
+            "explain_finding",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_id": "production",
+                "clause_id": finding.clause_id,
+            },
+            harness.context,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "get_context",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_id": "production",
+            },
+        ),
+        (
+            "compare_environments",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_ids": ["production", "development"],
+            },
+        ),
+        (
+            "explain_finding",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_id": "production",
+                "clause_id": "db-zone-loss-spof",
+            },
+        ),
+    ],
+)
+def test_context_and_finding_tools_reject_evidence_expired_at_request_time(
+    harness: Harness,
+    tool_name: str,
+    arguments: dict[str, object],
+) -> None:
+    harness.confirmation_clock.value = (
+        harness.policy_views["production"].evidence.expires_at
+    )
+
+    with pytest.raises(ToolGroundingError, match="trusted request time"):
+        harness.server.call_tool(tool_name, arguments, harness.context)
+
+
+def test_resolve_resource_rejects_evidence_expired_at_request_time(
+    harness: Harness,
+) -> None:
+    policy = harness.policy_views["production"]
+    harness.confirmation_clock.value = policy.evidence.expires_at
+
+    with pytest.raises(ToolGroundingError, match="trusted request time"):
+        harness.server.call_tool(
+            "resolve_resource",
+            {
+                "workload_id": WORKLOAD_ID,
+                "manifest_version": "1.1.0",
+                "profile_id": "production",
+                "resource_id": policy.evidence.resources[0].resource_id,
             },
             harness.context,
         )
@@ -284,6 +416,59 @@ def test_preview_creates_no_draft_and_confirmation_is_one_time(
             confirmed_arguments,
             harness.context,
         )
+
+
+def test_confirm_response_preflight_prevents_draft_and_preserves_confirmation(
+    harness: Harness,
+) -> None:
+    arguments = _proposal_arguments()
+    preview = harness.server.call_tool(
+        "propose_manifest_patch",
+        arguments,
+        harness.context,
+    )
+    assert isinstance(preview, ManifestPatchOutput)
+    assert preview.confirmation is not None
+    confirmation = {
+        **arguments,
+        "phase": "confirm",
+        "confirmation_token": preview.confirmation.token,
+    }
+    drafts_before = len(
+        harness.service.list_drafts(
+            harness.context.authentication.actor,
+            manifest_id=WORKLOAD_ID,
+        )
+    )
+    tiny_output_server = ContextMcpServer(
+        context_api=harness.service,
+        findings=harness.findings,
+        confirmation_signer=harness.confirmation_signer,
+        confirmation_store=harness.confirmation_store,
+        trusted_clock=harness.confirmation_clock,
+        max_output_bytes=256,
+    )
+
+    with pytest.raises(ToolResponseTooLargeError, match="byte bound"):
+        tiny_output_server.call_tool(
+            "propose_manifest_patch",
+            confirmation,
+            harness.context,
+        )
+    assert len(
+        harness.service.list_drafts(
+            harness.context.authentication.actor,
+            manifest_id=WORKLOAD_ID,
+        )
+    ) == drafts_before
+
+    confirmed = harness.server.call_tool(
+        "propose_manifest_patch",
+        confirmation,
+        harness.context,
+    )
+    assert isinstance(confirmed, ManifestPatchOutput)
+    assert confirmed.phase == "confirmed"
 
 
 def test_confirmation_rejects_tampered_patch_and_expiry(harness: Harness) -> None:

@@ -67,11 +67,11 @@ from athena_context.agent.models import (
 )
 from athena_context.agent.ports import (
     AuthoritativeFindingsPort,
-    ConfirmationClockPort,
     ConfirmationSignerPort,
     ConfirmationStorePort,
     ContextApiPort,
     McpTransportPort,
+    TrustedClockPort,
 )
 from athena_context.api.domain import (
     Actor,
@@ -322,6 +322,14 @@ def _finding_citation(finding: ManifestFinding) -> Citation:
     )
 
 
+def _deduplicated_citations(citations: Sequence[Citation]) -> tuple[Citation, ...]:
+    unique: dict[str, Citation] = {}
+    for citation in citations:
+        key = citation.model_dump_json(exclude_none=True)
+        unique.setdefault(key, citation)
+    return tuple(unique.values())
+
+
 class ContextMcpServer:
     """Exact, transport-neutral MCP tool registry over authoritative ports."""
 
@@ -332,7 +340,7 @@ class ContextMcpServer:
         findings: AuthoritativeFindingsPort,
         confirmation_signer: ConfirmationSignerPort,
         confirmation_store: ConfirmationStorePort,
-        confirmation_clock: ConfirmationClockPort,
+        trusted_clock: TrustedClockPort,
         confirmation_ttl_seconds: int = 300,
         max_input_bytes: int = MAX_INPUT_BYTES,
         max_output_bytes: int = MAX_OUTPUT_BYTES,
@@ -347,7 +355,7 @@ class ContextMcpServer:
         self._findings = findings
         self._confirmation_signer = confirmation_signer
         self._confirmation_store = confirmation_store
-        self._confirmation_clock = confirmation_clock
+        self._trusted_clock = trusted_clock
         self._confirmation_ttl_seconds = confirmation_ttl_seconds
         self._max_input_bytes = max_input_bytes
         self._max_output_bytes = max_output_bytes
@@ -474,10 +482,13 @@ class ContextMcpServer:
 
         if not isinstance(response, spec.output_model):
             raise ToolGroundingError("tool handler returned an unexpected response contract")
+        self._ensure_response_bound(response)
+        return response
+
+    def _ensure_response_bound(self, response: AgentModel) -> None:
         payload = response.model_dump(mode="json", exclude_none=True)
         if _json_size(payload) > self._max_output_bytes:
             raise ToolResponseTooLargeError("tool response exceeds the byte bound")
-        return response
 
     def serve(self, transport: McpTransportPort) -> None:
         transport.run(
@@ -529,6 +540,11 @@ class ContextMcpServer:
             candidate.model_dump(mode="python", by_alias=True)
         )
         evidence = validated.evidence
+        request_time = ensure_timestamp(self._trusted_clock.now())
+        if not (evidence.collected_at <= request_time < evidence.expires_at):
+            raise ToolGroundingError(
+                "authoritative evidence is stale or expired at trusted request time"
+            )
         if (
             len(evidence.resources) > MAX_POLICY_RESOURCES
             or len(validated.findings) > MAX_POLICY_FINDINGS
@@ -543,7 +559,80 @@ class ContextMcpServer:
             raise ToolGroundingError(
                 "findings port profile differs from the published manifest"
             )
+        verified_findings = self._findings.verify_policy_result(
+            actor,
+            view=validated,
+        )
+        verified_view = AuthoritativePolicyView.model_validate(
+            {
+                **validated.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude={"findings"},
+                ),
+                "findings": tuple(
+                    finding.model_dump(
+                        mode="python",
+                        by_alias=True,
+                        exclude_none=False,
+                    )
+                    for finding in verified_findings
+                ),
+            }
+        )
+        self._require_exact_verified_findings(
+            validated.findings,
+            verified_view.findings,
+        )
         return validated
+
+    @staticmethod
+    def _require_exact_verified_findings(
+        candidate: tuple[ManifestFinding, ...],
+        verified: tuple[ManifestFinding, ...],
+    ) -> None:
+        candidate_by_clause = {
+            finding.clause_id.casefold(): finding for finding in candidate
+        }
+        verified_by_clause = {
+            finding.clause_id.casefold(): finding for finding in verified
+        }
+        if (
+            len(candidate_by_clause) != len(candidate)
+            or len(verified_by_clause) != len(verified)
+            or candidate_by_clause.keys() != verified_by_clause.keys()
+        ):
+            raise ToolGroundingError(
+                "stored findings differ from authoritative verified clauses"
+            )
+        for clause_id, finding in candidate_by_clause.items():
+            expected = verified_by_clause[clause_id]
+            candidate_refs = [
+                reference.canonical_json() for reference in finding.evidence_refs
+            ]
+            verified_refs = [
+                reference.canonical_json() for reference in expected.evidence_refs
+            ]
+            if (
+                finding.clause_id != expected.clause_id
+                or finding.verdict != expected.verdict
+                or finding.finding_kind != expected.finding_kind
+                or finding.manifest_id != expected.manifest_id
+                or finding.manifest_version != expected.manifest_version
+                or finding.profile_id != expected.profile_id
+                or (
+                    finding.resolved_profile_digest
+                    != expected.resolved_profile_digest
+                )
+                or finding.governance_scope != expected.governance_scope
+                or finding.risk_acceptance_ref != expected.risk_acceptance_ref
+                or len(candidate_refs) != len(set(candidate_refs))
+                or len(verified_refs) != len(set(verified_refs))
+                or set(candidate_refs) != set(verified_refs)
+            ):
+                raise ToolGroundingError(
+                    "stored finding differs from authoritative verified result"
+                )
 
     def _list_workloads(
         self,
@@ -1116,7 +1205,6 @@ class ContextMcpServer:
             for index, policy in enumerate(policies)
         )
         differences: list[ClauseDifference] = []
-        citations: list[Citation] = []
         for clause in selected_clauses:
             present = [
                 findings.get(clause) for findings in findings_by_profile
@@ -1165,13 +1253,16 @@ class ContextMcpServer:
                     ),
                 )
             )
-            citations.extend(
+        citations = _deduplicated_citations(
+            tuple(
                 _finding_citation(finding)
-                for finding in present
-                if finding is not None
+                for findings in findings_by_profile
+                for clause in selected_clauses
+                if (finding := findings.get(clause)) is not None
             )
+        )
         if not citations:
-            citations = [
+            citations = tuple(
                 _manifest_citation(
                     published,
                     profile_id=policy.profile.profile_id,
@@ -1181,7 +1272,7 @@ class ContextMcpServer:
                     ),
                 )
                 for policy in policies
-            ]
+            )
         return EnvironmentComparisonOutput(
             workload_id=untrusted_data(
                 request.workload_id,
@@ -1196,7 +1287,7 @@ class ContextMcpServer:
             environments=environments,
             differences=tuple(differences),
             truncated=truncated,
-            citations=tuple(citations),
+            citations=citations,
         )
 
     def _explain_finding(
@@ -1371,7 +1462,7 @@ class ContextMcpServer:
         ):
             raise ToolInputError("proposed manifest version must be newer than its base")
         claims: ConfirmationClaims | None = None
-        confirmation_now = ensure_timestamp(self._confirmation_clock.now())
+        confirmation_now = ensure_timestamp(self._trusted_clock.now())
         if request.phase == "confirm":
             token = request.confirmation_token
             if token is None:
@@ -1469,6 +1560,16 @@ class ContextMcpServer:
             patch_digest=claims.patch_digest,
             expires_at=claims.expires_at,
         )
+        predicted_response = self._confirmed_patch_output(
+            request=request,
+            preview=preview,
+            profile_id=profile_id,
+            revision=1,
+            manifest_digest=patched.compatibility.artifact_digest,
+        )
+        # The complete deterministic response is checked before consuming the
+        # one-time capability or creating a draft.
+        self._ensure_response_bound(predicted_response)
         if not self._confirmation_store.consume(
             claims.challenge_id,
             binding,
@@ -1493,6 +1594,10 @@ class ContextMcpServer:
             draft.state is not DraftState.DRAFT
             or draft.manifest_id != request.workload_id
             or draft.manifest.manifest_version != request.proposed_manifest_version
+            or draft.draft_id != request.draft_id
+            or draft.revision != 1
+            or draft.manifest_digest != patched.compatibility.artifact_digest
+            or draft.manifest.canonical_json() != patched.canonical_json()
             or draft.previous_version != request.base_manifest_version
             or draft.created_by != actor
             or draft.approval is not None
@@ -1500,15 +1605,26 @@ class ContextMcpServer:
             or draft.publication_candidate is not None
         ):
             raise ToolGroundingError("Context API returned a non-draft proposal result")
+        return predicted_response
+
+    @staticmethod
+    def _confirmed_patch_output(
+        *,
+        request: ProposeManifestPatchInput,
+        preview: ManifestPatchPreview,
+        profile_id: str,
+        revision: int,
+        manifest_digest: str,
+    ) -> ManifestPatchOutput:
         citations = tuple(
             Citation(
                 manifest_id=untrusted_data(
-                    draft.manifest_id,
+                    request.workload_id,
                     source="draftProposal",
                     source_pointer="/manifestId",
                 ),
                 manifest_version=untrusted_data(
-                    draft.manifest.manifest_version,
+                    request.proposed_manifest_version,
                     source="draftProposal",
                     source_pointer="/manifestVersion",
                 ),
@@ -1531,7 +1647,7 @@ class ContextMcpServer:
                     EvidenceRefCitation(
                         ref_type="draftProposal",
                         reference=untrusted_data(
-                            draft.draft_id,
+                            request.draft_id,
                             source="draftProposal",
                             source_pointer="/draftId",
                         ),
@@ -1545,13 +1661,13 @@ class ContextMcpServer:
             preview=preview,
             draft=DraftProposalReceipt(
                 draft_id=untrusted_data(
-                    draft.draft_id,
+                    request.draft_id,
                     source="draftProposal",
                     source_pointer="/draftId",
                 ),
-                revision=draft.revision,
+                revision=revision,
                 state=DraftState.DRAFT,
-                manifest_digest=draft.manifest_digest,
+                manifest_digest=manifest_digest,
             ),
             citations=citations,
         )
@@ -1641,14 +1757,14 @@ def build_context_mcp_server(
     findings: AuthoritativeFindingsPort,
     confirmation_signer: ConfirmationSignerPort,
     confirmation_store: ConfirmationStorePort,
-    confirmation_clock: ConfirmationClockPort,
+    trusted_clock: TrustedClockPort,
 ) -> ContextMcpServer:
     return ContextMcpServer(
         context_api=context_api,
         findings=findings,
         confirmation_signer=confirmation_signer,
         confirmation_store=confirmation_store,
-        confirmation_clock=confirmation_clock,
+        trusted_clock=trusted_clock,
     )
 
 

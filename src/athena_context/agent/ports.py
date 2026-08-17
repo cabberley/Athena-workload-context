@@ -19,6 +19,7 @@ from athena_context.api.domain import (
     DraftRecord,
     PublishedManifestView,
 )
+from athena_context.contracts.manifest import ManifestFinding
 
 
 class ContextApiPort(Protocol):
@@ -49,7 +50,7 @@ class ContextApiPort(Protocol):
 
 
 class AuthoritativeFindingsPort(Protocol):
-    """Authorization-aware access to already evaluated deterministic findings."""
+    """Authorization-aware stored and independently verified deterministic findings."""
 
     def get_policy_view(
         self,
@@ -60,8 +61,17 @@ class AuthoritativeFindingsPort(Protocol):
         profile_id: str,
     ) -> AuthoritativePolicyView: ...
 
+    def verify_policy_result(
+        self,
+        actor: Actor,
+        *,
+        view: AuthoritativePolicyView,
+    ) -> tuple[ManifestFinding, ...]:
+        """Recompute or independently verify complete findings for the supplied inputs."""
+        ...
 
-class ConfirmationClockPort(Protocol):
+
+class TrustedClockPort(Protocol):
     def now(self) -> datetime: ...
 
 
@@ -105,10 +115,10 @@ class McpTransportPort(Protocol):
 
 __all__ = [
     "AuthoritativeFindingsPort",
-    "ConfirmationClockPort",
     "ConfirmationSignerPort",
     "ConfirmationStorePort",
     "ContextApiPort",
     "McpTransportPort",
     "ToolDispatch",
+    "TrustedClockPort",
 ]

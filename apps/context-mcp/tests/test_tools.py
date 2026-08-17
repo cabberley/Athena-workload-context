@@ -213,6 +213,37 @@ def test_context_and_explanation_are_deterministic_without_raw_bodies(
     }
 
 
+def test_compare_environments_cites_every_returned_finding_once(
+    harness: Harness,
+) -> None:
+    response = harness.server.call_tool(
+        "compare_environments",
+        {
+            "workload_id": WORKLOAD_ID,
+            "manifest_version": "1.1.0",
+            "profile_ids": ["production", "development", "training"],
+        },
+        harness.context,
+    )
+    returned = {
+        (environment.profile_id.value, finding.clause_id.value)
+        for environment in response.environments
+        for finding in environment.findings
+    }
+    cited = {
+        (citation.profile_id.value, citation.clause_id.value)
+        for citation in response.citations
+    }
+    serialized = [
+        citation.model_dump_json(exclude_none=True)
+        for citation in response.citations
+    ]
+
+    assert returned
+    assert cited == returned
+    assert len(serialized) == len(set(serialized))
+
+
 def test_manifest_authored_bypass_phrase_is_inert_provenanced_data(
     harness: Harness,
 ) -> None:

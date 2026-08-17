@@ -2,11 +2,11 @@
 
 from athena_context.agent import (
     AuthoritativeFindingsPort,
-    ConfirmationClockPort,
     ConfirmationSignerPort,
     ConfirmationStorePort,
     ContextApiPort,
     ContextMcpServer,
+    TrustedClockPort,
     build_context_mcp_server,
 )
 
@@ -17,7 +17,7 @@ def create_server(
     findings: AuthoritativeFindingsPort,
     confirmation_signer: ConfirmationSignerPort,
     confirmation_store: ConfirmationStorePort,
-    confirmation_clock: ConfirmationClockPort,
+    trusted_clock: TrustedClockPort,
 ) -> ContextMcpServer:
     """Compose the exact reviewed tools over deployment-supplied authoritative ports."""
 
@@ -26,7 +26,7 @@ def create_server(
         findings=findings,
         confirmation_signer=confirmation_signer,
         confirmation_store=confirmation_store,
-        confirmation_clock=confirmation_clock,
+        trusted_clock=trusted_clock,
     )
 
 

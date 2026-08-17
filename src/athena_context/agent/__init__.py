@@ -21,11 +21,11 @@ from athena_context.agent.models import (
 )
 from athena_context.agent.ports import (
     AuthoritativeFindingsPort,
-    ConfirmationClockPort,
     ConfirmationSignerPort,
     ConfirmationStorePort,
     ContextApiPort,
     McpTransportPort,
+    TrustedClockPort,
 )
 from athena_context.agent.server import (
     MAX_INPUT_BYTES,
@@ -45,7 +45,6 @@ __all__ = [
     "AuthoritativePolicyView",
     "ConfirmationBinding",
     "ConfirmationClaims",
-    "ConfirmationClockPort",
     "ConfirmationSignerPort",
     "ConfirmationStorePort",
     "ContextApiPort",
@@ -62,6 +61,7 @@ __all__ = [
     "ToolNotFoundError",
     "ToolPortError",
     "ToolResponseTooLargeError",
+    "TrustedClockPort",
     "UntrustedDataText",
     "build_context_mcp_server",
 ]
