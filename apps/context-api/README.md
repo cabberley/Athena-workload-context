@@ -47,10 +47,14 @@ The integration composes the merged components without introducing direct Azure 
   implementation, then calls the captured implementation directly with the sealed endpoint.
   Per-instance, class-level, or embedded-client method/transport replacement therefore fails
   closed before publication. The production HTTP invoker is
-  `ManagedIdentityPrivateMcpInvoker`, which installs a redirect-rejecting opener before obtaining
-  or attaching its keyless bearer token and rejects every 30x response without an authenticated
-  follow-up. The service rejects composition unless the actual transport configuration exactly
-  equals the separately loaded trusted WC-008 configuration.
+  `ManagedIdentityPrivateMcpInvoker`. It accepts only the trusted WC-008 configuration and managed
+  identity audience, constructs its exact credential and zero-state HTTP stack internally, and
+  has no injected clock, token provider, opener, or handler. Each request constructs a
+  redirect-rejecting opener before attaching its keyless bearer token and rejects every 30x
+  response without an authenticated follow-up. The zero-state HTTP identity and exact credential
+  and HTTP implementations are sealed and revalidated before invocation; the credential itself is
+  freshly constructed inside that sealed path. The service rejects composition unless the actual
+  transport configuration exactly equals the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
 - The app-owned `ContextService` resolves WC-007 context, approvals, and evaluation grants before

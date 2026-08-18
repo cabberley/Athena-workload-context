@@ -4,14 +4,19 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from inspect import getattr_static
 from pathlib import Path
 from types import FunctionType, MappingProxyType
 from typing import Any, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import BaseHandler, HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPRedirectHandler,
+    OpenerDirector,
+    Request,
+    build_opener,
+)
 
 from azure.identity import DefaultAzureCredential
 from pydantic import TypeAdapter, ValidationError
@@ -105,6 +110,11 @@ class _RejectRedirectHandler(HTTPRedirectHandler):
         return None
 
 
+_REJECT_REDIRECT_IMPLEMENTATION = _RejectRedirectHandler.redirect_request
+_URLLIB_BUILD_OPENER_IMPLEMENTATION = build_opener
+_URLLIB_OPENER_OPEN_IMPLEMENTATION = OpenerDirector.open
+
+
 class DefaultAzureCredentialContextApiToken:
     """Keyless Context API token provider for explicitly configured live runs."""
 
@@ -170,36 +180,131 @@ class DefaultAzureCredentialPrivateMcpToken:
             raise DemoEvaluationConfigurationError(
                 "private MCP token request did not match its pinned endpoint"
             )
+        credential = object.__getattribute__(self, "_credential")
+        if (
+            type(credential) is not _DEFAULT_AZURE_CREDENTIAL_TYPE
+            or getattr_static(
+                _DEFAULT_AZURE_CREDENTIAL_TYPE,
+                "get_token",
+                None,
+            )
+            is not _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP managed identity credential composition changed"
+            )
         scope = f"{self._audience.rstrip('/')}/.default"
-        return self._credential.get_token(scope).token
+        return _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION(
+            credential,
+            scope,
+        ).token
+
+
+_DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION = (
+    DefaultAzureCredential.get_token
+)
+_DEFAULT_AZURE_CREDENTIAL_TYPE = DefaultAzureCredential
+
+
+class _ManagedIdentityPrivateMcpHttpStack:
+    """Zero-state HTTP stack constructed only by the production invoker."""
+
+    __slots__ = ()
+
+    def build_opener(self) -> OpenerDirector:
+        if (
+            getattr_static(_RejectRedirectHandler, "redirect_request", None)
+            is not _REJECT_REDIRECT_IMPLEMENTATION
+            or getattr_static(OpenerDirector, "open", None)
+            is not _URLLIB_OPENER_OPEN_IMPLEMENTATION
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP redirect rejection stack changed"
+            )
+        opener = _URLLIB_BUILD_OPENER_IMPLEMENTATION(
+            _RejectRedirectHandler()
+        )
+        if type(opener) is not OpenerDirector:
+            raise DemoEvaluationConfigurationError(
+                "private MCP HTTP stack construction was not concrete"
+            )
+        return opener
+
+    def open(
+        self,
+        opener: OpenerDirector,
+        request: Request,
+        *,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> tuple[str, int, bytes]:
+        if type(opener) is not OpenerDirector:
+            raise DemoEvaluationConfigurationError(
+                "private MCP HTTP opener changed before invocation"
+            )
+        with _URLLIB_OPENER_OPEN_IMPLEMENTATION(
+            opener,
+            request,
+            timeout=timeout_seconds,
+        ) as response:
+            response_url = response.geturl()
+            status_code = response.getcode()
+            content = response.read(max_response_bytes + 1)
+        return response_url, status_code, content
+
+
+_MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION = (
+    _ManagedIdentityPrivateMcpHttpStack.open
+)
+_MANAGED_IDENTITY_HTTP_BUILD_IMPLEMENTATION = (
+    _ManagedIdentityPrivateMcpHttpStack.build_opener
+)
 
 
 class ManagedIdentityPrivateMcpInvoker:
-    """Authenticated MCP HTTP boundary that installs a zero-redirect policy first."""
+    """Production MCP boundary with no caller-injected bearer or HTTP dependency."""
 
-    _clock: Clock
-    _http_handler: BaseHandler | None
-    _token_provider: PrivateMcpAccessTokenPort
+    _audience: str
+    _http_stack: _ManagedIdentityPrivateMcpHttpStack
+    _private_mcp_endpoint: str
 
     __slots__ = (
-        "_clock",
-        "_http_handler",
-        "_token_provider",
+        "_audience",
+        "_http_stack",
+        "_private_mcp_endpoint",
     )
 
     def __init__(
         self,
         *,
-        clock: Clock,
-        token_provider: PrivateMcpAccessTokenPort,
-        http_handler: BaseHandler | None = None,
+        deployment_configuration: VerifiedWc008DeploymentConfiguration,
+        audience: str,
     ) -> None:
-        object.__setattr__(self, "_clock", clock)
-        object.__setattr__(self, "_http_handler", http_handler)
+        try:
+            _, sealed = seal_mcp_transport_configuration(
+                deployment_configuration
+            )
+            _, endpoint = sealed_mcp_transport_configuration_primitives(sealed)
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "managed identity MCP invoker requires exact trusted WC-008 "
+                "deployment configuration"
+            ) from exc
+        if (
+            type(audience) is not str
+            or not audience.strip()
+            or audience != audience.strip()
+            or len(audience) > 512
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP managed identity audience is required"
+            )
+        object.__setattr__(self, "_private_mcp_endpoint", endpoint)
+        object.__setattr__(self, "_audience", str.__str__(audience))
         object.__setattr__(
             self,
-            "_token_provider",
-            token_provider,
+            "_http_stack",
+            _ManagedIdentityPrivateMcpHttpStack(),
         )
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -212,104 +317,177 @@ class ManagedIdentityPrivateMcpInvoker:
         deployment_tool_name: str,
         request: EvidenceTransportRequest,
     ) -> McpTransportOutcome:
-        # Install the rejection handler before obtaining or attaching a bearer token.
-        handlers: tuple[BaseHandler, ...] = (
-            ()
-            if self._http_handler is None
-            else (self._http_handler,)
-        )
-        opener = build_opener(_RejectRedirectHandler(), *handlers)
-        credential = self._token_provider.get_token(private_mcp_endpoint)
-        if (
-            type(credential) is not str
-            or not credential
-            or credential != credential.strip()
-            or any(character in credential for character in "\r\n")
-        ):
-            raise DemoEvaluationConfigurationError(
-                "private MCP managed identity returned an invalid credential"
-            )
-        endpoint = f"{private_mcp_endpoint.rstrip('/')}/"
-        body = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": request.attempt_id,
-                "method": "tools/call",
-                "params": {
-                    "name": deployment_tool_name,
-                    "arguments": request.model_dump(
-                        mode="json",
-                        by_alias=True,
-                        exclude_none=True,
-                    ),
-                },
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        outbound = Request(  # noqa: S310 - the endpoint is operator-sealed HTTPS
-            endpoint,
-            data=body,
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {credential}",
-                "Cache-Control": "no-store",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with opener.open(  # noqa: S310 - redirect handling is explicitly disabled
-                outbound,
-                timeout=request.bounds.timeout_milliseconds / 1_000,
-            ) as response:
-                response_url = response.geturl()
-                status_code = response.getcode()
-                content = response.read(request.bounds.max_response_bytes + 1)
-        except HTTPError as exc:
-            if 300 <= exc.code < 400:
-                raise DemoEvaluationConfigurationError(
-                    "private MCP HTTP redirect was rejected"
-                ) from exc
-            observed_at = self._clock.now()
-            if exc.code in {401, 403}:
-                return McpAuthorizationFailure(
-                    authorization_status="denied",
-                    observed_at=observed_at,
-                )
-            content = exc.read(request.bounds.max_response_bytes + 1)
-            if not content or len(content) > request.bounds.max_response_bytes:
-                return McpToolUnavailable(
-                    unavailable_reason="mcpUnavailable",
-                    observed_at=observed_at,
-                )
-            return McpFailedResponse(
-                body=content,
-                response_received_at=observed_at,
-            )
-        except URLError:
-            return McpToolUnavailable(
-                unavailable_reason="networkUnavailable",
-                observed_at=self._clock.now(),
-            )
-        if (
-            response_url != endpoint
-            or not 200 <= status_code < 300
-            or not content
-            or len(content) > request.bounds.max_response_bytes
-        ):
-            raise DemoEvaluationConfigurationError(
-                "private MCP returned an untrusted HTTP response"
-            )
-        return McpSuccessResponse(
-            body=content,
-            response_received_at=self._clock.now(),
+        sealed = _seal_managed_identity_private_mcp_invoker(self)
+        return _invoke_managed_identity_private_mcp(
+            sealed,
+            private_mcp_endpoint,
+            deployment_tool_name,
+            request,
         )
 
 
 _MANAGED_IDENTITY_MCP_INVOKE_IMPLEMENTATION = (
     ManagedIdentityPrivateMcpInvoker.invoke
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedManagedIdentityPrivateMcpInvoker:
+    audience: str
+    http_stack: _ManagedIdentityPrivateMcpHttpStack
+    private_mcp_endpoint: str
+
+
+def _seal_managed_identity_private_mcp_invoker(
+    invoker: ManagedIdentityPrivateMcpInvoker,
+) -> _SealedManagedIdentityPrivateMcpInvoker:
+    try:
+        audience = object.__getattribute__(invoker, "_audience")
+        http_stack = object.__getattribute__(invoker, "_http_stack")
+        endpoint = object.__getattribute__(invoker, "_private_mcp_endpoint")
+    except AttributeError as exc:
+        raise DemoEvaluationConfigurationError(
+            "private MCP managed identity composition is incomplete"
+        ) from exc
+    if (
+        type(invoker) is not ManagedIdentityPrivateMcpInvoker
+        or type(audience) is not str
+        or type(endpoint) is not str
+        or type(http_stack) is not _ManagedIdentityPrivateMcpHttpStack
+        or getattr_static(
+            _DEFAULT_AZURE_CREDENTIAL_TYPE,
+            "get_token",
+            None,
+        )
+        is not _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION
+        or getattr_static(_ManagedIdentityPrivateMcpHttpStack, "open", None)
+        is not _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION
+        or getattr_static(
+            _ManagedIdentityPrivateMcpHttpStack,
+            "build_opener",
+            None,
+        )
+        is not _MANAGED_IDENTITY_HTTP_BUILD_IMPLEMENTATION
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP managed identity composition changed"
+        )
+    return _SealedManagedIdentityPrivateMcpInvoker(
+        audience=str.__str__(audience),
+        http_stack=http_stack,
+        private_mcp_endpoint=str.__str__(endpoint),
+    )
+
+
+def _invoke_managed_identity_private_mcp(
+    sealed: _SealedManagedIdentityPrivateMcpInvoker,
+    private_mcp_endpoint: str,
+    deployment_tool_name: str,
+    request: EvidenceTransportRequest,
+) -> McpTransportOutcome:
+    endpoint_origin = str.__str__(private_mcp_endpoint).rstrip("/")
+    if endpoint_origin != sealed.private_mcp_endpoint:
+        raise DemoEvaluationConfigurationError(
+            "private MCP invocation did not match the credential endpoint"
+        )
+    opener = _MANAGED_IDENTITY_HTTP_BUILD_IMPLEMENTATION(sealed.http_stack)
+    scope = f"{sealed.audience.rstrip('/')}/.default"
+    credential_provider = _DEFAULT_AZURE_CREDENTIAL_TYPE()
+    if type(credential_provider) is not _DEFAULT_AZURE_CREDENTIAL_TYPE:
+        raise DemoEvaluationConfigurationError(
+            "private MCP managed identity credential construction changed"
+        )
+    credential = _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION(
+        credential_provider,
+        scope,
+    ).token
+    if (
+        type(credential) is not str
+        or not credential
+        or credential != credential.strip()
+        or any(character in credential for character in "\r\n")
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP managed identity returned an invalid credential"
+        )
+    endpoint = f"{endpoint_origin}/"
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": request.attempt_id,
+            "method": "tools/call",
+            "params": {
+                "name": deployment_tool_name,
+                "arguments": request.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            },
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    outbound = Request(  # noqa: S310 - the endpoint is operator-sealed HTTPS
+        endpoint,
+        data=body,
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {credential}",
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        response_url, status_code, content = (
+            _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
+                sealed.http_stack,
+                opener,
+                outbound,
+                timeout_seconds=request.bounds.timeout_milliseconds / 1_000,
+                max_response_bytes=request.bounds.max_response_bytes,
+            )
+        )
+    except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise DemoEvaluationConfigurationError(
+                "private MCP HTTP redirect was rejected"
+            ) from exc
+        observed_at = datetime.now(UTC)
+        if exc.code in {401, 403}:
+            return McpAuthorizationFailure(
+                authorization_status="denied",
+                observed_at=observed_at,
+            )
+        content = exc.read(request.bounds.max_response_bytes + 1)
+        if not content or len(content) > request.bounds.max_response_bytes:
+            return McpToolUnavailable(
+                unavailable_reason="mcpUnavailable",
+                observed_at=observed_at,
+            )
+        return McpFailedResponse(
+            body=content,
+            response_received_at=observed_at,
+        )
+    except URLError:
+        return McpToolUnavailable(
+            unavailable_reason="networkUnavailable",
+            observed_at=datetime.now(UTC),
+        )
+    if (
+        response_url != endpoint
+        or not 200 <= status_code < 300
+        or not content
+        or len(content) > request.bounds.max_response_bytes
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP returned an untrusted HTTP response"
+        )
+    return McpSuccessResponse(
+        body=content,
+        response_received_at=datetime.now(UTC),
+    )
 
 
 class EnvironmentContextApiPublishedContextReader:
@@ -423,6 +601,7 @@ class _PrivateMcpInvokerBinding:
     invoker: PrivateMcpInvokerPort
     invoker_type: type[object]
     invoke_implementation: _PrivateMcpInvokeImplementation
+    managed_identity: _SealedManagedIdentityPrivateMcpInvoker | None
 
 
 def _static_instance_state(instance: object) -> Mapping[str, object] | None:
@@ -488,6 +667,13 @@ def _seal_private_mcp_invoker(
             "private MCP invoker must expose one concrete unmodified implementation"
         )
     sealed_invoker = _copy_invoker_with_sealed_state(invoker)
+    managed_identity = (
+        _seal_managed_identity_private_mcp_invoker(
+            cast(ManagedIdentityPrivateMcpInvoker, sealed_invoker)
+        )
+        if invoker_type is ManagedIdentityPrivateMcpInvoker
+        else None
+    )
     return _PrivateMcpInvokerBinding(
         invoker=sealed_invoker,
         invoker_type=invoker_type,
@@ -495,6 +681,7 @@ def _seal_private_mcp_invoker(
             _PrivateMcpInvokeImplementation,
             implementation,
         ),
+        managed_identity=managed_identity,
     )
 
 
@@ -502,11 +689,22 @@ def _require_exact_private_mcp_invoker(
     binding: _PrivateMcpInvokerBinding,
 ) -> None:
     try:
+        current_managed_identity = (
+            _seal_managed_identity_private_mcp_invoker(
+                cast(ManagedIdentityPrivateMcpInvoker, binding.invoker)
+            )
+            if binding.managed_identity is not None
+            else None
+        )
         invalid = (
             type(binding.invoker) is not binding.invoker_type
             or getattr_static(binding.invoker_type, "invoke", None)
             is not binding.invoke_implementation
             or _has_instance_invoke_override(binding.invoker)
+            or not _same_managed_identity_invoker_seal(
+                current_managed_identity,
+                binding.managed_identity,
+            )
         )
         _validate_invoker_instance_state(binding.invoker)
     except DemoEvaluationConfigurationError as exc:
@@ -517,6 +715,19 @@ def _require_exact_private_mcp_invoker(
         raise EvidenceClientCompositionError(
             "private MCP invoker implementation changed after composition"
         )
+
+
+def _same_managed_identity_invoker_seal(
+    current: _SealedManagedIdentityPrivateMcpInvoker | None,
+    expected: _SealedManagedIdentityPrivateMcpInvoker | None,
+) -> bool:
+    if current is None or expected is None:
+        return current is expected
+    return (
+        current.audience == expected.audience
+        and current.private_mcp_endpoint == expected.private_mcp_endpoint
+        and current.http_stack is expected.http_stack
+    )
 
 
 class PrivateMcpEvidenceTransport:
@@ -625,6 +836,13 @@ def _invoke_exact_private_mcp_transport(
         concrete_transport,
         "_invoker_binding",
     )
+    if binding.managed_identity is not None:
+        return _invoke_managed_identity_private_mcp(
+            binding.managed_identity,
+            endpoint,
+            AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+            request,
+        )
     return binding.invoke_implementation(
         binding.invoker,
         endpoint,

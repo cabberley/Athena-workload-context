@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from email.message import Message
 from io import BytesIO
 from typing import Any
-from urllib.request import BaseHandler
+from urllib.error import HTTPError
+from urllib.request import BaseHandler, Request, build_opener
 from urllib.response import addinfourl
 
 import pytest
@@ -21,6 +23,7 @@ from athena_context.api import (
     VerifiedWc008DeploymentConfiguration,
     Wc009EvidenceClientAdapter,
     create_app,
+    evaluation_adapters,
 )
 from athena_context.api.domain import (
     AuthenticationMethod,
@@ -32,7 +35,7 @@ from athena_context.api.errors import DemoEvaluationConfigurationError
 from athena_context.api.evaluation_ports import (
     seal_mcp_transport_configuration,
 )
-from athena_context.evidence import EvidenceTransportRequest
+from athena_context.evidence import EvidenceTransportRequest, McpSuccessResponse
 from athena_context.evidence.models import McpTransportOutcome
 from wc013_support import (
     APPROVER,
@@ -441,85 +444,8 @@ def test_http_rejects_exact_accepted_invoker_method_replacement_without_state() 
     assert harness.store.publication_count == 0
 
 
-def test_http_rejects_authenticated_private_mcp_redirect_without_follow_up() -> None:
-    """The managed-identity boundary never forwards Authorization through 30x."""
-
-    bearer_token = "synthetic-private-mcp-managed-identity-token"
-    token_requests: list[str] = []
-    network_requests: list[tuple[str, str | None]] = []
-
-    class TokenProvider:
-        def get_token(self, private_mcp_endpoint: str) -> str:
-            token_requests.append(private_mcp_endpoint)
-            return bearer_token
-
-    class RedirectingTransport(BaseHandler):
-        handler_order = 100
-
-        def _open(self, request: Any) -> Any:
-            network_requests.append(
-                (
-                    request.full_url,
-                    request.get_header("Authorization"),
-                )
-            )
-            if request.full_url == f"{PRIVATE_ENDPOINT}/":
-                headers = Message()
-                headers["Location"] = "https://attacker.invalid/collect"
-                response = addinfourl(
-                    BytesIO(b""),
-                    headers,
-                    request.full_url,
-                    307,
-                )
-                response.msg = "Temporary Redirect"
-                return response
-            response = addinfourl(
-                BytesIO(b'{"foreign":"authenticated"}'),
-                Message(),
-                request.full_url,
-                200,
-            )
-            response.msg = "OK"
-            return response
-
-        def https_open(self, request: Any) -> Any:
-            return self._open(request)
-
-    invoker = ManagedIdentityPrivateMcpInvoker(
-        clock=StepClock(NOW),
-        token_provider=TokenProvider(),
-        http_handler=RedirectingTransport(),
-    )
-    harness, client = _client(private_mcp_invoker=invoker)
-    idempotency_key = "wc013-http-authenticated-private-mcp-redirect"
-
-    response = client.post(
-        "/v1/demo-evaluations",
-        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
-        json=harness.command.model_dump(mode="json", by_alias=True),
-    )
-
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
-    assert token_requests == [PRIVATE_ENDPOINT]
-    assert network_requests == [
-        (
-            f"{PRIVATE_ENDPOINT}/",
-            f"Bearer {bearer_token}",
-        )
-    ]
-    assert harness.snapshot_signer.calls == 0
-    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
-    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
-    assert harness.store.resolve_result(harness.command.snapshot_id) is None
-    assert harness.store.publication_count == 0
-
-
-def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The production redirect boundary itself is pinned to its reviewed method."""
+def test_production_invoker_rejects_custom_bearer_and_http_dependencies() -> None:
+    """Production composition has no injectable token, clock, or HTTP handler."""
 
     token_requests: list[str] = []
     network_requests: list[str] = []
@@ -529,15 +455,160 @@ def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
             token_requests.append(private_mcp_endpoint)
             return "synthetic-private-mcp-managed-identity-token"
 
-    class RecordingTransport(BaseHandler):
+    class RedirectingTransport:
+        def open(self, request: object) -> object:
+            del request
+            network_requests.append("redirect")
+            raise AssertionError("custom HTTP handler must not be accepted")
+
+    with pytest.raises(TypeError):
+        ManagedIdentityPrivateMcpInvoker(  # type: ignore[call-arg]
+            clock=StepClock(NOW),
+            token_provider=TokenProvider(),
+            http_handler=RedirectingTransport(),
+        )
+
+    assert token_requests == []
+    assert network_requests == []
+
+
+def test_authenticated_redirect_rejection_has_no_follow_up_request() -> None:
+    """The exact production redirect policy never forwards Authorization."""
+
+    bearer_token = "synthetic-private-mcp-managed-identity-token"
+    network_requests: list[tuple[str, str | None]] = []
+
+    class RedirectingTransport(BaseHandler):
+        handler_order = 100
+
         def https_open(self, request: Any) -> Any:
-            network_requests.append(request.full_url)
-            raise AssertionError("replaced production invoker must not reach HTTP")
+            network_requests.append(
+                (
+                    request.full_url,
+                    request.get_header("Authorization"),
+                )
+            )
+            headers = Message()
+            headers["Location"] = "https://attacker.invalid/collect"
+            response = addinfourl(
+                BytesIO(b""),
+                headers,
+                request.full_url,
+                307,
+            )
+            response.msg = "Temporary Redirect"
+            return response
+
+    opener = build_opener(
+        evaluation_adapters._RejectRedirectHandler(),
+        RedirectingTransport(),
+    )
+    outbound = Request(
+        f"{PRIVATE_ENDPOINT}/",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        method="POST",
+    )
+
+    with pytest.raises(HTTPError) as rejected:
+        opener.open(outbound)
+
+    assert rejected.value.code == 307
+    assert network_requests == [
+        (
+            f"{PRIVATE_ENDPOINT}/",
+            f"Bearer {bearer_token}",
+        )
+    ]
+
+
+def test_http_rejects_nested_managed_identity_http_stack_replacement() -> None:
+    """A replaced nested stack cannot capture a bearer or publish fake evidence."""
+
+    bearer_captures: list[str | None] = []
+    fabricated_transport = ScenarioTransport()
+
+    class BearerCapturingHttpStack:
+        def open(
+            self,
+            request: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int,
+        ) -> tuple[str, int, bytes]:
+            del timeout_seconds, max_response_bytes
+            outbound = request
+            bearer_captures.append(outbound.get_header("Authorization"))
+            payload = json.loads(outbound.data)
+            transport_request = EvidenceTransportRequest.model_validate(
+                payload["params"]["arguments"]
+            )
+            outcome = fabricated_transport.invoke(
+                "https://attacker.invalid",
+                "group_resource_list",
+                transport_request,
+            )
+            assert isinstance(outcome, McpSuccessResponse)
+            return outbound.full_url, 200, outcome.body
 
     invoker = ManagedIdentityPrivateMcpInvoker(
-        clock=StepClock(NOW),
-        token_provider=TokenProvider(),
-        http_handler=RecordingTransport(),
+        deployment_configuration=verified_deployment_configuration(),
+        audience="api://athena-private-mcp",
+    )
+    harness, client = _client(private_mcp_invoker=invoker)
+    service = harness.context_resolver.service
+    audit_before = service.audit_history(
+        APPROVER,
+        harness.command.manifest_id,
+    )
+    evidence_client = harness.dependencies.evidence_client
+    assert type(evidence_client) is Wc009EvidenceClientAdapter
+    binding = object.__getattribute__(
+        evidence_client._transport,
+        "_invoker_binding",
+    )
+    accepted_invoker = binding.invoker
+    with pytest.raises(AttributeError):
+        object.__setattr__(
+            accepted_invoker,
+            "_http_handler",
+            BearerCapturingHttpStack(),
+        )
+    object.__setattr__(
+        accepted_invoker,
+        "_http_stack",
+        BearerCapturingHttpStack(),
+    )
+    idempotency_key = "wc013-http-nested-managed-identity-stack-replacement"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert bearer_captures == []
+    assert fabricated_transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+    assert (
+        service.audit_history(APPROVER, harness.command.manifest_id)
+        == audit_before
+    )
+
+
+def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production redirect boundary itself is pinned to its reviewed method."""
+
+    invoker = ManagedIdentityPrivateMcpInvoker(
+        deployment_configuration=verified_deployment_configuration(),
+        audience="api://athena-private-mcp",
     )
     harness, client = _client(private_mcp_invoker=invoker)
 
@@ -565,8 +636,6 @@ def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "demo_evaluation_configuration"
-    assert token_requests == []
-    assert network_requests == []
     assert harness.snapshot_signer.calls == 0
     assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
     assert harness.store.resolve_publication(harness.command.snapshot_id) is None
