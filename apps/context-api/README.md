@@ -104,13 +104,17 @@ multiple successor versions without granting generic selector-change authority. 
 instead infers a single latest unpublished draft that carries decision authority, it atomically
 persists an immutable typed predecessor binding. That binding fixes the workload, both versions and
 draft IDs, predecessor revision and manifest digest, and both endpoint selector-topology digests to
-their immutable baselines. Lifecycle and published recovery recursively validate every binding,
-fail closed on cycles or inconsistency, and keep a bound authority predecessor immutable so a later
-mutation cannot poison an already-created successor. Inferred drafts without carried decision
-authority do not acquire that lock, preserving selector-neutral edits. Unpublished authority cannot
-seed a second draft at the same version because a strictly descending, cycle-safe predecessor edge
-cannot represent that relationship. Any failure leaves drafts, baselines, bindings, decisions,
-audit, and idempotency receipts unchanged.
+their immutable baselines. It also fixes the canonical digest of the exact decision authority
+available at the predecessor revision. The successor baseline independently stores that inherited
+authority digest, so an absent edge or missing, added, or changed decision binding cannot make the
+post-decision successor manifest appear to be a new authority root. Lifecycle and published
+recovery recursively validate every binding and authority digest, fail closed on cycles or
+inconsistency, and keep a bound authority predecessor immutable so a later mutation cannot poison
+an already-created successor. Inferred drafts without carried decision authority do not acquire
+that lock, preserving selector-neutral edits. Unpublished authority cannot seed a second draft at
+the same version because a strictly descending, cycle-safe predecessor edge cannot represent that
+relationship. Any failure leaves drafts, baselines, bindings, decisions, audit, publication, and
+idempotency receipts unchanged.
 
 Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and
 candidate cache, actor-scoped idempotency ports, and a decision transaction port spanning WC-007

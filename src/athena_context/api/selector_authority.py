@@ -14,6 +14,7 @@ from athena_context.api.selector_provenance import (
     manifest_selector_provenance,
     selector_provenance_digest,
 )
+from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import ManifestRole
 
 
@@ -93,6 +94,30 @@ def _applied_bindings(
 def _version_key(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
     return (int(major), int(minor), int(patch))
+
+
+def selector_authority_digest(
+    bindings: tuple[CohortDecisionApplyBinding, ...],
+) -> str:
+    """Digest the exact immutable decision authority carried across lineage."""
+
+    return compute_artifact_digest(
+        [
+            binding.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            for binding in sorted(
+                bindings,
+                key=lambda item: (
+                    _version_key(item.manifest_version),
+                    item.resulting_draft.revision,
+                    item.decision_id,
+                ),
+            )
+        ]
+    )
 
 
 def _deduplicate_bindings(
@@ -180,6 +205,8 @@ def validate_draft_selector_predecessor_binding(
         != successor_baseline.source_manifest_digest
         or binding.successor_selector_provenance_digest
         != successor_baseline.selector_provenance_digest
+        or binding.predecessor_selector_authority_digest
+        != successor_baseline.inherited_selector_authority_digest
         or successor_baseline.draft_id != successor.draft_id
         or successor_baseline.manifest_id != successor.manifest_id
         or successor_baseline.manifest_version
@@ -234,10 +261,16 @@ def _draft_lineage_bindings(
             "draft selector authority lineage contains a cycle"
         )
     stored = tx.get_draft(current.draft_id)
+    baseline = tx.get_draft_selector_baseline(current.draft_id)
     if (
         stored is None
         or stored != current
         or current.manifest_id != current.manifest.manifest_id
+        or baseline is None
+        or baseline.draft_id != current.draft_id
+        or baseline.manifest_id != current.manifest_id
+        or baseline.manifest_version
+        != current.manifest.manifest_version
     ):
         raise PersistenceConflictError(
             "draft selector authority lineage is inconsistent"
@@ -263,6 +296,12 @@ def _draft_lineage_bindings(
             visited=next_visited,
             maximum_revision=binding.predecessor_revision,
         )
+        if selector_authority_digest(inherited) != (
+            binding.predecessor_selector_authority_digest
+        ):
+            raise PersistenceConflictError(
+                "draft selector predecessor authority is inconsistent"
+            )
     elif current.previous_version is not None:
         previous = tx.get_published(
             current.manifest_id,
@@ -282,6 +321,16 @@ def _draft_lineage_bindings(
             tx,
             published=previous,
             visited=next_visited,
+        )
+
+    inherited_digest = (
+        None
+        if not inherited
+        else selector_authority_digest(inherited)
+    )
+    if baseline.inherited_selector_authority_digest != inherited_digest:
+        raise PersistenceConflictError(
+            "draft inherited selector authority is missing or inconsistent"
         )
 
     direct = _applied_bindings(
@@ -367,5 +416,6 @@ __all__ = [
     "PersistedSelectorAuthority",
     "persisted_selector_authority_for_draft",
     "persisted_selector_authority_for_published",
+    "selector_authority_digest",
     "validate_draft_selector_predecessor_binding",
 ]

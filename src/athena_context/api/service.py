@@ -63,6 +63,7 @@ from athena_context.api.selector_authority import (
     PersistedSelectorAuthority,
     persisted_selector_authority_for_draft,
     persisted_selector_authority_for_published,
+    selector_authority_digest,
 )
 from athena_context.api.selector_provenance import (
     DraftSelectorBaseline,
@@ -180,10 +181,21 @@ class ContextService:
                     ),
                 )
             )
+            inherited_selector_authority_digest = (
+                None
+                if selector_reference is None
+                or selector_reference.selector_authority is None
+                else selector_authority_digest(
+                    selector_reference.selector_authority.bindings
+                )
+            )
             selector_baseline = DraftSelectorBaseline.capture(
                 draft_id=command.draft_id,
                 manifest=command.manifest,
                 manifest_digest=command.manifest_digest,
+                inherited_selector_authority_digest=(
+                    inherited_selector_authority_digest
+                ),
                 actor=actor,
                 captured_at=now,
             )
@@ -206,6 +218,7 @@ class ContextService:
             predecessor_binding = (
                 None
                 if selector_reference is None
+                or selector_reference.selector_authority is None
                 or selector_reference.predecessor is None
                 or selector_reference.predecessor_baseline is None
                 else DraftSelectorPredecessorBinding.capture(
@@ -215,6 +228,11 @@ class ContextService:
                     predecessor=selector_reference.predecessor,
                     predecessor_baseline=(
                         selector_reference.predecessor_baseline
+                    ),
+                    predecessor_selector_authority_digest=(
+                        selector_authority_digest(
+                            selector_reference.selector_authority.bindings
+                        )
                     ),
                     actor=actor,
                     bound_at=now,

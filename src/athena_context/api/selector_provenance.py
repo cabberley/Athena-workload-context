@@ -82,6 +82,10 @@ class DraftSelectorBaseline(ApiModel):
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     source_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
+    inherited_selector_authority_digest: str | None = Field(
+        default=None,
+        pattern=_DIGEST_PATTERN,
+    )
     entries: tuple[SelectorProvenanceEntry, ...]
     captured_by: Actor
     captured_at: AwareDatetime
@@ -103,6 +107,7 @@ class DraftSelectorBaseline(ApiModel):
         draft_id: str,
         manifest: CanonicalWorkloadManifest,
         manifest_digest: str,
+        inherited_selector_authority_digest: str | None,
         actor: Actor,
         captured_at: datetime,
     ) -> DraftSelectorBaseline:
@@ -113,6 +118,9 @@ class DraftSelectorBaseline(ApiModel):
             manifest_version=manifest.manifest_version,
             source_manifest_digest=manifest_digest,
             selector_provenance_digest=selector_provenance_digest(entries),
+            inherited_selector_authority_digest=(
+                inherited_selector_authority_digest
+            ),
             entries=entries,
             captured_by=actor,
             captured_at=captured_at,
@@ -136,6 +144,9 @@ class DraftSelectorPredecessorBinding(ApiModel):
         pattern=_DIGEST_PATTERN
     )
     predecessor_baseline_selector_provenance_digest: str = Field(
+        pattern=_DIGEST_PATTERN
+    )
+    predecessor_selector_authority_digest: str = Field(
         pattern=_DIGEST_PATTERN
     )
     bound_by: Actor
@@ -166,6 +177,7 @@ class DraftSelectorPredecessorBinding(ApiModel):
         successor_manifest_digest: str,
         predecessor: DraftRecord,
         predecessor_baseline: DraftSelectorBaseline,
+        predecessor_selector_authority_digest: str,
         actor: Actor,
         bound_at: datetime,
     ) -> DraftSelectorPredecessorBinding:
@@ -195,6 +207,9 @@ class DraftSelectorPredecessorBinding(ApiModel):
             ),
             predecessor_baseline_selector_provenance_digest=(
                 predecessor_baseline.selector_provenance_digest
+            ),
+            predecessor_selector_authority_digest=(
+                predecessor_selector_authority_digest
             ),
             bound_by=actor,
             bound_at=bound_at,

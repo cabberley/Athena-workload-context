@@ -39,6 +39,7 @@ from athena_context.api.errors import PersistenceConflictError
 from athena_context.api.http import create_app
 from athena_context.api.selector_authority import (
     persisted_selector_authority_for_draft,
+    persisted_selector_authority_for_published,
 )
 from athena_context.api.selector_provenance import (
     manifest_selector_provenance,
@@ -3244,6 +3245,232 @@ def test_inferred_unpublished_selector_authority_validates_and_publishes(
         idempotency_key="wc-034-inferred-publish-later-validate",
     )
     assert later_validated.status_code == 200, later_validated.text
+
+
+def test_applied_approval_cannot_be_laundered_by_inferred_new_version(
+) -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    applied = _post_decision(
+        harness,
+        _decision_body(harness, batch, decision="approve"),
+        "wc-034-inferred-approval-apply",
+    )
+    assert applied.status_code == 201, applied.text
+
+    source = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    successor_id = "draft-wc-034-inferred-approval-successor"
+    created = _create_inferred_successor(
+        harness,
+        source_draft_id=source.draft_id,
+        successor_draft_id=successor_id,
+        version="1.0.1",
+        idempotency_key="wc-034-inferred-approval-create",
+    )
+    assert created.status_code == 201, created.text
+    assert "previous_version" not in created.json()
+
+    with harness.store.transaction() as tx:
+        source_decisions = tx.list_cohort_decisions(
+            manifest_id=source.manifest_id,
+            draft_id=source.draft_id,
+        )
+        direct_successor_decisions = tx.list_cohort_decisions(
+            manifest_id=source.manifest_id,
+            draft_id=successor_id,
+        )
+        successor = tx.get_draft(successor_id)
+        successor_baseline = tx.get_draft_selector_baseline(successor_id)
+        binding = tx.get_draft_selector_predecessor_binding(successor_id)
+        assert successor is not None
+        inherited = persisted_selector_authority_for_draft(
+            tx,
+            current=successor,
+        )
+    assert len(source_decisions) == 1
+    source_authorization = source_decisions[0].apply_authorization
+    assert source_authorization is not None
+    assert direct_successor_decisions == []
+    assert successor_baseline is not None
+    assert binding is not None
+    assert inherited is not None
+    assert inherited.bindings == (source_authorization.binding,)
+    assert successor_baseline.inherited_selector_authority_digest == (
+        binding.predecessor_selector_authority_digest
+    )
+
+    # Reload every production service before exercising the complete exploit
+    # sequence that previously published with no recovered authority.
+    _enable_full_lifecycle(harness)
+    for action in ("validate", "submit", "approve"):
+        transitioned = _post_lifecycle_transition(
+            harness,
+            draft_id=successor_id,
+            action=action,
+            idempotency_key=f"wc-034-inferred-approval-{action}",
+        )
+        assert transitioned.status_code == 200, transitioned.text
+
+    approved = harness.lifecycle.get_draft(HUMAN, successor_id)
+    assert approved.approval is not None
+    published_response = harness.client.post(
+        f"/v1/drafts/{successor_id}/publish",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-inferred-approval-publish",
+        ),
+        json=PublishCommand(
+            expected_revision=approved.revision,
+            expected_manifest_version=(
+                approved.manifest.manifest_version
+            ),
+            expected_digest=approved.manifest_digest,
+            approval_id=approved.approval.decision_id,
+            reason="Publish only with exact inherited decision authority",
+        ).model_dump(mode="json"),
+    )
+    assert published_response.status_code == 201, published_response.text
+
+    with harness.store.transaction() as tx:
+        published = tx.get_published(source.manifest_id, "1.0.1")
+        direct_successor_decisions = tx.list_cohort_decisions(
+            manifest_id=source.manifest_id,
+            draft_id=successor_id,
+        )
+        assert published is not None
+        published_authority = persisted_selector_authority_for_published(
+            tx,
+            published=published,
+            effective_manifest_version="1.0.1",
+        )
+    assert direct_successor_decisions == []
+    assert published_authority is not None
+    assert published_authority.bindings == inherited.bindings
+    assert published_authority.effective_manifest_version == "1.0.1"
+
+
+def test_missing_inferred_authority_edge_blocks_publish_atomically() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    applied = _post_decision(
+        harness,
+        _decision_body(harness, batch, decision="approve"),
+        "wc-034-missing-inferred-edge-apply",
+    )
+    assert applied.status_code == 201, applied.text
+
+    successor_id = "draft-wc-034-missing-inferred-edge-successor"
+    created = _create_inferred_successor(
+        harness,
+        source_draft_id=harness.draft_id,
+        successor_draft_id=successor_id,
+        version="1.0.1",
+        idempotency_key="wc-034-missing-inferred-edge-create",
+    )
+    assert created.status_code == 201, created.text
+    _enable_full_lifecycle(harness)
+    for action in ("validate", "submit", "approve"):
+        transitioned = _post_lifecycle_transition(
+            harness,
+            draft_id=successor_id,
+            action=action,
+            idempotency_key=f"wc-034-missing-inferred-edge-{action}",
+        )
+        assert transitioned.status_code == 200, transitioned.text
+
+    approved = harness.lifecycle.get_draft(HUMAN, successor_id)
+    assert approved.approval is not None
+    # Simulate a durable adapter omitting the separately stored edge. The
+    # successor baseline must independently remember that authority is
+    # required, rather than accepting its post-decision manifest as a root.
+    harness.store._draft_selector_predecessors.pop(successor_id)
+    _enable_full_lifecycle(harness)
+
+    publish_key = "wc-034-missing-inferred-edge-publish"
+    state_before = _selector_lineage_failure_state(
+        harness,
+        publish_key,
+    )
+    with harness.store.transaction() as tx:
+        published_before = tx.list_published(
+            manifest_id=approved.manifest_id
+        )
+    blocked = harness.client.post(
+        f"/v1/drafts/{successor_id}/publish",
+        headers=_headers(HUMAN, idempotency_key=publish_key),
+        json=PublishCommand(
+            expected_revision=approved.revision,
+            expected_manifest_version=(
+                approved.manifest.manifest_version
+            ),
+            expected_digest=approved.manifest_digest,
+            approval_id=approved.approval.decision_id,
+            reason="Fail closed when inherited authority is unavailable",
+        ).model_dump(mode="json"),
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "persistence_conflict"
+    assert _selector_lineage_failure_state(
+        harness,
+        publish_key,
+    ) == state_before
+    assert harness.lifecycle.get_draft(HUMAN, successor_id) == approved
+    with harness.store.transaction() as tx:
+        assert tx.list_published(
+            manifest_id=approved.manifest_id
+        ) == published_before
+        assert tx.get_receipt(HUMAN.actor_id, publish_key) is None
+
+
+def test_inferred_authority_decision_mismatch_blocks_lifecycle_atomically(
+) -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    applied = _post_decision(
+        harness,
+        _decision_body(harness, batch, decision="approve"),
+        "wc-034-inferred-decision-mismatch-apply",
+    )
+    assert applied.status_code == 201, applied.text
+
+    successor_id = "draft-wc-034-inferred-decision-mismatch-successor"
+    created = _create_inferred_successor(
+        harness,
+        source_draft_id=harness.draft_id,
+        successor_draft_id=successor_id,
+        version="1.0.1",
+        idempotency_key="wc-034-inferred-decision-mismatch-create",
+    )
+    assert created.status_code == 201, created.text
+
+    decision_key = (
+        harness.manifest.manifest_id,
+        applied.json()["decisionId"],
+    )
+    persisted = harness.store._cohort_decisions.pop(decision_key)
+    _enable_full_lifecycle(harness)
+    validate_key = "wc-034-inferred-decision-mismatch-validate"
+    state_before = _selector_lineage_failure_state(
+        harness,
+        validate_key,
+    )
+    blocked = _post_lifecycle_transition(
+        harness,
+        draft_id=successor_id,
+        action="validate",
+        idempotency_key=validate_key,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "persistence_conflict"
+    assert _selector_lineage_failure_state(
+        harness,
+        validate_key,
+    ) == state_before
+    with harness.store.transaction() as tx:
+        assert tx.get_receipt(HUMAN.actor_id, validate_key) is None
+    harness.store._cohort_decisions[decision_key] = persisted
 
 
 def test_recursive_unpublished_selector_authority_survives_reload() -> None:
