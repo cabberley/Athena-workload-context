@@ -31,6 +31,7 @@ from athena_context.api import (
     OperatorDeploymentApproval,
     OperatorTrustedWc008ConfigurationPort,
     PrivateMcpEvidenceTransport,
+    PrivateMcpInvokerPort,
     PublishCommand,
     PublishedContextSelection,
     ResolvedPublishedContext,
@@ -748,7 +749,8 @@ class DemoHarness:
     command: DemoEvaluationCommand
     store: InMemoryDemoEvaluationStateReader
     commit_hook: EvaluationCommitHook
-    transport: ScenarioTransport
+    transport: PrivateMcpInvokerPort
+    transport_source: PrivateMcpInvokerPort
     snapshot_signer: DeterministicSnapshotSigner
     context_resolver: LifecycleContextResolver
     approval_registry: InMemoryDemoEvaluationApprovalRegistry
@@ -846,6 +848,7 @@ def build_harness(
     snapshot_freshness_seconds: int = 300,
     context_reader_actor: Actor = PUBLISHER,
     seed_approval: bool = True,
+    private_mcp_invoker: PrivateMcpInvokerPort | None = None,
 ) -> DemoHarness:
     clock = StepClock(as_of)
     trust = trust_configuration()
@@ -863,7 +866,11 @@ def build_harness(
     actual_transport_configuration = (
         transport_configuration or trusted_configuration
     )
-    invoker = ScenarioTransport(scenario)
+    invoker = (
+        ScenarioTransport(scenario)
+        if private_mcp_invoker is None
+        else private_mcp_invoker
+    )
     transport = PrivateMcpEvidenceTransport(
         deployment_configuration=actual_transport_configuration,
         invoker=invoker,
@@ -1018,7 +1025,8 @@ def build_harness(
         command=command,
         store=store,
         commit_hook=commit_hook,
-        transport=invoker,
+        transport=transport._invoker_binding.invoker,
+        transport_source=invoker,
         snapshot_signer=snapshot_signer,
         context_resolver=context_resolver,
         approval_registry=approval_registry,

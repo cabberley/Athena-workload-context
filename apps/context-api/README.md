@@ -43,10 +43,14 @@ The integration composes the merged components without introducing direct Azure 
   used by its injected invoker from it; no independent endpoint label can be supplied. It
   maps the WC-009 semantic inventory operation to WC-008's exact `group_resource_list` deployment
   tool. The WC-009 adapter and its immutable client share one exact transport object. Collection
-  checks that runtime identity and passes that same object explicitly through the invocation, so
-  replacing an embedded client transport cannot redirect the call. The service rejects
-  composition unless the actual transport configuration exactly equals the separately loaded
-  trusted WC-008 configuration.
+  checks the concrete transport and invoker type, object identity, and original method
+  implementation, then calls the captured implementation directly with the sealed endpoint.
+  Per-instance, class-level, or embedded-client method/transport replacement therefore fails
+  closed before publication. The production HTTP invoker is
+  `ManagedIdentityPrivateMcpInvoker`, which installs a redirect-rejecting opener before obtaining
+  or attaching its keyless bearer token and rejects every 30x response without an authenticated
+  follow-up. The service rejects composition unless the actual transport configuration exactly
+  equals the separately loaded trusted WC-008 configuration.
 - WC-009 validates tool identity, trust evidence, freshness, schema, count, size, and scope before
   the Context API sees evidence.
 - The app-owned `ContextService` resolves WC-007 context, approvals, and evaluation grants before

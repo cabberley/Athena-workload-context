@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from inspect import getattr_static
 from pathlib import Path
-from typing import Any, Protocol
+from types import FunctionType, MappingProxyType
+from typing import Any, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import BaseHandler, HTTPRedirectHandler, Request, build_opener
 
 from azure.identity import DefaultAzureCredential
 from pydantic import TypeAdapter, ValidationError
@@ -44,8 +48,13 @@ from athena_context.evidence import (
     CollectorTrustConfiguration,
     EvidenceClientCompositionError,
     EvidenceCollectionCommand,
+    McpAuthorizationFailure,
+    McpFailedResponse,
+    McpSuccessResponse,
+    McpToolUnavailable,
     SyncAttemptReplayGuard,
     SyncEvidenceClient,
+    SyncEvidenceTransport,
     SyncTrustedIngestionSigner,
 )
 from athena_context.evidence.models import EvidenceTransportRequest, McpTransportOutcome
@@ -60,6 +69,10 @@ class PrivateMcpInvokerPort(Protocol):
         deployment_tool_name: str,
         request: EvidenceTransportRequest,
     ) -> McpTransportOutcome: ...
+
+
+class PrivateMcpAccessTokenPort(Protocol):
+    def get_token(self, private_mcp_endpoint: str) -> str: ...
 
 
 class ContextApiAccessTokenPort(Protocol):
@@ -77,7 +90,7 @@ class PublishedContextReaderPort(Protocol):
 
 
 class _RejectRedirectHandler(HTTPRedirectHandler):
-    """Never forward the Context API bearer token through an HTTP redirect."""
+    """Never forward an Athena managed-identity bearer token through a redirect."""
 
     def redirect_request(
         self,
@@ -101,6 +114,202 @@ class DefaultAzureCredentialContextApiToken:
     def get_token(self, audience: str) -> str:
         scope = f"{audience.rstrip('/')}/.default"
         return self._credential.get_token(scope).token
+
+
+class DefaultAzureCredentialPrivateMcpToken:
+    """Keyless token provider pinned to one private MCP endpoint and audience."""
+
+    _audience: str
+    _credential: DefaultAzureCredential
+    _private_mcp_endpoint: str
+
+    __slots__ = (
+        "_audience",
+        "_credential",
+        "_private_mcp_endpoint",
+    )
+
+    def __init__(
+        self,
+        *,
+        private_mcp_endpoint: str,
+        audience: str,
+    ) -> None:
+        parsed = urlsplit(private_mcp_endpoint)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP token endpoint must be a trusted HTTPS origin"
+            )
+        if (
+            type(audience) is not str
+            or not audience.strip()
+            or audience != audience.strip()
+            or len(audience) > 512
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP managed identity audience is required"
+            )
+        object.__setattr__(self, "_private_mcp_endpoint", private_mcp_endpoint.rstrip("/"))
+        object.__setattr__(self, "_audience", audience)
+        object.__setattr__(self, "_credential", DefaultAzureCredential())
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("private MCP token provider composition is immutable")
+
+    def get_token(self, private_mcp_endpoint: str) -> str:
+        if private_mcp_endpoint.rstrip("/") != self._private_mcp_endpoint:
+            raise DemoEvaluationConfigurationError(
+                "private MCP token request did not match its pinned endpoint"
+            )
+        scope = f"{self._audience.rstrip('/')}/.default"
+        return self._credential.get_token(scope).token
+
+
+class ManagedIdentityPrivateMcpInvoker:
+    """Authenticated MCP HTTP boundary that installs a zero-redirect policy first."""
+
+    _clock: Clock
+    _http_handler: BaseHandler | None
+    _token_provider: PrivateMcpAccessTokenPort
+
+    __slots__ = (
+        "_clock",
+        "_http_handler",
+        "_token_provider",
+    )
+
+    def __init__(
+        self,
+        *,
+        clock: Clock,
+        token_provider: PrivateMcpAccessTokenPort,
+        http_handler: BaseHandler | None = None,
+    ) -> None:
+        object.__setattr__(self, "_clock", clock)
+        object.__setattr__(self, "_http_handler", http_handler)
+        object.__setattr__(
+            self,
+            "_token_provider",
+            token_provider,
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("private MCP invoker composition is immutable")
+
+    def invoke(
+        self,
+        private_mcp_endpoint: str,
+        deployment_tool_name: str,
+        request: EvidenceTransportRequest,
+    ) -> McpTransportOutcome:
+        # Install the rejection handler before obtaining or attaching a bearer token.
+        handlers: tuple[BaseHandler, ...] = (
+            ()
+            if self._http_handler is None
+            else (self._http_handler,)
+        )
+        opener = build_opener(_RejectRedirectHandler(), *handlers)
+        credential = self._token_provider.get_token(private_mcp_endpoint)
+        if (
+            type(credential) is not str
+            or not credential
+            or credential != credential.strip()
+            or any(character in credential for character in "\r\n")
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP managed identity returned an invalid credential"
+            )
+        endpoint = f"{private_mcp_endpoint.rstrip('/')}/"
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request.attempt_id,
+                "method": "tools/call",
+                "params": {
+                    "name": deployment_tool_name,
+                    "arguments": request.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                },
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        outbound = Request(  # noqa: S310 - the endpoint is operator-sealed HTTPS
+            endpoint,
+            data=body,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {credential}",
+                "Cache-Control": "no-store",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with opener.open(  # noqa: S310 - redirect handling is explicitly disabled
+                outbound,
+                timeout=request.bounds.timeout_milliseconds / 1_000,
+            ) as response:
+                response_url = response.geturl()
+                status_code = response.getcode()
+                content = response.read(request.bounds.max_response_bytes + 1)
+        except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise DemoEvaluationConfigurationError(
+                    "private MCP HTTP redirect was rejected"
+                ) from exc
+            observed_at = self._clock.now()
+            if exc.code in {401, 403}:
+                return McpAuthorizationFailure(
+                    authorization_status="denied",
+                    observed_at=observed_at,
+                )
+            content = exc.read(request.bounds.max_response_bytes + 1)
+            if not content or len(content) > request.bounds.max_response_bytes:
+                return McpToolUnavailable(
+                    unavailable_reason="mcpUnavailable",
+                    observed_at=observed_at,
+                )
+            return McpFailedResponse(
+                body=content,
+                response_received_at=observed_at,
+            )
+        except URLError:
+            return McpToolUnavailable(
+                unavailable_reason="networkUnavailable",
+                observed_at=self._clock.now(),
+            )
+        if (
+            response_url != endpoint
+            or not 200 <= status_code < 300
+            or not content
+            or len(content) > request.bounds.max_response_bytes
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP returned an untrusted HTTP response"
+            )
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=self._clock.now(),
+        )
+
+
+_MANAGED_IDENTITY_MCP_INVOKE_IMPLEMENTATION = (
+    ManagedIdentityPrivateMcpInvoker.invoke
+)
 
 
 class EnvironmentContextApiPublishedContextReader:
@@ -203,16 +412,123 @@ class EnvironmentContextApiPublishedContextReader:
         return content
 
 
+type _PrivateMcpInvokeImplementation = Callable[
+    [object, str, str, EvidenceTransportRequest],
+    McpTransportOutcome,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateMcpInvokerBinding:
+    invoker: PrivateMcpInvokerPort
+    invoker_type: type[object]
+    invoke_implementation: _PrivateMcpInvokeImplementation
+
+
+def _static_instance_state(instance: object) -> Mapping[str, object] | None:
+    try:
+        state = object.__getattribute__(instance, "__dict__")
+    except AttributeError:
+        return None
+    if type(state) is not dict:
+        raise DemoEvaluationConfigurationError(
+            "private MCP invoker has non-concrete instance state"
+        )
+    return MappingProxyType(cast(dict[str, object], state))
+
+
+def _has_instance_invoke_override(instance: object) -> bool:
+    state = _static_instance_state(instance)
+    return state is not None and "invoke" in state
+
+
+def _validate_invoker_instance_state(invoker: object) -> Mapping[str, object] | None:
+    state = _static_instance_state(invoker)
+    if state is None:
+        return None
+    for value in state.values():
+        if callable(value):
+            raise DemoEvaluationConfigurationError(
+                "private MCP invoker instance state contains mutable dispatch"
+            )
+    return state
+
+
+def _copy_invoker_with_sealed_state[Invoker: PrivateMcpInvokerPort](
+    invoker: Invoker,
+) -> Invoker:
+    state = _validate_invoker_instance_state(invoker)
+    if state is None:
+        return invoker
+    sealed = object.__new__(type(invoker))
+    sealed_state = object.__getattribute__(sealed, "__dict__")
+    if type(sealed_state) is not dict:
+        raise DemoEvaluationConfigurationError(
+            "private MCP invoker has non-concrete instance state"
+        )
+    for name, value in state.items():
+        sealed_state[str.__str__(name)] = value
+    return cast(Invoker, sealed)
+
+
+def _seal_private_mcp_invoker(
+    invoker: PrivateMcpInvokerPort,
+) -> _PrivateMcpInvokerBinding:
+    invoker_type = type(invoker)
+    implementation = getattr_static(invoker_type, "invoke", None)
+    if (
+        type(implementation) is not FunctionType
+        or (
+            invoker_type is ManagedIdentityPrivateMcpInvoker
+            and implementation is not _MANAGED_IDENTITY_MCP_INVOKE_IMPLEMENTATION
+        )
+        or _has_instance_invoke_override(invoker)
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP invoker must expose one concrete unmodified implementation"
+        )
+    sealed_invoker = _copy_invoker_with_sealed_state(invoker)
+    return _PrivateMcpInvokerBinding(
+        invoker=sealed_invoker,
+        invoker_type=invoker_type,
+        invoke_implementation=cast(
+            _PrivateMcpInvokeImplementation,
+            implementation,
+        ),
+    )
+
+
+def _require_exact_private_mcp_invoker(
+    binding: _PrivateMcpInvokerBinding,
+) -> None:
+    try:
+        invalid = (
+            type(binding.invoker) is not binding.invoker_type
+            or getattr_static(binding.invoker_type, "invoke", None)
+            is not binding.invoke_implementation
+            or _has_instance_invoke_override(binding.invoker)
+        )
+        _validate_invoker_instance_state(binding.invoker)
+    except DemoEvaluationConfigurationError as exc:
+        raise EvidenceClientCompositionError(
+            "private MCP invoker composition changed after composition"
+        ) from exc
+    if invalid:
+        raise EvidenceClientCompositionError(
+            "private MCP invoker implementation changed after composition"
+        )
+
+
 class PrivateMcpEvidenceTransport:
     """Own the immutable verified WC-008 identity used for every MCP invocation."""
 
     _deployment_configuration: VerifiedWc008DeploymentConfiguration
-    _invoker: PrivateMcpInvokerPort
+    _invoker_binding: _PrivateMcpInvokerBinding
     _transport_configuration: SealedMcpTransportConfiguration
 
     __slots__ = (
         "_deployment_configuration",
-        "_invoker",
+        "_invoker_binding",
         "_transport_configuration",
     )
 
@@ -233,7 +549,11 @@ class PrivateMcpEvidenceTransport:
             ) from exc
         object.__setattr__(self, "_deployment_configuration", normalized)
         object.__setattr__(self, "_transport_configuration", sealed)
-        object.__setattr__(self, "_invoker", invoker)
+        object.__setattr__(
+            self,
+            "_invoker_binding",
+            _seal_private_mcp_invoker(invoker),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -250,13 +570,67 @@ class PrivateMcpEvidenceTransport:
         return self._transport_configuration
 
     def invoke(self, request: EvidenceTransportRequest) -> McpTransportOutcome:
-        if request.tool_name != AZURE_RESOURCE_INVENTORY_TOOL:
-            raise ValueError("private MCP transport received an unsupported semantic tool")
-        return self._invoker.invoke(
-            self._transport_configuration.private_mcp_endpoint,
-            AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
-            request,
+        return _invoke_exact_private_mcp_transport(self, request)
+
+
+_PRIVATE_MCP_TRANSPORT_INVOKE_IMPLEMENTATION = PrivateMcpEvidenceTransport.invoke
+
+
+def _require_exact_private_mcp_transport(
+    transport: PrivateMcpEvidenceTransport,
+) -> None:
+    if (
+        type(transport) is not PrivateMcpEvidenceTransport
+        or getattr_static(PrivateMcpEvidenceTransport, "invoke", None)
+        is not _PRIVATE_MCP_TRANSPORT_INVOKE_IMPLEMENTATION
+        or _has_instance_invoke_override(transport)
+    ):
+        raise EvidenceClientCompositionError(
+            "private MCP transport implementation changed after composition"
         )
+    configuration = object.__getattribute__(
+        transport,
+        "_transport_configuration",
+    )
+    try:
+        sealed_mcp_transport_configuration_primitives(configuration)
+    except ValueError as exc:
+        raise EvidenceClientCompositionError(
+            "private MCP transport configuration is not sealed"
+        ) from exc
+    _require_exact_private_mcp_invoker(
+        object.__getattribute__(transport, "_invoker_binding")
+    )
+
+
+def _invoke_exact_private_mcp_transport(
+    transport: SyncEvidenceTransport,
+    request: EvidenceTransportRequest,
+) -> McpTransportOutcome:
+    if type(transport) is not PrivateMcpEvidenceTransport:
+        raise EvidenceClientCompositionError(
+            "private MCP invocation did not receive the exact transport"
+        )
+    concrete_transport = cast(PrivateMcpEvidenceTransport, transport)
+    _require_exact_private_mcp_transport(concrete_transport)
+    if request.tool_name != AZURE_RESOURCE_INVENTORY_TOOL:
+        raise ValueError("private MCP transport received an unsupported semantic tool")
+    _, endpoint = sealed_mcp_transport_configuration_primitives(
+        object.__getattribute__(
+            concrete_transport,
+            "_transport_configuration",
+        )
+    )
+    binding = object.__getattribute__(
+        concrete_transport,
+        "_invoker_binding",
+    )
+    return binding.invoke_implementation(
+        binding.invoker,
+        endpoint,
+        AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+        request,
+    )
 
 
 class Wc009EvidenceClientAdapter:
@@ -328,24 +702,28 @@ class Wc009EvidenceClientAdapter:
                 "MCP transport"
             )
         try:
-            sealed_mcp_transport_configuration_primitives(
-                self._transport.transport_configuration
-            )
-        except ValueError as exc:
+            _require_exact_private_mcp_transport(self._transport)
+        except EvidenceClientCompositionError as exc:
             raise DemoEvaluationConfigurationError(
-                "WC-009 runtime transport configuration is not sealed"
+                "WC-009 runtime transport or invoker composition changed"
             ) from exc
         return self._transport
 
     @property
     def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
         self._require_exact_runtime_transport()
-        return self._transport.deployment_configuration
+        return object.__getattribute__(
+            self._transport,
+            "_deployment_configuration",
+        )
 
     @property
     def transport_configuration(self) -> SealedMcpTransportConfiguration:
         self._require_exact_runtime_transport()
-        return self._transport.transport_configuration
+        return object.__getattribute__(
+            self._transport,
+            "_transport_configuration",
+        )
 
     @property
     def trust_configuration(self) -> CollectorTrustConfiguration:
@@ -366,6 +744,7 @@ class Wc009EvidenceClientAdapter:
                 self._client,
                 command,
                 transport=transport,
+                transport_invoke=_invoke_exact_private_mcp_transport,
             )
         except EvidenceClientCompositionError as exc:
             raise DemoEvaluationConfigurationError(
@@ -603,10 +982,13 @@ __all__ = [
     "ContextServicePublishedContextReader",
     "ContextServicePublishedContextResolver",
     "DefaultAzureCredentialContextApiToken",
+    "DefaultAzureCredentialPrivateMcpToken",
     "EnvironmentContextApiPublishedContextReader",
     "EnvironmentWc007PublishedContextSelectionPort",
     "EnvironmentWc008DeploymentConfigurationPort",
+    "ManagedIdentityPrivateMcpInvoker",
     "OperatorTrustedWc008ConfigurationPort",
+    "PrivateMcpAccessTokenPort",
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",
     "Wc009EvidenceClientAdapter",

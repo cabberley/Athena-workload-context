@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 
 from athena_context.contracts import TrustedKeyAnchor, TrustedKeyResolver
@@ -8,6 +9,7 @@ from athena_context.evidence.models import (
     CollectorTrustConfiguration,
     EvidenceClientCompositionError,
     EvidenceCollectionCommand,
+    EvidenceTransportRequest,
     McpTimeoutNoResponse,
     McpTransportOutcome,
     ReplayDetectedError,
@@ -28,6 +30,18 @@ from athena_context.evidence.validation import (
     project_transport_outcome,
     validate_trusted_identity,
 )
+
+type _SyncTransportInvoke = Callable[
+    [SyncEvidenceTransport, EvidenceTransportRequest],
+    McpTransportOutcome,
+]
+
+
+def _invoke_runtime_transport(
+    transport: SyncEvidenceTransport,
+    request: EvidenceTransportRequest,
+) -> McpTransportOutcome:
+    return transport.invoke(request)
 
 
 class SyncEvidenceClient:
@@ -79,6 +93,7 @@ class SyncEvidenceClient:
             self,
             command,
             transport=self._transport,
+            transport_invoke=_invoke_runtime_transport,
         )
 
     def _collect_with_bound_transport(
@@ -86,6 +101,7 @@ class SyncEvidenceClient:
         command: EvidenceCollectionCommand,
         *,
         transport: SyncEvidenceTransport,
+        transport_invoke: _SyncTransportInvoke,
     ) -> CollectedEvidence:
         """Collect through one caller-bound transport after an identity check."""
 
@@ -97,6 +113,7 @@ class SyncEvidenceClient:
             self,
             command,
             transport=transport,
+            transport_invoke=transport_invoke,
         )
 
     def _collect_with_transport(
@@ -104,6 +121,7 @@ class SyncEvidenceClient:
         command: EvidenceCollectionCommand,
         *,
         transport: SyncEvidenceTransport,
+        transport_invoke: _SyncTransportInvoke,
     ) -> CollectedEvidence:
         """Use the explicit local transport for the complete invocation."""
 
@@ -119,7 +137,7 @@ class SyncEvidenceClient:
         outcome: McpTransportOutcome
         if preflight is None:
             try:
-                outcome = transport.invoke(request)
+                outcome = transport_invoke(transport, request)
             except TimeoutError:
                 deadline = started_at + timedelta(
                     milliseconds=request.bounds.timeout_milliseconds

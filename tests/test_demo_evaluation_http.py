@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from email.message import Message
+from io import BytesIO
+from typing import Any
+from urllib.request import BaseHandler
+from urllib.response import addinfourl
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,7 +13,9 @@ from fastapi.testclient import TestClient
 from athena_context.api import (
     Actor,
     ActorKind,
+    ManagedIdentityPrivateMcpInvoker,
     PrivateMcpEvidenceTransport,
+    PrivateMcpInvokerPort,
     StaticTestAuthenticator,
     VerifiedAuthentication,
     VerifiedWc008DeploymentConfiguration,
@@ -30,8 +37,11 @@ from athena_context.evidence.models import McpTransportOutcome
 from wc013_support import (
     APPROVER,
     MCP_SERVICE_ACTOR,
+    NOW,
+    PRIVATE_ENDPOINT,
     PUBLISHER,
     ScenarioTransport,
+    StepClock,
     build_harness,
     verified_deployment_configuration,
 )
@@ -64,8 +74,15 @@ def _verified(actor: object) -> VerifiedAuthentication:
     )
 
 
-def _client(scenario: str = "success") -> tuple[object, TestClient]:
-    harness = build_harness(scenario)
+def _client(
+    scenario: str = "success",
+    *,
+    private_mcp_invoker: PrivateMcpInvokerPort | None = None,
+) -> tuple[object, TestClient]:
+    harness = build_harness(
+        scenario,
+        private_mcp_invoker=private_mcp_invoker,
+    )
     authentication = StaticTestAuthenticator(
         {
             PUBLISHER_TOKEN: _verified(PUBLISHER),
@@ -290,6 +307,266 @@ def test_http_rejects_exact_embedded_foreign_transport_without_network_or_state(
     assert response.json()["error"]["code"] == "demo_evaluation_configuration"
     assert attacker_invoker.calls == 0
     assert harness.transport.calls == 0
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_http_rejects_exact_transport_invoke_replacement_without_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime dispatch cannot replace the known implementation on the exact type."""
+
+    harness, client = _client()
+    evidence_client = harness.dependencies.evidence_client
+    assert type(evidence_client) is Wc009EvidenceClientAdapter
+    exact_transport = evidence_client._transport
+    assert type(exact_transport) is PrivateMcpEvidenceTransport
+    attacker_invoker = ScenarioTransport()
+
+    def invoke_foreign_endpoint(
+        self: PrivateMcpEvidenceTransport,
+        request: EvidenceTransportRequest,
+    ) -> McpTransportOutcome:
+        del self
+        return attacker_invoker.invoke(
+            "https://attacker.invalid",
+            "group_resource_list",
+            request,
+        )
+
+    # Replacing the class descriptor changes dispatch for this exact accepted
+    # instance without changing its type or sealed endpoint configuration.
+    monkeypatch.setattr(
+        PrivateMcpEvidenceTransport,
+        "invoke",
+        invoke_foreign_endpoint,
+    )
+    idempotency_key = "wc013-http-exact-transport-invoke-replacement"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert attacker_invoker.calls == 0
+    assert harness.transport.calls == 0  # type: ignore[attr-defined]
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_http_ignores_source_invoker_instance_method_replacement_without_state() -> None:
+    """The transport invokes its sealed copy, not mutable caller-owned dispatch."""
+
+    harness, client = _client()
+    attacker_invoker = ScenarioTransport()
+
+    def invoke_foreign_endpoint(
+        private_mcp_endpoint: str,
+        deployment_tool_name: str,
+        request: EvidenceTransportRequest,
+    ) -> McpTransportOutcome:
+        del private_mcp_endpoint, deployment_tool_name
+        return attacker_invoker.invoke(
+            "https://attacker.invalid",
+            "group_resource_list",
+            request,
+        )
+
+    harness.transport_source.invoke = (  # type: ignore[method-assign]
+        invoke_foreign_endpoint
+    )
+    idempotency_key = "wc013-http-exact-invoker-instance-method-replacement"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 201
+    assert attacker_invoker.calls == 0
+    assert harness.transport.calls == 1  # type: ignore[attr-defined]
+    assert harness.transport.endpoints == [PRIVATE_ENDPOINT]  # type: ignore[attr-defined]
+    assert harness.snapshot_signer.calls == 1
+    receipt = harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key)
+    assert receipt is not None
+    assert receipt.material.private_mcp_endpoint == PRIVATE_ENDPOINT
+    assert harness.store.publication_count == 1
+
+
+def test_http_rejects_exact_accepted_invoker_method_replacement_without_state() -> None:
+    """Mutable dispatch on the concrete invoker fails before any invocation."""
+
+    harness, client = _client()
+    attacker_invoker = ScenarioTransport()
+
+    def invoke_foreign_endpoint(
+        private_mcp_endpoint: str,
+        deployment_tool_name: str,
+        request: EvidenceTransportRequest,
+    ) -> McpTransportOutcome:
+        del private_mcp_endpoint, deployment_tool_name
+        return attacker_invoker.invoke(
+            "https://attacker.invalid",
+            "group_resource_list",
+            request,
+        )
+
+    harness.transport.invoke = invoke_foreign_endpoint  # type: ignore[method-assign]
+    idempotency_key = "wc013-http-exact-accepted-invoker-method-replacement"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert attacker_invoker.calls == 0
+    assert harness.transport.calls == 0  # type: ignore[attr-defined]
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_http_rejects_authenticated_private_mcp_redirect_without_follow_up() -> None:
+    """The managed-identity boundary never forwards Authorization through 30x."""
+
+    bearer_token = "synthetic-private-mcp-managed-identity-token"
+    token_requests: list[str] = []
+    network_requests: list[tuple[str, str | None]] = []
+
+    class TokenProvider:
+        def get_token(self, private_mcp_endpoint: str) -> str:
+            token_requests.append(private_mcp_endpoint)
+            return bearer_token
+
+    class RedirectingTransport(BaseHandler):
+        handler_order = 100
+
+        def _open(self, request: Any) -> Any:
+            network_requests.append(
+                (
+                    request.full_url,
+                    request.get_header("Authorization"),
+                )
+            )
+            if request.full_url == f"{PRIVATE_ENDPOINT}/":
+                headers = Message()
+                headers["Location"] = "https://attacker.invalid/collect"
+                response = addinfourl(
+                    BytesIO(b""),
+                    headers,
+                    request.full_url,
+                    307,
+                )
+                response.msg = "Temporary Redirect"
+                return response
+            response = addinfourl(
+                BytesIO(b'{"foreign":"authenticated"}'),
+                Message(),
+                request.full_url,
+                200,
+            )
+            response.msg = "OK"
+            return response
+
+        def https_open(self, request: Any) -> Any:
+            return self._open(request)
+
+    invoker = ManagedIdentityPrivateMcpInvoker(
+        clock=StepClock(NOW),
+        token_provider=TokenProvider(),
+        http_handler=RedirectingTransport(),
+    )
+    harness, client = _client(private_mcp_invoker=invoker)
+    idempotency_key = "wc013-http-authenticated-private-mcp-redirect"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert token_requests == [PRIVATE_ENDPOINT]
+    assert network_requests == [
+        (
+            f"{PRIVATE_ENDPOINT}/",
+            f"Bearer {bearer_token}",
+        )
+    ]
+    assert harness.snapshot_signer.calls == 0
+    assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
+    assert harness.store.resolve_publication(harness.command.snapshot_id) is None
+    assert harness.store.resolve_result(harness.command.snapshot_id) is None
+    assert harness.store.publication_count == 0
+
+
+def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production redirect boundary itself is pinned to its reviewed method."""
+
+    token_requests: list[str] = []
+    network_requests: list[str] = []
+
+    class TokenProvider:
+        def get_token(self, private_mcp_endpoint: str) -> str:
+            token_requests.append(private_mcp_endpoint)
+            return "synthetic-private-mcp-managed-identity-token"
+
+    class RecordingTransport(BaseHandler):
+        def https_open(self, request: Any) -> Any:
+            network_requests.append(request.full_url)
+            raise AssertionError("replaced production invoker must not reach HTTP")
+
+    invoker = ManagedIdentityPrivateMcpInvoker(
+        clock=StepClock(NOW),
+        token_provider=TokenProvider(),
+        http_handler=RecordingTransport(),
+    )
+    harness, client = _client(private_mcp_invoker=invoker)
+
+    def invoke_foreign_endpoint(
+        self: ManagedIdentityPrivateMcpInvoker,
+        private_mcp_endpoint: str,
+        deployment_tool_name: str,
+        request: EvidenceTransportRequest,
+    ) -> McpTransportOutcome:
+        del self, private_mcp_endpoint, deployment_tool_name, request
+        raise AssertionError("replaced production invoker method was dispatched")
+
+    monkeypatch.setattr(
+        ManagedIdentityPrivateMcpInvoker,
+        "invoke",
+        invoke_foreign_endpoint,
+    )
+    idempotency_key = "wc013-http-managed-identity-invoker-replacement"
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, idempotency_key),
+        json=harness.command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "demo_evaluation_configuration"
+    assert token_requests == []
+    assert network_requests == []
     assert harness.snapshot_signer.calls == 0
     assert harness.store.load_receipt(PUBLISHER.actor_id, idempotency_key) is None
     assert harness.store.resolve_publication(harness.command.snapshot_id) is None
