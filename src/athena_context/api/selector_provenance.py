@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import AwareDatetime, Field, model_validator
 
 from athena_context.api.cohort_domain import normalized_identifier
-from athena_context.api.domain import Actor, ApiModel, DraftRecord, WorkloadIdentifier
+from athena_context.api.domain import Actor, ApiModel, WorkloadIdentifier
 from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     AtomicSelector,
@@ -74,6 +74,33 @@ def selector_provenance_digest(
     )
 
 
+class DraftSelectorBaselineReference(ApiModel):
+    """Exact immutable creation baseline used by a neutral successor."""
+
+    draft_id: str = Field(pattern=_ID_PATTERN)
+    manifest_id: WorkloadIdentifier
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    source_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
+    captured_by: Actor
+    captured_at: AwareDatetime
+
+    @classmethod
+    def capture(
+        cls,
+        baseline: DraftSelectorBaseline,
+    ) -> DraftSelectorBaselineReference:
+        return cls(
+            draft_id=baseline.draft_id,
+            manifest_id=baseline.manifest_id,
+            manifest_version=baseline.manifest_version,
+            source_manifest_digest=baseline.source_manifest_digest,
+            selector_provenance_digest=baseline.selector_provenance_digest,
+            captured_by=baseline.captured_by,
+            captured_at=baseline.captured_at,
+        )
+
+
 class DraftSelectorBaseline(ApiModel):
     """Immutable selector baseline captured before a draft can be mutated."""
 
@@ -82,10 +109,7 @@ class DraftSelectorBaseline(ApiModel):
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     source_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
-    inherited_selector_authority_digest: str | None = Field(
-        default=None,
-        pattern=_DIGEST_PATTERN,
-    )
+    inferred_predecessor: DraftSelectorBaselineReference | None = None
     entries: tuple[SelectorProvenanceEntry, ...]
     captured_by: Actor
     captured_at: AwareDatetime
@@ -107,7 +131,7 @@ class DraftSelectorBaseline(ApiModel):
         draft_id: str,
         manifest: CanonicalWorkloadManifest,
         manifest_digest: str,
-        inherited_selector_authority_digest: str | None,
+        inferred_predecessor: DraftSelectorBaselineReference | None,
         actor: Actor,
         captured_at: datetime,
     ) -> DraftSelectorBaseline:
@@ -118,101 +142,10 @@ class DraftSelectorBaseline(ApiModel):
             manifest_version=manifest.manifest_version,
             source_manifest_digest=manifest_digest,
             selector_provenance_digest=selector_provenance_digest(entries),
-            inherited_selector_authority_digest=(
-                inherited_selector_authority_digest
-            ),
+            inferred_predecessor=inferred_predecessor,
             entries=entries,
             captured_by=actor,
             captured_at=captured_at,
-        )
-
-
-class DraftSelectorPredecessorBinding(ApiModel):
-    """Immutable edge to exact unpublished selector authority."""
-
-    successor_draft_id: str = Field(pattern=_ID_PATTERN)
-    manifest_id: WorkloadIdentifier
-    successor_manifest_version: str = Field(pattern=_VERSION_PATTERN)
-    successor_source_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
-    successor_selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
-    predecessor_draft_id: str = Field(pattern=_ID_PATTERN)
-    predecessor_manifest_version: str = Field(pattern=_VERSION_PATTERN)
-    predecessor_revision: int = Field(ge=1)
-    predecessor_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
-    predecessor_selector_provenance_digest: str = Field(pattern=_DIGEST_PATTERN)
-    predecessor_baseline_source_manifest_digest: str = Field(
-        pattern=_DIGEST_PATTERN
-    )
-    predecessor_baseline_selector_provenance_digest: str = Field(
-        pattern=_DIGEST_PATTERN
-    )
-    predecessor_selector_authority_digest: str = Field(
-        pattern=_DIGEST_PATTERN
-    )
-    bound_by: Actor
-    bound_at: AwareDatetime
-
-    @model_validator(mode="after")
-    def validate_lineage(self) -> DraftSelectorPredecessorBinding:
-        if self.successor_draft_id == self.predecessor_draft_id:
-            raise ValueError("selector predecessor cannot reference its own draft")
-        predecessor = tuple(
-            int(part) for part in self.predecessor_manifest_version.split(".")
-        )
-        successor = tuple(
-            int(part) for part in self.successor_manifest_version.split(".")
-        )
-        if predecessor >= successor:
-            raise ValueError(
-                "selector predecessor version must be lower than successor"
-            )
-        return self
-
-    @classmethod
-    def capture(
-        cls,
-        *,
-        successor_draft_id: str,
-        successor_manifest: CanonicalWorkloadManifest,
-        successor_manifest_digest: str,
-        predecessor: DraftRecord,
-        predecessor_baseline: DraftSelectorBaseline,
-        predecessor_selector_authority_digest: str,
-        actor: Actor,
-        bound_at: datetime,
-    ) -> DraftSelectorPredecessorBinding:
-        successor_entries = manifest_selector_provenance(successor_manifest)
-        predecessor_entries = manifest_selector_provenance(
-            predecessor.manifest
-        )
-        return cls(
-            successor_draft_id=successor_draft_id,
-            manifest_id=successor_manifest.manifest_id,
-            successor_manifest_version=successor_manifest.manifest_version,
-            successor_source_manifest_digest=successor_manifest_digest,
-            successor_selector_provenance_digest=selector_provenance_digest(
-                successor_entries
-            ),
-            predecessor_draft_id=predecessor.draft_id,
-            predecessor_manifest_version=(
-                predecessor.manifest.manifest_version
-            ),
-            predecessor_revision=predecessor.revision,
-            predecessor_manifest_digest=predecessor.manifest_digest,
-            predecessor_selector_provenance_digest=(
-                selector_provenance_digest(predecessor_entries)
-            ),
-            predecessor_baseline_source_manifest_digest=(
-                predecessor_baseline.source_manifest_digest
-            ),
-            predecessor_baseline_selector_provenance_digest=(
-                predecessor_baseline.selector_provenance_digest
-            ),
-            predecessor_selector_authority_digest=(
-                predecessor_selector_authority_digest
-            ),
-            bound_by=actor,
-            bound_at=bound_at,
         )
 
 
@@ -355,12 +288,11 @@ def selector_role_digests(
 
 __all__ = [
     "DraftSelectorBaseline",
-    "DraftSelectorPredecessorBinding",
+    "DraftSelectorBaselineReference",
     "SelectorProvenanceEntry",
     "SelectorRoleKey",
     "manifest_selector_provenance",
     "resolved_profile_selector_provenance",
     "role_selector_provenance_digest",
-    "selector_provenance_digest",
     "selector_role_digests",
 ]

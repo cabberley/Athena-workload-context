@@ -17,10 +17,7 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadIdentifier,
 )
-from athena_context.api.selector_provenance import (
-    DraftSelectorBaseline,
-    DraftSelectorPredecessorBinding,
-)
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 
 if TYPE_CHECKING:
     from athena_context.api.cohort_decision_domain import CohortDecisionRecord
@@ -75,23 +72,6 @@ class ContextTransactionPort(Protocol):
     def put_draft_selector_baseline(
         self,
         baseline: DraftSelectorBaseline,
-    ) -> None: ...
-
-    def get_draft_selector_predecessor_binding(
-        self,
-        successor_draft_id: str,
-    ) -> DraftSelectorPredecessorBinding | None: ...
-
-    def list_draft_selector_predecessor_bindings(
-        self,
-        *,
-        manifest_id: str,
-        predecessor_draft_id: str | None = None,
-    ) -> list[DraftSelectorPredecessorBinding]: ...
-
-    def put_draft_selector_predecessor_binding(
-        self,
-        binding: DraftSelectorPredecessorBinding,
     ) -> None: ...
 
     def get_published(

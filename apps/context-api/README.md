@@ -57,7 +57,14 @@ mutate it.
   every effective profile, including profile additions and removals, with the authoritative
   same-version draft, declared published predecessor, or single latest workload baseline before
   any baseline, audit, receipt, or draft write. Missing, invalid, or ambiguous predecessor lineage
-  fails closed.
+  fails closed. An inferred unpublished predecessor is accepted only when it has no persisted
+  selector authority and its stored manifest still exactly matches its immutable creation digest
+  and selector-baseline entries. The successor baseline stores the exact neutral predecessor
+  baseline reference and recursively verifies it during every lifecycle transition. A cohort
+  decision therefore prevents that mutable draft from seeding any higher version: the
+  decision-applied draft must first be published and the successor must declare that exact
+  `previous_version`. The API rejects unsafe inferred creation before writing a draft that could
+  fail later lifecycle validation.
   Selected proposal IDs are canonicalized once at the request boundary and are part of the
   decision version: disjoint selections in one batch may be decided independently, while any
   overlap conflicts and a rejection blocks only its covered authority members. Durable authority
@@ -87,11 +94,11 @@ mutate it.
   granted workload scope.
 
 All cohort routes require a verified human identity and a concrete workload grant; wildcard grants
-do not cross this boundary. Reject is durable and blocks later apply for its normalized authority
-and member coverage independently of proposal partitioning. Decision, decision audit, idempotency
-receipt, and draft replacement commit together or roll back together. The bounded WC-007
-replacement reason references the decision ID while the decision record retains the full
-rationale. These routes never publish or change role authority metadata.
+do not cross this boundary. Reject is durable and blocks later apply for the same proposal-set
+version. Decision, decision audit, idempotency receipt, and draft replacement commit together or
+roll back together. The bounded WC-007 replacement reason references the decision ID while the
+decision record retains the full rationale. These routes never publish or change role authority
+metadata.
 
 Validation resolves every profile and enforces selector identity inheritance before changing
 state. Submission repeats that check before and after server finalization, and publication checks
@@ -100,21 +107,8 @@ resolvable only from their persisted apply provenance. Proposal resolution recov
 provenance, and publication carries it through the published source draft into an exact
 selector-preserving next-version baseline. Published recovery recursively validates the complete
 `previous_version` lineage and deduplicates exact decision bindings, so that authority survives
-multiple successor versions without granting generic selector-change authority. When creation
-instead infers a single latest unpublished draft that carries decision authority, it atomically
-persists an immutable typed predecessor binding. That binding fixes the workload, both versions and
-draft IDs, predecessor revision and manifest digest, and both endpoint selector-topology digests to
-their immutable baselines. It also fixes the canonical digest of the exact decision authority
-available at the predecessor revision. The successor baseline independently stores that inherited
-authority digest, so an absent edge or missing, added, or changed decision binding cannot make the
-post-decision successor manifest appear to be a new authority root. Lifecycle and published
-recovery recursively validate every binding and authority digest, fail closed on cycles or
-inconsistency, and keep a bound authority predecessor immutable so a later mutation cannot poison
-an already-created successor. Inferred drafts without carried decision authority do not acquire
-that lock, preserving selector-neutral edits. Unpublished authority cannot seed a second draft at
-the same version because a strictly descending, cycle-safe predecessor edge cannot represent that
-relationship. Any failure leaves drafts, baselines, bindings, decisions, audit, publication, and
-idempotency receipts unchanged.
+multiple successor versions without granting generic selector-change authority. Any failure leaves
+draft state, revision, audit, and idempotency receipts unchanged.
 
 Deployments must inject the snapshot repository, cryptographic verifier, immutable proposal and
 candidate cache, actor-scoped idempotency ports, and a decision transaction port spanning WC-007
