@@ -372,6 +372,8 @@ class DemoEvaluationService:
                 if reasons
                 else collected.collector_attempt.attempt_type
             )
+            if gaps and gaps[0].failure_payload_pointer is not None:
+                detail = f"{detail}@{gaps[0].failure_payload_pointer}"
             raise EvidenceCollectionRejectedError(
                 f"evidence collection produced a fail-closed outcome: {detail}"
             )

@@ -2,35 +2,49 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
-from athena_context.api import (
-    ContextApiPublishedContextResolver,
-    EnvironmentContextApiPublishedContextReader,
-    EnvironmentWc007PublishedContextSelectionPort,
-    EnvironmentWc008DeploymentConfigurationPort,
+from athena_context.live_acceptance import (
+    prepare_wc013_live_acceptance,
+    run_wc013_live_acceptance,
 )
+
+
+def _live_configuration_path() -> Path:
+    if os.getenv("ATHENA_WC013_LIVE") != "1":
+        pytest.skip("set ATHENA_WC013_LIVE=1 for explicit live acceptance")
+    value = os.getenv("ATHENA_WC013_LIVE_CONFIG")
+    if value is None or not value.strip():
+        pytest.fail("ATHENA_WC013_LIVE_CONFIG is required for live acceptance")
+    return Path(value)
+
+
+@pytest.mark.live
+def test_private_mcp_response_produces_cryptographically_verified_snapshot(
+    tmp_path: Path,
+) -> None:
+    accepted = run_wc013_live_acceptance(
+        _live_configuration_path(),
+        snapshot_output=tmp_path / "wc013-live-evidence-snapshot.json",
+    )
+
+    assert accepted.result.snapshot.collector_attempts[0].attempt_type == (
+        "successResponse"
+    )
+    assert accepted.result.snapshot.evidence_records
+    assert accepted.result.snapshot.snapshot_attestation.signature
+    assert accepted.snapshot_path is not None
+    assert accepted.snapshot_path.is_file()
 
 
 @pytest.mark.live
 def test_optional_private_mcp_rejects_unauthenticated_tools_request() -> None:
-    if os.getenv("ATHENA_WC013_LIVE") != "1":
-        pytest.skip("set ATHENA_WC013_LIVE=1 for explicit private endpoint validation")
-    selection = EnvironmentWc007PublishedContextSelectionPort().load()
-    resolved = ContextApiPublishedContextResolver(
-        EnvironmentContextApiPublishedContextReader()
-    ).resolve(
-        selection,
-        as_of=datetime.now(UTC),
-    )
-    assert resolved.view.supersession is None
-    assert resolved.authority_token.manifest_version == selection.manifest_version
-    deployment = EnvironmentWc008DeploymentConfigurationPort().load_verified()
-    endpoint = deployment.assertion.azure_mcp_internal_endpoint
+    prepared = prepare_wc013_live_acceptance(_live_configuration_path())
+    endpoint = prepared.assertion.azure_mcp_internal_endpoint
 
     body = json.dumps(
         {

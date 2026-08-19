@@ -35,6 +35,9 @@ param virtualNetworkAddressPrefix string = '10.42.0.0/16'
 @description('Delegated infrastructure subnet prefix. Container Apps requires a dedicated subnet.')
 param infrastructureSubnetPrefix string = '10.42.0.0/23'
 
+@description('Dedicated subnet for private endpoints used by the WC-013 acceptance dependencies.')
+param privateEndpointSubnetPrefix string = '10.42.2.0/24'
+
 @description('Optional workload resource-group scopes. Empty means the MCP identity gets no workload access.')
 param workloadReadScopes array = []
 
@@ -68,14 +71,15 @@ resource infrastructureSubnet 'Microsoft.Network/virtualNetworks/subnets@2025-05
   name: 'container-apps-infrastructure'
   properties: {
     addressPrefix: infrastructureSubnetPrefix
-    delegations: [
-      {
-        name: 'Microsoft.App.environments'
-        properties: {
-          serviceName: 'Microsoft.App/environments'
-        }
-      }
-    ]
+  }
+}
+
+resource privateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2025-05-01' = {
+  parent: virtualNetwork
+  name: 'private-endpoints'
+  properties: {
+    addressPrefix: privateEndpointSubnetPrefix
+    privateEndpointNetworkPolicies: 'Disabled'
   }
 }
 
@@ -95,12 +99,36 @@ resource contextIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-
   })
 }
 
+resource operationalLogs 'Microsoft.OperationalInsights/workspaces@2025-02-01' = {
+  name: '${namePrefix}-mcp-logs'
+  location: location
+  tags: resourceTags
+  properties: {
+    retentionInDays: 30
+    sku: {
+      name: 'PerGB2018'
+    }
+    features: {
+      enableLogAccessUsingOnlyResourcePermissions: true
+    }
+    publicNetworkAccessForIngestion: 'Enabled'
+    publicNetworkAccessForQuery: 'Enabled'
+  }
+}
+
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' = {
   name: '${namePrefix}-mcp-env'
   location: location
   tags: resourceTags
   properties: {
     publicNetworkAccess: 'Disabled'
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: operationalLogs.properties.customerId
+        sharedKey: operationalLogs.listKeys().primarySharedKey
+      }
+    }
     vnetConfiguration: {
       infrastructureSubnetId: infrastructureSubnet.id
       internal: true
@@ -160,6 +188,24 @@ output azureMcpIdentityResourceId string = mcpIdentity.id
 
 @description('Athena context identity. This principal receives no workload read role in this deployment.')
 output athenaContextIdentityResourceId string = contextIdentity.id
+
+@description('Resource ID of the dedicated private Container Apps virtual network.')
+output virtualNetworkResourceId string = virtualNetwork.id
+
+@description('Resource ID of the dedicated subnet used for Key Vault and Storage private endpoints.')
+output privateEndpointSubnetResourceId string = privateEndpointSubnet.id
+
+@description('Resource ID of the bounded Container Apps operational log workspace.')
+output operationalLogWorkspaceResourceId string = operationalLogs.id
+
+@description('Customer ID used to query bounded Container Apps operational logs.')
+output operationalLogWorkspaceCustomerId string = operationalLogs.properties.customerId
+
+@description('Dedicated MCP/evidence identity principal ID.')
+output azureMcpIdentityPrincipalId string = mcpIdentity.properties.principalId
+
+@description('Dedicated MCP/evidence identity client ID.')
+output azureMcpIdentityClientId string = mcpIdentity.properties.clientId
 
 @description('Exact reviewed Azure MCP tools exposed by this foundation.')
 output allowedTools array = containerApp.outputs.allowedTools

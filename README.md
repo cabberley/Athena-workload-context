@@ -30,6 +30,7 @@ See:
 - [Agent operating model](AGENTS.md)
 - [Initial build plan](docs/planning/initial-build-plan.md)
 - [Copilot model allocation](docs/planning/model-allocation.md)
+- [WC-013 live acceptance](docs/operations/wc013-live-acceptance.md)
 
 ## Local reference proof
 

@@ -165,30 +165,14 @@ A separate 2026 test creates a new synthetic manifest version with bounded gover
 publishes it through the complete WC-007 proposer, validation, review, human approval, and
 human-authorized publication lifecycle.
 
-The optional live authentication probe is marked `live` and skipped unless explicitly enabled. The
-live path requires an exact published context identity in addition to bounded WC-008 assertion and
-operator-approval JSON files. Full evaluation composition must resolve this selection through
-WC-007 and rejects an expired, missing, ambiguous, or superseded selection:
-
-```powershell
-$env:ATHENA_WC013_LIVE = '1'
-$env:ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE = '<bounded WC-008 assertion JSON>'
-$env:ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE = '<operator approval JSON>'
-$env:ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST = 'sha256:<exact assertion digest>'
-$env:ATHENA_WC013_MANIFEST_ID = '<active published manifest ID>'
-$env:ATHENA_WC013_MANIFEST_VERSION = '<active published manifest version>'
-$env:ATHENA_WC013_PROFILE_ID = '<active profile ID>'
-$env:ATHENA_WC013_CONTEXT_API_ENDPOINT = 'https://<private-context-api-origin>'
-$env:ATHENA_WC013_CONTEXT_API_AUDIENCE = 'api://<context-api-app-id>'
-python -m pytest tests/test_wc013_live.py -m live
-```
-
-Before accessing MCP, the live path uses `DefaultAzureCredential` to resolve that exact selection
-from the authoritative Context API and rejects missing, expired, malformed, or superseded context.
-The Context API reader rejects every HTTP redirect, so its managed-identity bearer token is sent
-only to the configured HTTPS origin and is never forwarded to another host or downgraded scheme.
-The probe then sends only an unauthenticated synthetic `tools/list` request and requires HTTP 401
-or 403. It does not deploy resources, collect workload evidence, or use customer data.
+The initial opt-in live gate is a one-shot Container Apps Job and does not require this HTTP app to
+be deployed. It imports a bounded, human-approved, digest-pinned WC-007 authority bundle into the
+existing transactional `ContextService`, directly composes the WC-013 production adapters, requires
+a successful real private Azure MCP attempt, and cryptographically verifies the immutable
+`EvidenceSnapshot`. A future long-running API deployment must use equivalent durable Context API
+persistence rather than this one-shot authority import. Exact configuration, Azure resources,
+environment variables, and commands are documented in
+[WC-013 live acceptance](../../docs/operations/wc013-live-acceptance.md).
 
 ## Cohort proposal routes
 

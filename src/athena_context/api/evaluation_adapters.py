@@ -42,8 +42,10 @@ from athena_context.api.evaluation_ports import (
 )
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
+    EvidenceGapRecord,
     TrustedKeyAnchor,
     TrustedKeyResolver,
+    canonicalize_json,
     resolve_manifest_profile,
 )
 from athena_context.evidence import (
@@ -61,10 +63,27 @@ from athena_context.evidence import (
     SyncEvidenceClient,
     SyncEvidenceTransport,
     SyncTrustedIngestionSigner,
+    project_transport_outcome,
 )
-from athena_context.evidence.models import EvidenceTransportRequest, McpTransportOutcome
+from athena_context.evidence.models import (
+    EvidenceTransportRequest,
+    McpTransportOutcome,
+    ResourceResponseItem,
+)
 
 AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL = "group_resource_list"
+_AZURE_MCP_JSON_RPC_VERSION = "2.0"
+_AZURE_MCP_PROTOCOL_VERSION = "2025-11-25"
+_AZURE_MCP_CLIENT_NAME = "athena-wc013-live-acceptance"
+_AZURE_MCP_CLIENT_VERSION = "1.0.0"
+_SUPPORTED_INVENTORY_RESOURCE_TYPES = frozenset(
+    {
+        "Microsoft.Compute/virtualMachines",
+        "Microsoft.Network/loadBalancers",
+        "Microsoft.Storage/storageAccounts",
+        "Microsoft.OperationalInsights/workspaces",
+    }
+)
 
 
 class PrivateMcpInvokerPort(Protocol):
@@ -82,6 +101,264 @@ class PrivateMcpAccessTokenPort(Protocol):
 
 class ContextApiAccessTokenPort(Protocol):
     def get_token(self, audience: str) -> str: ...
+
+
+def _now_utc_millisecond() -> datetime:
+    current = datetime.now(UTC)
+    return current.replace(microsecond=(current.microsecond // 1000) * 1000)
+
+
+def _azure_mcp_tool_arguments(
+    request: EvidenceTransportRequest,
+) -> dict[str, str]:
+    scope = request.evidence_scope.model_dump(mode="json", by_alias=True)
+    if scope.get("scopeType") != "resourceGroup":
+        raise DemoEvaluationConfigurationError(
+            "Azure MCP resource inventory requires a resource-group scope"
+        )
+    subscription_id = scope.get("subscriptionId")
+    resource_group_name = scope.get("resourceGroupName")
+    tenant_id = scope.get("tenantId")
+    if not all(
+        type(value) is str and value
+        for value in (subscription_id, resource_group_name, tenant_id)
+    ):
+        raise DemoEvaluationConfigurationError(
+            "Azure MCP resource inventory scope is incomplete"
+        )
+    return {
+        "subscription": cast(str, subscription_id),
+        "resource-group": cast(str, resource_group_name),
+        "tenant": cast(str, tenant_id),
+    }
+
+
+def _azure_mcp_failure_body(request: EvidenceTransportRequest) -> bytes:
+    return canonicalize_json(
+        {
+            "schemaVersion": "1.0.0",
+            "toolName": request.tool_name,
+            "toolVersion": request.tool_version,
+            "attemptId": request.attempt_id,
+            "requestDigest": request.request_digest,
+            "error": {
+                "code": "serviceFailure",
+                "status": "unavailable",
+            },
+        }
+    ).encode("utf-8")
+
+
+def _parse_mcp_json_rpc_content(content: bytes) -> object | None:
+    try:
+        return json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    events = [
+        event
+        for event in text.replace("\r\n", "\n").split("\n\n")
+        if any(line.startswith("data:") for line in event.splitlines())
+    ]
+    if len(events) != 1:
+        return None
+    data = "\n".join(
+        line.removeprefix("data:").lstrip()
+        for line in events[0].splitlines()
+        if line.startswith("data:")
+    )
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        return None
+
+
+def _project_azure_mcp_response(
+    content: bytes,
+    request: EvidenceTransportRequest,
+    *,
+    deployment_tool_name: str,
+    response_received_at: datetime,
+) -> McpTransportOutcome:
+    response = _parse_mcp_json_rpc_content(content)
+    if response is None:
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    if (
+        type(response) is not dict
+        or response.get("jsonrpc") != _AZURE_MCP_JSON_RPC_VERSION
+        or response.get("id") != request.attempt_id
+    ):
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    result = response.get("result")
+    if type(result) is not dict:
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    blocks = result.get("content")
+    if type(blocks) is not list or len(blocks) != 1:
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    block = blocks[0]
+    if (
+        type(block) is not dict
+        or block.get("type") != "text"
+        or type(block.get("text")) is not str
+    ):
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    if result.get("isError") is True:
+        error_text = cast(str, block["text"]).casefold()
+        if "required option" in error_text or "required parameter" in error_text:
+            category = "invalidArguments"
+        elif "not found" in error_text:
+            category = "notFound"
+        elif "forbidden" in error_text or "unauthorized" in error_text:
+            category = "authorization"
+        else:
+            category = "unclassified"
+        raise DemoEvaluationConfigurationError(
+            f"private MCP tool returned a bounded error category: {category}"
+        )
+    try:
+        tool_payload = json.loads(cast(str, block["text"]))
+    except json.JSONDecodeError as exc:
+        raise DemoEvaluationConfigurationError(
+            "private MCP tool returned non-JSON text"
+        ) from exc
+    if type(tool_payload) is not dict:
+        raise DemoEvaluationConfigurationError(
+            "private MCP tool returned an unexpected result shape"
+        )
+    if set(tool_payload) == {"status", "message", "results", "duration"}:
+        if (
+            tool_payload.get("status") != 200
+            or type(tool_payload.get("message")) is not str
+            or type(tool_payload.get("duration")) is not int
+            or type(tool_payload.get("results")) is not dict
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP command response failed its closed success schema"
+            )
+        inventory_payload = cast(dict[str, object], tool_payload["results"])
+    elif set(tool_payload) == {"resources"}:
+        inventory_payload = tool_payload
+    else:
+        raise DemoEvaluationConfigurationError(
+            "private MCP tool returned an unexpected result shape"
+        )
+    if set(inventory_payload) not in ({"resources"}, {"Resources"}):
+        raise DemoEvaluationConfigurationError(
+            "private MCP inventory result failed its closed schema"
+        )
+    resources = (
+        inventory_payload.get("resources")
+        if "resources" in inventory_payload
+        else inventory_payload.get("Resources")
+    )
+    if type(resources) is not list:
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    items: list[dict[str, object]] = []
+    for resource in resources:
+        if type(resource) is not dict:
+            continue
+        if set(resource) == {"name", "id", "type", "location"}:
+            resource_id = resource.get("id")
+            resource_type = resource.get("type")
+            location = resource.get("location")
+        elif set(resource) == {"Name", "Id", "Type", "Location"}:
+            resource_id = resource.get("Id")
+            resource_type = resource.get("Type")
+            location = resource.get("Location")
+        else:
+            continue
+        if resource_type not in _SUPPORTED_INVENTORY_RESOURCE_TYPES:
+            continue
+        projected_item = {
+            "recordType": "resource",
+            "observedAt": response_received_at,
+            "resourceId": resource_id,
+            "resourceType": resource_type,
+            "location": location,
+            "availabilityZone": "unknown",
+            "tags": {"managedBy": "unknown"},
+            "state": "unknown",
+        }
+        try:
+            validated_item = ResourceResponseItem.model_validate(projected_item)
+        except ValidationError as exc:
+            first_error = exc.errors(include_url=False, include_context=False)[0]
+            location_path = ".".join(str(part) for part in first_error["loc"])
+            raise DemoEvaluationConfigurationError(
+                "private MCP inventory item failed the closed schema at "
+                f"{location_path}"
+            ) from exc
+        items.append(
+            cast(
+                dict[str, object],
+                validated_item.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            )
+        )
+    envelope = {
+        "schemaVersion": "1.0.0",
+        "toolName": request.tool_name,
+        "toolVersion": request.tool_version,
+        "attemptId": request.attempt_id,
+        "requestDigest": request.request_digest,
+        "evidenceScope": request.evidence_scope.model_dump(
+            mode="json",
+            by_alias=True,
+        ),
+        "observedAt": response_received_at,
+        "items": items,
+    }
+    if deployment_tool_name != AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL:
+        return McpSuccessResponse(
+            body=content,
+            response_received_at=response_received_at,
+        )
+    outcome = McpSuccessResponse(
+        body=canonicalize_json(envelope).encode("utf-8"),
+        response_received_at=response_received_at,
+    )
+    projection = project_transport_outcome(
+        request,
+        outcome,
+        validated_at=response_received_at,
+    )
+    gaps = [
+        record
+        for record in projection.evidence_records
+        if isinstance(record, EvidenceGapRecord)
+    ]
+    if gaps:
+        first_gap = gaps[0]
+        raise DemoEvaluationConfigurationError(
+            "private MCP inventory projection failed closed: "
+            f"{first_gap.gap_reason} at "
+            f"{first_gap.failure_payload_pointer or 'response'}"
+        )
+    return outcome
 
 
 class PublishedContextReaderPort(Protocol):
@@ -237,7 +514,7 @@ class _ManagedIdentityPrivateMcpHttpStack:
         *,
         timeout_seconds: float,
         max_response_bytes: int,
-    ) -> tuple[str, int, bytes]:
+    ) -> tuple[str, int, bytes, Mapping[str, str]]:
         if type(opener) is not OpenerDirector:
             raise DemoEvaluationConfigurationError(
                 "private MCP HTTP opener changed before invocation"
@@ -249,8 +526,14 @@ class _ManagedIdentityPrivateMcpHttpStack:
         ) as response:
             response_url = response.geturl()
             status_code = response.getcode()
+            headers = MappingProxyType(
+                {
+                    name.lower(): value
+                    for name, value in response.headers.items()
+                }
+            )
             content = response.read(max_response_bytes + 1)
-        return response_url, status_code, content
+        return response_url, status_code, content, headers
 
 
 _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION = (
@@ -379,6 +662,64 @@ def _seal_managed_identity_private_mcp_invoker(
     )
 
 
+def _mcp_http_request(
+    endpoint: str,
+    credential: str,
+    payload: Mapping[str, object],
+    *,
+    protocol_version: str | None = None,
+    session_id: str | None = None,
+) -> Request:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Authorization": "Bearer" + " " + credential,
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json",
+    }
+    if protocol_version is not None:
+        headers["MCP-Protocol-Version"] = protocol_version
+    if session_id is not None:
+        if (
+            not session_id
+            or session_id != session_id.strip()
+            or any(character in session_id for character in "\r\n")
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP returned an invalid session identifier"
+            )
+        headers["Mcp-Session-Id"] = session_id
+    body = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return Request(  # noqa: S310 - endpoint was operator-sealed as HTTPS
+        endpoint,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+
+
+def _validate_mcp_initialize_response(
+    content: bytes,
+    *,
+    request_id: str,
+) -> None:
+    response = _parse_mcp_json_rpc_content(content)
+    if (
+        type(response) is not dict
+        or response.get("jsonrpc") != _AZURE_MCP_JSON_RPC_VERSION
+        or response.get("id") != request_id
+        or type(response.get("result")) is not dict
+        or response["result"].get("protocolVersion")
+        != _AZURE_MCP_PROTOCOL_VERSION
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP initialize response did not match the reviewed protocol"
+        )
+
+
 def _invoke_managed_identity_private_mcp(
     sealed: _SealedManagedIdentityPrivateMcpInvoker,
     private_mcp_endpoint: str,
@@ -411,6 +752,114 @@ def _invoke_managed_identity_private_mcp(
             "private MCP managed identity returned an invalid credential"
         )
     endpoint = f"{endpoint_origin}/"
+    timeout_seconds = request.bounds.timeout_milliseconds / 1_000
+    initialize_id = f"{request.attempt_id}-initialize"
+    initialize = _mcp_http_request(
+        endpoint,
+        credential,
+        {
+            "jsonrpc": _AZURE_MCP_JSON_RPC_VERSION,
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": _AZURE_MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": _AZURE_MCP_CLIENT_NAME,
+                    "version": _AZURE_MCP_CLIENT_VERSION,
+                },
+            },
+        },
+    )
+    try:
+        initialize_url, initialize_status, initialize_content, initialize_headers = (
+            _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
+                sealed.http_stack,
+                opener,
+                initialize,
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=request.bounds.max_response_bytes,
+            )
+        )
+    except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise DemoEvaluationConfigurationError(
+                "private MCP initialize redirect was rejected"
+            ) from exc
+        if exc.code in {401, 403}:
+            return McpAuthorizationFailure(
+                authorization_status="denied",
+                observed_at=_now_utc_millisecond(),
+            )
+        raise DemoEvaluationConfigurationError(
+            f"private MCP initialize returned HTTP {exc.code}"
+        ) from exc
+    except URLError:
+        return McpToolUnavailable(
+            unavailable_reason="networkUnavailable",
+            observed_at=_now_utc_millisecond(),
+        )
+    if (
+        initialize_url != endpoint
+        or not 200 <= initialize_status < 300
+        or not initialize_content
+        or len(initialize_content) > request.bounds.max_response_bytes
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP returned an untrusted initialize response"
+        )
+    _validate_mcp_initialize_response(
+        initialize_content,
+        request_id=initialize_id,
+    )
+    session_id = initialize_headers.get("mcp-session-id")
+    initialized = _mcp_http_request(
+        endpoint,
+        credential,
+        {
+            "jsonrpc": _AZURE_MCP_JSON_RPC_VERSION,
+            "method": "notifications/initialized",
+            "params": {},
+        },
+        protocol_version=_AZURE_MCP_PROTOCOL_VERSION,
+        session_id=session_id,
+    )
+    try:
+        initialized_url, initialized_status, initialized_content, _ = (
+            _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
+                sealed.http_stack,
+                opener,
+                initialized,
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=request.bounds.max_response_bytes,
+            )
+        )
+    except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise DemoEvaluationConfigurationError(
+                "private MCP initialized notification redirect was rejected"
+            ) from exc
+        if exc.code in {401, 403}:
+            return McpAuthorizationFailure(
+                authorization_status="denied",
+                observed_at=_now_utc_millisecond(),
+            )
+        raise DemoEvaluationConfigurationError(
+            f"private MCP initialized notification returned HTTP {exc.code}"
+        ) from exc
+    except URLError:
+        return McpToolUnavailable(
+            unavailable_reason="networkUnavailable",
+            observed_at=_now_utc_millisecond(),
+        )
+    if (
+        initialized_url != endpoint
+        or not 200 <= initialized_status < 300
+        or len(initialized_content) > request.bounds.max_response_bytes
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP rejected the initialized notification"
+        )
     body = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -418,11 +867,7 @@ def _invoke_managed_identity_private_mcp(
             "method": "tools/call",
             "params": {
                 "name": deployment_tool_name,
-                "arguments": request.model_dump(
-                    mode="json",
-                    by_alias=True,
-                    exclude_none=True,
-                ),
+                "arguments": _azure_mcp_tool_arguments(request),
             },
         },
         ensure_ascii=True,
@@ -436,16 +881,22 @@ def _invoke_managed_identity_private_mcp(
             "Authorization": f"Bearer {credential}",
             "Cache-Control": "no-store",
             "Content-Type": "application/json",
+            "MCP-Protocol-Version": _AZURE_MCP_PROTOCOL_VERSION,
+            **(
+                {"Mcp-Session-Id": session_id}
+                if session_id is not None
+                else {}
+            ),
         },
         method="POST",
     )
     try:
-        response_url, status_code, content = (
+        response_url, status_code, content, _ = (
             _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
                 sealed.http_stack,
                 opener,
                 outbound,
-                timeout_seconds=request.bounds.timeout_milliseconds / 1_000,
+                timeout_seconds=timeout_seconds,
                 max_response_bytes=request.bounds.max_response_bytes,
             )
         )
@@ -454,7 +905,7 @@ def _invoke_managed_identity_private_mcp(
             raise DemoEvaluationConfigurationError(
                 "private MCP HTTP redirect was rejected"
             ) from exc
-        observed_at = datetime.now(UTC)
+        observed_at = _now_utc_millisecond()
         if exc.code in {401, 403}:
             return McpAuthorizationFailure(
                 authorization_status="denied",
@@ -467,13 +918,13 @@ def _invoke_managed_identity_private_mcp(
                 observed_at=observed_at,
             )
         return McpFailedResponse(
-            body=content,
+            body=_azure_mcp_failure_body(request),
             response_received_at=observed_at,
         )
     except URLError:
         return McpToolUnavailable(
             unavailable_reason="networkUnavailable",
-            observed_at=datetime.now(UTC),
+            observed_at=_now_utc_millisecond(),
         )
     if (
         response_url != endpoint
@@ -484,9 +935,11 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             "private MCP returned an untrusted HTTP response"
         )
-    return McpSuccessResponse(
-        body=content,
-        response_received_at=datetime.now(UTC),
+    return _project_azure_mcp_response(
+        content,
+        request,
+        deployment_tool_name=deployment_tool_name,
+        response_received_at=_now_utc_millisecond(),
     )
 
 

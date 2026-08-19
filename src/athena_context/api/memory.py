@@ -377,7 +377,7 @@ def _normalize_evaluation_preparation(
     )
     findings = tuple(
         ManifestFinding.model_validate_json(
-            finding.model_dump_json(by_alias=True)
+            finding.canonical_json()
         )
         for finding in prepared.findings
     )
@@ -479,13 +479,8 @@ def _normalize_evaluation_preparation(
         findings=findings,
         evaluated_at=validation_time,
     )
-    result_json = validation_result.model_dump_json(
-        by_alias=True,
-        exclude_none=True,
-    )
-    publication_json = validation_publication.model_dump_json(
-        exclude_none=True
-    )
+    result_json = validation_result.canonical_json()
+    publication_json = validation_publication.canonical_json()
     stored_result = DemoEvaluationResult.model_validate_json(result_json)
     stored_snapshot = EvidenceSnapshot.model_validate_json(snapshot_json)
     stored_publication = AuthorizedSnapshotPublication.model_validate_json(
@@ -521,10 +516,7 @@ def _normalize_evaluation_preparation(
         temporal_validity=temporal_validity,
         findings_json=tuple(
             _exact_text(
-                finding.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ),
+                finding.canonical_json(),
                 label="finding",
             )
             for finding in findings
@@ -1207,10 +1199,7 @@ class _MemoryTransaction(ContextTransactionPort):
         )
         authoritative_findings_json = tuple(
             _exact_text(
-                finding.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ),
+                finding.canonical_json(),
                 label="authoritative finding",
             )
             for finding in authoritative_findings

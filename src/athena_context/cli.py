@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TextIO, cast
 
 from athena_context import __version__
+from athena_context.live_acceptance import (
+    Wc013LiveAcceptanceError,
+    prepare_wc013_live_acceptance,
+    render_wc013_configuration,
+    run_wc013_live_acceptance,
+    wc013_configuration_template,
+)
 from athena_context.reference_command import (
     GoldenProofRunner,
     OutputFormat,
@@ -32,6 +40,31 @@ def build_parser() -> argparse.ArgumentParser:
         default="text",
         help="output format (default: text)",
     )
+    subparsers.add_parser(
+        "wc013-config-template",
+        help="print a non-secret WC-013 live configuration template",
+    )
+    render_parser = subparsers.add_parser(
+        "wc013-render-config",
+        help="render bounded WC-013 runtime files from reviewed non-secret inputs",
+    )
+    render_parser.add_argument("--input", required=True, type=Path)
+    render_parser.add_argument("--output-directory", required=True, type=Path)
+    live_parser = subparsers.add_parser(
+        "wc013-live-acceptance",
+        help="validate or run the WC-013 live acceptance gate",
+    )
+    live_parser.add_argument("--config", required=True, type=Path)
+    live_parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate non-secret prerequisites without acquiring credentials or using the network",
+    )
+    live_parser.add_argument(
+        "--snapshot-output",
+        type=Path,
+        help="create one new read-only canonical EvidenceSnapshot file",
+    )
     return parser
 
 
@@ -50,6 +83,49 @@ def main(
             stdout=stdout if stdout is not None else sys.stdout,
             stderr=stderr if stderr is not None else sys.stderr,
         )
+    output = stdout if stdout is not None else sys.stdout
+    errors = stderr if stderr is not None else sys.stderr
+    if args.command == "wc013-config-template":
+        output.write(wc013_configuration_template())
+        return 0
+    try:
+        if args.command == "wc013-render-config":
+            rendered = render_wc013_configuration(
+                args.input,
+                args.output_directory,
+            )
+            output.write(
+                f"rendered WC-013 configuration: {rendered.plan_path}\n"
+                f"pinned assertion digest: {rendered.assertion_digest}\n"
+                f"pinned authority digest: {rendered.authority_digest}\n"
+            )
+            return 0
+        if args.command == "wc013-live-acceptance":
+            if args.validate_only:
+                prepared = prepare_wc013_live_acceptance(args.config)
+                output.write(
+                    "WC-013 live configuration is valid\n"
+                    f"endpoint: {prepared.assertion.azure_mcp_internal_endpoint}\n"
+                    f"assertion digest: {prepared.assertion.assertion_digest}\n"
+                    f"authority digest: {prepared.authority.authority_digest}\n"
+                )
+                return 0
+            accepted = run_wc013_live_acceptance(
+                args.config,
+                snapshot_output=args.snapshot_output,
+            )
+            output.write(
+                "WC-013 live acceptance passed\n"
+                f"snapshot: {accepted.result.snapshot.snapshot_id}\n"
+                f"artifact digest: "
+                f"{accepted.result.snapshot.compatibility.artifact_digest}\n"
+            )
+            if accepted.snapshot_path is not None:
+                output.write(f"immutable snapshot file: {accepted.snapshot_path}\n")
+            return 0
+    except Wc013LiveAcceptanceError as exc:
+        errors.write(f"WC-013 live acceptance failed: {exc}\n")
+        return 1
     return 0
 
 

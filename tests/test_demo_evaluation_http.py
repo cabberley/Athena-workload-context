@@ -35,7 +35,12 @@ from athena_context.api.errors import DemoEvaluationConfigurationError
 from athena_context.api.evaluation_ports import (
     seal_mcp_transport_configuration,
 )
-from athena_context.evidence import EvidenceTransportRequest, McpSuccessResponse
+from athena_context.evidence import (
+    EvidenceCollectionCommand,
+    EvidenceTransportRequest,
+    McpSuccessResponse,
+    prepare_transport_request,
+)
 from athena_context.evidence.models import McpTransportOutcome
 from wc013_support import (
     APPROVER,
@@ -102,6 +107,173 @@ def _client(
             demo_evaluation_dependencies=harness.dependencies,
         )
     )
+
+
+def test_production_mcp_timestamps_use_contract_millisecond_precision() -> None:
+    timestamp = evaluation_adapters._now_utc_millisecond()
+
+    assert timestamp.tzinfo is not None
+    assert timestamp.microsecond % 1000 == 0
+
+
+def _production_transport_request() -> EvidenceTransportRequest:
+    harness = build_harness()
+    command = EvidenceCollectionCommand(
+        attemptId=harness.command.attempt_id,
+        evidenceScope=harness.command.authorized_scope,
+        authorizedScopes=(harness.command.authorized_scope,),
+        bounds=harness.command.bounds,
+    )
+    return prepare_transport_request(
+        command,
+        harness.dependencies.evidence_client.trust_configuration,
+        attempt_started_at=NOW,
+    )
+
+
+def test_production_mcp_uses_exact_azure_resource_group_arguments() -> None:
+    request = _production_transport_request()
+
+    assert evaluation_adapters._azure_mcp_tool_arguments(request) == {
+        "subscription": request.evidence_scope.subscription_id,
+        "resource-group": request.evidence_scope.resource_group_name,
+        "tenant": request.evidence_scope.tenant_id,
+    }
+
+
+def test_production_mcp_projects_json_rpc_inventory_into_closed_evidence() -> None:
+    request = _production_transport_request()
+    response = {
+        "jsonrpc": "2.0",
+        "id": request.attempt_id,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "status": 200,
+                            "message": "",
+                            "results": {
+                                "resources": [
+                                    {
+                                        "name": "vm-live-01",
+                                        "id": (
+                                            f"/subscriptions/"
+                                            f"{request.evidence_scope.subscription_id}"
+                                            f"/resourceGroups/"
+                                            f"{request.evidence_scope.resource_group_name}"
+                                            "/providers/Microsoft.Compute/"
+                                            "virtualMachines/vm-live-01"
+                                        ),
+                                        "type": "Microsoft.Compute/virtualMachines",
+                                        "location": "australiaeast",
+                                    },
+                                    {
+                                        "name": "vnet-live",
+                                        "id": (
+                                            f"/subscriptions/"
+                                            f"{request.evidence_scope.subscription_id}"
+                                            f"/resourceGroups/"
+                                            f"{request.evidence_scope.resource_group_name}"
+                                            "/providers/Microsoft.Network/"
+                                            "virtualNetworks/vnet-live"
+                                        ),
+                                        "type": "Microsoft.Network/virtualNetworks",
+                                        "location": "australiaeast",
+                                    },
+                                    {
+                                        "Name": "storage-live",
+                                        "Id": (
+                                            f"/subscriptions/"
+                                            f"{request.evidence_scope.subscription_id}"
+                                            f"/resourceGroups/"
+                                            f"{request.evidence_scope.resource_group_name}"
+                                            "/providers/Microsoft.Storage/"
+                                            "storageAccounts/storagelive"
+                                        ),
+                                        "Type": "Microsoft.Storage/storageAccounts",
+                                        "Location": "australiaeast",
+                                    },
+                                ]
+                            },
+                            "duration": 42,
+                        }
+                    ),
+                }
+            ],
+            "isError": False,
+        },
+    }
+
+    outcome = evaluation_adapters._project_azure_mcp_response(
+        json.dumps(response).encode(),
+        request,
+        deployment_tool_name="group_resource_list",
+        response_received_at=NOW,
+    )
+
+    assert isinstance(outcome, McpSuccessResponse)
+    projected = json.loads(outcome.body)
+    assert projected["evidenceScope"] == request.evidence_scope.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    assert projected["items"] == [
+        {
+            "availabilityZone": "unknown",
+            "location": "australiaeast",
+            "observedAt": "2025-06-01T12:00:00.000Z",
+            "recordType": "resource",
+            "resourceId": (
+                f"/subscriptions/{request.evidence_scope.subscription_id}"
+                f"/resourceGroups/{request.evidence_scope.resource_group_name}"
+                "/providers/Microsoft.Compute/virtualMachines/vm-live-01"
+            ),
+            "resourceType": "Microsoft.Compute/virtualMachines",
+            "state": "unknown",
+            "tags": {"managedBy": "unknown"},
+        },
+        {
+            "availabilityZone": "unknown",
+            "location": "australiaeast",
+            "observedAt": "2025-06-01T12:00:00.000Z",
+            "recordType": "resource",
+            "resourceId": (
+                f"/subscriptions/{request.evidence_scope.subscription_id}"
+                f"/resourceGroups/{request.evidence_scope.resource_group_name}"
+                "/providers/Microsoft.Storage/storageAccounts/storagelive"
+            ),
+            "resourceType": "Microsoft.Storage/storageAccounts",
+            "state": "unknown",
+            "tags": {"managedBy": "unknown"},
+        },
+    ]
+
+
+def test_production_mcp_maps_tool_errors_without_retaining_error_text() -> None:
+    request = _production_transport_request()
+    response = {
+        "jsonrpc": "2.0",
+        "id": request.attempt_id,
+        "result": {
+            "content": [{"type": "text", "text": "sensitive upstream detail"}],
+            "isError": True,
+        },
+    }
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="bounded error category: unclassified",
+    ) as rejected:
+        evaluation_adapters._project_azure_mcp_response(
+            json.dumps(response).encode(),
+            request,
+            deployment_tool_name="group_resource_list",
+            response_received_at=NOW,
+        )
+
+    assert "sensitive upstream detail" not in str(rejected.value)
 
 
 def _headers(token: str, key: str | None = None) -> dict[str, str]:

@@ -192,6 +192,20 @@ def test_private_fake_endpoint_publishes_and_evaluates_exact_golden_findings() -
     ) == result.publication.registry_record()
 
 
+def test_millisecond_collector_time_survives_prepared_normalization() -> None:
+    harness = build_harness()
+    harness.clock.advance(timedelta(milliseconds=123))
+
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "wc013-millisecond-collector-time",
+        harness.command,
+    )
+
+    assert result.findings
+    assert result.findings[0].evidence_refs[0].collector_attempt_at.microsecond == 123000
+
+
 def test_approval_read_authorization_uses_only_the_stored_workload() -> None:
     harness = build_harness()
     service = harness.context_resolver.service

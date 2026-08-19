@@ -181,10 +181,7 @@ class StoredEvaluation:
 
     @property
     def result_json(self) -> str:
-        return self.material.result(self.published_at).model_dump_json(
-            by_alias=True,
-            exclude_none=True,
-        )
+        return self.material.result(self.published_at).canonical_json()
 
     @property
     def snapshot_json(self) -> str:
@@ -192,9 +189,7 @@ class StoredEvaluation:
 
     @property
     def publication_json(self) -> str:
-        return self.material.publication(self.published_at).model_dump_json(
-            exclude_none=True
-        )
+        return self.material.publication(self.published_at).canonical_json()
 
 
 @dataclass(frozen=True, slots=True)
