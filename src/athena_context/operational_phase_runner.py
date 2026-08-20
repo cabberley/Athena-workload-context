@@ -16,14 +16,15 @@ from athena_context.contracts.common import (
     sha256_hex,
 )
 from athena_context.contracts.operational_phase import (
-    OPERATIONAL_PHASES,
     OperationalArtifactKind,
     OperationalPhaseArtifactReference,
+    OperationalPhaseCompletionIndex,
     OperationalPhaseConfiguration,
     OperationalPhaseDeliveryBundle,
-    OperationalPhaseReceipt,
+    OperationalPhaseInputs,
     OperationalPhaseSelector,
-    build_operational_phase_receipt,
+    VersionPinnedBlobReference,
+    build_operational_phase_completion_index,
     operational_phase_artifact_names,
 )
 from athena_context.contracts.presentation import (
@@ -44,8 +45,10 @@ from athena_context.presentation import (
 )
 
 _MAX_BUNDLE_BYTES = 256 * 1024
+_MAX_INPUTS_BYTES = 64 * 1024
 _MAX_CONFIGURATION_BYTES = 256 * 1024
 _MAX_RECEIPT_BYTES = 64 * 1024
+_MAX_INDEX_BYTES = 128 * 1024
 
 type Wc013PhaseRunner = Callable[
     [Wc013LiveAcceptancePlan, Path],
@@ -65,40 +68,59 @@ class CreateOnlyArtifact:
 
 
 class CreateOnlyArtifactWriterPort(Protocol):
-    """Create one complete artifact set without overwriting an existing name."""
+    """Create artifacts without overwrite and return their exact blob versions."""
 
     def create_only(
         self,
         artifacts: tuple[CreateOnlyArtifact, ...],
-    ) -> None: ...
+    ) -> tuple[VersionPinnedBlobReference, ...]: ...
+
+
+class VersionPinnedPhaseInputReaderPort(Protocol):
+    """Read only the exact receipt/index versions named by the phase inputs."""
+
+    def read_receipt(
+        self,
+        reference: VersionPinnedBlobReference,
+    ) -> bytes: ...
+
+    def read_completion_index(
+        self,
+        reference: VersionPinnedBlobReference,
+    ) -> bytes: ...
+
+
+class CompletionIndexWriterPort(Protocol):
+    """Create the phase completion marker after every payload artifact exists."""
+
+    def create_completion_index(
+        self,
+        artifact: CreateOnlyArtifact,
+    ) -> VersionPinnedBlobReference: ...
 
 
 @dataclass(frozen=True, slots=True)
 class OperationalPhaseRunResult:
+    run_id: str
     phase: ArgusPresentationPhase
     snapshot_id: str
     result_digest: str
     presentation_digest: str
-    receipt_digest: str
+    completion_index_digest: str
     artifacts: tuple[OperationalPhaseArtifactReference, ...]
-    receipt: OperationalPhaseReceipt
+    completion_index: OperationalPhaseCompletionIndex
+    completion_index_reference: VersionPinnedBlobReference
 
 
 @dataclass(frozen=True, slots=True)
 class _SelectedDelivery:
     bundle: OperationalPhaseDeliveryBundle
+    inputs: OperationalPhaseInputs
     configuration: OperationalPhaseConfiguration
     configuration_path: Path
     plan: Wc013LiveAcceptancePlan
-    fault_receipt: DemoFaultRunReceipt
-
-
-@dataclass(frozen=True, slots=True)
-class _LoadedPhase:
-    configuration: OperationalPhaseConfiguration
-    configuration_path: Path
-    plan: Wc013LiveAcceptancePlan
-    fault_receipt: DemoFaultRunReceipt
+    receipt: DemoFaultRunReceipt
+    previous_index: OperationalPhaseCompletionIndex | None
 
 
 def _read_bounded(path: Path, *, maximum_bytes: int) -> bytes:
@@ -117,19 +139,27 @@ def _read_bounded(path: Path, *, maximum_bytes: int) -> bytes:
 
 
 def _parse_model[Model: BaseModel](
+    content: bytes,
+    model: type[Model],
+) -> Model:
+    try:
+        return model.model_validate_json(content)
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise OperationalPhaseRunnerError(
+            "operational phase input failed closed validation"
+        ) from exc
+
+
+def _parse_file[Model: BaseModel](
     path: Path,
     model: type[Model],
     *,
     maximum_bytes: int,
 ) -> Model:
-    try:
-        return model.model_validate_json(
-            _read_bounded(path, maximum_bytes=maximum_bytes)
-        )
-    except (ValidationError, ValueError, TypeError) as exc:
-        raise OperationalPhaseRunnerError(
-            "operational phase input failed closed validation"
-        ) from exc
+    return _parse_model(
+        _read_bounded(path, maximum_bytes=maximum_bytes),
+        model,
+    )
 
 
 def _resolve_delivery_file(root: Path, relative_file: str) -> Path:
@@ -153,123 +183,207 @@ def _model_digest(model: BaseModel) -> str:
     )
 
 
+def _read_version_pinned(
+    *,
+    reference: VersionPinnedBlobReference,
+    read: Callable[[VersionPinnedBlobReference], bytes],
+    maximum_bytes: int,
+) -> bytes:
+    try:
+        content = bytes(read(reference))
+    except Exception as exc:  # noqa: BLE001 - injected readers are trust boundaries.
+        raise OperationalPhaseRunnerError(
+            "version-pinned phase input could not be read"
+        ) from exc
+    if (
+        not content
+        or len(content) > maximum_bytes
+        or sha256_hex(content) != reference.content_digest
+    ):
+        raise OperationalPhaseRunnerError(
+            "version-pinned phase input did not match its exact hash"
+        )
+    return content
+
+
+def _fault_lineage_digest(receipt: DemoFaultRunReceipt) -> str:
+    return compute_artifact_digest(
+        {
+            "scenarioId": "athena-web-node-fault.v1",
+            "faultRunId": receipt.fault_run_id,
+            "faultKind": receipt.fault_kind,
+            "resourceGroup": receipt.resource_group.casefold(),
+            "prefix": receipt.prefix.casefold(),
+            "targetVmName": receipt.target_vm_name.casefold(),
+            "targetVmResourceId": receipt.target_vm_resource_id.casefold(),
+            "eligibleWebVmNames": sorted(
+                name.casefold()
+                for name in receipt.eligible_web_vm_names
+            ),
+        }
+    )
+
+
+def _validate_receipt_phase(
+    phase: ArgusPresentationPhase,
+    receipt: DemoFaultRunReceipt,
+) -> None:
+    if phase == "baseline":
+        valid = (
+            receipt.action == "status"
+            and receipt.before_power_state == "PowerState/running"
+            and receipt.after_power_state == "PowerState/running"
+        )
+    elif phase == "faulted":
+        valid = (
+            receipt.action == "inject"
+            and receipt.before_power_state == "PowerState/running"
+            and receipt.after_power_state
+            in {"PowerState/stopped", "PowerState/deallocated"}
+        )
+    else:
+        valid = (
+            receipt.action == "reset"
+            and receipt.before_power_state
+            in {"PowerState/stopped", "PowerState/deallocated"}
+            and receipt.after_power_state == "PowerState/running"
+        )
+    if not valid:
+        raise OperationalPhaseRunnerError(
+            "selected receipt does not match the requested phase"
+        )
+
+
+def _validate_previous_index(
+    *,
+    bundle: OperationalPhaseDeliveryBundle,
+    inputs: OperationalPhaseInputs,
+    receipt: DemoFaultRunReceipt,
+    previous: OperationalPhaseCompletionIndex | None,
+) -> tuple[str, str | None]:
+    lineage_digest = _fault_lineage_digest(receipt)
+    if inputs.phase == "baseline":
+        if previous is not None:
+            raise OperationalPhaseRunnerError(
+                "baseline must not consume a previous phase index"
+            )
+        return lineage_digest, None
+
+    if previous is None:
+        if (
+            inputs.phase != "faulted"
+            or inputs.lineage_reference_digest != lineage_digest
+        ):
+            raise OperationalPhaseRunnerError(
+                "faulted phase lineage reference did not match its inject receipt"
+            )
+        return lineage_digest, None
+
+    expected_previous_phase: ArgusPresentationPhase = (
+        "baseline" if inputs.phase == "faulted" else "faulted"
+    )
+    if (
+        previous.run_id != bundle.run_id
+        or previous.bundle_digest != bundle.bundle_digest
+        or previous.phase != expected_previous_phase
+        or previous.lineage_digest != lineage_digest
+        or previous.receipt_completed_at > receipt.started_at
+        or previous.receipt_after_power_state
+        != receipt.before_power_state
+    ):
+        raise OperationalPhaseRunnerError(
+            "previous phase index did not preserve chronology and target lineage"
+        )
+    return lineage_digest, previous.index_digest
+
+
 def _load_selected_delivery(
+    *,
     bundle_path: Path,
+    inputs_path: Path,
     phase_selector: str,
+    input_reader: VersionPinnedPhaseInputReaderPort,
 ) -> _SelectedDelivery:
     selector = OperationalPhaseSelector(phase=phase_selector)
     phase = selector.selected_phase()
-    bundle = _parse_model(
+    bundle = _parse_file(
         bundle_path,
         OperationalPhaseDeliveryBundle,
         maximum_bytes=_MAX_BUNDLE_BYTES,
     )
-    if phase not in bundle.allowed_phases:
-        raise OperationalPhaseRunnerError("phase selector is not allowlisted")
-    loaded: dict[ArgusPresentationPhase, _LoadedPhase] = {}
-    for configured_phase in OPERATIONAL_PHASES:
-        configuration = bundle.configurations.select(configured_phase)
-        configuration_path = _resolve_delivery_file(
-            bundle_path.parent,
-            configuration.wc013_configuration_file,
+    inputs = _parse_file(
+        inputs_path,
+        OperationalPhaseInputs,
+        maximum_bytes=_MAX_INPUTS_BYTES,
+    )
+    if (
+        inputs.phase != phase
+        or inputs.run_id != bundle.run_id
+        or inputs.bundle_digest != bundle.bundle_digest
+    ):
+        raise OperationalPhaseRunnerError(
+            "phase inputs do not match the selected delivery bundle"
         )
-        receipt_path = _resolve_delivery_file(
-            bundle_path.parent,
-            configuration.fault_receipt_file,
+
+    configuration = bundle.configurations.select(phase)
+    configuration_path = _resolve_delivery_file(
+        bundle_path.parent,
+        configuration.wc013_configuration_file,
+    )
+    plan = _parse_file(
+        configuration_path,
+        Wc013LiveAcceptancePlan,
+        maximum_bytes=_MAX_CONFIGURATION_BYTES,
+    )
+    if _model_digest(plan) != configuration.wc013_configuration_digest:
+        raise OperationalPhaseRunnerError(
+            "selected configuration digest does not match the reviewed bundle"
         )
-        plan = _parse_model(
-            configuration_path,
-            Wc013LiveAcceptancePlan,
-            maximum_bytes=_MAX_CONFIGURATION_BYTES,
+    command = plan.evaluation_command
+    if (
+        command.attempt_id != configuration.attempt_id
+        or command.snapshot_id != configuration.snapshot_id
+        or plan.idempotency_key != configuration.idempotency_key
+    ):
+        raise OperationalPhaseRunnerError(
+            "selected phase does not match its reviewed WC-013 configuration"
         )
-        fault_receipt = _parse_model(
-            receipt_path,
-            DemoFaultRunReceipt,
+
+    receipt = _parse_model(
+        _read_version_pinned(
+            reference=inputs.receipt,
+            read=input_reader.read_receipt,
             maximum_bytes=_MAX_RECEIPT_BYTES,
+        ),
+        DemoFaultRunReceipt,
+    )
+    _validate_receipt_phase(phase, receipt)
+
+    previous_index = None
+    if inputs.previous_phase_index is not None:
+        previous_index = _parse_model(
+            _read_version_pinned(
+                reference=inputs.previous_phase_index,
+                read=input_reader.read_completion_index,
+                maximum_bytes=_MAX_INDEX_BYTES,
+            ),
+            OperationalPhaseCompletionIndex,
         )
-        if (
-            _model_digest(plan)
-            != configuration.wc013_configuration_digest
-            or _model_digest(fault_receipt)
-            != configuration.fault_receipt_digest
-        ):
-            raise OperationalPhaseRunnerError(
-                "phase input digest does not match the reviewed bundle"
-            )
-        command = plan.evaluation_command
-        if (
-            command.attempt_id != configuration.attempt_id
-            or command.snapshot_id != configuration.snapshot_id
-            or plan.idempotency_key != configuration.idempotency_key
-        ):
-            raise OperationalPhaseRunnerError(
-                "phase does not match its reviewed WC-013 configuration"
-            )
-        expected_action = {
-            "baseline": "status",
-            "faulted": "inject",
-            "recovered": "reset",
-        }[configured_phase]
-        if fault_receipt.action != expected_action:
-            raise OperationalPhaseRunnerError(
-                "phase does not match its reviewed fault receipt"
-            )
-        loaded[configured_phase] = _LoadedPhase(
-            configuration=configuration,
-            configuration_path=configuration_path,
-            plan=plan,
-            fault_receipt=fault_receipt,
-        )
-    _validate_receipt_sequence(loaded)
-    selected = loaded[phase]
+    _validate_previous_index(
+        bundle=bundle,
+        inputs=inputs,
+        receipt=receipt,
+        previous=previous_index,
+    )
     return _SelectedDelivery(
         bundle=bundle,
-        configuration=selected.configuration,
-        configuration_path=selected.configuration_path,
-        plan=selected.plan,
-        fault_receipt=selected.fault_receipt,
+        inputs=inputs,
+        configuration=configuration,
+        configuration_path=configuration_path,
+        plan=plan,
+        receipt=receipt,
+        previous_index=previous_index,
     )
-
-
-def _validate_receipt_sequence(
-    loaded: dict[ArgusPresentationPhase, _LoadedPhase],
-) -> None:
-    baseline = loaded["baseline"].fault_receipt
-    faulted = loaded["faulted"].fault_receipt
-    recovered = loaded["recovered"].fault_receipt
-
-    def lineage(receipt: DemoFaultRunReceipt) -> tuple[object, ...]:
-        return (
-            receipt.fault_run_id,
-            receipt.fault_kind,
-            receipt.resource_group.casefold(),
-            receipt.prefix.casefold(),
-            receipt.target_vm_name.casefold(),
-            receipt.target_vm_resource_id.casefold(),
-            tuple(name.casefold() for name in receipt.eligible_web_vm_names),
-        )
-
-    if len({lineage(baseline), lineage(faulted), lineage(recovered)}) != 1:
-        raise OperationalPhaseRunnerError(
-            "phase receipts do not share one reviewed fault lineage"
-        )
-    if (
-        baseline.before_power_state != "PowerState/running"
-        or baseline.after_power_state != "PowerState/running"
-        or faulted.before_power_state != "PowerState/running"
-        or recovered.before_power_state != faulted.after_power_state
-        or recovered.after_power_state != "PowerState/running"
-    ):
-        raise OperationalPhaseRunnerError(
-            "phase receipts do not form the reviewed power-state sequence"
-        )
-    if (
-        baseline.completed_at > faulted.started_at
-        or faulted.completed_at > recovered.started_at
-    ):
-        raise OperationalPhaseRunnerError(
-            "phase receipt chronology is not baseline, faulted, recovered"
-        )
 
 
 def _require_result_binding(
@@ -294,49 +408,80 @@ def _canonical_artifact(content: str) -> bytes:
     return (content + "\n").encode("utf-8")
 
 
-def _artifact_reference(
-    *,
-    kind: OperationalArtifactKind,
-    name: str,
-    content: bytes,
-) -> OperationalPhaseArtifactReference:
-    return OperationalPhaseArtifactReference(
-        kind=kind,
+def _artifact_request(name: str, content: bytes) -> CreateOnlyArtifact:
+    return CreateOnlyArtifact(
         name=name,
+        content=content,
         digest=sha256_hex(content),
     )
 
 
-def _artifact_request(
-    reference: OperationalPhaseArtifactReference,
-    content: bytes,
-) -> CreateOnlyArtifact:
-    if reference.digest != sha256_hex(content):
+def _validate_written_artifacts(
+    *,
+    requests: tuple[CreateOnlyArtifact, ...],
+    references: tuple[VersionPinnedBlobReference, ...],
+) -> tuple[OperationalPhaseArtifactReference, ...]:
+    if len(references) != len(requests):
         raise OperationalPhaseRunnerError(
-            "operational phase artifact digest changed before persistence"
+            "create-only writer returned an incomplete artifact set"
         )
-    return CreateOnlyArtifact(
-        name=reference.name,
-        content=content,
-        digest=reference.digest,
+    kinds: tuple[OperationalArtifactKind, ...] = (
+        "evaluationResult",
+        "evidenceSnapshot",
+        "argusPresentation",
+        "presentationAttestation",
     )
+    output: list[OperationalPhaseArtifactReference] = []
+    for kind, request, reference in zip(
+        kinds,
+        requests,
+        references,
+        strict=True,
+    ):
+        if (
+            reference.name != request.name
+            or reference.content_digest != request.digest
+        ):
+            raise OperationalPhaseRunnerError(
+                "create-only writer returned a mismatched artifact version"
+            )
+        output.append(
+            OperationalPhaseArtifactReference(
+                kind=kind,
+                name=reference.name,
+                version=reference.version,
+                contentDigest=reference.content_digest,
+            )
+        )
+    return tuple(output)
 
 
 def run_operational_phase(
     *,
     bundle_path: Path,
+    inputs_path: Path,
     phase_selector: str,
     artifact_writer: CreateOnlyArtifactWriterPort | None,
+    input_reader: VersionPinnedPhaseInputReaderPort | None,
+    completion_index_writer: CompletionIndexWriterPort | None,
     result_verifier: TrustedDemoEvaluationVerifier | None,
     snapshot_verifier: TrustedSnapshotVerifier | None,
     signer: PresentationSigner | None,
     wc013_runner: Wc013PhaseRunner | None = None,
 ) -> OperationalPhaseRunResult:
-    """Run one reviewed phase without injecting or resetting an Azure fault."""
+    """Run one reviewed phase without requiring future receipt artifacts."""
 
     if artifact_writer is None:
         raise OperationalPhaseRunnerError(
             "create-only artifact writer is not configured"
+        )
+    if input_reader is None:
+        raise OperationalPhaseRunnerError(
+            "version-pinned phase input reader is not configured"
+        )
+    if completion_index_writer is None:
+        raise OperationalPhaseRunnerError(
+            "completion index writer is not configured"
         )
     if result_verifier is None or snapshot_verifier is None:
         raise OperationalPhaseRunnerError(
@@ -348,7 +493,12 @@ def run_operational_phase(
         )
 
     try:
-        selected = _load_selected_delivery(bundle_path, phase_selector)
+        selected = _load_selected_delivery(
+            bundle_path=bundle_path,
+            inputs_path=inputs_path,
+            phase_selector=phase_selector,
+            input_reader=input_reader,
+        )
     except OperationalPhaseRunnerError:
         raise
     except (AthenaValidationError, ValidationError, ValueError, TypeError) as exc:
@@ -363,7 +513,7 @@ def run_operational_phase(
             else run_wc013_live_acceptance_plan
         )
         accepted = executor(selected.plan, selected.configuration_path)
-    except Exception as exc:  # noqa: BLE001 - the production composition is a trust boundary.
+    except Exception as exc:  # noqa: BLE001 - production composition is a trust boundary.
         raise OperationalPhaseRunnerError(
             "WC-013 phase execution failed closed"
         ) from exc
@@ -382,7 +532,7 @@ def run_operational_phase(
         )
         presentation = project_argus_presentation(
             verified,
-            receipt=selected.fault_receipt,
+            receipt=selected.receipt,
             phase=cast(
                 ArgusPresentationPhase,
                 selected.configuration.phase,
@@ -401,7 +551,10 @@ def run_operational_phase(
         ) from exc
 
     phase = selected.configuration.phase
-    names = operational_phase_artifact_names(phase)
+    names = operational_phase_artifact_names(
+        selected.bundle.run_id,
+        phase,
+    )
     result_content = _canonical_artifact(result.canonical_json())
     snapshot_content = _canonical_artifact(
         canonicalize_json(
@@ -418,40 +571,57 @@ def run_operational_phase(
     attestation_content = _canonical_artifact(
         attestation.canonical_json()
     )
-    artifact_references = (
-        _artifact_reference(
-            kind="evaluationResult",
-            name=names[0],
-            content=result_content,
-        ),
-        _artifact_reference(
-            kind="evidenceSnapshot",
-            name=names[1],
-            content=snapshot_content,
-        ),
-        _artifact_reference(
-            kind="argusPresentation",
-            name=names[2],
-            content=presentation_content,
-        ),
-        _artifact_reference(
-            kind="presentationAttestation",
-            name=names[3],
-            content=attestation_content,
-        ),
+    artifact_requests = (
+        _artifact_request(names[0], result_content),
+        _artifact_request(names[1], snapshot_content),
+        _artifact_request(names[2], presentation_content),
+        _artifact_request(names[3], attestation_content),
     )
-    receipt = build_operational_phase_receipt(
+    try:
+        written = artifact_writer.create_only(artifact_requests)
+    except Exception as exc:  # noqa: BLE001 - writer implementations are untrusted ports.
+        raise OperationalPhaseRunnerError(
+            "create-only artifact persistence failed closed"
+        ) from exc
+    try:
+        artifacts = _validate_written_artifacts(
+            requests=artifact_requests,
+            references=written,
+        )
+    except OperationalPhaseRunnerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - writer return values are untrusted.
+        raise OperationalPhaseRunnerError(
+            "create-only writer returned invalid artifact versions"
+        ) from exc
+
+    lineage_digest, previous_index_digest = _validate_previous_index(
+        bundle=selected.bundle,
+        inputs=selected.inputs,
+        receipt=selected.receipt,
+        previous=selected.previous_index,
+    )
+    completion_index = build_operational_phase_completion_index(
+        run_id=selected.bundle.run_id,
         phase=phase,
         bundle_digest=selected.bundle.bundle_digest,
         configuration_digest=(
             selected.configuration.wc013_configuration_digest
         ),
-        fault_receipt_digest=selected.configuration.fault_receipt_digest,
+        receipt=selected.inputs.receipt,
+        previous_phase_index=selected.inputs.previous_phase_index,
+        previous_phase_index_digest=previous_index_digest,
+        lineage_digest=lineage_digest,
         attempt_id=selected.configuration.attempt_id,
         snapshot_id=selected.configuration.snapshot_id,
         idempotency_key_digest=sha256_hex(
             selected.configuration.idempotency_key
         ),
+        receipt_action=selected.receipt.action,
+        receipt_started_at=selected.receipt.started_at,
+        receipt_completed_at=selected.receipt.completed_at,
+        receipt_before_power_state=selected.receipt.before_power_state,
+        receipt_after_power_state=selected.receipt.after_power_state,
         result_digest=result.result_digest,
         snapshot_artifact_digest=(
             result.snapshot.compatibility.artifact_digest
@@ -460,48 +630,60 @@ def run_operational_phase(
             result.snapshot.compatibility.semantic_digest
         ),
         presentation_digest=presentation.athena.result_digest,
-        artifacts=artifact_references,
+        artifacts=artifacts,
     )
-    receipt_content = _canonical_artifact(receipt.canonical_json())
-    receipt_reference = OperationalPhaseArtifactReference(
-        kind="phaseReceipt",
-        name=names[4],
-        digest=sha256_hex(receipt_content),
-    )
-    written_references = (*artifact_references, receipt_reference)
-    requests = (
-        _artifact_request(artifact_references[0], result_content),
-        _artifact_request(artifact_references[1], snapshot_content),
-        _artifact_request(artifact_references[2], presentation_content),
-        _artifact_request(artifact_references[3], attestation_content),
-        _artifact_request(receipt_reference, receipt_content),
-    )
-    if len({request.name for request in requests}) != len(requests):
-        raise OperationalPhaseRunnerError(
-            "operational phase artifact names are not unique"
-        )
+    index_content = _canonical_artifact(completion_index.canonical_json())
+    index_request = _artifact_request(names[4], index_content)
     try:
-        artifact_writer.create_only(requests)
+        index_reference = completion_index_writer.create_completion_index(
+            index_request
+        )
     except Exception as exc:  # noqa: BLE001 - writer implementations are untrusted ports.
         raise OperationalPhaseRunnerError(
-            "create-only artifact persistence failed closed"
+            "completion index persistence failed closed"
+        ) from exc
+    try:
+        validated_index_reference = VersionPinnedBlobReference(
+            name=index_reference.name,
+            version=index_reference.version,
+            contentDigest=index_reference.content_digest,
+        )
+        if (
+            validated_index_reference.name != index_request.name
+            or validated_index_reference.content_digest
+            != index_request.digest
+        ):
+            raise OperationalPhaseRunnerError(
+                "completion index writer returned a mismatched version"
+            )
+    except OperationalPhaseRunnerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - writer return values are untrusted.
+        raise OperationalPhaseRunnerError(
+            "completion index writer returned an invalid version"
         ) from exc
     return OperationalPhaseRunResult(
+        run_id=selected.bundle.run_id,
         phase=phase,
         snapshot_id=result.snapshot.snapshot_id,
         result_digest=result.result_digest,
         presentation_digest=presentation.athena.result_digest,
-        receipt_digest=receipt_reference.digest,
-        artifacts=written_references,
-        receipt=receipt,
+        completion_index_digest=(
+            validated_index_reference.content_digest
+        ),
+        artifacts=artifacts,
+        completion_index=completion_index,
+        completion_index_reference=validated_index_reference,
     )
 
 
 __all__ = [
+    "CompletionIndexWriterPort",
     "CreateOnlyArtifact",
     "CreateOnlyArtifactWriterPort",
     "OperationalPhaseRunResult",
     "OperationalPhaseRunnerError",
+    "VersionPinnedPhaseInputReaderPort",
     "Wc013PhaseRunner",
     "run_operational_phase",
 ]
