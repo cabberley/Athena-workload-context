@@ -39,6 +39,7 @@ var azureMcpImage = '${azureMcpImageRepository}:${azureMcpVersion}@${azureMcpIma
 // Keep this list exact. Every entry is a reviewed read-only Azure MCP 2.0.5 tool.
 var approvedTools = [
   'group_resource_list'
+  'compute_vm_get'
   'monitor_activitylog_list'
   'monitor_metrics_definitions'
   'monitor_metrics_query'

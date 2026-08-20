@@ -37,6 +37,7 @@ from athena_context.api.domain import (
 )
 from athena_context.api.evaluation_adapters import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
+    AZURE_VM_GET_DEPLOYMENT_TOOL,
     ContextApiPublishedContextResolver,
     ContextServicePublishedContextReader,
     ContextServicePublishedContextResolver,
@@ -96,6 +97,7 @@ __all__ = [
     "Actor",
     "ActorKind",
     "AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL",
+    "AZURE_VM_GET_DEPLOYMENT_TOOL",
     "AZURE_MCP_2_0_5_ALLOWED_TOOLS",
     "AZURE_MCP_2_0_5_CATALOG_HASH",
     "AZURE_MCP_2_0_5_IMAGE_DIGEST",

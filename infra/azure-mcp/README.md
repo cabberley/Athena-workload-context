@@ -37,17 +37,25 @@ cross-resource-group optional RBAC scopes must stay visible for review.
 The allowlist is a source constant, not a deployment parameter:
 
 1. `group_resource_list`
-2. `monitor_activitylog_list`
-3. `monitor_metrics_definitions`
-4. `monitor_metrics_query`
-5. `monitor_resource_log_query`
-6. `monitor_workspace_log_query`
-7. `resourcehealth_availability-status_get`
+2. `compute_vm_get`
+3. `monitor_activitylog_list`
+4. `monitor_metrics_definitions`
+5. `monitor_metrics_query`
+6. `monitor_resource_log_query`
+7. `monitor_workspace_log_query`
+8. `resourcehealth_availability-status_get`
 
 Every tool is read-only in Azure MCP 2.0.5. Namespace filters and wildcards are not accepted.
 The pinned catalog snapshot under `validation/` records each runtime name, command ID, safety
 metadata, source commit, catalog hash, image digest, and retrieval command. Runtime tool names do
 not include the CLI executable prefix.
+
+Athena uses `group_resource_list` for the bounded inventory and then calls `compute_vm_get` once
+for each projected VM in deterministic resource-ID order, in the same initialized MCP session.
+Each VM call is restricted to the authorized subscription and resource group and requests
+`instance-view: true`. Only exact `PowerState/running`, `PowerState/stopped`, and
+`PowerState/deallocated` status codes are normalized; every missing, conflicting, partial, or
+unclassified response remains `unknown`.
 
 Azure MCP 2.0.5 maps HTTP MCP with `app.MapMcp()` at `/`. The deployment output is therefore the
 root internal FQDN, with no `/mcp` suffix. Clients send MCP requests using `POST /`.

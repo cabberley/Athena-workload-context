@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from inspect import getattr_static
 from pathlib import Path
 from types import FunctionType, MappingProxyType
@@ -48,6 +48,7 @@ from athena_context.contracts import (
     canonicalize_json,
     resolve_manifest_profile,
 )
+from athena_context.contracts.models import ResourceState
 from athena_context.evidence import (
     AZURE_RESOURCE_INVENTORY_TOOL,
     Clock,
@@ -58,6 +59,7 @@ from athena_context.evidence import (
     McpAuthorizationFailure,
     McpFailedResponse,
     McpSuccessResponse,
+    McpTimeoutNoResponse,
     McpToolUnavailable,
     SyncAttemptReplayGuard,
     SyncEvidenceClient,
@@ -72,6 +74,7 @@ from athena_context.evidence.models import (
 )
 
 AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL = "group_resource_list"
+AZURE_VM_GET_DEPLOYMENT_TOOL = "compute_vm_get"
 _AZURE_MCP_JSON_RPC_VERSION = "2.0"
 _AZURE_MCP_PROTOCOL_VERSION = "2025-11-25"
 _AZURE_MCP_CLIENT_NAME = "athena-wc013-live-acceptance"
@@ -82,6 +85,14 @@ _SUPPORTED_INVENTORY_RESOURCE_TYPES = frozenset(
         "Microsoft.Network/loadBalancers",
         "Microsoft.Storage/storageAccounts",
         "Microsoft.OperationalInsights/workspaces",
+    }
+)
+_VM_RESOURCE_TYPE = "Microsoft.Compute/virtualMachines"
+_NORMALIZED_VM_STATES: Mapping[str, ResourceState] = MappingProxyType(
+    {
+        "PowerState/running": "running",
+        "PowerState/stopped": "stopped",
+        "PowerState/deallocated": "deallocated",
     }
 )
 
@@ -130,6 +141,25 @@ def _azure_mcp_tool_arguments(
         "subscription": cast(str, subscription_id),
         "resource-group": cast(str, resource_group_name),
         "tenant": cast(str, tenant_id),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _VmInventoryTarget:
+    resource_id: str
+    vm_name: str
+
+
+def _azure_mcp_vm_arguments(
+    request: EvidenceTransportRequest,
+    target: _VmInventoryTarget,
+) -> dict[str, object]:
+    inventory_arguments = _azure_mcp_tool_arguments(request)
+    return {
+        "subscription": inventory_arguments["subscription"],
+        "resource-group": inventory_arguments["resource-group"],
+        "vm-name": target.vm_name,
+        "instance-view": True,
     }
 
 
@@ -182,6 +212,9 @@ def _project_azure_mcp_response(
     *,
     deployment_tool_name: str,
     response_received_at: datetime,
+    vm_states: Mapping[str, ResourceState] | None = None,
+    vm_observed_at: Mapping[str, datetime] | None = None,
+    inventory_observed_at: datetime | None = None,
 ) -> McpTransportOutcome:
     response = _parse_mcp_json_rpc_content(content)
     if response is None:
@@ -290,15 +323,33 @@ def _project_azure_mcp_response(
             continue
         if resource_type not in _SUPPORTED_INVENTORY_RESOURCE_TYPES:
             continue
+        normalized_resource_id = (
+            cast(str, resource_id).casefold()
+            if type(resource_id) is str
+            else ""
+        )
+        item_observed_at = (
+            (vm_observed_at or {}).get(
+                normalized_resource_id,
+                inventory_observed_at or response_received_at,
+            )
+            if resource_type == _VM_RESOURCE_TYPE
+            else inventory_observed_at or response_received_at
+        )
         projected_item = {
             "recordType": "resource",
-            "observedAt": response_received_at,
+            "observedAt": item_observed_at,
             "resourceId": resource_id,
             "resourceType": resource_type,
             "location": location,
             "availabilityZone": "unknown",
             "tags": {"managedBy": "unknown"},
-            "state": "unknown",
+            "state": (
+                (vm_states or {}).get(normalized_resource_id, "unknown")
+                if resource_type == _VM_RESOURCE_TYPE
+                and type(resource_id) is str
+                else "unknown"
+            ),
         }
         try:
             validated_item = ResourceResponseItem.model_validate(projected_item)
@@ -359,6 +410,322 @@ def _project_azure_mcp_response(
             f"{first_gap.failure_payload_pointer or 'response'}"
         )
     return outcome
+
+
+def _scoped_vm_target(
+    resource_id: str,
+    request: EvidenceTransportRequest,
+) -> _VmInventoryTarget:
+    scope_arguments = _azure_mcp_tool_arguments(request)
+    parts = resource_id.strip("/").split("/")
+    if (
+        len(parts) != 8
+        or parts[0].casefold() != "subscriptions"
+        or parts[2].casefold() != "resourcegroups"
+        or parts[4].casefold() != "providers"
+        or parts[5].casefold() != "microsoft.compute"
+        or parts[6].casefold() != "virtualmachines"
+        or parts[1].casefold()
+        != scope_arguments["subscription"].casefold()
+        or parts[3].casefold()
+        != scope_arguments["resource-group"].casefold()
+        or not parts[7]
+    ):
+        raise DemoEvaluationConfigurationError(
+            "private MCP inventory VM escaped the authorized resource-group scope"
+        )
+    return _VmInventoryTarget(
+        resource_id=resource_id,
+        vm_name=parts[7],
+    )
+
+
+def _projected_vm_targets(
+    outcome: McpTransportOutcome,
+    request: EvidenceTransportRequest,
+) -> tuple[_VmInventoryTarget, ...]:
+    if not isinstance(outcome, McpSuccessResponse):
+        return ()
+    try:
+        envelope = json.loads(outcome.body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ()
+    expected_keys = {
+        "schemaVersion",
+        "toolName",
+        "toolVersion",
+        "attemptId",
+        "requestDigest",
+        "evidenceScope",
+        "observedAt",
+        "items",
+    }
+    if type(envelope) is not dict or set(envelope) != expected_keys:
+        return ()
+    items = envelope.get("items")
+    if type(items) is not list:
+        return ()
+    if len(items) > request.bounds.max_items:
+        raise DemoEvaluationConfigurationError(
+            "private MCP inventory exceeded the approved item bound"
+        )
+    targets_by_id: dict[str, _VmInventoryTarget] = {}
+    for item in items:
+        if type(item) is not dict or item.get("resourceType") != _VM_RESOURCE_TYPE:
+            continue
+        resource_id = item.get("resourceId")
+        if type(resource_id) is not str:
+            raise DemoEvaluationConfigurationError(
+                "private MCP inventory VM omitted its resource ID"
+            )
+        target = _scoped_vm_target(resource_id, request)
+        normalized_id = target.resource_id.casefold()
+        if normalized_id in targets_by_id:
+            raise DemoEvaluationConfigurationError(
+                "private MCP inventory returned a duplicate VM resource"
+            )
+        targets_by_id[normalized_id] = target
+    return tuple(
+        sorted(
+            targets_by_id.values(),
+            key=lambda target: target.resource_id.casefold(),
+        )
+    )
+
+
+def _mcp_tool_result_payload(
+    content: bytes,
+    *,
+    request_id: str,
+) -> dict[str, object] | None:
+    response = _parse_mcp_json_rpc_content(content)
+    if (
+        type(response) is not dict
+        or set(response) != {"jsonrpc", "id", "result"}
+        or response.get("jsonrpc") != _AZURE_MCP_JSON_RPC_VERSION
+        or response.get("id") != request_id
+    ):
+        return None
+    result = response.get("result")
+    if (
+        type(result) is not dict
+        or set(result) != {"content", "isError"}
+        or result.get("isError") is not False
+    ):
+        return None
+    blocks = result.get("content")
+    if type(blocks) is not list or len(blocks) != 1:
+        return None
+    block = blocks[0]
+    if (
+        type(block) is not dict
+        or set(block) != {"type", "text"}
+        or block.get("type") != "text"
+        or type(block.get("text")) is not str
+    ):
+        return None
+    try:
+        tool_payload = json.loads(cast(str, block["text"]))
+    except json.JSONDecodeError:
+        return None
+    if type(tool_payload) is not dict:
+        return None
+    if set(tool_payload) == {"status", "message", "results", "duration"}:
+        if (
+            tool_payload.get("status") != 200
+            or type(tool_payload.get("message")) is not str
+            or type(tool_payload.get("duration")) is not int
+            or type(tool_payload.get("results")) is not dict
+        ):
+            return None
+        return cast(dict[str, object], tool_payload["results"])
+    return cast(dict[str, object], tool_payload)
+
+
+def _parse_vm_power_state_response(
+    content: bytes,
+    *,
+    request_id: str,
+    target: _VmInventoryTarget,
+) -> ResourceState:
+    payload = _mcp_tool_result_payload(
+        content,
+        request_id=request_id,
+    )
+    if payload is None:
+        return "unknown"
+    if set(payload) == {"vm", "instanceView"}:
+        vm = payload.get("vm")
+        instance_view = payload.get("instanceView")
+    elif set(payload) == {"Vm", "InstanceView"}:
+        vm = payload.get("Vm")
+        instance_view = payload.get("InstanceView")
+    else:
+        return "unknown"
+
+    allowed_vm_keys = {
+        "name",
+        "id",
+        "location",
+        "vmSize",
+        "provisioningState",
+        "osType",
+        "licenseType",
+        "zones",
+        "tags",
+    }
+    if (
+        type(vm) is not dict
+        or not {"name", "id"}.issubset(vm)
+        or not set(vm).issubset(allowed_vm_keys)
+        or type(vm.get("name")) is not str
+        or type(vm.get("id")) is not str
+        or cast(str, vm["name"]).casefold() != target.vm_name.casefold()
+        or cast(str, vm["id"]).casefold()
+        != target.resource_id.casefold()
+    ):
+        return "unknown"
+
+    allowed_instance_view_keys = {
+        "name",
+        "powerState",
+        "provisioningState",
+        "vmAgent",
+        "disks",
+        "extensions",
+        "statuses",
+    }
+    if (
+        type(instance_view) is not dict
+        or not {"name", "statuses"}.issubset(instance_view)
+        or not set(instance_view).issubset(allowed_instance_view_keys)
+        or type(instance_view.get("name")) is not str
+        or cast(str, instance_view["name"]).casefold()
+        != target.vm_name.casefold()
+        or type(instance_view.get("statuses")) is not list
+    ):
+        return "unknown"
+
+    status_codes: list[str] = []
+    allowed_status_keys = {
+        "code",
+        "level",
+        "displayStatus",
+        "message",
+        "time",
+    }
+    for status in cast(list[object], instance_view["statuses"]):
+        if (
+            type(status) is not dict
+            or "code" not in status
+            or not set(status).issubset(allowed_status_keys)
+            or type(status.get("code")) is not str
+            or any(
+                value is not None and type(value) is not str
+                for key, value in status.items()
+                if key != "code"
+            )
+        ):
+            return "unknown"
+        code = cast(str, status["code"])
+        if code.startswith("PowerState/"):
+            status_codes.append(code)
+    if len(status_codes) != 1:
+        return "unknown"
+    normalized_state = _NORMALIZED_VM_STATES.get(status_codes[0])
+    if normalized_state is None:
+        return "unknown"
+    declared_power_state = instance_view.get("powerState")
+    if declared_power_state is not None and (
+        type(declared_power_state) is not str
+        or cast(str, declared_power_state).casefold() != normalized_state
+    ):
+        return "unknown"
+    return normalized_state
+
+
+type _VmToolInvoker = Callable[
+    [str, str, Mapping[str, object], float, int],
+    bytes | None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _VmPowerStateCollection:
+    states: Mapping[str, ResourceState]
+    observed_at: Mapping[str, datetime]
+    completed_at: datetime
+    deadline_exceeded: bool
+
+
+def _collect_vm_power_states(
+    inventory_outcome: McpTransportOutcome,
+    request: EvidenceTransportRequest,
+    *,
+    invoke_tool: _VmToolInvoker,
+    deadline_at: datetime,
+    response_byte_budget: int,
+    now: Callable[[], datetime],
+    inventory_observed_at: datetime | None = None,
+) -> _VmPowerStateCollection:
+    targets = _projected_vm_targets(inventory_outcome, request)
+    states: dict[str, ResourceState] = {
+        target.resource_id.casefold(): "unknown"
+        for target in targets
+    }
+    baseline_observed_at = inventory_observed_at or request.attempt_started_at
+    observed_at = {
+        target.resource_id.casefold(): baseline_observed_at
+        for target in targets
+    }
+    completed_at = baseline_observed_at
+    remaining_bytes = max(response_byte_budget, 0)
+    for index, target in enumerate(targets, start=1):
+        current = now()
+        if current >= deadline_at or remaining_bytes <= 0:
+            break
+        request_id = f"{request.attempt_id}-vm-state-{index:04d}"
+        timeout_seconds = max(
+            (deadline_at - current).total_seconds(),
+            0.001,
+        )
+        try:
+            content = invoke_tool(
+                request_id,
+                AZURE_VM_GET_DEPLOYMENT_TOOL,
+                _azure_mcp_vm_arguments(request, target),
+                timeout_seconds,
+                remaining_bytes,
+            )
+        except TimeoutError:
+            content = None
+        received_at = now()
+        if received_at > deadline_at:
+            return _VmPowerStateCollection(
+                states=MappingProxyType(states),
+                observed_at=MappingProxyType(observed_at),
+                completed_at=received_at,
+                deadline_exceeded=True,
+            )
+        normalized_id = target.resource_id.casefold()
+        observed_at[normalized_id] = received_at
+        completed_at = max(completed_at, received_at)
+        if content is None:
+            continue
+        if len(content) > remaining_bytes:
+            break
+        remaining_bytes -= len(content)
+        states[normalized_id] = _parse_vm_power_state_response(
+            content,
+            request_id=request_id,
+            target=target,
+        )
+    return _VmPowerStateCollection(
+        states=MappingProxyType(states),
+        observed_at=MappingProxyType(observed_at),
+        completed_at=completed_at,
+        deadline_exceeded=False,
+    )
 
 
 class PublishedContextReaderPort(Protocol):
@@ -701,6 +1068,37 @@ def _mcp_http_request(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _InitializedMcpSession:
+    endpoint: str
+    credential: str = field(repr=False)
+    session_id: str | None
+
+
+def _mcp_session_tool_request(
+    session: _InitializedMcpSession,
+    *,
+    request_id: str,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> Request:
+    return _mcp_http_request(
+        session.endpoint,
+        session.credential,
+        {
+            "jsonrpc": _AZURE_MCP_JSON_RPC_VERSION,
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": dict(arguments),
+            },
+        },
+        protocol_version=_AZURE_MCP_PROTOCOL_VERSION,
+        session_id=session.session_id,
+    )
+
+
 def _validate_mcp_initialize_response(
     content: bytes,
     *,
@@ -720,6 +1118,23 @@ def _validate_mcp_initialize_response(
         )
 
 
+def _remaining_mcp_timeout_seconds(deadline_at: datetime) -> float | None:
+    remaining = (deadline_at - _now_utc_millisecond()).total_seconds()
+    return max(remaining, 0.001) if remaining > 0 else None
+
+
+def _mcp_deadline_timeout(
+    deadline_at: datetime,
+) -> McpTimeoutNoResponse:
+    timed_out_at = _now_utc_millisecond()
+    if timed_out_at <= deadline_at:
+        timed_out_at = deadline_at + timedelta(milliseconds=1)
+    return McpTimeoutNoResponse(
+        deadline_at=deadline_at,
+        timed_out_at=timed_out_at,
+    )
+
+
 def _invoke_managed_identity_private_mcp(
     sealed: _SealedManagedIdentityPrivateMcpInvoker,
     private_mcp_endpoint: str,
@@ -731,6 +1146,9 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             "private MCP invocation did not match the credential endpoint"
         )
+    deadline_at = request.attempt_started_at + timedelta(
+        milliseconds=request.bounds.timeout_milliseconds
+    )
     opener = _MANAGED_IDENTITY_HTTP_BUILD_IMPLEMENTATION(sealed.http_stack)
     scope = f"{sealed.audience.rstrip('/')}/.default"
     credential_provider = _DEFAULT_AZURE_CREDENTIAL_TYPE()
@@ -752,7 +1170,6 @@ def _invoke_managed_identity_private_mcp(
             "private MCP managed identity returned an invalid credential"
         )
     endpoint = f"{endpoint_origin}/"
-    timeout_seconds = request.bounds.timeout_milliseconds / 1_000
     initialize_id = f"{request.attempt_id}-initialize"
     initialize = _mcp_http_request(
         endpoint,
@@ -771,13 +1188,16 @@ def _invoke_managed_identity_private_mcp(
             },
         },
     )
+    initialize_timeout = _remaining_mcp_timeout_seconds(deadline_at)
+    if initialize_timeout is None:
+        return _mcp_deadline_timeout(deadline_at)
     try:
         initialize_url, initialize_status, initialize_content, initialize_headers = (
             _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
                 sealed.http_stack,
                 opener,
                 initialize,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=initialize_timeout,
                 max_response_bytes=request.bounds.max_response_bytes,
             )
         )
@@ -794,11 +1214,15 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             f"private MCP initialize returned HTTP {exc.code}"
         ) from exc
+    except TimeoutError:
+        return _mcp_deadline_timeout(deadline_at)
     except URLError:
         return McpToolUnavailable(
             unavailable_reason="networkUnavailable",
             observed_at=_now_utc_millisecond(),
         )
+    if _now_utc_millisecond() > deadline_at:
+        return _mcp_deadline_timeout(deadline_at)
     if (
         initialize_url != endpoint
         or not 200 <= initialize_status < 300
@@ -813,6 +1237,11 @@ def _invoke_managed_identity_private_mcp(
         request_id=initialize_id,
     )
     session_id = initialize_headers.get("mcp-session-id")
+    session = _InitializedMcpSession(
+        endpoint=endpoint,
+        credential=credential,
+        session_id=session_id,
+    )
     initialized = _mcp_http_request(
         endpoint,
         credential,
@@ -824,13 +1253,16 @@ def _invoke_managed_identity_private_mcp(
         protocol_version=_AZURE_MCP_PROTOCOL_VERSION,
         session_id=session_id,
     )
+    initialized_timeout = _remaining_mcp_timeout_seconds(deadline_at)
+    if initialized_timeout is None:
+        return _mcp_deadline_timeout(deadline_at)
     try:
         initialized_url, initialized_status, initialized_content, _ = (
             _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
                 sealed.http_stack,
                 opener,
                 initialized,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=initialized_timeout,
                 max_response_bytes=request.bounds.max_response_bytes,
             )
         )
@@ -847,11 +1279,15 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             f"private MCP initialized notification returned HTTP {exc.code}"
         ) from exc
+    except TimeoutError:
+        return _mcp_deadline_timeout(deadline_at)
     except URLError:
         return McpToolUnavailable(
             unavailable_reason="networkUnavailable",
             observed_at=_now_utc_millisecond(),
         )
+    if _now_utc_millisecond() > deadline_at:
+        return _mcp_deadline_timeout(deadline_at)
     if (
         initialized_url != endpoint
         or not 200 <= initialized_status < 300
@@ -860,43 +1296,22 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             "private MCP rejected the initialized notification"
         )
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": request.attempt_id,
-            "method": "tools/call",
-            "params": {
-                "name": deployment_tool_name,
-                "arguments": _azure_mcp_tool_arguments(request),
-            },
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    outbound = Request(  # noqa: S310 - the endpoint is operator-sealed HTTPS
-        endpoint,
-        data=body,
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {credential}",
-            "Cache-Control": "no-store",
-            "Content-Type": "application/json",
-            "MCP-Protocol-Version": _AZURE_MCP_PROTOCOL_VERSION,
-            **(
-                {"Mcp-Session-Id": session_id}
-                if session_id is not None
-                else {}
-            ),
-        },
-        method="POST",
+    outbound = _mcp_session_tool_request(
+        session,
+        request_id=request.attempt_id,
+        tool_name=deployment_tool_name,
+        arguments=_azure_mcp_tool_arguments(request),
     )
+    inventory_timeout = _remaining_mcp_timeout_seconds(deadline_at)
+    if inventory_timeout is None:
+        return _mcp_deadline_timeout(deadline_at)
     try:
         response_url, status_code, content, _ = (
             _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
                 sealed.http_stack,
                 opener,
                 outbound,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=inventory_timeout,
                 max_response_bytes=request.bounds.max_response_bytes,
             )
         )
@@ -921,11 +1336,16 @@ def _invoke_managed_identity_private_mcp(
             body=_azure_mcp_failure_body(request),
             response_received_at=observed_at,
         )
+    except TimeoutError:
+        return _mcp_deadline_timeout(deadline_at)
     except URLError:
         return McpToolUnavailable(
             unavailable_reason="networkUnavailable",
             observed_at=_now_utc_millisecond(),
         )
+    inventory_received_at = _now_utc_millisecond()
+    if inventory_received_at > deadline_at:
+        return _mcp_deadline_timeout(deadline_at)
     if (
         response_url != endpoint
         or not 200 <= status_code < 300
@@ -935,11 +1355,67 @@ def _invoke_managed_identity_private_mcp(
         raise DemoEvaluationConfigurationError(
             "private MCP returned an untrusted HTTP response"
         )
+    inventory_outcome = _project_azure_mcp_response(
+        content,
+        request,
+        deployment_tool_name=deployment_tool_name,
+        response_received_at=inventory_received_at,
+    )
+
+    def invoke_vm_tool(
+        request_id: str,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        remaining_timeout_seconds: float,
+        remaining_response_bytes: int,
+    ) -> bytes | None:
+        vm_request = _mcp_session_tool_request(
+            session,
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        try:
+            vm_url, vm_status, vm_content, _ = (
+                _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION(
+                    sealed.http_stack,
+                    opener,
+                    vm_request,
+                    timeout_seconds=remaining_timeout_seconds,
+                    max_response_bytes=remaining_response_bytes,
+                )
+            )
+        except (HTTPError, URLError, TimeoutError):
+            return None
+        if (
+            vm_url != endpoint
+            or not 200 <= vm_status < 300
+            or not vm_content
+        ):
+            return None
+        return vm_content
+
+    vm_collection = _collect_vm_power_states(
+        inventory_outcome,
+        request,
+        invoke_tool=invoke_vm_tool,
+        deadline_at=deadline_at,
+        response_byte_budget=request.bounds.max_response_bytes - len(content),
+        now=_now_utc_millisecond,
+        inventory_observed_at=inventory_received_at,
+    )
+    if vm_collection.deadline_exceeded:
+        return _mcp_deadline_timeout(deadline_at)
+    if not vm_collection.states:
+        return inventory_outcome
     return _project_azure_mcp_response(
         content,
         request,
         deployment_tool_name=deployment_tool_name,
-        response_received_at=_now_utc_millisecond(),
+        response_received_at=vm_collection.completed_at,
+        vm_states=vm_collection.states,
+        vm_observed_at=vm_collection.observed_at,
+        inventory_observed_at=inventory_received_at,
     )
 
 

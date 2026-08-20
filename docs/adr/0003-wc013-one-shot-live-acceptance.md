@@ -28,6 +28,19 @@ Use `DefaultAzureCredential` with explicit managed-identity client IDs, one exac
 Vault RSA key for ingestion and snapshot signatures, independent Entra token verification, and an
 Azure Table batch that atomically reserves attempt and request identities.
 
+The private MCP transport first calls the reviewed `group_resource_list` inventory tool. For every
+projected `Microsoft.Compute/virtualMachines` record, it then calls the separately reviewed
+read-only `compute_vm_get` tool exactly once in deterministic resource-ID order, reusing the same
+initialized MCP session. Arguments are derived only from the authorized resource-group scope and
+the exact inventory resource ID: `subscription`, `resource-group`, `vm-name`, and
+`instance-view: true`.
+
+The enrichment shares the collection item, response-byte, and absolute timeout bounds. Only one
+exact instance-view `PowerState/running`, `PowerState/stopped`, or `PowerState/deallocated` status
+code is normalized. Missing, duplicate, conflicting, unclassified, out-of-scope, partial,
+oversized, timed-out, or malformed VM responses produce `unknown`. Provisioning state, Resource
+Health, display text, and model-view power fields are not evidence of runtime state.
+
 ## Consequences
 
 - No Context API Container App is required for the initial gate.
@@ -37,6 +50,9 @@ Azure Table batch that atomically reserves attempt and request identities.
   sealed private MCP adapter.
 - Replay reservations survive job/process restarts. A failed post-reservation run requires new
   reviewed attempt and snapshot IDs.
+- The WC-008 allowlist adds only `compute_vm_get`; the existing resource-group Reader assignment
+  already covers the required VM instance-view read, so no RBAC or scope broadening is introduced.
+- Non-VM inventory records retain their existing projection and `unknown` operational state.
 - The in-memory authority store is acceptable only for this single evaluation. A long-running API,
   concurrent writers, or reusable evaluation service requires durable Context API persistence with
   equivalent conditional transactions.
@@ -58,4 +74,7 @@ Azure Table batch that atomically reserves attempt and request identities.
   evidence-identity verification, and atomic replay reservations.
 - The one-shot composition test runs the existing services end to end without a Context API HTTP
   endpoint.
+- Runtime-state tests cover all supported power states, wrapper variants, deterministic per-VM
+  calls, scope enforcement, partial and timeout behavior, response-byte exhaustion, malformed and
+  conflicting statuses, and exact allowlist drift.
 - Targeted WC-013 and demo-evaluation tests, Ruff, and mypy must pass.

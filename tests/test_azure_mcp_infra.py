@@ -150,7 +150,7 @@ def test_pinned_tool_catalog_has_runtime_provenance() -> None:
     )
     assert provenance["toolNameSeparator"] == "_"
     assert provenance["toolExposureAssignment"] == "Name = fullName"
-    assert len(tools) == 7
+    assert len(tools) == 8
     assert len({tool["id"] for tool in tools}) == len(tools)
     assert len({tool["name"] for tool in tools}) == len(tools)
     assert all(tool["name"] == tool["command"].replace(" ", "_") for tool in tools)
@@ -178,6 +178,16 @@ def test_tool_allowlist_matches_pinned_catalog_without_mutations() -> None:
     catalog_tools = TOOL_CATALOG["tools"]
     expected_tools = tuple(tool["name"] for tool in catalog_tools)
     configured_tools = _quoted_values_in_variable(CONTAINER_APP, "approvedTools")
+    assert expected_tools == (
+        "group_resource_list",
+        "compute_vm_get",
+        "monitor_activitylog_list",
+        "monitor_metrics_definitions",
+        "monitor_metrics_query",
+        "monitor_resource_log_query",
+        "monitor_workspace_log_query",
+        "resourcehealth_availability-status_get",
+    )
     assert configured_tools == expected_tools
     assert all(tool["readOnly"] is True for tool in catalog_tools)
     assert all(tool["destructive"] is False for tool in catalog_tools)

@@ -58,6 +58,15 @@
       "openWorld": false
     },
     {
+      "id": "c1a8b3e5-4f2d-4a6e-8c7b-9d2e3f4a5b6c",
+      "command": "compute vm get",
+      "name": "compute_vm_get",
+      "readOnly": true,
+      "destructive": false,
+      "secret": false,
+      "openWorld": false
+    },
+    {
       "id": "ffc0ed72-0622-4a27-bfd8-6df9b83adce8",
       "command": "monitor activitylog list",
       "name": "monitor_activitylog_list",

@@ -60,6 +60,7 @@ NormalizedProfileId = Annotated[
 
 AZURE_MCP_2_0_5_ALLOWED_TOOLS: tuple[str, ...] = (
     "group_resource_list",
+    "compute_vm_get",
     "monitor_activitylog_list",
     "monitor_metrics_definitions",
     "monitor_metrics_query",

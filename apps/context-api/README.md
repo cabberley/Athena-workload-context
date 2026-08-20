@@ -37,12 +37,14 @@ The integration composes the merged components without introducing direct Azure 
 - A trusted WC-008 configuration port verifies a bounded deployment-output assertion against a
   separately pinned human operator decision. The assertion binds the exact endpoint, managed
   environment and Container App resource IDs, internal/private ingress flags, separate identity
-  IDs, Azure MCP 2.0.5 image digest, seven-tool allowlist/catalog hash, and explicit read scopes.
+  IDs, Azure MCP 2.0.5 image digest, eight-tool allowlist/catalog hash, and explicit read scopes.
   A hostname suffix or caller-supplied private flag is never treated as proof of private ingress.
 - `PrivateMcpEvidenceTransport` owns that immutable verified configuration and derives the endpoint
   used by its injected invoker from it; no independent endpoint label can be supplied. It
   maps the WC-009 semantic inventory operation to WC-008's exact `group_resource_list` deployment
-  tool. The WC-009 adapter and its immutable client share one exact transport object. Collection
+  tool, then uses the separately allowlisted `compute_vm_get` tool in the same initialized MCP
+  session to enrich only projected VM records with bounded instance-view power state. The WC-009
+  adapter and its immutable client share one exact transport object. Collection
   checks the concrete transport and invoker type, object identity, and original method
   implementation, then calls the captured implementation directly with the sealed endpoint.
   Per-instance, class-level, or embedded-client method/transport replacement therefore fails
