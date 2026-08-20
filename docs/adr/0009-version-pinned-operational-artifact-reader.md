@@ -1,11 +1,11 @@
-# ADR 0007: Read operational artifacts only by exact verified Blob version
+# ADR 0009: Read operational artifacts only by exact verified Blob version
 
 - **Status:** Proposed
 - **Date:** 2026-08-20
 
 ## Context
 
-ADR 0006 established private create-only artifact persistence and required downstream consumers to
+ADR 0007 established private create-only artifact persistence and required downstream consumers to
 retain a Blob version ID. Receipt ingestion and operator verification now need a narrow read
 capability without introducing listing, latest-version lookup, deletion, writes, phase execution,
 presentation projection, or orchestration.
