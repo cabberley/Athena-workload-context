@@ -20,6 +20,8 @@ param signingKeyName = 'wc013-signing'
 param replayStorageAccountName = 'athenasynthwc013replay'
 param replayTableName = 'Wc013Replay'
 param replayPartitionKey = 'wc013-live-synthetic'
+param artifactContainerName = 'operational-artifacts'
+param artifactRetentionDays = 30
 
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.
 param wc007PinnedAuthorityDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'

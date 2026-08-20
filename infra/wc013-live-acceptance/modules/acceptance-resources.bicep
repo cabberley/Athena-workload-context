@@ -1,7 +1,7 @@
 targetScope = 'resourceGroup'
 
 metadata name = 'WC-013 one-shot acceptance resources'
-metadata description = 'Private Key Vault, Azure Table replay storage, and manual Container Apps Job for WC-013.'
+metadata description = 'Private Key Vault, Azure Table replay storage, immutable Azure Blob artifacts, and the manual Container Apps Job for WC-013.'
 
 @description('Azure region for the acceptance resources.')
 param location string
@@ -22,6 +22,9 @@ param keyVaultPrivateDnsZoneResourceId string
 
 @description('Resource ID of the private DNS zone for Azure Table private endpoints.')
 param storageTablePrivateDnsZoneResourceId string
+
+@description('Resource ID of the private DNS zone for Azure Blob private endpoints.')
+param storageBlobPrivateDnsZoneResourceId string
 
 @description('Resource ID of the dedicated MCP/evidence managed identity.')
 param evidenceIdentityResourceId string
@@ -56,6 +59,14 @@ param replayTableName string
 @description('Dedicated replay reservation namespace.')
 param replayPartitionKey string
 
+@description('Dedicated immutable Blob container for operational artifacts.')
+param artifactContainerName string
+
+@description('Explicit unlocked WORM retention period for artifact blob versions.')
+@minValue(1)
+@maxValue(146000)
+param artifactRetentionDays int
+
 @description('Exact non-secret WC-007 authority digest emitted by the configuration renderer.')
 param wc007PinnedAuthorityDigest string
 
@@ -77,6 +88,7 @@ var resourceTags = union(tags, {
   managedBy: 'bicep'
 })
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 
 module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
   name: 'wc013-signing-key-vault'
@@ -159,6 +171,26 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
       bypass: 'None'
       defaultAction: 'Deny'
     }
+    blobServices: {
+      // Preserve the AVM 0.33.0 soft-delete defaults already applied to the replay account.
+      containerDeleteRetentionPolicyEnabled: true
+      containerDeleteRetentionPolicyDays: 7
+      deleteRetentionPolicyEnabled: true
+      deleteRetentionPolicyDays: 6
+      isVersioningEnabled: true
+      containers: [
+        {
+          name: artifactContainerName
+          publicAccess: 'None'
+          immutableStorageWithVersioningEnabled: true
+          immutabilityPolicy: {
+            immutabilityPeriodSinceCreationInDays: artifactRetentionDays
+            allowProtectedAppendWrites: false
+            allowProtectedAppendWritesAll: false
+          }
+        }
+      ]
+    }
     privateEndpoints: [
       {
         name: '${namePrefix}-wc013-table-pe'
@@ -169,6 +201,19 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
           privateDnsZoneGroupConfigs: [
             {
               privateDnsZoneResourceId: storageTablePrivateDnsZoneResourceId
+            }
+          ]
+        }
+      }
+      {
+        name: '${namePrefix}-wc013-blob-pe'
+        service: 'blob'
+        subnetResourceId: privateEndpointSubnetResourceId
+        privateDnsZoneGroup: {
+          name: 'default'
+          privateDnsZoneGroupConfigs: [
+            {
+              privateDnsZoneResourceId: storageBlobPrivateDnsZoneResourceId
             }
           ]
         }
@@ -196,6 +241,16 @@ resource replayTable 'Microsoft.Storage/storageAccounts/tableServices/tables@202
   ]
 }
 
+resource replayBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' existing = {
+  parent: replayStorageAccount
+  name: 'default'
+}
+
+resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
+  parent: replayBlobService
+  name: artifactContainerName
+}
+
 resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(
     replayTable.id,
@@ -211,6 +266,26 @@ resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@202
       storageTableDataContributorRoleDefinitionId
     )
   }
+}
+
+resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    artifactContainer.id,
+    acceptanceIdentityPrincipalId,
+    storageBlobDataContributorRoleDefinitionId
+  )
+  scope: artifactContainer
+  properties: {
+    principalId: acceptanceIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
 }
 
 module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
@@ -329,6 +404,18 @@ output replayTableName string = replayTableName
 
 @description('Resource ID of the dedicated replay table.')
 output replayTableResourceId string = replayTable.id
+
+@description('Private Azure Blob service endpoint for immutable operational artifacts.')
+output artifactBlobEndpoint string = replayStorage.outputs.serviceEndpoints.blob
+
+@description('Dedicated immutable operational artifact container name.')
+output artifactContainerName string = artifactContainerName
+
+@description('Resource ID of the dedicated immutable operational artifact container.')
+output artifactContainerResourceId string = artifactContainer.id
+
+@description('Configured unlocked WORM retention period for artifact blob versions.')
+output artifactRetentionDays int = artifactRetentionDays
 
 @description('Manual WC-013 acceptance job name.')
 output acceptanceJobName string = acceptanceJob.outputs.name
