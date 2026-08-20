@@ -182,6 +182,10 @@ def test_configuration_template_is_valid_and_contains_no_credentials() -> None:
     parsed = Wc013ConfigurationInput.model_validate_json(template)
 
     assert parsed.deployment.azure_mcp_internal_endpoint.startswith("https://")
+    assert parsed.deployment.azure_mcp_internal_endpoint.endswith(
+        ".azurecontainerapps.io"
+    )
+    assert ".internal." not in parsed.deployment.azure_mcp_internal_endpoint
     lowered = template.casefold()
     assert "bearertoken" not in lowered
     assert '"password"' not in lowered

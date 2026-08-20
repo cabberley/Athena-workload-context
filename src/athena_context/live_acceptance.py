@@ -494,7 +494,9 @@ def wc013_configuration_template() -> str:
     digest = "sha256:" + ("0" * 64)
     template = {
         "deployment": {
-            "azure_mcp_internal_endpoint": "https://azure-mcp.internal.example",
+            "azure_mcp_internal_endpoint": (
+                "https://azure-mcp.synthetic-env.australiaeast.azurecontainerapps.io"
+            ),
             "managed_environment_resource_id": (
                 "/subscriptions/11111111-1111-1111-1111-111111111111/"
                 "resourceGroups/rg-athena-demo/providers/Microsoft.App/"

@@ -3169,11 +3169,15 @@ def test_wc008_output_configuration_enforces_identity_and_role_separation() -> N
         )
     with pytest.raises(ValidationError, match="external_ingress"):
         Wc008DeploymentOutputAssertion.model_validate(
-            _changed_assertion_payload(external_ingress=True)
+            _changed_assertion_payload(external_ingress=False)
         )
     with pytest.raises(ValidationError):
         McpReadAssignment(scope=scope(), role="Contributor")  # type: ignore[arg-type]
     assert assertion.context_identity_object_id == CONTEXT_OBJECT_ID
+    assert assertion.internal_environment is True
+    assert assertion.public_network_access == "Disabled"
+    assert assertion.external_ingress is True
+    assert assertion.allow_insecure is False
 
 
 def test_endpoint_is_derived_from_actual_transport_and_cannot_be_relabelled() -> None:

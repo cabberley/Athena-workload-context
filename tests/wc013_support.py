@@ -100,7 +100,9 @@ TRUST_ANCHOR = (
     "https://athena-fixture.vault.azure.net/keys/athena-fixture/"
     "0123456789abcdef0123456789abcdef"
 )
-PRIVATE_ENDPOINT = "https://athena-synthetic-mcp.internal"
+PRIVATE_ENDPOINT = (
+    "https://athena-synthetic-mcp.synthetic-env.australiaeast.azurecontainerapps.io"
+)
 
 PUBLISHER = Actor(actor_id="wc013-human-publisher", kind=ActorKind.HUMAN)
 APPROVER = Actor(actor_id="wc013-human-approver", kind=ActorKind.HUMAN)
@@ -766,7 +768,7 @@ def deployment_assertion(
     *,
     internal_environment: bool = True,
     public_network_access: str = "Disabled",
-    external_ingress: bool = False,
+    external_ingress: bool = True,
 ) -> Wc008DeploymentOutputAssertion:
     resource_group_prefix = (
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture"

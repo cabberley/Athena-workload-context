@@ -26,6 +26,14 @@ The production path uses:
 No bearer token, client secret, storage key, connection string, or private key is accepted in
 configuration or persisted in evidence.
 
+WC-008 deliberately configures the MCP app with `external: true` while the Container Apps
+environment remains `internal: true` with `publicNetworkAccess: Disabled`. In this combination,
+external ingress means reachable through the environment's private static IP from the linked VNet;
+it does not create an internet-reachable endpoint. A private DNS zone named for the environment
+`defaultDomain` is linked to that VNet, and its wildcard A record maps the normal non-`.internal`
+Container App FQDN to the environment `staticIp`. See
+`docs/adr/0004-vnet-scoped-container-app-ingress.md`.
+
 ## Reviewed input files
 
 `wc013-source.json` is produced by `athena-context wc013-config-template` and references:
@@ -76,6 +84,11 @@ athena-context wc013-live-acceptance `
 It validates both pinned human approvals, WC-007 selection/digests/profile, active unsuperseded
 shape, exact workload grants, WC-008 endpoint/identity/scope, separate identities, trusted key
 fingerprint, and all bounded files.
+
+The rendered WC-008 assertion must pin `internal_environment: true`,
+`public_network_access: Disabled`, `external_ingress: true`, and `allow_insecure: false`. An older
+assertion that records `external_ingress: false` no longer represents the deployable topology and
+must be re-rendered and separately approved.
 
 ## One-shot execution
 
@@ -131,9 +144,9 @@ managed environment.
 The composition uses pinned Azure Verified Modules for the Key Vault
 (`avm/res/key-vault/vault:0.14.0`), Storage account
 (`avm/res/storage/storage-account:0.33.0`), and Container Apps Job
-(`avm/res/app/job:0.7.2`). The existing native Azure MCP implementation remains visible because
-its reviewed image, command line, internal ingress, and cross-resource-group Reader assignment are
-security-critical.
+(`avm/res/app/job:0.7.2`). The existing native Azure MCP implementation remains visible because its
+reviewed image, command line, VNet-scoped ingress, private DNS, and cross-resource-group Reader
+assignment are security-critical.
 
 It creates exactly two runtime identities:
 
@@ -281,8 +294,8 @@ identity IDs, `keyVaultUri`, `signingKeyName`, `signingKeyUriWithVersion`,
 `replayStorageAccountResourceId`, `replayTableEndpoint`, `replayTableName`,
 `replayTableResourceId`, `acceptanceJobName`, and `acceptanceJobResourceId`.
 
-No Context API Container App, public ingress, client secret, storage account key, or exported
-private key is required for this initial one-shot gate.
+No Context API Container App, internet-reachable environment endpoint, client secret, storage
+account key, or exported private key is required for this initial one-shot gate.
 
 The equivalent live pytest gate is:
 
@@ -319,8 +332,40 @@ The initial live gate completed successfully on 2026-08-19:
 - Evidence records: 15 projected resources from
   `rg-athena-demo-workload`.
 
+The recorded WC-008 assertion digest above is historical evidence for that completed run. Do not
+reuse it after reconciling the deployment to VNet-scoped `external_ingress: true`; render and
+approve a new assertion for the next execution.
+
 Independent verification recomputed both immutable snapshot digests and verified the Key Vault
 RSA snapshot attestation and trusted-ingestion signature against the pinned public key. Live RBAC
 verification also confirmed Reader only on the demo resource group for the evidence identity, and
 only AcrPull, Key Vault Crypto User, and Storage Table Data Contributor at their exact resource
 scopes for the acceptance identity.
+
+## Recorded VNet-scoped re-attestation
+
+The reconciled VNet-scoped composition completed successfully on 2026-08-20:
+
+- Container Apps Job execution:
+  `athena-wc013-live-acceptance-1mmei91`
+- Runner image digest:
+  `sha256:4ded30d50ee849d33d32597bfe88fc3b32af02a5b4a6376c749be586b407c095`
+- Delivery image digest:
+  `sha256:946f6b4e7008f4af80c4d66bbc28f5a4c29972dcd0e65e58452fd09a4451ba13`
+- VNet-accessible private MCP endpoint:
+  `https://athena-wc013-live-mcp.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
+- Attempt/snapshot:
+  `attempt-c2fb3624108e` / `snap-7b4f7b57e673`
+- Snapshot artifact and semantic digest:
+  `sha256:5137142b745beb4e5c75db1c42f8178b4716fec265aa479796e324c4568c8f2c`
+- WC-007 authority digest:
+  `sha256:d90b488ecf17915eeb1fe8944ad4ce0e81637c01a160e1d9ecce8a62fc9a2500`
+- WC-008 assertion digest:
+  `sha256:dd19d5ce778225ed3840ce1f7bf47bfeab561ac3af91e93b162de7b3ffce8183`
+- Evidence records: 15 projected resources from
+  `rg-athena-demo-workload`.
+
+Independent verification confirmed both RSA signatures, the exact managed-identity claims,
+authorized resource-group scope, successful MCP attempt, and immutable snapshot digests. An
+authenticated MCP initialize request from the VNet jumpbox returned HTTP 200 while the Container
+Apps environment remained internal with public network access disabled.

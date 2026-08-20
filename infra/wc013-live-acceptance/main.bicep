@@ -129,6 +129,7 @@ module azureMcp '../azure-mcp/main.bicep' = {
     azureMcpVersion: azureMcpVersion
     azureMcpImageDigest: azureMcpImageDigest
     entraApplicationClientId: azureMcpResourceApplicationClientId
+    containerAppsPrivateDnsVnetLinkName: 'wc013-containerapps-link'
     workloadReadScopes: [
       {
         subscriptionId: targetDemoWorkloadSubscriptionId
@@ -208,7 +209,7 @@ module acceptanceImagePull 'modules/acr-pull-rbac.bicep' = {
 @description('Resource ID of the dedicated WC-013 hosting resource group.')
 output foundationResourceGroupResourceId string = foundationResourceGroup.id
 
-@description('Environment-local HTTPS endpoint for the pinned private Azure MCP Container App.')
+@description('VNet-scoped HTTPS endpoint for the pinned private Azure MCP Container App.')
 output azureMcpInternalEndpoint string = azureMcp.outputs.azureMcpInternalEndpoint
 
 @description('Exact audience that the acceptance identity requests for private Azure MCP calls.')

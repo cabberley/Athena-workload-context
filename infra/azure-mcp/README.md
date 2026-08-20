@@ -8,7 +8,12 @@ not change shared root orchestration.
 - The reviewed `mcr.microsoft.com/azure-sdk/azure-mcp:2.0.5` image is pinned to manifest digest
   `sha256:2285f62dc1720ebf5da90498828b27e73d8fae6fd6fb89cab8cf67e3646fce3a`.
 - The Container Apps environment is internal with public network access disabled. App ingress is
-  environment-local (`external: false`), HTTPS-only at Envoy, and unavailable on public ingress.
+  external to the app environment (`external: true`) so approved VNet callers can use the normal
+  non-`.internal` FQDN, but the environment virtual IP remains private and is not internet
+  reachable. Envoy remains HTTPS-only.
+- A private DNS zone named for the environment `defaultDomain` is linked only to the dedicated VNet.
+  Its wildcard A record maps every Container Apps FQDN in that domain to the environment
+  `staticIp`.
 - Azure MCP requires an Entra bearer token. Supply an existing Entra application client ID
   configured with the Azure MCP `Mcp.Tools.ReadWrite.All` application role and grant that role only
   to approved calling identities. No client secret is required by this deployment.
@@ -93,8 +98,9 @@ Prerequisites:
 2. Create or approve the Entra resource application and application role described above. Grant
    the role to only the calling Athena service identity; do not add Azure workload roles to that
    identity.
-3. Ensure the calling Athena service runs in the same Container Apps environment. Because ingress
-   is environment-local, a VNet client outside the environment cannot call it directly.
+3. Ensure the calling Athena service runs inside the linked VNet boundary. The WC-013 job shares
+   the Container Apps environment; other approved VNet callers must have both network connectivity
+   and private DNS resolution for the environment domain.
 4. Review every optional RBAC target and ensure the deployment identity can deploy at those exact
    scopes.
 
@@ -128,11 +134,18 @@ These commands are optional and require an approved deployed environment. They a
 default test suite.
 
 ```powershell
-# Both checks must report private/disabled.
+# The environment must report internal=true/public=Disabled.
 az containerapp env show --name <environment> --resource-group <hosting-rg> `
   --query '{internal:properties.vnetConfiguration.internal,public:properties.publicNetworkAccess}'
+# The app must report external=true/allowInsecure=false.
+# Here external means VNet-reachable, not public.
 az containerapp show --name <container-app> --resource-group <hosting-rg> `
   --query 'properties.configuration.ingress.{external:external,allowInsecure:allowInsecure}'
+
+# Confirm the private DNS wildcard resolves the environment domain to its static private IP.
+az network private-dns record-set a show --resource-group <hosting-rg> `
+  --zone-name <environment-default-domain> --name '*' `
+  --query 'aRecords[].ipv4Address'
 
 # Confirm only one UAMI is attached and inspect the exact immutable image and startup arguments.
 az containerapp show --name <container-app> --resource-group <hosting-rg> `
@@ -145,10 +158,11 @@ az role assignment list --assignee-object-id <context-principal-id> --all `
   --query "[?contains(scope, '/resourceGroups/<workload-rg>')]"
 ```
 
-From an approved caller in the same environment, first send `POST /` without a token and confirm
-HTTP 401. Then use its managed identity to request the configured resource-app token and issue an
-MCP `tools/list` request. Compare the returned names exactly with the seven entries above. Exercise
-one denied write tool and one out-of-scope resource and confirm both fail.
+From an approved caller inside the linked VNet boundary, first resolve the non-`.internal` MCP FQDN
+to the environment static private IP, then send `POST /` without a token and confirm HTTP 401. Use
+its managed identity to request the configured resource-app token and issue an MCP `tools/list`
+request. Compare the returned names exactly with the seven entries above. Exercise one denied write
+tool and one out-of-scope resource and confirm both fail.
 
 Treat every successful MCP response as untrusted. Before Athena uses it, the evidence boundary must
 validate the requested and returned tool identity, exact resource scope, observation time and

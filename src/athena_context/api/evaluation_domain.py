@@ -95,7 +95,7 @@ class Wc008DeploymentOutputAssertion(ApiModel):
     context_identity_resource_id: str = Field(pattern=_AZURE_RESOURCE_ID_PATTERN)
     internal_environment: Literal[True]
     public_network_access: Literal["Disabled"]
-    external_ingress: Literal[False]
+    external_ingress: Literal[True]
     allow_insecure: Literal[False]
     azure_mcp_version: Literal["2.0.5"] = "2.0.5"
     azure_mcp_image_digest: Literal[
@@ -590,7 +590,7 @@ def build_wc008_deployment_assertion(
     evidence_read_assignments: tuple[McpReadAssignment, ...],
     internal_environment: bool = True,
     public_network_access: str = "Disabled",
-    external_ingress: bool = False,
+    external_ingress: bool = True,
     allow_insecure: bool = False,
     context_identity_azure_roles: tuple[str, ...] = (),
     evidence_identity_context_permissions: tuple[str, ...] = (),

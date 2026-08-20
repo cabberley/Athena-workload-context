@@ -38,6 +38,9 @@ param infrastructureSubnetPrefix string = '10.42.0.0/23'
 @description('Dedicated subnet for private endpoints used by the WC-013 acceptance dependencies.')
 param privateEndpointSubnetPrefix string = '10.42.2.0/24'
 
+@description('Private DNS VNet-link name. Override only to adopt an existing reviewed link.')
+param containerAppsPrivateDnsVnetLinkName string = 'container-apps-vnet-link'
+
 @description('Optional workload resource-group scopes. Empty means the MCP identity gets no workload access.')
 param workloadReadScopes array = []
 
@@ -137,6 +140,17 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2026-01-01' = {
   }
 }
 
+module containerAppsPrivateDns 'modules/container-apps-private-dns.bicep' = {
+  name: 'private-container-apps-dns'
+  params: {
+    virtualNetworkLinkName: containerAppsPrivateDnsVnetLinkName
+    environmentDefaultDomain: managedEnvironment.properties.defaultDomain
+    environmentStaticIp: managedEnvironment.properties.staticIp
+    virtualNetworkResourceId: virtualNetwork.id
+    tags: resourceTags
+  }
+}
+
 module containerApp 'modules/container-app.bicep' = {
   name: 'private-read-only-azure-mcp'
   params: {
@@ -180,7 +194,7 @@ output azureMcpContainerAppResourceId string = containerApp.outputs.containerApp
 @description('Resource ID of the internal Container Apps environment for approved callers.')
 output managedEnvironmentResourceId string = managedEnvironment.id
 
-@description('Environment-local MCP endpoint. It is not reachable through public ingress.')
+@description('VNet-scoped MCP endpoint. The internal environment has no public network endpoint.')
 output azureMcpInternalEndpoint string = containerApp.outputs.internalEndpoint
 
 @description('Dedicated identity used only by the Azure MCP evidence plane.')

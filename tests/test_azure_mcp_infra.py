@@ -7,10 +7,16 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MCP_ROOT = ROOT / "infra" / "azure-mcp"
+WC013_MAIN = (
+    ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
+).read_text(encoding="utf-8")
 MAIN = (MCP_ROOT / "main.bicep").read_text(encoding="utf-8")
 CONTAINER_APP = (MCP_ROOT / "modules" / "container-app.bicep").read_text(
     encoding="utf-8"
 )
+PRIVATE_DNS = (
+    MCP_ROOT / "modules" / "container-apps-private-dns.bicep"
+).read_text(encoding="utf-8")
 WORKLOAD_RBAC = (MCP_ROOT / "modules" / "workload-read-rbac.bicep").read_text(
     encoding="utf-8"
 )
@@ -38,12 +44,47 @@ def _quoted_values_in_variable(source: str, variable: str) -> tuple[str, ...]:
     return tuple(re.findall(r"'([^']+)'", match.group("body")))
 
 
-def test_ingress_and_environment_are_private() -> None:
+def test_ingress_is_vnet_scoped_without_public_environment_exposure() -> None:
     assert "publicNetworkAccess: 'Disabled'" in MAIN
     assert "internal: true" in MAIN
-    assert "external: false" in CONTAINER_APP
+    assert "external: true" in CONTAINER_APP
     assert "allowInsecure: false" in CONTAINER_APP
-    assert "external: true" not in CONTAINER_APP
+    assert "external: false" not in CONTAINER_APP
+    assert "modules/container-apps-private-dns.bicep" in MAIN
+    assert (
+        "environmentDefaultDomain: managedEnvironment.properties.defaultDomain"
+        in MAIN
+    )
+    assert "environmentStaticIp: managedEnvironment.properties.staticIp" in MAIN
+    assert "virtualNetworkResourceId: virtualNetwork.id" in MAIN
+    assert (
+        "containerAppsPrivateDnsVnetLinkName: 'wc013-containerapps-link'"
+        in WC013_MAIN
+    )
+
+
+def test_private_dns_maps_container_apps_domain_to_environment_static_ip() -> None:
+    assert (
+        "resource containerAppsPrivateDnsZone "
+        "'Microsoft.Network/privateDnsZones@2024-06-01'"
+        in PRIVATE_DNS
+    )
+    assert "name: environmentDefaultDomain" in PRIVATE_DNS
+    assert (
+        "resource containerAppsPrivateDnsZoneLink "
+        "'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01'"
+        in PRIVATE_DNS
+    )
+    assert "registrationEnabled: false" in PRIVATE_DNS
+    assert "name: virtualNetworkLinkName" in PRIVATE_DNS
+    assert "id: virtualNetworkResourceId" in PRIVATE_DNS
+    assert (
+        "resource containerAppsWildcardRecord "
+        "'Microsoft.Network/privateDnsZones/A@2024-06-01'"
+        in PRIVATE_DNS
+    )
+    assert "name: '*'" in PRIVATE_DNS
+    assert "ipv4Address: environmentStaticIp" in PRIVATE_DNS
 
 
 def test_http_endpoint_uses_pinned_server_root_route() -> None:
