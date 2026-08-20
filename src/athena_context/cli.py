@@ -7,12 +7,22 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from athena_context import __version__
+from athena_context.binding.verification import TrustedSnapshotVerifier
+from athena_context.contracts.presentation import ArgusPresentationPhase
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
     prepare_wc013_live_acceptance,
     render_wc013_configuration,
     run_wc013_live_acceptance,
     wc013_configuration_template,
+)
+from athena_context.presentation import (
+    PresentationSigner,
+    TrustedDemoEvaluationVerifier,
+)
+from athena_context.presentation_export import (
+    PresentationExportError,
+    run_argus_presentation_export,
 )
 from athena_context.reference_command import (
     GoldenProofRunner,
@@ -65,6 +75,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="create one new read-only canonical EvidenceSnapshot file",
     )
+    presentation_parser = subparsers.add_parser(
+        "argus-presentation-export",
+        help="export a verified synthetic-safe ARGUS presentation",
+    )
+    presentation_parser.add_argument("--result", required=True, type=Path)
+    presentation_parser.add_argument("--receipt", required=True, type=Path)
+    presentation_parser.add_argument(
+        "--phase",
+        required=True,
+        choices=("baseline", "faulted", "recovered"),
+    )
+    presentation_parser.add_argument("--synthetic-key-id", required=True)
+    presentation_parser.add_argument("--output", required=True, type=Path)
+    presentation_parser.add_argument(
+        "--attestation-output",
+        required=True,
+        type=Path,
+    )
     return parser
 
 
@@ -72,6 +100,9 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     golden_runner: GoldenProofRunner | None = None,
+    presentation_result_verifier: TrustedDemoEvaluationVerifier | None = None,
+    presentation_snapshot_verifier: TrustedSnapshotVerifier | None = None,
+    presentation_signer: PresentationSigner | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
@@ -123,8 +154,38 @@ def main(
             if accepted.snapshot_path is not None:
                 output.write(f"immutable snapshot file: {accepted.snapshot_path}\n")
             return 0
+        if args.command == "argus-presentation-export":
+            if (
+                presentation_result_verifier is None
+                or presentation_snapshot_verifier is None
+                or presentation_signer is None
+            ):
+                raise PresentationExportError(
+                    "trusted result verifier, snapshot verifier, and signer are required"
+                )
+            exported = run_argus_presentation_export(
+                result_path=args.result,
+                receipt_path=args.receipt,
+                phase=cast(ArgusPresentationPhase, args.phase),
+                synthetic_key_id=args.synthetic_key_id,
+                payload_path=args.output,
+                attestation_path=args.attestation_output,
+                result_verifier=presentation_result_verifier,
+                snapshot_verifier=presentation_snapshot_verifier,
+                signer=presentation_signer,
+            )
+            output.write(
+                "ARGUS presentation export passed\n"
+                f"payload: {exported.payload_path}\n"
+                f"attestation: {exported.attestation_path}\n"
+                f"result digest: {exported.payload.athena.result_digest}\n"
+            )
+            return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
+        return 1
+    except PresentationExportError as exc:
+        errors.write(f"ARGUS presentation export failed: {exc}\n")
         return 1
     return 0
 
