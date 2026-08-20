@@ -17,8 +17,10 @@ from athena_context.live_acceptance import (
     wc013_configuration_template,
 )
 from athena_context.operational_phase_runner import (
+    CompletionIndexWriterPort,
     CreateOnlyArtifactWriterPort,
     OperationalPhaseRunnerError,
+    VersionPinnedPhaseInputReaderPort,
     Wc013PhaseRunner,
     run_operational_phase,
 )
@@ -104,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run one reviewed non-mutating operational demo phase",
     )
     phase_parser.add_argument("--bundle", required=True, type=Path)
+    phase_parser.add_argument("--inputs", required=True, type=Path)
     phase_parser.add_argument("--phase", required=True)
     return parser
 
@@ -116,6 +119,8 @@ def main(
     presentation_snapshot_verifier: TrustedSnapshotVerifier | None = None,
     presentation_signer: PresentationSigner | None = None,
     phase_artifact_writer: CreateOnlyArtifactWriterPort | None = None,
+    phase_input_reader: VersionPinnedPhaseInputReaderPort | None = None,
+    phase_completion_index_writer: CompletionIndexWriterPort | None = None,
     phase_result_verifier: TrustedDemoEvaluationVerifier | None = None,
     phase_snapshot_verifier: TrustedSnapshotVerifier | None = None,
     phase_signer: PresentationSigner | None = None,
@@ -201,8 +206,11 @@ def main(
         if args.command == "operational-phase-runner":
             completed = run_operational_phase(
                 bundle_path=args.bundle,
+                inputs_path=args.inputs,
                 phase_selector=args.phase,
                 artifact_writer=phase_artifact_writer,
+                input_reader=phase_input_reader,
+                completion_index_writer=phase_completion_index_writer,
                 result_verifier=phase_result_verifier,
                 snapshot_verifier=phase_snapshot_verifier,
                 signer=phase_signer,
@@ -210,11 +218,13 @@ def main(
             )
             output.write(
                 "operational phase runner passed\n"
+                f"run: {completed.run_id}\n"
                 f"phase: {completed.phase}\n"
                 f"snapshot: {completed.snapshot_id}\n"
                 f"result digest: {completed.result_digest}\n"
                 f"presentation digest: {completed.presentation_digest}\n"
-                f"receipt digest: {completed.receipt_digest}\n"
+                f"completion index digest: "
+                f"{completed.completion_index_digest}\n"
             )
             return 0
     except Wc013LiveAcceptanceError as exc:

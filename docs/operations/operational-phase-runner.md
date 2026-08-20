@@ -1,27 +1,15 @@
 # Operational phase runner
 
-The operational phase runner is the non-mutating Job prerequisite for the
-`athena-web-node-fault.v1` baseline, faulted, and recovered evidence sequence. It runs exactly one
-reviewed WC-013 configuration, consumes the separately produced fault/status/reset receipt, and
-writes a complete immutable artifact set. It does **not** inject or reset the fault.
+The operational phase runner executes one reviewed WC-013 baseline, faulted, or recovered phase.
+It reads only the receipt and prior completion information available for that phase. It does not
+inject, reset, deploy, or otherwise mutate an Azure resource.
 
-See [ADR 0007](../adr/0007-operational-phase-runner-boundary.md).
+See [ADR 0008](../adr/0008-progressive-operational-phase-completion-chain.md).
 
-## Responsibility boundary
+## Delivery bundle v2
 
-The external operator workflow is responsible for:
-
-1. confirming the healthy baseline and producing a `status` receipt;
-2. injecting the reviewed web-node power-state fault and producing an `inject` receipt; and
-3. resetting the same node and producing a `reset` receipt.
-
-The phase runner only reads one of those receipts after it has been placed in the reviewed delivery
-bundle. It has no interface for start, stop, restart, deallocate, deployment, or reset operations.
-
-## Reviewed delivery layout
-
-Use a single read-only delivery root. Paths in the bundle are portable relative paths and may not
-escape this root.
+The read-only delivery root contains the three reviewed WC-013 plans. Future receipt files are not
+part of the bundle and do not need to exist for baseline.
 
 ```text
 delivery/
@@ -30,154 +18,197 @@ delivery/
     baseline.json
     faulted.json
     recovered.json
-  receipts/
-    baseline.json
-    faulted.json
-    recovered.json
-  ...the WC-007, WC-008, and public-key files referenced by each WC-013 plan...
+  ...WC-007, WC-008, and public-key files referenced by the plans...
 ```
 
-`operational-phase-bundle.json` uses
-`schemaVersion = athena.operationalPhaseDeliveryBundle.v1` and contains:
+The bundle uses `athena.operationalPhaseDeliveryBundle.v2`:
 
 ```json
 {
-  "schemaVersion": "athena.operationalPhaseDeliveryBundle.v1",
+  "schemaVersion": "athena.operationalPhaseDeliveryBundle.v2",
   "scenarioId": "athena-web-node-fault.v1",
+  "runId": "synthetic-run-001",
   "allowedPhases": ["baseline", "faulted", "recovered"],
   "syntheticPresentationKeyId": "synthetic-key://athena-argus-demo/rs256-v1",
   "configurations": {
     "baseline": {
       "phase": "baseline",
       "wc013ConfigurationFile": "configs/baseline.json",
-      "wc013ConfigurationDigest": "sha256:<canonical-plan-digest>",
-      "faultReceiptFile": "receipts/baseline.json",
-      "faultReceiptDigest": "sha256:<canonical-receipt-digest>",
+      "wc013ConfigurationDigest": "sha256:<digest>",
       "attemptId": "attempt-<12-lowercase-hex>",
       "snapshotId": "snap-<12-lowercase-hex>",
-      "idempotencyKey": "<unique-reviewed-value>"
+      "idempotencyKey": "<unique-value>"
     },
     "faulted": {
       "phase": "faulted",
       "wc013ConfigurationFile": "configs/faulted.json",
-      "wc013ConfigurationDigest": "sha256:<canonical-plan-digest>",
-      "faultReceiptFile": "receipts/faulted.json",
-      "faultReceiptDigest": "sha256:<canonical-receipt-digest>",
+      "wc013ConfigurationDigest": "sha256:<digest>",
       "attemptId": "attempt-<different-12-lowercase-hex>",
       "snapshotId": "snap-<different-12-lowercase-hex>",
-      "idempotencyKey": "<different-reviewed-value>"
+      "idempotencyKey": "<different-value>"
     },
     "recovered": {
       "phase": "recovered",
       "wc013ConfigurationFile": "configs/recovered.json",
-      "wc013ConfigurationDigest": "sha256:<canonical-plan-digest>",
-      "faultReceiptFile": "receipts/recovered.json",
-      "faultReceiptDigest": "sha256:<canonical-receipt-digest>",
+      "wc013ConfigurationDigest": "sha256:<digest>",
       "attemptId": "attempt-<different-12-lowercase-hex>",
       "snapshotId": "snap-<different-12-lowercase-hex>",
-      "idempotencyKey": "<different-reviewed-value>"
+      "idempotencyKey": "<different-value>"
     }
   },
   "bundleDigest": "sha256:<canonical-bundle-digest>"
 }
 ```
 
-Build and validate the bundle through `OperationalPhaseConfiguration`,
-`OperationalPhaseConfigurations`, and `build_operational_phase_delivery_bundle`; do not calculate
-digests with pretty-printed JSON bytes or hand-edit the final digest.
+Build it through `build_operational_phase_delivery_bundle`. Do not hand-edit the final digest.
+Use a new `runId`, attempt ID, snapshot ID, and idempotency key after any post-reservation failure.
 
-Each phase plan must retain all WC-013 prerequisites described in
-[WC-013 live acceptance](wc013-live-acceptance.md). The bundle adds another review layer; it does
-not replace WC-007 authority, WC-008 deployment approval, Key Vault trust, or replay-table
-protection.
+## Progressive input documents
 
-All three receipts must describe the same fault-run ID, resource group, prefix, target VM, exact VM
-resource ID, and eligible web-node set. Their timestamps must be ordered baseline, faulted,
-recovered. The recovered receipt's before-state must equal the faulted receipt's confirmed
-after-state, so a recovery cannot be signed for a different node or unrelated fault.
+Each invocation receives `athena.operationalPhaseInputs.v1`. A reference is trusted only as the
+combination of its synthetic blob name, immutable version, and exact content hash.
 
-## Job composition
+Receipt names are frozen:
 
-The Job composition root must inject:
+```text
+runs/<runId>/inputs/baseline/fault-receipt.json
+runs/<runId>/inputs/faulted/fault-receipt.json
+runs/<runId>/inputs/recovered/fault-receipt.json
+```
 
-- a `TrustedDemoEvaluationVerifier` for the complete WC-013 result;
-- a `TrustedSnapshotVerifier` for the exact `EvidenceSnapshot`;
-- the existing `KeyVaultRsaSigner` through the `PresentationSigner` interface; and
-- a `CreateOnlyArtifactWriterPort` whose `create_only` implementation preflights and creates the
-  full five-artifact set without overwriting an existing name.
+### Baseline
 
-The standalone command intentionally fails closed when those ports are absent. No storage adapter
-or Key Vault credential is accepted from command-line arguments.
+Baseline requires only the version-pinned `status` receipt:
 
-Invoke one allowlisted phase:
+```json
+{
+  "schemaVersion": "athena.operationalPhaseInputs.v1",
+  "runId": "synthetic-run-001",
+  "bundleDigest": "sha256:<bundle-digest>",
+  "phase": "baseline",
+  "receipt": {
+    "name": "runs/synthetic-run-001/inputs/baseline/fault-receipt.json",
+    "version": "<immutable-version>",
+    "contentDigest": "sha256:<exact-byte-hash>"
+  }
+}
+```
+
+No inject receipt, reset receipt, prior index, or future phase configuration file is read.
+
+### Faulted
+
+Faulted requires the inject receipt and normally the baseline completion index:
+
+```json
+{
+  "schemaVersion": "athena.operationalPhaseInputs.v1",
+  "runId": "synthetic-run-001",
+  "bundleDigest": "sha256:<bundle-digest>",
+  "phase": "faulted",
+  "receipt": {
+    "name": "runs/synthetic-run-001/inputs/faulted/fault-receipt.json",
+    "version": "<immutable-version>",
+    "contentDigest": "sha256:<exact-byte-hash>"
+  },
+  "previousPhaseIndex": {
+    "name": "runs/synthetic-run-001/baseline/phase-completion-index.json",
+    "version": "<immutable-version>",
+    "contentDigest": "sha256:<exact-byte-hash>"
+  }
+}
+```
+
+For an independently reviewed fault start, omit `previousPhaseIndex` and supply exactly one
+`lineageReferenceDigest` matching the inject receipt's canonical lineage.
+
+### Recovered
+
+Recovered requires the reset receipt and the exact faulted completion index:
+
+```json
+{
+  "schemaVersion": "athena.operationalPhaseInputs.v1",
+  "runId": "synthetic-run-001",
+  "bundleDigest": "sha256:<bundle-digest>",
+  "phase": "recovered",
+  "receipt": {
+    "name": "runs/synthetic-run-001/inputs/recovered/fault-receipt.json",
+    "version": "<immutable-version>",
+    "contentDigest": "sha256:<exact-byte-hash>"
+  },
+  "previousPhaseIndex": {
+    "name": "runs/synthetic-run-001/faulted/phase-completion-index.json",
+    "version": "<immutable-version>",
+    "contentDigest": "sha256:<exact-byte-hash>"
+  }
+}
+```
+
+Missing or mismatched prior faulted indexes fail before WC-013 execution.
+
+## Production composition
+
+The Job composition root injects:
+
+- `VersionPinnedPhaseInputReaderPort` to read exact receipt and prior-index versions;
+- `CreateOnlyArtifactWriterPort` to create the four payload artifacts and return each immutable
+  version/hash;
+- `CompletionIndexWriterPort` to create the completion index after the payload write;
+- trusted full-result and snapshot verifiers; and
+- the existing Key Vault-compatible `PresentationSigner`.
+
+No connection string, account key, private key, receipt payload, or arbitrary storage path is
+accepted on the CLI.
 
 ```powershell
 athena-context operational-phase-runner `
   --bundle $configurationRoot\operational-phase-bundle.json `
+  --inputs $configurationRoot\baseline-inputs.json `
   --phase baseline
 ```
 
-Repeat only after the external workflow has completed the next reviewed action and delivered its
-receipt:
+The standalone command fails closed until all production ports are injected.
 
-```powershell
-athena-context operational-phase-runner `
-  --bundle $configurationRoot\operational-phase-bundle.json `
-  --phase faulted
+## Run-scoped outputs and completion marker
 
-athena-context operational-phase-runner `
-  --bundle $configurationRoot\operational-phase-bundle.json `
-  --phase recovered
-```
-
-Do not retry a post-reservation WC-013 failure with the same phase configuration. Render and review
-a replacement configuration with new attempt, snapshot, and idempotency values, then rebuild the
-bundle digest.
-
-## Artifact set
-
-For `<phase>` equal to `baseline`, `faulted`, or `recovered`, the writer receives:
+The create-only namespace is:
 
 ```text
-operational-demo/<phase>/demo-evaluation-result.json
-operational-demo/<phase>/evidence-snapshot.json
-operational-demo/<phase>/argus-presentation.json
-operational-demo/<phase>/presentation-attestation.json
-operational-demo/<phase>/phase-receipt.json
+runs/<runId>/<phase>/demo-evaluation-result.json
+runs/<runId>/<phase>/evidence-snapshot.json
+runs/<runId>/<phase>/argus-presentation.json
+runs/<runId>/<phase>/presentation-attestation.json
+runs/<runId>/<phase>/phase-completion-index.json
 ```
 
-Every request includes the SHA-256 digest of the exact UTF-8 bytes. The compact phase receipt binds
-the reviewed inputs to the authoritative result/snapshot digests, presentation digest, and first
-four artifact content digests. The runner reports the receipt file's content digest after the
-create-only call succeeds.
+The first four objects are created together. Their exact names, immutable versions, and byte hashes
+are then placed in `athena.operationalPhaseCompletionIndex.v1`. The index is written last and also
+contains the phase, attempt/snapshot identifiers, prior index digest, lineage digest, receipt
+version/hash, state transition labels, and authoritative result/snapshot/presentation digests.
 
-## Expected logging
-
-Success output contains only:
-
-- the allowlisted phase;
-- the snapshot identifier;
-- result digest;
-- presentation digest; and
-- receipt content digest.
-
-No result JSON, evidence record, Azure resource ID, resource name, receipt payload, exception
-payload, token claim, or signature is written to stdout or stderr.
+The index contains no raw receipt/evidence/presentation payload, Azure ID, resource group, VM name,
+signature, or token claim. Downstream automation treats only a valid version-pinned index as phase
+completion.
 
 ## Fail-closed checks
 
-The Job must fail without calling the writer when:
+The phase fails before payload creation when:
 
-- the selector is not one of the three allowlisted phases;
-- the bundle, WC-013 plan, or fault receipt digest changes;
-- a selected file is missing or escapes the delivery root;
-- any unselected phase file is missing, invalid, or no longer digest-bound;
-- attempt, snapshot, or idempotency values do not match the selected plan;
-- replay values are reused across phases;
-- the receipt action does not match `status`, `inject`, or `reset` for the selected phase;
-- the three receipts do not share one target/run lineage and ordered power-state sequence;
-- the selected plan file changes after validation (execution uses the already parsed model);
-- WC-013 writes a direct snapshot output instead of returning in memory;
-- the full result or snapshot verifier rejects the exact object;
-- presentation projection or Key Vault signing fails; or
-- the create-only writer cannot persist the complete artifact set.
+- bundle, phase input, configuration, receipt, or prior-index validation fails;
+- a version or exact byte hash does not match;
+- phase, run, or bundle bindings differ;
+- recovered has no faulted index;
+- previous phase, lineage, chronology, or power-state continuity differs;
+- WC-013 result identifiers differ from the selected plan;
+- trusted result/snapshot verification or signing fails; or
+- any required composition port is missing.
+
+Payload writer failures create no index. Completion-index writer failures leave no completion
+marker; retry requires newly reviewed create-only identities.
+
+## Expected logging
+
+Success output is limited to run ID, phase, snapshot identifier, result digest, presentation
+digest, and completion-index content digest. Port exceptions and payload content are never copied
+to stdout or stderr.
