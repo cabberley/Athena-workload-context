@@ -5,7 +5,7 @@ The operational phase runner is the non-mutating Job prerequisite for the
 reviewed WC-013 configuration, consumes the separately produced fault/status/reset receipt, and
 writes a complete immutable artifact set. It does **not** inject or reset the fault.
 
-See [ADR 0007](../adr/0007-operational-phase-runner-boundary.md).
+See [ADR 0008](../adr/0008-operational-phase-runner-boundary.md).
 
 ## Responsibility boundary
 

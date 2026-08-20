@@ -1,4 +1,4 @@
-# ADR 0006: Add a private create-only operational artifact plane
+# ADR 0007: Add a private create-only operational artifact plane
 
 - **Status:** Proposed
 - **Date:** 2026-08-20

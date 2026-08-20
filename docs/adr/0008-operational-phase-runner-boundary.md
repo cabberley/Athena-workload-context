@@ -1,4 +1,4 @@
-# ADR 0007: Run reviewed operational phases through a non-mutating job boundary
+# ADR 0008: Run reviewed operational phases through a non-mutating job boundary
 
 - **Status:** Proposed
 - **Date:** 2026-08-20
