@@ -106,6 +106,13 @@ result, snapshot attestation, collector identity signature, scope, freshness, an
 pass. A failed run creates no snapshot. Reusing either the attempt ID or request digest is rejected
 durably; an operator must issue new reviewed IDs after a failed post-reservation run.
 
+The three-phase operational demonstration reuses this execution path without the direct
+`--snapshot-output` file. Its
+[operational phase runner](operational-phase-runner.md) selects one digest-pinned baseline,
+faulted, or recovered plan, verifies the returned result and snapshot again, then sends the full
+artifact set through an injected create-only writer. Fault injection and reset remain outside
+Athena and are represented only by separately delivered receipts.
+
 ## Exact runtime environment variables
 
 Generated `wc013-runtime.ps1` sets:

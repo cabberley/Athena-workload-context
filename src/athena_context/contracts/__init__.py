@@ -13,6 +13,10 @@ from athena_context.contracts.manifest import *  # noqa: F403
 from athena_context.contracts.manifest import __all__ as _manifest_all
 from athena_context.contracts.models import *  # noqa: F403
 from athena_context.contracts.models import __all__ as _model_all
+from athena_context.contracts.operational_phase import *  # noqa: F403
+from athena_context.contracts.operational_phase import (
+    __all__ as _operational_phase_all,
+)
 from athena_context.contracts.presentation import *  # noqa: F403
 from athena_context.contracts.presentation import __all__ as _presentation_all
 
@@ -22,6 +26,7 @@ WorkloadManifest = CanonicalWorkloadManifest  # type: ignore[misc,assignment]  #
 __all__ = [
     *list(_model_all),
     *list(_manifest_all),
+    *list(_operational_phase_all),
     *list(_presentation_all),
     "AthenaValidationError",
     "NormalizationCollisionError",

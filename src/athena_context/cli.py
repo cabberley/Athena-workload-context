@@ -16,6 +16,12 @@ from athena_context.live_acceptance import (
     run_wc013_live_acceptance,
     wc013_configuration_template,
 )
+from athena_context.operational_phase_runner import (
+    CreateOnlyArtifactWriterPort,
+    OperationalPhaseRunnerError,
+    Wc013PhaseRunner,
+    run_operational_phase,
+)
 from athena_context.presentation import (
     PresentationSigner,
     TrustedDemoEvaluationVerifier,
@@ -93,6 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
     )
+    phase_parser = subparsers.add_parser(
+        "operational-phase-runner",
+        help="run one reviewed non-mutating operational demo phase",
+    )
+    phase_parser.add_argument("--bundle", required=True, type=Path)
+    phase_parser.add_argument("--phase", required=True)
     return parser
 
 
@@ -103,6 +115,11 @@ def main(
     presentation_result_verifier: TrustedDemoEvaluationVerifier | None = None,
     presentation_snapshot_verifier: TrustedSnapshotVerifier | None = None,
     presentation_signer: PresentationSigner | None = None,
+    phase_artifact_writer: CreateOnlyArtifactWriterPort | None = None,
+    phase_result_verifier: TrustedDemoEvaluationVerifier | None = None,
+    phase_snapshot_verifier: TrustedSnapshotVerifier | None = None,
+    phase_signer: PresentationSigner | None = None,
+    phase_wc013_runner: Wc013PhaseRunner | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
@@ -181,11 +198,33 @@ def main(
                 f"result digest: {exported.payload.athena.result_digest}\n"
             )
             return 0
+        if args.command == "operational-phase-runner":
+            completed = run_operational_phase(
+                bundle_path=args.bundle,
+                phase_selector=args.phase,
+                artifact_writer=phase_artifact_writer,
+                result_verifier=phase_result_verifier,
+                snapshot_verifier=phase_snapshot_verifier,
+                signer=phase_signer,
+                wc013_runner=phase_wc013_runner,
+            )
+            output.write(
+                "operational phase runner passed\n"
+                f"phase: {completed.phase}\n"
+                f"snapshot: {completed.snapshot_id}\n"
+                f"result digest: {completed.result_digest}\n"
+                f"presentation digest: {completed.presentation_digest}\n"
+                f"receipt digest: {completed.receipt_digest}\n"
+            )
+            return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
     except PresentationExportError as exc:
         errors.write(f"ARGUS presentation export failed: {exc}\n")
+        return 1
+    except OperationalPhaseRunnerError as exc:
+        errors.write(f"operational phase runner failed: {exc}\n")
         return 1
     return 0
 
