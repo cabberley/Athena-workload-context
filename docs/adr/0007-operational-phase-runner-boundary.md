@@ -1,9 +1,13 @@
 # ADR 0007: Run reviewed operational phases through a non-mutating job boundary
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR 0008](0008-progressive-operational-phase-completion-chain.md)
 - **Date:** 2026-08-20
 
 ## Context
+
+> This ADR records the original all-receipts-up-front design. ADR 0008 replaces that delivery
+> model with progressive version-pinned inputs so baseline does not depend on future fault/reset
+> receipts.
 
 The `athena-web-node-fault.v1` demonstration needs three independently reviewable WC-013
 evaluations: baseline, faulted, and recovered. Each evaluation consumes different observed Azure
