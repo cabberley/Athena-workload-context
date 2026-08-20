@@ -68,7 +68,9 @@ Use a new `runId`, attempt ID, snapshot ID, and idempotency key after any post-r
 Each invocation receives `athena.operationalPhaseInputs.v1`. A reference is trusted only as the
 combination of its synthetic blob name, immutable version, and exact content hash.
 
-Receipt names are frozen:
+Receipt names are frozen. The trusted workload controller must create these exact immutable
+`athena.demoFaultRun.v1` Blobs before the matching phase Job starts; the phase Job only reads the
+exact name, version, and hash and still does not mutate workload:
 
 ```text
 runs/<runId>/inputs/baseline/fault-receipt.json
@@ -161,7 +163,10 @@ wrapper:
 
 The standalone `operational-phase-runner` command still fails closed until all ports are injected.
 The production job wrapper accepts no connection string, account key, private key, raw receipt
-payload, alternate storage path, or shell command text.
+payload, alternate storage path, or shell command text. The receipt Blob itself is created earlier
+by the workload-owned controller through the separate container-scoped
+`workloadReceiptWriterObjectIds` capability; the Athena Job only reads the exact receipt reference
+that controller produced.
 
 Each deployed phase Job fixes its reviewed phase, bundle path, local input path, local handoff
 path, and artifact container:

@@ -22,7 +22,14 @@ param replayTableName = 'Wc013Replay'
 param replayPartitionKey = 'wc013-live-synthetic'
 param artifactContainerName = 'operational-artifacts'
 param artifactRetentionDays = 30
+
+// Demo jumpbox/operator verification reader for exact version-pinned artifact reads.
 param operatorArtifactReaderObjectIds = [
+  '51425b07-8512-4c49-a763-23a09c347f0b'
+]
+
+// The same governed jumpbox principal may also create exact run-scoped receipts through the workload-owned controller.
+param workloadReceiptWriterObjectIds = [
   '51425b07-8512-4c49-a763-23a09c347f0b'
 ]
 

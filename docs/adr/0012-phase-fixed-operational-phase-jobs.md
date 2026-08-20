@@ -15,7 +15,11 @@ The phase inputs are partly dynamic because exact receipt and completion-index B
 not known until execution time. The deployed Job templates therefore pin reviewed defaults for the
 command, selected phase, bundle path, and artifact destination. Azure Container Apps start-time
 overrides replace the full execution template, so those defaults are not a platform-enforced
-immutability boundary by themselves.
+immutability boundary by themselves. Before a phase Job starts, the workload-owned controller
+invoked by the external operator must also create the exact immutable `athena.demoFaultRun.v1`
+receipt blob at `runs/<runId>/inputs/<phase>/fault-receipt.json`. Azure RBAC cannot narrow a
+built-in Blob data role to that Blob prefix, so strict create-only semantics must remain enforced
+in the trusted controller contract and writer port rather than in ARM scope alone.
 
 ## Decision
 
@@ -61,10 +65,15 @@ The Job also writes the governed handoff file and may emit one
 external phase-job controller can retrieve the exact completion-index reference from the specific
 execution it started.
 
-Change the deployment parameter from one `operatorArtifactReaderObjectId` to a bounded
-`operatorArtifactReaderObjectIds` array. Grant each object ID `Storage Blob Data Reader` only at
-the artifact-container scope. The external operator configuration still uses the corresponding
-managed-identity client ID for token acquisition.
+Keep the existing bounded `operatorArtifactReaderObjectIds` array. Grant each object ID
+`Storage Blob Data Reader` only at the artifact-container scope so the external operator can
+verify exact artifact versions. Add a separate bounded `workloadReceiptWriterObjectIds` array.
+Grant each object ID `Storage Blob Data Contributor` only at that same artifact-container scope so
+the trusted workload-owned controller can create the exact phase receipt Blob before the Job reads
+it. Azure RBAC cannot scope a built-in Blob role to `runs/<runId>/inputs/<phase>/`, so the
+controller must enforce the exact `athena.demoFaultRun.v1` JSON name, create-only
+`If-None-Match: *`, and no-overwrite semantics in application code. The external operator
+configuration still uses the corresponding managed-identity client ID for token acquisition.
 
 ## Consequences
 
@@ -78,7 +87,10 @@ managed-identity client ID for token acquisition.
   bounded exact-reference environment variables.
 - Bicep defaults reduce accidental retargeting and provide an auditable expected template; narrow
   start RBAC and controller-side template validation enforce the execution boundary.
-- Athena still performs no workload mutation. Inject and reset remain outside Athena.
+- Athena phase Jobs still perform no workload mutation; they read exact receipt references only.
+  Inject and reset remain outside Athena.
+- The same governed principal may appear in both arrays for the demo, but exact-version read
+  verification and receipt creation remain distinct reviewed capabilities.
 - The same reviewed delivery image must now carry the operational phase bundle beneath the copied
   `wc013-live/` tree.
 - Exact-version Blob reads and create-only Blob writes remain scoped to the one artifact container.
@@ -110,5 +122,5 @@ Deterministic validation covers:
 - phase-input environment parsing and fail-closed behavior;
 - production bootstrap wiring of Blob adapters, signer, runtime environment, and handoff output;
 - exactly three phase-specific Bicep Jobs with direct reviewed defaults and no mutation verbs;
-- operator Reader RBAC at artifact-container scope from the bounded object-ID array; and
+- operator Reader RBAC and workload receipt-writer RBAC at artifact-container scope from the bounded object-ID arrays; and
 - targeted pytest, ruff, mypy, Bicep build, and Bicep lint without deployment.

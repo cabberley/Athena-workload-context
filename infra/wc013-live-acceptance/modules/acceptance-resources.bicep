@@ -71,6 +71,10 @@ param artifactRetentionDays int
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
+@description('Object IDs of the separate workload-controller managed identities that create exact run-scoped fault receipts.')
+@maxLength(32)
+param workloadReceiptWriterObjectIds array = []
+
 @description('Exact non-secret WC-007 authority digest emitted by the configuration renderer.')
 param wc007PinnedAuthorityDigest string
 
@@ -307,6 +311,26 @@ resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@20
     replayStorage
   ]
 }
+
+resource workloadReceiptBlobDataContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for workloadReceiptWriterObjectId in workloadReceiptWriterObjectIds: {
+  name: guid(
+    artifactContainer.id,
+    workloadReceiptWriterObjectId,
+    storageBlobDataContributorRoleDefinitionId
+  )
+  scope: artifactContainer
+  properties: {
+    principalId: workloadReceiptWriterObjectId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}]
 
 resource operatorArtifactBlobDataReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds: {
   name: guid(

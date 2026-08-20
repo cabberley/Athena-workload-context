@@ -170,9 +170,15 @@ identity only so the in-process adapter can acquire the separate collector token
 role is scoped to the one RSA key, `Storage Table Data Contributor` is scoped to the one replay
 table, and `Storage Blob Data Contributor` is scoped to the one immutable artifact container.
 The separately supplied `operatorArtifactReaderObjectIds` array receives `Storage Blob Data Reader`
-at that same container only. Those Bicep values are Entra object IDs for RBAC; the external
-operator configuration still uses the corresponding managed-identity client ID when it requests
-tokens. Shared keys, connection strings, secrets, and private key export are disabled or unused.
+at that same container only for exact-version operator verification. The separate
+`workloadReceiptWriterObjectIds` array receives `Storage Blob Data Contributor` at that same
+container only so the trusted workload-owned controller can create the exact immutable
+`athena.demoFaultRun.v1` receipt Blobs required by the phase Jobs. Azure RBAC cannot scope that
+built-in Blob role to `runs/<runId>/inputs/<phase>/`, so exact names, JSON-only payloads, and
+create-only `If-None-Match: *` semantics remain enforced by the controller contract and writer
+port. Those Bicep values are Entra object IDs for RBAC; the external operator configuration still
+uses the corresponding managed-identity client ID when it requests tokens. Shared keys,
+connection strings, secrets, and private key export are disabled or unused.
 
 ### Required existing Entra resources
 
@@ -227,13 +233,15 @@ az bicep lint --file infra/wc013-live-acceptance/main.bicep
 ```
 
 Copy `infra/wc013-live-acceptance/main.example.bicepparam` to an operator-owned parameter file.
-It contains only synthetic non-secret values except the current jumpbox/operator object ID already
-placed in `operatorArtifactReaderObjectIds`. Replace or extend that reviewed array as required. Set
-the globally unique Key Vault and Storage account names, exact target demo resource-group scope,
-existing ACR server/resource ID, existing Entra app IDs/audiences, and the runner image digest. For
-the bootstrap deployment, leave the two `wc007PinnedAuthorityDigest` and
-`wc008PinnedAssertionDigest` values as nonmatching placeholders. They prevent an accidental
-execution until the reviewed renderer output is available.
+It contains only synthetic non-secret values except the current jumpbox/operator object ID
+`51425b07-8512-4c49-a763-23a09c347f0b`, intentionally placed in both
+`operatorArtifactReaderObjectIds` and `workloadReceiptWriterObjectIds` for this demo. The Reader
+array is for exact-version verification; the writer array is only for workload-controller receipt
+creation. Replace or extend those reviewed arrays as required. Set the globally unique Key Vault
+and Storage account names, exact target demo resource-group scope, existing ACR server/resource ID,
+existing Entra app IDs/audiences, and the runner image digest. For the bootstrap deployment, leave
+the two `wc007PinnedAuthorityDigest` and `wc008PinnedAssertionDigest` values as nonmatching
+placeholders. They prevent an accidental execution until the reviewed renderer output is available.
 
 ```powershell
 az deployment sub what-if `

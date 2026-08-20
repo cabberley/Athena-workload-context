@@ -24,11 +24,40 @@ def _job_module(source: str, name: str) -> str:
     return match.group(0)
 
 
+def _loop_role_assignment(source: str, name: str) -> str:
+    pattern = (
+        rf"resource {name} 'Microsoft.Authorization/roleAssignments@2022-04-01' = "
+        rf"\[for .*?: \{{(?P<body>.*?)\n\}}\]"
+    )
+    match = re.search(pattern, source, re.DOTALL)
+    assert match is not None
+    return match.group(0)
+
+
+def _example_object_ids(example: str) -> tuple[str, str]:
+    guid_pattern = r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    reader = re.search(
+        rf"param operatorArtifactReaderObjectIds = \[\s*'{guid_pattern}'\s*\]",
+        example,
+        re.DOTALL,
+    )
+    writer = re.search(
+        rf"param workloadReceiptWriterObjectIds = \[\s*'{guid_pattern}'\s*\]",
+        example,
+        re.DOTALL,
+    )
+    assert reader is not None
+    assert writer is not None
+    return reader.group('id'), writer.group('id')
+
+
 def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> None:
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+    compiled = _read("infra/wc013-live-acceptance/main.json")
     foundation = _read("infra/azure-mcp/main.bicep")
     workload_rbac = _read("infra/azure-mcp/modules/workload-read-rbac.bicep")
+    acr_rbac = _read("infra/wc013-live-acceptance/modules/acr-pull-rbac.bicep")
 
     assert "workloadReadScopes: [" in orchestration
     assert "approvedLogWorkspaces: []" in orchestration
@@ -56,11 +85,35 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "storageBlobDataContributorRoleDefinitionId" in resources
     assert "param operatorArtifactReaderObjectIds array" in orchestration
     assert "operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds" in orchestration
-    assert "for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds" in resources
-    assert "principalId: operatorArtifactReaderObjectId" in resources
+    assert "param workloadReceiptWriterObjectIds array = []" in orchestration
+    assert "workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds" in orchestration
+    assert "param workloadReceiptWriterObjectIds array = []" in resources
     assert "storageBlobDataReaderRoleDefinitionId" in resources
     assert "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1" in resources
-    assert resources.count("scope: artifactContainer") == 2
+
+    reader_rbac = _loop_role_assignment(resources, "operatorArtifactBlobDataReaders")
+    assert "scope: artifactContainer" in reader_rbac
+    assert "for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds" in reader_rbac
+    assert "principalId: operatorArtifactReaderObjectId" in reader_rbac
+    assert "storageBlobDataReaderRoleDefinitionId" in reader_rbac
+    assert "storageBlobDataContributorRoleDefinitionId" not in reader_rbac
+
+    writer_rbac = _loop_role_assignment(resources, "workloadReceiptBlobDataContributors")
+    assert "scope: artifactContainer" in writer_rbac
+    assert "for workloadReceiptWriterObjectId in workloadReceiptWriterObjectIds" in writer_rbac
+    assert "principalId: workloadReceiptWriterObjectId" in writer_rbac
+    assert "storageBlobDataContributorRoleDefinitionId" in writer_rbac
+    for forbidden in (
+        "scope: replayTable",
+        "storageTableDataContributorRoleDefinitionId",
+        "storageBlobDataReaderRoleDefinitionId",
+        "roleDefinitionIdOrName: 'Key Vault Crypto User'",
+        "acceptanceIdentityPrincipalId",
+        "evidenceIdentityResourceId",
+    ):
+        assert forbidden not in writer_rbac
+
+    assert resources.count("scope: artifactContainer") == 3
     assert "artifactContainerResourceId" in orchestration
     assert "artifactBlobEndpoint" in orchestration
     assert "artifactContainerName" in orchestration
@@ -73,10 +126,27 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "evidenceIdentityResourceId" in resources
     assert "AZURE_CLIENT_ID" in resources
     assert "operationalPhaseJobNames" in orchestration
+
     example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
-    assert "51425b07-8512-4c49-a763-23a09c347f0b" in example
-    assert "51425b07-8512-4c49-a763-23a09c347f0b" not in orchestration
-    assert "51425b07-8512-4c49-a763-23a09c347f0b" not in resources
+    reader_id, writer_id = _example_object_ids(example)
+    assert reader_id == writer_id
+    assert reader_id not in orchestration
+    assert reader_id not in resources
+    assert reader_id not in compiled
+
+    for forbidden_role in (
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+        "b24988ac-6180-42a0-ab88-20f7382dd24c",
+    ):
+        assert forbidden_role not in orchestration
+        assert forbidden_role not in resources
+        assert forbidden_role not in writer_rbac
+
+    assert "workloadReceiptWriterObjectIds" in compiled
+    assert "workloadReceiptWriterObjectIds" not in foundation
+    assert "workloadReceiptWriterObjectIds" not in workload_rbac
+    assert "workloadReceiptWriterObjectIds" not in acr_rbac
+
     for forbidden in ("passwordSecretRef", "connectionString", "listKeys(", "secrets:"):
         assert forbidden not in resources
 

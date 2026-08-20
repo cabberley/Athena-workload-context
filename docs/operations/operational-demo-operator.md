@@ -93,7 +93,8 @@ The operator reads `athena.operationalDemoOperator.v1`:
 All files are relative to the configuration directory and must stay inside that boundary.
 The `artifactReader.managedIdentityClientId` value is the operator identity client ID used for
 token acquisition; the Bicep deployment parameter uses the corresponding object ID for container-
-scoped Reader RBAC.
+scoped Reader RBAC. That reader identity is distinct from the workload-controller receipt writer
+capability, even when the same governed demo principal is intentionally reviewed into both arrays.
 
 ## Controller output contracts
 
@@ -107,13 +108,20 @@ The workload controller is invoked with fixed verbs:
 <workload-controller> ... reset  --run-id <runId> --scenario-id athena-web-node-fault.v1
 ```
 
-Each verb returns `athena.operationalDemoWorkloadAction.v1` on stdout. That report contains:
+Each verb returns `athena.operationalDemoWorkloadAction.v1` on stdout. Before reporting success
+for a phase, the trusted workload-owned controller must create exactly one immutable
+`athena.demoFaultRun.v1` Blob at `runs/<runId>/inputs/<phase>/fault-receipt.json`. That report
+contains:
 
 - the synthetic run and scenario;
 - the bounded `athena.demoFaultRun.v1` receipt; and
 - the exact version-pinned receipt Blob reference expected by the phase runner.
 
-The operator verifies action, state, chronology, target continuity, and lineage across receipts.
+The controller's managed-identity object ID must be in `workloadReceiptWriterObjectIds`. Azure
+RBAC cannot narrow that built-in Blob Contributor grant to the receipt prefix, so the controller
+contract itself must enforce exact run-scoped names, JSON-only payloads, create-only
+`If-None-Match: *`, and no overwrite/list/delete behavior. The operator verifies action, state,
+chronology, target continuity, and lineage across receipts.
 
 ### Phase-job controller
 

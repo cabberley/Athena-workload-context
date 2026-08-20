@@ -79,6 +79,10 @@ param artifactRetentionDays int
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
+@description('Object IDs of the separate workload-controller managed identities that create exact run-scoped fault receipts.')
+@maxLength(32)
+param workloadReceiptWriterObjectIds array = []
+
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -200,6 +204,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     artifactContainerName: artifactContainerName
     artifactRetentionDays: artifactRetentionDays
     operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
+    workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
