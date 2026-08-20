@@ -39,7 +39,14 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "allowProtectedAppendWritesAll: false" in resources
     assert "scope: artifactContainer" in resources
     assert "storageBlobDataContributorRoleDefinitionId" in resources
+    assert "operatorArtifactReaderObjectId" in orchestration
+    assert "principalId: operatorArtifactReaderObjectId" in resources
+    assert "storageBlobDataReaderRoleDefinitionId" in resources
+    assert "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1" in resources
+    assert resources.count("scope: artifactContainer") == 2
     assert "artifactContainerResourceId" in orchestration
+    assert "artifactBlobEndpoint" in orchestration
+    assert "artifactContainerName" in orchestration
     assert "roleDefinitionIdOrName: 'Key Vault Crypto User'" in resources
     assert "scope: replayTable" in resources
     assert "storageTableDataContributorRoleDefinitionId" in resources

@@ -160,7 +160,9 @@ The job selects the acceptance identity with `AZURE_CLIENT_ID`; it attaches the 
 identity only so the in-process adapter can acquire the separate collector token. The Key Vault
 role is scoped to the one RSA key, `Storage Table Data Contributor` is scoped to the one replay
 table, and `Storage Blob Data Contributor` is scoped to the one immutable artifact container.
-Shared keys, connection strings, secrets, and private key export are disabled or unused.
+The separately supplied operator managed-identity object ID receives `Storage Blob Data Reader` at
+that same container only. Shared keys, connection strings, secrets, and private key export are
+disabled or unused.
 
 ### Required existing Entra resources
 

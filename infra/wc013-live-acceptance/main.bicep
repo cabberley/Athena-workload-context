@@ -75,6 +75,11 @@ param artifactContainerName string = 'operational-artifacts'
 @maxValue(146000)
 param artifactRetentionDays int
 
+@description('Object ID of the separate operator managed identity that reads exact artifact versions.')
+@minLength(36)
+@maxLength(36)
+param operatorArtifactReaderObjectId string
+
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -195,6 +200,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     replayPartitionKey: replayPartitionKey
     artifactContainerName: artifactContainerName
     artifactRetentionDays: artifactRetentionDays
+    operatorArtifactReaderObjectId: operatorArtifactReaderObjectId
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
