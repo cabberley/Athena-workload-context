@@ -19,6 +19,7 @@ from athena_context.contracts import (
     EvidenceReferenceContext,
     EvidenceSnapshot,
     ResolvedManifestProfile,
+    ResourceEvidenceRecord,
     ResourceProofFact,
     SnapshotPublicationRecord,
     canonicalize_manifest_payload,
@@ -245,6 +246,32 @@ def test_public_runner_emits_exact_immutable_release_evidence() -> None:
     assert "| web-zone-distribution | pass | pass | pass |" in rendered
     with pytest.raises(FrozenInstanceError):
         result.snapshot_id = "snap-mutated"  # type: ignore[misc]
+
+
+def test_verified_resource_context_carries_exact_snapshot_operational_state() -> None:
+    bundle, _, evidence, verifier = _verified_production_boundary()
+    states_by_resource = {
+        record.resource_id: record.state
+        for record in bundle.canonical_snapshot.evidence_records
+        if isinstance(record, ResourceEvidenceRecord)
+    }
+
+    assert {
+        fact.resource_id: fact.operational_state
+        for fact in evidence.resources
+    } == states_by_resource
+    verifier(evidence, golden.GOLDEN_PROOF_AS_OF)
+
+    tampered = evidence.model_copy(deep=True)
+    web_fact = next(
+        fact for fact in tampered.resources if fact.role_ref == "web"
+    )
+    web_fact.operational_state = "stopped"
+    with pytest.raises(
+        AthenaValidationError,
+        match="resource proof fact does not match",
+    ):
+        verifier(tampered, golden.GOLDEN_PROOF_AS_OF)
 
 
 def test_versioned_golden_manifest_is_exact_approved_wc002_derivation() -> None:

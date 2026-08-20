@@ -270,6 +270,7 @@ def build_resource_evidence_context(
                     resourceId=record.resource_id,
                     roleRef=role_ref,
                     availabilityZone=record.availability_zone or "unknown",
+                    operationalState=record.state,
                     state="complete",
                     proofSource="observed",
                     evidenceRef=reference,
@@ -329,6 +330,10 @@ def make_resource_snapshot_context_verifier(
             selected is not None
             and fact.state == "complete"
             and fact.proof_source == "observed"
+            and (
+                "operational_state" not in fact.model_fields_set
+                or fact.operational_state == record.state
+            )
             and any(
                 _normalized(candidate.resource_id)
                 == _normalized(record.resource_id)

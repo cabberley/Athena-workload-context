@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from athena_context import (
     evaluate_manifest_profile as evaluate_root_profile,
@@ -27,6 +28,7 @@ from athena_context.contracts.manifest import (
     EvidenceReferenceContext,
     ExceptionManifestRelationship,
     ManifestConstraint,
+    ManifestFinding,
     ManifestObjective,
     ManifestOwner,
     ManifestRiskAcceptance,
@@ -36,6 +38,7 @@ from athena_context.contracts.manifest import (
     ResolvedManifestProfile,
     ResourceProofFact,
     RoleBindingProof,
+    RoleOperationalStateProof,
     canonicalize_manifest_payload,
     resolve_manifest_profile,
 )
@@ -47,6 +50,7 @@ from athena_context.contracts.models import (
     EvidenceItemRef,
     ProducerInfo,
     ResourceGroupScope,
+    ResourceState,
 )
 from athena_context.policy import (
     evaluate_manifest_profile as evaluate_policy_profile,
@@ -698,6 +702,239 @@ def _verify_unit_evidence(
             or binding.selector_result_digest != compute_artifact_digest(selected)
         ):
             raise AthenaValidationError("unit selector binding was not verified")
+
+
+OPERATIONAL_CLAUSE_ID = "web-service-operational-state"
+
+
+def _operational_constraint(
+    profile_id: str,
+    minimum_healthy: int,
+    *,
+    failure_states: tuple[ResourceState, ...] = ("stopped", "deallocated"),
+) -> ManifestConstraint:
+    return ManifestConstraint.model_validate(
+        {
+            "constraintId": OPERATIONAL_CLAUSE_ID,
+            "constraintType": "roleOperationalState",
+            "findingKind": "operationalState",
+            "governanceScope": _scope(profile_id, OPERATIONAL_CLAUSE_ID),
+            "ownerRef": "owner-operations",
+            "profiles": [profile_id],
+            "proofRequirement": {
+                "proofKind": "roleOperationalStateProof",
+                "roleRef": "web",
+                "healthyStates": ["running"],
+                "failureStates": list(failure_states),
+                "minimumHealthy": minimum_healthy,
+            },
+            "failureVerdict": "violation",
+            "successVerdict": "pass",
+        }
+    )
+
+
+def _operational_profile(
+    profile_id: str,
+    minimum_healthy: int,
+    *,
+    failure_states: tuple[ResourceState, ...] = ("stopped", "deallocated"),
+) -> ResolvedManifestProfile:
+    profile = _resolved_profile(profile_id)
+    profile.constraints.append(
+        _operational_constraint(
+            profile_id,
+            minimum_healthy,
+            failure_states=failure_states,
+        )
+    )
+    return _resign_profile(profile)
+
+
+def _operational_evidence(
+    profile: ResolvedManifestProfile,
+    states: tuple[ResourceState, ...],
+) -> EvidenceReferenceContext:
+    evidence = _evidence(profile)
+    web_facts = sorted(
+        (
+            fact
+            for fact in evidence.resources
+            if fact.role_ref == "web"
+        ),
+        key=lambda fact: fact.resource_id.casefold(),
+    )
+    if not 1 <= len(states) <= 3:
+        raise AssertionError("operational-state tests support one to three web resources")
+
+    updated_web_facts: list[ResourceProofFact] = []
+    zones = ("1", "2", "3")
+    for index, operational_state in enumerate(states):
+        if index < len(web_facts):
+            updated_web_facts.append(
+                web_facts[index].model_copy(
+                    update={"operational_state": operational_state},
+                )
+            )
+            continue
+        updated_web_facts.append(
+            ResourceProofFact(
+                resourceId=RESOURCE_PREFIX + f"synthetic-web-{index + 1:02d}",
+                roleRef="web",
+                availabilityZone=zones[index],
+                operationalState=operational_state,
+                state="complete",
+                proofSource="observed",
+                evidenceRef=_item_ref(9 + index - len(web_facts)),
+            )
+        )
+
+    evidence.resources = [
+        fact for fact in evidence.resources if fact.role_ref != "web"
+    ] + updated_web_facts
+    web_binding = next(
+        binding for binding in evidence.role_bindings if binding.role_ref == "web"
+    )
+    selected_ids = sorted(
+        (fact.resource_id for fact in updated_web_facts),
+        key=str.casefold,
+    )
+    web_binding.selected_resource_ids = selected_ids
+    web_binding.selector_result_digest = compute_artifact_digest(selected_ids)
+    return EvidenceReferenceContext.model_validate(
+        evidence.model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
+
+
+def _operational_finding(
+    profile: ResolvedManifestProfile,
+    evidence: EvidenceReferenceContext,
+) -> ManifestFinding:
+    return evaluate_profile(
+        profile,
+        evidence,
+        as_of=AS_OF,
+        verify_evidence_context=_verify_unit_evidence,
+    )[OPERATIONAL_CLAUSE_ID]
+
+
+def test_role_operational_state_contract_is_serialized_and_legacy_facts_fail_closed() -> None:
+    proof = RoleOperationalStateProof(
+        proofKind="roleOperationalStateProof",
+        roleRef="web",
+        healthyStates=["running"],
+        failureStates=["stopped", "deallocated"],
+        minimumHealthy=2,
+    )
+
+    assert proof.model_dump(mode="json", by_alias=True) == {
+        "proofKind": "roleOperationalStateProof",
+        "roleRef": "web",
+        "healthyStates": ["running"],
+        "failureStates": ["stopped", "deallocated"],
+        "minimumHealthy": 2,
+    }
+    legacy_fact = ResourceProofFact.model_validate(
+        {
+            "resourceId": RESOURCE_IDS["web"][0],
+            "roleRef": "web",
+            "availabilityZone": "1",
+            "state": "complete",
+            "proofSource": "observed",
+            "evidenceRef": _item_ref(3),
+        }
+    )
+    assert legacy_fact.operational_state == "unknown"
+
+    for invalid in (
+        {
+            "proofKind": "roleOperationalStateProof",
+            "roleRef": "web",
+            "healthyStates": ["running", "running"],
+            "failureStates": ["stopped"],
+            "minimumHealthy": 1,
+        },
+        {
+            "proofKind": "roleOperationalStateProof",
+            "roleRef": "web",
+            "healthyStates": ["running"],
+            "failureStates": ["running"],
+            "minimumHealthy": 1,
+        },
+        {
+            "proofKind": "roleOperationalStateProof",
+            "roleRef": "web",
+            "healthyStates": ["running"],
+            "failureStates": ["unknown"],
+            "minimumHealthy": 1,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            RoleOperationalStateProof.model_validate(invalid)
+
+
+@pytest.mark.parametrize(
+    ("states", "failure_states", "expected_verdict"),
+    [
+        (("running", "running", "running"), ("stopped", "deallocated"), "pass"),
+        (("running", "running", "stopped"), ("stopped", "deallocated"), "observation"),
+        (("running", "running", "deallocated"), ("stopped", "deallocated"), "observation"),
+        (("running", "stopped", "deallocated"), ("stopped", "deallocated"), "violation"),
+        (("running", "running", "unknown"), ("stopped", "deallocated"), "unknown"),
+        (("running", "running", "deallocated"), ("stopped",), "unknown"),
+    ],
+)
+def test_role_operational_state_policy_is_fail_closed_and_deterministic(
+    states: tuple[ResourceState, ...],
+    failure_states: tuple[ResourceState, ...],
+    expected_verdict: str,
+) -> None:
+    profile = _operational_profile(
+        "production",
+        2,
+        failure_states=failure_states,
+    )
+    evidence = _operational_evidence(profile, states)
+
+    finding = _operational_finding(profile, evidence)
+
+    assert finding.finding_kind == "operationalState"
+    assert finding.verdict == expected_verdict
+    expected_references = sorted(
+        (_item_ref(3), _item_ref(4), _item_ref(9)),
+        key=lambda reference: reference.canonical_json(),
+    )
+    assert [
+        reference.canonical_json() for reference in finding.evidence_refs
+    ] == [
+        reference.canonical_json() for reference in expected_references
+    ]
+
+    reversed_evidence = evidence.model_copy(deep=True)
+    reversed_evidence.resources.reverse()
+    repeated = _operational_finding(profile, reversed_evidence)
+    assert repeated.canonical_json() == finding.canonical_json()
+
+
+def test_same_web_fault_uses_three_profile_minimum_healthy_policy() -> None:
+    expected = {
+        "production": (2, "observation"),
+        "development": (1, "observation"),
+        "training": (3, "violation"),
+    }
+
+    for profile_id, (minimum_healthy, expected_verdict) in expected.items():
+        profile = _operational_profile(profile_id, minimum_healthy)
+        evidence = _operational_evidence(
+            profile,
+            ("running", "running", "stopped"),
+        )
+
+        finding = _operational_finding(profile, evidence)
+
+        assert finding.profile_id == profile_id
+        assert finding.verdict == expected_verdict
+        assert len(finding.evidence_refs) == 3
 
 
 def test_same_policy_path_evaluates_all_three_environments() -> None:
