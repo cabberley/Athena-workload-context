@@ -195,6 +195,60 @@ def _vm_response(
     return response.encode()
 
 
+def _live_vm_response(
+    request_id: str,
+    target: evaluation_adapters._VmInventoryTarget,
+    *,
+    status_state: str,
+    declared_power_state: str,
+) -> bytes:
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "status": 200,
+                                "message": "Success",
+                                "results": {
+                                    "Vm": {
+                                        "name": target.vm_name,
+                                        "id": target.resource_id,
+                                        "location": "australiaeast",
+                                        "provisioningState": "Succeeded",
+                                    },
+                                    "InstanceView": {
+                                        "name": target.vm_name,
+                                        "powerState": declared_power_state,
+                                        "statuses": [
+                                            {
+                                                "code": (
+                                                    f"PowerState/{status_state}"
+                                                ),
+                                                "level": "Info",
+                                                "displayStatus": (
+                                                    f"VM {status_state}"
+                                                ),
+                                            }
+                                        ],
+                                    },
+                                },
+                                "duration": 0,
+                            }
+                        ),
+                    }
+                ],
+                "isError": False,
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
 @pytest.mark.parametrize(
     ("code", "power_state", "expected"),
     [
@@ -227,6 +281,51 @@ def test_exact_instance_view_power_states_are_normalized(
     )
 
     assert state == expected
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["stopped", "running", "deallocated"],
+)
+def test_live_pascal_case_compute_envelope_is_canonical(
+    transport_request: EvidenceTransportRequest,
+    state: ResourceState,
+) -> None:
+    target = _target(transport_request, f"vm-live-{state}")
+    request_id = f"synthetic-live-{state}-call"
+
+    actual = evaluation_adapters._parse_vm_power_state_response(
+        _live_vm_response(
+            request_id,
+            target,
+            status_state=state,
+            declared_power_state=state,
+        ),
+        request_id=request_id,
+        target=target,
+    )
+
+    assert actual == state
+
+
+def test_live_pascal_case_power_state_mismatch_is_unknown(
+    transport_request: EvidenceTransportRequest,
+) -> None:
+    target = _target(transport_request, "vm-live-mismatch")
+    request_id = "synthetic-live-mismatch-call"
+
+    actual = evaluation_adapters._parse_vm_power_state_response(
+        _live_vm_response(
+            request_id,
+            target,
+            status_state="stopped",
+            declared_power_state="running",
+        ),
+        request_id=request_id,
+        target=target,
+    )
+
+    assert actual == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -307,6 +406,12 @@ def test_missing_conflicting_unclassified_and_malformed_states_are_unknown(
             target,
             status_codes=["PowerState/running"],
             power_state="stopped",
+        ),
+        _vm_response(
+            request_id,
+            target,
+            status_codes=["PowerState/running"],
+            power_state=None,
         ),
         _vm_response(
             request_id,

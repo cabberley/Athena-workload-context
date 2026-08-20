@@ -554,12 +554,12 @@ def _parse_vm_power_state_response(
     )
     if payload is None:
         return "unknown"
-    if set(payload) == {"vm", "instanceView"}:
-        vm = payload.get("vm")
-        instance_view = payload.get("instanceView")
-    elif set(payload) == {"Vm", "InstanceView"}:
+    if set(payload) == {"Vm", "InstanceView"}:
         vm = payload.get("Vm")
         instance_view = payload.get("InstanceView")
+    elif set(payload) == {"vm", "instanceView"}:
+        vm = payload.get("vm")
+        instance_view = payload.get("instanceView")
     else:
         return "unknown"
 
@@ -636,7 +636,7 @@ def _parse_vm_power_state_response(
     if normalized_state is None:
         return "unknown"
     declared_power_state = instance_view.get("powerState")
-    if declared_power_state is not None and (
+    if (
         type(declared_power_state) is not str
         or cast(str, declared_power_state).casefold() != normalized_state
     ):
