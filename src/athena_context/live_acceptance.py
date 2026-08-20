@@ -795,6 +795,16 @@ def _powershell_environment_template(plan: Wc013LiveAcceptancePlan) -> str:
 
 def prepare_wc013_live_acceptance(plan_path: Path) -> PreparedWc013LiveAcceptance:
     plan = _parse_model(plan_path, Wc013LiveAcceptancePlan)
+    return prepare_wc013_live_acceptance_plan(plan, plan_path=plan_path)
+
+
+def prepare_wc013_live_acceptance_plan(
+    plan: Wc013LiveAcceptancePlan,
+    *,
+    plan_path: Path,
+) -> PreparedWc013LiveAcceptance:
+    """Prepare one already parsed plan without reopening its configuration file."""
+
     root = plan_path.parent
     assertion_path = _resolve_plan_path(root, plan.wc008_deployment_assertion_file)
     approval_path = _resolve_plan_path(root, plan.wc008_operator_approval_file)
@@ -931,6 +941,30 @@ def run_wc013_live_acceptance(
     snapshot_output: Path | None = None,
 ) -> Wc013LiveAcceptanceResult:
     prepared = prepare_wc013_live_acceptance(plan_path)
+    return run_prepared_wc013_live_acceptance(
+        prepared,
+        snapshot_output=snapshot_output,
+    )
+
+
+def run_wc013_live_acceptance_plan(
+    plan: Wc013LiveAcceptancePlan,
+    plan_path: Path,
+) -> Wc013LiveAcceptanceResult:
+    """Execute one already parsed plan without reopening its configuration file."""
+
+    prepared = prepare_wc013_live_acceptance_plan(
+        plan,
+        plan_path=plan_path,
+    )
+    return run_prepared_wc013_live_acceptance(prepared)
+
+
+def run_prepared_wc013_live_acceptance(
+    prepared: PreparedWc013LiveAcceptance,
+    *,
+    snapshot_output: Path | None = None,
+) -> Wc013LiveAcceptanceResult:
     _require_runtime_environment(prepared)
     try:
         service = _compose_wc013_one_shot_service(prepared)
@@ -1269,8 +1303,11 @@ __all__ = [
     "Wc013ReplayInput",
     "build_wc013_authority_bundle",
     "prepare_wc013_live_acceptance",
+    "prepare_wc013_live_acceptance_plan",
     "render_wc013_configuration",
+    "run_prepared_wc013_live_acceptance",
     "run_wc013_live_acceptance",
+    "run_wc013_live_acceptance_plan",
     "verify_wc013_live_result",
     "wc013_configuration_template",
 ]

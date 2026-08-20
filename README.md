@@ -31,6 +31,7 @@ See:
 - [Initial build plan](docs/planning/initial-build-plan.md)
 - [Copilot model allocation](docs/planning/model-allocation.md)
 - [WC-013 live acceptance](docs/operations/wc013-live-acceptance.md)
+- [Operational phase runner](docs/operations/operational-phase-runner.md)
 
 ## Local reference proof
 
