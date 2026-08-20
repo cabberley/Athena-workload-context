@@ -72,6 +72,7 @@ type ConstraintKind = Literal[
     "cardinality",
     "zoneColocation",
     "zoneDistribution",
+    "roleOperationalState",
     "dependencyRequired",
     "dependencyProhibited",
     "supportedSingleton",
@@ -88,6 +89,7 @@ type FindingKind = Literal[
     "objective",
     "relationshipConflict",
     "evidenceGap",
+    "operationalState",
 ]
 type ControlKind = Literal[
     "backup",
@@ -601,6 +603,7 @@ class DeterministicExplanation(AgentModel):
         "cardinalityProof",
         "zoneColocationProof",
         "zoneDistributionProof",
+        "roleOperationalStateProof",
         "relationshipPresenceProof",
         "evidenceFreshnessProof",
         "controlHealthProof",
