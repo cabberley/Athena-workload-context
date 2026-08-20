@@ -91,6 +91,9 @@ The operator reads `athena.operationalDemoOperator.v1`:
 ```
 
 All files are relative to the configuration directory and must stay inside that boundary.
+The `artifactReader.managedIdentityClientId` value is the operator identity client ID used for
+token acquisition; the Bicep deployment parameter uses the corresponding object ID for container-
+scoped Reader RBAC.
 
 ## Controller output contracts
 
@@ -122,7 +125,12 @@ The phase-job controller is invoked with fixed verbs:
 <phase-job-controller> ... handoff --execution-id <exact-id> --run-id <runId> --phase <phase>
 ```
 
-`start` returns `athena.operationalPhaseExecution.v1`.
+`start` returns `athena.operationalPhaseExecution.v1`. It selects exactly one phase-specific Job.
+Because Container Apps accepts start-time environment changes only through a complete execution
+template, the trusted controller must retrieve and validate the reviewed template, preserve its
+image, command, args, identities, and reviewed bundle path exactly, and change only the allowlisted
+bounded exact-reference environment variables required by that phase. Only the controller identity
+should receive Job-start permission.
 
 `status` returns `athena.operationalPhaseExecutionStatus.v1` with one of:
 
@@ -138,18 +146,36 @@ completion-index Blob name, version ID, and SHA-256 expected by the operator.
 
 ## Phase Job requirement
 
-The phase Job itself should call the existing single-phase runner and emit a governed handoff file:
+The deployed phase Job uses `athena-context operational-phase-job`. It writes the fixed local
+phase-input file, invokes the single-phase runner in process, writes the governed handoff file,
+and may emit one base64 handoff line for the external controller:
 
 ```powershell
-athena-context operational-phase-runner `
-  --bundle <reviewed-bundle-file> `
-  --inputs <generated-phase-inputs-file> `
+athena-context operational-phase-job `
   --phase baseline `
-  --handoff-output <governed-handoff-file>
+  --bundle /opt/athena/wc013-live/delivery/operational-phase-bundle.json `
+  --inputs-output /tmp/athena-operational/baseline-inputs.json `
+  --handoff-output /tmp/athena-operational/baseline-handoff.json `
+  --artifact-blob-endpoint https://<account>.blob.core.windows.net `
+  --artifact-container operational-artifacts `
+  --emit-handoff-base64
 ```
 
-The handoff file contains the exact completion-index reference needed by the outer operator. The
-operator never lists blobs or resolves a latest version.
+The controller supplies only exact reference metadata for that phase through start-time
+environment variables:
+
+- `ATHENA_OPERATIONAL_RECEIPT_NAME`, `ATHENA_OPERATIONAL_RECEIPT_VERSION`, and
+  `ATHENA_OPERATIONAL_RECEIPT_DIGEST`;
+- faulted or recovered only:
+  `ATHENA_OPERATIONAL_PREVIOUS_INDEX_NAME`,
+  `ATHENA_OPERATIONAL_PREVIOUS_INDEX_VERSION`, and
+  `ATHENA_OPERATIONAL_PREVIOUS_INDEX_DIGEST`; and
+- faulted without a baseline index only: `ATHENA_OPERATIONAL_LINEAGE_REFERENCE_DIGEST`.
+
+The handoff file contains the exact completion-index reference needed by the outer operator. When
+`--emit-handoff-base64` is enabled, the Job also prints one
+`ATHENA_OPERATIONAL_PHASE_HANDOFF_B64=` line that the phase-job controller may retrieve from the
+exact execution logs. The operator still never lists blobs or resolves a latest version.
 
 ## Exact artifact verification
 

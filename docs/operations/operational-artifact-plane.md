@@ -14,8 +14,9 @@ The existing WC-013 replay StorageV2 account also hosts one Blob container:
 - immutable version retention: the explicit `artifactRetentionDays` Bicep parameter; and
 - identity: the existing acceptance identity with `Storage Blob Data Contributor` scoped to the
   container resource ID only; and
-- operator reader: the managed identity object ID supplied as
-  `operatorArtifactReaderObjectId`, with `Storage Blob Data Reader` at the same exact container.
+- operator readers: the managed identity object IDs supplied as
+  `operatorArtifactReaderObjectIds`, each with `Storage Blob Data Reader` at the same exact
+  container.
 
 The account keeps `allowSharedKeyAccess: false`, OAuth as the default, public Blob access disabled,
 and public network access disabled. The private endpoint uses the existing private-endpoint subnet
@@ -60,7 +61,7 @@ and validates UTF-8 JSON before returning. Missing versions, missing metadata, o
 and any mismatch fail closed. It never lists Blobs or resolves a latest version.
 
 The built-in Reader role includes read and list data actions. The no-list rule is enforced by the
-port surface, not by Azure RBAC. The separate operator identity is read-only at Azure scope; the
+port surface, not by Azure RBAC. Each separate operator identity is read-only at Azure scope; the
 acceptance identity may use the same adapter but retains its existing Contributor permissions.
 
 ## Bicep inputs and outputs
@@ -71,7 +72,7 @@ The WC-013 entrypoint adds:
 |---|---|---|
 | `artifactContainerName` | input | The single immutable artifact container. |
 | `artifactRetentionDays` | input | Explicit unlocked WORM retention period. |
-| `operatorArtifactReaderObjectId` | input | Entra object ID of the separate operator reader managed identity. |
+| `operatorArtifactReaderObjectIds` | input | Entra object IDs of the separate operator reader managed identities. |
 | `artifactBlobEndpoint` | output | Private-resolved normal Blob HTTPS endpoint. |
 | `artifactContainerName` | output | Exact container name. |
 | `artifactContainerResourceId` | output | Exact Azure RBAC scope. |
@@ -85,9 +86,11 @@ and review the required retention value before any deployment.
 No deployment is required:
 
 ```powershell
-python -m pytest tests/test_artifact_writer.py tests/test_artifact_reader.py tests/test_wc013_deployment_assets.py -q
+python -m pytest tests/test_artifact_writer.py tests/test_artifact_reader.py tests/test_operational_phase_job.py tests/test_wc013_deployment_assets.py -q
 ruff check src tests
 mypy src
 az bicep build --file infra/azure-mcp/main.bicep
 az bicep build --file infra/wc013-live-acceptance/main.bicep
+az bicep lint --file infra/azure-mcp/main.bicep
+az bicep lint --file infra/wc013-live-acceptance/main.bicep
 ```

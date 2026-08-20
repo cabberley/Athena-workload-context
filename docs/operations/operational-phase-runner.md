@@ -4,7 +4,7 @@ The operational phase runner executes one reviewed WC-013 baseline, faulted, or 
 It reads only the receipt and prior completion information available for that phase. It does not
 inject, reset, deploy, or otherwise mutate an Azure resource.
 
-See [ADR 0010](../adr/0010-progressive-operational-phase-completion-chain.md).
+See [ADR 0010](../adr/0010-progressive-operational-phase-completion-chain.md) and [ADR 0012](../adr/0012-phase-fixed-operational-phase-jobs.md).
 
 ## Delivery bundle v2
 
@@ -149,36 +149,53 @@ Missing or mismatched prior faulted indexes fail before WC-013 execution.
 
 ## Production composition
 
-The Job composition root injects:
+The deployed Container Apps phase Jobs use `athena-context operational-phase-job`. That narrow
+wrapper:
 
-- `VersionPinnedPhaseInputReaderPort` to read exact receipt and prior-index versions;
-- `CreateOnlyArtifactWriterPort` to create the four payload artifacts and return each immutable
-  version/hash;
-- `CompletionIndexWriterPort` to create the completion index after the payload write;
-- trusted full-result and snapshot verifiers; and
-- the existing Key Vault-compatible `PresentationSigner`.
+- reads one reviewed bundle from `/opt/athena/wc013-live/delivery/operational-phase-bundle.json`;
+- writes one fixed local `athena.operationalPhaseInputs.v1` file under `/tmp/athena-operational/`;
+- composes the production `VersionPinnedPhaseInputReaderPort`,
+  `CreateOnlyArtifactWriterPort`, `CompletionIndexWriterPort`, trusted WC-013 result/snapshot
+  verifiers, and the Key Vault-backed `PresentationSigner`; and
+- then invokes the existing single-phase runner in process.
 
-No connection string, account key, private key, receipt payload, or arbitrary storage path is
-accepted on the CLI.
+The standalone `operational-phase-runner` command still fails closed until all ports are injected.
+The production job wrapper accepts no connection string, account key, private key, raw receipt
+payload, alternate storage path, or shell command text.
 
-```powershell
-athena-context operational-phase-runner `
-  --bundle $configurationRoot\operational-phase-bundle.json `
-  --inputs $configurationRoot\baseline-inputs.json `
-  --phase baseline
-```
-
-The standalone command fails closed until all production ports are injected.
-
-The external operational demo operator can also request a governed handoff file:
+Each deployed phase Job fixes its reviewed phase, bundle path, local input path, local handoff
+path, and artifact container:
 
 ```powershell
-athena-context operational-phase-runner `
-  --bundle $configurationRoot\operational-phase-bundle.json `
-  --inputs $configurationRoot\baseline-inputs.json `
+athena-context operational-phase-job `
   --phase baseline `
-  --handoff-output $configurationRoot\baseline-handoff.json
+  --bundle /opt/athena/wc013-live/delivery/operational-phase-bundle.json `
+  --inputs-output /tmp/athena-operational/baseline-inputs.json `
+  --handoff-output /tmp/athena-operational/baseline-handoff.json `
+  --artifact-blob-endpoint https://<account>.blob.core.windows.net `
+  --artifact-container operational-artifacts `
+  --emit-handoff-base64
 ```
+
+Container Apps requires the controller to submit a complete execution template when adding these
+run-time values. The separately governed controller must first retrieve and validate the reviewed
+Job template, preserve its image, command, args, identities, and reviewed bundle path exactly, and
+change only the allowlisted bounded exact-reference environment values. Job-start permission must
+be scoped only to that trusted controller identity; the deployed defaults are not an independent
+platform-enforced immutability boundary.
+
+| Variable | Phase use |
+|---|---|
+| `ATHENA_OPERATIONAL_RECEIPT_NAME` | Frozen receipt Blob name for the selected phase. |
+| `ATHENA_OPERATIONAL_RECEIPT_VERSION` | Exact immutable receipt Blob version. |
+| `ATHENA_OPERATIONAL_RECEIPT_DIGEST` | Exact receipt SHA-256 digest. |
+| `ATHENA_OPERATIONAL_PREVIOUS_INDEX_NAME` | Exact previous completion-index Blob name for faulted or recovered. |
+| `ATHENA_OPERATIONAL_PREVIOUS_INDEX_VERSION` | Exact previous completion-index Blob version. |
+| `ATHENA_OPERATIONAL_PREVIOUS_INDEX_DIGEST` | Exact previous completion-index SHA-256 digest. |
+| `ATHENA_OPERATIONAL_LINEAGE_REFERENCE_DIGEST` | Faulted-only independently reviewed lineage digest when no baseline index is supplied. |
+
+Baseline supplies only the receipt triple. Faulted supplies either the previous-index triple or the
+lineage digest, but never both. Recovered supplies the previous-index triple and no lineage digest.
 
 ## Run-scoped outputs and completion marker
 
@@ -231,5 +248,21 @@ marker; retry requires newly reviewed create-only identities.
 ## Expected logging
 
 Success output is limited to run ID, phase, snapshot identifier, result digest, presentation
-digest, and completion-index content digest. Port exceptions and payload content are never copied
-to stdout or stderr.
+digest, and completion-index content digest. The production job wrapper may also emit one
+`ATHENA_OPERATIONAL_PHASE_HANDOFF_B64=` line that contains only the governed handoff JSON required
+by the external phase-job controller. Port exceptions and payload content are never copied to
+stdout or stderr.
+
+## Offline validation
+
+No deployment is required:
+
+```powershell
+python -m pytest tests/test_operational_phase_runner.py tests/test_operational_phase_job.py tests/test_wc013_deployment_assets.py -q
+ruff check src tests
+mypy src
+az bicep build --file infra/azure-mcp/main.bicep
+az bicep build --file infra/wc013-live-acceptance/main.bicep
+az bicep lint --file infra/azure-mcp/main.bicep
+az bicep lint --file infra/wc013-live-acceptance/main.bicep
+```

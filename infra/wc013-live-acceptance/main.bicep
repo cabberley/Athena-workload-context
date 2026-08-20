@@ -1,7 +1,7 @@
 targetScope = 'subscription'
 
-metadata name = 'Athena WC-013 one-shot live acceptance'
-metadata description = 'Composes the private Azure MCP evidence plane with the bounded WC-013 acceptance job.'
+metadata name = 'Athena WC-013 live acceptance and operational phase jobs'
+metadata description = 'Composes the private Azure MCP evidence plane with the bounded WC-013 acceptance job and the phase-fixed operational runner jobs.'
 
 @description('Azure region for the dedicated WC-013 hosting resource group.')
 param location string = deployment().location
@@ -75,10 +75,9 @@ param artifactContainerName string = 'operational-artifacts'
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object ID of the separate operator managed identity that reads exact artifact versions.')
-@minLength(36)
-@maxLength(36)
-param operatorArtifactReaderObjectId string
+@description('Object IDs of the separate operator managed identities that read exact artifact versions.')
+@maxLength(32)
+param operatorArtifactReaderObjectIds array
 
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
@@ -90,7 +89,7 @@ param wc007PinnedAuthorityDigest string
 @maxLength(71)
 param wc008PinnedAssertionDigest string
 
-@description('Digest-pinned configuration delivery image containing only the rendered non-secret WC-013 files and public key.')
+@description('Digest-pinned configuration delivery image containing the reviewed non-secret WC-013 files, public key, and operational phase bundle.')
 @minLength(1)
 @maxLength(2048)
 param acceptanceImage string
@@ -200,7 +199,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     replayPartitionKey: replayPartitionKey
     artifactContainerName: artifactContainerName
     artifactRetentionDays: artifactRetentionDays
-    operatorArtifactReaderObjectId: operatorArtifactReaderObjectId
+    operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
@@ -305,6 +304,9 @@ output acceptanceJobName string = acceptanceResources.outputs.acceptanceJobName
 
 @description('Manual one-shot Container Apps Job resource ID.')
 output acceptanceJobResourceId string = acceptanceResources.outputs.acceptanceJobResourceId
+
+@description('Deterministic manual Container Apps Job names for the phase-fixed operational runner jobs.')
+output operationalPhaseJobNames object = acceptanceResources.outputs.operationalPhaseJobNames
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId

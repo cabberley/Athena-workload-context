@@ -1,7 +1,7 @@
 targetScope = 'resourceGroup'
 
 metadata name = 'WC-013 one-shot acceptance resources'
-metadata description = 'Private Key Vault, Azure Table replay storage, immutable Azure Blob artifacts, and the manual Container Apps Job for WC-013.'
+metadata description = 'Private Key Vault, Azure Table replay storage, immutable Azure Blob artifacts, and the manual Container Apps Jobs for WC-013 and the operational phases.'
 
 @description('Azure region for the acceptance resources.')
 param location string
@@ -67,8 +67,9 @@ param artifactContainerName string
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object ID of the separate operator managed identity that reads exact artifact versions.')
-param operatorArtifactReaderObjectId string
+@description('Object IDs of the separate operator managed identities that read exact artifact versions.')
+@maxLength(32)
+param operatorArtifactReaderObjectIds array
 
 @description('Exact non-secret WC-007 authority digest emitted by the configuration renderer.')
 param wc007PinnedAuthorityDigest string
@@ -76,7 +77,7 @@ param wc007PinnedAuthorityDigest string
 @description('Exact non-secret WC-008 assertion digest emitted by the configuration renderer.')
 param wc008PinnedAssertionDigest string
 
-@description('Digest-pinned configuration delivery image containing the reviewed non-secret WC-013 files.')
+@description('Digest-pinned configuration delivery image containing the reviewed non-secret WC-013 files, public key, and operational phase bundle.')
 param acceptanceImage string
 
 @description('Azure Container Registry login server hosting the private acceptance image.')
@@ -93,6 +94,21 @@ var resourceTags = union(tags, {
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+var operationalPhaseBundlePath = '/opt/athena/wc013-live/delivery/operational-phase-bundle.json'
+var operationalScratchDirectory = '/tmp/athena-operational'
+var baselineOperationalJobName = '${namePrefix}-op-baseline'
+var faultedOperationalJobName = '${namePrefix}-op-faulted'
+var recoveredOperationalJobName = '${namePrefix}-op-recovered'
+var baselineOperationalInputsPath = '${operationalScratchDirectory}/baseline-inputs.json'
+var faultedOperationalInputsPath = '${operationalScratchDirectory}/faulted-inputs.json'
+var recoveredOperationalInputsPath = '${operationalScratchDirectory}/recovered-inputs.json'
+var baselineOperationalHandoffPath = '${operationalScratchDirectory}/baseline-handoff.json'
+var faultedOperationalHandoffPath = '${operationalScratchDirectory}/faulted-handoff.json'
+var recoveredOperationalHandoffPath = '${operationalScratchDirectory}/recovered-handoff.json'
+var operationalJobResources = {
+  cpu: '0.5'
+  memory: '1Gi'
+}
 
 module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
   name: 'wc013-signing-key-vault'
@@ -292,7 +308,7 @@ resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@20
   ]
 }
 
-resource operatorArtifactBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource operatorArtifactBlobDataReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds: {
   name: guid(
     artifactContainer.id,
     operatorArtifactReaderObjectId,
@@ -310,7 +326,7 @@ resource operatorArtifactBlobDataReader 'Microsoft.Authorization/roleAssignments
   dependsOn: [
     replayStorage
   ]
-}
+}]
 
 module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
   name: 'wc013-one-shot-job'
@@ -405,6 +421,193 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
   }
 }
 
+
+module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
+  name: 'wc013-operational-baseline-job'
+  params: {
+    name: baselineOperationalJobName
+    location: location
+    environmentResourceId: managedEnvironmentResourceId
+    enableTelemetry: false
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 900
+    managedIdentities: {
+      userAssignedResourceIds: [
+        acceptanceIdentityResourceId
+        evidenceIdentityResourceId
+      ]
+    }
+    registries: [
+      {
+        server: acceptanceImageRegistryServer
+        identity: acceptanceIdentityResourceId
+      }
+    ]
+    containers: [
+      {
+        name: 'athena-operational-baseline'
+        image: acceptanceImage
+        command: [
+          'athena-context'
+        ]
+        args: [
+          'operational-phase-job'
+          '--phase'
+          'baseline'
+          '--bundle'
+          operationalPhaseBundlePath
+          '--inputs-output'
+          baselineOperationalInputsPath
+          '--handoff-output'
+          baselineOperationalHandoffPath
+          '--artifact-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--artifact-container'
+          artifactContainerName
+          '--emit-handoff-base64'
+        ]
+        env: [
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: acceptanceIdentityClientId
+          }
+        ]
+        resources: operationalJobResources
+      }
+    ]
+    tags: resourceTags
+  }
+}
+
+module faultedOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
+  name: 'wc013-operational-faulted-job'
+  params: {
+    name: faultedOperationalJobName
+    location: location
+    environmentResourceId: managedEnvironmentResourceId
+    enableTelemetry: false
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 900
+    managedIdentities: {
+      userAssignedResourceIds: [
+        acceptanceIdentityResourceId
+        evidenceIdentityResourceId
+      ]
+    }
+    registries: [
+      {
+        server: acceptanceImageRegistryServer
+        identity: acceptanceIdentityResourceId
+      }
+    ]
+    containers: [
+      {
+        name: 'athena-operational-faulted'
+        image: acceptanceImage
+        command: [
+          'athena-context'
+        ]
+        args: [
+          'operational-phase-job'
+          '--phase'
+          'faulted'
+          '--bundle'
+          operationalPhaseBundlePath
+          '--inputs-output'
+          faultedOperationalInputsPath
+          '--handoff-output'
+          faultedOperationalHandoffPath
+          '--artifact-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--artifact-container'
+          artifactContainerName
+          '--emit-handoff-base64'
+        ]
+        env: [
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: acceptanceIdentityClientId
+          }
+        ]
+        resources: operationalJobResources
+      }
+    ]
+    tags: resourceTags
+  }
+}
+
+module recoveredOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
+  name: 'wc013-operational-recovered-job'
+  params: {
+    name: recoveredOperationalJobName
+    location: location
+    environmentResourceId: managedEnvironmentResourceId
+    enableTelemetry: false
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 900
+    managedIdentities: {
+      userAssignedResourceIds: [
+        acceptanceIdentityResourceId
+        evidenceIdentityResourceId
+      ]
+    }
+    registries: [
+      {
+        server: acceptanceImageRegistryServer
+        identity: acceptanceIdentityResourceId
+      }
+    ]
+    containers: [
+      {
+        name: 'athena-operational-recovered'
+        image: acceptanceImage
+        command: [
+          'athena-context'
+        ]
+        args: [
+          'operational-phase-job'
+          '--phase'
+          'recovered'
+          '--bundle'
+          operationalPhaseBundlePath
+          '--inputs-output'
+          recoveredOperationalInputsPath
+          '--handoff-output'
+          recoveredOperationalHandoffPath
+          '--artifact-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--artifact-container'
+          artifactContainerName
+          '--emit-handoff-base64'
+        ]
+        env: [
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: acceptanceIdentityClientId
+          }
+        ]
+        resources: operationalJobResources
+      }
+    ]
+    tags: resourceTags
+  }
+}
+
 @description('Resource ID of the private signing Key Vault.')
 output keyVaultResourceId string = signingKeyVault.outputs.resourceId
 
@@ -446,3 +649,10 @@ output acceptanceJobName string = acceptanceJob.outputs.name
 
 @description('Manual WC-013 acceptance job resource ID.')
 output acceptanceJobResourceId string = acceptanceJob.outputs.resourceId
+
+@description('Deterministic manual Container Apps Job names for the phase-fixed operational runner jobs.')
+output operationalPhaseJobNames object = {
+  baseline: baselineOperationalPhaseJob.outputs.name
+  faulted: faultedOperationalPhaseJob.outputs.name
+  recovered: recoveredOperationalPhaseJob.outputs.name
+}

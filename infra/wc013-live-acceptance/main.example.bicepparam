@@ -22,7 +22,9 @@ param replayTableName = 'Wc013Replay'
 param replayPartitionKey = 'wc013-live-synthetic'
 param artifactContainerName = 'operational-artifacts'
 param artifactRetentionDays = 30
-param operatorArtifactReaderObjectId = '44444444-4444-4444-4444-444444444444'
+param operatorArtifactReaderObjectIds = [
+  '51425b07-8512-4c49-a763-23a09c347f0b'
+]
 
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.
 param wc007PinnedAuthorityDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'

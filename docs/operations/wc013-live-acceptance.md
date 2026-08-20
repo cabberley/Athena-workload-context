@@ -107,13 +107,12 @@ pass. A failed run creates no snapshot. Reusing either the attempt ID or request
 durably; an operator must issue new reviewed IDs after a failed post-reservation run.
 
 The three-phase operational demonstration reuses this execution path without the direct
-`--snapshot-output` file. Its
-[operational phase runner](operational-phase-runner.md) selects one digest-pinned baseline,
-faulted, or recovered plan, reads only the version-pinned receipt and prior completion index
-available for that phase, verifies the returned result and snapshot again, then writes run-scoped
-payload artifacts followed by a completion index. Fault injection and reset remain outside Athena
-and are represented only by separately delivered receipts. The outer orchestration loop is
-documented in the [operational demo operator](operational-demo-operator.md) runbook.
+`--snapshot-output` file. Its deployed `athena-context operational-phase-job` wrapper writes one
+fixed local phase-input file, composes the production Blob reader/writer and Key Vault signer,
+invokes the [operational phase runner](operational-phase-runner.md) for one digest-pinned
+baseline, faulted, or recovered plan, then writes a governed handoff file for the outer
+[operational demo operator](operational-demo-operator.md). Fault injection and reset remain
+outside Athena and are represented only by separately delivered receipts.
 
 ## Exact runtime environment variables
 
@@ -148,8 +147,9 @@ configuration, idempotency key, exact command, and relative input-file paths.
 `infra/wc013-live-acceptance/main.bicep` is the subscription-scope composition for this gate. It
 creates a dedicated hosting resource group, reuses `infra/azure-mcp/main.bicep` and its pinned
 Azure MCP 2.0.5 implementation, and adds a private-endpoint subnet, private DNS zones, a private
-Key Vault, private Azure Table and Blob endpoints, one immutable artifact container, and a manual
-Container Apps Job in the same internal managed environment.
+Key Vault, private Azure Table and Blob endpoints, one immutable artifact container, one manual
+WC-013 acceptance Job, and three manual phase-fixed operational Jobs in the same internal managed
+environment.
 
 The composition uses pinned Azure Verified Modules for the Key Vault
 (`avm/res/key-vault/vault:0.14.0`), Storage account
@@ -165,13 +165,14 @@ It creates exactly two runtime identities:
 2. the separate acceptance-job context identity is attached to the Job and has no workload Reader
    or workspace-log role.
 
-The job selects the acceptance identity with `AZURE_CLIENT_ID`; it attaches the MCP/evidence
+Each Job selects the acceptance identity with `AZURE_CLIENT_ID`; it attaches the MCP/evidence
 identity only so the in-process adapter can acquire the separate collector token. The Key Vault
 role is scoped to the one RSA key, `Storage Table Data Contributor` is scoped to the one replay
 table, and `Storage Blob Data Contributor` is scoped to the one immutable artifact container.
-The separately supplied operator managed-identity object ID receives `Storage Blob Data Reader` at
-that same container only. Shared keys, connection strings, secrets, and private key export are
-disabled or unused.
+The separately supplied `operatorArtifactReaderObjectIds` array receives `Storage Blob Data Reader`
+at that same container only. Those Bicep values are Entra object IDs for RBAC; the external
+operator configuration still uses the corresponding managed-identity client ID when it requests
+tokens. Shared keys, connection strings, secrets, and private key export are disabled or unused.
 
 ### Required existing Entra resources
 
@@ -204,7 +205,9 @@ public exposure, and all role assignments before creating a deployment.
 The root `Dockerfile` packages this repository with its normal `pyproject.toml` installation and
 runs the `athena-context wc013-live-acceptance` CLI as a non-root user. It deliberately contains no
 operator configuration. `Dockerfile.wc013-delivery` is the second, required image layer: it copies
-only the reviewed rendered files and the public PEM into the fixed paths used by the Job.
+the reviewed `wc013-live/` tree and the public PEM into the fixed paths used by the Jobs. For the
+operational demonstration, that same `wc013-live/` tree must also contain the reviewed phase bundle
+at `wc013-live/delivery/operational-phase-bundle.json`.
 
 Build and push a digest-pinned runner image first. Use it as the bootstrap `acceptanceImage`; the
 Job is manual and must not be started at this stage.
@@ -219,14 +222,18 @@ Build the Bicep templates before a what-if or deployment:
 ```powershell
 az bicep build --file infra/azure-mcp/main.bicep
 az bicep build --file infra/wc013-live-acceptance/main.bicep
+az bicep lint --file infra/azure-mcp/main.bicep
+az bicep lint --file infra/wc013-live-acceptance/main.bicep
 ```
 
 Copy `infra/wc013-live-acceptance/main.example.bicepparam` to an operator-owned parameter file.
-It contains only synthetic non-secret values. Set the globally unique Key Vault and Storage account
-names, exact target demo resource-group scope, existing ACR server/resource ID, existing Entra app
-IDs/audiences, and the runner image digest. For the bootstrap deployment, leave the two
-`wc007PinnedAuthorityDigest` and `wc008PinnedAssertionDigest` values as nonmatching placeholders.
-They prevent an accidental execution until the reviewed renderer output is available.
+It contains only synthetic non-secret values except the current jumpbox/operator object ID already
+placed in `operatorArtifactReaderObjectIds`. Replace or extend that reviewed array as required. Set
+the globally unique Key Vault and Storage account names, exact target demo resource-group scope,
+existing ACR server/resource ID, existing Entra app IDs/audiences, and the runner image digest. For
+the bootstrap deployment, leave the two `wc007PinnedAuthorityDigest` and
+`wc008PinnedAssertionDigest` values as nonmatching placeholders. They prevent an accidental
+execution until the reviewed renderer output is available.
 
 ```powershell
 az deployment sub what-if `
@@ -263,6 +270,11 @@ athena-context wc013-render-config `
   --input <staging-directory>/wc013-source.json `
   --output-directory <staging-directory>/wc013-live
 
+Copy the reviewed operational phase delivery bundle into
+`<staging-directory>/wc013-live/delivery/` before the image build. That subtree must contain
+`operational-phase-bundle.json`, `configs/`, and every WC-007, WC-008, and public-key file
+referenced by the reviewed phase plans.
+
 Set-Location <staging-directory>
 docker build `
   --file <repository-root>/Dockerfile.wc013-delivery `
@@ -272,16 +284,17 @@ docker build `
 docker push <registry>/athena/wc013-live:<reviewed-tag>
 ```
 
-The staging directory must contain `wc013-live/` and `wc013-signing-public-key.pem` only as
-reviewed non-secret delivery artifacts. Do not add authority data, PEM files, or any runtime files
-to Bicep parameters, outputs, Container Apps secrets, or source control.
+The staging directory must contain `wc013-live/` (including the reviewed `delivery/` subtree)
+and `wc013-signing-public-key.pem` only as reviewed non-secret delivery artifacts. Do not add
+authority data, PEM files, or any runtime files to Bicep parameters, outputs, Container Apps
+secrets, or source control.
 
 Update the operator parameter file with the configuration delivery image digest and the exact
 `pinned authority digest` and `pinned assertion digest` printed by the renderer. Re-run what-if,
-then redeploy the same Bicep entrypoint. This updates the manual Job with its reviewed image and
-non-secret environment pins. Re-read the Key Vault version output after each resource deployment;
-if a new key version was intentionally produced, download that public key and rerender before
-starting the Job.
+then redeploy the same Bicep entrypoint. This updates the manual Jobs with their reviewed image
+and non-secret environment pins. Re-read the Key Vault version output after each resource
+deployment; if a new key version was intentionally produced, download that public key and rerender
+before starting any Job.
 
 ```powershell
 az deployment sub what-if `
@@ -301,13 +314,19 @@ az containerapp job start `
   --resource-group <foundationResourceGroupName>
 ```
 
+Do not grant human operator identities direct start permission on the three operational phase
+Jobs. Container Apps start-time environment changes require a complete execution-template
+override. The separately governed phase-job controller must validate the deployed reviewed
+template, preserve its image, command, args, identities, and bundle path exactly, and modify only
+the allowlisted bounded exact-reference environment variables.
+
 The relevant final outputs are `azureMcpInternalEndpoint`, `azureMcpAudience`,
 `azureMcpContainerAppResourceId`, `managedEnvironmentResourceId`, all evidence and acceptance
 identity IDs, `keyVaultUri`, `signingKeyName`, `signingKeyUriWithVersion`,
 `replayStorageAccountResourceId`, `replayTableEndpoint`, `replayTableName`,
 `replayTableResourceId`, `artifactBlobEndpoint`, `artifactContainerName`,
-`artifactContainerResourceId`, `artifactRetentionDays`, `acceptanceJobName`, and
-`acceptanceJobResourceId`.
+`artifactContainerResourceId`, `artifactRetentionDays`, `acceptanceJobName`,
+`acceptanceJobResourceId`, and `operationalPhaseJobNames`.
 
 No Context API Container App, internet-reachable environment endpoint, client secret, storage
 account key, or exported private key is required for this initial one-shot gate.

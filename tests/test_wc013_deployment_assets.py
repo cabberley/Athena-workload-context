@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -7,6 +8,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _job_module(source: str, name: str) -> str:
+    pattern = (
+        rf"module {name} 'br/public:avm/res/app/job:0\.7\.2' = \{{(?P<body>.*?)\n\}}"
+        rf"(?:\n\nmodule|\n\n@description)"
+    )
+    match = re.search(
+        pattern,
+        source,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group(0)
 
 
 def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> None:
@@ -39,7 +54,9 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "allowProtectedAppendWritesAll: false" in resources
     assert "scope: artifactContainer" in resources
     assert "storageBlobDataContributorRoleDefinitionId" in resources
-    assert "operatorArtifactReaderObjectId" in orchestration
+    assert "param operatorArtifactReaderObjectIds array" in orchestration
+    assert "operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds" in orchestration
+    assert "for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds" in resources
     assert "principalId: operatorArtifactReaderObjectId" in resources
     assert "storageBlobDataReaderRoleDefinitionId" in resources
     assert "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1" in resources
@@ -55,6 +72,11 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "acceptanceIdentityResourceId" in resources
     assert "evidenceIdentityResourceId" in resources
     assert "AZURE_CLIENT_ID" in resources
+    assert "operationalPhaseJobNames" in orchestration
+    example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
+    assert "51425b07-8512-4c49-a763-23a09c347f0b" in example
+    assert "51425b07-8512-4c49-a763-23a09c347f0b" not in orchestration
+    assert "51425b07-8512-4c49-a763-23a09c347f0b" not in resources
     for forbidden in ("passwordSecretRef", "connectionString", "listKeys(", "secrets:"):
         assert forbidden not in resources
 
@@ -72,3 +94,65 @@ def test_wc013_container_images_use_the_packaged_cli_and_only_reviewed_config_fi
     assert "wc013-signing-public-key.pem" in delivery
     assert "!src/**" in dockerignore
     assert "!pyproject.toml" in dockerignore
+
+
+
+def test_wc013_phase_jobs_are_phase_fixed_direct_commands_with_minimal_rbac() -> None:
+    resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+
+    assert resources.count("'operational-phase-job'") == 3
+    assert (
+        "var operationalPhaseBundlePath = "
+        "'/opt/athena/wc013-live/delivery/operational-phase-bundle.json'"
+        in resources
+    )
+    assert "output operationalPhaseJobNames object = {" in resources
+
+    expectations = {
+        "baselineOperationalPhaseJob": (
+            "baseline",
+            "baselineOperationalInputsPath",
+            "baselineOperationalHandoffPath",
+        ),
+        "faultedOperationalPhaseJob": (
+            "faulted",
+            "faultedOperationalInputsPath",
+            "faultedOperationalHandoffPath",
+        ),
+        "recoveredOperationalPhaseJob": (
+            "recovered",
+            "recoveredOperationalInputsPath",
+            "recoveredOperationalHandoffPath",
+        ),
+    }
+    for module_name, (phase, inputs_path, handoff_path) in expectations.items():
+        block = _job_module(resources, module_name)
+        lowered = block.casefold()
+
+        assert "triggerType: 'Manual'" in block
+        assert "'athena-context'" in block
+        assert "'operational-phase-job'" in block
+        assert "'--phase'" in block
+        assert f"'{phase}'" in block
+        assert "'--bundle'" in block
+        assert "operationalPhaseBundlePath" in block
+        assert "'--inputs-output'" in block
+        assert inputs_path in block
+        assert "'--handoff-output'" in block
+        assert handoff_path in block
+        assert "'--artifact-blob-endpoint'" in block
+        assert "replayStorage.outputs.serviceEndpoints.blob" in block
+        assert "'--artifact-container'" in block
+        assert "artifactContainerName" in block
+        assert "'--emit-handoff-base64'" in block
+        assert "acceptanceIdentityResourceId" in block
+        assert "evidenceIdentityResourceId" in block
+        assert "AZURE_CLIENT_ID" in block
+        assert "/bin/sh" not in block
+        assert "passwordsecretref" not in lowered
+        assert "connectionstring" not in lowered
+        assert "secrets:" not in lowered
+        assert " listkeys(" not in lowered
+        assert "inject" not in lowered
+        assert " reset" not in lowered
+        assert " status" not in lowered

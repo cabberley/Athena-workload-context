@@ -33,18 +33,18 @@ stream, and verifies the post-read byte count. It requires:
 Only an exact `BlobNotFound` response is mapped to the typed artifact-not-found error. Container,
 authorization, network, and other service failures remain visible to the caller.
 
-Add a required `operatorArtifactReaderObjectId` Bicep input. It is the Entra object ID of a
-separate operator managed identity, not its client ID. Grant that principal `Storage Blob Data
-Reader` at the artifact container resource ID only. The existing acceptance identity keeps its
-container-scoped Contributor assignment and may instantiate the same read adapter for receipt
-ingestion.
+Add a required `operatorArtifactReaderObjectIds` Bicep input. These are the Entra object IDs of
+one or more separate operator managed identities, not their client IDs. Grant each principal
+`Storage Blob Data Reader` at the artifact container resource ID only. The existing acceptance
+identity keeps its container-scoped Contributor assignment and may instantiate the same read
+adapter for receipt ingestion.
 
 ## Consequences
 
 - The application port has no list, latest, delete, or write method.
 - The built-in `Storage Blob Data Reader` role still grants Blob read and list data actions. The
   no-list guarantee is therefore a port capability boundary, not an Azure RBAC prohibition.
-- The separate operator identity is Azure-enforced read-only. Using the acceptance Contributor
+- Each separate operator identity is Azure-enforced read-only. Using the acceptance Contributor
   identity with the adapter does not reduce that identity's effective Azure permissions.
 - Missing version IDs, response version drift, absent hash metadata, wrong content type, oversized
   payloads, malformed JSON, and digest mismatches fail closed.

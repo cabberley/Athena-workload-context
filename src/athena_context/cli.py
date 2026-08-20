@@ -28,6 +28,10 @@ from athena_context.operational_demo_operator import (
     render_operational_demo_validation,
     run_operational_demo_operator,
 )
+from athena_context.operational_phase_job import (
+    HANDOFF_BASE64_PREFIX,
+    run_operational_phase_job,
+)
 from athena_context.operational_phase_runner import (
     CompletionIndexWriterPort,
     CreateOnlyArtifactWriterPort,
@@ -121,6 +125,21 @@ def build_parser() -> argparse.ArgumentParser:
     phase_parser.add_argument("--inputs", required=True, type=Path)
     phase_parser.add_argument("--phase", required=True)
     phase_parser.add_argument("--handoff-output", type=Path)
+    phase_job_parser = subparsers.add_parser(
+        "operational-phase-job",
+        help="run one fixed operational demo phase inside the production job",
+    )
+    phase_job_parser.add_argument("--bundle", required=True, type=Path)
+    phase_job_parser.add_argument("--phase", required=True)
+    phase_job_parser.add_argument("--inputs-output", required=True, type=Path)
+    phase_job_parser.add_argument("--handoff-output", required=True, type=Path)
+    phase_job_parser.add_argument("--artifact-blob-endpoint", required=True)
+    phase_job_parser.add_argument("--artifact-container", required=True)
+    phase_job_parser.add_argument(
+        "--emit-handoff-base64",
+        action="store_true",
+        help="print the governed handoff as one base64 line for the phase-job controller",
+    )
     operator_parser = subparsers.add_parser(
         "operational-demo-operator",
         help="validate or run the external operational demonstration operator",
@@ -279,6 +298,30 @@ def main(
                 f"{completed.completion_index_digest}\n"
             )
             return 0
+        if args.command == "operational-phase-job":
+            job = run_operational_phase_job(
+                bundle_path=args.bundle,
+                phase_selector=args.phase,
+                inputs_output_path=args.inputs_output,
+                handoff_output_path=args.handoff_output,
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                artifact_container_name=args.artifact_container,
+            )
+            output.write(
+                "operational phase job passed\n"
+                f"run: {job.completed.run_id}\n"
+                f"phase: {job.completed.phase}\n"
+                f"snapshot: {job.completed.snapshot_id}\n"
+                f"result digest: {job.completed.result_digest}\n"
+                f"presentation digest: {job.completed.presentation_digest}\n"
+                f"completion index digest: "
+                f"{job.completed.completion_index_digest}\n"
+            )
+            if args.emit_handoff_base64:
+                output.write(
+                    f"{HANDOFF_BASE64_PREFIX}{job.handoff_base64()}\n"
+                )
+            return 0
         if args.command == "operational-demo-operator":
             if args.validate_only:
                 validation = build_operational_demo_validation(args.config)
@@ -301,7 +344,12 @@ def main(
         errors.write(f"ARGUS presentation export failed: {exc}\n")
         return 1
     except OperationalPhaseRunnerError as exc:
-        errors.write(f"operational phase runner failed: {exc}\n")
+        label = (
+            'operational phase job'
+            if args.command == 'operational-phase-job'
+            else 'operational phase runner'
+        )
+        errors.write(f"{label} failed: {exc}\n")
         return 1
     except OperationalDemoOperatorError as exc:
         errors.write(f"operational demo operator failed: {exc}\n")
