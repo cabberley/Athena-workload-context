@@ -1,11 +1,11 @@
 # ADR 0008: Run reviewed operational phases through a non-mutating job boundary
 
-- **Status:** Superseded by [ADR 0008](0008-progressive-operational-phase-completion-chain.md)
+- **Status:** Superseded by [ADR 0010](0010-progressive-operational-phase-completion-chain.md)
 - **Date:** 2026-08-20
 
 ## Context
 
-> This ADR records the original all-receipts-up-front design. ADR 0008 replaces that delivery
+> This ADR records the original all-receipts-up-front design. ADR 0010 replaces that delivery
 > model with progressive version-pinned inputs so baseline does not depend on future fault/reset
 > receipts.
 

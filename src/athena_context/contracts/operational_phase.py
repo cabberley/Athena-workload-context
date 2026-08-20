@@ -14,6 +14,7 @@ from athena_context.contracts.models import UtcDateTime
 from athena_context.contracts.presentation import (
     ATHENA_WEB_NODE_FAULT_SCENARIO_ID,
     ArgusPresentationPhase,
+    DemoFaultRunReceipt,
 )
 
 OPERATIONAL_PHASES: tuple[
@@ -443,6 +444,24 @@ def operational_phase_artifact_names(
     )
 
 
+def compute_fault_lineage_digest(receipt: DemoFaultRunReceipt) -> str:
+    return compute_artifact_digest(
+        {
+            "scenarioId": ATHENA_WEB_NODE_FAULT_SCENARIO_ID,
+            "faultRunId": receipt.fault_run_id,
+            "faultKind": receipt.fault_kind,
+            "resourceGroup": receipt.resource_group.casefold(),
+            "prefix": receipt.prefix.casefold(),
+            "targetVmName": receipt.target_vm_name.casefold(),
+            "targetVmResourceId": receipt.target_vm_resource_id.casefold(),
+            "eligibleWebVmNames": sorted(
+                name.casefold()
+                for name in receipt.eligible_web_vm_names
+            ),
+        }
+    )
+
+
 def build_operational_phase_delivery_bundle(
     *,
     run_id: str,
@@ -542,5 +561,6 @@ __all__ = [
     "VersionPinnedBlobReference",
     "build_operational_phase_completion_index",
     "build_operational_phase_delivery_bundle",
+    "compute_fault_lineage_digest",
     "operational_phase_artifact_names",
 ]

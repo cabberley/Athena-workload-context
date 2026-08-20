@@ -25,6 +25,7 @@ from athena_context.contracts.operational_phase import (
     OperationalPhaseSelector,
     VersionPinnedBlobReference,
     build_operational_phase_completion_index,
+    compute_fault_lineage_digest,
     operational_phase_artifact_names,
 )
 from athena_context.contracts.presentation import (
@@ -207,21 +208,7 @@ def _read_version_pinned(
 
 
 def _fault_lineage_digest(receipt: DemoFaultRunReceipt) -> str:
-    return compute_artifact_digest(
-        {
-            "scenarioId": "athena-web-node-fault.v1",
-            "faultRunId": receipt.fault_run_id,
-            "faultKind": receipt.fault_kind,
-            "resourceGroup": receipt.resource_group.casefold(),
-            "prefix": receipt.prefix.casefold(),
-            "targetVmName": receipt.target_vm_name.casefold(),
-            "targetVmResourceId": receipt.target_vm_resource_id.casefold(),
-            "eligibleWebVmNames": sorted(
-                name.casefold()
-                for name in receipt.eligible_web_vm_names
-            ),
-        }
-    )
+    return compute_fault_lineage_digest(receipt)
 
 
 def _validate_receipt_phase(

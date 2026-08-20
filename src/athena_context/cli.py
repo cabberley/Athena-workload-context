@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from athena_context import __version__
+from athena_context.artifacts import VersionPinnedArtifactReaderPort
 from athena_context.binding.verification import TrustedSnapshotVerifier
+from athena_context.contracts import build_operational_phase_reference_handoff
 from athena_context.contracts.presentation import ArgusPresentationPhase
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
@@ -15,6 +17,16 @@ from athena_context.live_acceptance import (
     render_wc013_configuration,
     run_wc013_live_acceptance,
     wc013_configuration_template,
+)
+from athena_context.operational_demo_operator import (
+    OperationalDemoOperatorError,
+    PhaseJobPort,
+    ReferenceHandoffPort,
+    WorkloadActionPort,
+    build_operational_demo_validation,
+    render_operational_demo_result,
+    render_operational_demo_validation,
+    run_operational_demo_operator,
 )
 from athena_context.operational_phase_runner import (
     CompletionIndexWriterPort,
@@ -108,7 +120,31 @@ def build_parser() -> argparse.ArgumentParser:
     phase_parser.add_argument("--bundle", required=True, type=Path)
     phase_parser.add_argument("--inputs", required=True, type=Path)
     phase_parser.add_argument("--phase", required=True)
+    phase_parser.add_argument("--handoff-output", type=Path)
+    operator_parser = subparsers.add_parser(
+        "operational-demo-operator",
+        help="validate or run the external operational demonstration operator",
+    )
+    operator_parser.add_argument("--config", required=True, type=Path)
+    operator_parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate the reviewed operator configuration without calling any ports",
+    )
+    operator_parser.add_argument(
+        "--confirm",
+        help="exact confirmation phrase printed by --validate-only",
+    )
     return parser
+
+
+def _write_exclusive_json_file(path: Path, content: str, *, message: str) -> None:
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.write("\n")
+    except OSError as exc:
+        raise OperationalPhaseRunnerError(message) from exc
 
 
 def main(
@@ -125,6 +161,10 @@ def main(
     phase_snapshot_verifier: TrustedSnapshotVerifier | None = None,
     phase_signer: PresentationSigner | None = None,
     phase_wc013_runner: Wc013PhaseRunner | None = None,
+    operational_demo_workload_port: WorkloadActionPort | None = None,
+    operational_demo_phase_job_port: PhaseJobPort | None = None,
+    operational_demo_handoff_port: ReferenceHandoffPort | None = None,
+    operational_demo_artifact_reader: VersionPinnedArtifactReaderPort | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
@@ -216,6 +256,18 @@ def main(
                 signer=phase_signer,
                 wc013_runner=phase_wc013_runner,
             )
+            if args.handoff_output is not None:
+                handoff = build_operational_phase_reference_handoff(
+                    run_id=completed.run_id,
+                    phase=completed.phase,
+                    bundle_digest=completed.completion_index.bundle_digest,
+                    completion_index=completed.completion_index_reference,
+                )
+                _write_exclusive_json_file(
+                    args.handoff_output,
+                    handoff.canonical_json(),
+                    message="phase reference handoff output could not be created",
+                )
             output.write(
                 "operational phase runner passed\n"
                 f"run: {completed.run_id}\n"
@@ -227,6 +279,21 @@ def main(
                 f"{completed.completion_index_digest}\n"
             )
             return 0
+        if args.command == "operational-demo-operator":
+            if args.validate_only:
+                validation = build_operational_demo_validation(args.config)
+                output.write(render_operational_demo_validation(validation))
+                return 0
+            result = run_operational_demo_operator(
+                args.config,
+                confirmation_phrase=args.confirm,
+                workload_port=operational_demo_workload_port,
+                phase_job_port=operational_demo_phase_job_port,
+                handoff_port=operational_demo_handoff_port,
+                artifact_reader=operational_demo_artifact_reader,
+            )
+            output.write(render_operational_demo_result(result))
+            return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
@@ -235,6 +302,9 @@ def main(
         return 1
     except OperationalPhaseRunnerError as exc:
         errors.write(f"operational phase runner failed: {exc}\n")
+        return 1
+    except OperationalDemoOperatorError as exc:
+        errors.write(f"operational demo operator failed: {exc}\n")
         return 1
     return 0
 

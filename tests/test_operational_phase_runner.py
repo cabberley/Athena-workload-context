@@ -33,10 +33,12 @@ from athena_context.contracts import (
     OperationalPhaseConfigurations,
     OperationalPhaseDeliveryBundle,
     OperationalPhaseInputs,
+    OperationalPhaseReferenceHandoff,
     OperationalPhaseSelector,
     ResourceEvidenceRecord,
     VersionPinnedBlobReference,
     build_operational_phase_delivery_bundle,
+    build_operational_phase_reference_handoff,
     canonicalize_json,
     compute_artifact_digest,
     sha256_hex,
@@ -1233,3 +1235,87 @@ def test_cli_fails_closed_without_production_ports_and_logs_no_paths(
         "create-only artifact writer is not configured\n"
     )
     assert "sensitive-" not in stderr.getvalue()
+
+
+def test_cli_writes_phase_reference_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = _phase_source(
+        monkeypatch,
+        phase="baseline",
+        states=("running", "running", "running"),
+        verdict="pass",
+        ordinal=1,
+        started_seconds_before_snapshot=2,
+        completed_seconds_before_snapshot=1,
+    )
+    bundle = _bundle(
+        run_id=RUN_ID,
+        configurations={
+            "baseline": _configuration(baseline),
+            "faulted": _placeholder_configuration("faulted", 2),
+            "recovered": _placeholder_configuration("recovered", 3),
+        },
+    )
+    bundle_path = _write_bundle(tmp_path, bundle)
+    _write_plan(tmp_path, baseline)
+    store = InMemoryVersionPinnedArtifactPlane()
+    receipt_reference = _seed_receipt(store, run_id=RUN_ID, source=baseline)
+    inputs_path = _write_inputs(
+        tmp_path,
+        OperationalPhaseInputs(
+            schemaVersion="athena.operationalPhaseInputs.v1",
+            runId=RUN_ID,
+            bundleDigest=bundle.bundle_digest,
+            phase="baseline",
+            receipt=receipt_reference,
+        ),
+    )
+    handoff_path = tmp_path / "phase-handoff.json"
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = main(
+        [
+            "operational-phase-runner",
+            "--bundle",
+            str(bundle_path),
+            "--inputs",
+            str(inputs_path),
+            "--phase",
+            "baseline",
+            "--handoff-output",
+            str(handoff_path),
+        ],
+        phase_artifact_writer=store,
+        phase_input_reader=store,
+        phase_completion_index_writer=store,
+        phase_result_verifier=lambda supplied: supplied,
+        phase_snapshot_verifier=_snapshot_verifier(baseline.harness),
+        phase_signer=DeterministicPresentationSigner(CANONICAL_PRIVATE_KEY),
+        phase_wc013_runner=lambda plan, _path: (
+            Wc013LiveAcceptanceResult(
+                result=baseline.result,
+                snapshot_path=None,
+            )
+            if plan.evaluation_command.snapshot_id
+            == baseline.result.snapshot.snapshot_id
+            else pytest.fail("runner selected an unreviewed plan")
+        ),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    handoff = OperationalPhaseReferenceHandoff.model_validate_json(
+        handoff_path.read_text(encoding="utf-8")
+    )
+    expected = build_operational_phase_reference_handoff(
+        run_id=RUN_ID,
+        phase="baseline",
+        bundle_digest=bundle.bundle_digest,
+        completion_index=handoff.completion_index,
+    )
+    assert handoff == expected

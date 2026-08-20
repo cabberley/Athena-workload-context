@@ -112,7 +112,8 @@ The three-phase operational demonstration reuses this execution path without the
 faulted, or recovered plan, reads only the version-pinned receipt and prior completion index
 available for that phase, verifies the returned result and snapshot again, then writes run-scoped
 payload artifacts followed by a completion index. Fault injection and reset remain outside Athena
-and are represented only by separately delivered receipts.
+and are represented only by separately delivered receipts. The outer orchestration loop is
+documented in the [operational demo operator](operational-demo-operator.md) runbook.
 
 ## Exact runtime environment variables
 

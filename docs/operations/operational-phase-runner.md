@@ -170,6 +170,16 @@ athena-context operational-phase-runner `
 
 The standalone command fails closed until all production ports are injected.
 
+The external operational demo operator can also request a governed handoff file:
+
+```powershell
+athena-context operational-phase-runner `
+  --bundle $configurationRoot\operational-phase-bundle.json `
+  --inputs $configurationRoot\baseline-inputs.json `
+  --phase baseline `
+  --handoff-output $configurationRoot\baseline-handoff.json
+```
+
 ## Run-scoped outputs and completion marker
 
 The create-only namespace is:
@@ -186,6 +196,17 @@ The first four objects are created together. Their exact names, immutable versio
 are then placed in `athena.operationalPhaseCompletionIndex.v1`. The index is written last and also
 contains the phase, attempt/snapshot identifiers, prior index digest, lineage digest, receipt
 version/hash, state transition labels, and authoritative result/snapshot/presentation digests.
+
+When `--handoff-output` is supplied, the runner also writes
+`athena.operationalPhaseReferenceHandoff.v1`. That bounded file contains only:
+
+- scenario, run, and phase;
+- the reviewed bundle digest; and
+- the exact completion-index Blob name, version, and SHA-256.
+
+The handoff is create-only on the local file system and is intended for the external operational
+demo operator or another governed orchestrator. It contains no receipt payload, Azure ID, path to
+the bundle, token, or raw command output.
 
 The index contains no raw receipt/evidence/presentation payload, Azure ID, resource group, VM name,
 signature, or token claim. Downstream automation treats only a valid version-pinned index as phase
