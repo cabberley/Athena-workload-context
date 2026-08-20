@@ -2,18 +2,30 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import jwt
+from azure.core import MatchConditions
 from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.keys import KeyClient
 from azure.keyvault.keys.crypto import CryptographyClient, SignatureAlgorithm
+from azure.storage.blob import BlobServiceClient, BlobType, ContentSettings
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
+from athena_context.artifacts import (
+    MAX_ARTIFACT_PAYLOAD_BYTES,
+    ArtifactAlreadyExistsError,
+    ArtifactPayloadTooLargeError,
+    ArtifactWriteError,
+    ArtifactWriteReceipt,
+    ArtifactWriteRequest,
+)
 from athena_context.contracts import (
     TrustedKeyAnchor,
     TrustedKeyRecord,
@@ -46,6 +58,7 @@ def _production_credential(
         exclude_cli_credential=True,
         exclude_powershell_credential=True,
         exclude_developer_cli_credential=True,
+        exclude_workload_identity_credential=True,
         exclude_broker_credential=True,
     )
 
@@ -216,6 +229,120 @@ class AzureTableAttemptReplayGuard:
                 return False
             raise
         return True
+
+
+class AzureBlobCreateOnlyArtifactWriter:
+    """Write one bounded JSON blob version without overwrite, listing, or deletion."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+        max_payload_bytes: int = MAX_ARTIFACT_PAYLOAD_BYTES,
+    ) -> None:
+        self._validate_blob_endpoint(blob_endpoint)
+        if (
+            type(container_name) is not str
+            or re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?",
+                container_name,
+            )
+            is None
+            or "--" in container_name
+        ):
+            raise ValueError("container_name must be a valid lowercase Azure Blob container")
+        if (
+            type(max_payload_bytes) is not int
+            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_PAYLOAD_BYTES}"
+            )
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_put_size=max_payload_bytes,
+        )
+        self._container = service.get_container_client(container_name)
+        self._container_name = container_name
+        self._max_payload_bytes = max_payload_bytes
+
+    @staticmethod
+    def _validate_blob_endpoint(blob_endpoint: str) -> None:
+        if type(blob_endpoint) is not str:
+            raise TypeError("blob_endpoint must be an exact string")
+        parsed = urlsplit(blob_endpoint)
+        hostname = parsed.hostname
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+            or hostname is None
+            or re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", hostname)
+            is None
+        ):
+            raise ValueError("blob_endpoint must be an Azure public-cloud Blob HTTPS origin")
+
+    def create(self, request: ArtifactWriteRequest) -> ArtifactWriteReceipt:
+        if type(request) is not ArtifactWriteRequest:
+            raise TypeError("request must be an exact ArtifactWriteRequest")
+        size_bytes = len(request.payload)
+        if size_bytes > self._max_payload_bytes:
+            raise ArtifactPayloadTooLargeError(
+                f"artifact payload exceeds {self._max_payload_bytes} bytes"
+            )
+        blob = self._container.get_blob_client(request.blob_name)
+        try:
+            response = blob.upload_blob(
+                request.payload,
+                blob_type=BlobType.BLOCKBLOB,
+                length=size_bytes,
+                metadata=request.hashes.as_blob_metadata(),
+                overwrite=False,
+                match_condition=MatchConditions.IfMissing,
+                content_settings=ContentSettings(content_type=request.content_type),
+            )
+        except ResourceExistsError as exc:
+            error_code = getattr(exc, "error_code", None)
+            normalized_code = getattr(error_code, "value", error_code)
+            if normalized_code != "BlobAlreadyExists":
+                raise
+            raise ArtifactAlreadyExistsError(
+                f"artifact blob already exists: {request.blob_name}"
+            ) from exc
+
+        etag = response.get("etag")
+        version_id = response.get("version_id")
+        last_modified = response.get("last_modified")
+        if (
+            type(etag) is not str
+            or not etag
+            or type(version_id) is not str
+            or not version_id
+            or not isinstance(last_modified, datetime)
+            or last_modified.tzinfo is None
+        ):
+            raise ArtifactWriteError(
+                "Blob upload response omitted the version-pinned immutable receipt"
+            )
+        return ArtifactWriteReceipt(
+            container_name=self._container_name,
+            blob_name=request.blob_name,
+            version_id=version_id,
+            etag=etag,
+            last_modified=last_modified,
+            size_bytes=size_bytes,
+            payload_sha256=request.hashes.payload_sha256,
+        )
 
 
 class DefaultAzureCredentialTrustedIngestionSigner:
@@ -450,6 +577,7 @@ class DefaultAzureCredentialTrustedIngestionSigner:
 
 
 __all__ = [
+    "AzureBlobCreateOnlyArtifactWriter",
     "AzureTableAttemptReplayGuard",
     "DefaultAzureCredentialTrustedIngestionSigner",
     "KeyVaultRsaSigner",

@@ -27,6 +27,19 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "publicNetworkAccess: 'Disabled'" in resources
     assert "allowSharedKeyAccess: false" in resources
     assert "defaultToOAuthAuthentication: true" in resources
+    assert "service: 'blob'" in resources
+    assert "storageBlobPrivateDnsZoneResourceId" in orchestration
+    assert "privatelink.blob.core.windows.net" in _read(
+        "infra/wc013-live-acceptance/modules/private-dns.bicep"
+    )
+    assert "isVersioningEnabled: true" in resources
+    assert "immutableStorageWithVersioningEnabled: true" in resources
+    assert "immutabilityPeriodSinceCreationInDays: artifactRetentionDays" in resources
+    assert "allowProtectedAppendWrites: false" in resources
+    assert "allowProtectedAppendWritesAll: false" in resources
+    assert "scope: artifactContainer" in resources
+    assert "storageBlobDataContributorRoleDefinitionId" in resources
+    assert "artifactContainerResourceId" in orchestration
     assert "roleDefinitionIdOrName: 'Key Vault Crypto User'" in resources
     assert "scope: replayTable" in resources
     assert "storageTableDataContributorRoleDefinitionId" in resources

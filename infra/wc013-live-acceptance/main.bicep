@@ -65,6 +65,16 @@ param replayTableName string = 'Wc013Replay'
 @maxLength(128)
 param replayPartitionKey string
 
+@description('Dedicated immutable Blob container for operational artifacts.')
+@minLength(3)
+@maxLength(63)
+param artifactContainerName string = 'operational-artifacts'
+
+@description('Explicit unlocked WORM retention period for artifact blob versions.')
+@minValue(1)
+@maxValue(146000)
+param artifactRetentionDays int
+
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -171,6 +181,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     privateEndpointSubnetResourceId: azureMcp.outputs.privateEndpointSubnetResourceId
     keyVaultPrivateDnsZoneResourceId: privateDns.outputs.keyVaultPrivateDnsZoneResourceId
     storageTablePrivateDnsZoneResourceId: privateDns.outputs.storageTablePrivateDnsZoneResourceId
+    storageBlobPrivateDnsZoneResourceId: privateDns.outputs.storageBlobPrivateDnsZoneResourceId
     evidenceIdentityResourceId: azureMcp.outputs.azureMcpIdentityResourceId
     evidenceIdentityClientId: evidenceIdentity.properties.clientId
     acceptanceIdentityResourceId: acceptanceJobIdentity.id
@@ -182,6 +193,8 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     replayStorageAccountName: replayStorageAccountName
     replayTableName: replayTableName
     replayPartitionKey: replayPartitionKey
+    artifactContainerName: artifactContainerName
+    artifactRetentionDays: artifactRetentionDays
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
@@ -268,6 +281,18 @@ output replayTableName string = acceptanceResources.outputs.replayTableName
 
 @description('Replay table resource ID.')
 output replayTableResourceId string = acceptanceResources.outputs.replayTableResourceId
+
+@description('Private HTTPS Azure Blob endpoint for immutable operational artifacts.')
+output artifactBlobEndpoint string = acceptanceResources.outputs.artifactBlobEndpoint
+
+@description('Dedicated immutable operational artifact container name.')
+output artifactContainerName string = acceptanceResources.outputs.artifactContainerName
+
+@description('Artifact container resource ID used as the exact Blob data-role scope.')
+output artifactContainerResourceId string = acceptanceResources.outputs.artifactContainerResourceId
+
+@description('Configured unlocked WORM retention period for artifact blob versions.')
+output artifactRetentionDays int = acceptanceResources.outputs.artifactRetentionDays
 
 @description('Manual one-shot Container Apps Job name.')
 output acceptanceJobName string = acceptanceResources.outputs.acceptanceJobName

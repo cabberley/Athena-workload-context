@@ -22,6 +22,7 @@ The production path uses:
 - independent Entra JWKS, issuer, audience, time, tenant, object-id, and client-id verification;
 - one exact versioned Key Vault RSA key for trusted-ingestion and snapshot RS256 signatures; and
 - one Azure Table transaction that atomically reserves both attempt ID and request digest.
+- one private immutable Blob container prepared for later bounded operational artifacts.
 
 No bearer token, client secret, storage key, connection string, or private key is accepted in
 configuration or persisted in evidence.
@@ -138,8 +139,8 @@ configuration, idempotency key, exact command, and relative input-file paths.
 `infra/wc013-live-acceptance/main.bicep` is the subscription-scope composition for this gate. It
 creates a dedicated hosting resource group, reuses `infra/azure-mcp/main.bicep` and its pinned
 Azure MCP 2.0.5 implementation, and adds a private-endpoint subnet, private DNS zones, a private
-Key Vault, a private Azure Table endpoint, and a manual Container Apps Job in the same internal
-managed environment.
+Key Vault, private Azure Table and Blob endpoints, one immutable artifact container, and a manual
+Container Apps Job in the same internal managed environment.
 
 The composition uses pinned Azure Verified Modules for the Key Vault
 (`avm/res/key-vault/vault:0.14.0`), Storage account
@@ -157,8 +158,9 @@ It creates exactly two runtime identities:
 
 The job selects the acceptance identity with `AZURE_CLIENT_ID`; it attaches the MCP/evidence
 identity only so the in-process adapter can acquire the separate collector token. The Key Vault
-role is scoped to the one RSA key, and `Storage Table Data Contributor` is scoped to the one replay
-table. Shared keys, connection strings, secrets, and private key export are disabled or unused.
+role is scoped to the one RSA key, `Storage Table Data Contributor` is scoped to the one replay
+table, and `Storage Blob Data Contributor` is scoped to the one immutable artifact container.
+Shared keys, connection strings, secrets, and private key export are disabled or unused.
 
 ### Required existing Entra resources
 
@@ -292,7 +294,9 @@ The relevant final outputs are `azureMcpInternalEndpoint`, `azureMcpAudience`,
 `azureMcpContainerAppResourceId`, `managedEnvironmentResourceId`, all evidence and acceptance
 identity IDs, `keyVaultUri`, `signingKeyName`, `signingKeyUriWithVersion`,
 `replayStorageAccountResourceId`, `replayTableEndpoint`, `replayTableName`,
-`replayTableResourceId`, `acceptanceJobName`, and `acceptanceJobResourceId`.
+`replayTableResourceId`, `artifactBlobEndpoint`, `artifactContainerName`,
+`artifactContainerResourceId`, `artifactRetentionDays`, `acceptanceJobName`, and
+`acceptanceJobResourceId`.
 
 No Context API Container App, internet-reachable environment endpoint, client secret, storage
 account key, or exported private key is required for this initial one-shot gate.
