@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Literal, NoReturn, Protocol
 
 from athena_context.contracts import sha256_hex
 
@@ -26,6 +27,49 @@ class ArtifactPayloadTooLargeError(ArtifactWriteError):
     """The artifact exceeds the writer's configured single-upload bound."""
 
 
+class ArtifactReadError(RuntimeError):
+    """Base error for version-pinned artifact retrieval."""
+
+
+class ArtifactNotFoundError(ArtifactReadError):
+    """The exact requested Blob version does not exist."""
+
+
+class ArtifactReadTooLargeError(ArtifactReadError):
+    """The selected Blob version exceeds the reader's response bound."""
+
+
+class ArtifactVerificationError(ArtifactReadError):
+    """The selected Blob version failed content, metadata, or integrity checks."""
+
+
+def _validate_blob_name(blob_name: str) -> None:
+    if type(blob_name) is not str:
+        raise TypeError("blob_name must be an exact string")
+    if not 1 <= len(blob_name) <= 1024:
+        raise ValueError("blob_name must contain between 1 and 1024 characters")
+    segments = blob_name.split("/")
+    if (
+        len(segments) > 64
+        or any(
+            not segment
+            or len(segment) > 255
+            or _BLOB_SEGMENT_PATTERN.fullmatch(segment) is None
+            for segment in segments
+        )
+    ):
+        raise ValueError("blob_name must be a bounded lowercase relative artifact path")
+
+
+def _validate_sha256(field_name: str, digest: str) -> None:
+    if type(digest) is not str or _SHA256_PATTERN.fullmatch(digest) is None:
+        raise ValueError(f"{field_name} must be a lowercase sha256 digest")
+
+
+def _reject_non_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant is not allowed: {value}")
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactMetadataHashes:
     """Fixed hash metadata persisted with an operational artifact."""
@@ -37,10 +81,8 @@ class ArtifactMetadataHashes:
     def __post_init__(self) -> None:
         for field_name in ("payload_sha256", "artifact_sha256", "semantic_sha256"):
             digest = getattr(self, field_name)
-            if digest is not None and (
-                type(digest) is not str or _SHA256_PATTERN.fullmatch(digest) is None
-            ):
-                raise ValueError(f"{field_name} must be a lowercase sha256 digest")
+            if digest is not None:
+                _validate_sha256(field_name, digest)
 
     def as_blob_metadata(self) -> dict[str, str]:
         metadata = {"payload_sha256": self.payload_sha256}
@@ -61,21 +103,7 @@ class ArtifactWriteRequest:
     hashes: ArtifactMetadataHashes
 
     def __post_init__(self) -> None:
-        if type(self.blob_name) is not str:
-            raise TypeError("blob_name must be an exact string")
-        if not 1 <= len(self.blob_name) <= 1024:
-            raise ValueError("blob_name must contain between 1 and 1024 characters")
-        segments = self.blob_name.split("/")
-        if (
-            len(segments) > 64
-            or any(
-                not segment
-                or len(segment) > 255
-                or _BLOB_SEGMENT_PATTERN.fullmatch(segment) is None
-                for segment in segments
-            )
-        ):
-            raise ValueError("blob_name must be a bounded lowercase relative artifact path")
+        _validate_blob_name(self.blob_name)
         if type(self.payload) is not bytes:
             raise TypeError("payload must be immutable bytes")
         if not self.payload:
@@ -105,20 +133,69 @@ class ArtifactWriteReceipt:
     payload_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactReadRequest:
+    """An exact immutable Blob version and the digest expected by its caller."""
+
+    blob_name: str
+    version_id: str
+    expected_payload_sha256: str
+
+    def __post_init__(self) -> None:
+        _validate_blob_name(self.blob_name)
+        if type(self.version_id) is not str:
+            raise TypeError("version_id must be an exact string")
+        if not 1 <= len(self.version_id) <= 256:
+            raise ValueError("version_id must be a non-empty bounded opaque value")
+        _validate_sha256("expected_payload_sha256", self.expected_payload_sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactReadResult:
+    """Verified JSON-media-type bytes from one exact immutable Blob version."""
+
+    container_name: str
+    blob_name: str
+    version_id: str
+    payload: bytes
+    size_bytes: int
+    content_type: ArtifactContentType
+    payload_sha256: str
+
+    def parsed_json(self) -> object:
+        return json.loads(
+            self.payload.decode("utf-8"),
+            parse_constant=_reject_non_json_constant,
+        )
+
+
 class CreateOnlyArtifactWriterPort(Protocol):
     """Capability-minimized artifact persistence: create exactly once or fail."""
 
     def create(self, request: ArtifactWriteRequest) -> ArtifactWriteReceipt: ...
 
 
+class VersionPinnedArtifactReaderPort(Protocol):
+    """Capability-minimized retrieval of one exact verified Blob version."""
+
+    def read(self, request: ArtifactReadRequest) -> ArtifactReadResult: ...
+
+
 __all__ = [
     "ArtifactAlreadyExistsError",
     "ArtifactContentType",
     "ArtifactMetadataHashes",
+    "ArtifactNotFoundError",
     "ArtifactPayloadTooLargeError",
+    "ArtifactReadError",
+    "ArtifactReadRequest",
+    "ArtifactReadResult",
+    "ArtifactReadTooLargeError",
+    "ArtifactVerificationError",
     "ArtifactWriteError",
     "ArtifactWriteReceipt",
     "ArtifactWriteRequest",
     "CreateOnlyArtifactWriterPort",
     "MAX_ARTIFACT_PAYLOAD_BYTES",
+    "VersionPinnedArtifactReaderPort",
 ]

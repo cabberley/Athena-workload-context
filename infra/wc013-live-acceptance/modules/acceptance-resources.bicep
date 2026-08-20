@@ -67,6 +67,9 @@ param artifactContainerName string
 @maxValue(146000)
 param artifactRetentionDays int
 
+@description('Object ID of the separate operator managed identity that reads exact artifact versions.')
+param operatorArtifactReaderObjectId string
+
 @description('Exact non-secret WC-007 authority digest emitted by the configuration renderer.')
 param wc007PinnedAuthorityDigest string
 
@@ -89,6 +92,7 @@ var resourceTags = union(tags, {
 })
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 
 module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
   name: 'wc013-signing-key-vault'
@@ -281,6 +285,26 @@ resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@20
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource operatorArtifactBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    artifactContainer.id,
+    operatorArtifactReaderObjectId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: artifactContainer
+  properties: {
+    principalId: operatorArtifactReaderObjectId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleDefinitionId
     )
   }
   dependsOn: [

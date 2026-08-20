@@ -64,7 +64,7 @@ revocable.
 | Binding engine | Evidence-backed cohort proposals and dynamic selectors |
 | Policy engine | Deterministic evaluation of observed state against declared intent |
 | Evidence client | Typed, bounded client for the private Azure MCP |
-| Operational artifact store | Private, versioned, create-only persistence for bounded signed evaluation artifacts |
+| Operational artifact store | Private, versioned, create-only persistence and exact-version verified retrieval for bounded signed evaluation artifacts |
 | Context MCP | Agent-safe access to published context and proposed changes |
 | Agent core | Grounded explanations using policy results and cited evidence |
 | Context Studio | Workload configuration, cohort approval, topology, findings, Copilot |
@@ -83,7 +83,7 @@ revocable.
 8. Agent-generated text never becomes an authoritative manifest without human approval.
 9. Every contextual finding cites both Azure evidence and the applicable manifest clause.
 10. Pure binding, policy, and forecasting logic remains separate from Azure and storage I/O.
-11. Operational artifacts use version-pinned immutable Blob references and create-only conditional writes.
+11. Operational artifacts use version-pinned immutable Blob references, create-only conditional writes, and exact-version hash-verifying reads.
 
 ## Relationship classes
 

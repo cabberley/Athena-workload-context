@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from urllib.parse import urlsplit
 
 import jwt
 from azure.core import MatchConditions
-from azure.core.exceptions import HttpResponseError, ResourceExistsError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceNotFoundError,
+)
 from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.keys import KeyClient
@@ -21,7 +26,12 @@ from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
     ArtifactAlreadyExistsError,
+    ArtifactNotFoundError,
     ArtifactPayloadTooLargeError,
+    ArtifactReadRequest,
+    ArtifactReadResult,
+    ArtifactReadTooLargeError,
+    ArtifactVerificationError,
     ArtifactWriteError,
     ArtifactWriteReceipt,
     ArtifactWriteRequest,
@@ -44,6 +54,9 @@ from athena_context.evidence import TrustedIngestionBinding
 
 _GUID_CLAIMS = ("tid", "oid", "sub")
 _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
+_BLOB_CONTAINER_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?"
+)
 
 
 def _production_credential(
@@ -72,6 +85,39 @@ def _minimum_datetime(
     if second is None:
         return first
     return min(first, second)
+
+
+def _validate_blob_endpoint(blob_endpoint: str) -> None:
+    if type(blob_endpoint) is not str:
+        raise TypeError("blob_endpoint must be an exact string")
+    parsed = urlsplit(blob_endpoint)
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+        or hostname is None
+        or re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", hostname)
+        is None
+    ):
+        raise ValueError("blob_endpoint must be an Azure public-cloud Blob HTTPS origin")
+
+
+def _validate_container_name(container_name: str) -> None:
+    if (
+        type(container_name) is not str
+        or _BLOB_CONTAINER_PATTERN.fullmatch(container_name) is None
+        or "--" in container_name
+    ):
+        raise ValueError("container_name must be a valid lowercase Azure Blob container")
+
+
+def _reject_non_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant is not allowed: {value}")
 
 
 class KeyVaultRsaSigner:
@@ -242,17 +288,8 @@ class AzureBlobCreateOnlyArtifactWriter:
         managed_identity_client_id: str,
         max_payload_bytes: int = MAX_ARTIFACT_PAYLOAD_BYTES,
     ) -> None:
-        self._validate_blob_endpoint(blob_endpoint)
-        if (
-            type(container_name) is not str
-            or re.fullmatch(
-                r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?",
-                container_name,
-            )
-            is None
-            or "--" in container_name
-        ):
-            raise ValueError("container_name must be a valid lowercase Azure Blob container")
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
         if (
             type(max_payload_bytes) is not int
             or not 1 <= max_payload_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
@@ -271,26 +308,6 @@ class AzureBlobCreateOnlyArtifactWriter:
         self._container = service.get_container_client(container_name)
         self._container_name = container_name
         self._max_payload_bytes = max_payload_bytes
-
-    @staticmethod
-    def _validate_blob_endpoint(blob_endpoint: str) -> None:
-        if type(blob_endpoint) is not str:
-            raise TypeError("blob_endpoint must be an exact string")
-        parsed = urlsplit(blob_endpoint)
-        hostname = parsed.hostname
-        if (
-            parsed.scheme != "https"
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.port is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in ("", "/")
-            or hostname is None
-            or re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", hostname)
-            is None
-        ):
-            raise ValueError("blob_endpoint must be an Azure public-cloud Blob HTTPS origin")
 
     def create(self, request: ArtifactWriteRequest) -> ArtifactWriteReceipt:
         if type(request) is not ArtifactWriteRequest:
@@ -342,6 +359,146 @@ class AzureBlobCreateOnlyArtifactWriter:
             last_modified=last_modified,
             size_bytes=size_bytes,
             payload_sha256=request.hashes.payload_sha256,
+        )
+
+
+class AzureBlobVersionPinnedArtifactReader:
+    """Read one exact Blob version and return it only after bounded verification."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+        max_payload_bytes: int = MAX_ARTIFACT_PAYLOAD_BYTES,
+    ) -> None:
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
+        if (
+            type(max_payload_bytes) is not int
+            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_PAYLOAD_BYTES}"
+            )
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_get_size=max_payload_bytes + 1,
+            max_chunk_get_size=max_payload_bytes + 1,
+        )
+        self._container = service.get_container_client(container_name)
+        self._container_name = container_name
+        self._max_payload_bytes = max_payload_bytes
+
+    @staticmethod
+    def _raise_if_blob_not_found(exc: ResourceNotFoundError) -> NoReturn:
+        error_code = getattr(exc, "error_code", None)
+        normalized_code = getattr(error_code, "value", error_code)
+        if normalized_code != "BlobNotFound":
+            raise exc
+        raise ArtifactNotFoundError(
+            "the exact requested artifact Blob version does not exist"
+        ) from exc
+
+    @staticmethod
+    def _raise_if_empty_blob_range(exc: HttpResponseError) -> None:
+        error_code = getattr(exc, "error_code", None)
+        normalized_code = getattr(error_code, "value", error_code)
+        if exc.status_code == 416 and normalized_code == "InvalidRange":
+            raise ArtifactVerificationError(
+                "Blob version is empty and cannot be a JSON artifact"
+            ) from exc
+
+    def read(self, request: ArtifactReadRequest) -> ArtifactReadResult:
+        if type(request) is not ArtifactReadRequest:
+            raise TypeError("request must be an exact ArtifactReadRequest")
+        blob = self._container.get_blob_client(
+            request.blob_name,
+            version_id=request.version_id,
+        )
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=self._max_payload_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            version_id = getattr(properties, "version_id", None)
+            if type(version_id) is not str or version_id != request.version_id:
+                raise ArtifactVerificationError(
+                    "Blob response version does not match the exact requested version"
+                )
+            size = getattr(downloader, "size", None)
+            if type(size) is not int or size < 1:
+                raise ArtifactVerificationError(
+                    "Blob response omitted a valid positive content length"
+                )
+            if size > self._max_payload_bytes:
+                raise ArtifactReadTooLargeError(
+                    f"artifact payload exceeds {self._max_payload_bytes} bytes"
+                )
+            content_settings = getattr(properties, "content_settings", None)
+            content_type = getattr(content_settings, "content_type", None)
+            if content_type != "application/json":
+                raise ArtifactVerificationError(
+                    "Blob version content type is not exactly application/json"
+                )
+            metadata = getattr(properties, "metadata", None)
+            metadata_digest = (
+                metadata.get("payload_sha256")
+                if type(metadata) is dict
+                else None
+            )
+            if (
+                type(metadata_digest) is not str
+                or metadata_digest != request.expected_payload_sha256
+            ):
+                raise ArtifactVerificationError(
+                    "Blob payload hash metadata is missing or does not match the expected digest"
+                )
+            payload = downloader.readall()
+        except ResourceNotFoundError as exc:
+            self._raise_if_blob_not_found(exc)
+        except HttpResponseError as exc:
+            self._raise_if_empty_blob_range(exc)
+            raise
+
+        if type(payload) is not bytes:
+            raise ArtifactVerificationError("Blob download did not return immutable bytes")
+        if len(payload) != size or len(payload) > self._max_payload_bytes:
+            raise ArtifactVerificationError(
+                "Blob download length does not match the bounded response metadata"
+            )
+        computed_digest = sha256_hex(payload)
+        if (
+            computed_digest != request.expected_payload_sha256
+            or computed_digest != metadata_digest
+        ):
+            raise ArtifactVerificationError(
+                "Blob payload bytes do not match the expected SHA-256 digest"
+            )
+        try:
+            json.loads(
+                payload.decode("utf-8"),
+                parse_constant=_reject_non_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ArtifactVerificationError(
+                "Blob payload is not valid UTF-8 JSON"
+            ) from exc
+        return ArtifactReadResult(
+            container_name=self._container_name,
+            blob_name=request.blob_name,
+            version_id=request.version_id,
+            payload=payload,
+            size_bytes=size,
+            content_type="application/json",
+            payload_sha256=computed_digest,
         )
 
 
@@ -578,6 +735,7 @@ class DefaultAzureCredentialTrustedIngestionSigner:
 
 __all__ = [
     "AzureBlobCreateOnlyArtifactWriter",
+    "AzureBlobVersionPinnedArtifactReader",
     "AzureTableAttemptReplayGuard",
     "DefaultAzureCredentialTrustedIngestionSigner",
     "KeyVaultRsaSigner",
