@@ -17,7 +17,7 @@ from athena_context.artifacts import (
 from athena_context.azure_adapters import AzureBlobVersionPinnedArtifactReader
 from athena_context.contracts import sha256_hex
 
-VERSION_ID = "2026-08-20T08:00:00.0000000Z"
+VERSION_ID = "2026-08-20T23:50:41.2983616Z"
 
 
 class _Credential:

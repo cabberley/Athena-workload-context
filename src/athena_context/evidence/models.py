@@ -155,7 +155,7 @@ class CollectorTrustConfiguration(AthenaBaseModel):
 
 class EvidenceTransportRequest(AthenaBaseModel):
     attempt_id: AttemptIdentifier = Field(..., alias="attemptId")
-    attempt_started_at: datetime = Field(..., alias="attemptStartedAt")
+    attempt_started_at: UtcDateTime = Field(..., alias="attemptStartedAt")
     tool_name: ToolName = Field(..., alias="toolName")
     tool_version: ToolVersion = Field(..., alias="toolVersion")
     expected_record_type: Literal["resource"] = Field(

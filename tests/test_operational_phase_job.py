@@ -31,6 +31,8 @@ from wc013_support import build_harness
 
 SYNTHETIC_KEY_ID = "synthetic-key://athena-argus-demo/rs256-v1"
 RUN_ID = "synthetic-run-001"
+RECEIPT_VERSION_ID = "2026-08-20T23:50:41.2983616Z"
+COMPLETION_INDEX_VERSION_ID = "2026-08-20T23:50:43.2983616Z"
 
 
 def _model_digest(model: BaseModel) -> str:
@@ -161,12 +163,12 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
 
     receipt_reference = VersionPinnedBlobReference(
         name=f"runs/{RUN_ID}/inputs/baseline/fault-receipt.json",
-        version="version-0001",
+        version=RECEIPT_VERSION_ID,
         contentDigest="sha256:" + "3" * 64,
     )
     completion_index_reference = VersionPinnedBlobReference(
         name=f"runs/{RUN_ID}/baseline/phase-completion-index.json",
-        version="version-0002",
+        version=COMPLETION_INDEX_VERSION_ID,
         contentDigest="sha256:" + "4" * 64,
     )
     prepared = SimpleNamespace(

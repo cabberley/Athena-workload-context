@@ -4,7 +4,7 @@ import base64
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +29,8 @@ from athena_context.contracts import (
     DemoFaultRunReceipt,
     EvidenceSnapshot,
     ManifestFinding,
+    OperationalPhaseArtifactReference,
+    OperationalPhaseCompletionIndex,
     OperationalPhaseConfiguration,
     OperationalPhaseConfigurations,
     OperationalPhaseDeliveryBundle,
@@ -37,10 +39,12 @@ from athena_context.contracts import (
     OperationalPhaseSelector,
     ResourceEvidenceRecord,
     VersionPinnedBlobReference,
+    build_operational_phase_completion_index,
     build_operational_phase_delivery_bundle,
     build_operational_phase_reference_handoff,
     canonicalize_json,
     compute_artifact_digest,
+    operational_phase_artifact_names,
     sha256_hex,
 )
 from athena_context.contracts.manifest import FindingVerdict
@@ -1001,6 +1005,92 @@ def test_recovered_rejects_missing_prior_index() -> None:
             phase="recovered",
             receipt=reference,
         )
+
+
+def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -> None:
+    receipt_version = "2026-08-20T23:50:41.2983616Z"
+    previous_version = "2026-08-20T23:50:42.2983616Z"
+    artifact_versions = (
+        "2026-08-20T23:50:43.2983616Z",
+        "2026-08-20T23:50:44.2983616Z",
+        "2026-08-20T23:50:45.2983616Z",
+        "2026-08-20T23:50:46.2983616Z",
+    )
+    artifact_names = operational_phase_artifact_names(RUN_ID, "faulted")
+    kinds: tuple[
+        Literal[
+            "evaluationResult",
+            "evidenceSnapshot",
+            "argusPresentation",
+            "presentationAttestation",
+        ],
+        ...,
+    ] = (
+        "evaluationResult",
+        "evidenceSnapshot",
+        "argusPresentation",
+        "presentationAttestation",
+    )
+    digests = (
+        "sha256:" + "4" * 64,
+        "sha256:" + "5" * 64,
+        "sha256:" + "6" * 64,
+        "sha256:" + "7" * 64,
+    )
+    artifacts = tuple(
+        OperationalPhaseArtifactReference(
+            kind=kind,
+            name=name,
+            version=version,
+            contentDigest=digest,
+        )
+        for kind, name, version, digest in zip(
+            kinds,
+            artifact_names[:4],
+            artifact_versions,
+            digests,
+            strict=True,
+        )
+    )
+    index = build_operational_phase_completion_index(
+        run_id=RUN_ID,
+        phase="faulted",
+        bundle_digest="sha256:" + "1" * 64,
+        configuration_digest="sha256:" + "2" * 64,
+        receipt=VersionPinnedBlobReference(
+            name=_receipt_name(RUN_ID, "faulted"),
+            version=receipt_version,
+            contentDigest="sha256:" + "3" * 64,
+        ),
+        previous_phase_index=VersionPinnedBlobReference(
+            name=operational_phase_artifact_names(RUN_ID, "baseline")[4],
+            version=previous_version,
+            contentDigest="sha256:" + "8" * 64,
+        ),
+        previous_phase_index_digest="sha256:" + "9" * 64,
+        lineage_digest="sha256:" + "a" * 64,
+        attempt_id="attempt-000000000001",
+        snapshot_id="snap-000000000001",
+        idempotency_key_digest="sha256:" + "b" * 64,
+        receipt_action="inject",
+        receipt_started_at=datetime(2025, 1, 2, 12, 0, tzinfo=UTC),
+        receipt_completed_at=datetime(2025, 1, 2, 12, 0, 1, tzinfo=UTC),
+        receipt_before_power_state="PowerState/running",
+        receipt_after_power_state="PowerState/deallocated",
+        result_digest="sha256:" + "c" * 64,
+        snapshot_artifact_digest="sha256:" + "d" * 64,
+        snapshot_semantic_digest="sha256:" + "e" * 64,
+        presentation_digest="sha256:" + "f" * 64,
+        artifacts=artifacts,
+    )
+
+    canonical = index.canonical_json()
+
+    assert receipt_version in canonical
+    assert previous_version in canonical
+    for version in artifact_versions:
+        assert version in canonical
+    assert OperationalPhaseCompletionIndex.model_validate_json(canonical) == index
 
 
 def test_recovered_rejects_different_target_lineage(

@@ -50,20 +50,21 @@ def _normalize_datetime_string(value: str) -> str:
             )
         return value
     fractional_seconds = lexical_match.group(1)
-    if (
-        fractional_seconds is not None
-        and len(fractional_seconds) > 3
-        and any(digit != "0" for digit in fractional_seconds[3:])
-    ):
-        raise AthenaValidationError(
-            "timestamp precision must be exactly representable in milliseconds"
-        )
+    if fractional_seconds is not None and len(fractional_seconds) > 3:
+        if len(fractional_seconds) > 6:
+            return value
+        if any(digit != "0" for digit in fractional_seconds[3:]):
+            return value
     candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
         parsed = datetime.fromisoformat(candidate)
     except ValueError:
         return value
-    utc_value = parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    utc_value = (
+        parsed.astimezone(UTC)
+        if parsed.tzinfo is not None
+        else parsed.replace(tzinfo=UTC)
+    )
     if utc_value.microsecond % 1000:
         raise AthenaValidationError(
             "timestamp precision must be exactly representable in milliseconds"
