@@ -32,6 +32,7 @@ from athena_context.contracts import (
     compute_artifact_digest,
 )
 from athena_context.contracts.models import (
+    EvidenceEnvelopeResolver,
     EvidenceSnapshot,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
@@ -80,6 +81,21 @@ class _PreparedPhaseVerificationContext:
     def __init__(self, prepared: PreparedWc013LiveAcceptance) -> None:
         self._prepared = prepared
         self._verified_result: DemoEvaluationResult | None = None
+        self._envelope_resolver: EvidenceEnvelopeResolver | None = None
+
+    def bind_live_result(
+        self,
+        live_result: Wc013LiveAcceptanceResult,
+    ) -> None:
+        if live_result.envelope_resolver is None:
+            raise OperationalPhaseRunnerError(
+                "trusted phase result did not retain its source envelope resolver"
+            )
+        if self._envelope_resolver is not None:
+            raise OperationalPhaseRunnerError(
+                "trusted phase source envelope resolver was already bound"
+            )
+        self._envelope_resolver = live_result.envelope_resolver
 
     def verify_result(self, result: DemoEvaluationResult) -> DemoEvaluationResult:
         verify_wc013_live_result(self._prepared, result)
@@ -95,6 +111,11 @@ class _PreparedPhaseVerificationContext:
         if verified_result is None or verified_result.snapshot is not snapshot:
             raise OperationalPhaseRunnerError(
                 "trusted phase snapshot is not bound to the exact verified result"
+            )
+        envelope_resolver = self._envelope_resolver
+        if envelope_resolver is None:
+            raise OperationalPhaseRunnerError(
+                "trusted phase source envelope resolver is unavailable"
             )
         publication = SnapshotPublicationRecord(
             snapshot_id=snapshot.snapshot_id,
@@ -132,6 +153,7 @@ class _PreparedPhaseVerificationContext:
             identity_evidence=snapshot.identity_evidence,
             key_resolver=resolve_key,
             trusted_key_anchor=self._prepared.trusted_key_anchor,
+            envelope_resolver=envelope_resolver,
         )
 
 
@@ -473,6 +495,7 @@ def _temporary_environment(values: Mapping[str, str]) -> Iterator[None]:
 
 def _wc013_runner(
     prepared_phase: _PreparedOperationalPhase,
+    verification_context: _PreparedPhaseVerificationContext,
 ) -> Wc013PhaseRunner:
     expected_plan = prepared_phase.prepared.plan
     expected_path = prepared_phase.configuration_path
@@ -487,9 +510,11 @@ def _wc013_runner(
                 "selected phase plan changed during production composition"
             )
         with _temporary_environment(runtime_environment):
-            return run_prepared_wc013_live_acceptance(
+            live_result = run_prepared_wc013_live_acceptance(
                 prepared_phase.prepared
             )
+        verification_context.bind_live_result(live_result)
+        return live_result
 
     return run_selected_plan
 
@@ -548,7 +573,7 @@ def run_operational_phase_job(
             trusted_key_anchor=prepared_phase.prepared.trusted_key_anchor,
             managed_identity_client_id=managed_identity_client_id,
         ),
-        wc013_runner=_wc013_runner(prepared_phase),
+        wc013_runner=_wc013_runner(prepared_phase, verification_context),
     )
     handoff = build_operational_phase_reference_handoff(
         run_id=completed.run_id,

@@ -25,9 +25,14 @@ from athena_context.contracts import (
     canonicalize_json,
     compute_artifact_digest,
 )
-from athena_context.live_acceptance import Wc013LiveAcceptancePlan, wc013_configuration_template
+from athena_context.fixtures import CANONICAL_PRIVATE_KEY
+from athena_context.live_acceptance import (
+    Wc013LiveAcceptancePlan,
+    Wc013LiveAcceptanceResult,
+    wc013_configuration_template,
+)
 from athena_context.operational_phase_runner import OperationalPhaseRunnerError
-from wc013_support import build_harness
+from wc013_support import PUBLISHER, build_harness, key_anchor, key_resolver
 
 SYNTHETIC_KEY_ID = "synthetic-key://athena-argus-demo/rs256-v1"
 RUN_ID = "synthetic-run-001"
@@ -242,7 +247,11 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
         observed["runtime_environment"] = {
             name: os.getenv(name) for name in expected_environment
         }
-        return SimpleNamespace(result=None, snapshot_path=None)
+        return SimpleNamespace(
+            result=None,
+            snapshot_path=None,
+            envelope_resolver=lambda *_args: None,
+        )
 
     def fake_run_operational_phase(
         *,
@@ -356,6 +365,106 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
         completion_index=completion_index_reference,
     )
     assert result.handoff == handoff
+
+
+def test_phase_snapshot_verification_uses_exact_source_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness()
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "phase-job-envelope-verification",
+        harness.command,
+    )
+    public_key = CANONICAL_PRIVATE_KEY.public_key()
+    anchor = key_anchor(public_key)
+    prepared = SimpleNamespace(
+        trusted_key_anchor=anchor,
+        trusted_key_record=key_resolver(public_key)(anchor),
+    )
+    context = phase_job_module._PreparedPhaseVerificationContext(prepared)  # noqa: SLF001
+    monkeypatch.setattr(
+        phase_job_module,
+        "verify_wc013_live_result",
+        lambda _prepared, _result: None,
+    )
+    context.bind_live_result(
+        Wc013LiveAcceptanceResult(
+            result=result,
+            snapshot_path=None,
+            envelope_resolver=harness.store.resolve_envelope,
+        )
+    )
+    context.verify_result(result)
+
+    assert (
+        context.verify_snapshot(result.snapshot, result.evaluated_at)
+        is result.snapshot
+    )
+
+
+def test_phase_snapshot_verification_fails_without_source_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness()
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "phase-job-missing-envelope-verification",
+        harness.command,
+    )
+    public_key = CANONICAL_PRIVATE_KEY.public_key()
+    anchor = key_anchor(public_key)
+    prepared = SimpleNamespace(
+        trusted_key_anchor=anchor,
+        trusted_key_record=key_resolver(public_key)(anchor),
+    )
+    context = phase_job_module._PreparedPhaseVerificationContext(prepared)  # noqa: SLF001
+    monkeypatch.setattr(
+        phase_job_module,
+        "verify_wc013_live_result",
+        lambda _prepared, _result: None,
+    )
+    context.verify_result(result)
+
+    with pytest.raises(
+        OperationalPhaseRunnerError,
+        match="source envelope resolver is unavailable",
+    ):
+        context.verify_snapshot(result.snapshot, result.evaluated_at)
+
+
+def test_phase_snapshot_verification_rejects_wrong_source_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_harness()
+    result = harness.service.evaluate(
+        PUBLISHER,
+        "phase-job-wrong-envelope-verification",
+        harness.command,
+    )
+    public_key = CANONICAL_PRIVATE_KEY.public_key()
+    anchor = key_anchor(public_key)
+    prepared = SimpleNamespace(
+        trusted_key_anchor=anchor,
+        trusted_key_record=key_resolver(public_key)(anchor),
+    )
+    context = phase_job_module._PreparedPhaseVerificationContext(prepared)  # noqa: SLF001
+    monkeypatch.setattr(
+        phase_job_module,
+        "verify_wc013_live_result",
+        lambda _prepared, _result: None,
+    )
+    context.bind_live_result(
+        Wc013LiveAcceptanceResult(
+            result=result,
+            snapshot_path=None,
+            envelope_resolver=lambda *_args: None,
+        )
+    )
+    context.verify_result(result)
+
+    with pytest.raises(ValueError, match="envelope"):
+        context.verify_snapshot(result.snapshot, result.evaluated_at)
 
 
 def test_phase_job_environment_requires_exact_reference_sets() -> None:

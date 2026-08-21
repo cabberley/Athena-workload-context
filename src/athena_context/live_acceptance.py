@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
@@ -59,7 +59,10 @@ from athena_context.contracts import (
     resolve_manifest_profile,
     sha256_hex,
 )
-from athena_context.contracts.models import verify_snapshot_attestation_signature
+from athena_context.contracts.models import (
+    EvidenceEnvelopeResolver,
+    verify_snapshot_attestation_signature,
+)
 from athena_context.evidence import CollectorTrustConfiguration
 from athena_context.evidence.models import (
     AZURE_RESOURCE_INVENTORY_TOOL,
@@ -296,6 +299,11 @@ class PreparedWc013LiveAcceptance:
 class Wc013LiveAcceptanceResult:
     result: DemoEvaluationResult
     snapshot_path: Path | None
+    envelope_resolver: EvidenceEnvelopeResolver | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 class Wc013LiveAcceptanceError(RuntimeError):
@@ -967,12 +975,42 @@ def run_prepared_wc013_live_acceptance(
 ) -> Wc013LiveAcceptanceResult:
     _require_runtime_environment(prepared)
     try:
-        service = _compose_wc013_one_shot_service(prepared)
+        service, context_service = _compose_wc013_one_shot_service(prepared)
         result = service.evaluate(
             prepared.authority.publisher,
             prepared.plan.idempotency_key,
             prepared.plan.evaluation_command,
         )
+        stored_evaluations = tuple(
+            artifact
+            for artifact in context_service.list_demo_evaluations(
+                prepared.authority.context_reader
+            )
+            if artifact.snapshot_id == result.snapshot.snapshot_id
+            and artifact.envelope_attempt_id
+            == prepared.plan.evaluation_command.attempt_id
+        )
+        if len(stored_evaluations) != 1:
+            raise Wc013LiveAcceptanceError(
+                "the exact trusted source envelope could not be resolved"
+            )
+        stored_evaluation = stored_evaluations[0]
+
+        def resolve_envelope(
+            attempt_id: str,
+            kind: Literal["response", "failure"],
+            digest: str,
+        ) -> object | None:
+            envelope = stored_evaluation.envelope
+            return (
+                envelope.payload()
+                if (
+                    attempt_id == stored_evaluation.envelope_attempt_id
+                    and kind == envelope.kind
+                    and digest == envelope.digest
+                )
+                else None
+            )
     except Exception as exc:
         exception_types: list[str] = []
         safe_causes: list[str] = []
@@ -993,7 +1031,11 @@ def run_prepared_wc013_live_acceptance(
     written_path = None
     if snapshot_output is not None:
         written_path = _write_immutable_snapshot(snapshot_output, result)
-    return Wc013LiveAcceptanceResult(result=result, snapshot_path=written_path)
+    return Wc013LiveAcceptanceResult(
+        result=result,
+        snapshot_path=written_path,
+        envelope_resolver=resolve_envelope,
+    )
 
 
 def _safe_validation_failure_pointers(error: ValidationError) -> str:
@@ -1046,7 +1088,7 @@ def _require_runtime_environment(
 
 def _compose_wc013_one_shot_service(
     prepared: PreparedWc013LiveAcceptance,
-) -> DemoEvaluationService:
+) -> tuple[DemoEvaluationService, ContextService]:
     plan = prepared.plan
     authority = prepared.authority
     clock = _SystemClock()
@@ -1117,7 +1159,7 @@ def _compose_wc013_one_shot_service(
         key_resolver=key_resolver,
         trusted_key_anchor=prepared.trusted_key_anchor,
     )
-    return DemoEvaluationService.from_dependencies(
+    service = DemoEvaluationService.from_dependencies(
         context_service=context_service,
         dependencies=DemoEvaluationDependencies(
             deployment_configuration=configuration_port,
@@ -1130,6 +1172,7 @@ def _compose_wc013_one_shot_service(
             context_reader_actor=authority.context_reader,
         ),
     )
+    return service, context_service
 
 
 def verify_wc013_live_result(
