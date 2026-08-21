@@ -532,6 +532,11 @@ def run_operational_phase(
             presentation,
             signer=signer,
         )
+    except AthenaValidationError as exc:
+        raise OperationalPhaseRunnerError(
+            "trusted phase verification or presentation signing failed closed: "
+            f"{exc}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - verification and signing fail closed.
         raise OperationalPhaseRunnerError(
             "trusted phase verification or presentation signing failed closed"
