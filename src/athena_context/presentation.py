@@ -23,7 +23,6 @@ from athena_context.contracts.common import (
 from athena_context.contracts.manifest import ManifestFinding
 from athena_context.contracts.models import (
     EvidenceItemRef,
-    EvidenceSnapshot,
     ResourceEvidenceRecord,
 )
 from athena_context.contracts.presentation import (
@@ -60,7 +59,6 @@ class PresentationSignatureVerifier(Protocol):
 _VERIFIED_RESULT_MARKER = object()
 _ZERO_DIGEST = "sha256:" + "0" * 64
 _WEB_RESOURCE_TYPE = "microsoft.compute/virtualmachines"
-_WEB_ROLE = "web-service"
 _WEB_OPERATIONAL_CLAUSE_ID = "web-service-operational-state"
 
 
@@ -212,30 +210,9 @@ def _resource_group_and_name(resource_id: str) -> tuple[str, str]:
     return parts[resource_group_index], parts[provider_index + 2]
 
 
-def _web_records(snapshot: EvidenceSnapshot) -> tuple[ResourceEvidenceRecord, ...]:
-    records = tuple(
-        sorted(
-            (
-                record
-                for record in snapshot.evidence_records
-                if isinstance(record, ResourceEvidenceRecord)
-                and record.resource_type.casefold() == _WEB_RESOURCE_TYPE
-                and record.tags.workload_role == _WEB_ROLE
-            ),
-            key=lambda record: record.resource_id.casefold(),
-        )
-    )
-    if len(records) < 2:
-        raise AthenaValidationError(
-            "athena-web-node-fault.v1 requires at least two web-service VM records"
-        )
-    return records
-
-
 def _operational_finding(
     result: DemoEvaluationResult,
-    web_records: tuple[ResourceEvidenceRecord, ...],
-) -> ManifestFinding:
+) -> tuple[ManifestFinding, tuple[ResourceEvidenceRecord, ...]]:
     findings = tuple(
         finding
         for finding in result.findings
@@ -273,7 +250,7 @@ def _operational_finding(
         if isinstance(record, ResourceEvidenceRecord):
             records_by_digest.setdefault(record.item_digest, []).append(record)
 
-    cited_digests: set[str] = set()
+    cited_records: list[ResourceEvidenceRecord] = []
     for reference in finding.evidence_refs:
         if not isinstance(reference, EvidenceItemRef):
             raise AthenaValidationError(
@@ -289,14 +266,25 @@ def _operational_finding(
             raise AthenaValidationError(
                 "operationalState finding citation is ambiguous or unresolved"
             )
-        cited_digests.add(matching_records[0].item_digest)
+        record = matching_records[0]
+        if record.resource_type.casefold() != _WEB_RESOURCE_TYPE:
+            raise AthenaValidationError(
+                "operationalState finding must cite only Azure virtual machines"
+            )
+        cited_records.append(record)
 
-    expected_digests = {record.item_digest for record in web_records}
-    if cited_digests != expected_digests:
-        raise AthenaValidationError(
-            "operationalState finding must cite every exact web-service VM record"
+    web_records = tuple(
+        sorted(
+            cited_records,
+            key=lambda record: record.resource_id.casefold(),
         )
-    return finding
+    )
+    if len(web_records) < 2:
+        raise AthenaValidationError(
+            "operationalState finding must cite every exact web-service VM record; "
+            "at least two are required"
+        )
+    return finding, web_records
 
 
 def _validate_receipt_and_phase(
@@ -411,8 +399,7 @@ def project_argus_presentation(
     """Project verified Athena evidence into the frozen synthetic-safe ARGUS shape."""
 
     result = _require_verified_result(verified)
-    web_records = _web_records(result.snapshot)
-    finding = _operational_finding(result, web_records)
+    finding, web_records = _operational_finding(result)
     running_nodes, faulted_nodes = _validate_receipt_and_phase(
         result=result,
         receipt=receipt,
