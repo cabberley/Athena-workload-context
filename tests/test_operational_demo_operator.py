@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
@@ -27,6 +28,7 @@ from athena_context.contracts import (
     EvidenceSnapshot,
     ManifestFinding,
     OperationalDemoWorkloadActionReport,
+    OperationalPhaseArtifactReference,
     OperationalPhaseCompletionIndex,
     OperationalPhaseConfiguration,
     OperationalPhaseConfigurations,
@@ -557,7 +559,11 @@ def _run_phase(
         snapshot_verifier=_snapshot_verifier(source.harness),
         signer=DeterministicPresentationSigner(CANONICAL_PRIVATE_KEY),
         wc013_runner=lambda plan, _path: (
-            Wc013LiveAcceptanceResult(result=source.result, snapshot_path=None)
+            Wc013LiveAcceptanceResult(
+                result=source.result,
+                snapshot_path=None,
+                envelope_resolver=source.harness.store.resolve_envelope,
+            )
             if plan.evaluation_command.snapshot_id == source.result.snapshot.snapshot_id
             else pytest.fail("runner selected an unreviewed plan")
         ),
@@ -631,10 +637,19 @@ def _build_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> OperatorFixture:
+    public_key = CANONICAL_PRIVATE_KEY.public_key()
+    trusted_key_anchor = wc013_support.key_anchor(public_key)
+    trusted_key_record = wc013_support.key_resolver(public_key)(
+        trusted_key_anchor
+    )
+    assert trusted_key_record is not None
     monkeypatch.setattr(
         operator_module,
         "prepare_wc013_live_acceptance_plan",
-        lambda plan, plan_path: object(),
+        lambda plan, plan_path: SimpleNamespace(
+            trusted_key_anchor=trusted_key_anchor,
+            trusted_key_record=trusted_key_record,
+        ),
     )
     monkeypatch.setattr(
         operator_module,
@@ -944,9 +959,31 @@ def _rewrite_completion_index_reference(
         return value
 
     result = fixture.phase_results[phase]
-    payload = result.completion_index.model_dump(mode="json", by_alias=True)
-    payload.update({key: _json_safe(value) for key, value in updates.items()})
-    digest_payload = {key: value for key, value in payload.items() if key != "indexDigest"}
+    source = result.completion_index
+    if "artifacts" in updates:
+        artifacts = updates["artifacts"]
+        assert isinstance(artifacts, tuple)
+        source = source.model_copy(update={"artifacts": artifacts})
+    payload = source.model_dump(mode="json", by_alias=True)
+    payload.update(
+        {
+            key: _json_safe(value)
+            for key, value in updates.items()
+            if key != "artifacts"
+        }
+    )
+    non_artifact_updates = {
+        key: value for key, value in updates.items() if key != "artifacts"
+    }
+    digest_payload = (
+        source._digest_payload()  # noqa: SLF001 - focused tamper fixture.
+        if not non_artifact_updates
+        else {
+            key: value
+            for key, value in payload.items()
+            if key != "indexDigest"
+        }
+    )
     if isinstance(payload.get("artifacts"), list):
         payload["artifacts"] = tuple(payload["artifacts"])
     payload["indexDigest"] = compute_artifact_digest(
@@ -956,6 +993,54 @@ def _rewrite_completion_index_reference(
     return fixture.store.seed(
         name=result.completion_index_reference.name,
         content=(model.canonical_json() + "\n").encode("utf-8"),
+    )
+
+
+def _replace_source_envelope_reference(
+    fixture: OperatorFixture,
+    phase: ArgusPresentationPhase,
+    *,
+    content: bytes,
+) -> VersionPinnedBlobReference:
+    result = fixture.phase_results[phase]
+    source_reference = result.completion_index.artifacts[4]
+    replacement = fixture.store.seed(
+        name=source_reference.name,
+        content=content,
+    )
+    artifacts = (
+        *result.completion_index.artifacts[:4],
+        OperationalPhaseArtifactReference(
+            kind="sourceEnvelope",
+            name=replacement.name,
+            version=replacement.version,
+            contentDigest=replacement.content_digest,
+        ),
+    )
+    return _rewrite_completion_index_reference(
+        fixture,
+        phase,
+        updates={"artifacts": artifacts},
+    )
+
+
+def _remove_source_envelope_reference(
+    fixture: OperatorFixture,
+    phase: ArgusPresentationPhase,
+) -> VersionPinnedBlobReference:
+    result = fixture.phase_results[phase]
+    payload = result.completion_index.model_dump(mode="json", by_alias=True)
+    payload["artifacts"] = payload["artifacts"][:4]
+    payload["indexDigest"] = compute_artifact_digest(
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "indexDigest"
+        }
+    )
+    return fixture.store.seed(
+        name=result.completion_index_reference.name,
+        content=(canonicalize_json(payload) + "\n").encode("utf-8"),
     )
 
 
@@ -1078,6 +1163,83 @@ def test_operator_runs_lifecycle_in_order_and_reads_exact_versions(
         for reference in expected_reads
     ]
     assert clock.sleeps == [1, 1, 1]
+
+
+def test_operator_rejects_missing_source_envelope_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture(tmp_path, monkeypatch)
+    workload, controller = _success_ports(fixture)
+    baseline = fixture.phase_results["baseline"]
+    tampered_reference = _remove_source_envelope_reference(
+        fixture,
+        "baseline",
+    )
+    controller._plans["baseline"] = PhasePlan(
+        statuses=["succeeded"],
+        handoff=build_operational_phase_reference_handoff(
+            run_id=RUN_ID,
+            phase="baseline",
+            bundle_digest=baseline.completion_index.bundle_digest,
+            completion_index=tampered_reference,
+        ),
+    )
+
+    with pytest.raises(
+        OperationalDemoOperatorError,
+        match="baseline completion index failed closed verification",
+    ):
+        run_operational_demo_operator(
+            fixture.config_path,
+            confirmation_phrase=fixture.confirmation_phrase,
+            workload_port=workload,
+            phase_job_port=controller,
+            handoff_port=controller,
+            artifact_reader=fixture.reader,
+            clock=FakeClock(),
+        )
+
+
+def test_operator_rejects_wrong_source_envelope_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture(tmp_path, monkeypatch)
+    workload, controller = _success_ports(fixture)
+    baseline = fixture.phase_results["baseline"]
+    wrong_source = fixture.phase_results["faulted"].completion_index.artifacts[4]
+    tampered_reference = _replace_source_envelope_reference(
+        fixture,
+        "baseline",
+        content=fixture.store.content(
+            wrong_source.name,
+            wrong_source.version,
+        ),
+    )
+    controller._plans["baseline"] = PhasePlan(
+        statuses=["succeeded"],
+        handoff=build_operational_phase_reference_handoff(
+            run_id=RUN_ID,
+            phase="baseline",
+            bundle_digest=baseline.completion_index.bundle_digest,
+            completion_index=tampered_reference,
+        ),
+    )
+
+    with pytest.raises(
+        OperationalDemoOperatorError,
+        match="baseline phase integrity verification failed closed",
+    ):
+        run_operational_demo_operator(
+            fixture.config_path,
+            confirmation_phrase=fixture.confirmation_phrase,
+            workload_port=workload,
+            phase_job_port=controller,
+            handoff_port=controller,
+            artifact_reader=fixture.reader,
+            clock=FakeClock(),
+        )
 
 
 def test_baseline_failure_does_not_reset(

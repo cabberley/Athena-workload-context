@@ -607,6 +607,7 @@ def _run(
             Wc013LiveAcceptanceResult(
                 result=source.result,
                 snapshot_path=None,
+                envelope_resolver=source.harness.store.resolve_envelope,
             )
             if plan.evaluation_command.snapshot_id
             == source.result.snapshot.snapshot_id
@@ -1015,6 +1016,7 @@ def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -
         "2026-08-20T23:50:44.2983616Z",
         "2026-08-20T23:50:45.2983616Z",
         "2026-08-20T23:50:46.2983616Z",
+        "2026-08-20T23:50:47.2983616Z",
     )
     artifact_names = operational_phase_artifact_names(RUN_ID, "faulted")
     kinds: tuple[
@@ -1023,6 +1025,7 @@ def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -
             "evidenceSnapshot",
             "argusPresentation",
             "presentationAttestation",
+            "sourceEnvelope",
         ],
         ...,
     ] = (
@@ -1030,12 +1033,14 @@ def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -
         "evidenceSnapshot",
         "argusPresentation",
         "presentationAttestation",
+        "sourceEnvelope",
     )
     digests = (
         "sha256:" + "4" * 64,
         "sha256:" + "5" * 64,
         "sha256:" + "6" * 64,
         "sha256:" + "7" * 64,
+        "sha256:" + "8" * 64,
     )
     artifacts = tuple(
         OperationalPhaseArtifactReference(
@@ -1046,7 +1051,7 @@ def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -
         )
         for kind, name, version, digest in zip(
             kinds,
-            artifact_names[:4],
+            (*artifact_names[:4], artifact_names[5]),
             artifact_versions,
             digests,
             strict=True,
@@ -1065,9 +1070,9 @@ def test_completion_index_canonicalization_preserves_exact_azure_version_ids() -
         previous_phase_index=VersionPinnedBlobReference(
             name=operational_phase_artifact_names(RUN_ID, "baseline")[4],
             version=previous_version,
-            contentDigest="sha256:" + "8" * 64,
+            contentDigest="sha256:" + "9" * 64,
         ),
-        previous_phase_index_digest="sha256:" + "9" * 64,
+        previous_phase_index_digest="sha256:" + "0" * 64,
         lineage_digest="sha256:" + "a" * 64,
         attempt_id="attempt-000000000001",
         snapshot_id="snap-000000000001",
@@ -1388,6 +1393,7 @@ def test_cli_writes_phase_reference_handoff(
             Wc013LiveAcceptanceResult(
                 result=baseline.result,
                 snapshot_path=None,
+                envelope_resolver=baseline.harness.store.resolve_envelope,
             )
             if plan.evaluation_command.snapshot_id
             == baseline.result.snapshot.snapshot_id

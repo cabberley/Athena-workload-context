@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -14,6 +14,11 @@ from athena_context.contracts.common import (
     canonicalize_json,
     compute_artifact_digest,
     sha256_hex,
+)
+from athena_context.contracts.models import (
+    EvidenceEnvelopeResolver,
+    compute_failure_envelope_digest,
+    compute_response_envelope_digest,
 )
 from athena_context.contracts.operational_phase import (
     OperationalArtifactKind,
@@ -408,7 +413,7 @@ def _validate_written_artifacts(
     requests: tuple[CreateOnlyArtifact, ...],
     references: tuple[VersionPinnedBlobReference, ...],
 ) -> tuple[OperationalPhaseArtifactReference, ...]:
-    if len(references) != len(requests):
+    if len(requests) != 5 or len(references) != len(requests):
         raise OperationalPhaseRunnerError(
             "create-only writer returned an incomplete artifact set"
         )
@@ -417,10 +422,11 @@ def _validate_written_artifacts(
         "evidenceSnapshot",
         "argusPresentation",
         "presentationAttestation",
+        "sourceEnvelope",
     )
     output: list[OperationalPhaseArtifactReference] = []
     for kind, request, reference in zip(
-        kinds,
+        kinds[: len(requests)],
         requests,
         references,
         strict=True,
@@ -441,6 +447,49 @@ def _validate_written_artifacts(
             )
         )
     return tuple(output)
+
+
+def _source_envelope_artifact(
+    *,
+    name: str,
+    result: DemoEvaluationResult,
+    envelope_resolver: EvidenceEnvelopeResolver | None,
+) -> CreateOnlyArtifact:
+    if envelope_resolver is None:
+        raise OperationalPhaseRunnerError(
+            "trusted phase result did not retain its source envelope resolver"
+        )
+    attempt = result.snapshot.collector_attempts[0]
+    if attempt.attempt_type == "successResponse":
+        kind: Literal["response", "failure"] = "response"
+        expected_digest = attempt.response_digest
+        digest = compute_response_envelope_digest
+    elif attempt.attempt_type == "failedResponse":
+        kind = "failure"
+        expected_digest = attempt.failure_digest
+        digest = compute_failure_envelope_digest
+    else:
+        raise OperationalPhaseRunnerError(
+            "trusted phase result did not retain a digest-covered source envelope"
+        )
+    try:
+        envelope = envelope_resolver(
+            attempt.attempt_id,
+            kind,
+            expected_digest,
+        )
+        if envelope is None or digest(envelope) != expected_digest:
+            raise OperationalPhaseRunnerError(
+                "trusted phase source envelope did not match the verified snapshot"
+            )
+        content = _canonical_artifact(canonicalize_json(envelope))
+    except OperationalPhaseRunnerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the resolver is a trust boundary.
+        raise OperationalPhaseRunnerError(
+            "trusted phase source envelope could not be retained"
+        ) from exc
+    return _artifact_request(name, content)
 
 
 def run_operational_phase(
@@ -563,12 +612,18 @@ def run_operational_phase(
     attestation_content = _canonical_artifact(
         attestation.canonical_json()
     )
-    artifact_requests = (
+    base_artifact_requests = (
         _artifact_request(names[0], result_content),
         _artifact_request(names[1], snapshot_content),
         _artifact_request(names[2], presentation_content),
         _artifact_request(names[3], attestation_content),
     )
+    source_envelope_artifact = _source_envelope_artifact(
+        name=names[5],
+        result=result,
+        envelope_resolver=accepted.envelope_resolver,
+    )
+    artifact_requests = (*base_artifact_requests, source_envelope_artifact)
     try:
         written = artifact_writer.create_only(artifact_requests)
     except Exception as exc:  # noqa: BLE001 - writer implementations are untrusted ports.

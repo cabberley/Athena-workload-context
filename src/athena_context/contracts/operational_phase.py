@@ -27,7 +27,7 @@ OPERATIONAL_PHASE_DELIVERY_SCHEMA_VERSION = (
 )
 OPERATIONAL_PHASE_INPUTS_SCHEMA_VERSION = "athena.operationalPhaseInputs.v1"
 OPERATIONAL_PHASE_COMPLETION_INDEX_SCHEMA_VERSION = (
-    "athena.operationalPhaseCompletionIndex.v1"
+    "athena.operationalPhaseCompletionIndex.v2"
 )
 
 type OperationalArtifactKind = Literal[
@@ -35,6 +35,7 @@ type OperationalArtifactKind = Literal[
     "evidenceSnapshot",
     "argusPresentation",
     "presentationAttestation",
+    "sourceEnvelope",
 ]
 type ReceiptAction = Literal["inject", "status", "reset"]
 type ReceiptPowerState = Literal[
@@ -304,7 +305,7 @@ class OperationalPhaseArtifactReference(VersionPinnedBlobReference):
 
 class OperationalPhaseCompletionIndex(_StrictOperationalContract):
     schema_version: Literal[
-        "athena.operationalPhaseCompletionIndex.v1"
+        "athena.operationalPhaseCompletionIndex.v2"
     ] = Field(alias="schemaVersion")
     scenario_id: Literal["athena-web-node-fault.v1"] = Field(alias="scenarioId")
     run_id: str = Field(alias="runId", pattern=_RUN_ID_PATTERN)
@@ -356,7 +357,7 @@ class OperationalPhaseCompletionIndex(_StrictOperationalContract):
     artifacts: tuple[
         OperationalPhaseArtifactReference,
         ...,
-    ] = Field(min_length=4, max_length=4)
+    ] = Field(min_length=5, max_length=5)
     index_digest: str = Field(alias="indexDigest", pattern=_DIGEST_PATTERN)
 
     def _digest_payload(self) -> dict[str, object]:
@@ -370,15 +371,20 @@ class OperationalPhaseCompletionIndex(_StrictOperationalContract):
 
     @model_validator(mode="after")
     def validate_index(self) -> OperationalPhaseCompletionIndex:
-        expected_names = operational_phase_artifact_names(
+        artifact_names = operational_phase_artifact_names(
             self.run_id,
             self.phase,
-        )[:4]
+        )
+        expected_names = (
+            *artifact_names[:4],
+            artifact_names[5],
+        )
         expected_kinds: tuple[OperationalArtifactKind, ...] = (
             "evaluationResult",
             "evidenceSnapshot",
             "argusPresentation",
             "presentationAttestation",
+            "sourceEnvelope",
         )
         if tuple(
             (artifact.kind, artifact.name)
@@ -431,7 +437,7 @@ class OperationalPhaseCompletionIndex(_StrictOperationalContract):
 def operational_phase_artifact_names(
     run_id: str,
     phase: ArgusPresentationPhase,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str]:
     if re.fullmatch(_RUN_ID_PATTERN, run_id) is None:
         raise AthenaValidationError("runId is not a synthetic run identifier")
     prefix = f"runs/{run_id}/{phase}"
@@ -441,6 +447,7 @@ def operational_phase_artifact_names(
         f"{prefix}/argus-presentation.json",
         f"{prefix}/presentation-attestation.json",
         f"{prefix}/phase-completion-index.json",
+        f"{prefix}/source-envelope.json",
     )
 
 

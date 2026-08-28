@@ -211,13 +211,16 @@ runs/<runId>/<phase>/demo-evaluation-result.json
 runs/<runId>/<phase>/evidence-snapshot.json
 runs/<runId>/<phase>/argus-presentation.json
 runs/<runId>/<phase>/presentation-attestation.json
+runs/<runId>/<phase>/source-envelope.json
 runs/<runId>/<phase>/phase-completion-index.json
 ```
 
-The first four objects are created together. Their exact names, immutable versions, and byte hashes
-are then placed in `athena.operationalPhaseCompletionIndex.v1`. The index is written last and also
+The first five objects are created together. Their exact names, immutable versions, and byte hashes
+are then placed in `athena.operationalPhaseCompletionIndex.v2`. The index is written last and also
 contains the phase, attempt/snapshot identifiers, prior index digest, lineage digest, receipt
 version/hash, state transition labels, and authoritative result/snapshot/presentation digests.
+The external operator uses the exact source-envelope artifact as its trusted resolver when it
+re-runs snapshot evaluation validation, including digest and JSON-pointer bindings.
 
 When `--handoff-output` is supplied, the runner also writes
 `athena.operationalPhaseReferenceHandoff.v1`. That bounded file contains only:

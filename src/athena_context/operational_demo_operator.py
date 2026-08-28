@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Protocol, cast
+from typing import IO, Literal, Protocol, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -35,6 +36,9 @@ from athena_context.contracts import (
     OperationalPhaseReferenceHandoff,
     PresentationAttestation,
     ReceiptAction,
+    SnapshotPublicationRecord,
+    TrustedKeyAnchor,
+    TrustedKeyRecord,
     VersionPinnedBlobReference,
     compute_fault_lineage_digest,
     sha256_hex,
@@ -513,14 +517,6 @@ def _load_rsa_public_key(path: Path) -> rsa.RSAPublicKey:
     return public_key
 
 
-def _identity_snapshot_verifier(
-    snapshot: EvidenceSnapshot,
-    as_of: datetime,
-) -> EvidenceSnapshot:
-    del as_of
-    return snapshot
-
-
 def _identity_result_verifier(result: DemoEvaluationResult) -> DemoEvaluationResult:
     return result
 
@@ -905,6 +901,16 @@ def _snapshot_json(snapshot: EvidenceSnapshot) -> str:
     )
 
 
+def _parse_json_object(content: bytes, *, message: str) -> dict[str, object]:
+    try:
+        value = json.loads(content)
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise OperationalDemoOperatorError(message) from exc
+    if not isinstance(value, dict):
+        raise OperationalDemoOperatorError(message)
+    return cast(dict[str, object], value)
+
+
 def _verify_phase_artifacts(
     *,
     prepared: PreparedOperationalDemoOperator,
@@ -978,6 +984,10 @@ def _verify_phase_artifacts(
         )
         for reference in completion_index.artifacts
     )
+    if len(artifact_results) != 5:
+        raise OperationalDemoOperatorError(
+            f"{phase} phase artifact verification failed closed"
+        )
     result = _parse_model(
         artifact_results[0].payload,
         DemoEvaluationResult,
@@ -998,6 +1008,10 @@ def _verify_phase_artifacts(
         PresentationAttestation,
         message=f"{phase} phase artifact verification failed closed",
     )
+    source_envelope = _parse_json_object(
+        artifact_results[4].payload,
+        message=f"{phase} phase artifact verification failed closed",
+    )
     if (
         result.result_digest != completion_index.result_digest
         or result.snapshot.compatibility.artifact_digest
@@ -1015,10 +1029,87 @@ def _verify_phase_artifacts(
             phase_review.prepared,
             result,
         )
+        attempt = result.snapshot.collector_attempts[0]
+        if attempt.attempt_id != completion_index.attempt_id:
+            raise AthenaValidationError(
+                "phase source envelope attempt does not match the completion index"
+            )
+        if attempt.attempt_type == "successResponse":
+            envelope_kind: Literal["response", "failure"] = "response"
+            envelope_digest = attempt.response_digest
+        elif attempt.attempt_type == "failedResponse":
+            envelope_kind = "failure"
+            envelope_digest = attempt.failure_digest
+        else:
+            raise AthenaValidationError(
+                "phase snapshot does not contain a digest-covered source envelope"
+            )
+        publication = SnapshotPublicationRecord(
+            snapshot_id=result.snapshot.snapshot_id,
+            artifact_digest=result.snapshot.compatibility.artifact_digest,
+            semantic_digest=result.snapshot.compatibility.semantic_digest,
+            schema_version=result.snapshot.compatibility.schema_version,
+            semantic_contract_version=(
+                result.snapshot.compatibility.semantic_contract_version
+            ),
+            published_at=result.publication.published_at,
+        )
+        expected_snapshot = result.snapshot
+        key_record = phase_review.prepared.trusted_key_record
+
+        def resolve_publication(
+            snapshot_id: str,
+        ) -> SnapshotPublicationRecord | None:
+            return publication if snapshot_id == expected_snapshot.snapshot_id else None
+
+        def resolve_key(
+            anchor: TrustedKeyAnchor,
+        ) -> TrustedKeyRecord | None:
+            return (
+                key_record
+                if anchor == phase_review.prepared.trusted_key_anchor
+                else None
+            )
+
+        def resolve_envelope(
+            attempt_id: str,
+            kind: Literal["response", "failure"],
+            digest: str,
+        ) -> object | None:
+            return (
+                source_envelope
+                if (
+                    attempt_id == attempt.attempt_id
+                    and kind == envelope_kind
+                    and digest == envelope_digest
+                )
+                else None
+            )
+
+        def verify_snapshot(
+            candidate: EvidenceSnapshot,
+            as_of: datetime,
+        ) -> EvidenceSnapshot:
+            if candidate is not expected_snapshot:
+                raise AthenaValidationError(
+                    "phase snapshot is not bound to the exact verified result"
+                )
+            return candidate.validate_for_evaluation(
+                as_of=as_of,
+                expected_artifact_digest=(
+                    candidate.compatibility.artifact_digest
+                ),
+                publication_resolver=resolve_publication,
+                identity_evidence=candidate.identity_evidence,
+                key_resolver=resolve_key,
+                trusted_key_anchor=phase_review.prepared.trusted_key_anchor,
+                envelope_resolver=resolve_envelope,
+            )
+
         verified = verify_demo_evaluation_result(
             result,
             result_verifier=_identity_result_verifier,
-            snapshot_verifier=_identity_snapshot_verifier,
+            snapshot_verifier=verify_snapshot,
         )
         expected_presentation = project_argus_presentation(
             verified,
