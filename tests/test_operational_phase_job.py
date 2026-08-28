@@ -242,8 +242,13 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
         assert plan_path == config_path.resolve(strict=True)
         return prepared
 
-    def fake_run_prepared(supplied_prepared: object) -> object:
+    def fake_run_prepared(
+        supplied_prepared: object,
+        *,
+        collected_evidence: object,
+    ) -> object:
         assert supplied_prepared is prepared
+        assert collected_evidence == "precollected"
         observed["runtime_environment"] = {
             name: os.getenv(name) for name in expected_environment
         }
@@ -320,6 +325,11 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
     )
     monkeypatch.setattr(
         phase_job_module,
+        "load_precollected_evidence",
+        lambda *_args, **_kwargs: "precollected",
+    )
+    monkeypatch.setattr(
+        phase_job_module,
         "run_operational_phase",
         fake_run_operational_phase,
     )
@@ -331,6 +341,8 @@ def test_phase_job_builds_exact_inputs_and_writes_handoff(
         handoff_output_path=tmp_path / "runtime" / "baseline-handoff.json",
         artifact_blob_endpoint="https://athenareplay.blob.core.windows.net",
         artifact_container_name="operational-artifacts",
+        evidence_blob_endpoint="https://athenareplay.blob.core.windows.net",
+        evidence_container_name="collected-evidence",
         environment={
             "ATHENA_OPERATIONAL_RECEIPT_NAME": receipt_reference.name,
             "ATHENA_OPERATIONAL_RECEIPT_VERSION": receipt_reference.version,
@@ -549,6 +561,10 @@ def test_cli_operational_phase_job_emits_base64_handoff_without_paths(
             "https://athenareplay.blob.core.windows.net",
             "--artifact-container",
             "operational-artifacts",
+            "--evidence-blob-endpoint",
+            "https://athenareplay.blob.core.windows.net",
+            "--evidence-container",
+            "collected-evidence",
             "--emit-handoff-base64",
         ],
         stdout=stdout,
@@ -597,6 +613,10 @@ def test_cli_operational_phase_job_redacts_paths_on_failure(
             "https://athenareplay.blob.core.windows.net",
             "--artifact-container",
             "operational-artifacts",
+            "--evidence-blob-endpoint",
+            "https://athenareplay.blob.core.windows.net",
+            "--evidence-container",
+            "collected-evidence",
         ],
         stderr=stderr,
     )

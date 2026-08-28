@@ -42,6 +42,7 @@ from athena_context.live_acceptance import (
     PreparedWc013LiveAcceptance,
     Wc013LiveAcceptancePlan,
     Wc013LiveAcceptanceResult,
+    load_precollected_evidence,
     prepare_wc013_live_acceptance_plan,
     run_prepared_wc013_live_acceptance,
     verify_wc013_live_result,
@@ -465,13 +466,6 @@ def _wc013_runtime_environment(
         "ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID": (
             plan.context_identity_client_id
         ),
-        "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID": (
-            plan.evidence_identity_client_id
-        ),
-        "ATHENA_WC013_AZURE_MCP_AUDIENCE": plan.azure_mcp_audience,
-        "ATHENA_WC013_REPLAY_TABLE_ENDPOINT": plan.replay.table_endpoint,
-        "ATHENA_WC013_REPLAY_TABLE_NAME": plan.replay.table_name,
-        "ATHENA_WC013_REPLAY_PARTITION_KEY": plan.replay.partition_key,
         "ATHENA_WC013_LIVE": "1",
     }
 
@@ -496,10 +490,16 @@ def _temporary_environment(values: Mapping[str, str]) -> Iterator[None]:
 def _wc013_runner(
     prepared_phase: _PreparedOperationalPhase,
     verification_context: _PreparedPhaseVerificationContext,
+    *,
+    evidence_blob_endpoint: str,
+    evidence_container_name: str,
+    environment: Mapping[str, str],
 ) -> Wc013PhaseRunner:
     expected_plan = prepared_phase.prepared.plan
     expected_path = prepared_phase.configuration_path
     runtime_environment = _wc013_runtime_environment(prepared_phase.prepared)
+    evidence_environment = dict(environment)
+    evidence_environment.update(runtime_environment)
 
     def run_selected_plan(
         plan: Wc013LiveAcceptancePlan,
@@ -510,8 +510,15 @@ def _wc013_runner(
                 "selected phase plan changed during production composition"
             )
         with _temporary_environment(runtime_environment):
+            collected = load_precollected_evidence(
+                prepared_phase.prepared,
+                evidence_blob_endpoint=evidence_blob_endpoint,
+                evidence_container_name=evidence_container_name,
+                environment=evidence_environment,
+            )
             live_result = run_prepared_wc013_live_acceptance(
-                prepared_phase.prepared
+                prepared_phase.prepared,
+                collected_evidence=collected,
             )
         verification_context.bind_live_result(live_result)
         return live_result
@@ -527,6 +534,8 @@ def run_operational_phase_job(
     handoff_output_path: Path,
     artifact_blob_endpoint: str,
     artifact_container_name: str,
+    evidence_blob_endpoint: str,
+    evidence_container_name: str,
     environment: Mapping[str, str] | None = None,
 ) -> OperationalPhaseJobResult:
     prepared_phase = _load_prepared_phase(
@@ -573,7 +582,13 @@ def run_operational_phase_job(
             trusted_key_anchor=prepared_phase.prepared.trusted_key_anchor,
             managed_identity_client_id=managed_identity_client_id,
         ),
-        wc013_runner=_wc013_runner(prepared_phase, verification_context),
+        wc013_runner=_wc013_runner(
+            prepared_phase,
+            verification_context,
+            evidence_blob_endpoint=evidence_blob_endpoint,
+            evidence_container_name=evidence_container_name,
+            environment=runtime_environment,
+        ),
     )
     handoff = build_operational_phase_reference_handoff(
         run_id=completed.run_id,

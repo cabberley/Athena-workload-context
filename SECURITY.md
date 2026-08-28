@@ -12,7 +12,8 @@ reporting process after the GitHub repository is created.
 - Use Managed Identity and `DefaultAzureCredential`.
 - Keep Athena and Azure MCP on private authenticated endpoints.
 - Keep Azure MCP read-only with an exact tool allowlist.
-- Keep the Athena context identity free of workload Reader permissions.
+- Keep the Athena context identity free of workload Reader permissions, and never attach the
+  workload-reader identity to an Athena acceptance or phase job.
 - Store raw operational logs only in their approved Azure monitoring systems.
 - Persist bounded evidence references and summaries, not unrestricted log bodies.
 - Require human approval before publishing context changes or applying remediation.

@@ -34,6 +34,26 @@ def _loop_role_assignment(source: str, name: str) -> str:
     return match.group(0)
 
 
+def _role_assignment(source: str, name: str) -> str:
+    pattern = (
+        rf"resource {name} 'Microsoft.Authorization/roleAssignments@2022-04-01' = "
+        rf"\{{(?P<body>.*?)\n\}}"
+    )
+    match = re.search(pattern, source, re.DOTALL)
+    assert match is not None
+    return match.group(0)
+
+
+def _loop_job_module(source: str, name: str) -> str:
+    pattern = (
+        rf"module {name} 'br/public:avm/res/app/job:0\.7\.2' = "
+        rf"\[for .*?: \{{(?P<body>.*?)\n\}}\]"
+    )
+    match = re.search(pattern, source, re.DOTALL)
+    assert match is not None
+    return match.group(0)
+
+
 def _example_object_ids(example: str) -> tuple[str, str]:
     guid_pattern = r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
     reader = re.search(
@@ -119,7 +139,10 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "artifactContainerResourceId" in orchestration
     assert "artifactBlobEndpoint" in orchestration
     assert "artifactContainerName" in orchestration
+    assert "collectorArtifactContainerResourceId" in orchestration
+    assert "collectorArtifactContainerName" in orchestration
     assert "roleDefinitionIdOrName: 'Key Vault Crypto User'" in resources
+    assert "principalId: evidenceIdentityPrincipalId" in resources
     assert "scope: replayTable" in resources
     assert "storageTableDataContributorRoleDefinitionId" in resources
     assert "triggerType: 'Manual'" in resources
@@ -128,6 +151,7 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert "evidenceIdentityResourceId" in resources
     assert "AZURE_CLIENT_ID" in resources
     assert "operationalPhaseJobNames" in orchestration
+    assert "evidenceCollectorJobNames" in orchestration
 
     example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
     reader_id, writer_id = _example_object_ids(example)
@@ -253,9 +277,12 @@ def test_wc013_phase_jobs_are_phase_fixed_direct_commands_with_minimal_rbac() ->
         assert "replayStorage.outputs.serviceEndpoints.blob" in block
         assert "'--artifact-container'" in block
         assert "artifactContainerName" in block
+        assert "'--evidence-blob-endpoint'" in block
+        assert "'--evidence-container'" in block
+        assert "collectorArtifactContainerName" in block
         assert "'--emit-handoff-base64'" in block
         assert "acceptanceIdentityResourceId" in block
-        assert "evidenceIdentityResourceId" in block
+        assert "evidenceIdentityResourceId" not in block
         assert "AZURE_CLIENT_ID" in block
         assert "/bin/sh" not in block
         assert "passwordsecretref" not in lowered
@@ -265,3 +292,53 @@ def test_wc013_phase_jobs_are_phase_fixed_direct_commands_with_minimal_rbac() ->
         assert "inject" not in lowered
         assert " reset" not in lowered
         assert " status" not in lowered
+
+
+def test_wc013_collector_and_athena_jobs_have_disjoint_identities() -> None:
+    resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+    acceptance = _job_module(resources, "acceptanceJob")
+    collectors = _loop_job_module(resources, "evidenceCollectorJobs")
+
+    assert "acceptanceIdentityResourceId" in acceptance
+    assert "evidenceIdentityResourceId" not in acceptance
+    assert "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID" not in acceptance
+    assert "ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64" in acceptance
+    assert "collectorArtifactContainerName" in acceptance
+
+    assert "'wc013-evidence-collector-job'" in collectors
+    assert "evidenceIdentityResourceId" in collectors
+    assert "acceptanceIdentityResourceId" not in collectors
+    assert "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID" in collectors
+    assert "collectorArtifactContainerName" in collectors
+
+    assert (
+        "resource collectorArtifactBlobDataContributor "
+        "'Microsoft.Authorization/roleAssignments@2022-04-01'"
+        in resources
+    )
+    assert (
+        "resource collectorArtifactBlobDataReader "
+        "'Microsoft.Authorization/roleAssignments@2022-04-01'"
+        in resources
+    )
+    assert "scope: collectorArtifactContainer" in resources
+
+    replay_writer = _role_assignment(resources, "replayTableDataContributor")
+    assert "principalId: evidenceIdentityPrincipalId" in replay_writer
+    assert "acceptanceIdentityPrincipalId" not in replay_writer
+
+    collector_writer = _role_assignment(
+        resources,
+        "collectorArtifactBlobDataContributor",
+    )
+    assert "scope: collectorArtifactContainer" in collector_writer
+    assert "principalId: evidenceIdentityPrincipalId" in collector_writer
+    assert "acceptanceIdentityPrincipalId" not in collector_writer
+
+    collector_reader = _role_assignment(
+        resources,
+        "collectorArtifactBlobDataReader",
+    )
+    assert "scope: collectorArtifactContainer" in collector_reader
+    assert "principalId: acceptanceIdentityPrincipalId" in collector_reader
+    assert "evidenceIdentityPrincipalId" not in collector_reader

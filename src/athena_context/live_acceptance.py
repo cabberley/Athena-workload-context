@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,16 +26,14 @@ from athena_context.api import (
     EnvironmentWc007PublishedContextSelectionPort,
     EnvironmentWc008DeploymentConfigurationPort,
     EvaluationTrustedKeyAuthority,
-    ManagedIdentityPrivateMcpInvoker,
     McpReadAssignment,
     OperatorDeploymentApproval,
     OperatorTrustedWc008ConfigurationPort,
-    PrivateMcpEvidenceTransport,
     PublishedContextSelection,
     RoleBasedAuthorization,
     RoleGrant,
     Wc008DeploymentOutputAssertion,
-    Wc009EvidenceClientAdapter,
+    Wc009PrecollectedEvidenceClientAdapter,
     build_wc008_deployment_assertion,
 )
 from athena_context.api.domain import (
@@ -45,9 +44,9 @@ from athena_context.api.domain import (
 from athena_context.api.errors import ContextApiError, DemoEvaluationConfigurationError
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
+from athena_context.artifacts import ArtifactReadRequest
 from athena_context.azure_adapters import (
-    AzureTableAttemptReplayGuard,
-    DefaultAzureCredentialTrustedIngestionSigner,
+    AzureBlobVersionPinnedArtifactReader,
     KeyVaultRsaSigner,
     KeyVaultTrustedKeyResolver,
 )
@@ -67,7 +66,13 @@ from athena_context.evidence import CollectorTrustConfiguration
 from athena_context.evidence.models import (
     AZURE_RESOURCE_INVENTORY_TOOL,
     AZURE_RESOURCE_INVENTORY_VERSION,
+    CollectedEvidence,
     EvidenceClientError,
+)
+from athena_context.precollected_evidence import (
+    Wc013CollectedEvidenceArtifact,
+    parse_collected_evidence_handoff,
+    wc013_plan_digest,
 )
 
 _MAX_CONFIGURATION_BYTES = 131_072
@@ -775,13 +780,6 @@ def _powershell_environment_template(plan: Wc013LiveAcceptancePlan) -> str:
         "ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID": (
             plan.context_identity_client_id
         ),
-        "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID": (
-            plan.evidence_identity_client_id
-        ),
-        "ATHENA_WC013_AZURE_MCP_AUDIENCE": plan.azure_mcp_audience,
-        "ATHENA_WC013_REPLAY_TABLE_ENDPOINT": plan.replay.table_endpoint,
-        "ATHENA_WC013_REPLAY_TABLE_NAME": plan.replay.table_name,
-        "ATHENA_WC013_REPLAY_PARTITION_KEY": plan.replay.partition_key,
         "AZURE_CLIENT_ID": plan.context_identity_client_id,
         "ATHENA_WC013_LIVE": "1",
         "ATHENA_WC013_LIVE_CONFIG": (
@@ -946,11 +944,21 @@ def _load_rsa_public_key(path: Path) -> rsa.RSAPublicKey:
 def run_wc013_live_acceptance(
     plan_path: Path,
     *,
+    evidence_blob_endpoint: str,
+    evidence_container_name: str,
     snapshot_output: Path | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> Wc013LiveAcceptanceResult:
     prepared = prepare_wc013_live_acceptance(plan_path)
+    collected = load_precollected_evidence(
+        prepared,
+        evidence_blob_endpoint=evidence_blob_endpoint,
+        evidence_container_name=evidence_container_name,
+        environment=environment if environment is not None else os.environ,
+    )
     return run_prepared_wc013_live_acceptance(
         prepared,
+        collected_evidence=collected,
         snapshot_output=snapshot_output,
     )
 
@@ -958,6 +966,8 @@ def run_wc013_live_acceptance(
 def run_wc013_live_acceptance_plan(
     plan: Wc013LiveAcceptancePlan,
     plan_path: Path,
+    *,
+    collected_evidence: CollectedEvidence | None = None,
 ) -> Wc013LiveAcceptanceResult:
     """Execute one already parsed plan without reopening its configuration file."""
 
@@ -965,17 +975,28 @@ def run_wc013_live_acceptance_plan(
         plan,
         plan_path=plan_path,
     )
-    return run_prepared_wc013_live_acceptance(prepared)
+    if collected_evidence is None:
+        raise Wc013LiveAcceptanceError(
+            "context-only evaluation requires isolated precollected evidence"
+        )
+    return run_prepared_wc013_live_acceptance(
+        prepared,
+        collected_evidence=collected_evidence,
+    )
 
 
 def run_prepared_wc013_live_acceptance(
     prepared: PreparedWc013LiveAcceptance,
     *,
+    collected_evidence: CollectedEvidence,
     snapshot_output: Path | None = None,
 ) -> Wc013LiveAcceptanceResult:
     _require_runtime_environment(prepared)
     try:
-        service, context_service = _compose_wc013_one_shot_service(prepared)
+        service, context_service = _compose_wc013_one_shot_service(
+            prepared,
+            collected_evidence=collected_evidence,
+        )
         result = service.evaluate(
             prepared.authority.publisher,
             prepared.plan.idempotency_key,
@@ -1066,13 +1087,6 @@ def _require_runtime_environment(
         "ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID": (
             plan.context_identity_client_id
         ),
-        "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID": (
-            plan.evidence_identity_client_id
-        ),
-        "ATHENA_WC013_AZURE_MCP_AUDIENCE": plan.azure_mcp_audience,
-        "ATHENA_WC013_REPLAY_TABLE_ENDPOINT": plan.replay.table_endpoint,
-        "ATHENA_WC013_REPLAY_TABLE_NAME": plan.replay.table_name,
-        "ATHENA_WC013_REPLAY_PARTITION_KEY": plan.replay.partition_key,
     }
     mismatches = [
         name
@@ -1088,6 +1102,8 @@ def _require_runtime_environment(
 
 def _compose_wc013_one_shot_service(
     prepared: PreparedWc013LiveAcceptance,
+    *,
+    collected_evidence: CollectedEvidence,
 ) -> tuple[DemoEvaluationService, ContextService]:
     plan = prepared.plan
     authority = prepared.authority
@@ -1134,28 +1150,9 @@ def _compose_wc013_one_shot_service(
         operator_approval=prepared.operator_approval,
     )
     verified_configuration = configuration_port.load_verified()
-    transport = PrivateMcpEvidenceTransport(
+    evidence_client = Wc009PrecollectedEvidenceClientAdapter(
         deployment_configuration=verified_configuration,
-        invoker=ManagedIdentityPrivateMcpInvoker(
-            deployment_configuration=verified_configuration,
-            audience=plan.azure_mcp_audience,
-            managed_identity_client_id=plan.context_identity_client_id,
-        ),
-    )
-    evidence_client = Wc009EvidenceClientAdapter(
-        transport=transport,
-        signer=DefaultAzureCredentialTrustedIngestionSigner(
-            trusted_key_anchor=prepared.trusted_key_anchor,
-            signing_identity_client_id=plan.context_identity_client_id,
-            evidence_identity_client_id=plan.evidence_identity_client_id,
-        ),
-        replay_guard=AzureTableAttemptReplayGuard(
-            endpoint=plan.replay.table_endpoint,
-            table_name=plan.replay.table_name,
-            partition_key=plan.replay.partition_key,
-            managed_identity_client_id=plan.context_identity_client_id,
-        ),
-        clock=clock,
+        collected=collected_evidence,
         trust_configuration=prepared.collector_trust,
         key_resolver=key_resolver,
         trusted_key_anchor=prepared.trusted_key_anchor,
@@ -1174,6 +1171,64 @@ def _compose_wc013_one_shot_service(
         ),
     )
     return service, context_service
+
+
+def load_precollected_evidence(
+    prepared: PreparedWc013LiveAcceptance,
+    *,
+    evidence_blob_endpoint: str,
+    evidence_container_name: str,
+    environment: Mapping[str, str],
+) -> CollectedEvidence:
+    handoff_value = environment.get(
+        "ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64"
+    )
+    if handoff_value is None:
+        raise Wc013LiveAcceptanceError(
+            "collected evidence handoff is required for context-only evaluation"
+        )
+    try:
+        handoff = parse_collected_evidence_handoff(handoff_value)
+        expected_plan_digest = wc013_plan_digest(prepared.plan)
+        if (
+            handoff.plan_digest != expected_plan_digest
+            or handoff.attempt_id != prepared.plan.evaluation_command.attempt_id
+        ):
+            raise ValueError(
+                "collected evidence handoff does not match the reviewed plan"
+            )
+        reader = AzureBlobVersionPinnedArtifactReader(
+            blob_endpoint=evidence_blob_endpoint,
+            container_name=evidence_container_name,
+            managed_identity_client_id=prepared.plan.context_identity_client_id,
+        )
+        reference = handoff.evidence
+        result = reader.read(
+            ArtifactReadRequest(
+                blob_name=reference.name,
+                version_id=reference.version,
+                expected_payload_sha256=reference.content_digest,
+            )
+        )
+        artifact = Wc013CollectedEvidenceArtifact.model_validate_json(
+            result.payload
+        )
+        if (
+            artifact.plan_digest != expected_plan_digest
+            or artifact.collection_request.attempt_id
+            != prepared.plan.evaluation_command.attempt_id
+        ):
+            raise ValueError(
+                "collected evidence artifact does not match the reviewed plan"
+            )
+        return artifact.collected_evidence()
+    except Wc013LiveAcceptanceError:
+        raise
+    except Exception as exc:
+        raise Wc013LiveAcceptanceError(
+            "collected evidence artifact failed closed validation "
+            f"({type(exc).__name__})"
+        ) from exc
 
 
 def verify_wc013_live_result(
@@ -1346,6 +1401,7 @@ __all__ = [
     "Wc013LiveAcceptanceResult",
     "Wc013ReplayInput",
     "build_wc013_authority_bundle",
+    "load_precollected_evidence",
     "prepare_wc013_live_acceptance",
     "prepare_wc013_live_acceptance_plan",
     "render_wc013_configuration",

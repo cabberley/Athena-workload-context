@@ -127,12 +127,15 @@ class DemoEvaluationService:
     def _validate_composition(self) -> None:
         from athena_context.api.evaluation_adapters import (
             Wc009EvidenceClientAdapter,
+            Wc009PrecollectedEvidenceClientAdapter,
         )
 
-        if type(self._evidence_client) is not Wc009EvidenceClientAdapter:
+        if type(self._evidence_client) not in {
+            Wc009EvidenceClientAdapter,
+            Wc009PrecollectedEvidenceClientAdapter,
+        }:
             raise DemoEvaluationConfigurationError(
-                "demo evaluation requires the exact endpoint-bound WC-009 "
-                "evidence client adapter"
+                "demo evaluation requires an exact WC-009 evidence client adapter"
             )
         configuration = self._deployment_configuration
         assertion = configuration.assertion

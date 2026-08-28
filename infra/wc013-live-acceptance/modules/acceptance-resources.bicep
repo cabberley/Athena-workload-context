@@ -32,6 +32,9 @@ param evidenceIdentityResourceId string
 @description('Client ID of the dedicated MCP/evidence managed identity.')
 param evidenceIdentityClientId string
 
+@description('Principal ID of the dedicated MCP/evidence managed identity.')
+param evidenceIdentityPrincipalId string
+
 @description('Resource ID of the separate acceptance-job managed identity.')
 param acceptanceIdentityResourceId string
 
@@ -40,9 +43,6 @@ param acceptanceIdentityPrincipalId string
 
 @description('Client ID of the separate acceptance-job managed identity.')
 param acceptanceIdentityClientId string
-
-@description('Exact audience requested by the acceptance-job identity for private Azure MCP calls.')
-param azureMcpAudience string
 
 @description('Globally unique Key Vault name for the non-exportable signing key.')
 param keyVaultName string
@@ -56,11 +56,11 @@ param replayStorageAccountName string
 @description('Dedicated replay table name.')
 param replayTableName string
 
-@description('Dedicated replay reservation namespace.')
-param replayPartitionKey string
-
 @description('Dedicated immutable Blob container for operational artifacts.')
 param artifactContainerName string
+
+@description('Dedicated immutable Blob container written only by the isolated evidence collector.')
+param collectorArtifactContainerName string
 
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
@@ -122,6 +122,28 @@ var operationalJobResources = {
   cpu: '0.5'
   memory: '1Gi'
 }
+var collectorJobDefinitions = [
+  {
+    key: 'acceptance'
+    name: '${namePrefix}-acceptance-collector'
+    configurationPath: '/opt/athena/wc013-live/wc013-live-acceptance.json'
+  }
+  {
+    key: 'baseline'
+    name: '${namePrefix}-op-baseline-collector'
+    configurationPath: '/opt/athena/wc013-live/delivery/configs/baseline.json'
+  }
+  {
+    key: 'faulted'
+    name: '${namePrefix}-op-faulted-collector'
+    configurationPath: '/opt/athena/wc013-live/delivery/configs/faulted.json'
+  }
+  {
+    key: 'recovered'
+    name: '${namePrefix}-op-recovered-collector'
+    configurationPath: '/opt/athena/wc013-live/delivery/configs/recovered.json'
+  }
+]
 
 module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
   name: 'wc013-signing-key-vault'
@@ -174,7 +196,13 @@ module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
             roleDefinitionIdOrName: 'Key Vault Crypto User'
             principalId: acceptanceIdentityPrincipalId
             principalType: 'ServicePrincipal'
-            description: 'WC-013 acceptance job can resolve and sign only with this key.'
+            description: 'Athena evaluation jobs can resolve and sign only with this key.'
+          }
+          {
+            roleDefinitionIdOrName: 'Key Vault Crypto User'
+            principalId: evidenceIdentityPrincipalId
+            principalType: 'ServicePrincipal'
+            description: 'The isolated evidence collector can attest collection with this key.'
           }
         ]
       }
@@ -214,6 +242,16 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
       containers: [
         {
           name: artifactContainerName
+          publicAccess: 'None'
+          immutableStorageWithVersioningEnabled: true
+          immutabilityPolicy: {
+            immutabilityPeriodSinceCreationInDays: artifactRetentionDays
+            allowProtectedAppendWrites: false
+            allowProtectedAppendWritesAll: false
+          }
+        }
+        {
+          name: collectorArtifactContainerName
           publicAccess: 'None'
           immutableStorageWithVersioningEnabled: true
           immutabilityPolicy: {
@@ -284,15 +322,20 @@ resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
   name: artifactContainerName
 }
 
+resource collectorArtifactContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
+  parent: replayBlobService
+  name: collectorArtifactContainerName
+}
+
 resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(
     replayTable.id,
-    acceptanceIdentityPrincipalId,
+    evidenceIdentityPrincipalId,
     storageTableDataContributorRoleDefinitionId
   )
   scope: replayTable
   properties: {
-    principalId: acceptanceIdentityPrincipalId
+    principalId: evidenceIdentityPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
@@ -314,6 +357,46 @@ resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@20
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource collectorArtifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    collectorArtifactContainer.id,
+    evidenceIdentityPrincipalId,
+    storageBlobDataContributorRoleDefinitionId
+  )
+  scope: collectorArtifactContainer
+  properties: {
+    principalId: evidenceIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource collectorArtifactBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    collectorArtifactContainer.id,
+    acceptanceIdentityPrincipalId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: collectorArtifactContainer
+  properties: {
+    principalId: acceptanceIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleDefinitionId
     )
   }
   dependsOn: [
@@ -378,7 +461,6 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
     managedIdentities: {
       userAssignedResourceIds: [
         acceptanceIdentityResourceId
-        evidenceIdentityResourceId
       ]
     }
     registries: [
@@ -396,7 +478,7 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
           '-c'
         ]
         args: [
-          'athena-context wc013-live-acceptance --config /opt/athena/wc013-live/wc013-live-acceptance.json --snapshot-output /tmp/evidence-snapshot.json && python -c "import base64; print(\'WC013_SNAPSHOT_B64=\' + base64.b64encode(open(\'/tmp/evidence-snapshot.json\', \'rb\').read()).decode(\'ascii\'))"'
+          'athena-context wc013-live-acceptance --config /opt/athena/wc013-live/wc013-live-acceptance.json --evidence-blob-endpoint ${replayStorage.outputs.serviceEndpoints.blob} --evidence-container ${collectorArtifactContainerName} --snapshot-output /tmp/evidence-snapshot.json && python -c "import base64; print(\'WC013_SNAPSHOT_B64=\' + base64.b64encode(open(\'/tmp/evidence-snapshot.json\', \'rb\').read()).decode(\'ascii\'))"'
         ]
         env: [
           {
@@ -424,24 +506,8 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
             value: acceptanceIdentityClientId
           }
           {
-            name: 'ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID'
-            value: evidenceIdentityClientId
-          }
-          {
-            name: 'ATHENA_WC013_AZURE_MCP_AUDIENCE'
-            value: azureMcpAudience
-          }
-          {
-            name: 'ATHENA_WC013_REPLAY_TABLE_ENDPOINT'
-            value: replayStorage.outputs.serviceEndpoints.table
-          }
-          {
-            name: 'ATHENA_WC013_REPLAY_TABLE_NAME'
-            value: replayTableName
-          }
-          {
-            name: 'ATHENA_WC013_REPLAY_PARTITION_KEY'
-            value: replayPartitionKey
+            name: 'ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64'
+            value: ''
           }
         ]
         resources: {
@@ -453,6 +519,73 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
     tags: resourceTags
   }
 }
+
+module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJob in collectorJobDefinitions: {
+  name: 'wc013-${collectorJob.key}-evidence-collector-job'
+  params: {
+    name: collectorJob.name
+    location: location
+    environmentResourceId: managedEnvironmentResourceId
+    enableTelemetry: false
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 900
+    managedIdentities: {
+      userAssignedResourceIds: [
+        evidenceIdentityResourceId
+      ]
+    }
+    registries: [
+      {
+        server: acceptanceImageRegistryServer
+        identity: evidenceIdentityResourceId
+      }
+    ]
+    containers: [
+      {
+        name: 'wc013-${collectorJob.key}-evidence-collector'
+        image: acceptanceImage
+        command: [
+          'athena-context'
+        ]
+        args: [
+          'wc013-evidence-collector-job'
+          '--config'
+          collectorJob.configurationPath
+          '--artifact-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--artifact-container'
+          collectorArtifactContainerName
+          '--emit-handoff-base64'
+        ]
+        env: [
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: evidenceIdentityClientId
+          }
+          {
+            name: 'ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID'
+            value: evidenceIdentityClientId
+          }
+          {
+            name: 'ATHENA_WC013_WC007_PINNED_AUTHORITY_DIGEST'
+            value: wc007PinnedAuthorityDigest
+          }
+          {
+            name: 'ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST'
+            value: wc008PinnedAssertionDigest
+          }
+        ]
+        resources: operationalJobResources
+      }
+    ]
+    tags: resourceTags
+  }
+}]
 
 
 module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
@@ -472,7 +605,6 @@ module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     managedIdentities: {
       userAssignedResourceIds: [
         acceptanceIdentityResourceId
-        evidenceIdentityResourceId
       ]
     }
     registries: [
@@ -502,6 +634,10 @@ module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
           replayStorage.outputs.serviceEndpoints.blob
           '--artifact-container'
           artifactContainerName
+          '--evidence-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--evidence-container'
+          collectorArtifactContainerName
           '--emit-handoff-base64'
         ]
         env: [
@@ -534,7 +670,6 @@ module faultedOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     managedIdentities: {
       userAssignedResourceIds: [
         acceptanceIdentityResourceId
-        evidenceIdentityResourceId
       ]
     }
     registries: [
@@ -564,6 +699,10 @@ module faultedOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
           replayStorage.outputs.serviceEndpoints.blob
           '--artifact-container'
           artifactContainerName
+          '--evidence-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--evidence-container'
+          collectorArtifactContainerName
           '--emit-handoff-base64'
         ]
         env: [
@@ -596,7 +735,6 @@ module recoveredOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     managedIdentities: {
       userAssignedResourceIds: [
         acceptanceIdentityResourceId
-        evidenceIdentityResourceId
       ]
     }
     registries: [
@@ -626,6 +764,10 @@ module recoveredOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
           replayStorage.outputs.serviceEndpoints.blob
           '--artifact-container'
           artifactContainerName
+          '--evidence-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--evidence-container'
+          collectorArtifactContainerName
           '--emit-handoff-base64'
         ]
         env: [
@@ -674,6 +816,12 @@ output artifactContainerName string = artifactContainerName
 @description('Resource ID of the dedicated immutable operational artifact container.')
 output artifactContainerResourceId string = artifactContainer.id
 
+@description('Dedicated immutable collector artifact container name.')
+output collectorArtifactContainerName string = collectorArtifactContainerName
+
+@description('Resource ID of the dedicated immutable collector artifact container.')
+output collectorArtifactContainerResourceId string = collectorArtifactContainer.id
+
 @description('Configured unlocked WORM retention period for artifact blob versions.')
 output artifactRetentionDays int = artifactRetentionDays
 
@@ -688,4 +836,12 @@ output operationalPhaseJobNames object = {
   baseline: baselineOperationalPhaseJob.outputs.name
   faulted: faultedOperationalPhaseJob.outputs.name
   recovered: recoveredOperationalPhaseJob.outputs.name
+}
+
+@description('Deterministic manual Container Apps Job names for isolated evidence collection.')
+output evidenceCollectorJobNames object = {
+  acceptance: evidenceCollectorJobs[0].outputs.name
+  baseline: evidenceCollectorJobs[1].outputs.name
+  faulted: evidenceCollectorJobs[2].outputs.name
+  recovered: evidenceCollectorJobs[3].outputs.name
 }

@@ -56,6 +56,7 @@ from athena_context.evidence import (
     CollectorTrustConfiguration,
     EvidenceClientCompositionError,
     EvidenceCollectionCommand,
+    EvidenceProjection,
     McpAuthorizationFailure,
     McpFailedResponse,
     McpSuccessResponse,
@@ -65,7 +66,9 @@ from athena_context.evidence import (
     SyncEvidenceClient,
     SyncEvidenceTransport,
     SyncTrustedIngestionSigner,
+    prepare_transport_request,
     project_transport_outcome,
+    validate_trusted_identity,
 )
 from athena_context.evidence.models import (
     EvidenceTransportRequest,
@@ -1966,6 +1969,109 @@ class Wc009EvidenceClientAdapter:
         return collected
 
 
+class Wc009PrecollectedEvidenceClientAdapter:
+    """Consume one collector-produced result without exposing its runtime identity."""
+
+    _collected: CollectedEvidence
+    _deployment_configuration: VerifiedWc008DeploymentConfiguration
+    _key_resolver: TrustedKeyResolver
+    _transport_configuration: SealedMcpTransportConfiguration
+    _trust_configuration: CollectorTrustConfiguration
+    _trusted_key_anchor: TrustedKeyAnchor
+
+    __slots__ = (
+        "_collected",
+        "_deployment_configuration",
+        "_key_resolver",
+        "_transport_configuration",
+        "_trust_configuration",
+        "_trusted_key_anchor",
+    )
+
+    def __init__(
+        self,
+        *,
+        deployment_configuration: VerifiedWc008DeploymentConfiguration,
+        collected: CollectedEvidence,
+        trust_configuration: CollectorTrustConfiguration,
+        key_resolver: TrustedKeyResolver,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> None:
+        if type(collected) is not CollectedEvidence:
+            raise DemoEvaluationConfigurationError(
+                "precollected WC-009 evidence must use the exact collected-evidence type"
+            )
+        try:
+            normalized_configuration, transport_configuration = (
+                seal_mcp_transport_configuration(deployment_configuration)
+            )
+        except ValueError as exc:
+            raise DemoEvaluationConfigurationError(
+                "precollected WC-009 evidence requires exact trusted WC-008 configuration"
+            ) from exc
+        object.__setattr__(self, "_deployment_configuration", normalized_configuration)
+        object.__setattr__(self, "_transport_configuration", transport_configuration)
+        object.__setattr__(self, "_collected", collected)
+        object.__setattr__(self, "_trust_configuration", trust_configuration)
+        object.__setattr__(self, "_key_resolver", key_resolver)
+        object.__setattr__(self, "_trusted_key_anchor", trusted_key_anchor)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("precollected WC-009 evidence composition is immutable")
+
+    @property
+    def deployment_configuration(self) -> VerifiedWc008DeploymentConfiguration:
+        return self._deployment_configuration
+
+    @property
+    def transport_configuration(self) -> SealedMcpTransportConfiguration:
+        return self._transport_configuration
+
+    @property
+    def trust_configuration(self) -> CollectorTrustConfiguration:
+        return self._trust_configuration
+
+    @property
+    def key_resolver(self) -> TrustedKeyResolver:
+        return self._key_resolver
+
+    @property
+    def trusted_key_anchor(self) -> TrustedKeyAnchor:
+        return self._trusted_key_anchor
+
+    def collect(self, command: EvidenceCollectionCommand) -> CollectedEvidence:
+        if type(self) is not Wc009PrecollectedEvidenceClientAdapter:
+            raise EvidenceClientCompositionError(
+                "precollected WC-009 evidence adapter type changed"
+            )
+        collected = self._collected
+        expected_request = prepare_transport_request(
+            command,
+            self._trust_configuration,
+            attempt_started_at=collected.request.attempt_started_at,
+        )
+        if collected.request != expected_request:
+            raise EvidenceClientCompositionError(
+                "precollected evidence does not match the exact evaluation request"
+            )
+        projection = EvidenceProjection(
+            request=collected.request,
+            collector_attempt=collected.collector_attempt,
+            evidence_records=collected.evidence_records,
+            envelope=collected.envelope,
+        )
+        validate_trusted_identity(
+            collected.collector_identity_evidence,
+            projection,
+            self._trust_configuration,
+            key_resolver=self._key_resolver,
+            trusted_key_anchor=self._trusted_key_anchor,
+            as_of=collected.collector_identity_evidence.ingestion_signature.signed_at,
+        )
+        return collected
+
+
 class OperatorTrustedWc008ConfigurationPort:
     """Verify a raw assertion against a separately pinned operator decision."""
 
@@ -2204,4 +2310,5 @@ __all__ = [
     "PrivateMcpEvidenceTransport",
     "PrivateMcpInvokerPort",
     "Wc009EvidenceClientAdapter",
+    "Wc009PrecollectedEvidenceClientAdapter",
 ]

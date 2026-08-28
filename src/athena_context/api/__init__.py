@@ -51,6 +51,7 @@ from athena_context.api.evaluation_adapters import (
     PrivateMcpEvidenceTransport,
     PrivateMcpInvokerPort,
     Wc009EvidenceClientAdapter,
+    Wc009PrecollectedEvidenceClientAdapter,
 )
 from athena_context.api.evaluation_domain import (
     AZURE_MCP_2_0_5_ALLOWED_TOOLS,
@@ -166,6 +167,7 @@ __all__ = [
     "VerifiedWc008DeploymentConfiguration",
     "Wc008DeploymentOutputAssertion",
     "Wc009EvidenceClientAdapter",
+    "Wc009PrecollectedEvidenceClientAdapter",
     "build_wc008_deployment_assertion",
     "WorkloadGrantScope",
     "WorkloadIdentifier",

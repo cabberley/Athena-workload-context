@@ -40,6 +40,9 @@ from athena_context.operational_phase_runner import (
     Wc013PhaseRunner,
     run_operational_phase,
 )
+from athena_context.precollected_evidence import (
+    COLLECTED_EVIDENCE_HANDOFF_BASE64_PREFIX,
+)
 from athena_context.presentation import (
     PresentationSigner,
     TrustedDemoEvaluationVerifier,
@@ -53,6 +56,9 @@ from athena_context.reference_command import (
     OutputFormat,
     run_agreed_golden_api,
     run_reference_command,
+)
+from athena_context.wc013_evidence_collector import (
+    run_wc013_evidence_collector_job,
 )
 
 
@@ -99,6 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="create one new read-only canonical EvidenceSnapshot file",
     )
+    live_parser.add_argument("--evidence-blob-endpoint")
+    live_parser.add_argument("--evidence-container")
+    collector_parser = subparsers.add_parser(
+        "wc013-evidence-collector-job",
+        help="collect and attest WC-013 evidence outside the Athena identity boundary",
+    )
+    collector_parser.add_argument("--config", required=True, type=Path)
+    collector_parser.add_argument("--artifact-blob-endpoint", required=True)
+    collector_parser.add_argument("--artifact-container", required=True)
+    collector_parser.add_argument(
+        "--emit-handoff-base64",
+        action="store_true",
+        help="print the version-pinned evidence handoff as one base64 line",
+    )
     presentation_parser = subparsers.add_parser(
         "argus-presentation-export",
         help="export a verified synthetic-safe ARGUS presentation",
@@ -135,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     phase_job_parser.add_argument("--handoff-output", required=True, type=Path)
     phase_job_parser.add_argument("--artifact-blob-endpoint", required=True)
     phase_job_parser.add_argument("--artifact-container", required=True)
+    phase_job_parser.add_argument("--evidence-blob-endpoint", required=True)
+    phase_job_parser.add_argument("--evidence-container", required=True)
     phase_job_parser.add_argument(
         "--emit-handoff-base64",
         action="store_true",
@@ -222,8 +244,14 @@ def main(
                     f"authority digest: {prepared.authority.authority_digest}\n"
                 )
                 return 0
+            if not args.evidence_blob_endpoint or not args.evidence_container:
+                raise Wc013LiveAcceptanceError(
+                    "evidence Blob endpoint and container are required"
+                )
             accepted = run_wc013_live_acceptance(
                 args.config,
+                evidence_blob_endpoint=args.evidence_blob_endpoint,
+                evidence_container_name=args.evidence_container,
                 snapshot_output=args.snapshot_output,
             )
             output.write(
@@ -234,6 +262,24 @@ def main(
             )
             if accepted.snapshot_path is not None:
                 output.write(f"immutable snapshot file: {accepted.snapshot_path}\n")
+            return 0
+        if args.command == "wc013-evidence-collector-job":
+            collected = run_wc013_evidence_collector_job(
+                args.config,
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                artifact_container_name=args.artifact_container,
+            )
+            output.write(
+                "WC-013 isolated evidence collection passed\n"
+                f"attempt: {collected.artifact.collection_request.attempt_id}\n"
+                f"artifact: {collected.handoff.evidence.name}\n"
+                f"artifact digest: {collected.handoff.evidence.content_digest}\n"
+            )
+            if args.emit_handoff_base64:
+                output.write(
+                    f"{COLLECTED_EVIDENCE_HANDOFF_BASE64_PREFIX}"
+                    f"{collected.handoff.base64()}\n"
+                )
             return 0
         if args.command == "argus-presentation-export":
             if (
@@ -306,6 +352,8 @@ def main(
                 handoff_output_path=args.handoff_output,
                 artifact_blob_endpoint=args.artifact_blob_endpoint,
                 artifact_container_name=args.artifact_container,
+                evidence_blob_endpoint=args.evidence_blob_endpoint,
+                evidence_container_name=args.evidence_container,
             )
             output.write(
                 "operational phase job passed\n"

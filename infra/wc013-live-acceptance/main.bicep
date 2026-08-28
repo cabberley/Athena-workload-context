@@ -70,6 +70,11 @@ param replayPartitionKey string
 @maxLength(63)
 param artifactContainerName string = 'operational-artifacts'
 
+@description('Dedicated immutable Blob container for isolated collector handoffs.')
+@minLength(3)
+@maxLength(63)
+param collectorArtifactContainerName string = 'collected-evidence'
+
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
 @maxValue(146000)
@@ -192,16 +197,16 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     storageBlobPrivateDnsZoneResourceId: privateDns.outputs.storageBlobPrivateDnsZoneResourceId
     evidenceIdentityResourceId: azureMcp.outputs.azureMcpIdentityResourceId
     evidenceIdentityClientId: evidenceIdentity.properties.clientId
+    evidenceIdentityPrincipalId: evidenceIdentity.properties.principalId
     acceptanceIdentityResourceId: acceptanceJobIdentity.id
     acceptanceIdentityPrincipalId: acceptanceJobIdentity.properties.principalId
     acceptanceIdentityClientId: acceptanceJobIdentity.properties.clientId
-    azureMcpAudience: azureMcpAudience
     keyVaultName: keyVaultName
     signingKeyName: signingKeyName
     replayStorageAccountName: replayStorageAccountName
     replayTableName: replayTableName
-    replayPartitionKey: replayPartitionKey
     artifactContainerName: artifactContainerName
+    collectorArtifactContainerName: collectorArtifactContainerName
     artifactRetentionDays: artifactRetentionDays
     operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
     workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds
@@ -224,8 +229,24 @@ module acceptanceImagePull 'modules/acr-pull-rbac.bicep' = {
   ]
   params: {
     registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    acceptanceIdentityName: '${namePrefix}-context-id'
-    acceptanceIdentityPrincipalId: acceptanceJobIdentity.properties.principalId
+    identityName: '${namePrefix}-context-id'
+    identityPrincipalId: acceptanceJobIdentity.properties.principalId
+  }
+}
+
+module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
+  name: 'wc013-evidence-collector-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  dependsOn: [
+    azureMcp
+  ]
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-mcp-evidence-id'
+    identityPrincipalId: evidenceIdentity.properties.principalId
   }
 }
 
@@ -235,7 +256,7 @@ output foundationResourceGroupResourceId string = foundationResourceGroup.id
 @description('VNet-scoped HTTPS endpoint for the pinned private Azure MCP Container App.')
 output azureMcpInternalEndpoint string = azureMcp.outputs.azureMcpInternalEndpoint
 
-@description('Exact audience that the acceptance identity requests for private Azure MCP calls.')
+@description('Exact audience that the isolated evidence collector requests for private Azure MCP calls.')
 output azureMcpAudience string = azureMcpAudience
 
 @description('Resource ID of the private Azure MCP Container App.')
@@ -289,6 +310,9 @@ output replayTableEndpoint string = acceptanceResources.outputs.replayTableEndpo
 @description('Dedicated replay table name.')
 output replayTableName string = acceptanceResources.outputs.replayTableName
 
+@description('Dedicated replay reservation namespace used by the isolated evidence collector.')
+output replayPartitionKey string = replayPartitionKey
+
 @description('Replay table resource ID.')
 output replayTableResourceId string = acceptanceResources.outputs.replayTableResourceId
 
@@ -301,6 +325,12 @@ output artifactContainerName string = acceptanceResources.outputs.artifactContai
 @description('Artifact container resource ID used as the exact Blob data-role scope.')
 output artifactContainerResourceId string = acceptanceResources.outputs.artifactContainerResourceId
 
+@description('Dedicated immutable collector artifact container name.')
+output collectorArtifactContainerName string = acceptanceResources.outputs.collectorArtifactContainerName
+
+@description('Collector artifact container resource ID used as the exact Blob data-role scope.')
+output collectorArtifactContainerResourceId string = acceptanceResources.outputs.collectorArtifactContainerResourceId
+
 @description('Configured unlocked WORM retention period for artifact blob versions.')
 output artifactRetentionDays int = acceptanceResources.outputs.artifactRetentionDays
 
@@ -312,6 +342,9 @@ output acceptanceJobResourceId string = acceptanceResources.outputs.acceptanceJo
 
 @description('Deterministic manual Container Apps Job names for the phase-fixed operational runner jobs.')
 output operationalPhaseJobNames object = acceptanceResources.outputs.operationalPhaseJobNames
+
+@description('Deterministic manual Container Apps Job names for isolated evidence collection.')
+output evidenceCollectorJobNames object = acceptanceResources.outputs.evidenceCollectorJobNames
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId

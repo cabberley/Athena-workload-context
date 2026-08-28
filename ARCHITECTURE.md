@@ -67,6 +67,7 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 | Binding engine | Evidence-backed cohort proposals and dynamic selectors |
 | Policy engine | Deterministic evaluation of observed state against declared intent |
 | Evidence client | Typed, bounded client for the private Azure MCP |
+| Evidence collector jobs | Identity-isolated jobs that alone hold the workload-reader identity, call private Azure MCP, and publish signed version-pinned evidence handoffs |
 | Operational artifact store | Private, versioned, create-only persistence and exact-version verified retrieval for bounded signed evaluation artifacts |
 | Workload controller | Workload-owned `status`/`inject`/`reset` boundary and strict create-only publication of exact run-scoped `athena.demoFaultRun.v1` receipt Blobs |
 | Operational phase jobs | Phase-fixed non-mutating Container Apps Jobs that compose reviewed WC-013 plans, exact Blob references, and governed handoff emission |

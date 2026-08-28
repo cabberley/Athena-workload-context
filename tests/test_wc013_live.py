@@ -23,12 +23,25 @@ def _live_configuration_path() -> Path:
     return Path(value)
 
 
+def _required_environment(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        pytest.fail(f"{name} is required for live acceptance")
+    return value
+
+
 @pytest.mark.live
 def test_private_mcp_response_produces_cryptographically_verified_snapshot(
     tmp_path: Path,
 ) -> None:
     accepted = run_wc013_live_acceptance(
         _live_configuration_path(),
+        evidence_blob_endpoint=_required_environment(
+            "ATHENA_WC013_EVIDENCE_BLOB_ENDPOINT"
+        ),
+        evidence_container_name=_required_environment(
+            "ATHENA_WC013_EVIDENCE_CONTAINER"
+        ),
         snapshot_output=tmp_path / "wc013-live-evidence-snapshot.json",
     )
 

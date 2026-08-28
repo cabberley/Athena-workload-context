@@ -151,10 +151,14 @@ Missing or mismatched prior faulted indexes fail before WC-013 execution.
 
 ## Production composition
 
-The deployed Container Apps phase Jobs use `athena-context operational-phase-job`. That narrow
-wrapper:
+For each phase, the controller first starts the matching isolated evidence collector Job and
+captures its `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` output. It then starts the deployed
+context-only Container Apps phase Job with that exact handoff and the receipt/index references.
+The `athena-context operational-phase-job` wrapper:
 
 - reads one reviewed bundle from `/opt/athena/wc013-live/delivery/operational-phase-bundle.json`;
+- reads one collector artifact by exact Blob name, immutable version, and SHA-256 from the
+  plan-bound handoff;
 - writes one fixed local `athena.operationalPhaseInputs.v1` file under `/tmp/athena-operational/`;
 - composes the production `VersionPinnedPhaseInputReaderPort`,
   `CreateOnlyArtifactWriterPort`, `CompletionIndexWriterPort`, trusted WC-013 result/snapshot
@@ -179,6 +183,8 @@ athena-context operational-phase-job `
   --handoff-output /tmp/athena-operational/baseline-handoff.json `
   --artifact-blob-endpoint https://<account>.blob.core.windows.net `
   --artifact-container operational-artifacts `
+  --evidence-blob-endpoint https://<account>.blob.core.windows.net `
+  --evidence-container collected-evidence `
   --emit-handoff-base64
 ```
 
@@ -198,6 +204,7 @@ platform-enforced immutability boundary.
 | `ATHENA_OPERATIONAL_PREVIOUS_INDEX_VERSION` | Exact previous completion-index Blob version. |
 | `ATHENA_OPERATIONAL_PREVIOUS_INDEX_DIGEST` | Exact previous completion-index SHA-256 digest. |
 | `ATHENA_OPERATIONAL_LINEAGE_REFERENCE_DIGEST` | Faulted-only independently reviewed lineage digest when no baseline index is supplied. |
+| `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` | Exact handoff emitted by the matching isolated collector Job. |
 
 Baseline supplies only the receipt triple. Faulted supplies either the previous-index triple or the
 lineage digest, but never both. Recovered supplies the previous-index triple and no lineage digest.

@@ -13,6 +13,7 @@ import athena_context.live_acceptance as live_acceptance
 from athena_context.api import PublishedContextSelection, Role, RoleGrant
 from athena_context.api.domain import WorkloadGrantScope
 from athena_context.cli import main
+from athena_context.evidence import EvidenceCollectionCommand
 from athena_context.fixtures import CANONICAL_PRIVATE_KEY
 from athena_context.live_acceptance import (
     Wc013AuthorityInput,
@@ -20,6 +21,7 @@ from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
     prepare_wc013_live_acceptance,
     render_wc013_configuration,
+    run_prepared_wc013_live_acceptance,
     verify_wc013_live_result,
     wc013_configuration_template,
 )
@@ -29,10 +31,7 @@ from wc013_support import (
     PUBLISHER,
     TRUST_ANCHOR,
     DemoHarness,
-    DeterministicIngestionSigner,
     DeterministicSnapshotSigner,
-    ReplayGuard,
-    ScenarioTransport,
     StepClock,
     build_current_synthetic_manifest,
     build_harness,
@@ -56,6 +55,20 @@ def _write_public_key(path: Path, private_key: rsa.RSAPrivateKey) -> None:
         private_key.public_key().public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+
+def _collected_evidence(prepared: object) -> object:
+    harness = _live_harness()
+    plan = prepared.plan
+    command = plan.evaluation_command
+    return harness.dependencies.evidence_client.collect(
+        EvidenceCollectionCommand(
+            attemptId=command.attempt_id,
+            evidenceScope=command.authorized_scope,
+            authorizedScopes=(command.authorized_scope,),
+            bounds=command.bounds,
         )
     )
 
@@ -210,8 +223,10 @@ def test_rendered_configuration_round_trips_existing_environment_ports(
     powershell = rendered.powershell_path.read_text(encoding="utf-8")
     assert "ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE" in powershell
     assert "ATHENA_WC013_WC007_PINNED_AUTHORITY_DIGEST" in powershell
-    assert "ATHENA_WC013_REPLAY_TABLE_ENDPOINT" in powershell
     assert "$env:AZURE_CLIENT_ID" in powershell
+    assert "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID" not in powershell
+    assert "ATHENA_WC013_AZURE_MCP_AUDIENCE" not in powershell
+    assert "ATHENA_WC013_REPLAY_TABLE_ENDPOINT" not in powershell
     assert '= "$configurationRoot\\wc008-deployment-assertion.json"' in powershell
     assert "Bearer " not in powershell
     plan_payload = json.loads(rendered.plan_path.read_text(encoding="utf-8"))
@@ -327,6 +342,7 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
         tmp_path / "rendered",
     )
     prepared = prepare_wc013_live_acceptance(rendered.plan_path)
+    collected = _collected_evidence(prepared)
     clock = StepClock(CURRENT_NOW + timedelta(seconds=10))
     resolver = key_resolver(CANONICAL_PRIVATE_KEY.public_key())
 
@@ -341,23 +357,9 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
         "ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID": (
             prepared.plan.context_identity_client_id
         ),
-        "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID": (
-            prepared.plan.evidence_identity_client_id
-        ),
-        "ATHENA_WC013_AZURE_MCP_AUDIENCE": (
-            prepared.plan.azure_mcp_audience
-        ),
-        "ATHENA_WC013_REPLAY_TABLE_ENDPOINT": (
-            prepared.plan.replay.table_endpoint
-        ),
-        "ATHENA_WC013_REPLAY_TABLE_NAME": prepared.plan.replay.table_name,
-        "ATHENA_WC013_REPLAY_PARTITION_KEY": (
-            prepared.plan.replay.partition_key
-        ),
     }
     for name, value in runtime_environment.items():
         monkeypatch.setenv(name, value)
-    invoker_configuration: dict[str, object] = {}
     monkeypatch.setattr(live_acceptance, "_SystemClock", lambda: clock)
     monkeypatch.setattr(
         live_acceptance,
@@ -369,36 +371,16 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
         "KeyVaultRsaSigner",
         lambda **_kwargs: DeterministicSnapshotSigner(CANONICAL_PRIVATE_KEY),
     )
-    monkeypatch.setattr(
-        live_acceptance,
-        "DefaultAzureCredentialTrustedIngestionSigner",
-        lambda **_kwargs: DeterministicIngestionSigner(CANONICAL_PRIVATE_KEY),
-    )
-    monkeypatch.setattr(
-        live_acceptance,
-        "AzureTableAttemptReplayGuard",
-        lambda **_kwargs: ReplayGuard(),
-    )
-    monkeypatch.setattr(
-        live_acceptance,
-        "ManagedIdentityPrivateMcpInvoker",
-        lambda **kwargs: (
-            invoker_configuration.update(kwargs)
-            or ScenarioTransport("success")
-        ),
-    )
-
-    accepted = live_acceptance.run_wc013_live_acceptance(
-        rendered.plan_path,
+    accepted = run_prepared_wc013_live_acceptance(
+        prepared,
+        collected_evidence=collected,
         snapshot_output=tmp_path / "snapshot.json",
     )
 
     assert accepted.result.snapshot.evidence_records
     assert accepted.snapshot_path is not None
     assert accepted.snapshot_path.is_file()
-    assert invoker_configuration["managed_identity_client_id"] == (
-        prepared.plan.context_identity_client_id
-    )
+    assert not hasattr(live_acceptance, "DefaultAzureCredentialTrustedIngestionSigner")
 
 
 def test_one_shot_failure_reports_only_exception_type(
@@ -410,6 +392,7 @@ def test_one_shot_failure_reports_only_exception_type(
         tmp_path / "rendered",
     )
     prepared = prepare_wc013_live_acceptance(rendered.plan_path)
+    collected = _collected_evidence(prepared)
     runtime_environment = {
         "AZURE_CLIENT_ID": prepared.plan.context_identity_client_id,
         "ATHENA_WC013_WC007_PINNED_AUTHORITY_DIGEST": (
@@ -421,13 +404,6 @@ def test_one_shot_failure_reports_only_exception_type(
         "ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID": (
             prepared.plan.context_identity_client_id
         ),
-        "ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID": (
-            prepared.plan.evidence_identity_client_id
-        ),
-        "ATHENA_WC013_AZURE_MCP_AUDIENCE": prepared.plan.azure_mcp_audience,
-        "ATHENA_WC013_REPLAY_TABLE_ENDPOINT": prepared.plan.replay.table_endpoint,
-        "ATHENA_WC013_REPLAY_TABLE_NAME": prepared.plan.replay.table_name,
-        "ATHENA_WC013_REPLAY_PARTITION_KEY": prepared.plan.replay.partition_key,
     }
     for name, value in runtime_environment.items():
         monkeypatch.setenv(name, value)
@@ -438,7 +414,7 @@ def test_one_shot_failure_reports_only_exception_type(
     monkeypatch.setattr(
         live_acceptance,
         "_compose_wc013_one_shot_service",
-        lambda _prepared: (_ for _ in ()).throw(
+        lambda _prepared, **_kwargs: (_ for _ in ()).throw(
             SensitiveFailure("Bearer sensitive-token")
         ),
     )
@@ -447,7 +423,10 @@ def test_one_shot_failure_reports_only_exception_type(
         Wc013LiveAcceptanceError,
         match=r"failed closed \(SensitiveFailure\)$",
     ) as raised:
-        live_acceptance.run_wc013_live_acceptance(rendered.plan_path)
+        run_prepared_wc013_live_acceptance(
+            prepared,
+            collected_evidence=collected,
+        )
 
     assert "sensitive-token" not in str(raised.value)
 
@@ -473,10 +452,15 @@ def test_one_shot_composition_requires_pinned_runtime_environment(
         _configuration_source(tmp_path),
         tmp_path / "rendered",
     )
+    prepared = prepare_wc013_live_acceptance(rendered.plan_path)
+    collected = _collected_evidence(prepared)
     monkeypatch.setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
 
     with pytest.raises(
         Wc013LiveAcceptanceError,
         match="runtime environment does not match",
     ):
-        live_acceptance.run_wc013_live_acceptance(rendered.plan_path)
+        run_prepared_wc013_live_acceptance(
+            prepared,
+            collected_evidence=collected,
+        )
