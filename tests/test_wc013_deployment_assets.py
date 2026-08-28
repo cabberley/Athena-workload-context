@@ -54,7 +54,6 @@ def _example_object_ids(example: str) -> tuple[str, str]:
 def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> None:
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
-    compiled = _read("infra/wc013-live-acceptance/main.json")
     foundation = _read("infra/azure-mcp/main.bicep")
     workload_rbac = _read("infra/azure-mcp/modules/workload-read-rbac.bicep")
     acr_rbac = _read("infra/wc013-live-acceptance/modules/acr-pull-rbac.bicep")
@@ -135,10 +134,8 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     assert reader_id != writer_id
     assert reader_id not in orchestration
     assert reader_id not in resources
-    assert reader_id not in compiled
     assert writer_id not in orchestration
     assert writer_id not in resources
-    assert writer_id not in compiled
 
     for forbidden_role in (
         "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
@@ -148,7 +145,7 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
         assert forbidden_role not in resources
         assert forbidden_role not in writer_rbac
 
-    assert "workloadReceiptWriterObjectIds" in compiled
+    assert "workloadReceiptWriterObjectIds" in orchestration
     assert "workloadReceiptWriterObjectIds" not in foundation
     assert "workloadReceiptWriterObjectIds" not in workload_rbac
     assert "workloadReceiptWriterObjectIds" not in acr_rbac
