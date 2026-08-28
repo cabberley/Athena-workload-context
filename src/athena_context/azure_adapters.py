@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
+    MAX_ARTIFACT_TRANSFER_BYTES,
     ArtifactAlreadyExistsError,
     ArtifactNotFoundError,
     ArtifactPayloadTooLargeError,
@@ -292,10 +293,10 @@ class AzureBlobCreateOnlyArtifactWriter:
         _validate_container_name(container_name)
         if (
             type(max_payload_bytes) is not int
-            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
+            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_TRANSFER_BYTES
         ):
             raise ValueError(
-                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_PAYLOAD_BYTES}"
+                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_TRANSFER_BYTES}"
             )
         credential = _production_credential(
             managed_identity_client_id=managed_identity_client_id
@@ -312,6 +313,10 @@ class AzureBlobCreateOnlyArtifactWriter:
     def create(self, request: ArtifactWriteRequest) -> ArtifactWriteReceipt:
         if type(request) is not ArtifactWriteRequest:
             raise TypeError("request must be an exact ArtifactWriteRequest")
+        if request.maximum_payload_bytes > self._max_payload_bytes:
+            raise ArtifactPayloadTooLargeError(
+                "artifact request bound exceeds the writer's configured bound"
+            )
         size_bytes = len(request.payload)
         if size_bytes > self._max_payload_bytes:
             raise ArtifactPayloadTooLargeError(
@@ -377,10 +382,10 @@ class AzureBlobVersionPinnedArtifactReader:
         _validate_container_name(container_name)
         if (
             type(max_payload_bytes) is not int
-            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
+            or not 1 <= max_payload_bytes <= MAX_ARTIFACT_TRANSFER_BYTES
         ):
             raise ValueError(
-                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_PAYLOAD_BYTES}"
+                f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_TRANSFER_BYTES}"
             )
         credential = _production_credential(
             managed_identity_client_id=managed_identity_client_id

@@ -57,6 +57,11 @@ from athena_context.reference_command import (
     run_agreed_golden_api,
     run_reference_command,
 )
+from athena_context.wc013_collector_controller import (
+    Wc013CollectorControllerError,
+    Wc013CollectorJobManagementPort,
+    run_governed_wc013_collector_start,
+)
 from athena_context.wc013_evidence_collector import (
     run_wc013_evidence_collector_job,
 )
@@ -118,6 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--emit-handoff-base64",
         action="store_true",
         help="print the version-pinned evidence handoff as one base64 line",
+    )
+    collector_controller_parser = subparsers.add_parser(
+        "wc013-collector-controller",
+        help="validate and start one exact deployed WC-013 collector template",
+    )
+    collector_controller_parser.add_argument("--contract", required=True, type=Path)
+    collector_controller_parser.add_argument(
+        "--controller-identity-client-id",
+        required=True,
+    )
+    collector_controller_parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="retrieve and validate the deployed collector without starting it",
     )
     presentation_parser = subparsers.add_parser(
         "argus-presentation-export",
@@ -206,6 +225,9 @@ def main(
     operational_demo_phase_job_port: PhaseJobPort | None = None,
     operational_demo_handoff_port: ReferenceHandoffPort | None = None,
     operational_demo_artifact_reader: VersionPinnedArtifactReaderPort | None = None,
+    wc013_collector_job_management_port: (
+        Wc013CollectorJobManagementPort | None
+    ) = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
@@ -279,6 +301,23 @@ def main(
                 output.write(
                     f"{COLLECTED_EVIDENCE_HANDOFF_BASE64_PREFIX}"
                     f"{collected.handoff.base64()}\n"
+                )
+            return 0
+        if args.command == "wc013-collector-controller":
+            started = run_governed_wc013_collector_start(
+                args.contract,
+                controller_identity_client_id=args.controller_identity_client_id,
+                management=wc013_collector_job_management_port,
+                validate_only=args.validate_only,
+            )
+            output.write(
+                "WC-013 collector template validated\n"
+                f"job: {started.job_resource_id}\n"
+                f"template digest: {started.execution_template_digest}\n"
+            )
+            if not args.validate_only:
+                output.write(
+                    f"execution: {started.execution_name or 'accepted'}\n"
                 )
             return 0
         if args.command == "argus-presentation-export":
@@ -387,6 +426,9 @@ def main(
             return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
+        return 1
+    except Wc013CollectorControllerError as exc:
+        errors.write(f"WC-013 collector controller failed: {exc}\n")
         return 1
     except PresentationExportError as exc:
         errors.write(f"ARGUS presentation export failed: {exc}\n")

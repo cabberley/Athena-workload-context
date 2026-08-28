@@ -35,6 +35,10 @@ param workloadReceiptWriterObjectIds = [
   '55555555-5555-5555-5555-555555555555'
 ]
 
+// Separately governed managed identity that alone receives collector Job read/start permission.
+// It must be distinct from both runtime identities and all operator/receipt principals.
+param collectorControllerPrincipalId = '77777777-7777-7777-7777-777777777777'
+
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.
 param wc007PinnedAuthorityDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'

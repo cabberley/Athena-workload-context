@@ -75,6 +75,12 @@ param operatorArtifactReaderObjectIds array
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
+@description('Object ID of the separately governed managed identity allowed to read and start collector Jobs.')
+param collectorControllerPrincipalId string
+
+@description('Resource ID of the custom collector Job read/start role definition.')
+param collectorControllerRoleDefinitionId string
+
 @description('Exact non-secret WC-007 authority digest emitted by the configuration renderer.')
 param wc007PinnedAuthorityDigest string
 
@@ -126,21 +132,25 @@ var collectorJobDefinitions = [
   {
     key: 'acceptance'
     name: '${namePrefix}-acceptance-collector'
+    containerName: 'wc013-acceptance-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/wc013-live-acceptance.json'
   }
   {
     key: 'baseline'
     name: '${namePrefix}-op-baseline-collector'
+    containerName: 'wc013-baseline-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/baseline.json'
   }
   {
     key: 'faulted'
     name: '${namePrefix}-op-faulted-collector'
+    containerName: 'wc013-faulted-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/faulted.json'
   }
   {
     key: 'recovered'
     name: '${namePrefix}-op-recovered-collector'
+    containerName: 'wc013-recovered-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/recovered.json'
   }
 ]
@@ -539,6 +549,14 @@ module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJ
         evidenceIdentityResourceId
       ]
     }
+    roleAssignments: [
+      {
+        roleDefinitionIdOrName: collectorControllerRoleDefinitionId
+        principalId: collectorControllerPrincipalId
+        principalType: 'ServicePrincipal'
+        description: 'Only the governed controller may retrieve and start this fixed collector Job.'
+      }
+    ]
     registries: [
       {
         server: acceptanceImageRegistryServer
@@ -547,7 +565,7 @@ module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJ
     ]
     containers: [
       {
-        name: 'wc013-${collectorJob.key}-evidence-collector'
+        name: collectorJob.containerName
         image: acceptanceImage
         command: [
           'athena-context'
@@ -845,3 +863,68 @@ output evidenceCollectorJobNames object = {
   faulted: evidenceCollectorJobs[2].outputs.name
   recovered: evidenceCollectorJobs[3].outputs.name
 }
+
+@description('Exact reviewed collector templates for the governed start controller.')
+output evidenceCollectorStartContracts array = [for collectorJob in collectorJobDefinitions: {
+  schemaVersion: 'athena.wc013CollectorStartContract.v1'
+  jobResourceId: resourceId('Microsoft.App/jobs', collectorJob.name)
+  evidenceIdentityResourceId: evidenceIdentityResourceId
+  evidenceIdentityClientId: evidenceIdentityClientId
+  wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
+  wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
+  configuration: {
+    triggerType: 'Manual'
+    replicaRetryLimit: 0
+    replicaTimeout: 900
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    registries: [
+      {
+        server: acceptanceImageRegistryServer
+        identity: evidenceIdentityResourceId
+      }
+    ]
+  }
+  template: {
+    containers: [
+      {
+        name: collectorJob.containerName
+        image: acceptanceImage
+        command: [
+          'athena-context'
+        ]
+        args: [
+          'wc013-evidence-collector-job'
+          '--config'
+          collectorJob.configurationPath
+          '--artifact-blob-endpoint'
+          replayStorage.outputs.serviceEndpoints.blob
+          '--artifact-container'
+          collectorArtifactContainerName
+          '--emit-handoff-base64'
+        ]
+        env: [
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: evidenceIdentityClientId
+          }
+          {
+            name: 'ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID'
+            value: evidenceIdentityClientId
+          }
+          {
+            name: 'ATHENA_WC013_WC007_PINNED_AUTHORITY_DIGEST'
+            value: wc007PinnedAuthorityDigest
+          }
+          {
+            name: 'ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST'
+            value: wc008PinnedAssertionDigest
+          }
+        ]
+        resources: operationalJobResources
+      }
+    ]
+  }
+}]

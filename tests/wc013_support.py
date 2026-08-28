@@ -353,6 +353,15 @@ class DeterministicSnapshotSigner:
         )
         return base64.b64encode(signature).decode("ascii")
 
+    def sign_preimage(self, canonical_preimage: bytes) -> str:
+        self.calls += 1
+        signature = self._private_key.sign(
+            canonical_preimage,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("ascii")
+
 
 class ScenarioTransport:
     def __init__(self, scenario: str = "success") -> None:

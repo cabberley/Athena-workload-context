@@ -95,7 +95,8 @@ must be re-rendered and separately approved.
 
 ## Collector and evaluation execution
 
-Run the matching isolated collector first:
+The following command is the fixed entry point inside each collector Job. Operators must not run
+it with the evidence identity or invoke the Job start action directly:
 
 ```powershell
 athena-context wc013-evidence-collector-job `
@@ -116,11 +117,15 @@ athena-context wc013-live-acceptance `
   --snapshot-output .\evidence-snapshot.json
 ```
 
-The collector writes one create-only `athena.wc013CollectedEvidence.v1` object under the reviewed
-attempt ID and emits only an `athena.wc013CollectedEvidenceHandoff.v1` containing its exact Blob
-name, immutable version, SHA-256, plan digest, and attempt ID. The Athena job reads that exact
-version and creates the final snapshot only after the complete result, snapshot attestation,
-collector identity signature, source envelope, scope, freshness, and authority checks pass. A
+The collector writes one create-only `athena.wc013CollectedEvidence.v2` object under the reviewed
+attempt ID and emits only an `athena.wc013CollectedEvidenceHandoff.v2` containing its exact Blob
+name, immutable version, SHA-256, plan digest, attempt ID, WC-008 assertion digest, and sealed
+transport digest. The artifact has a separate Key Vault RSA attestation over those bindings and
+the complete collected payload. The Athena job reads that exact version and creates the final
+snapshot only after the complete result, artifact attestation, collector identity signature,
+source envelope, scope, freshness, transport, and authority checks pass. The dedicated 8 MiB
+collector-artifact cap accommodates the 1 MiB raw MCP response, its projected records, and bounded
+provenance/attestation overhead without changing the default 1 MiB operational-artifact limit. A
 failed run creates no snapshot. Reusing either the attempt ID or request digest is rejected
 durably; an operator must issue new reviewed IDs after a failed post-reservation run.
 
@@ -184,6 +189,13 @@ It creates exactly two runtime identities:
 2. the separate context identity is attached only to the Athena acceptance and phase Jobs and has
    no workload Reader or workspace-log role.
 
+A third, non-runtime managed identity is required for collector orchestration. The deployment
+creates a custom role containing only `Microsoft.App/jobs/read`,
+`Microsoft.App/jobs/start/action`, and `Microsoft.App/jobs/executions/read`, scoped to each
+collector Job, and assigns it only to `collectorControllerPrincipalId`. That principal must be
+distinct from the evidence identity, context identity, artifact readers, and receipt writers.
+Neither human operators nor either runtime identity receives collector Job start permission.
+
 Each process receives exactly one user-assigned identity. The collector identity has Key Vault
 sign/verify on the one RSA key, `Storage Table Data Contributor` on the one replay table, and
 `Storage Blob Data Contributor` on the dedicated collector container. The context identity has
@@ -224,9 +236,10 @@ No client secret is created or accepted.
 
 The deployment identity needs resource deployment rights in the hosting resource group, role
 assignment rights at the supplied demo resource-group and ACR scopes, and permission to create the
-key-scoped and table-scoped data-plane role assignments. The supplied existing ACR resource ID is
-also assigned `AcrPull` for the acceptance identity. Review the subscription what-if for deletes,
-public exposure, and all role assignments before creating a deployment.
+key-scoped and table-scoped data-plane role assignments and the narrowly assignable custom
+collector-controller role. The supplied existing ACR resource ID is also assigned `AcrPull` for
+the acceptance identity. Review the subscription what-if for deletes, public exposure, and all
+role assignments before creating a deployment.
 
 ### Build the runner and deployment configuration image
 
@@ -256,9 +269,11 @@ az bicep lint --file infra/wc013-live-acceptance/main.bicep
 
 Copy `infra/wc013-live-acceptance/main.example.bicepparam` to an operator-owned parameter file.
 It contains only synthetic non-secret values, including distinct placeholder object IDs for
-`operatorArtifactReaderObjectIds` and `workloadReceiptWriterObjectIds`. The Reader array is for
-exact-version verification; the writer array is only for workload-controller receipt creation.
-Replace those placeholders independently and never place the same principal in both arrays.
+`operatorArtifactReaderObjectIds`, `workloadReceiptWriterObjectIds`, and
+`collectorControllerPrincipalId`. The Reader array is for exact-version verification; the writer
+array is only for workload-controller receipt creation; the controller principal is only for
+collector Job read/start. Replace those placeholders independently and never reuse a principal
+across these roles.
 Set the globally unique Key Vault and Storage account names, exact target demo resource-group scope,
 existing ACR server/resource ID, existing Entra app IDs/audiences, and the runner image digest. For
 the bootstrap deployment, leave the two `wc007PinnedAuthorityDigest` and
@@ -339,10 +354,24 @@ az deployment sub create `
   --template-file infra/wc013-live-acceptance/main.bicep `
   --parameters <operator-wc013.bicepparam>
 
-az containerapp job start `
-  --name <evidenceCollectorJobNames.acceptance> `
-  --resource-group <foundationResourceGroupName>
+$contract = az deployment sub show `
+  --name wc013-ready `
+  --query "properties.outputs.evidenceCollectorStartContracts.value[?jobResourceId=='<collector-job-resource-id>'] | [0]" `
+  --output json
+$contract | Set-Content -NoNewline .\collector-start-contract.json
+
+# Run only in the separately governed controller workload under its managed identity.
+athena-context wc013-collector-controller `
+  --contract .\collector-start-contract.json `
+  --controller-identity-client-id <collector-controller-managed-identity-client-id>
 ```
+
+The controller first retrieves the deployed Job, rejects any identity, registry, image, command,
+argument, environment, resource, init-container, volume, trigger, retry, or timeout difference,
+then calls the ARM start action with that exact validated template as the complete execution body.
+This prevents a Job-template write between validation and start from changing the execution. Its API
+and CLI expose no caller-supplied execution-template or mutable field. Direct
+`az containerapp job start` use for collector Jobs is prohibited.
 
 Retrieve the collector handoff from its bounded log line. Start `acceptanceJobName` only through a
 complete execution-template override that preserves the deployed image, command, arguments,
@@ -362,7 +391,8 @@ identity IDs, `keyVaultUri`, `signingKeyName`, `signingKeyUriWithVersion`,
 `replayPartitionKey`, `replayTableResourceId`, `artifactBlobEndpoint`,
 `artifactContainerName`, `artifactContainerResourceId`, `collectorArtifactContainerName`,
 `collectorArtifactContainerResourceId`, `artifactRetentionDays`, `acceptanceJobName`,
-`acceptanceJobResourceId`, `operationalPhaseJobNames`, and `evidenceCollectorJobNames`.
+`acceptanceJobResourceId`, `operationalPhaseJobNames`, `evidenceCollectorJobNames`,
+`evidenceCollectorStartContracts`, and `collectorControllerRoleDefinitionId`.
 
 No Context API Container App, internet-reachable environment endpoint, client secret, storage
 account key, or exported private key is required for this initial one-shot gate.

@@ -88,6 +88,11 @@ param operatorArtifactReaderObjectIds array
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
+@description('Object ID of the separately governed managed identity that alone receives collector Job read/start permission.')
+@minLength(36)
+@maxLength(36)
+param collectorControllerPrincipalId string
+
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -136,6 +141,25 @@ var resourceTags = union(tags, {
 var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
   ? acceptanceImage
   : fail('acceptanceImage must be pinned by a sha256 manifest digest')
+var collectorControllerRoleDefinitionGuid = guid(
+  subscription().id,
+  foundationResourceGroupName,
+  'athena-wc013-collector-controller'
+)
+var forbiddenCollectorControllerPrincipalIds = concat(
+  map(operatorArtifactReaderObjectIds, objectId => toLower(string(objectId))),
+  map(workloadReceiptWriterObjectIds, objectId => toLower(string(objectId))),
+  [
+    toLower(evidenceIdentity.properties.principalId)
+    toLower(acceptanceJobIdentity.properties.principalId)
+  ]
+)
+var validatedCollectorControllerPrincipalId = contains(
+  forbiddenCollectorControllerPrincipalIds,
+  toLower(collectorControllerPrincipalId)
+)
+  ? fail('collectorControllerPrincipalId must be distinct from runtime and operator principals')
+  : collectorControllerPrincipalId
 
 resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: foundationResourceGroupName
@@ -174,6 +198,30 @@ resource acceptanceJobIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities
   scope: foundationResourceGroup
 }
 
+resource collectorControllerRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: collectorControllerRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC013 Collector Controller ${uniqueString(foundationResourceGroup.id)}'
+    description: 'Read and start only the fixed WC-013 collector Jobs. No write, exec, or data-plane permission.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: [
+          'Microsoft.App/jobs/read'
+          'Microsoft.App/jobs/start/action'
+          'Microsoft.App/jobs/executions/read'
+        ]
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      foundationResourceGroup.id
+    ]
+  }
+}
+
 module privateDns 'modules/private-dns.bicep' = {
   name: 'wc013-private-endpoint-dns'
   scope: foundationResourceGroup
@@ -210,6 +258,8 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     artifactRetentionDays: artifactRetentionDays
     operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
     workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds
+    collectorControllerPrincipalId: validatedCollectorControllerPrincipalId
+    collectorControllerRoleDefinitionId: collectorControllerRoleDefinition.id
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
@@ -345,6 +395,12 @@ output operationalPhaseJobNames object = acceptanceResources.outputs.operational
 
 @description('Deterministic manual Container Apps Job names for isolated evidence collection.')
 output evidenceCollectorJobNames object = acceptanceResources.outputs.evidenceCollectorJobNames
+
+@description('Reviewed exact collector templates consumed by the governed start controller.')
+output evidenceCollectorStartContracts array = acceptanceResources.outputs.evidenceCollectorStartContracts
+
+@description('Custom role definition assigned only to the governed collector controller.')
+output collectorControllerRoleDefinitionId string = collectorControllerRoleDefinition.id
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId

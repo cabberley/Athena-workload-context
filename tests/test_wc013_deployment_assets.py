@@ -342,3 +342,39 @@ def test_wc013_collector_and_athena_jobs_have_disjoint_identities() -> None:
     assert "scope: collectorArtifactContainer" in collector_reader
     assert "principalId: acceptanceIdentityPrincipalId" in collector_reader
     assert "evidenceIdentityPrincipalId" not in collector_reader
+
+
+def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
+    orchestration = _read("infra/wc013-live-acceptance/main.bicep")
+    resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+    operations = _read("docs/operations/wc013-live-acceptance.md")
+    acceptance = _job_module(resources, "acceptanceJob")
+    collectors = _loop_job_module(resources, "evidenceCollectorJobs")
+
+    assert "param collectorControllerPrincipalId string" in orchestration
+    assert "collectorControllerRoleDefinition" in orchestration
+    assert "'Microsoft.App/jobs/read'" in orchestration
+    assert "'Microsoft.App/jobs/start/action'" in orchestration
+    assert "'Microsoft.App/jobs/executions/read'" in orchestration
+    for forbidden in (
+        "'Microsoft.App/jobs/write'",
+        "'Microsoft.App/jobs/*/action'",
+        "'Microsoft.App/jobs/exec/action'",
+    ):
+        assert forbidden not in orchestration
+    assert (
+        "collectorControllerPrincipalId: validatedCollectorControllerPrincipalId"
+        in orchestration
+    )
+    assert (
+        "collectorControllerRoleDefinitionId: collectorControllerRoleDefinition.id"
+        in orchestration
+    )
+    assert "roleAssignments:" in collectors
+    assert "collectorControllerPrincipalId" in collectors
+    assert "collectorControllerRoleDefinitionId" in collectors
+    assert "roleAssignments:" not in acceptance
+    assert "output evidenceCollectorStartContracts array" in resources
+    assert "evidenceCollectorStartContracts" in orchestration
+    assert "\naz containerapp job start `" not in operations
+    assert "wc013-collector-controller" in operations

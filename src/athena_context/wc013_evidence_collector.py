@@ -17,6 +17,7 @@ from athena_context.azure_adapters import (
     AzureBlobCreateOnlyArtifactWriter,
     AzureTableAttemptReplayGuard,
     DefaultAzureCredentialTrustedIngestionSigner,
+    KeyVaultRsaSigner,
     KeyVaultTrustedKeyResolver,
 )
 from athena_context.contracts import EvidenceGapRecord, VersionPinnedBlobReference, sha256_hex
@@ -27,10 +28,12 @@ from athena_context.live_acceptance import (
     prepare_wc013_live_acceptance,
 )
 from athena_context.precollected_evidence import (
+    MAX_COLLECTED_EVIDENCE_ARTIFACT_BYTES,
     Wc013CollectedEvidenceArtifact,
     Wc013CollectedEvidenceHandoff,
     build_collected_evidence_artifact,
     wc013_plan_digest,
+    wc013_transport_binding,
 )
 
 
@@ -134,7 +137,13 @@ def collect_prepared_wc013_evidence(
             )
         return build_collected_evidence_artifact(
             plan_digest=wc013_plan_digest(plan),
+            transport_binding=wc013_transport_binding(verified_configuration),
             collected=collected,
+            signer=KeyVaultRsaSigner(
+                trusted_key_anchor=prepared.trusted_key_anchor,
+                managed_identity_client_id=plan.evidence_identity_client_id,
+            ),
+            trusted_key_anchor=prepared.trusted_key_anchor,
         )
     except Wc013LiveAcceptanceError:
         raise
@@ -162,6 +171,7 @@ def run_wc013_evidence_collector_job(
             blob_endpoint=artifact_blob_endpoint,
             container_name=artifact_container_name,
             managed_identity_client_id=prepared.plan.evidence_identity_client_id,
+            max_payload_bytes=MAX_COLLECTED_EVIDENCE_ARTIFACT_BYTES,
         )
         blob_name = (
             f"wc013-evidence/{prepared.plan.evaluation_command.attempt_id}/"
@@ -173,6 +183,7 @@ def run_wc013_evidence_collector_job(
                 payload=payload,
                 content_type="application/json",
                 hashes=ArtifactMetadataHashes(payload_sha256=sha256_hex(payload)),
+                maximum_payload_bytes=MAX_COLLECTED_EVIDENCE_ARTIFACT_BYTES,
             )
         )
         reference = VersionPinnedBlobReference(
@@ -181,8 +192,9 @@ def run_wc013_evidence_collector_job(
             contentDigest=receipt.payload_sha256,
         )
         handoff = Wc013CollectedEvidenceHandoff(
-            schemaVersion="athena.wc013CollectedEvidenceHandoff.v1",
+            schemaVersion="athena.wc013CollectedEvidenceHandoff.v2",
             planDigest=artifact.plan_digest,
+            transportBinding=artifact.transport_binding,
             attemptId=artifact.collection_request.attempt_id,
             evidence=reference,
         )

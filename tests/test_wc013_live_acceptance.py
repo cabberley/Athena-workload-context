@@ -40,13 +40,17 @@ from wc013_support import (
     key_resolver,
     operator_approval,
     trust_configuration,
+    verified_deployment_configuration,
 )
 
 
-def _live_harness() -> DemoHarness:
+def _live_harness(endpoint: str = PRIVATE_ENDPOINT) -> DemoHarness:
+    configuration = verified_deployment_configuration(endpoint)
     return build_harness(
         as_of=CURRENT_NOW,
         manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+        service_configuration=configuration,
+        transport_configuration=configuration,
     )
 
 
@@ -73,9 +77,12 @@ def _collected_evidence(prepared: object) -> object:
     )
 
 
-def _configuration_source(tmp_path: Path) -> Path:
-    harness = _live_harness()
-    assertion = deployment_assertion()
+def _configuration_source(
+    tmp_path: Path,
+    endpoint: str = PRIVATE_ENDPOINT,
+) -> Path:
+    harness = _live_harness(endpoint)
+    assertion = deployment_assertion(endpoint)
     approval = operator_approval(assertion)
     trust = trust_configuration()
     grant_scope = WorkloadGrantScope(workload_id=harness.command.manifest_id)

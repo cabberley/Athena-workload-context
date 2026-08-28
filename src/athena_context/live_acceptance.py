@@ -53,6 +53,7 @@ from athena_context.azure_adapters import (
 from athena_context.contracts import (
     TrustedKeyAnchor,
     TrustedKeyRecord,
+    TrustedKeyResolver,
     canonicalize_json,
     compute_artifact_digest,
     resolve_manifest_profile,
@@ -70,9 +71,12 @@ from athena_context.evidence.models import (
     EvidenceClientError,
 )
 from athena_context.precollected_evidence import (
+    MAX_COLLECTED_EVIDENCE_ARTIFACT_BYTES,
     Wc013CollectedEvidenceArtifact,
     parse_collected_evidence_handoff,
+    verify_collected_evidence_artifact_attestation,
     wc013_plan_digest,
+    wc013_transport_binding,
 )
 
 _MAX_CONFIGURATION_BYTES = 131_072
@@ -1179,6 +1183,7 @@ def load_precollected_evidence(
     evidence_blob_endpoint: str,
     evidence_container_name: str,
     environment: Mapping[str, str],
+    key_resolver: TrustedKeyResolver | None = None,
 ) -> CollectedEvidence:
     handoff_value = environment.get(
         "ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64"
@@ -1190,17 +1195,27 @@ def load_precollected_evidence(
     try:
         handoff = parse_collected_evidence_handoff(handoff_value)
         expected_plan_digest = wc013_plan_digest(prepared.plan)
+        verified_configuration = OperatorTrustedWc008ConfigurationPort(
+            assertion=prepared.assertion,
+            pinned_assertion_digest=prepared.assertion.assertion_digest,
+            operator_approval=prepared.operator_approval,
+        ).load_verified()
+        expected_transport_binding = wc013_transport_binding(
+            verified_configuration
+        )
         if (
             handoff.plan_digest != expected_plan_digest
             or handoff.attempt_id != prepared.plan.evaluation_command.attempt_id
+            or handoff.transport_binding != expected_transport_binding
         ):
             raise ValueError(
-                "collected evidence handoff does not match the reviewed plan"
+                "collected evidence handoff does not match the reviewed plan and transport"
             )
         reader = AzureBlobVersionPinnedArtifactReader(
             blob_endpoint=evidence_blob_endpoint,
             container_name=evidence_container_name,
             managed_identity_client_id=prepared.plan.context_identity_client_id,
+            max_payload_bytes=MAX_COLLECTED_EVIDENCE_ARTIFACT_BYTES,
         )
         reference = handoff.evidence
         result = reader.read(
@@ -1215,12 +1230,23 @@ def load_precollected_evidence(
         )
         if (
             artifact.plan_digest != expected_plan_digest
+            or artifact.transport_binding != expected_transport_binding
+            or artifact.transport_binding != handoff.transport_binding
             or artifact.collection_request.attempt_id
             != prepared.plan.evaluation_command.attempt_id
         ):
             raise ValueError(
-                "collected evidence artifact does not match the reviewed plan"
+                "collected evidence artifact does not match the reviewed plan and transport"
             )
+        resolver = key_resolver or KeyVaultTrustedKeyResolver(
+            expected_record=prepared.trusted_key_record,
+            managed_identity_client_id=prepared.plan.context_identity_client_id,
+        )
+        verify_collected_evidence_artifact_attestation(
+            artifact,
+            trusted_key_anchor=prepared.trusted_key_anchor,
+            key_resolver=resolver,
+        )
         return artifact.collected_evidence()
     except Wc013LiveAcceptanceError:
         raise

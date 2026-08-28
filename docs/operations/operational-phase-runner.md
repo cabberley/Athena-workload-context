@@ -151,8 +151,13 @@ Missing or mismatched prior faulted indexes fail before WC-013 execution.
 
 ## Production composition
 
-For each phase, the controller first starts the matching isolated evidence collector Job and
-captures its `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` output. It then starts the deployed
+For each phase, the controller first uses `athena-context wc013-collector-controller` to retrieve
+and validate the matching collector's exact deployed evidence-only template, then starts it with
+that same closed template supplied as the complete ARM execution body. This pins the execution
+even if the stored Job template changes after validation; the controller exposes no caller-supplied
+template or mutable field. It captures the collector's
+`ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` output.
+No human or runtime identity receives direct collector Job-start permission. It then starts the deployed
 context-only Container Apps phase Job with that exact handoff and the receipt/index references.
 The `athena-context operational-phase-job` wrapper:
 

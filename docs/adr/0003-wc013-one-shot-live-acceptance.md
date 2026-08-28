@@ -5,7 +5,8 @@
 
 > **Amended by [ADR 0014](0014-isolate-wc013-evidence-identity.md):** evidence collection now runs
 > in an isolated collector job. The context-only Athena job consumes a version-pinned signed
-> collector artifact and never receives the workload-reader identity.
+> collector artifact and never receives the workload-reader identity. Collector starts require
+> the separate exact-template-validating controller path.
 
 ## Context
 

@@ -9,6 +9,7 @@ from typing import Literal, NoReturn, Protocol
 from athena_context.contracts import sha256_hex
 
 MAX_ARTIFACT_PAYLOAD_BYTES = 1024 * 1024
+MAX_ARTIFACT_TRANSFER_BYTES = 8 * 1024 * 1024
 ArtifactContentType = Literal["application/json"]
 
 _BLOB_SEGMENT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
@@ -101,16 +102,25 @@ class ArtifactWriteRequest:
     payload: bytes
     content_type: ArtifactContentType
     hashes: ArtifactMetadataHashes
+    maximum_payload_bytes: int = MAX_ARTIFACT_PAYLOAD_BYTES
 
     def __post_init__(self) -> None:
         _validate_blob_name(self.blob_name)
+        if (
+            type(self.maximum_payload_bytes) is not int
+            or not 1 <= self.maximum_payload_bytes <= MAX_ARTIFACT_TRANSFER_BYTES
+        ):
+            raise ValueError(
+                "maximum_payload_bytes must be between 1 and "
+                f"{MAX_ARTIFACT_TRANSFER_BYTES}"
+            )
         if type(self.payload) is not bytes:
             raise TypeError("payload must be immutable bytes")
         if not self.payload:
             raise ValueError("payload must not be empty")
-        if len(self.payload) > MAX_ARTIFACT_PAYLOAD_BYTES:
+        if len(self.payload) > self.maximum_payload_bytes:
             raise ArtifactPayloadTooLargeError(
-                f"artifact payload exceeds {MAX_ARTIFACT_PAYLOAD_BYTES} bytes"
+                f"artifact payload exceeds {self.maximum_payload_bytes} bytes"
             )
         if self.content_type != "application/json":
             raise ValueError("content_type must be application/json")
@@ -197,5 +207,6 @@ __all__ = [
     "ArtifactWriteRequest",
     "CreateOnlyArtifactWriterPort",
     "MAX_ARTIFACT_PAYLOAD_BYTES",
+    "MAX_ARTIFACT_TRANSFER_BYTES",
     "VersionPinnedArtifactReaderPort",
 ]
