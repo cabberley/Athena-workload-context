@@ -1139,6 +1139,7 @@ def _compose_wc013_one_shot_service(
         invoker=ManagedIdentityPrivateMcpInvoker(
             deployment_configuration=verified_configuration,
             audience=plan.azure_mcp_audience,
+            managed_identity_client_id=plan.context_identity_client_id,
         ),
     )
     evidence_client = Wc009EvidenceClientAdapter(

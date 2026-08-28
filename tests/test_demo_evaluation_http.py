@@ -644,6 +644,104 @@ def test_production_invoker_rejects_custom_bearer_and_http_dependencies() -> Non
     assert network_requests == []
 
 
+def test_production_invoker_credential_excludes_non_managed_identity_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production token chain is pinned to the reviewed context identity."""
+
+    managed_identity_client_id = "55555555-5555-5555-5555-555555555555"
+    invoker = ManagedIdentityPrivateMcpInvoker(
+        deployment_configuration=verified_deployment_configuration(),
+        audience="api://athena-private-mcp",
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    sealed = evaluation_adapters._seal_managed_identity_private_mcp_invoker(invoker)
+    captured: dict[str, object] = {}
+
+    class _DefaultAzureCredential:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        evaluation_adapters,
+        "_DEFAULT_AZURE_CREDENTIAL_TYPE",
+        _DefaultAzureCredential,
+    )
+    monkeypatch.setattr(
+        evaluation_adapters,
+        "_DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION",
+        _DefaultAzureCredential.__init__,
+    )
+
+    credential = evaluation_adapters._managed_identity_only_credential(
+        managed_identity_client_id=sealed.managed_identity_client_id,
+    )
+
+    assert type(credential) is _DefaultAzureCredential
+    assert captured["managed_identity_client_id"] == managed_identity_client_id
+    assert captured["exclude_managed_identity_credential"] is False
+    assert captured["exclude_workload_identity_credential"] is True
+    assert all(
+        captured[name] is True
+        for name in (
+            "exclude_environment_credential",
+            "exclude_shared_token_cache_credential",
+            "exclude_visual_studio_code_credential",
+            "exclude_cli_credential",
+            "exclude_powershell_credential",
+            "exclude_developer_cli_credential",
+            "exclude_interactive_browser_credential",
+            "exclude_broker_credential",
+        )
+    )
+
+
+def test_production_invoker_credential_resists_environment_chain_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AZURE_TOKEN_CREDENTIALS cannot replace the exact managed identity."""
+
+    monkeypatch.setenv(
+        "AZURE_TOKEN_CREDENTIALS",
+        "interactivebrowsercredential",
+    )
+
+    credential = evaluation_adapters._managed_identity_only_credential(
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
+    )
+
+    assert [type(item).__name__ for item in credential.credentials] == [
+        "ManagedIdentityCredential"
+    ]
+
+
+def test_production_invoker_rejects_credential_constructor_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replaced credential constructor fails closed before token acquisition."""
+
+    invoker = ManagedIdentityPrivateMcpInvoker(
+        deployment_configuration=verified_deployment_configuration(),
+        audience="api://athena-private-mcp",
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
+    )
+
+    def replaced_init(self: object, **kwargs: object) -> None:
+        del self, kwargs
+
+    monkeypatch.setattr(
+        evaluation_adapters.DefaultAzureCredential,
+        "__init__",
+        replaced_init,
+    )
+
+    with pytest.raises(
+        DemoEvaluationConfigurationError,
+        match="managed identity composition changed",
+    ):
+        evaluation_adapters._seal_managed_identity_private_mcp_invoker(invoker)
+
+
 def test_authenticated_redirect_rejection_has_no_follow_up_request() -> None:
     """The exact production redirect policy never forwards Authorization."""
 
@@ -725,6 +823,7 @@ def test_http_rejects_nested_managed_identity_http_stack_replacement() -> None:
     invoker = ManagedIdentityPrivateMcpInvoker(
         deployment_configuration=verified_deployment_configuration(),
         audience="api://athena-private-mcp",
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
     )
     harness, client = _client(private_mcp_invoker=invoker)
     service = harness.context_resolver.service
@@ -781,6 +880,7 @@ def test_http_rejects_managed_identity_invoker_method_replacement_before_token(
     invoker = ManagedIdentityPrivateMcpInvoker(
         deployment_configuration=verified_deployment_configuration(),
         audience="api://athena-private-mcp",
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
     )
     harness, client = _client(private_mcp_invoker=invoker)
 

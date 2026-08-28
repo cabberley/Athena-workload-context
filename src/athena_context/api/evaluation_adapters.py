@@ -847,7 +847,37 @@ class DefaultAzureCredentialPrivateMcpToken:
 _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION = (
     DefaultAzureCredential.get_token
 )
+_DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION = (
+    DefaultAzureCredential.__init__
+)
 _DEFAULT_AZURE_CREDENTIAL_TYPE = DefaultAzureCredential
+
+
+def _managed_identity_only_credential(
+    *,
+    managed_identity_client_id: str,
+) -> DefaultAzureCredential:
+    credential = object.__new__(_DEFAULT_AZURE_CREDENTIAL_TYPE)
+    _DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION(
+        credential,
+        managed_identity_client_id=managed_identity_client_id,
+        exclude_environment_credential=True,
+        exclude_workload_identity_credential=True,
+        exclude_managed_identity_credential=False,
+        exclude_shared_token_cache_credential=True,
+        exclude_visual_studio_code_credential=True,
+        exclude_cli_credential=True,
+        exclude_powershell_credential=True,
+        exclude_developer_cli_credential=True,
+        exclude_interactive_browser_credential=True,
+        exclude_broker_credential=True,
+    )
+    return credential
+
+
+_MANAGED_IDENTITY_CREDENTIAL_FACTORY_IMPLEMENTATION = (
+    _managed_identity_only_credential
+)
 
 
 class _ManagedIdentityPrivateMcpHttpStack:
@@ -916,11 +946,13 @@ class ManagedIdentityPrivateMcpInvoker:
 
     _audience: str
     _http_stack: _ManagedIdentityPrivateMcpHttpStack
+    _managed_identity_client_id: str
     _private_mcp_endpoint: str
 
     __slots__ = (
         "_audience",
         "_http_stack",
+        "_managed_identity_client_id",
         "_private_mcp_endpoint",
     )
 
@@ -929,6 +961,7 @@ class ManagedIdentityPrivateMcpInvoker:
         *,
         deployment_configuration: VerifiedWc008DeploymentConfiguration,
         audience: str,
+        managed_identity_client_id: str,
     ) -> None:
         try:
             _, sealed = seal_mcp_transport_configuration(
@@ -949,8 +982,22 @@ class ManagedIdentityPrivateMcpInvoker:
             raise DemoEvaluationConfigurationError(
                 "private MCP managed identity audience is required"
             )
+        if (
+            type(managed_identity_client_id) is not str
+            or not managed_identity_client_id.strip()
+            or managed_identity_client_id != managed_identity_client_id.strip()
+            or len(managed_identity_client_id) > 128
+        ):
+            raise DemoEvaluationConfigurationError(
+                "private MCP managed identity client ID is required"
+            )
         object.__setattr__(self, "_private_mcp_endpoint", endpoint)
         object.__setattr__(self, "_audience", str.__str__(audience))
+        object.__setattr__(
+            self,
+            "_managed_identity_client_id",
+            str.__str__(managed_identity_client_id),
+        )
         object.__setattr__(
             self,
             "_http_stack",
@@ -985,6 +1032,7 @@ _MANAGED_IDENTITY_MCP_INVOKE_IMPLEMENTATION = (
 class _SealedManagedIdentityPrivateMcpInvoker:
     audience: str
     http_stack: _ManagedIdentityPrivateMcpHttpStack
+    managed_identity_client_id: str
     private_mcp_endpoint: str
 
 
@@ -994,6 +1042,10 @@ def _seal_managed_identity_private_mcp_invoker(
     try:
         audience = object.__getattribute__(invoker, "_audience")
         http_stack = object.__getattribute__(invoker, "_http_stack")
+        managed_identity_client_id = object.__getattribute__(
+            invoker,
+            "_managed_identity_client_id",
+        )
         endpoint = object.__getattribute__(invoker, "_private_mcp_endpoint")
     except AttributeError as exc:
         raise DemoEvaluationConfigurationError(
@@ -1003,6 +1055,7 @@ def _seal_managed_identity_private_mcp_invoker(
         type(invoker) is not ManagedIdentityPrivateMcpInvoker
         or type(audience) is not str
         or type(endpoint) is not str
+        or type(managed_identity_client_id) is not str
         or type(http_stack) is not _ManagedIdentityPrivateMcpHttpStack
         or getattr_static(
             _DEFAULT_AZURE_CREDENTIAL_TYPE,
@@ -1010,6 +1063,14 @@ def _seal_managed_identity_private_mcp_invoker(
             None,
         )
         is not _DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION
+        or getattr_static(
+            _DEFAULT_AZURE_CREDENTIAL_TYPE,
+            "__init__",
+            None,
+        )
+        is not _DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION
+        or _managed_identity_only_credential
+        is not _MANAGED_IDENTITY_CREDENTIAL_FACTORY_IMPLEMENTATION
         or getattr_static(_ManagedIdentityPrivateMcpHttpStack, "open", None)
         is not _MANAGED_IDENTITY_HTTP_OPEN_IMPLEMENTATION
         or getattr_static(
@@ -1025,6 +1086,7 @@ def _seal_managed_identity_private_mcp_invoker(
     return _SealedManagedIdentityPrivateMcpInvoker(
         audience=str.__str__(audience),
         http_stack=http_stack,
+        managed_identity_client_id=str.__str__(managed_identity_client_id),
         private_mcp_endpoint=str.__str__(endpoint),
     )
 
@@ -1151,7 +1213,9 @@ def _invoke_managed_identity_private_mcp(
     )
     opener = _MANAGED_IDENTITY_HTTP_BUILD_IMPLEMENTATION(sealed.http_stack)
     scope = f"{sealed.audience.rstrip('/')}/.default"
-    credential_provider = _DEFAULT_AZURE_CREDENTIAL_TYPE()
+    credential_provider = _MANAGED_IDENTITY_CREDENTIAL_FACTORY_IMPLEMENTATION(
+        managed_identity_client_id=sealed.managed_identity_client_id,
+    )
     if type(credential_provider) is not _DEFAULT_AZURE_CREDENTIAL_TYPE:
         raise DemoEvaluationConfigurationError(
             "private MCP managed identity credential construction changed"
@@ -1654,6 +1718,7 @@ def _same_managed_identity_invoker_seal(
         return current is expected
     return (
         current.audience == expected.audience
+        and current.managed_identity_client_id == expected.managed_identity_client_id
         and current.private_mcp_endpoint == expected.private_mcp_endpoint
         and current.http_stack is expected.http_stack
     )

@@ -930,6 +930,9 @@ def test_production_http_path_rejects_initialize_after_overall_deadline(
     observed_timeouts: list[float] = []
 
     class SyntheticCredential:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
         def get_token(self, scope: str) -> SimpleNamespace:
             assert scope == "api://athena-private-mcp/.default"
             return SimpleNamespace(token="synthetic-managed-identity-token")
@@ -967,6 +970,11 @@ def test_production_http_path_rejects_initialize_after_overall_deadline(
     )
     monkeypatch.setattr(
         evaluation_adapters,
+        "_DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION",
+        SyntheticCredential.__init__,
+    )
+    monkeypatch.setattr(
+        evaluation_adapters,
         "_DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION",
         SyntheticCredential.get_token,
     )
@@ -983,6 +991,7 @@ def test_production_http_path_rejects_initialize_after_overall_deadline(
     sealed = evaluation_adapters._SealedManagedIdentityPrivateMcpInvoker(
         audience="api://athena-private-mcp",
         http_stack=evaluation_adapters._ManagedIdentityPrivateMcpHttpStack(),
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
         private_mcp_endpoint=PRIVATE_ENDPOINT,
     )
 
@@ -1018,6 +1027,9 @@ def test_production_http_path_enriches_each_vm_in_the_same_session(
     requests: list[tuple[str, str | None, dict[str, object]]] = []
 
     class SyntheticCredential:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
         def get_token(self, scope: str) -> SimpleNamespace:
             assert scope == "api://athena-private-mcp/.default"
             return SimpleNamespace(token="synthetic-managed-identity-token")
@@ -1092,6 +1104,11 @@ def test_production_http_path_enriches_each_vm_in_the_same_session(
     )
     monkeypatch.setattr(
         evaluation_adapters,
+        "_DEFAULT_AZURE_CREDENTIAL_INIT_IMPLEMENTATION",
+        SyntheticCredential.__init__,
+    )
+    monkeypatch.setattr(
+        evaluation_adapters,
         "_DEFAULT_AZURE_CREDENTIAL_GET_TOKEN_IMPLEMENTATION",
         SyntheticCredential.get_token,
     )
@@ -1108,6 +1125,7 @@ def test_production_http_path_enriches_each_vm_in_the_same_session(
     sealed = evaluation_adapters._SealedManagedIdentityPrivateMcpInvoker(
         audience="api://athena-private-mcp",
         http_stack=evaluation_adapters._ManagedIdentityPrivateMcpHttpStack(),
+        managed_identity_client_id="55555555-5555-5555-5555-555555555555",
         private_mcp_endpoint=PRIVATE_ENDPOINT,
     )
 

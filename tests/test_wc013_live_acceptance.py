@@ -357,6 +357,7 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
     }
     for name, value in runtime_environment.items():
         monkeypatch.setenv(name, value)
+    invoker_configuration: dict[str, object] = {}
     monkeypatch.setattr(live_acceptance, "_SystemClock", lambda: clock)
     monkeypatch.setattr(
         live_acceptance,
@@ -381,7 +382,10 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
     monkeypatch.setattr(
         live_acceptance,
         "ManagedIdentityPrivateMcpInvoker",
-        lambda **_kwargs: ScenarioTransport("success"),
+        lambda **kwargs: (
+            invoker_configuration.update(kwargs)
+            or ScenarioTransport("success")
+        ),
     )
 
     accepted = live_acceptance.run_wc013_live_acceptance(
@@ -392,6 +396,9 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
     assert accepted.result.snapshot.evidence_records
     assert accepted.snapshot_path is not None
     assert accepted.snapshot_path.is_file()
+    assert invoker_configuration["managed_identity_client_id"] == (
+        prepared.plan.context_identity_client_id
+    )
 
 
 def test_one_shot_failure_reports_only_exception_type(
