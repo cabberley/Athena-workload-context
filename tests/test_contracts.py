@@ -298,23 +298,72 @@ def test_datetime_string_normalization_matches_datetime_object_digest() -> None:
     assert compute_artifact_digest(payload_string) == compute_artifact_digest(payload_datetime)
 
 
+def test_zero_padded_microsecond_datetime_strings_normalize_to_milliseconds() -> None:
+    payload_string = {
+        "attemptStartedAt": "2025-01-02T12:00:00.123000+00:00",
+        "responseReceivedAt": "2025-01-02T12:00:05.000000Z",
+    }
+    payload_datetime = {
+        "attemptStartedAt": datetime(2025, 1, 2, 12, 0, 0, 123000, tzinfo=UTC),
+        "responseReceivedAt": datetime(2025, 1, 2, 12, 0, 5, tzinfo=UTC),
+    }
+
+    assert compute_artifact_digest(payload_string) == compute_artifact_digest(payload_datetime)
+
+
+def test_utc_datetime_json_serialization_uses_canonical_milliseconds() -> None:
+    adapter = TypeAdapter(UtcDateTime)
+
+    assert (
+        adapter.dump_json(datetime(2025, 1, 2, 12, 0, 0, 123000, tzinfo=UTC))
+        == b'"2025-01-02T12:00:00.123Z"'
+    )
+    assert (
+        adapter.dump_json(datetime(2025, 1, 2, 12, 0, 5, tzinfo=UTC))
+        == b'"2025-01-02T12:00:05Z"'
+    )
+
+
 @pytest.mark.parametrize(
     "timestamp",
     [
-        datetime(2025, 1, 2, 13, 0, 0, 999, tzinfo=UTC),
-        "2025-01-02T13:00:00.000999Z",
-        "2025-01-02T13:00:00.0000009Z",
+        "2026-08-20T23:50:41.2983616Z",
+        "2026-08-20T08:00:00.0000000Z",
         "2025-01-02T13:00:00.0000009+10:00",
+    ],
+)
+def test_digest_canonicalization_preserves_high_precision_timestamp_like_strings(
+    timestamp: str,
+) -> None:
+    payload = {"versionId": timestamp}
+    canonical = canonicalize_json(payload)
+
+    assert canonical == json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    assert compute_artifact_digest(payload) == sha256_hex(canonical)
+
+
+def test_digest_canonicalization_rejects_submillisecond_datetime_objects() -> None:
+    with pytest.raises(AthenaValidationError, match="milliseconds"):
+        compute_artifact_digest(
+            {
+                "expiresAt": datetime(2025, 1, 2, 13, 0, 0, 999, tzinfo=UTC),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
         "2025-01-02T13:00:00.0000009+10",
         "2025-01-02T13:00:00.0000009+1000",
         "2025-01-02T13:00:00.0000009+10:00:00",
         "2025-01-02T13:00:00.0000009",
     ],
 )
-def test_digest_canonicalization_rejects_submillisecond_timestamps(
-    timestamp: datetime | str,
+def test_digest_canonicalization_rejects_malformed_timestamp_like_strings(
+    timestamp: str,
 ) -> None:
-    with pytest.raises(AthenaValidationError, match="milliseconds|RFC 3339"):
+    with pytest.raises(AthenaValidationError, match="RFC 3339"):
         compute_artifact_digest({"expiresAt": timestamp})
 
 

@@ -16,6 +16,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PlainSerializer,
     StringConstraints,
     WithJsonSchema,
     field_validator,
@@ -30,6 +31,18 @@ from athena_context.contracts.common import (
     normalize_nfc_text,
     sha256_hex,
 )
+
+
+def _canonical_utc_datetime_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise AthenaValidationError("timestamp must be UTC")
+    if value.microsecond % 1000:
+        raise AthenaValidationError(
+            "timestamp precision must be exactly representable in milliseconds"
+        )
+    if value.microsecond:
+        return value.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 
 class AthenaBaseModel(BaseModel):
@@ -687,19 +700,19 @@ def _validate_utc_lexical_value(value: Any) -> Any:
 
 
 def _validate_utc_datetime(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
-        raise AthenaValidationError("timestamp must be UTC")
-    if value.microsecond % 1000:
-        raise AthenaValidationError(
-            "timestamp precision must be exactly representable in milliseconds"
-        )
+    _canonical_utc_datetime_text(value)
     return value
+
+
+def _serialize_utc_datetime(value: datetime) -> str:
+    return _canonical_utc_datetime_text(value)
 
 
 type UtcDateTime = Annotated[
     datetime,
     BeforeValidator(_validate_utc_lexical_value),
     AfterValidator(_validate_utc_datetime),
+    PlainSerializer(_serialize_utc_datetime, return_type=str, when_used="json"),
     WithJsonSchema(
         {
             "type": "string",

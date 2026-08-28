@@ -23,6 +23,20 @@ REQUIRED_FILES = (
 
 FRONTMATTER_PATTERN = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
 MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]+\]\((?!https?://|mailto:|#)([^)]+)\)")
+EXCLUDED_MARKDOWN_PATH_PARTS = frozenset(
+    {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "build",
+        "coverage",
+        "dist",
+        "htmlcov",
+        "node_modules",
+    }
+)
 ALLOWED_MODELS = {
     "mai-code-1.1-flash",
     "gpt-5.3-codex",
@@ -320,10 +334,18 @@ def validate_model_strategy_text(errors: list[str]) -> None:
             errors.append(f"architecture issue template: missing required field {field!r}")
 
 
+def _iter_repository_markdown(root: Path = ROOT) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*.md")
+        if not EXCLUDED_MARKDOWN_PATH_PARTS.intersection(
+            path.relative_to(root).parts
+        )
+    )
+
+
 def validate_local_markdown_links(errors: list[str]) -> None:
-    for path in ROOT.rglob("*.md"):
-        if ".git" in path.parts:
-            continue
+    for path in _iter_repository_markdown():
         text = path.read_text(encoding="utf-8")
         for raw_target in MARKDOWN_LINK_PATTERN.findall(text):
             target = raw_target.split("#", maxsplit=1)[0]

@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# Build from the directory containing wc013-live/ and wc013-signing-public-key.pem.
+ARG ATHENA_WC013_RUNNER_IMAGE
+FROM ${ATHENA_WC013_RUNNER_IMAGE}
+
+# These are reviewed, non-secret artifacts. The exact plan pins all files and key metadata.
+COPY --chown=10001:10001 wc013-live/ /opt/athena/wc013-live/
+COPY --chown=10001:10001 wc013-signing-public-key.pem /opt/athena/wc013-signing-public-key.pem
+
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["athena-context wc013-live-acceptance --config /opt/athena/wc013-live/wc013-live-acceptance.json --snapshot-output /tmp/evidence-snapshot.json && python -c \"import base64; print('WC013_SNAPSHOT_B64=' + base64.b64encode(open('/tmp/evidence-snapshot.json', 'rb').read()).decode('ascii'))\""]

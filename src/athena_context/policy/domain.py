@@ -21,6 +21,7 @@ from athena_context.contracts.manifest import (
     ResolvedManifestProfile,
     ResourceProofFact,
     RoleEndpoint,
+    RoleOperationalStateProof,
     ZoneColocationProof,
     ZoneDistributionProof,
 )
@@ -205,6 +206,37 @@ def _evaluate_zone_distribution(
         else constraint.failure_verdict
     )
     return PolicyDecision(verdict, tuple(references))
+
+
+def _evaluate_role_operational_state(
+    evidence: EvidenceReferenceContext,
+    constraint: ManifestConstraint,
+    proof: RoleOperationalStateProof,
+) -> PolicyDecision:
+    bound = _bound_role_resources(evidence, proof.role_ref)
+    references = _references_for_resources(bound.resources)
+    gate = _merge_gates(bound.gate, _resource_gate(bound.resources))
+    if gate is not None:
+        return PolicyDecision(gate, tuple(references))
+
+    healthy_states = set(proof.healthy_states)
+    failure_states = set(proof.failure_states)
+    operational_states = tuple(
+        resource.operational_state for resource in bound.resources
+    )
+    if any(
+        state == "unknown"
+        or state not in healthy_states | failure_states
+        for state in operational_states
+    ):
+        return PolicyDecision("unknown", tuple(references))
+
+    healthy_count = sum(state in healthy_states for state in operational_states)
+    if healthy_count < proof.minimum_healthy:
+        return PolicyDecision(constraint.failure_verdict, tuple(references))
+    if any(state in failure_states for state in operational_states):
+        return PolicyDecision("observation", tuple(references))
+    return PolicyDecision(constraint.success_verdict, tuple(references))
 
 
 def _declared_relationship(
@@ -409,7 +441,10 @@ def _proof_role_refs(
     constraint: ManifestConstraint,
 ) -> tuple[str, ...]:
     proof = constraint.proof_requirement
-    if isinstance(proof, (CardinalityProof, ZoneDistributionProof)):
+    if isinstance(
+        proof,
+        (CardinalityProof, ZoneDistributionProof, RoleOperationalStateProof),
+    ):
         return (proof.role_ref,)
     if isinstance(proof, ZoneColocationProof):
         return (proof.subject_role_ref, proof.anchor_role_ref)
@@ -564,6 +599,8 @@ def evaluate_constraint(
         decision = _evaluate_zone_colocation(evidence, constraint, proof)
     elif isinstance(proof, ZoneDistributionProof):
         decision = _evaluate_zone_distribution(evidence, constraint, proof)
+    elif isinstance(proof, RoleOperationalStateProof):
+        decision = _evaluate_role_operational_state(evidence, constraint, proof)
     elif isinstance(proof, RelationshipPresenceProof):
         decision = _evaluate_relationship(profile, evidence, constraint, proof)
     elif isinstance(proof, ControlHealthProof):

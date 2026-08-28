@@ -1,0 +1,477 @@
+# WC-013 live acceptance
+
+The initial gate uses two manual Container Apps Jobs in the same private managed environment as
+the Azure MCP Container App. An isolated collector job invokes Azure MCP and publishes a signed,
+version-pinned evidence artifact. A separate context-only Athena job consumes that exact artifact
+and composes the existing `ContextService` and `DemoEvaluationService`. It does not require a
+separately deployed Context API HTTP composition.
+
+This is safe only because the job imports a bounded, human-approved, digest-pinned WC-007 authority
+bundle and performs no manifest, approval, grant, or key-trust mutation. The imported
+`PublishedManifestView`, active `DemoEvaluationApproval`, publisher/context-reader identities, and
+exact workload-scoped grants are loaded into the existing transactional ContextService store.
+ContextService still re-resolves context, approval, grants, key authority, scope, freshness, and
+identity before and after collection and owns the only evaluation commit.
+
+The production path uses:
+
+- `DefaultAzureCredential` with the exact evidence identity only inside the isolated collector for
+  the private Azure MCP call, replay-table transaction, collector token, and ingestion signature;
+- `DefaultAzureCredential` with the exact context identity only inside Athena for collector
+  artifact reads, Key Vault key resolution, snapshot/presentation signing, and operational output
+  writes;
+- independent Entra JWKS, issuer, audience, time, tenant, object-id, and client-id verification;
+- one exact versioned Key Vault RSA key for trusted-ingestion and snapshot RS256 signatures; and
+- one Azure Table transaction that atomically reserves both attempt ID and request digest;
+- one private immutable collector container for version-pinned evidence handoffs; and
+- a separate private immutable Blob container for bounded operational artifacts.
+
+No bearer token, client secret, storage key, connection string, or private key is accepted in
+configuration or persisted in evidence.
+
+WC-008 deliberately configures the MCP app with `external: true` while the Container Apps
+environment remains `internal: true` with `publicNetworkAccess: Disabled`. In this combination,
+external ingress means reachable through the environment's private static IP from the linked VNet;
+it does not create an internet-reachable endpoint. A private DNS zone named for the environment
+`defaultDomain` is linked to that VNet, and its wildcard A record maps the normal non-`.internal`
+Container App FQDN to the environment `staticIp`. See
+`docs/adr/0004-vnet-scoped-container-app-ingress.md`.
+
+## Reviewed input files
+
+`wc013-source.json` is produced by `athena-context wc013-config-template` and references:
+
+1. the exact WC-008 deployment facts and separate human operator approval;
+2. a `wc013-authority-source.json` containing:
+   - `published_context`: exact active `PublishedManifestView`;
+   - `evaluation_approval`: exact active `DemoEvaluationApproval`;
+   - `publisher` and `context_reader` actors;
+   - at least one exact workload-scoped publisher grant and reader grant;
+3. the exact WC-007 selection and `DemoEvaluationCommand`;
+4. separate context/evidence managed-identity client IDs;
+5. the private Azure MCP audience;
+6. collector trust and the exact versioned Key Vault key/public PEM; and
+7. the Azure Table endpoint, table name, and acceptance partition key.
+
+The authority source is an export, not a proposal or publication command. The renderer computes its
+canonical digest, creates a separate human trust record, and refuses to overwrite output.
+
+```powershell
+athena-context wc013-config-template |
+  Set-Content -Encoding utf8 .\wc013-source.json
+
+athena-context wc013-render-config `
+  --input .\wc013-source.json `
+  --output-directory .\wc013-live
+```
+
+Download only the public half of the exact key version:
+
+```powershell
+az keyvault key download `
+  --id 'https://<vault>.vault.azure.net/keys/<name>/<version>' `
+  --encoding PEM `
+  --file .\wc013-signing-public-key.pem
+```
+
+## Offline validation
+
+This performs no credential or network operation:
+
+```powershell
+athena-context wc013-live-acceptance `
+  --config .\wc013-live\wc013-live-acceptance.json `
+  --validate-only
+```
+
+It validates both pinned human approvals, WC-007 selection/digests/profile, active unsuperseded
+shape, exact workload grants, WC-008 endpoint/identity/scope, separate identities, trusted key
+fingerprint, and all bounded files.
+
+The rendered WC-008 assertion must pin `internal_environment: true`,
+`public_network_access: Disabled`, `external_ingress: true`, and `allow_insecure: false`. An older
+assertion that records `external_ingress: false` no longer represents the deployable topology and
+must be re-rendered and separately approved.
+
+## Collector and evaluation execution
+
+The following command is the fixed entry point inside each collector Job. Operators must not run
+it with the evidence identity or invoke the Job start action directly:
+
+```powershell
+athena-context wc013-evidence-collector-job `
+  --config $env:ATHENA_WC013_LIVE_CONFIG `
+  --artifact-blob-endpoint $env:ATHENA_WC013_EVIDENCE_BLOB_ENDPOINT `
+  --artifact-container $env:ATHENA_WC013_EVIDENCE_CONTAINER `
+  --emit-handoff-base64
+```
+
+Copy the emitted `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` value unchanged into the
+context-only job environment, then run:
+
+```powershell
+athena-context wc013-live-acceptance `
+  --config $env:ATHENA_WC013_LIVE_CONFIG `
+  --evidence-blob-endpoint $env:ATHENA_WC013_EVIDENCE_BLOB_ENDPOINT `
+  --evidence-container $env:ATHENA_WC013_EVIDENCE_CONTAINER `
+  --snapshot-output .\evidence-snapshot.json
+```
+
+The collector writes one create-only `athena.wc013CollectedEvidence.v2` object under the reviewed
+attempt ID and emits only an `athena.wc013CollectedEvidenceHandoff.v2` containing its exact Blob
+name, immutable version, SHA-256, plan digest, attempt ID, WC-008 assertion digest, and sealed
+transport digest. The artifact has a separate Key Vault RSA attestation over those bindings and
+the complete collected payload. The Athena job reads that exact version and creates the final
+snapshot only after the complete result, artifact attestation, collector identity signature,
+source envelope, scope, freshness, transport, and authority checks pass. The dedicated 8 MiB
+collector-artifact cap accommodates the 1 MiB raw MCP response, its projected records, and bounded
+provenance/attestation overhead without changing the default 1 MiB operational-artifact limit. A
+failed run creates no snapshot. Reusing either the attempt ID or request digest is rejected
+durably; an operator must issue new reviewed IDs after a failed post-reservation run.
+
+The three-phase operational demonstration reuses this execution path without the direct
+`--snapshot-output` file. Its deployed `athena-context operational-phase-job` wrapper writes one
+fixed local phase-input file, composes the production Blob reader/writer and Key Vault signer,
+invokes the [operational phase runner](operational-phase-runner.md) for one digest-pinned
+baseline, faulted, or recovered plan, then writes a governed handoff file for the outer
+[operational demo operator](operational-demo-operator.md). Fault injection and reset remain
+outside Athena and are represented only by separately delivered receipts.
+
+## Exact runtime environment variables
+
+Generated `wc013-runtime.ps1` sets:
+
+| Variable | Exact purpose |
+|---|---|
+| `AZURE_CLIENT_ID` | WC-008 context managed-identity client ID. |
+| `ATHENA_WC013_LIVE` | `1` for the opt-in pytest gate. |
+| `ATHENA_WC013_LIVE_CONFIG` | Absolute path to `wc013-live-acceptance.json`. |
+| `ATHENA_WC013_MANIFEST_ID` | Exact WC-007 manifest ID. |
+| `ATHENA_WC013_MANIFEST_VERSION` | Exact active version. |
+| `ATHENA_WC013_PROFILE_ID` | Exact resolved profile ID. |
+| `ATHENA_WC013_WC007_AUTHORITY_FILE` | Bounded rendered authority bundle. |
+| `ATHENA_WC013_WC007_AUTHORITY_APPROVAL_FILE` | Separate human approval of the authority digest. |
+| `ATHENA_WC013_WC007_PINNED_AUTHORITY_DIGEST` | Exact `sha256:<64 lowercase hex>` digest. |
+| `ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE` | Bounded WC-008 assertion JSON. |
+| `ATHENA_WC013_WC008_OPERATOR_APPROVAL_FILE` | Separate human WC-008 approval JSON. |
+| `ATHENA_WC013_WC008_PINNED_ASSERTION_DIGEST` | Exact WC-008 digest. |
+| `ATHENA_WC013_CONTEXT_IDENTITY_CLIENT_ID` | Exact context identity client ID. |
+| `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64` | Exact base64 collector handoff supplied only to the context-only evaluator job. |
+
+The collector job separately receives `AZURE_CLIENT_ID` and
+`ATHENA_WC013_EVIDENCE_IDENTITY_CLIENT_ID` set to the evidence identity plus the pinned WC-007 and
+WC-008 digests. The private MCP audience and replay configuration remain in the reviewed plan; the
+Athena evaluator receives no evidence-identity selector.
+
+The plan also contains the non-secret Key Vault key ID, public-key metadata, collector trust, replay
+configuration, idempotency key, exact command, and relative input-file paths.
+
+## Deployment assets and prerequisites
+
+`infra/wc013-live-acceptance/main.bicep` is the subscription-scope composition for this gate. It
+creates a dedicated hosting resource group, reuses `infra/azure-mcp/main.bicep` and its pinned
+Azure MCP 2.0.5 implementation, and adds a private-endpoint subnet, private DNS zones, a private
+Key Vault, private Azure Table and Blob endpoints, separate immutable collector and operational
+artifact containers, four manual collector Jobs, one manual WC-013 acceptance Job, and three
+manual phase-fixed operational Jobs in the same internal managed environment.
+
+The composition uses pinned Azure Verified Modules for the Key Vault
+(`avm/res/key-vault/vault:0.14.0`), Storage account
+(`avm/res/storage/storage-account:0.33.0`), and Container Apps Job
+(`avm/res/app/job:0.7.2`). The existing native Azure MCP implementation remains visible because its
+reviewed image, command line, VNet-scoped ingress, private DNS, and cross-resource-group Reader
+assignment are security-critical.
+
+It creates exactly two runtime identities:
+
+1. the MCP/evidence identity has the single Reader role at the supplied synthetic demo workload
+   resource-group scope and is attached only to the collector Jobs; and
+2. the separate context identity is attached only to the Athena acceptance and phase Jobs and has
+   no workload Reader or workspace-log role.
+
+A third, non-runtime managed identity is required for collector orchestration. The deployment
+creates a custom role containing only `Microsoft.App/jobs/read`,
+`Microsoft.App/jobs/start/action`, and `Microsoft.App/jobs/executions/read`, scoped to each
+collector Job, and assigns it only to `collectorControllerPrincipalId`. That principal must be
+distinct from the evidence identity, context identity, artifact readers, and receipt writers.
+Neither human operators nor either runtime identity receives collector Job start permission.
+
+Each process receives exactly one user-assigned identity. The collector identity has Key Vault
+sign/verify on the one RSA key, `Storage Table Data Contributor` on the one replay table, and
+`Storage Blob Data Contributor` on the dedicated collector container. The context identity has
+Key Vault sign/verify, `Storage Blob Data Reader` on the collector container, and
+`Storage Blob Data Contributor` on the separate operational artifact container.
+The separately supplied `operatorArtifactReaderObjectIds` array receives `Storage Blob Data Reader`
+at that same container only for exact-version operator verification. The separate
+`workloadReceiptWriterObjectIds` array receives `Storage Blob Data Contributor` at that same
+container only so the trusted workload-owned controller can create the exact immutable
+`athena.demoFaultRun.v1` receipt Blobs required by the phase Jobs. Azure RBAC cannot scope that
+built-in Blob role to `runs/<runId>/inputs/<phase>/`, so exact names, JSON-only payloads, and
+create-only `If-None-Match: *` semantics remain enforced by the controller contract and writer
+port. Because Blob Contributor also permits reads and lists, the reader and receipt-writer arrays
+must be disjoint. The resource module normalizes object-ID casing and fails deployment if a
+principal appears in both arrays or if either array contains the acceptance or evidence runtime
+identity. Those Bicep values are Entra object IDs for RBAC; the external operator configuration
+still uses the corresponding managed-identity client ID when it requests tokens. Shared keys,
+connection strings, secrets, and private key export are disabled or unused.
+
+### Required existing Entra resources
+
+Azure Resource Manager Bicep intentionally does not create Entra applications or directory
+application-role assignments. Supply these non-secret IDs and audiences as Bicep parameters before
+the infrastructure deployment:
+
+- `azureMcpResourceApplicationClientId` and `azureMcpAudience`: an existing Azure MCP resource
+  application whose Application ID URI equals the configured audience and which exposes the
+  reviewed `Mcp.Tools.ReadWrite.All` application role.
+- `trustedIngestionResourceApplicationClientId` and `trustedIngestionAudience`: an existing
+  trusted-ingestion resource application whose Application ID URI equals the configured ingestion
+audience, accepts v1 access tokens, and exposes an application role usable with `.default`.
+
+After the first deployment has produced the two managed-identity principal IDs, but before any Job
+execution, an Entra administrator must grant both the Azure MCP application role and the
+trusted-ingestion application role only to `evidenceIdentityPrincipalId`. Remove any earlier Azure
+MCP application-role grant from `acceptanceJobIdentityPrincipalId`. The trusted-ingestion token
+must retain the exact configured `api://...` audience, rather than only a client-ID GUID audience.
+No client secret is created or accepted.
+
+The deployment identity needs resource deployment rights in the hosting resource group, role
+assignment rights at the supplied demo resource-group and ACR scopes, and permission to create the
+key-scoped and table-scoped data-plane role assignments and the narrowly assignable custom
+collector-controller role. The supplied existing ACR resource ID is also assigned `AcrPull` for
+the acceptance identity. Review the subscription what-if for deletes, public exposure, and all
+role assignments before creating a deployment.
+
+### Build the runner and deployment configuration image
+
+The root `Dockerfile` packages this repository with its normal `pyproject.toml` installation and
+runs the `athena-context wc013-live-acceptance` CLI as a non-root user. It deliberately contains no
+operator configuration. `Dockerfile.wc013-delivery` is the second, required image layer: it copies
+the reviewed `wc013-live/` tree and the public PEM into the fixed paths used by the Jobs. For the
+operational demonstration, that same `wc013-live/` tree must also contain the reviewed phase bundle
+at `wc013-live/delivery/operational-phase-bundle.json`.
+
+Build and push a digest-pinned runner image first. Use it as the bootstrap `acceptanceImage`; the
+Job is manual and must not be started at this stage.
+
+```powershell
+docker build --file Dockerfile --tag <registry>/athena/wc013-runner:<reviewed-tag> .
+docker push <registry>/athena/wc013-runner:<reviewed-tag>
+```
+
+Build the Bicep templates before a what-if or deployment:
+
+```powershell
+az bicep build --file infra/azure-mcp/main.bicep
+az bicep build --file infra/wc013-live-acceptance/main.bicep
+az bicep lint --file infra/azure-mcp/main.bicep
+az bicep lint --file infra/wc013-live-acceptance/main.bicep
+```
+
+Copy `infra/wc013-live-acceptance/main.example.bicepparam` to an operator-owned parameter file.
+It contains only synthetic non-secret values, including distinct placeholder object IDs for
+`operatorArtifactReaderObjectIds`, `workloadReceiptWriterObjectIds`, and
+`collectorControllerPrincipalId`. The Reader array is for exact-version verification; the writer
+array is only for workload-controller receipt creation; the controller principal is only for
+collector Job read/start. Replace those placeholders independently and never reuse a principal
+across these roles. The deployment rejects either runtime identity in the reader or writer array.
+Set the globally unique Key Vault and Storage account names, exact target demo resource-group scope,
+existing ACR server/resource ID, existing Entra app IDs/audiences, and the runner image digest. For
+the bootstrap deployment, leave the two `wc007PinnedAuthorityDigest` and
+`wc008PinnedAssertionDigest` values as nonmatching placeholders. They prevent an accidental
+execution until the reviewed renderer output is available.
+
+```powershell
+az deployment sub what-if `
+  --name wc013-bootstrap `
+  --location <region> `
+  --template-file infra/wc013-live-acceptance/main.bicep `
+  --parameters <operator-wc013.bicepparam>
+
+az deployment sub create `
+  --name wc013-bootstrap `
+  --location <region> `
+  --template-file infra/wc013-live-acceptance/main.bicep `
+  --parameters <operator-wc013.bicepparam>
+
+az deployment sub show --name wc013-bootstrap --query properties.outputs -o json
+```
+
+Map the first deployment outputs directly into `wc013-source.json`: use the MCP endpoint, managed
+environment and Container App resource IDs, both identity resource/principal/client IDs, the one
+Reader scope, `azureMcpAudience`, `replayTableEndpoint`, `replayTableName`, and
+`signingKeyUriWithVersion`. Use the output key URI, not an unversioned name, to download the public
+PEM. The configured trusted-ingestion application ID and audience remain operator-supplied Bicep
+outputs for the collector trust section.
+
+Download the exact public key, then render the reviewed files into a staging directory:
+
+```powershell
+az keyvault key download `
+  --id <signingKeyUriWithVersion> `
+  --encoding PEM `
+  --file <staging-directory>/wc013-signing-public-key.pem
+
+athena-context wc013-render-config `
+  --input <staging-directory>/wc013-source.json `
+  --output-directory <staging-directory>/wc013-live
+
+Copy the reviewed operational phase delivery bundle into
+`<staging-directory>/wc013-live/delivery/` before the image build. That subtree must contain
+`operational-phase-bundle.json`, `configs/`, and every WC-007, WC-008, and public-key file
+referenced by the reviewed phase plans.
+
+Set-Location <staging-directory>
+docker build `
+  --file <repository-root>/Dockerfile.wc013-delivery `
+  --build-arg ATHENA_WC013_RUNNER_IMAGE=<runner-image-by-digest> `
+  --tag <registry>/athena/wc013-live:<reviewed-tag> `
+  .
+docker push <registry>/athena/wc013-live:<reviewed-tag>
+```
+
+The staging directory must contain `wc013-live/` (including the reviewed `delivery/` subtree)
+and `wc013-signing-public-key.pem` only as reviewed non-secret delivery artifacts. Do not add
+authority data, PEM files, or any runtime files to Bicep parameters, outputs, Container Apps
+secrets, or source control.
+
+Update the operator parameter file with the configuration delivery image digest and the exact
+`pinned authority digest` and `pinned assertion digest` printed by the renderer. Re-run what-if,
+then redeploy the same Bicep entrypoint. This updates the manual Jobs with their reviewed image
+and non-secret environment pins. Re-read the Key Vault version output after each resource
+deployment; if a new key version was intentionally produced, download that public key and rerender
+before starting any Job.
+
+```powershell
+az deployment sub what-if `
+  --name wc013-ready `
+  --location <region> `
+  --template-file infra/wc013-live-acceptance/main.bicep `
+  --parameters <operator-wc013.bicepparam>
+
+az deployment sub create `
+  --name wc013-ready `
+  --location <region> `
+  --template-file infra/wc013-live-acceptance/main.bicep `
+  --parameters <operator-wc013.bicepparam>
+
+$contract = az deployment sub show `
+  --name wc013-ready `
+  --query "properties.outputs.evidenceCollectorStartContracts.value[?jobResourceId=='<collector-job-resource-id>'] | [0]" `
+  --output json
+$contract | Set-Content -NoNewline .\collector-start-contract.json
+
+# Run only in the separately governed controller workload under its managed identity.
+athena-context wc013-collector-controller `
+  --contract .\collector-start-contract.json `
+  --controller-identity-client-id <collector-controller-managed-identity-client-id>
+```
+
+The controller first retrieves the deployed Job, rejects any identity, registry, image, command,
+argument, environment, resource, init-container, volume, trigger, retry, or timeout difference,
+then calls the ARM start action with that exact validated template as the complete execution body.
+This prevents a Job-template write between validation and start from changing the execution. Its API
+and CLI expose no caller-supplied execution-template or mutable field. Direct
+`az containerapp job start` use for collector Jobs is prohibited.
+
+Retrieve the collector handoff from its bounded log line. Start `acceptanceJobName` only through a
+complete execution-template override that preserves the deployed image, command, arguments,
+single context identity, and configuration path and adds only
+`ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64`.
+
+Do not grant human operator identities direct start permission on the three operational phase
+Jobs. Container Apps start-time environment changes require a complete execution-template
+override. The separately governed phase-job controller must validate the deployed reviewed
+template, preserve its image, command, args, identities, and bundle path exactly, and modify only
+the allowlisted bounded receipt, prior-index, lineage, and collected-evidence handoff variables.
+
+The relevant final outputs are `azureMcpInternalEndpoint`, `azureMcpAudience`,
+`azureMcpContainerAppResourceId`, `managedEnvironmentResourceId`, all evidence and acceptance
+identity IDs, `keyVaultUri`, `signingKeyName`, `signingKeyUriWithVersion`,
+`replayStorageAccountResourceId`, `replayTableEndpoint`, `replayTableName`,
+`replayPartitionKey`, `replayTableResourceId`, `artifactBlobEndpoint`,
+`artifactContainerName`, `artifactContainerResourceId`, `collectorArtifactContainerName`,
+`collectorArtifactContainerResourceId`, `artifactRetentionDays`, `acceptanceJobName`,
+`acceptanceJobResourceId`, `operationalPhaseJobNames`, `evidenceCollectorJobNames`,
+`evidenceCollectorStartContracts`, and `collectorControllerRoleDefinitionId`.
+
+No Context API Container App, internet-reachable environment endpoint, client secret, storage
+account key, or exported private key is required for this initial one-shot gate.
+
+The equivalent live pytest gate is:
+
+```powershell
+$env:ATHENA_WC013_LIVE = '1'
+$env:ATHENA_WC013_LIVE_CONFIG = (
+  Resolve-Path .\wc013-live\wc013-live-acceptance.json
+)
+$env:ATHENA_WC013_EVIDENCE_BLOB_ENDPOINT = 'https://<account>.blob.core.windows.net'
+$env:ATHENA_WC013_EVIDENCE_CONTAINER = 'collected-evidence'
+$env:ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64 = '<collector-handoff>'
+python -m pytest tests/test_wc013_live.py -m live
+```
+
+The second live test retains the direct unauthenticated Azure MCP `tools/list` 401/403 check.
+
+## Recorded initial acceptance
+
+The initial live gate completed successfully on 2026-08-19:
+
+- Container Apps Job execution:
+  `athena-wc013-live-acceptance-6b9olif`
+- Runner image digest:
+  `sha256:44407e4cda6f8d5c413f583e95a75565aa7dc3ddd2f216197a4dbd17d0ef2b67`
+- Delivery image digest:
+  `sha256:5cfbcc0f50aef45f07e45d5a12210f7497fe6a8e4fadda08d1a1443996e94110`
+- Manifest/profile:
+  `wl-athena-demo-live-inventory` / `production`
+- Attempt/snapshot:
+  `attempt-63719e874a0b` / `snap-77139bba9a02`
+- Snapshot artifact and semantic digest:
+  `sha256:0647e9609cc2b3096c1d722ab7e56dd7b866f8320783ddeebdf2e3273abd9ab6`
+- WC-007 authority digest:
+  `sha256:5bdf54958a5e83b38129740c8ab0b4d8d05500eb5b126373d942f3baf8aec016`
+- WC-008 assertion digest:
+  `sha256:93c36c4615c35b5a19616ea471f376d9596ab81c415827b02cd0d9b65c70ef21`
+- Evidence records: 15 projected resources from
+  `rg-athena-demo-workload`.
+
+The recorded WC-008 assertion digest above is historical evidence for that completed run. Do not
+reuse it after reconciling the deployment to VNet-scoped `external_ingress: true`; render and
+approve a new assertion for the next execution.
+
+Independent verification recomputed both immutable snapshot digests and verified the Key Vault
+RSA snapshot attestation and trusted-ingestion signature against the pinned public key. Live RBAC
+verification also confirmed Reader only on the demo resource group for the evidence identity, and
+only AcrPull, Key Vault Crypto User, and Storage Table Data Contributor at their exact resource
+scopes for the acceptance identity. This was a pre-ADR-0014 combined-job execution and does not
+demonstrate the current isolated collector/evaluator identity boundary.
+
+## Recorded VNet-scoped re-attestation
+
+The reconciled VNet-scoped composition completed successfully on 2026-08-20:
+
+- Container Apps Job execution:
+  `athena-wc013-live-acceptance-1mmei91`
+- Runner image digest:
+  `sha256:4ded30d50ee849d33d32597bfe88fc3b32af02a5b4a6376c749be586b407c095`
+- Delivery image digest:
+  `sha256:946f6b4e7008f4af80c4d66bbc28f5a4c29972dcd0e65e58452fd09a4451ba13`
+- VNet-accessible private MCP endpoint:
+  `https://athena-wc013-live-mcp.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
+- Attempt/snapshot:
+  `attempt-c2fb3624108e` / `snap-7b4f7b57e673`
+- Snapshot artifact and semantic digest:
+  `sha256:5137142b745beb4e5c75db1c42f8178b4716fec265aa479796e324c4568c8f2c`
+- WC-007 authority digest:
+  `sha256:d90b488ecf17915eeb1fe8944ad4ce0e81637c01a160e1d9ecce8a62fc9a2500`
+- WC-008 assertion digest:
+  `sha256:dd19d5ce778225ed3840ce1f7bf47bfeab561ac3af91e93b162de7b3ffce8183`
+- Evidence records: 15 projected resources from
+  `rg-athena-demo-workload`.
+
+Independent verification confirmed both RSA signatures, the exact managed-identity claims,
+authorized resource-group scope, successful MCP attempt, and immutable snapshot digests. An
+authenticated MCP initialize request from the VNet jumpbox returned HTTP 200 while the Container
+Apps environment remained internal with public network access disabled. This was also a
+pre-ADR-0014 combined-job execution; a new live run must use the split collector/evaluator flow.

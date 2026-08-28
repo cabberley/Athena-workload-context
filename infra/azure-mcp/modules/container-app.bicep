@@ -39,6 +39,7 @@ var azureMcpImage = '${azureMcpImageRepository}:${azureMcpVersion}@${azureMcpIma
 // Keep this list exact. Every entry is a reviewed read-only Azure MCP 2.0.5 tool.
 var approvedTools = [
   'group_resource_list'
+  'compute_vm_get'
   'monitor_activitylog_list'
   'monitor_metrics_definitions'
   'monitor_metrics_query'
@@ -77,7 +78,8 @@ resource azureMcp 'Microsoft.App/containerApps@2026-01-01' = {
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
-        external: false
+        // External to the app environment, but VNet-scoped because the environment is internal.
+        external: true
         allowInsecure: false
         targetPort: 8080
         transport: 'http'
@@ -168,5 +170,6 @@ resource azureMcp 'Microsoft.App/containerApps@2026-01-01' = {
 }
 
 output containerAppResourceId string = azureMcp.id
+// With external ingress on an internal environment, this is the VNet-scoped non-.internal FQDN.
 output internalEndpoint string = 'https://${azureMcp.properties.configuration.ingress.fqdn}'
 output allowedTools array = approvedTools

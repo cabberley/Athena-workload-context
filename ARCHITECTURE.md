@@ -52,7 +52,10 @@ Users
 
 The Athena context identity has no Reader role over customer workload resources. Azure evidence is
 obtained through the private Azure MCP identity, which is independently scoped, audited, and
-revocable.
+revocable. A separately governed workload controller may receive container-scoped receipt-writer
+RBAC only so it can create the exact `athena.demoFaultRun.v1` phase-input Blobs before Athena
+phase Jobs read them; the create-only exact-name contract is enforced in application code because
+Azure RBAC cannot be narrowed to a Blob prefix.
 
 ## Logical components
 
@@ -64,6 +67,11 @@ revocable.
 | Binding engine | Evidence-backed cohort proposals and dynamic selectors |
 | Policy engine | Deterministic evaluation of observed state against declared intent |
 | Evidence client | Typed, bounded client for the private Azure MCP |
+| Evidence collector jobs | Identity-isolated jobs that alone hold the workload-reader identity, call private Azure MCP, and publish signed version-pinned evidence handoffs |
+| Collector start controller | Separately authorized managed-identity boundary that validates the exact deployed collector and pins that template as the complete execution body |
+| Operational artifact store | Private, versioned, create-only persistence and exact-version verified retrieval for bounded signed evaluation artifacts |
+| Workload controller | Workload-owned `status`/`inject`/`reset` boundary and strict create-only publication of exact run-scoped `athena.demoFaultRun.v1` receipt Blobs |
+| Operational phase jobs | Phase-fixed non-mutating Container Apps Jobs that compose reviewed WC-013 plans, exact Blob references, and governed handoff emission |
 | Context MCP | Agent-safe access to published context and proposed changes |
 | Agent core | Grounded explanations using policy results and cited evidence |
 | Context Studio | Workload configuration, cohort approval, topology, findings, Copilot |
@@ -82,6 +90,9 @@ revocable.
 8. Agent-generated text never becomes an authoritative manifest without human approval.
 9. Every contextual finding cites both Azure evidence and the applicable manifest clause.
 10. Pure binding, policy, and forecasting logic remains separate from Azure and storage I/O.
+11. Operational artifacts use version-pinned immutable Blob references, create-only conditional writes, and exact-version hash-verifying reads.
+12. Operational phase execution uses reviewed bundle paths, phase-fixed Jobs, bounded exact-reference inputs, and governed handoff files.
+13. The workload-owned controller, not Athena phase Jobs, creates exact run-scoped receipt Blobs with create-only semantics enforced in application code; Azure RBAC stays container-scoped because Blob roles cannot be narrowed to a prefix.
 
 ## Relationship classes
 

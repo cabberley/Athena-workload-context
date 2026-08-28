@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 
 from athena_context.contracts import TrustedKeyAnchor, TrustedKeyResolver
 from athena_context.evidence.models import (
     CollectedEvidence,
     CollectorTrustConfiguration,
+    EvidenceClientCompositionError,
     EvidenceCollectionCommand,
+    EvidenceTransportRequest,
     McpTimeoutNoResponse,
     McpTransportOutcome,
     ReplayDetectedError,
@@ -28,8 +31,40 @@ from athena_context.evidence.validation import (
     validate_trusted_identity,
 )
 
+type _SyncTransportInvoke = Callable[
+    [SyncEvidenceTransport, EvidenceTransportRequest],
+    McpTransportOutcome,
+]
+
+
+def _invoke_runtime_transport(
+    transport: SyncEvidenceTransport,
+    request: EvidenceTransportRequest,
+) -> McpTransportOutcome:
+    return transport.invoke(request)
+
 
 class SyncEvidenceClient:
+    """A synchronously collected evidence pipeline with immutable composition."""
+
+    _clock: Clock
+    _key_resolver: TrustedKeyResolver
+    _replay_guard: SyncAttemptReplayGuard
+    _signer: SyncTrustedIngestionSigner
+    _transport: SyncEvidenceTransport
+    _trust_configuration: CollectorTrustConfiguration
+    _trusted_key_anchor: TrustedKeyAnchor
+
+    __slots__ = (
+        "_clock",
+        "_key_resolver",
+        "_replay_guard",
+        "_signer",
+        "_transport",
+        "_trust_configuration",
+        "_trusted_key_anchor",
+    )
+
     def __init__(
         self,
         *,
@@ -41,15 +76,55 @@ class SyncEvidenceClient:
         key_resolver: TrustedKeyResolver,
         trusted_key_anchor: TrustedKeyAnchor,
     ) -> None:
-        self._transport = transport
-        self._signer = signer
-        self._replay_guard = replay_guard
-        self._clock = clock
-        self._trust_configuration = trust_configuration
-        self._key_resolver = key_resolver
-        self._trusted_key_anchor = trusted_key_anchor
+        object.__setattr__(self, "_transport", transport)
+        object.__setattr__(self, "_signer", signer)
+        object.__setattr__(self, "_replay_guard", replay_guard)
+        object.__setattr__(self, "_clock", clock)
+        object.__setattr__(self, "_trust_configuration", trust_configuration)
+        object.__setattr__(self, "_key_resolver", key_resolver)
+        object.__setattr__(self, "_trusted_key_anchor", trusted_key_anchor)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("sync evidence client composition is immutable")
 
     def collect(self, command: EvidenceCollectionCommand) -> CollectedEvidence:
+        return SyncEvidenceClient._collect_with_transport(
+            self,
+            command,
+            transport=self._transport,
+            transport_invoke=_invoke_runtime_transport,
+        )
+
+    def _collect_with_bound_transport(
+        self,
+        command: EvidenceCollectionCommand,
+        *,
+        transport: SyncEvidenceTransport,
+        transport_invoke: _SyncTransportInvoke,
+    ) -> CollectedEvidence:
+        """Collect through one caller-bound transport after an identity check."""
+
+        if type(self) is not SyncEvidenceClient or self._transport is not transport:
+            raise EvidenceClientCompositionError(
+                "sync evidence client runtime transport binding changed"
+            )
+        return SyncEvidenceClient._collect_with_transport(
+            self,
+            command,
+            transport=transport,
+            transport_invoke=transport_invoke,
+        )
+
+    def _collect_with_transport(
+        self,
+        command: EvidenceCollectionCommand,
+        *,
+        transport: SyncEvidenceTransport,
+        transport_invoke: _SyncTransportInvoke,
+    ) -> CollectedEvidence:
+        """Use the explicit local transport for the complete invocation."""
+
         started_at = self._clock.now()
         request = prepare_transport_request(
             command,
@@ -62,7 +137,7 @@ class SyncEvidenceClient:
         outcome: McpTransportOutcome
         if preflight is None:
             try:
-                outcome = self._transport.invoke(request)
+                outcome = transport_invoke(transport, request)
             except TimeoutError:
                 deadline = started_at + timedelta(
                     milliseconds=request.bounds.timeout_milliseconds

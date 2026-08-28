@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import pytest
 from fastapi.testclient import TestClient
 
+import athena_context.api.http as http_module
 from athena_context.api.authorization import StaticTestAuthenticator
 from athena_context.api.domain import (
     Actor,
@@ -11,7 +15,7 @@ from athena_context.api.domain import (
     TransitionCommand,
     VerifiedAuthentication,
 )
-from athena_context.api.http import create_app
+from athena_context.api.http import SystemClock, create_app
 from athena_context.api.service import ContextService
 from context_api_support import (
     AGENT,
@@ -74,6 +78,42 @@ def _headers(
     if spoofed_actor is not None:
         headers["X-Athena-Actor"] = spoofed_actor
     return headers
+
+
+def test_system_clock_preserves_supported_subsecond_expiry_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PreciseDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            del tz
+            return datetime(
+                2026,
+                8,
+                18,
+                0,
+                54,
+                47,
+                654321,
+                tzinfo=UTC,
+            )
+
+    monkeypatch.setattr(http_module, "datetime", PreciseDateTime)
+    expiry_boundary = datetime(
+        2026,
+        8,
+        18,
+        0,
+        54,
+        47,
+        654000,
+        tzinfo=UTC,
+    )
+
+    observed = SystemClock().now()
+
+    assert observed == expiry_boundary
+    assert not observed < expiry_boundary
 
 
 def test_openapi_exposes_typed_lifecycle_contracts() -> None:

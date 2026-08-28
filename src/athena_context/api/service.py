@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
+from threading import Lock
 from typing import TypeVar
 
 from pydantic import ValidationError
@@ -26,6 +28,7 @@ from athena_context.api.domain import (
     PublishedManifestView,
     ReplaceDraftCommand,
     ReviewSubmission,
+    RoleGrant,
     SupersedeCommand,
     Supersession,
     TransitionCommand,
@@ -36,8 +39,11 @@ from athena_context.api.domain import (
 from athena_context.api.errors import (
     AlreadySupersededError,
     AmbiguousLookupError,
+    DemoEvaluationApprovalError,
+    DemoEvaluationConfigurationError,
     DigestMismatchError,
     DuplicateVersionError,
+    EvaluationFailedClosedError,
     IdempotencyConflictError,
     InvalidTransitionError,
     ManifestValidationError,
@@ -46,19 +52,92 @@ from athena_context.api.errors import (
     StaleRevisionError,
     VersionMismatchError,
 )
+from athena_context.api.evaluation_authority import (
+    TransactionEvaluationAuthorityUnitOfWork,
+    build_evaluation_temporal_validity,
+    resolve_transaction_evaluation_authority,
+    validate_loaded_evaluation_authority,
+)
+from athena_context.api.evaluation_domain import (
+    AuthorizationGrantToken,
+    AuthorizedSnapshotPublication,
+    CreateDemoEvaluationApprovalCommand,
+    DemoEvaluationApproval,
+    DemoEvaluationCommand,
+    DemoEvaluationResult,
+    EvaluationAuthorityToken,
+    PublishedContextSelection,
+    ResolvedPublishedContext,
+    RevokeDemoEvaluationApprovalCommand,
+    VerifiedWc008DeploymentConfiguration,
+    build_authorized_publication,
+    normalize_evaluation_authority_token,
+)
+from athena_context.api.evaluation_ports import (
+    ContextServiceEvaluationPublicationStorePort,
+    DemoEvaluationTrustConfiguration,
+    EvaluationAuthorityTransactionPort,
+    EvaluationAuthorityUnitOfWorkPort,
+    EvaluationCollectionAuthority,
+    EvaluationCommitAuthorityCondition,
+    EvaluationTrustedKeyAuthority,
+    PreparedEvaluationArtifact,
+    StoredEvaluation,
+    build_demo_evaluation_request_digest,
+    build_evaluation_collection_authority,
+)
+from athena_context.api.evaluation_verification import (
+    validate_evaluation_collection_binding,
+    verify_and_evaluate_snapshot_for_publication,
+)
 from athena_context.api.ports import (
     AuthorizationPort,
     ClockPort,
     ContextStorePort,
     ContextTransactionPort,
 )
+from athena_context.contracts import (
+    EvidenceSnapshot,
+    ManifestFinding,
+    SnapshotPublicationRecord,
+    TrustedKeyAnchor,
+)
 from athena_context.contracts.common import compute_artifact_digest
 from athena_context.contracts.manifest import (
     CanonicalWorkloadManifest,
+    EvidenceFreshnessProof,
     canonicalize_manifest_payload,
+)
+from athena_context.evidence import (
+    CollectedEvidence,
+    CollectorTrustConfiguration,
+    EvidenceTransportRequest,
+    ValidatedEnvelope,
 )
 
 TApiModel = TypeVar("TApiModel", bound=ApiModel)
+TUnitOfWorkResult = TypeVar("TUnitOfWorkResult")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDemoEvaluationRequest:
+    """Opaque service-issued request; its capability is resolved from a private registry."""
+
+    _request_capability: object | None
+    approval: DemoEvaluationApproval | None
+    resolved: ResolvedPublishedContext | None
+    replay: StoredEvaluation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DemoEvaluationRequestRecord:
+    reader_actor: Actor
+    actor: Actor
+    idempotency_key: str
+    command: DemoEvaluationCommand
+    expected_authority: EvaluationAuthorityToken
+    collection_authority: EvaluationCollectionAuthority
+    request_digest: str
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
@@ -102,6 +181,7 @@ class ContextService:
         authorization: AuthorizationPort,
         clock: ClockPort,
         publication_actor: Actor,
+        demo_evaluation_trust: DemoEvaluationTrustConfiguration | None = None,
     ) -> None:
         if publication_actor.kind is not ActorKind.SERVICE:
             raise ValueError("publication_actor must be a service actor")
@@ -109,6 +189,1126 @@ class ContextService:
         self._authorization = authorization
         self._clock = clock
         self._publication_actor = publication_actor
+        self._demo_evaluation_trust = demo_evaluation_trust
+        self.__evaluation_publication_capability = object()
+        self.__evaluation_orchestrator_capabilities: set[object] = set()
+        self.__evaluation_collection_configuration: (
+            tuple[
+                VerifiedWc008DeploymentConfiguration,
+                CollectorTrustConfiguration,
+            ]
+            | None
+        ) = None
+        self.__evaluation_request_lock = Lock()
+        self.__evaluation_requests: dict[
+            object,
+            _DemoEvaluationRequestRecord,
+        ] = {}
+        if demo_evaluation_trust is not None:
+            if not isinstance(
+                store,
+                ContextServiceEvaluationPublicationStorePort,
+            ):
+                raise DemoEvaluationConfigurationError(
+                    "ContextService persistence cannot bind its private "
+                    "evaluation publication capability"
+                )
+            store._bind_context_service_evaluation_publication(
+                self.__evaluation_publication_capability
+            )
+
+    def _bind_demo_evaluation_orchestrator(
+        self,
+        *,
+        deployment_configuration: VerifiedWc008DeploymentConfiguration,
+        trust_configuration: CollectorTrustConfiguration,
+    ) -> object:
+        """Bind one in-process orchestrator to immutable operator-pinned config."""
+
+        self._require_demo_evaluation_trust()
+        configuration = VerifiedWc008DeploymentConfiguration.model_validate_json(
+            deployment_configuration.model_dump_json(by_alias=True)
+        )
+        trust = CollectorTrustConfiguration.model_validate_json(
+            trust_configuration.model_dump_json(by_alias=True)
+        )
+        assertion = configuration.assertion
+        if (
+            trust.managed_identity_object_id
+            != assertion.evidence_identity_object_id
+            or trust.context_identity_object_id
+            != assertion.context_identity_object_id
+        ):
+            raise DemoEvaluationConfigurationError(
+                "demo evaluation collection identities do not match the "
+                "operator-pinned WC-008 configuration"
+            )
+        with self.__evaluation_request_lock:
+            current_configuration = (
+                self.__evaluation_collection_configuration
+            )
+            if (
+                current_configuration is not None
+                and current_configuration != (configuration, trust)
+            ):
+                raise DemoEvaluationConfigurationError(
+                    "ContextService demo evaluation orchestrators must share "
+                    "one exact collection authority"
+                )
+            capability = object()
+            self.__evaluation_orchestrator_capabilities.add(capability)
+            self.__evaluation_collection_configuration = (
+                configuration,
+                trust,
+            )
+            if not isinstance(
+                self._store,
+                ContextServiceEvaluationPublicationStorePort,
+            ):
+                raise DemoEvaluationConfigurationError(
+                    "ContextService persistence cannot bind collection authority"
+                )
+            self._store._bind_context_service_evaluation_collection_authority(
+                self.__evaluation_publication_capability,
+                configuration,
+                trust,
+            )
+            return capability
+
+    @property
+    def publication_actor(self) -> Actor:
+        """The service identity finalized by this ContextService instance."""
+
+        return self._publication_actor
+
+    def require_demo_evaluation_trust_anchor(
+        self,
+        trusted_key_anchor: TrustedKeyAnchor,
+    ) -> None:
+        """Reject demo composition unless this service owns the exact trust anchor."""
+
+        configured = self._demo_evaluation_trust
+        if (
+            configured is None
+            or configured.trusted_key_anchor != trusted_key_anchor
+        ):
+            raise DemoEvaluationConfigurationError(
+                "ContextService is not configured with the demo evaluation "
+                "trusted key anchor"
+            )
+
+    def _run_evaluation_authority_transaction(
+        self,
+        *,
+        reader_actor: Actor,
+        operation: Callable[
+            [EvaluationAuthorityUnitOfWorkPort],
+            TUnitOfWorkResult,
+        ],
+    ) -> TUnitOfWorkResult:
+        """Run one narrow UoW on the actual configured persistence transaction."""
+
+        with self._store.transaction() as transaction:
+            unit_of_work = self._evaluation_unit_of_work(
+                transaction,
+                reader_actor=reader_actor,
+            )
+            return operation(unit_of_work)
+
+    def _evaluation_unit_of_work(
+        self,
+        transaction: ContextTransactionPort,
+        *,
+        reader_actor: Actor,
+    ) -> EvaluationAuthorityUnitOfWorkPort:
+        if not isinstance(
+            transaction,
+            EvaluationAuthorityTransactionPort,
+        ):
+            raise RuntimeError(
+                "ContextService persistence does not implement the "
+                "evaluation authority unit of work"
+            )
+        return TransactionEvaluationAuthorityUnitOfWork(
+            context_transaction=transaction,
+            evaluation_transaction=transaction,
+            reader_actor=reader_actor,
+            publication_capability=(
+                self.__evaluation_publication_capability
+            ),
+        )
+
+    def load_demo_evaluation_receipt(
+        self,
+        actor: Actor,
+        idempotency_key: str,
+        *,
+        manifest_id: str,
+    ) -> StoredEvaluation | None:
+        """Load only this actor's receipt after authoritative publish authorization."""
+
+        def load(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> StoredEvaluation | None:
+            unit_of_work.authorize(
+                actor,
+                Permission.PUBLISH,
+                manifest_id,
+            )
+            receipt = unit_of_work.load_receipt(
+                actor.actor_id,
+                manifest_id,
+                idempotency_key,
+            )
+            if receipt is None:
+                return None
+            if receipt.workload_id != manifest_id:
+                raise EvaluationFailedClosedError(
+                    "evaluation receipt workload does not match the requested "
+                    "workload"
+                )
+            unit_of_work.authorize(
+                actor,
+                Permission.PUBLISH,
+                receipt.workload_id,
+            )
+            return receipt
+
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=load,
+        )
+
+    def _prepare_demo_evaluation_request(
+        self,
+        *,
+        orchestrator_capability: object,
+        reader_actor: Actor,
+        actor: Actor,
+        idempotency_key: str,
+        command: DemoEvaluationCommand,
+        as_of: datetime,
+    ) -> _PreparedDemoEvaluationRequest:
+        """Issue one opaque request after resolving service-owned configuration."""
+
+        normalized_reader = Actor.model_validate_json(
+            reader_actor.model_dump_json(by_alias=True)
+        )
+        normalized_actor = Actor.model_validate_json(
+            actor.model_dump_json(by_alias=True)
+        )
+        normalized_command = DemoEvaluationCommand.model_validate_json(
+            command.model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        with self.__evaluation_request_lock:
+            if (
+                orchestrator_capability
+                not in self.__evaluation_orchestrator_capabilities
+                or self.__evaluation_collection_configuration is None
+            ):
+                raise EvaluationFailedClosedError(
+                    "demo evaluation requires the ContextService-bound orchestrator"
+                )
+            configuration, collection_trust = (
+                self.__evaluation_collection_configuration
+            )
+        try:
+            collection_authority = build_evaluation_collection_authority(
+                configuration,
+                collection_trust,
+                authorized_scope=normalized_command.authorized_scope,
+            )
+        except ValueError as exc:
+            raise DemoEvaluationApprovalError(
+                "approval does not authorize an exact configured WC-008 "
+                "Reader assignment for this evaluation command"
+            ) from exc
+        assertion = collection_authority.deployment_configuration.assertion
+        request_digest = build_demo_evaluation_request_digest(
+            actor=normalized_actor,
+            command=normalized_command,
+            collection_authority=collection_authority,
+        )
+
+        def prepare(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> tuple[
+            StoredEvaluation | None,
+            DemoEvaluationApproval | None,
+            ResolvedPublishedContext | None,
+            EvaluationAuthorityToken | None,
+        ]:
+            unit_of_work.authorize(
+                normalized_actor,
+                Permission.PUBLISH,
+                normalized_command.manifest_id,
+            )
+            replay = unit_of_work.load_receipt(
+                normalized_actor.actor_id,
+                normalized_command.manifest_id,
+                idempotency_key,
+            )
+            if replay is not None:
+                if replay.workload_id != normalized_command.manifest_id:
+                    raise EvaluationFailedClosedError(
+                        "evaluation receipt workload does not match the "
+                        "authorized command"
+                    )
+                unit_of_work.authorize(
+                    normalized_actor,
+                    Permission.PUBLISH,
+                    replay.workload_id,
+                )
+                if replay.request_digest != request_digest:
+                    raise IdempotencyConflictError(
+                        "idempotency key was used for a different demo evaluation"
+                    )
+                return replay, None, None, None
+            trust = self._require_demo_evaluation_trust()
+            approval, resolved, authority = (
+                resolve_transaction_evaluation_authority(
+                    unit_of_work,
+                    actor=normalized_actor,
+                    command=normalized_command,
+                    as_of=as_of,
+                    private_mcp_endpoint=(
+                        assertion.azure_mcp_internal_endpoint
+                    ),
+                    evidence_identity_object_id=(
+                        assertion.evidence_identity_object_id
+                    ),
+                    trusted_key_anchor=trust.trusted_key_anchor,
+                )
+            )
+            return None, approval, resolved, authority
+
+        replay, approval, resolved, authority = (
+            self._run_evaluation_authority_transaction(
+                reader_actor=normalized_reader,
+                operation=prepare,
+            )
+        )
+        if replay is not None:
+            return _PreparedDemoEvaluationRequest(
+                _request_capability=None,
+                approval=None,
+                resolved=None,
+                replay=replay,
+            )
+        if approval is None or resolved is None or authority is None:
+            raise RuntimeError("evaluation request preparation was incomplete")
+        request_capability = object()
+        record = _DemoEvaluationRequestRecord(
+            reader_actor=normalized_reader,
+            actor=normalized_actor,
+            idempotency_key=str(idempotency_key),
+            command=normalized_command,
+            expected_authority=normalize_evaluation_authority_token(authority),
+            collection_authority=collection_authority,
+            request_digest=request_digest,
+        )
+        with self.__evaluation_request_lock:
+            self.__evaluation_requests[request_capability] = record
+        return _PreparedDemoEvaluationRequest(
+            _request_capability=request_capability,
+            approval=approval,
+            resolved=resolved,
+        )
+
+    def _discard_demo_evaluation_request(
+        self,
+        prepared_request: _PreparedDemoEvaluationRequest,
+    ) -> None:
+        """Release an uncommitted opaque request after collection/preflight failure."""
+
+        capability = prepared_request._request_capability
+        if capability is None:
+            return
+        with self.__evaluation_request_lock:
+            self.__evaluation_requests.pop(capability, None)
+
+    def _commit_prepared_demo_evaluation(
+        self,
+        *,
+        prepared_request: _PreparedDemoEvaluationRequest,
+        snapshot: EvidenceSnapshot,
+        collected: CollectedEvidence,
+    ) -> DemoEvaluationResult:
+        """Consume one service-issued request and publish through the owned UoW."""
+
+        if not isinstance(prepared_request, _PreparedDemoEvaluationRequest):
+            raise EvaluationFailedClosedError(
+                "demo evaluation request was fabricated or not service-issued"
+            )
+        capability = prepared_request._request_capability
+        if capability is None:
+            raise EvaluationFailedClosedError(
+                "demo evaluation request is not an active publication request"
+            )
+        with self.__evaluation_request_lock:
+            request = self.__evaluation_requests.pop(capability, None)
+        if request is None:
+            raise EvaluationFailedClosedError(
+                "demo evaluation request was fabricated, reused, or not service-issued"
+            )
+        if collected.envelope is None:
+            raise EvaluationFailedClosedError(
+                "successful evidence publication requires a validated source envelope"
+            )
+        try:
+            artifact = self._run_evaluation_authority_transaction(
+                reader_actor=request.reader_actor,
+                operation=lambda unit_of_work: self._commit_demo_evaluation(
+                    unit_of_work,
+                    request,
+                    snapshot=snapshot,
+                    collected=collected,
+                ),
+            )
+        except StaleRevisionError as exc:
+            raise EvaluationFailedClosedError(
+                "authority changed during the publication transaction"
+            ) from exc
+        return DemoEvaluationResult.model_validate_json(artifact.result_json)
+
+    def _commit_demo_evaluation(
+        self,
+        unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        request: _DemoEvaluationRequestRecord,
+        *,
+        snapshot: EvidenceSnapshot,
+        collected: CollectedEvidence,
+    ) -> StoredEvaluation:
+        command = request.command
+        collection_authority = request.collection_authority
+        assertion = collection_authority.deployment_configuration.assertion
+        envelope = collected.envelope
+        if envelope is None:
+            raise EvaluationFailedClosedError(
+                "successful evidence publication requires a validated source envelope"
+            )
+        replay = unit_of_work.load_receipt(
+            request.actor.actor_id,
+            command.manifest_id,
+            request.idempotency_key,
+        )
+        if replay is not None:
+            if replay.workload_id != command.manifest_id:
+                raise EvaluationFailedClosedError(
+                    "evaluation receipt workload does not match the "
+                    "authorized command"
+                )
+            unit_of_work.authorize(
+                request.actor,
+                Permission.PUBLISH,
+                replay.workload_id,
+            )
+            if replay.request_digest != request.request_digest:
+                raise IdempotencyConflictError(
+                    "idempotency key was concurrently used for a different evaluation"
+                )
+            return replay
+
+        initial_time = self._now()
+        trust = self._require_demo_evaluation_trust()
+        resolve_transaction_evaluation_authority(
+            unit_of_work,
+            actor=request.actor,
+            command=command,
+            as_of=initial_time,
+            private_mcp_endpoint=assertion.azure_mcp_internal_endpoint,
+            evidence_identity_object_id=assertion.evidence_identity_object_id,
+            trusted_key_anchor=trust.trusted_key_anchor,
+            expected_authority=request.expected_authority,
+        )
+        if initial_time >= snapshot.expires_at:
+            raise EvaluationFailedClosedError(
+                "snapshot became stale before publication"
+            )
+
+        self._before_evaluation_artifact_insert()
+
+        authority_read_at = self._now()
+        approval, resolved, authority = (
+            resolve_transaction_evaluation_authority(
+                unit_of_work,
+                actor=request.actor,
+                command=command,
+                as_of=authority_read_at,
+                private_mcp_endpoint=assertion.azure_mcp_internal_endpoint,
+                evidence_identity_object_id=(
+                    assertion.evidence_identity_object_id
+                ),
+                trusted_key_anchor=trust.trusted_key_anchor,
+                expected_authority=request.expected_authority,
+            )
+        )
+
+        def prepare_before_persistence_time(
+            trusted_key: EvaluationTrustedKeyAuthority,
+        ) -> PreparedEvaluationArtifact:
+            prepared_approval, prepared_resolved, _ = (
+                validate_loaded_evaluation_authority(
+                    actor=request.actor,
+                    command=command,
+                    approval=approval,
+                    resolved=resolved,
+                    authorization=authority.authorization,
+                    context_reader_authorization=(
+                        authority.context_reader_authorization
+                    ),
+                    as_of=authority_read_at,
+                    private_mcp_endpoint=(
+                        assertion.azure_mcp_internal_endpoint
+                    ),
+                    evidence_identity_object_id=(
+                        assertion.evidence_identity_object_id
+                    ),
+                    trusted_key=trusted_key,
+                    trusted_key_anchor=(
+                        self._require_demo_evaluation_trust()
+                        .trusted_key_anchor
+                    ),
+                    expected_authority=request.expected_authority,
+                )
+            )
+            if authority_read_at >= snapshot.expires_at:
+                raise EvaluationFailedClosedError(
+                    "snapshot became stale before publication"
+                )
+            validate_evaluation_collection_binding(
+                command=command,
+                snapshot=snapshot,
+                collection_request=collected.request,
+                envelope=envelope,
+                collection_authority=collection_authority,
+            )
+            verification_publication = build_authorized_publication(
+                snapshot=snapshot,
+                approval=prepared_approval,
+                publisher=request.actor,
+                publication_actor=self._publication_actor,
+                published_at=authority_read_at,
+                resolved_profile_digest=(
+                    prepared_resolved.profile.resolved_profile_digest
+                ),
+                endpoint=assertion.azure_mcp_internal_endpoint,
+                scope=command.authorized_scope,
+                reason=command.reason,
+            )
+            findings = self._evaluate_demo_snapshot_for_publication(
+                request,
+                snapshot=snapshot,
+                collection_request=collected.request,
+                envelope=envelope,
+                approval=prepared_approval,
+                resolved=prepared_resolved,
+                publication=verification_publication,
+                trusted_key=trusted_key,
+                as_of=authority_read_at,
+            )
+            self._validate_precomputed_finding_time_bounds(
+                snapshot,
+                resolved=prepared_resolved,
+                findings=findings,
+                as_of=authority_read_at,
+            )
+            return PreparedEvaluationArtifact(
+                snapshot=snapshot,
+                approval=prepared_approval,
+                resolved_profile_digest=(
+                    prepared_resolved.profile.resolved_profile_digest
+                ),
+                findings=findings,
+                collection_request=collected.request,
+                envelope=envelope,
+                temporal_validity=build_evaluation_temporal_validity(
+                    snapshot,
+                    approval=prepared_approval,
+                    resolved_profile=prepared_resolved.profile,
+                    manifest=prepared_resolved.view.published.manifest,
+                    as_of=authority_read_at,
+                ),
+            )
+
+        condition = EvaluationCommitAuthorityCondition(
+            reader_actor=request.reader_actor,
+            actor=request.actor,
+            publication_actor=self._publication_actor,
+            command=command,
+            expected_authority=request.expected_authority,
+            collection_authority=collection_authority,
+            trusted_key_anchor=trust.trusted_key_anchor,
+            idempotency_key=request.idempotency_key,
+        )
+        return unit_of_work.insert_evaluation_conditionally(
+            condition,
+            prepare_before_persistence_time,
+        )
+
+    def _require_demo_evaluation_trust(
+        self,
+    ) -> DemoEvaluationTrustConfiguration:
+        trust = self._demo_evaluation_trust
+        if trust is None:
+            raise EvaluationFailedClosedError(
+                "ContextService has no authoritative demo evaluation trust"
+            )
+        return trust
+
+    def _resolve_demo_approval_collection_authority(
+        self,
+        command: CreateDemoEvaluationApprovalCommand,
+    ) -> EvaluationCollectionAuthority:
+        with self.__evaluation_request_lock:
+            configured = self.__evaluation_collection_configuration
+        if configured is None:
+            raise DemoEvaluationConfigurationError(
+                "demo evaluation approvals require the ContextService-bound "
+                "collection configuration"
+            )
+        deployment_configuration, trust_configuration = configured
+        try:
+            return build_evaluation_collection_authority(
+                deployment_configuration,
+                trust_configuration,
+                authorized_scope=command.authorized_scope,
+            )
+        except ValueError as exc:
+            raise DemoEvaluationApprovalError(
+                "approval scope does not match one exact configured WC-008 "
+                "Reader assignment"
+            ) from exc
+
+    def _evaluate_demo_snapshot_for_publication(
+        self,
+        request: _DemoEvaluationRequestRecord,
+        *,
+        snapshot: EvidenceSnapshot,
+        collection_request: EvidenceTransportRequest,
+        envelope: ValidatedEnvelope,
+        approval: DemoEvaluationApproval,
+        resolved: ResolvedPublishedContext,
+        publication: AuthorizedSnapshotPublication,
+        trusted_key: EvaluationTrustedKeyAuthority,
+        as_of: datetime,
+    ) -> tuple[ManifestFinding, ...]:
+        """Cryptographically verify and evaluate inside the authority transaction."""
+
+        trust = self._demo_evaluation_trust
+        if trust is None:
+            raise EvaluationFailedClosedError(
+                "ContextService has no authoritative demo evaluation trust"
+            )
+        del publication
+        assertion = (
+            request.collection_authority.deployment_configuration.assertion
+        )
+        return verify_and_evaluate_snapshot_for_publication(
+            snapshot=snapshot,
+            approval=approval,
+            publisher=request.actor,
+            publication_actor=self._publication_actor,
+            resolved=resolved,
+            private_mcp_endpoint=assertion.azure_mcp_internal_endpoint,
+            authorized_scope=request.command.authorized_scope,
+            reason=request.command.reason,
+            envelope_attempt_id=collection_request.attempt_id,
+            envelope=envelope,
+            trusted_key=trusted_key,
+            trusted_key_anchor=trust.trusted_key_anchor,
+            as_of=as_of,
+        )
+
+    def _validate_precomputed_finding_time_bounds(
+        self,
+        snapshot: EvidenceSnapshot,
+        *,
+        resolved: ResolvedPublishedContext,
+        findings: tuple[ManifestFinding, ...],
+        as_of: datetime,
+    ) -> None:
+        """Prove prepared findings remain valid at the exact insertion time."""
+
+        findings_by_clause = {
+            finding.clause_id: finding for finding in findings
+        }
+        if len(findings_by_clause) != len(findings):
+            raise EvaluationFailedClosedError(
+                "prepared policy findings contain duplicate clauses"
+            )
+        for constraint in resolved.profile.constraints:
+            proof = constraint.proof_requirement
+            if not isinstance(proof, EvidenceFreshnessProof):
+                continue
+            finding = findings_by_clause.get(constraint.constraint_id)
+            age_seconds = (
+                as_of - snapshot.collected_at
+            ).total_seconds()
+            if (
+                finding is None
+                or finding.verdict != constraint.success_verdict
+                or age_seconds > proof.maximum_age_seconds
+            ):
+                raise EvaluationFailedClosedError(
+                    "policy evidence freshness failed at the authoritative "
+                    "publication time"
+                )
+
+    def _before_evaluation_artifact_insert(self) -> None:
+        """Delay-only test seam that cannot observe the active transaction."""
+
+    def get_demo_evaluation_result(
+        self,
+        actor: Actor,
+        snapshot_id: str,
+    ) -> DemoEvaluationResult | None:
+        def get(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> DemoEvaluationResult | None:
+            artifact = unit_of_work.load_artifact(snapshot_id)
+            if artifact is None:
+                return None
+            result = DemoEvaluationResult.model_validate_json(artifact.result_json)
+            unit_of_work.authorize(
+                actor,
+                Permission.READ,
+                result.publication.manifest_id,
+            )
+            return result
+
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=get,
+        )
+
+    def get_demo_snapshot_publication(
+        self,
+        actor: Actor,
+        snapshot_id: str,
+    ) -> SnapshotPublicationRecord | None:
+        result = self.get_demo_evaluation_result(actor, snapshot_id)
+        return None if result is None else result.publication.registry_record()
+
+    def list_demo_evaluations(
+        self,
+        actor: Actor,
+    ) -> tuple[StoredEvaluation, ...]:
+        def list_authorized(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> tuple[StoredEvaluation, ...]:
+            artifacts = unit_of_work.list_evaluations()
+            for artifact in artifacts:
+                result = DemoEvaluationResult.model_validate_json(
+                    artifact.result_json
+                )
+                unit_of_work.authorize(
+                    actor,
+                    Permission.READ,
+                    result.publication.manifest_id,
+                )
+            return artifacts
+
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=list_authorized,
+        )
+
+    def create_demo_evaluation_approval(
+        self,
+        actor: Actor,
+        idempotency_key: str,
+        command: CreateDemoEvaluationApprovalCommand,
+    ) -> DemoEvaluationApproval:
+        """Create approval provenance from authenticated identity and trusted time."""
+
+        normalized_actor = Actor.model_validate_json(
+            actor.model_dump_json(by_alias=True)
+        )
+        normalized_command = (
+            CreateDemoEvaluationApprovalCommand.model_validate_json(
+                command.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+        )
+        target = MutationTarget(
+            manifest_id=normalized_command.manifest_id,
+            manifest_version=normalized_command.manifest_version,
+        )
+        request_digest = compute_artifact_digest(
+            {
+                "operation": "create_demo_evaluation_approval",
+                "actorId": normalized_actor.actor_id,
+                "target": target.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                ),
+                "command": normalized_command.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            }
+        )
+
+        with self._store.transaction() as transaction:
+            unit_of_work = self._evaluation_unit_of_work(
+                transaction,
+                reader_actor=normalized_actor,
+            )
+            unit_of_work.authorize(
+                normalized_actor,
+                Permission.APPROVE,
+                normalized_command.manifest_id,
+            )
+            receipt = transaction.get_receipt(
+                normalized_actor.actor_id,
+                idempotency_key,
+            )
+            if receipt is not None:
+                if (
+                    receipt.operation
+                    != "create_demo_evaluation_approval"
+                    or receipt.target != target
+                    or receipt.request_digest != request_digest
+                    or receipt.response_type
+                    != DemoEvaluationApproval.__name__
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key was used for a different mutation"
+                    )
+                return DemoEvaluationApproval.model_validate_json(
+                    receipt.response_json
+                )
+
+            collection_authority = (
+                self._resolve_demo_approval_collection_authority(
+                    normalized_command
+                )
+            )
+            approved_at = self._now()
+            resolved, _ = unit_of_work.resolve_context(
+                PublishedContextSelection(
+                    manifest_id=normalized_command.manifest_id,
+                    manifest_version=normalized_command.manifest_version,
+                    profile_id=normalized_command.profile_id,
+                ),
+                as_of=approved_at,
+            )
+            published = resolved.view.published
+            if (
+                resolved.view.supersession is not None
+                or published.manifest_id
+                != normalized_command.manifest_id
+                or published.manifest_version
+                != normalized_command.manifest_version
+                or published.manifest_digest
+                != normalized_command.manifest_digest
+                or resolved.profile.profile_id
+                != normalized_command.profile_id
+            ):
+                raise DemoEvaluationApprovalError(
+                    "approval intent does not match one exact active "
+                    "published manifest profile"
+                )
+            if normalized_command.expires_at <= approved_at:
+                raise DemoEvaluationApprovalError(
+                    "demo evaluation approval expiry must be after the "
+                    "authoritative approval time"
+                )
+            assertion = (
+                collection_authority.deployment_configuration.assertion
+            )
+            approval = DemoEvaluationApproval(
+                decision_id=normalized_command.decision_id,
+                status="authorized",
+                revision=1,
+                approved_by=normalized_actor,
+                approved_at=approved_at,
+                expires_at=normalized_command.expires_at,
+                manifest_id=published.manifest_id,
+                manifest_version=published.manifest_version,
+                manifest_digest=published.manifest_digest,
+                profile_id=resolved.profile.profile_id,
+                authorized_scope=normalized_command.authorized_scope,
+                private_mcp_endpoint=(
+                    assertion.azure_mcp_internal_endpoint
+                ),
+                evidence_identity_object_id=(
+                    assertion.evidence_identity_object_id
+                ),
+                reason=normalized_command.reason,
+            )
+            unit_of_work.put_approval(
+                approval,
+                expected_revision=None,
+            )
+            transaction.append_audit(
+                PendingAuditEvent(
+                    occurred_at=approved_at,
+                    actor=normalized_actor,
+                    action=(
+                        AuditAction.DEMO_EVALUATION_APPROVAL_CREATED
+                    ),
+                    manifest_id=approval.manifest_id,
+                    revision=approval.revision,
+                    manifest_version=approval.manifest_version,
+                    manifest_digest=approval.manifest_digest,
+                    reason=normalized_command.reason,
+                )
+            )
+            transaction.put_receipt(
+                MutationReceipt(
+                    actor_id=normalized_actor.actor_id,
+                    idempotency_key=idempotency_key,
+                    operation="create_demo_evaluation_approval",
+                    target=target,
+                    request_digest=request_digest,
+                    response_type=DemoEvaluationApproval.__name__,
+                    response_json=approval.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                )
+            )
+            return approval
+
+    def revoke_demo_evaluation_approval(
+        self,
+        actor: Actor,
+        decision_id: str,
+        idempotency_key: str,
+        command: RevokeDemoEvaluationApprovalCommand,
+    ) -> DemoEvaluationApproval:
+        """Revoke one decision while preserving its server-owned provenance."""
+
+        normalized_actor = Actor.model_validate_json(
+            actor.model_dump_json(by_alias=True)
+        )
+        normalized_command = (
+            RevokeDemoEvaluationApprovalCommand.model_validate_json(
+                command.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+        )
+        with self._store.transaction() as transaction:
+            unit_of_work = self._evaluation_unit_of_work(
+                transaction,
+                reader_actor=normalized_actor,
+            )
+            current = unit_of_work.resolve_approval(decision_id)
+            if current is None:
+                raise ResourceNotFoundError(
+                    f"demo evaluation approval {decision_id!r} was not found"
+                )
+            unit_of_work.authorize(
+                normalized_actor,
+                Permission.APPROVE,
+                current.manifest_id,
+            )
+            target = MutationTarget(
+                manifest_id=current.manifest_id,
+                manifest_version=current.manifest_version,
+            )
+            request_digest = compute_artifact_digest(
+                {
+                    "operation": "revoke_demo_evaluation_approval",
+                    "actorId": normalized_actor.actor_id,
+                    "decisionId": decision_id,
+                    "target": target.model_dump(
+                        mode="json",
+                        exclude_none=True,
+                    ),
+                    "command": normalized_command.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                }
+            )
+            receipt = transaction.get_receipt(
+                normalized_actor.actor_id,
+                idempotency_key,
+            )
+            if receipt is not None:
+                if (
+                    receipt.operation
+                    != "revoke_demo_evaluation_approval"
+                    or receipt.target != target
+                    or receipt.request_digest != request_digest
+                    or receipt.response_type
+                    != DemoEvaluationApproval.__name__
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key was used for a different mutation"
+                    )
+                return DemoEvaluationApproval.model_validate_json(
+                    receipt.response_json
+                )
+            if current.revision != normalized_command.expected_revision:
+                raise StaleRevisionError(
+                    "demo evaluation approval revision changed before "
+                    "revocation"
+                )
+            revoked_at = self._now()
+            if revoked_at < current.approved_at:
+                raise DemoEvaluationApprovalError(
+                    "authoritative approval clock moved backwards"
+                )
+            revoked = DemoEvaluationApproval.model_validate(
+                {
+                    **current.model_dump(mode="python"),
+                    "status": "revoked",
+                    "revision": current.revision + 1,
+                    "revoked_at": revoked_at,
+                }
+            )
+            unit_of_work.put_approval(
+                revoked,
+                expected_revision=current.revision,
+            )
+            transaction.append_audit(
+                PendingAuditEvent(
+                    occurred_at=revoked_at,
+                    actor=normalized_actor,
+                    action=(
+                        AuditAction.DEMO_EVALUATION_APPROVAL_REVOKED
+                    ),
+                    manifest_id=revoked.manifest_id,
+                    revision=revoked.revision,
+                    previous_revision=current.revision,
+                    manifest_version=revoked.manifest_version,
+                    manifest_digest=revoked.manifest_digest,
+                    reason=normalized_command.reason,
+                )
+            )
+            transaction.put_receipt(
+                MutationReceipt(
+                    actor_id=normalized_actor.actor_id,
+                    idempotency_key=idempotency_key,
+                    operation="revoke_demo_evaluation_approval",
+                    target=target,
+                    request_digest=request_digest,
+                    response_type=DemoEvaluationApproval.__name__,
+                    response_json=revoked.model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                )
+            )
+            return revoked
+
+    def get_demo_evaluation_approval(
+        self,
+        actor: Actor,
+        decision_id: str,
+    ) -> DemoEvaluationApproval | None:
+        """Load first, then authorize against only the stored workload."""
+
+        def get(
+            unit_of_work: EvaluationAuthorityUnitOfWorkPort,
+        ) -> DemoEvaluationApproval | None:
+            approval = unit_of_work.resolve_approval(decision_id)
+            if approval is None:
+                return None
+            unit_of_work.authorize(
+                actor,
+                Permission.AUDIT,
+                approval.manifest_id,
+            )
+            return approval
+
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=get,
+        )
+
+    def get_demo_evaluation_trusted_key(
+        self,
+        actor: Actor,
+    ) -> EvaluationTrustedKeyAuthority | None:
+        """Read this service's exact transaction-owned signing-key trust."""
+
+        self._authorization.require(actor, Permission.AUDIT, None)
+        trust = self._require_demo_evaluation_trust()
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.resolve_trusted_key(
+                trust.trusted_key_anchor
+            ),
+        )
+
+    def put_demo_evaluation_trusted_key(
+        self,
+        actor: Actor,
+        authority: EvaluationTrustedKeyAuthority,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """Replace signing-key trust through the actual ContextService store."""
+
+        self._authorization.require(actor, Permission.APPROVE, None)
+        trust = self._require_demo_evaluation_trust()
+        if authority.record.anchor != trust.trusted_key_anchor:
+            raise DemoEvaluationConfigurationError(
+                "trusted key replacement does not match this ContextService "
+                "anchor"
+            )
+        self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.put_trusted_key(
+                authority,
+                expected_revision=expected_revision,
+            ),
+        )
+
+    def get_demo_evaluation_grants(
+        self,
+        actor: Actor,
+    ) -> tuple[tuple[RoleGrant, ...], int]:
+        self._authorization.require(actor, Permission.PUBLISH, None)
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.get_grants(),
+        )
+
+    def authorize_demo_evaluation(
+        self,
+        actor: Actor,
+        permission: Permission,
+        manifest_id: str,
+    ) -> AuthorizationGrantToken:
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.authorize(
+                actor,
+                permission,
+                manifest_id,
+            ),
+        )
+
+    def replace_demo_evaluation_grants(
+        self,
+        actor: Actor,
+        grants: tuple[RoleGrant, ...],
+        *,
+        expected_revision: int,
+    ) -> int:
+        self._authorization.require(actor, Permission.PUBLISH, None)
+        return self._run_evaluation_authority_transaction(
+            reader_actor=actor,
+            operation=lambda unit_of_work: unit_of_work.replace_grants(
+                grants,
+                expected_revision=expected_revision,
+            ),
+        )
 
     def create_draft(
         self,

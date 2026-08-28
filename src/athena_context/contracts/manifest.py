@@ -29,6 +29,7 @@ from athena_context.contracts.models import (
     EvidenceSnapshot,
     ObservedRelationshipEvidenceRecord,
     ResourceEvidenceRecord,
+    ResourceState,
     SnapshotPublicationResolver,
     TrustedKeyAnchor,
     TrustedKeyResolver,
@@ -90,6 +91,7 @@ type Environment = Literal[
     "disasterRecovery",
     "sandbox",
 ]
+type ProfileId = Annotated[str, Field(min_length=1, max_length=128)]
 type AzureCloudName = Literal[
     "azureCloud",
     "azureChinaCloud",
@@ -123,6 +125,7 @@ type ManifestFindingKind = Literal[
     "objective",
     "relationshipConflict",
     "evidenceGap",
+    "operationalState",
 ]
 type FailureVerdict = Literal["violation", "unknown", "conflicting"]
 type EvidenceState = Literal["complete", "missing", "gap", "stale", "conflicting"]
@@ -488,7 +491,7 @@ class DeclaredManifestRelationship(AthenaBaseModel):
     source: ManifestEndpoint
     target: ManifestEndpoint
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     source_clause: str = Field(
         ..., alias="sourceClause", min_length=1, max_length=512, pattern=r"^/"
     )
@@ -542,6 +545,44 @@ class ZoneDistributionProof(AthenaBaseModel):
     minimum_distinct_zones: int = Field(..., alias="minimumDistinctZones", ge=1, le=3)
 
 
+class RoleOperationalStateProof(AthenaBaseModel):
+    proof_kind: Literal["roleOperationalStateProof"] = Field(..., alias="proofKind")
+    role_ref: str = Field(..., alias="roleRef", min_length=1, max_length=128)
+    healthy_states: list[ResourceState] = Field(
+        ...,
+        alias="healthyStates",
+        min_length=1,
+        max_length=3,
+    )
+    failure_states: list[ResourceState] = Field(
+        ...,
+        alias="failureStates",
+        min_length=1,
+        max_length=3,
+    )
+    minimum_healthy: int = Field(..., alias="minimumHealthy", ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def validate_state_classification(self) -> RoleOperationalStateProof:
+        healthy = set(self.healthy_states)
+        failure = set(self.failure_states)
+        if len(healthy) != len(self.healthy_states) or len(failure) != len(
+            self.failure_states
+        ):
+            raise AthenaValidationError(
+                "role operational state classifications must be unique"
+            )
+        if "unknown" in healthy or "unknown" in failure:
+            raise AthenaValidationError(
+                "unknown resource state cannot be classified as healthy or failure"
+            )
+        if healthy & failure:
+            raise AthenaValidationError(
+                "healthyStates and failureStates must be disjoint"
+            )
+        return self
+
+
 class RelationshipPresenceProof(AthenaBaseModel):
     proof_kind: Literal["relationshipPresenceProof"] = Field(..., alias="proofKind")
     declared_relationship_ref: str = Field(
@@ -571,6 +612,7 @@ type ManifestProof = Annotated[
     CardinalityProof
     | ZoneColocationProof
     | ZoneDistributionProof
+    | RoleOperationalStateProof
     | RelationshipPresenceProof
     | EvidenceFreshnessProof
     | ControlHealthProof
@@ -591,6 +633,7 @@ class ManifestConstraint(AthenaBaseModel):
         "cardinality",
         "zoneColocation",
         "zoneDistribution",
+        "roleOperationalState",
         "dependencyRequired",
         "dependencyProhibited",
         "supportedSingleton",
@@ -601,7 +644,7 @@ class ManifestConstraint(AthenaBaseModel):
     finding_kind: ManifestFindingKind = Field(..., alias="findingKind")
     governance_scope: ClauseScope = Field(..., alias="governanceScope")
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     proof_requirement: ManifestProof = Field(..., alias="proofRequirement")
     failure_verdict: FailureVerdict = Field(..., alias="failureVerdict")
     success_verdict: Literal["pass", "expectedConstraint", "observation"] = Field(
@@ -622,6 +665,7 @@ class ManifestConstraint(AthenaBaseModel):
             "supportedSingleton": CardinalityProof,
             "zoneColocation": ZoneColocationProof,
             "zoneDistribution": ZoneDistributionProof,
+            "roleOperationalState": RoleOperationalStateProof,
             "dependencyRequired": RelationshipPresenceProof,
             "dependencyProhibited": RelationshipPresenceProof,
             "objectiveRequired": ObjectiveThresholdProof,
@@ -643,7 +687,7 @@ class _ControlBase(AthenaBaseModel):
     control_id: str = Field(..., alias="controlId", min_length=1, max_length=128)
     governance_scope: ClauseScope = Field(..., alias="governanceScope")
     owner_ref: str = Field(..., alias="ownerRef", min_length=1, max_length=128)
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     health: Literal[
         "effective",
         "degraded",
@@ -755,7 +799,7 @@ class ManifestRiskAcceptance(AthenaBaseModel):
         alias="acceptedResourceBindings",
         max_length=1000,
     )
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
     status: ApprovalStatus
 
     @model_validator(mode="after")
@@ -830,7 +874,7 @@ class GovernedWeakeningOverride(AthenaBaseModel):
     status: ApprovalStatus
     accepted_at: UtcDateTime = Field(..., alias="acceptedAt")
     expires_at: UtcDateTime = Field(..., alias="expiresAt")
-    profiles: list[Environment] = Field(..., min_length=1, max_length=25)
+    profiles: list[ProfileId] = Field(..., min_length=1, max_length=25)
 
     def authorizes(
         self,
@@ -2068,6 +2112,39 @@ def _validate_weakening(
                 target_ref=constraint.constraint_id,
                 reason="zoneRequirementRelaxation",
             )
+        if isinstance(
+            previous_constraint.proof_requirement,
+            RoleOperationalStateProof,
+        ) and isinstance(
+            constraint.proof_requirement,
+            RoleOperationalStateProof,
+        ):
+            previous_proof = previous_constraint.proof_requirement
+            current_proof = constraint.proof_requirement
+            if (
+                _normalized_id(previous_proof.role_ref)
+                != _normalized_id(current_proof.role_ref)
+                or set(previous_proof.healthy_states)
+                != set(current_proof.healthy_states)
+                or set(previous_proof.failure_states)
+                != set(current_proof.failure_states)
+            ):
+                raise AthenaValidationError(
+                    f"proof semantics require a new constraint id: "
+                    f"{constraint.constraint_id}"
+                )
+            if current_proof.minimum_healthy < previous_proof.minimum_healthy:
+                _find_override(
+                    overrides,
+                    as_of=as_of,
+                    profile_id=child.profile_id,
+                    target_path=(
+                        f"/resolvedProfiles/{child.profile_id}/constraints/"
+                        f"{constraint.constraint_id}/proofRequirement/minimumHealthy"
+                    ),
+                    target_ref=constraint.constraint_id,
+                    reason="constraintRequirementRelaxation",
+                )
 
 
 def _validate_role_requirement_weakening(
@@ -2240,6 +2317,34 @@ def _validate_constraint_requirement_weakening(
                 target_ref=constraint.constraint_id,
                 reason="zoneRequirementRelaxation",
             )
+        if isinstance(previous_proof, RoleOperationalStateProof) and isinstance(
+            current_proof,
+            RoleOperationalStateProof,
+        ):
+            if (
+                _normalized_id(previous_proof.role_ref)
+                != _normalized_id(current_proof.role_ref)
+                or set(previous_proof.healthy_states)
+                != set(current_proof.healthy_states)
+                or set(previous_proof.failure_states)
+                != set(current_proof.failure_states)
+            ):
+                raise AthenaValidationError(
+                    f"proof semantics require a new constraint id: "
+                    f"{constraint.constraint_id}"
+                )
+            if current_proof.minimum_healthy < previous_proof.minimum_healthy:
+                _find_override(
+                    child.weakening_overrides,
+                    as_of=as_of,
+                    profile_id=child.profile_id,
+                    target_path=(
+                        f"/resolvedProfiles/{child.profile_id}/constraints/"
+                        f"{constraint.constraint_id}/proofRequirement/minimumHealthy"
+                    ),
+                    target_ref=constraint.constraint_id,
+                    reason="constraintRequirementRelaxation",
+                )
         if (
             isinstance(previous_proof, EvidenceFreshnessProof)
             and isinstance(current_proof, EvidenceFreshnessProof)
@@ -3140,6 +3245,7 @@ class ResourceProofFact(AthenaBaseModel):
     resource_id: str = Field(..., alias="resourceId", min_length=1, max_length=2048)
     role_ref: str = Field(..., alias="roleRef", min_length=1, max_length=128)
     availability_zone: Literal["1", "2", "3", "unknown"] = Field(..., alias="availabilityZone")
+    operational_state: ResourceState = Field(default="unknown", alias="operationalState")
     state: EvidenceState
     proof_source: ProofSource = Field(..., alias="proofSource")
     evidence_ref: EvidenceReference = Field(..., alias="evidenceRef")
@@ -3392,6 +3498,10 @@ def verified_snapshot_context_verifier(
                     not isinstance(record, ResourceEvidenceRecord)
                     or record.resource_id != fact.resource_id
                     or record.availability_zone != fact.availability_zone
+                    or (
+                        "operational_state" in fact.model_fields_set
+                        and record.state != fact.operational_state
+                    )
                 )
             ):
                 raise AthenaValidationError(
@@ -3475,6 +3585,7 @@ __all__ = [
     "ProofFactValidator",
     "ProvenanceSelector",
     "RelationshipProofFact",
+    "RoleOperationalStateProof",
     "RoleBindingProof",
     "RoleBindingValidator",
     "ResolvedManifestProfile",

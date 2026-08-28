@@ -9,8 +9,13 @@ description = "Customer-hosted workload context and operational judgment layer f
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-  "cryptography>=45.0",
+  "azure-data-tables>=12.7",
+  "azure-identity>=1.25",
+  "azure-keyvault-keys>=4.11",
+  "azure-storage-blob>=12.26",
+  "cryptography>=50.0",
   "fastapi>=0.116",
+  "pyjwt[crypto]>=2.10",
   "pydantic>=2.11",
   "pyyaml>=6.0",
   "rfc8785>=0.1.4",
@@ -43,6 +48,9 @@ athena_context = ["data/fixtures/*.json"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "live: requires explicit private Azure MCP environment configuration",
+]
 
 [tool.ruff]
 line-length = 100

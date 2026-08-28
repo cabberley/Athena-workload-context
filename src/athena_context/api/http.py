@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import time_ns
 from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, status
@@ -45,8 +46,26 @@ from athena_context.api.errors import (
     AuthorizationError,
     CohortBoundaryError,
     ContextApiError,
+    DemoEvaluationConfigurationError,
+    EvaluationFailedClosedError,
+    EvidenceCollectionRejectedError,
     ManifestValidationError,
     ResourceNotFoundError,
+)
+from athena_context.api.evaluation_domain import (
+    CreateDemoEvaluationApprovalCommand,
+    DemoEvaluationApproval,
+    DemoEvaluationCommand,
+    DemoEvaluationResult,
+    RevokeDemoEvaluationApprovalCommand,
+)
+from athena_context.api.evaluation_ports import (
+    DemoEvaluationTrustConfiguration,
+    EvaluationTrustedKeyAuthority,
+)
+from athena_context.api.evaluation_service import (
+    DemoEvaluationDependencies,
+    DemoEvaluationService,
 )
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.ports import AuthenticationPort
@@ -80,7 +99,15 @@ class SystemClock:
     """Infrastructure clock used only by the default ASGI composition root."""
 
     def now(self) -> datetime:
-        return datetime.now(tz=UTC).replace(microsecond=0)
+        current = datetime.now(tz=UTC)
+        return current.replace(
+            microsecond=(current.microsecond // 1000) * 1000
+        )
+
+    def now_epoch_milliseconds(self) -> int:
+        """Return the persistence timestamp as an exact, non-polymorphic value."""
+
+        return time_ns() // 1_000_000
 
 
 def _current_actor(
@@ -104,19 +131,50 @@ def create_app(
     *,
     service: ContextService | None = None,
     authentication: AuthenticationPort | None = None,
+    demo_evaluation_dependencies: DemoEvaluationDependencies | None = None,
+    demo_evaluation_service: DemoEvaluationService | None = None,
     cohort_service: CohortProposalService | None = None,
 ) -> FastAPI:
+    if demo_evaluation_service is not None:
+        raise DemoEvaluationConfigurationError(
+            "preconstructed demo evaluation services are rejected; provide only "
+            "non-authoritative dependencies for composition with the app-owned "
+            "ContextService"
+        )
     default_store: InMemoryContextStore | None = None
     if service is None:
-        default_store = InMemoryContextStore()
+        default_clock = SystemClock()
+        demo_trust: DemoEvaluationTrustConfiguration | None = None
+        trusted_key: EvaluationTrustedKeyAuthority | None = None
+        if demo_evaluation_dependencies is not None:
+            evidence_client = demo_evaluation_dependencies.evidence_client
+            anchor = evidence_client.trusted_key_anchor
+            record = evidence_client.key_resolver(anchor)
+            if record is None:
+                raise DemoEvaluationConfigurationError(
+                    "demo evaluation signing key was not found while seeding "
+                    "the ContextService trust authority"
+                )
+            demo_trust = DemoEvaluationTrustConfiguration(
+                trusted_key_anchor=anchor,
+            )
+            trusted_key = EvaluationTrustedKeyAuthority(
+                record=record,
+                revision=1,
+            )
+        default_store = InMemoryContextStore(
+            authoritative_clock=default_clock,
+            demo_evaluation_trusted_key=trusted_key,
+        )
         service = ContextService(
             store=default_store,
             authorization=RoleBasedAuthorization(),
-            clock=SystemClock(),
+            clock=default_clock,
             publication_actor=Actor(
                 actor_id="athena-context-api",
                 kind=ActorKind.SERVICE,
             ),
+            demo_evaluation_trust=demo_trust,
         )
     if cohort_service is None:
         cohort_persistence = InMemoryCohortPersistence()
@@ -130,6 +188,14 @@ def create_app(
             preview_receipts=cohort_persistence,
         )
     authenticator = authentication or RejectUnverifiedAuthentication()
+    bound_demo_evaluation = (
+        None
+        if demo_evaluation_dependencies is None
+        else DemoEvaluationService.from_dependencies(
+            context_service=service,
+            dependencies=demo_evaluation_dependencies,
+        )
+    )
     application = FastAPI(
         title="Athena Context API",
         version="1.0.0",
@@ -151,8 +217,17 @@ def create_app(
             http_status = status.HTTP_404_NOT_FOUND
         elif isinstance(exc, CohortBoundaryError):
             http_status = status.HTTP_413_CONTENT_TOO_LARGE
-        elif isinstance(exc, ManifestValidationError):
+        elif isinstance(
+            exc,
+            (
+                ManifestValidationError,
+                EvidenceCollectionRejectedError,
+                EvaluationFailedClosedError,
+            ),
+        ):
             http_status = status.HTTP_422_UNPROCESSABLE_CONTENT
+        elif isinstance(exc, DemoEvaluationConfigurationError):
+            http_status = status.HTTP_503_SERVICE_UNAVAILABLE
         else:
             http_status = status.HTTP_409_CONFLICT
         body = ErrorResponse(error=ErrorDetail(code=exc.code, message=exc.message))
@@ -403,6 +478,90 @@ def create_app(
         actor: ActorDependency,
     ) -> list[AuditEvent]:
         return service.audit_history(actor, manifest_id)
+
+    if bound_demo_evaluation is not None:
+
+        @application.post(
+            "/v1/demo-evaluation-approvals",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+            status_code=status.HTTP_201_CREATED,
+        )
+        def create_demo_evaluation_approval(
+            command: CreateDemoEvaluationApprovalCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            return service.create_demo_evaluation_approval(
+                actor,
+                idempotency_key,
+                command,
+            )
+
+        @application.get(
+            "/v1/demo-evaluation-approvals/{decision_id}",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+        )
+        def get_demo_evaluation_approval(
+            decision_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            approval = service.get_demo_evaluation_approval(
+                actor,
+                decision_id,
+            )
+            if approval is None:
+                raise ResourceNotFoundError(
+                    f"demo evaluation approval {decision_id!r} was not found"
+                )
+            return approval
+
+        @application.post(
+            "/v1/demo-evaluation-approvals/{decision_id}/revoke",
+            response_model=DemoEvaluationApproval,
+            response_model_exclude_none=True,
+        )
+        def revoke_demo_evaluation_approval(
+            decision_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+            command: RevokeDemoEvaluationApprovalCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationApproval:
+            return service.revoke_demo_evaluation_approval(
+                actor,
+                decision_id,
+                idempotency_key,
+                command,
+            )
+
+        @application.post(
+            "/v1/demo-evaluations",
+            response_model=DemoEvaluationResult,
+            response_model_exclude_none=True,
+            status_code=status.HTTP_201_CREATED,
+        )
+        def evaluate_demo(
+            command: DemoEvaluationCommand,
+            idempotency_key: IdempotencyHeader,
+            actor: ActorDependency,
+        ) -> DemoEvaluationResult:
+            return bound_demo_evaluation.evaluate(
+                actor,
+                idempotency_key,
+                command,
+            )
+
+        @application.get(
+            "/v1/demo-evaluations/{snapshot_id}",
+            response_model=DemoEvaluationResult,
+            response_model_exclude_none=True,
+        )
+        def get_demo_evaluation(
+            snapshot_id: str,
+            actor: ActorDependency,
+        ) -> DemoEvaluationResult:
+            return bound_demo_evaluation.get_result(actor, snapshot_id)
 
     return application
 

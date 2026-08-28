@@ -155,7 +155,7 @@ class CollectorTrustConfiguration(AthenaBaseModel):
 
 class EvidenceTransportRequest(AthenaBaseModel):
     attempt_id: AttemptIdentifier = Field(..., alias="attemptId")
-    attempt_started_at: datetime = Field(..., alias="attemptStartedAt")
+    attempt_started_at: UtcDateTime = Field(..., alias="attemptStartedAt")
     tool_name: ToolName = Field(..., alias="toolName")
     tool_version: ToolVersion = Field(..., alias="toolVersion")
     expected_record_type: Literal["resource"] = Field(
@@ -296,6 +296,10 @@ class EvidenceClientError(RuntimeError):
     """Base class for fail-closed evidence client errors."""
 
 
+class EvidenceClientCompositionError(EvidenceClientError):
+    """A configured client no longer owns its originally bound transport."""
+
+
 class EvidenceBoundaryError(EvidenceClientError):
     """The typed MCP boundary could not be represented safely."""
 
@@ -316,6 +320,7 @@ __all__ = [
     "CollectorTrustConfiguration",
     "EvidenceBoundaryError",
     "EvidenceClientError",
+    "EvidenceClientCompositionError",
     "EvidenceCollectionCommand",
     "EvidenceProjection",
     "EvidenceResponseBounds",
