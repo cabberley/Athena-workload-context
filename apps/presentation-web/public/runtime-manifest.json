@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "athena.presentationWeb.runtime.v1",
+  "classification": "synthetic-demo-only",
+  "key": {
+    "path": "./trust/presentation-public-key.jwk.json",
+    "assetSha256": "sha256:d6d4778ae610008acf646edd1d100a7685c888e470564acd86a2b81770985049",
+    "keyId": "synthetic-key://athena-argus-demo/rs256-v1",
+    "fingerprint": "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
+  },
+  "phases": [
+    {
+      "phase": "baseline",
+      "payloadPath": "./fixtures/baseline.presentation.json",
+      "payloadSha256": "sha256:c0f055d96abd3bc488cbf1599dbcd8f7d51fc413b739e42f61308083f691bfa1",
+      "attestationPath": "./fixtures/baseline.attestation.json",
+      "attestationSha256": "sha256:c3bde642102958cc0109df154a65a89ed7772a54e396a703a8d96989254efe44"
+    },
+    {
+      "phase": "faulted",
+      "payloadPath": "./fixtures/faulted.presentation.json",
+      "payloadSha256": "sha256:419d58b89a9336f313c2b0903ed58d77a6c94aedaed6a4735193e8062cd66561",
+      "attestationPath": "./fixtures/faulted.attestation.json",
+      "attestationSha256": "sha256:87c06adf02fa95de3a118ec04aac266307a5d7677c9c23d3d7988a9911a95978"
+    },
+    {
+      "phase": "recovered",
+      "payloadPath": "./fixtures/recovered.presentation.json",
+      "payloadSha256": "sha256:8841015e78cba032b9d629c3a0e257f3e3dacaf03ee254e9c466d5747daddef4",
+      "attestationPath": "./fixtures/recovered.attestation.json",
+      "attestationSha256": "sha256:c3fd82909090f2da32358b01f0f9236405fc62a52873e08f18909c12cc285ceb"
+    }
+  ]
+}

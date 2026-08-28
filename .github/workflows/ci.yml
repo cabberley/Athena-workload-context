@@ -28,3 +28,53 @@ jobs:
         run: python -m mypy src
       - name: Test
         run: python -m pytest
+
+  context-studio:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Test
+        run: npm run test
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Audit
+        run: npm audit --audit-level=high
+
+  presentation-web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/presentation-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation-web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Test
+        run: npm run test
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Audit
+        run: npm audit --audit-level=high

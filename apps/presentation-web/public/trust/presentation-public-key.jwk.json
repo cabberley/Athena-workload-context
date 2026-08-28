@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "athena.presentationWeb.publicKey.v1",
+  "keyId": "synthetic-key://athena-argus-demo/rs256-v1",
+  "fingerprint": "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515",
+  "jwk": {
+    "kty": "RSA",
+    "n": "6Msl_qGhUP2CAKrXsN4EYWf2fYEr1zO7_fARmXnQiH5GtQbhp_ZYKWhMot6X82FqSuYVOeWHwfnOoU9wwQKEpIvRADmTeEtGToVpqMx8hQirZz403RPCPoXIt7RtFrLKRyLA5WHmUbgrwZ3t3CPThSOZR8l8KhKli6a6LMbscJGT6vDt2akFxXXUeqoaqYj1HydwDayfBLexpys6eB_RJx5qnGugyAJRiINOVzZ4ctHY_XcvpCdEuaKJfJovfsVPN6HPV1RmxdzZPY3mIcJMclsiL6pf18VMj4ds4QC_h7eQoF02LOMMIN9EE2drinDTuG_qpqDYo5qeBr10IRgDv5LbHfXX0M4UdmaCZxqgbz8hbWfKka5gHq17CtLoOW5gN0GyyUiQasS1ZTOpQ4MGErmh-h50KZyUS5e8NdWO4a5MltA-Lf3u7IFs4PqyTwz3jMNIeZSmsgJD0Ze-FGhJKoiYHBkiN9QYXcOQHZpALwLGWr6bS_bmzpDRIAmZ_kUl",
+    "e": "AQAB",
+    "alg": "RS256",
+    "key_ops": ["verify"],
+    "ext": true
+  }
+}

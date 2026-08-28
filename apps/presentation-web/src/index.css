@@ -1,0 +1,17 @@
+:root {
+  font-family: Inter, 'Segoe UI', system-ui, sans-serif;
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+p,
+ol,
+dl {
+  margin-top: 0;
+}

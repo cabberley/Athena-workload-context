@@ -33,6 +33,7 @@ See:
 - [WC-013 live acceptance](docs/operations/wc013-live-acceptance.md)
 - [Operational phase runner](docs/operations/operational-phase-runner.md)
 - [Operational demo operator](docs/operations/operational-demo-operator.md)
+- [Standalone verified presentation web](apps/presentation-web/README.md)
 
 ## Local reference proof
 
