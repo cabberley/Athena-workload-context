@@ -24,13 +24,15 @@ param artifactContainerName = 'operational-artifacts'
 param artifactRetentionDays = 30
 
 // Demo jumpbox/operator verification reader for exact version-pinned artifact reads.
+// Replace with a reviewed Entra object ID that is not used by the receipt writer.
 param operatorArtifactReaderObjectIds = [
-  '51425b07-8512-4c49-a763-23a09c347f0b'
+  '44444444-4444-4444-4444-444444444444'
 ]
 
-// The same governed jumpbox principal may also create exact run-scoped receipts through the workload-owned controller.
+// Separate workload-controller principal for exact run-scoped receipt creation.
+// This object ID must not appear in operatorArtifactReaderObjectIds.
 param workloadReceiptWriterObjectIds = [
-  '51425b07-8512-4c49-a763-23a09c347f0b'
+  '55555555-5555-5555-5555-555555555555'
 ]
 
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.

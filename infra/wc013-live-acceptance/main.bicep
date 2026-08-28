@@ -75,11 +75,11 @@ param artifactContainerName string = 'operational-artifacts'
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of the separate operator managed identities that read exact artifact versions.')
+@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
-@description('Object IDs of the separate workload-controller managed identities that create exact run-scoped fault receipts.')
+@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds.')
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 

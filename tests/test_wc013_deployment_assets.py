@@ -100,7 +100,10 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
 
     writer_rbac = _loop_role_assignment(resources, "workloadReceiptBlobDataContributors")
     assert "scope: artifactContainer" in writer_rbac
-    assert "for workloadReceiptWriterObjectId in workloadReceiptWriterObjectIds" in writer_rbac
+    assert (
+        "for workloadReceiptWriterObjectId in validatedWorkloadReceiptWriterObjectIds"
+        in writer_rbac
+    )
     assert "principalId: workloadReceiptWriterObjectId" in writer_rbac
     assert "storageBlobDataContributorRoleDefinitionId" in writer_rbac
     for forbidden in (
@@ -129,10 +132,13 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
 
     example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
     reader_id, writer_id = _example_object_ids(example)
-    assert reader_id == writer_id
+    assert reader_id != writer_id
     assert reader_id not in orchestration
     assert reader_id not in resources
     assert reader_id not in compiled
+    assert writer_id not in orchestration
+    assert writer_id not in resources
+    assert writer_id not in compiled
 
     for forbidden_role in (
         "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
@@ -149,6 +155,42 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
 
     for forbidden in ("passwordSecretRef", "connectionString", "listKeys(", "secrets:"):
         assert forbidden not in resources
+
+
+def test_wc013_bicep_rejects_shared_operator_reader_and_receipt_writer_principals() -> None:
+    resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+
+    assert (
+        "map(operatorArtifactReaderObjectIds, objectId => toLower(string(objectId)))"
+        in resources
+    )
+    assert (
+        "map(workloadReceiptWriterObjectIds, objectId => toLower(string(objectId)))"
+        in resources
+    )
+    assert (
+        "var overlappingArtifactAccessObjectIds = intersection(\n"
+        "  normalizedOperatorArtifactReaderObjectIds,\n"
+        "  normalizedWorkloadReceiptWriterObjectIds\n"
+        ")"
+        in resources
+    )
+    assert (
+        "var validatedWorkloadReceiptWriterObjectIds = "
+        "empty(overlappingArtifactAccessObjectIds)"
+        in resources
+    )
+    assert (
+        "fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds "
+        "must contain distinct principals')"
+        in resources
+    )
+
+    writer_rbac = _loop_role_assignment(resources, "workloadReceiptBlobDataContributors")
+    assert (
+        "for workloadReceiptWriterObjectId in validatedWorkloadReceiptWriterObjectIds"
+        in writer_rbac
+    )
 
 
 def test_wc013_container_images_use_the_packaged_cli_and_only_reviewed_config_files() -> None:

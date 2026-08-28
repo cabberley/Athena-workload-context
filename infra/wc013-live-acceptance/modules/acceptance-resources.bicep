@@ -67,11 +67,11 @@ param artifactContainerName string
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of the separate operator managed identities that read exact artifact versions.')
+@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
-@description('Object IDs of the separate workload-controller managed identities that create exact run-scoped fault receipts.')
+@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds.')
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
@@ -98,6 +98,15 @@ var resourceTags = union(tags, {
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+var normalizedOperatorArtifactReaderObjectIds = map(operatorArtifactReaderObjectIds, objectId => toLower(string(objectId)))
+var normalizedWorkloadReceiptWriterObjectIds = map(workloadReceiptWriterObjectIds, objectId => toLower(string(objectId)))
+var overlappingArtifactAccessObjectIds = intersection(
+  normalizedOperatorArtifactReaderObjectIds,
+  normalizedWorkloadReceiptWriterObjectIds
+)
+var validatedWorkloadReceiptWriterObjectIds = empty(overlappingArtifactAccessObjectIds)
+  ? workloadReceiptWriterObjectIds
+  : fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds must contain distinct principals')
 var operationalPhaseBundlePath = '/opt/athena/wc013-live/delivery/operational-phase-bundle.json'
 var operationalScratchDirectory = '/tmp/athena-operational'
 var baselineOperationalJobName = '${namePrefix}-op-baseline'
@@ -312,7 +321,7 @@ resource artifactBlobDataContributor 'Microsoft.Authorization/roleAssignments@20
   ]
 }
 
-resource workloadReceiptBlobDataContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for workloadReceiptWriterObjectId in workloadReceiptWriterObjectIds: {
+resource workloadReceiptBlobDataContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for workloadReceiptWriterObjectId in validatedWorkloadReceiptWriterObjectIds: {
   name: guid(
     artifactContainer.id,
     workloadReceiptWriterObjectId,

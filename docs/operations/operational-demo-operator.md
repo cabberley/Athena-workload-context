@@ -93,8 +93,9 @@ The operator reads `athena.operationalDemoOperator.v1`:
 All files are relative to the configuration directory and must stay inside that boundary.
 The `artifactReader.managedIdentityClientId` value is the operator identity client ID used for
 token acquisition; the Bicep deployment parameter uses the corresponding object ID for container-
-scoped Reader RBAC. That reader identity is distinct from the workload-controller receipt writer
-capability, even when the same governed demo principal is intentionally reviewed into both arrays.
+scoped Reader RBAC. That reader principal must be distinct from every workload-controller receipt
+writer principal because the writer's Blob Contributor role would otherwise defeat the operator's
+read-only boundary.
 
 ## Controller output contracts
 

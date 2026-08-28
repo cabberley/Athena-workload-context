@@ -67,13 +67,16 @@ execution it started.
 
 Keep the existing bounded `operatorArtifactReaderObjectIds` array. Grant each object ID
 `Storage Blob Data Reader` only at the artifact-container scope so the external operator can
-verify exact artifact versions. Add a separate bounded `workloadReceiptWriterObjectIds` array.
+verify exact artifact versions. Add a separate, disjoint bounded
+`workloadReceiptWriterObjectIds` array.
 Grant each object ID `Storage Blob Data Contributor` only at that same artifact-container scope so
 the trusted workload-owned controller can create the exact phase receipt Blob before the Job reads
 it. Azure RBAC cannot scope a built-in Blob role to `runs/<runId>/inputs/<phase>/`, so the
 controller must enforce the exact `athena.demoFaultRun.v1` JSON name, create-only
 `If-None-Match: *`, and no-overwrite semantics in application code. The external operator
 configuration still uses the corresponding managed-identity client ID for token acquisition.
+The Bicep resource module compares normalized object IDs and fails deployment when the reader and
+writer arrays overlap.
 
 ## Consequences
 
@@ -89,8 +92,8 @@ configuration still uses the corresponding managed-identity client ID for token 
   start RBAC and controller-side template validation enforce the execution boundary.
 - Athena phase Jobs still perform no workload mutation; they read exact receipt references only.
   Inject and reset remain outside Athena.
-- The same governed principal may appear in both arrays for the demo, but exact-version read
-  verification and receipt creation remain distinct reviewed capabilities.
+- Operator readers and workload receipt writers must use distinct principals so the Contributor
+  capability cannot collapse the read-only operator trust boundary.
 - The same reviewed delivery image must now carry the operational phase bundle beneath the copied
   `wc013-live/` tree.
 - Exact-version Blob reads and create-only Blob writes remain scoped to the one artifact container.

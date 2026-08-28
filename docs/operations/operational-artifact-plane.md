@@ -22,6 +22,11 @@ The existing WC-013 replay StorageV2 account also hosts one Blob container:
   `operatorArtifactReaderObjectIds`, each with `Storage Blob Data Reader` at the same exact
   container for exact-version verification only.
 
+The operator-reader and workload receipt-writer arrays are a hard trust boundary and must be
+disjoint. Because Blob Contributor includes read and list data actions, assigning both roles to one
+principal would collapse the read-only operator boundary. The resource module compares normalized
+object IDs and fails deployment if any principal appears in both arrays.
+
 The account keeps `allowSharedKeyAccess: false`, OAuth as the default, public Blob access disabled,
 and public network access disabled. The private endpoint uses the existing private-endpoint subnet
 and VNet link. Clients use the normal Blob hostname; DNS resolves it to the private endpoint.
@@ -85,8 +90,8 @@ The WC-013 entrypoint adds:
 |---|---|---|
 | `artifactContainerName` | input | The single immutable artifact container. |
 | `artifactRetentionDays` | input | Explicit unlocked WORM retention period. |
-| `operatorArtifactReaderObjectIds` | input | Entra object IDs of the separate operator reader managed identities used for exact-version verification. |
-| `workloadReceiptWriterObjectIds` | input | Entra object IDs of the trusted workload-controller managed identities that create exact run-scoped receipt Blobs. |
+| `operatorArtifactReaderObjectIds` | input | Entra object IDs of the operator reader managed identities used for exact-version verification; disjoint from receipt writers. |
+| `workloadReceiptWriterObjectIds` | input | Entra object IDs of the trusted workload-controller managed identities that create exact run-scoped receipt Blobs; disjoint from operator readers. |
 | `artifactBlobEndpoint` | output | Private-resolved normal Blob HTTPS endpoint. |
 | `artifactContainerName` | output | Exact container name. |
 | `artifactContainerResourceId` | output | Exact Azure RBAC scope. |
