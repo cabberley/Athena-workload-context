@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import traceback
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import URLError
 
 import pytest
 
@@ -250,3 +252,100 @@ def test_arm_client_posts_only_the_exact_controller_template(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def test_real_arm_http_stack_sends_bearer_token_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "synthetic.arm.token"
+    url = f"https://management.azure.com{JOB_RESOURCE_ID}/start?api-version=2024-03-01"
+    observed: dict[str, object] = {}
+
+    class _Response:
+        status = 202
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return url
+
+        def read(self, limit: int) -> bytes:
+            observed["limit"] = limit
+            return b'{"name":"execution-0002"}'
+
+    class _Opener:
+        def open(self, request: object, timeout: int) -> _Response:
+            observed["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
+            observed["timeout"] = timeout
+            return _Response()
+
+    monkeypatch.setattr(
+        controller_module,
+        "build_opener",
+        lambda *_handlers: _Opener(),
+    )
+
+    status, response_url, payload = controller_module._ArmHttpStack().request(
+        method="POST",
+        url=url,
+        token=token,
+        body=b"{}",
+    )
+
+    assert status == 202
+    assert response_url == url
+    assert payload == b'{"name":"execution-0002"}'
+    assert observed["authorization"] == "Bearer " + token
+    assert observed["timeout"] == 30
+
+
+def test_arm_client_failure_suppresses_token_from_exception_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = "synthetic-token-that-must-not-leak"
+
+    class _Credential:
+        def get_token(self, _scope: str) -> object:
+            return SimpleNamespace(token=token)
+
+    class _Opener:
+        def open(self, _request: object, timeout: int) -> None:
+            assert timeout == 30
+            raise URLError(f"upstream failure echoed {token}")
+
+    monkeypatch.setattr(
+        controller_module,
+        "DefaultAzureCredential",
+        lambda **_kwargs: _Credential(),
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "build_opener",
+        lambda *_handlers: _Opener(),
+    )
+    client = AzureContainerAppsCollectorJobManagementClient(
+        controller_identity_client_id=(
+            "44444444-4444-4444-4444-444444444444"
+        )
+    )
+
+    with pytest.raises(Wc013CollectorControllerError) as captured:
+        client.get_job(JOB_RESOURCE_ID)
+
+    formatted = "".join(
+        traceback.format_exception(
+            type(captured.value),
+            captured.value,
+            captured.value.__traceback__,
+        )
+    )
+    assert token not in str(captured.value)
+    assert token not in formatted
+    assert token not in caplog.text
+    assert captured.value.__cause__ is None
+    assert captured.value.__suppress_context__

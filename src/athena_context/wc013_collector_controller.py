@@ -315,7 +315,7 @@ class _ArmHttpStack:
             data=body,
             headers={
                 "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
+                "Authorization": "Bearer " + token,
                 **(
                     {"Content-Type": "application/json"}
                     if body is not None
@@ -373,9 +373,10 @@ class AzureContainerAppsCollectorJobManagementClient:
                 body=body,
             )
         except (HTTPError, URLError, OSError, ValueError) as exc:
+            failure_type = type(exc).__name__
             raise Wc013CollectorControllerError(
-                f"collector job ARM {method} failed closed ({type(exc).__name__})"
-            ) from exc
+                f"collector job ARM {method} failed closed ({failure_type})"
+            ) from None
         if (
             response_url != url
             or status not in ({200} if method == "GET" else {200, 202})

@@ -67,11 +67,11 @@ param collectorArtifactContainerName string
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds.')
+@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds or match either runtime identity.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
-@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds.')
+@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds or match either runtime identity.')
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
@@ -106,13 +106,30 @@ var storageBlobDataContributorRoleDefinitionId = 'ba92f5b4-2d11-453d-a403-e96b00
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var normalizedOperatorArtifactReaderObjectIds = map(operatorArtifactReaderObjectIds, objectId => toLower(string(objectId)))
 var normalizedWorkloadReceiptWriterObjectIds = map(workloadReceiptWriterObjectIds, objectId => toLower(string(objectId)))
+var normalizedRuntimeIdentityPrincipalIds = [
+  toLower(acceptanceIdentityPrincipalId)
+  toLower(evidenceIdentityPrincipalId)
+]
 var overlappingArtifactAccessObjectIds = intersection(
   normalizedOperatorArtifactReaderObjectIds,
   normalizedWorkloadReceiptWriterObjectIds
 )
-var validatedWorkloadReceiptWriterObjectIds = empty(overlappingArtifactAccessObjectIds)
-  ? workloadReceiptWriterObjectIds
-  : fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds must contain distinct principals')
+var operatorRuntimeIdentityOverlap = intersection(
+  normalizedOperatorArtifactReaderObjectIds,
+  normalizedRuntimeIdentityPrincipalIds
+)
+var workloadRuntimeIdentityOverlap = intersection(
+  normalizedWorkloadReceiptWriterObjectIds,
+  normalizedRuntimeIdentityPrincipalIds
+)
+var validatedOperatorArtifactReaderObjectIds = empty(operatorRuntimeIdentityOverlap)
+  ? operatorArtifactReaderObjectIds
+  : fail('operatorArtifactReaderObjectIds must not contain acceptance or evidence runtime identities')
+var validatedWorkloadReceiptWriterObjectIds = !empty(overlappingArtifactAccessObjectIds)
+  ? fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds must contain distinct principals')
+  : empty(workloadRuntimeIdentityOverlap)
+    ? workloadReceiptWriterObjectIds
+    : fail('workloadReceiptWriterObjectIds must not contain acceptance or evidence runtime identities')
 var operationalPhaseBundlePath = '/opt/athena/wc013-live/delivery/operational-phase-bundle.json'
 var operationalScratchDirectory = '/tmp/athena-operational'
 var baselineOperationalJobName = '${namePrefix}-op-baseline'
@@ -434,7 +451,7 @@ resource workloadReceiptBlobDataContributors 'Microsoft.Authorization/roleAssign
   ]
 }]
 
-resource operatorArtifactBlobDataReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds: {
+resource operatorArtifactBlobDataReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for operatorArtifactReaderObjectId in validatedOperatorArtifactReaderObjectIds: {
   name: guid(
     artifactContainer.id,
     operatorArtifactReaderObjectId,

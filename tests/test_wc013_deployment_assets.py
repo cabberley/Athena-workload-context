@@ -112,7 +112,11 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
 
     reader_rbac = _loop_role_assignment(resources, "operatorArtifactBlobDataReaders")
     assert "scope: artifactContainer" in reader_rbac
-    assert "for operatorArtifactReaderObjectId in operatorArtifactReaderObjectIds" in reader_rbac
+    assert (
+        "for operatorArtifactReaderObjectId in "
+        "validatedOperatorArtifactReaderObjectIds"
+        in reader_rbac
+    )
     assert "principalId: operatorArtifactReaderObjectId" in reader_rbac
     assert "storageBlobDataReaderRoleDefinitionId" in reader_rbac
     assert "storageBlobDataContributorRoleDefinitionId" not in reader_rbac
@@ -198,7 +202,7 @@ def test_wc013_bicep_rejects_shared_operator_reader_and_receipt_writer_principal
     )
     assert (
         "var validatedWorkloadReceiptWriterObjectIds = "
-        "empty(overlappingArtifactAccessObjectIds)"
+        "!empty(overlappingArtifactAccessObjectIds)"
         in resources
     )
     assert (
@@ -212,6 +216,57 @@ def test_wc013_bicep_rejects_shared_operator_reader_and_receipt_writer_principal
         "for workloadReceiptWriterObjectId in validatedWorkloadReceiptWriterObjectIds"
         in writer_rbac
     )
+
+
+def test_wc013_bicep_rejects_runtime_identities_in_operator_arrays() -> None:
+    resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
+
+    assert (
+        "var normalizedRuntimeIdentityPrincipalIds = [\n"
+        "  toLower(acceptanceIdentityPrincipalId)\n"
+        "  toLower(evidenceIdentityPrincipalId)\n"
+        "]"
+        in resources
+    )
+    assert (
+        "var operatorRuntimeIdentityOverlap = intersection(\n"
+        "  normalizedOperatorArtifactReaderObjectIds,\n"
+        "  normalizedRuntimeIdentityPrincipalIds\n"
+        ")"
+        in resources
+    )
+    assert (
+        "var workloadRuntimeIdentityOverlap = intersection(\n"
+        "  normalizedWorkloadReceiptWriterObjectIds,\n"
+        "  normalizedRuntimeIdentityPrincipalIds\n"
+        ")"
+        in resources
+    )
+    assert (
+        "var validatedOperatorArtifactReaderObjectIds = "
+        "empty(operatorRuntimeIdentityOverlap)"
+        in resources
+    )
+    assert (
+        "fail('operatorArtifactReaderObjectIds must not contain acceptance or "
+        "evidence runtime identities')"
+        in resources
+    )
+    assert (
+        "empty(workloadRuntimeIdentityOverlap)\n"
+        "    ? workloadReceiptWriterObjectIds\n"
+        "    : fail('workloadReceiptWriterObjectIds must not contain acceptance "
+        "or evidence runtime identities')"
+        in resources
+    )
+
+    reader_rbac = _loop_role_assignment(resources, "operatorArtifactBlobDataReaders")
+    writer_rbac = _loop_role_assignment(
+        resources,
+        "workloadReceiptBlobDataContributors",
+    )
+    assert "validatedOperatorArtifactReaderObjectIds" in reader_rbac
+    assert "validatedWorkloadReceiptWriterObjectIds" in writer_rbac
 
 
 def test_wc013_container_images_use_the_packaged_cli_and_only_reviewed_config_files() -> None:

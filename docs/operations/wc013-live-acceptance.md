@@ -210,9 +210,10 @@ built-in Blob role to `runs/<runId>/inputs/<phase>/`, so exact names, JSON-only 
 create-only `If-None-Match: *` semantics remain enforced by the controller contract and writer
 port. Because Blob Contributor also permits reads and lists, the reader and receipt-writer arrays
 must be disjoint. The resource module normalizes object-ID casing and fails deployment if a
-principal appears in both arrays. Those Bicep values are Entra object IDs for RBAC; the external
-operator configuration still uses the corresponding managed-identity client ID when it requests
-tokens. Shared keys, connection strings, secrets, and private key export are disabled or unused.
+principal appears in both arrays or if either array contains the acceptance or evidence runtime
+identity. Those Bicep values are Entra object IDs for RBAC; the external operator configuration
+still uses the corresponding managed-identity client ID when it requests tokens. Shared keys,
+connection strings, secrets, and private key export are disabled or unused.
 
 ### Required existing Entra resources
 
@@ -273,7 +274,7 @@ It contains only synthetic non-secret values, including distinct placeholder obj
 `collectorControllerPrincipalId`. The Reader array is for exact-version verification; the writer
 array is only for workload-controller receipt creation; the controller principal is only for
 collector Job read/start. Replace those placeholders independently and never reuse a principal
-across these roles.
+across these roles. The deployment rejects either runtime identity in the reader or writer array.
 Set the globally unique Key Vault and Storage account names, exact target demo resource-group scope,
 existing ACR server/resource ID, existing Entra app IDs/audiences, and the runner image digest. For
 the bootstrap deployment, leave the two `wc007PinnedAuthorityDigest` and

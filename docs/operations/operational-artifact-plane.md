@@ -90,8 +90,8 @@ The WC-013 entrypoint adds:
 |---|---|---|
 | `artifactContainerName` | input | The single immutable artifact container. |
 | `artifactRetentionDays` | input | Explicit unlocked WORM retention period. |
-| `operatorArtifactReaderObjectIds` | input | Entra object IDs of the operator reader managed identities used for exact-version verification; disjoint from receipt writers. |
-| `workloadReceiptWriterObjectIds` | input | Entra object IDs of the trusted workload-controller managed identities that create exact run-scoped receipt Blobs; disjoint from operator readers. |
+| `operatorArtifactReaderObjectIds` | input | Entra object IDs of the operator reader managed identities used for exact-version verification; disjoint from receipt writers and both runtime identities. |
+| `workloadReceiptWriterObjectIds` | input | Entra object IDs of the trusted workload-controller managed identities that create exact run-scoped receipt Blobs; disjoint from operator readers and both runtime identities. |
 | `artifactBlobEndpoint` | output | Private-resolved normal Blob HTTPS endpoint. |
 | `artifactContainerName` | output | Exact container name. |
 | `artifactContainerResourceId` | output | Exact Azure RBAC scope. |

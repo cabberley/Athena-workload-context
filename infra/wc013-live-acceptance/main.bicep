@@ -80,11 +80,11 @@ param collectorArtifactContainerName string = 'collected-evidence'
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds.')
+@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds or match either runtime identity.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
-@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds.')
+@description('Object IDs of workload-controller managed identities that create exact run-scoped fault receipts. These principals must not appear in operatorArtifactReaderObjectIds or match either runtime identity.')
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
