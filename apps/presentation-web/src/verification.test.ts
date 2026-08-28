@@ -27,7 +27,7 @@ describe('detached RS256 lifecycle verification', () => {
       algorithm: 'RS256',
       keyId: 'synthetic-key://athena-argus-demo/rs256-v1',
       keyFingerprint:
-        'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
+        'sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a',
       verifiedPhases: 3,
     })
     expect(verified.phases.faulted.blastRadius).toBe('contained-web-tier')
@@ -71,7 +71,7 @@ describe('detached RS256 lifecycle verification', () => {
     const wrongPair = (await crypto.subtle.generateKey(
       {
         name: 'RSASSA-PKCS1-v1_5',
-        modulusLength: 3072,
+        modulusLength: 2048,
         publicExponent: new Uint8Array([1, 0, 1]),
         hash: 'SHA-256',
       },

@@ -26,6 +26,9 @@ payloads and attestations.
 
 The public key asset contains an RS256 verification-only JWK, its synthetic key ID, and a SHA-256
 fingerprint over DER SPKI bytes. The same key ID and fingerprint are pinned in application code.
+All browser assets are reproduced by a repository generator that validates the reviewed source
+payloads, uses the existing deterministic presentation proof key and signer path, writes exact
+LF-terminated UTF-8 bytes, and derives runtime-manifest hashes only from those bytes.
 
 Startup fetches and verifies the complete asset set before rendering lifecycle data. Verification
 enforces:
@@ -53,6 +56,9 @@ authority.
 - Static hosting must preserve reviewed JSON bytes and serve them from the application origin.
 - Replacing an asset requires review of its exact file digest; replacing the key also requires an
   application change to the pinned SPKI fingerprint.
+- Scoped `.gitattributes` rules force source and generated presentation JSON to LF on every
+  checkout, while generator drift tests compare Git clean-filter blob hashes rather than trusting
+  platform-specific working-tree line endings.
 - Runtime-manifest compromise cannot substitute an attacker key because the trust anchor remains
   compiled into the application.
 - The included fixtures remain clearly synthetic presentation artifacts, not authoritative Azure

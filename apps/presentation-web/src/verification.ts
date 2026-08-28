@@ -20,7 +20,7 @@ import {
 export const PINNED_PRESENTATION_KEY_ID =
   'synthetic-key://athena-argus-demo/rs256-v1'
 export const PINNED_PRESENTATION_KEY_FINGERPRINT =
-  'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515'
+  'sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a'
 
 export interface UnverifiedPhaseAssets {
   payload: unknown

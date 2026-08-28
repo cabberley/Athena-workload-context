@@ -1,45 +1,45 @@
 {
-  "argus": {
-    "predictedIssue": "No synthetic web-node fault detected",
-    "recommendedAction": "Observe the synthetic baseline and confirm both redundant nodes are represented as healthy.",
-    "riskLevel": "normal"
+  "schemaVersion": "athena.argus.presentation.v1",
+  "scenarioId": "athena-web-node-fault.v1",
+  "phase": "baseline",
+  "workload": {
+    "name": "Synthetic Athena web workload",
+    "manifestId": "synthetic-manifest-7431bd762cf16b9416a9ebe4035704b88cbd238180d11419573318ae2dcb7627",
+    "manifestVersion": "1.0.0",
+    "profileId": "synthetic-profile-3953551bd11d268fc4e5414e03e71fdaaa9face11392458a148090e36d65c528",
+    "resourceGroup": "synthetic-rg-36c4a74ac567d0bba5e5e4d9e940d5f685bfad399f3fc045d69d8a58eca8a0bf"
   },
   "athena": {
+    "snapshotId": "synthetic-snapshot-a09cc3e88d8a82ce2e47d0f078003b787b0b88e1c7c7866f57e0689c6629b266",
     "artifactDigest": "sha256:90a437b7ca587253c69751c25bf96b8fb1a04d1da8ed6586939d49046d59f4d1",
-    "keyVaultKeyId": "synthetic-key://athena-argus-demo/rs256-v1",
-    "resultDigest": "sha256:94b568f74325d2022afea4f8e6caf8ea5ed2bea4cf8256ec88ed1a50ec6f2b74",
     "semanticDigest": "sha256:90a437b7ca587253c69751c25bf96b8fb1a04d1da8ed6586939d49046d59f4d1",
+    "resultDigest": "sha256:94b568f74325d2022afea4f8e6caf8ea5ed2bea4cf8256ec88ed1a50ec6f2b74",
     "signatureAlgorithm": "RS256",
-    "snapshotId": "synthetic-snapshot-a09cc3e88d8a82ce2e47d0f078003b787b0b88e1c7c7866f57e0689c6629b266"
+    "keyVaultKeyId": "synthetic-key://athena-argus-demo/rs256-v1"
+  },
+  "runtimeState": {
+    "webTier": {
+      "expectedNodes": 3,
+      "runningNodes": 3,
+      "faultedNodes": 0,
+      "serviceState": "healthy"
+    }
   },
   "findings": [
     {
       "clauseId": "synthetic-clause-184b4b19dc6d65e5a5b3537c2eae5e1f4898884104d31eedd501953191fa2bfb",
+      "verdict": "pass",
+      "summary": "Both synthetic web nodes are represented as running.",
       "evidenceRefs": [
         "synthetic-evidence-2a165b7bd1f8393c95bf74956654f4446f39db6357a5329d1ea1a856e4f45cee",
         "synthetic-evidence-2af7cbc5b2a20eedadc956640908da51d631649b5279e2ebac9608b6c61fe4df",
         "synthetic-evidence-5eb0810ea7d8d1a46a272f8898cdd1654ed6f75a5bcc4853035ea9ea25710213"
-      ],
-      "summary": "Both synthetic web nodes are represented as running.",
-      "verdict": "pass"
+      ]
     }
   ],
-  "phase": "baseline",
-  "runtimeState": {
-    "webTier": {
-      "expectedNodes": 3,
-      "faultedNodes": 0,
-      "runningNodes": 3,
-      "serviceState": "healthy"
-    }
-  },
-  "scenarioId": "athena-web-node-fault.v1",
-  "schemaVersion": "athena.argus.presentation.v1",
-  "workload": {
-    "manifestId": "synthetic-manifest-7431bd762cf16b9416a9ebe4035704b88cbd238180d11419573318ae2dcb7627",
-    "manifestVersion": "1.0.0",
-    "name": "Synthetic Athena web workload",
-    "profileId": "synthetic-profile-3953551bd11d268fc4e5414e03e71fdaaa9face11392458a148090e36d65c528",
-    "resourceGroup": "synthetic-rg-36c4a74ac567d0bba5e5e4d9e940d5f685bfad399f3fc045d69d8a58eca8a0bf"
+  "argus": {
+    "riskLevel": "normal",
+    "predictedIssue": "No synthetic web-node fault detected",
+    "recommendedAction": "Observe the synthetic baseline and confirm both redundant nodes are represented as healthy."
   }
 }
