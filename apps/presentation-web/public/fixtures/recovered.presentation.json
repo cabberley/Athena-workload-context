@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "athena.argus.presentation.v1",
+  "scenarioId": "athena-web-node-fault.v1",
+  "phase": "recovered",
+  "workload": {
+    "name": "Synthetic Athena web workload",
+    "manifestId": "synthetic-manifest-7431bd762cf16b9416a9ebe4035704b88cbd238180d11419573318ae2dcb7627",
+    "manifestVersion": "1.0.0",
+    "profileId": "synthetic-profile-3953551bd11d268fc4e5414e03e71fdaaa9face11392458a148090e36d65c528",
+    "resourceGroup": "synthetic-rg-36c4a74ac567d0bba5e5e4d9e940d5f685bfad399f3fc045d69d8a58eca8a0bf"
+  },
+  "faultRun": {
+    "faultRunId": "synthetic-fault-run-7d8758df51b41841ddbaacb6095cf0e8495b039c003b658ffe89f9ed32f16901",
+    "targetVmName": "synthetic-vm-a32894d61661f1adf7892f9cd4cb69143dc805f2c15ad77ff7f14ab157bf7237",
+    "afterPowerState": "running"
+  },
+  "athena": {
+    "snapshotId": "synthetic-snapshot-c997f2e168701d8d8e0b52b3e78b221a793f64a6038c37cadc4ec31b14e87c83",
+    "artifactDigest": "sha256:fcdeaf95a2aabc3d9ecc940d1511e78418fe1a4c26c705d39383cac099b25edf",
+    "semanticDigest": "sha256:fcdeaf95a2aabc3d9ecc940d1511e78418fe1a4c26c705d39383cac099b25edf",
+    "resultDigest": "sha256:d77d2850408027d0f69c87991c834ba3be0740cf1978df86e3d855cf208051fe",
+    "signatureAlgorithm": "RS256",
+    "keyVaultKeyId": "synthetic-key://athena-argus-demo/rs256-v1"
+  },
+  "runtimeState": {
+    "webTier": {
+      "expectedNodes": 3,
+      "runningNodes": 3,
+      "faultedNodes": 0,
+      "serviceState": "recovered"
+    }
+  },
+  "findings": [
+    {
+      "clauseId": "synthetic-clause-184b4b19dc6d65e5a5b3537c2eae5e1f4898884104d31eedd501953191fa2bfb",
+      "verdict": "resolved",
+      "summary": "The affected synthetic web node is represented as running after recovery.",
+      "evidenceRefs": [
+        "synthetic-evidence-2777dd1ee6b86a940be5e472e35aae8ece11b2f8ebf742d0ce127169999b6044",
+        "synthetic-evidence-4275ba7a4ee9a33ae5be8fc928a79460fcaab760c45a9c0c09d93a7fc736a8d1",
+        "synthetic-evidence-594fedb537b945be225ebf990963903b04f1fa6fba17de88c5b61f53a062402a",
+        "synthetic-evidence-796b478b7ebb847414188950ba2112225827d52946d5c4dd595c2cbb6728928e"
+      ]
+    }
+  ],
+  "argus": {
+    "riskLevel": "normal",
+    "predictedIssue": "Synthetic web-tier redundancy restored",
+    "recommendedAction": "Confirm the synthetic node and redundancy indicators are healthy, then close the demo finding."
+  }
+}

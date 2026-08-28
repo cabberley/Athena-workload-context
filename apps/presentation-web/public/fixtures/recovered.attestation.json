@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "athena.argus.presentationAttestation.v1",
+  "resultDigest": "sha256:d77d2850408027d0f69c87991c834ba3be0740cf1978df86e3d855cf208051fe",
+  "signatureAlgorithm": "RS256",
+  "keyVaultKeyId": "synthetic-key://athena-argus-demo/rs256-v1",
+  "detachedSignature": "oH5l-wywgeBHYcPXulD2OZXkbojAxUzVfalcc5ISNW_h7LtWZXiLRvupd4KN5ifXOq1qVEItklji-7zAO6cYsdk67MEL93eCMU4UrN1CdGpsE1cgI0KCnxI66NqkZOnlL5vRRe7TvWw7uLWbZsOwm0BF02SEW9A6f85Fd5hycH6VxUWfmDvfcnlOSY2J9tG6lIdTlttGTajTQQOMBsv3U83Z0UCGk3RJqu60gNrVf0wSVQCtryvJ6Cmc7sTQizqzBVxN2nNp_mhO3IFSqhQOoBFFhQKdBVz6PcKhFv2FtqqLduN9jRQ75PLmIw1oBojzrR8NalxZj2ceOPlLZgGmWw"
+}

@@ -75,6 +75,7 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 | Context MCP | Agent-safe access to published context and proposed changes |
 | Agent core | Grounded explanations using policy results and cited evidence |
 | Context Studio | Workload configuration, cohort approval, topology, findings, Copilot |
+| Standalone presentation web | Same-origin, fail-closed verification and display of frozen synthetic lifecycle payloads; no Azure or storage access |
 | Event processor | Normalizes Azure resource, health, monitoring, and change events |
 | Forecast worker | Evaluates trends and time-to-limit against workload objectives |
 
@@ -93,6 +94,7 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 11. Operational artifacts use version-pinned immutable Blob references, create-only conditional writes, and exact-version hash-verifying reads.
 12. Operational phase execution uses reviewed bundle paths, phase-fixed Jobs, bounded exact-reference inputs, and governed handoff files.
 13. The workload-owned controller, not Athena phase Jobs, creates exact run-scoped receipt Blobs with create-only semantics enforced in application code; Azure RBAC stays container-scoped because Blob roles cannot be narrowed to a prefix.
+14. The standalone presentation browser renders no lifecycle data until all reviewed static payloads, detached attestations, content digests, lifecycle bindings, and the pinned RSA public-key fingerprint verify locally.
 
 ## Relationship classes
 

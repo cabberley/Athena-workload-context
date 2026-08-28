@@ -1,6 +1,7 @@
 ---
 applyTo:
   - "apps/web/**"
+  - "apps/presentation-web/**"
 ---
 
 # Web rules

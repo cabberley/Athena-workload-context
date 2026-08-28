@@ -11,6 +11,8 @@ Push-Location $repoRoot
 try {
     & $python scripts\validate_repository.py
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $python scripts\generate_presentation_web_assets.py --check
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m ruff check .
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $python -m mypy src
