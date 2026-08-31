@@ -58,7 +58,11 @@ CLI, and Docker are plumbing only: no controller code or Python dependencies run
    `athena.wc013CollectorStartContract.v1` object from the captured output. The contracts object
    contains no `acceptance` entry. Each digest is SHA-256 over UTF-8 JSON serialized with sorted
    keys, no insignificant whitespace, and separators `,` and `:`.
-4. Review all metadata, controller RepoDigest, all three contracts and their canonical digests, and
+4. Review all metadata, controller RepoDigest, all three contracts and their canonical digests.
+   Each phase must use its exact `-op-<phase>-collector` Job suffix,
+   `wc013-<phase>-evidence-collector` container, fixed
+   `/opt/athena/wc013-live/delivery/configs/<phase>.json` path, and the deployment ACR
+   `athena/wc013-live@sha256:<64-lowercase-hex>` image. Also review
    the SHA-256 of the complete artifact bytes. `.gitattributes` disables text conversion for these
    JSON files, so checkout cannot change reviewed bytes. Verify the deployed Job templates,
    identities, and controller-image deployment output still match.
@@ -76,8 +80,10 @@ CLI, and Docker are plumbing only: no controller code or Python dependencies run
 After environment approval, the workflow remains on `${{ github.sha }}` even if `main` changes. It:
 
 1. validates the index and full artifact hash with fixed hosted-runner plumbing;
-2. extracts only the allowlisted phase, writes canonical bytes with mode `0444`, and verifies its
-   artifact-pinned digest;
+2. extracts only the allowlisted phase, writes canonical bytes with mode `0444`, verifies its
+   artifact-pinned digest, then independently checks the exact phase-specific Job suffix, collector
+   name, fixed configuration path, and acceptance ACR `athena/wc013-live` RepoDigest before any
+   Docker launch;
 3. logs in with GitHub OIDC, exchanges a piped ARM token directly at the fixed ACR OAuth
    endpoint for a pull token, pulls the artifact-pinned controller image, deletes Docker
    authentication state, and requires the local RepoDigest to equal the
@@ -101,8 +107,10 @@ The controller identity receives only:
 - `AcrPull` on the existing controller-image registry.
 
 It receives neither `Microsoft.Resources/deployments/read` nor a built-in Reader role. The
-controller's Job GET validates the current deployed identity and complete template against the
-selected reviewed contract before posting that exact template as the start body.
+controller's contract model independently requires a lowercase Azure Container Registry login
+server and the exact matching `athena/wc013-live@sha256:<64-lowercase-hex>` image. Its Job GET then
+validates the current deployed identity and complete template against the selected reviewed
+contract before posting that exact template as the start body.
 
 The remaining unavoidable boundary is the GitHub-hosted `ubuntu-24.04` runner and its preinstalled
 Azure CLI, `curl`, `jq`, SHA-256, Docker client, and Docker daemon. Exact checkout/action/image/contract

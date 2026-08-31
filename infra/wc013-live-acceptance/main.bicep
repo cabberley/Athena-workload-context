@@ -153,13 +153,36 @@ var resourceTags = union(tags, {
   dataBoundary: 'customer'
   managedBy: 'bicep'
 })
-var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
-  ? acceptanceImage
-  : fail('acceptanceImage must be pinned by a sha256 manifest digest')
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
+var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
+  ? acceptanceImageRegistryServer
+  : fail('acceptanceImageRegistryServer must exactly match the supplied Azure Container Registry resource ID')
+var acceptanceImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc013-live@sha256:'
+var acceptanceImageDigestCandidate = replace(acceptanceImage, acceptanceImageRepositoryPrefix, '')
+var acceptanceImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var acceptanceImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedAcceptanceImage = acceptanceImage == toLower(acceptanceImage) && startsWith(
+  acceptanceImage,
+  acceptanceImageRepositoryPrefix
+) && length(acceptanceImage) == length(acceptanceImageRepositoryPrefix) + 64 && length(
+  acceptanceImageDigestCandidate
+) == 64 && empty(
+  acceptanceImageDigestInvalidCharacters
+) && !endsWith(acceptanceImage, rejectedImageDigestSuffix)
+  ? acceptanceImage
+  : fail('acceptanceImage must use the exact acceptanceImageRegistryServer/athena/wc013-live repository and a real 64-character lowercase sha256 digest')
 var validatedControllerImage = contains(collectorControllerImage, '@sha256:') && startsWith(
   toLower(collectorControllerImage),
-  '${toLower(acceptanceImageRegistryServer)}/athena/wc013-controller@sha256:'
+  '${validatedAcceptanceImageRegistryServer}/athena/wc013-controller@sha256:'
 ) && !endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)
   ? collectorControllerImage
   : fail('collectorControllerImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
@@ -333,7 +356,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
-    acceptanceImageRegistryServer: acceptanceImageRegistryServer
+    acceptanceImageRegistryServer: validatedAcceptanceImageRegistryServer
     tags: resourceTags
   }
 }

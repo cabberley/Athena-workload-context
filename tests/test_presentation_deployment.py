@@ -246,6 +246,44 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert workflow.index("Select one byte-pinned reviewed contract") < workflow.index(
         "Sign in as the deployment-owned controller identity"
     )
+    phase_binding_index = workflow.index('case "$PHASE" in')
+    assert phase_binding_index < workflow.index(
+        "Sign in as the deployment-owned controller identity"
+    )
+    assert phase_binding_index < workflow.index('docker pull "$CONTROLLER_IMAGE"')
+    assert phase_binding_index < workflow.index(
+        "Validate and start through the immutable controller image"
+    )
+    for phase in ("baseline", "faulted", "recovered"):
+        assert f"expected_job_suffix='-op-{phase}-collector'" in workflow
+        assert (
+            f"expected_container_name='wc013-{phase}-evidence-collector'"
+            in workflow
+        )
+        assert (
+            "expected_config_path="
+            f"'/opt/athena/wc013-live/delivery/configs/{phase}.json'"
+            in workflow
+        )
+    for exact_semantic_check in (
+        'endswith($job_suffix)',
+        '.template.containers[0].name == $container_name',
+        '.template.containers[0].args[0] == "wc013-evidence-collector-job"',
+        '.template.containers[0].args[1] == "--config"',
+        '.template.containers[0].args[2] == $config_path',
+        '"$collector_registry_server" != "$ACR_SERVER"',
+        '"$ACR_SERVER/athena/wc013-live@sha256:$collector_image_digest"',
+    ):
+        assert exact_semantic_check in workflow
+    assert (
+        "Selected collector contract does not match the requested phase semantics."
+        in workflow
+    )
+    assert (
+        "Selected collector contract image is not the exact reviewed acceptance "
+        "ACR repository digest."
+        in workflow
+    )
     assert workflow.index("Pull and verify the exact reviewed controller image") < (
         workflow.index("Validate and start through the immutable controller image")
     )

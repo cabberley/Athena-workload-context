@@ -157,6 +157,39 @@ def _contract() -> Wc013CollectorStartContract:
     )
 
 
+@pytest.mark.parametrize(
+    ("registry_server", "image"),
+    [
+        (
+            "mcr.microsoft.com",
+            "mcr.microsoft.com/athena/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "athenafixture.azurecr.io/other/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "otherfixture.azurecr.io/athena/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "athenafixture.azurecr.io/athena/wc013-live@sha256:" + "0" * 64,
+        ),
+    ],
+)
+def test_collector_contract_rejects_non_exact_acceptance_acr_image(
+    registry_server: str,
+    image: str,
+) -> None:
+    payload = _contract_payload()
+    payload["configuration"]["registries"][0]["server"] = registry_server  # type: ignore[index]
+    payload["template"]["containers"][0]["image"] = image  # type: ignore[index]
+
+    with pytest.raises(ValueError):
+        Wc013CollectorStartContract.model_validate(payload)
+
+
 def test_governed_collector_start_validates_then_pins_exact_template(
     tmp_path: Path,
 ) -> None:

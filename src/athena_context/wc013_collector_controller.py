@@ -115,7 +115,7 @@ class Wc013CollectorControllerError(RuntimeError):
 
 
 class _CollectorRegistry(AthenaBaseModel):
-    server: str = Field(pattern=r"^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$")
+    server: str = Field(pattern=r"^[a-z0-9]{5,50}\.azurecr\.io$")
     identity: str = Field(pattern=_IDENTITY_RESOURCE_ID_PATTERN)
 
 
@@ -183,7 +183,7 @@ class _CollectorContainerResources(AthenaBaseModel):
 class _CollectorContainer(AthenaBaseModel):
     name: str = Field(pattern=r"^wc013-[a-z0-9-]+-evidence-collector$")
     image: str = Field(
-        pattern=r"^[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9._/-]+"
+        pattern=r"^[a-z0-9]{5,50}\.azurecr\.io/athena/wc013-live"
         r"@sha256:[a-f0-9]{64}$"
     )
     command: tuple[str, ...] = Field(min_length=1, max_length=1)
@@ -307,6 +307,16 @@ class Wc013CollectorStartContract(AthenaBaseModel):
         registry = self.configuration.registries[0]
         if registry.identity.casefold() != self.evidence_identity_resource_id.casefold():
             raise ValueError("collector registry identity must be the evidence identity")
+        collector_image = self.template.containers[0].image
+        expected_image_prefix = f"{registry.server}/athena/wc013-live@sha256:"
+        if (
+            not collector_image.startswith(expected_image_prefix)
+            or collector_image == expected_image_prefix + "0" * 64
+        ):
+            raise ValueError(
+                "collector image must use the exact acceptance ACR repository and "
+                "a non-placeholder digest"
+            )
         environment = self.template.containers[0].env
         values = {item.name: item.value for item in environment}
         expected = {

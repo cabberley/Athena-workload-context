@@ -256,8 +256,10 @@ the reviewed `wc013-live/` tree and the public PEM into the fixed paths used by 
 operational demonstration, that same `wc013-live/` tree must also contain the reviewed phase bundle
 at `wc013-live/delivery/operational-phase-bundle.json`.
 
-Build and push a digest-pinned runner image first. Use it as the bootstrap `acceptanceImage`; the
-Job is manual and must not be started at this stage.
+Build and push a digest-pinned runner image first. This intermediate image is build input only:
+it is not a valid `acceptanceImage` and must never be placed in the deployment parameters. The
+existing reviewed `athena/wc013-live` RepoDigest remains in place until the new delivery image is
+complete, and no Job is started at this stage.
 
 ```powershell
 docker build --file Dockerfile --tag <registry>/athena/wc013-runner:<reviewed-tag> .
@@ -308,7 +310,10 @@ Replace `.azure/wc013.parameters.json` `presentationImage` with
 an all-zero digest that both root and presentation-module Bicep reject with `fail()`. ARM
 validation, what-if, and deployment therefore fail closed until the real digest is supplied.
 Keep the current `acceptanceImage` value until the runner and delivery build step intentionally
-replaces it.
+replaces it. Root and resource-module Bicep accept only the exact lowercase
+`<acceptanceImageRegistryServer>/athena/wc013-live@sha256:<64-lowercase-hex>` form, reject the
+all-zero digest, and bind the login server to the supplied ACR resource ID. MCR, another ACR, a
+different repository, a tag, uppercase digest text, or extra suffix fails closed.
 
 Build the Bicep templates before a what-if or deployment:
 
@@ -381,6 +386,10 @@ docker build `
 docker push <registry>/athena/wc013-live:<reviewed-tag>
 ```
 
+Resolve the pushed manifest digest and set `acceptanceImage` only to
+`<acceptanceImageRegistryServer>/athena/wc013-live@sha256:<64-lowercase-hex>`. Both Bicep layers and
+the reviewed collector contract reject any other registry/repository shape and the all-zero digest.
+
 The staging directory must contain `wc013-live/` (including the reviewed `delivery/` subtree)
 and `wc013-signing-public-key.pem` only as reviewed non-secret delivery artifacts. Do not add
 authority data, PEM files, or any runtime files to Bicep parameters, outputs, Container Apps
@@ -444,9 +453,14 @@ only choice until review is complete.
 
 The workflow grants only `contents: read` and `id-token: write`, pins action revisions, runs on the
 specific available `ubuntu-24.04` label, checks out `${{ github.sha }}`, and verifies `HEAD`. It uses
-host `jq` and SHA-256 only to validate the immutable artifact and extract one allowlisted phase. It
-does not install or execute repository Python on the hosted runner. After OIDC login it exchanges a short-lived ARM token directly with the fixed ACR OAuth endpoint for a
-pull token, pulls the artifact-pinned image, deletes Docker auth state, and verifies the
+host `jq` and SHA-256 only to validate the immutable artifact and extract one allowlisted phase.
+Before Azure login or any Docker launch, a closed `case` mapping and `jq` check require that phase's
+exact Job resource-ID suffix, collector container name, and fixed configuration path. The same
+pre-launch check requires the selected collector image to be the non-placeholder
+`athena/wc013-live` RepoDigest in the fixed ACR, so swapping artifact phase slots cannot select a
+different Job or image. It does not install or execute repository Python on the hosted runner.
+After OIDC login it exchanges a short-lived ARM token directly with the fixed ACR OAuth endpoint
+for a pull token, pulls the artifact-pinned image, deletes Docker auth state, and verifies the
 pulled RepoDigest exactly. It mounts only the selected mode-`0444` contract read-only into an
 unprivileged, read-only, capability-free container with the image's fixed controller entrypoint.
 

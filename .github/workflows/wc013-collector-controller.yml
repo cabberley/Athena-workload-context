@@ -136,6 +136,62 @@ jobs:
             echo 'Selected collector contract bytes do not match the reviewed digest.' >&2
             exit 1
           fi
+
+          case "$PHASE" in
+            baseline)
+              expected_job_suffix='-op-baseline-collector'
+              expected_container_name='wc013-baseline-evidence-collector'
+              expected_config_path='/opt/athena/wc013-live/delivery/configs/baseline.json'
+              ;;
+            faulted)
+              expected_job_suffix='-op-faulted-collector'
+              expected_container_name='wc013-faulted-evidence-collector'
+              expected_config_path='/opt/athena/wc013-live/delivery/configs/faulted.json'
+              ;;
+            recovered)
+              expected_job_suffix='-op-recovered-collector'
+              expected_container_name='wc013-recovered-evidence-collector'
+              expected_config_path='/opt/athena/wc013-live/delivery/configs/recovered.json'
+              ;;
+            *)
+              echo 'Requested collector phase is not allowlisted.' >&2
+              exit 1
+              ;;
+          esac
+          if ! jq -e \
+            --arg job_suffix "$expected_job_suffix" \
+            --arg container_name "$expected_container_name" \
+            --arg config_path "$expected_config_path" '
+              (.jobResourceId | type == "string" and endswith($job_suffix))
+              and (.template.containers | type == "array" and length == 1)
+              and (.template.containers[0].name == $container_name)
+              and (.template.containers[0].args | type == "array" and length == 8)
+              and (.template.containers[0].args[0] == "wc013-evidence-collector-job")
+              and (.template.containers[0].args[1] == "--config")
+              and (.template.containers[0].args[2] == $config_path)
+            ' "$CONTRACT_PATH" >/dev/null; then
+            echo 'Selected collector contract does not match the requested phase semantics.' >&2
+            exit 1
+          fi
+
+          collector_registry_server="$(jq -er '
+            .configuration.registries
+            | select(type == "array" and length == 1)
+            | .[0].server
+          ' "$CONTRACT_PATH")"
+          collector_image="$(jq -er '
+            .template.containers
+            | select(type == "array" and length == 1)
+            | .[0].image
+          ' "$CONTRACT_PATH")"
+          collector_image_digest="${collector_image##*@sha256:}"
+          if [[ "$collector_registry_server" != "$ACR_SERVER" ]] ||
+             [[ "$collector_image" != "$ACR_SERVER/athena/wc013-live@sha256:$collector_image_digest" ]] ||
+             [[ ! "$collector_image_digest" =~ ^[a-f0-9]{64}$ ]] ||
+             [[ "$collector_image_digest" == "$(printf '0%.0s' {1..64})" ]]; then
+            echo 'Selected collector contract image is not the exact reviewed acceptance ACR repository digest.' >&2
+            exit 1
+          fi
           echo "CONTROLLER_IMAGE=$controller_image" >>"$GITHUB_ENV"
 
       - name: Sign in as the deployment-owned controller identity

@@ -96,9 +96,11 @@ signing, and a private static presentation container.
 - A GitHub OIDC federated credential binds that controller identity to the protected
   `cabberley/Athena-workload-context` deployment environment so collector starts execute reviewed
   controller code without a client secret. The workflow checks out the immutable dispatch SHA,
-  selects a byte-pinned deployment contract, pulls its exact reviewed controller RepoDigest, and
-  executes only that image with a one-shot ARM token piped through stdin. No repository Python or
-  dependencies execute on the host, and the workflow never reads mutable deployment outputs.
+  selects a byte-pinned deployment contract, independently verifies that the requested phase maps
+  to its exact Job suffix, collector name, fixed configuration path, and acceptance ACR repository,
+  then pulls its exact reviewed controller RepoDigest and executes only that image with a one-shot
+  ARM token piped through stdin. No repository Python or dependencies execute on the host, and
+  the workflow never reads mutable deployment outputs.
 - A new presentation identity receives only `AcrPull`; the presentation container receives no
   Blob, Key Vault, MCP, workload, or ARM role.
 - The presentation browser makes same-origin requests only and validates content hashes,
@@ -119,7 +121,8 @@ signing, and a private static presentation container.
 
 1. Add presentation container packaging, Bicep resources, controller identity federation, and
    deployment parameter updates.
-2. Build the runner, controller, and presentation images in ACR and replace both rejected
+2. Build the runner, controller, and presentation images in ACR; publish the final delivery
+   image only as `athena/wc013-live@sha256:<64 lowercase hex>`, and replace both rejected
    controller/presentation placeholders before any ARM validation or what-if.
 3. Run Bicep build/lint, repository tests, application tests, policy checks, ARM validation, and
    full what-if. Placeholder parameters must fail closed.
@@ -181,6 +184,9 @@ signing, and a private static presentation container.
 - [x] Replace host Python with verified ACR image execution and one-shot stdin ARM token
 - [x] Grant the OIDC controller identity only registry-scoped `AcrPull` in addition to Job actions
 - [x] Hard-reject all-zero controller and presentation image digests in Bicep
+- [x] Restrict the acceptance image to the supplied ACR and exact `athena/wc013-live` RepoDigest
+- [x] Bind every workflow phase to its exact Job suffix, collector name, and configuration path
+  before Docker launch
 - [x] Correct operator reader, workload receipt writer, and controller parameters
 - [x] Add/update deterministic deployment tests and documentation
 - [x] Run local preparation tests, audits, container checks, Bicep build/lint, validator, and diff check

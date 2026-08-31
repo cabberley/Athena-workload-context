@@ -17,6 +17,23 @@ _MAX_ARTIFACT_BYTES = 512 * 1024
 _MAX_INDEX_BYTES = 128 * 1024
 _MAX_REVIEWED_DEPLOYMENTS = 16
 _PHASES = ("baseline", "faulted", "recovered")
+_PHASE_BINDINGS = {
+    "baseline": (
+        "-op-baseline-collector",
+        "wc013-baseline-evidence-collector",
+        "/opt/athena/wc013-live/delivery/configs/baseline.json",
+    ),
+    "faulted": (
+        "-op-faulted-collector",
+        "wc013-faulted-evidence-collector",
+        "/opt/athena/wc013-live/delivery/configs/faulted.json",
+    ),
+    "recovered": (
+        "-op-recovered-collector",
+        "wc013-recovered-evidence-collector",
+        "/opt/athena/wc013-live/delivery/configs/recovered.json",
+    ),
+}
 _SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 _COMMIT_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 _GUID_PATTERN = re.compile(
@@ -229,10 +246,21 @@ def select_reviewed_collector_contract(
             raise ReviewedCollectorContractError(
                 f"reviewed {contract_phase} collector contract failed validation"
             ) from exc
-        expected_suffix = f"-op-{contract_phase}-collector"
+        expected_suffix, expected_container_name, expected_config_path = (
+            _PHASE_BINDINGS[contract_phase]
+        )
         if not contract.job_resource_id.casefold().endswith(expected_suffix):
             raise ReviewedCollectorContractError(
                 f"reviewed {contract_phase} collector contract targets the wrong job"
+            )
+        collector_container = contract.template.containers[0]
+        if (
+            collector_container.name != expected_container_name
+            or collector_container.args[2] != expected_config_path
+        ):
+            raise ReviewedCollectorContractError(
+                f"reviewed {contract_phase} collector contract has the wrong fixed "
+                "phase semantics"
             )
         job_subscription = contract.job_resource_id.split("/", 3)[2].casefold()
         if job_subscription != deployment_subscription:

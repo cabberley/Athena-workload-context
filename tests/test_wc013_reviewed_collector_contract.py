@@ -301,6 +301,49 @@ def test_rejects_artifact_byte_drift_and_unselected_contract_drift(
         _select(artifact_path, changed_digest, phase="baseline")
 
 
+@pytest.mark.parametrize(
+    ("requested_phase", "swapped_phase"),
+    [
+        ("baseline", "faulted"),
+        ("faulted", "recovered"),
+        ("recovered", "baseline"),
+    ],
+)
+def test_rejects_contract_swapped_into_another_phase_slot(
+    tmp_path: Path,
+    requested_phase: str,
+    swapped_phase: str,
+) -> None:
+    artifact_path = tmp_path / "reviewed.json"
+    contracts = {
+        phase: _contract(phase) for phase in ("baseline", "faulted", "recovered")
+    }
+    contracts[requested_phase] = deepcopy(contracts[swapped_phase])
+    _, digest = _write_artifact(artifact_path, contracts=contracts)
+
+    with pytest.raises(ReviewedCollectorContractError, match="targets the wrong job"):
+        _select(artifact_path, digest, phase=requested_phase)
+
+
+def test_rejects_relabelled_swapped_contract_phase_semantics(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "reviewed.json"
+    contracts = {
+        phase: _contract(phase) for phase in ("baseline", "faulted", "recovered")
+    }
+    swapped = deepcopy(contracts["faulted"])
+    swapped["jobResourceId"] = contracts["baseline"]["jobResourceId"]  # type: ignore[index]
+    contracts["baseline"] = swapped
+    _, digest = _write_artifact(artifact_path, contracts=contracts)
+
+    with pytest.raises(
+        ReviewedCollectorContractError,
+        match="wrong fixed phase semantics",
+    ):
+        _select(artifact_path, digest, phase="baseline")
+
+
 def test_rejects_placeholder_or_cross_registry_controller_image(
     tmp_path: Path,
 ) -> None:
