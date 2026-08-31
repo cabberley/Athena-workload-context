@@ -237,15 +237,52 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert "--user 10001:10001" in workflow
     assert "--cap-drop ALL" in workflow
     assert "--security-opt no-new-privileges" in workflow
-    assert workflow.count("--mount ") == 1
+    assert workflow.count("--mount ") == 2
+    assert "source=$GITHUB_WORKSPACE,target=/workspace,readonly" in workflow
     assert "target=/run/athena/collector-contract.json,readonly" in workflow
     assert "az account get-access-token" in workflow
     assert "| docker run --rm --interactive" in workflow
     assert "ARM_ACCESS_TOKEN" not in workflow
     assert "accessToken" not in workflow.split("env:", 1)[1].split("steps:", 1)[0]
-    assert workflow.index("Select one byte-pinned reviewed contract") < workflow.index(
+    selection_step_index = workflow.index(
+        "Select one byte-pinned reviewed contract"
+    )
+    login_step_index = workflow.index(
         "Sign in as the deployment-owned controller identity"
     )
+    strict_selector_index = workflow.index(
+        "scripts/strict_select_wc013_contract.py"
+    )
+    canonical_jq_index = workflow.index(
+        "jq -e --arg deployment", strict_selector_index
+    )
+    assert selection_step_index < strict_selector_index < canonical_jq_index
+    assert canonical_jq_index < login_step_index
+    assert (
+        "python:3.14.7-slim-bookworm@sha256:"
+        "416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63"
+        in workflow
+    )
+    assert (
+        "python@sha256:"
+        "416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63"
+        in workflow
+    )
+    assert "--network none" in workflow
+    assert "--user 65534:65534" in workflow
+    assert "{{.Config.User}}|{{json .Config.Entrypoint}}" in workflow
+    assert '"1|$VERIFIER_REPO_DIGEST||null"' in workflow
+    assert '"$VERIFIER_IMAGE"' in workflow
+    assert '"$STRICT_SELECTION_PATH"' in workflow
+    assert "athena.wc013StrictCollectorSelection.v1" in workflow
+    pre_verification = workflow[selection_step_index:strict_selector_index]
+    assert "jq -" not in pre_verification
+    assert "az account" not in workflow[selection_step_index:login_step_index]
+    assert 'docker pull "$CONTROLLER_IMAGE"' not in workflow[
+        selection_step_index:login_step_index
+    ]
+    assert 'jq -er ".controllerImage" "$artifact_path"' not in workflow
+    assert 'jq -jceS --arg phase "$PHASE"' not in workflow
     phase_binding_index = workflow.index('case "$PHASE" in')
     assert phase_binding_index < workflow.index(
         "Sign in as the deployment-owned controller identity"

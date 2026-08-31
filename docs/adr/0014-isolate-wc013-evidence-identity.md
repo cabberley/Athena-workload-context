@@ -42,14 +42,16 @@ federated credential. The trust is limited to issuer
 `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject
 `repo:cabberley/Athena-workload-context:environment:athena-live`. A manually dispatched workflow
 runs only from protected `main` in the protected `athena-live` environment on `ubuntu-24.04`,
-accepts only closed phase and immutable-deployment choices, and checks out the dispatch SHA. It
-selects a byte-pinned contract and controller ACR RepoDigest from that commit. Before Docker
-launch, it independently binds the requested phase to the exact collector Job suffix, container
-name, fixed configuration path, and `athena/wc013-live` ACR RepoDigest. It then pulls and verifies
-the controller image and executes its fixed entrypoint in a read-only unprivileged container.
-Repository Python is never installed on the host. A short-lived ARM token is piped to container stdin, consumed
-once, and never stored in an argument, environment variable, file, or mount. The identity receives
-only the Job actions and ACR `AcrPull`; it cannot read deployments and has no client secret, caller
+accepts only closed phase and immutable-deployment choices, and checks out the dispatch SHA. Before
+Azure login, a networkless, digest-pinned minimal Python verifier runs the immutable repository
+strict selector with no credentials and a read-only mount. It recursively rejects duplicate JSON
+keys and emits one canonical bounded selection. Only that output reaches `jq`, which independently
+binds the requested phase to the exact collector Job suffix, container name, fixed configuration
+path, and `athena/wc013-live` ACR RepoDigest. It then pulls and verifies the controller image and
+executes its fixed entrypoint in a read-only unprivileged container. Controller code is never
+installed on or executed through host Python. A short-lived ARM token is piped to container stdin,
+consumed once, and never stored in an argument, environment variable, file, or mount. The
+identity receives only the Job actions and ACR `AcrPull`; it cannot read deployments and has no client secret, caller
 path, command, or image/template override.
 
 Collector artifacts use a dedicated immutable Blob container. The evidence identity has
@@ -122,6 +124,7 @@ access is not supported.
   plan/transport-bound handoff loading, cross-endpoint relabel rejection, exact immutable Blob
   reads, artifact-capacity boundaries, tampered envelope rejection, and evidence-only collector
   credential selection, bounded stdin ARM token consumption/redaction, artifact-pinned controller
-  images, exact acceptance-image ACR/repository checks, swapped-phase rejection before Docker
-  launch, exact pulled RepoDigest checks, and fixed unprivileged container execution.
+  images, recursive duplicate-key rejection before Azure login/controller execution, exact
+  acceptance-image ACR/repository checks, swapped-phase rejection, exact pulled RepoDigest checks,
+  and fixed unprivileged container execution.
 - WC-013, operational phase, full pytest, Ruff, mypy, and Bicep build/lint validation must pass.

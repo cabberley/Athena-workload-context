@@ -6,6 +6,10 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from scripts.strict_select_wc013_contract import (
+    StrictWc013SelectionError,
+    select_strict_wc013_contract,
+)
 
 from athena_context.wc013_collector_controller import (
     load_wc013_collector_start_contract,
@@ -182,6 +186,132 @@ def _write_index(path: Path, artifact_digest: str) -> None:
         json.dumps(index, separators=(",", ":"), sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _strict_fixture_paths(tmp_path: Path) -> tuple[Path, Path]:
+    deployment = DEPLOYMENT_RESOURCE_ID.rsplit("/", 1)[-1]
+    artifact_path = tmp_path / f"{deployment}.json"
+    _, artifact_digest = _write_artifact(artifact_path)
+    index_path = tmp_path / "index.json"
+    _write_index(index_path, artifact_digest)
+    return index_path, artifact_path
+
+
+def _replace_once(payload: bytes, needle: bytes, replacement: bytes) -> bytes:
+    assert needle in payload
+    return payload.replace(needle, replacement, 1)
+
+
+def _run_strict_gate_with_execution_markers(
+    index_path: Path,
+    events: list[str],
+) -> bytes:
+    selection = select_strict_wc013_contract(
+        index_path,
+        deployment=DEPLOYMENT_RESOURCE_ID.rsplit("/", 1)[-1],
+        phase="baseline",
+    )
+    events.extend(("azure-login", "controller-image-pull", "controller-docker-run"))
+    return selection
+
+
+def test_strict_selector_emits_one_canonical_bounded_selection(tmp_path: Path) -> None:
+    index_path, _ = _strict_fixture_paths(tmp_path)
+
+    payload = select_strict_wc013_contract(
+        index_path,
+        deployment=DEPLOYMENT_RESOURCE_ID.rsplit("/", 1)[-1],
+        phase="faulted",
+    )
+    selection = json.loads(payload)
+
+    assert payload == json.dumps(
+        selection,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert selection["schemaVersion"] == "athena.wc013StrictCollectorSelection.v1"
+    assert selection["phase"] == "faulted"
+    assert selection["controllerImage"] == CONTROLLER_IMAGE
+    assert selection["contractDigest"] == _canonical_digest(selection["contract"])
+
+
+@pytest.mark.parametrize(
+    ("label", "needle", "replacement"),
+    [
+        (
+            "controller image",
+            f'"controllerImage":"{CONTROLLER_IMAGE}"'.encode(),
+            (
+                '"controllerImage":"duplicate",'
+                f'"controllerImage":"{CONTROLLER_IMAGE}"'
+            ).encode(),
+        ),
+        (
+            "digest map",
+            b'"collectorContractDigests":{"baseline":',
+            (
+                b'"collectorContractDigests":{"baseline":"sha256:'
+                + b"0" * 64
+                + b'","baseline":'
+            ),
+        ),
+        (
+            "contract slot",
+            b'"contracts":{"baseline":',
+            b'"contracts":{"baseline":{},"baseline":',
+        ),
+        (
+            "nested job",
+            b'"jobResourceId":',
+            b'"jobResourceId":"duplicate","jobResourceId":',
+        ),
+        (
+            "nested template",
+            b'"template":{"containers":',
+            b'"template":{"containers":[],"containers":',
+        ),
+        (
+            "nested environment",
+            b'"env":[{"name":"AZURE_CLIENT_ID"',
+            br'"env":[{"name":"duplicate","n\u0061me":"AZURE_CLIENT_ID"',
+        ),
+    ],
+)
+def test_duplicate_artifact_or_nested_contract_key_stops_before_execution(
+    tmp_path: Path,
+    label: str,
+    needle: bytes,
+    replacement: bytes,
+) -> None:
+    index_path, artifact_path = _strict_fixture_paths(tmp_path)
+    duplicate_payload = _replace_once(artifact_path.read_bytes(), needle, replacement)
+    artifact_path.write_bytes(duplicate_payload)
+    _write_index(index_path, _digest(duplicate_payload))
+    events: list[str] = []
+
+    with pytest.raises(StrictWc013SelectionError, match="duplicate object key"):
+        _run_strict_gate_with_execution_markers(index_path, events)
+
+    assert events == [], f"{label} duplicate crossed the pre-login execution gate"
+
+
+def test_duplicate_index_key_stops_before_execution(tmp_path: Path) -> None:
+    index_path, _ = _strict_fixture_paths(tmp_path)
+    duplicate_index = _replace_once(
+        index_path.read_bytes(),
+        b'"artifactDigest":',
+        b'"artifactDigest":"sha256:' + b"0" * 64 + b'","artifactDigest":',
+    )
+    index_path.write_bytes(duplicate_index)
+    events: list[str] = []
+
+    with pytest.raises(StrictWc013SelectionError, match="duplicate object key"):
+        _run_strict_gate_with_execution_markers(index_path, events)
+
+    assert events == []
 
 
 def test_selects_one_phase_from_exact_deployment_bound_artifact(

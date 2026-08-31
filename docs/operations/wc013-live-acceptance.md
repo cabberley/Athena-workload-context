@@ -452,14 +452,20 @@ override. The current `pending-review-no-deployment` choice exits before Azure l
 only choice until review is complete.
 
 The workflow grants only `contents: read` and `id-token: write`, pins action revisions, runs on the
-specific available `ubuntu-24.04` label, checks out `${{ github.sha }}`, and verifies `HEAD`. It uses
-host `jq` and SHA-256 only to validate the immutable artifact and extract one allowlisted phase.
-Before Azure login or any Docker launch, a closed `case` mapping and `jq` check require that phase's
-exact Job resource-ID suffix, collector container name, and fixed configuration path. The same
-pre-launch check requires the selected collector image to be the non-placeholder
-`athena/wc013-live` RepoDigest in the fixed ACR, so swapping artifact phase slots cannot select a
-different Job or image. It does not install or execute repository Python on the hosted runner.
-After OIDC login it exchanges a short-lived ARM token directly with the fixed ACR OAuth endpoint
+specific available `ubuntu-24.04` label, checks out `${{ github.sha }}`, and verifies `HEAD`. Before
+Azure login, it pulls and RepoDigest-verifies the fixed minimal Python verifier image and runs the
+repository strict selector there as UID 65534 with no network, credentials, capabilities, or
+writable repository mount. The selector recursively rejects duplicate keys in `index.json`, the deployment
+artifact, every contract slot, and nested Job/template/environment objects while preserving all
+byte, hash, deployment, phase, and image bindings. It emits one canonical bounded selection; host
+`jq` is forbidden from parsing the original JSON and may parse only that output.
+
+A closed `case` mapping and `jq` check then require the selected phase's exact Job resource-ID
+suffix, collector container name, fixed configuration path, and non-placeholder
+`athena/wc013-live` RepoDigest in the fixed ACR. Thus duplicate or swapped slots fail before Azure
+login, ARM token acquisition, controller image pull, or controller execution. No controller code or
+dependencies execute through hosted-runner Python. After OIDC login the workflow exchanges a
+short-lived ARM token directly with the fixed ACR OAuth endpoint
 for a pull token, pulls the artifact-pinned image, deletes Docker auth state, and verifies the
 pulled RepoDigest exactly. It mounts only the selected mode-`0444` contract read-only into an
 unprivileged, read-only, capability-free container with the image's fixed controller entrypoint.

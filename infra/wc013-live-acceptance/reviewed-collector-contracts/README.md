@@ -2,7 +2,9 @@
 
 The protected collector workflow reads only a byte-pinned artifact from the exact repository
 commit captured by `workflow_dispatch`. It never reads Azure deployment outputs at run time and
-never installs or executes repository Python on the hosted runner.
+never installs or executes controller code through the hosted runner Python. A small repository
+strict-selector script executes only in a digest-pinned, networkless verifier container before
+Azure login.
 
 No active artifact exists while `.azure/deployment-plan.md` is `Executing`. The workflow exposes
 only `pending-review-no-deployment`, which exits before Azure login. This is intentional: a
@@ -18,8 +20,11 @@ exact ACR RepoDigest in `collectorControllerImage`; Bicep rejects the all-zero p
 the GitHub OIDC identity only `AcrPull` in addition to its exact Job permissions.
 
 The reviewed deployment artifact pins the same complete image reference. At execution, the workflow
-uses only SHA-pinned checkout and `azure/login` actions on `ubuntu-24.04`. Host `jq`, SHA-256, Azure
-CLI, and Docker are plumbing only: no controller code or Python dependencies run on the host.
+uses only SHA-pinned checkout and `azure/login` actions on `ubuntu-24.04`. Before Azure login,
+Docker runs `scripts/strict_select_wc013_contract.py` as UID 65534 in the same reviewed,
+digest-pinned Python base used by the controller build, with a read-only repository mount, no
+network, no capabilities, and no credentials. Host `jq` may parse only its canonical bounded
+selection; no controller code or dependencies run through host Python.
 
 ## Artifact creation and review
 
@@ -79,11 +84,14 @@ CLI, and Docker are plumbing only: no controller code or Python dependencies run
 
 After environment approval, the workflow remains on `${{ github.sha }}` even if `main` changes. It:
 
-1. validates the index and full artifact hash with fixed hosted-runner plumbing;
-2. extracts only the allowlisted phase, writes canonical bytes with mode `0444`, verifies its
-   artifact-pinned digest, then independently checks the exact phase-specific Job suffix, collector
-   name, fixed configuration path, and acceptance ACR `athena/wc013-live` RepoDigest before any
-   Docker launch;
+1. pulls and RepoDigest-verifies the fixed minimal verifier image, then runs the strict selector
+   without network or credentials; the selector size-bounds and recursively rejects duplicate keys
+   in the index, artifact, every contract slot, and all nested objects before emitting one canonical
+   selection;
+2. allows host `jq` to parse only that canonical bounded selection, writes the contract bytes with
+   mode `0444`, verifies its artifact-pinned digest, and independently checks the exact phase Job
+   suffix, collector name, fixed configuration path, and acceptance ACR RepoDigest before any
+   controller image pull or execution;
 3. logs in with GitHub OIDC, exchanges a piped ARM token directly at the fixed ACR OAuth
    endpoint for a pull token, pulls the artifact-pinned controller image, deletes Docker
    authentication state, and requires the local RepoDigest to equal the
@@ -112,7 +120,8 @@ server and the exact matching `athena/wc013-live@sha256:<64-lowercase-hex>` imag
 validates the current deployed identity and complete template against the selected reviewed
 contract before posting that exact template as the start body.
 
-The remaining unavoidable boundary is the GitHub-hosted `ubuntu-24.04` runner and its preinstalled
-Azure CLI, `curl`, `jq`, SHA-256, Docker client, and Docker daemon. Exact checkout/action/image/contract
-hashes, temporary credential storage cleanup, and post-login cleanup reduce but cannot eliminate
+The remaining unavoidable boundary is the GitHub-hosted `ubuntu-24.04` runner, Docker daemon,
+and preinstalled Azure CLI, `curl`, `jq`, and SHA-256, plus the reviewed digest-pinned minimal
+Python verifier image. Exact checkout/action/image/contract hashes, temporary credential storage
+cleanup, and post-login cleanup reduce but cannot eliminate
 trust in that hosted execution substrate.

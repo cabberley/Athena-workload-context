@@ -43,6 +43,9 @@ jobs:
       INDEX_PATH: infra/wc013-live-acceptance/reviewed-collector-contracts/index.json
       CONTRACT_DIRECTORY: ${{ runner.temp }}/wc013-controller
       CONTRACT_PATH: ${{ runner.temp }}/wc013-controller/collector-contract.json
+      STRICT_SELECTION_PATH: ${{ runner.temp }}/wc013-controller/strict-selection.json
+      VERIFIER_IMAGE: python:3.14.7-slim-bookworm@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
+      VERIFIER_REPO_DIGEST: python@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
     steps:
       - name: Check out the immutable dispatch commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -76,48 +79,47 @@ jobs:
             exit 1
           fi
           install -d -m 0700 "$CONTRACT_DIRECTORY"
+          trap 'docker image rm "$VERIFIER_IMAGE" >/dev/null 2>&1 || true' EXIT
+          docker pull "$VERIFIER_IMAGE" >/dev/null
+          verifier_image_config="$(docker image inspect "$VERIFIER_IMAGE" \
+            --format '{{len .RepoDigests}}|{{index .RepoDigests 0}}|{{.Config.User}}|{{json .Config.Entrypoint}}')"
+          if [[ "$verifier_image_config" != "1|$VERIFIER_REPO_DIGEST||null" ]]; then
+            echo 'Strict verifier image RepoDigest changed.' >&2
+            exit 1
+          fi
+          docker run --rm \
+            --read-only \
+            --network none \
+            --user 65534:65534 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 64 \
+            --memory 128m \
+            --cpus 1 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            "$VERIFIER_IMAGE" \
+            python /workspace/scripts/strict_select_wc013_contract.py \
+            --index "/workspace/$INDEX_PATH" \
+            --deployment "$DEPLOYMENT_SELECTION" \
+            --phase "$PHASE" \
+            >"$STRICT_SELECTION_PATH"
+          docker image rm "$VERIFIER_IMAGE" >/dev/null
+          trap - EXIT
 
-          entry="$(jq -ce --arg deployment "$DEPLOYMENT_SELECTION" '
-            select(.schemaVersion == "athena.wc013CollectorDeploymentContractIndex.v1")
-            | .deployments[$deployment]
-            | select(type == "object")
-            | select((keys | sort) == [
-                "artifactDigest",
-                "artifactFile",
-                "deploymentCorrelationId",
-                "deploymentResourceId",
-                "deploymentTemplateHash",
-                "sourceCommit"
-              ])
-          ' "$INDEX_PATH")"
-          artifact_file="$(jq -er '.artifactFile' <<<"$entry")"
-          expected_artifact_digest="$(jq -er '.artifactDigest' <<<"$entry")"
-          if [[ "$artifact_file" != "$DEPLOYMENT_SELECTION.json" ]]; then
-            echo 'Reviewed artifact filename does not match the selected deployment.' >&2
-            exit 1
-          fi
-          if [[ ! "$expected_artifact_digest" =~ ^sha256:[a-f0-9]{64}$ ]] ||
-             [[ "$expected_artifact_digest" == "sha256:$(printf '0%.0s' {1..64})" ]]; then
-            echo 'Reviewed artifact digest is invalid.' >&2
-            exit 1
-          fi
-          artifact_path="${INDEX_PATH%/*}/$artifact_file"
-          actual_artifact_digest="sha256:$(sha256sum "$artifact_path" | cut -d ' ' -f 1)"
-          if [[ "$actual_artifact_digest" != "$expected_artifact_digest" ]]; then
-            echo 'Reviewed artifact bytes do not match the immutable index.' >&2
-            exit 1
-          fi
-
-          jq -e --argjson entry "$entry" '
-            .schemaVersion == "athena.wc013CollectorDeploymentContract.v2"
-            and .deploymentResourceId == $entry.deploymentResourceId
-            and .deploymentCorrelationId == $entry.deploymentCorrelationId
-            and .deploymentTemplateHash == $entry.deploymentTemplateHash
-            and .sourceCommit == $entry.sourceCommit
-            and ((.contracts | keys) == ["baseline", "faulted", "recovered"])
-            and ((.collectorContractDigests | keys) == ["baseline", "faulted", "recovered"])
-          ' "$artifact_path" >/dev/null
-          controller_image="$(jq -er '.controllerImage' "$artifact_path")"
+          jq -e --arg deployment "$DEPLOYMENT_SELECTION" --arg phase "$PHASE" '
+            (keys | sort) == [
+              "contract",
+              "contractDigest",
+              "controllerImage",
+              "deployment",
+              "phase",
+              "schemaVersion"
+            ]
+            and .schemaVersion == "athena.wc013StrictCollectorSelection.v1"
+            and .deployment == $deployment
+            and .phase == $phase
+          ' "$STRICT_SELECTION_PATH" >/dev/null
+          controller_image="$(jq -er '.controllerImage' "$STRICT_SELECTION_PATH")"
           controller_digest="${controller_image##*@sha256:}"
           if [[ "$controller_image" != "$ACR_SERVER/athena/wc013-controller@sha256:$controller_digest" ]] ||
              [[ ! "$controller_digest" =~ ^[a-f0-9]{64}$ ]] ||
@@ -126,10 +128,8 @@ jobs:
             exit 1
           fi
 
-          expected_contract_digest="$(jq -er --arg phase "$PHASE" \
-            '.collectorContractDigests[$phase]' "$artifact_path")"
-          jq -jceS --arg phase "$PHASE" '.contracts[$phase]' \
-            "$artifact_path" >"$CONTRACT_PATH"
+          expected_contract_digest="$(jq -er '.contractDigest' "$STRICT_SELECTION_PATH")"
+          jq -jceS '.contract' "$STRICT_SELECTION_PATH" >"$CONTRACT_PATH"
           chmod 0444 "$CONTRACT_PATH"
           actual_contract_digest="sha256:$(sha256sum "$CONTRACT_PATH" | cut -d ' ' -f 1)"
           if [[ "$actual_contract_digest" != "$expected_contract_digest" ]]; then
@@ -274,7 +274,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -f "$CONTRACT_PATH"
+          rm -f "$CONTRACT_PATH" "$STRICT_SELECTION_PATH"
           rm -rf "$RUNNER_TEMP/wc013-docker-auth"
           if [[ -n "${CONTROLLER_IMAGE:-}" ]]; then
             docker image rm "$CONTROLLER_IMAGE" >/dev/null 2>&1 || true

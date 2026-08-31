@@ -96,18 +96,21 @@ signing, and a private static presentation container.
 - A GitHub OIDC federated credential binds that controller identity to the protected
   `cabberley/Athena-workload-context` deployment environment so collector starts execute reviewed
   controller code without a client secret. The workflow checks out the immutable dispatch SHA,
-  selects a byte-pinned deployment contract, independently verifies that the requested phase maps
-  to its exact Job suffix, collector name, fixed configuration path, and acceptance ACR repository,
-  then pulls its exact reviewed controller RepoDigest and executes only that image with a one-shot
-  ARM token piped through stdin. No repository Python or dependencies execute on the host, and
-  the workflow never reads mutable deployment outputs.
+  then uses a networkless, digest-pinned minimal Python verifier container to reject duplicate keys
+  recursively and emit one canonical bounded selection before Azure login. Only then may `jq` read
+  that selection and independently verify that the requested phase maps to its exact Job suffix,
+  collector name, fixed configuration path, and acceptance ACR repository. The workflow pulls the
+  exact reviewed controller RepoDigest and executes only that image with a one-shot ARM token piped
+  through stdin. No repository Python or dependencies execute through the hosted runner Python,
+  and the workflow never reads mutable deployment outputs.
 - A new presentation identity receives only `AcrPull`; the presentation container receives no
   Blob, Key Vault, MCP, workload, or ARM role.
 - The presentation browser makes same-origin requests only and validates content hashes,
   RFC 8785 digests, RS256 signatures, key fingerprint, and lifecycle consistency before rendering.
 - The unavoidable execution substrate is GitHub's hosted `ubuntu-24.04` runner and its pinned-action
-  plumbing (`azure/login`, Azure CLI, curl, jq, SHA-256, Docker client/daemon). No repository Python
-  runs there; exact image/contract digests and ephemeral token pipes bound the residual trust.
+  plumbing (`azure/login`, Azure CLI, curl, jq, SHA-256, Docker client/daemon) plus the pinned
+  verifier image. No controller code or unpinned Python runs directly on the host; exact image and
+  contract digests, strict canonical selection, and ephemeral token pipes bound the residual trust.
 
 ### Network boundary
 
@@ -186,7 +189,8 @@ signing, and a private static presentation container.
 - [x] Hard-reject all-zero controller and presentation image digests in Bicep
 - [x] Restrict the acceptance image to the supplied ACR and exact `athena/wc013-live` RepoDigest
 - [x] Bind every workflow phase to its exact Job suffix, collector name, and configuration path
-  before Docker launch
+  before controller Docker launch
+- [x] Reject duplicate keys recursively before `jq`, Azure login, or controller image execution
 - [x] Correct operator reader, workload receipt writer, and controller parameters
 - [x] Add/update deterministic deployment tests and documentation
 - [x] Run local preparation tests, audits, container checks, Bicep build/lint, validator, and diff check
@@ -242,6 +246,7 @@ counts, and timestamps before deployment.
 | `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Blocked by rejected controller/presentation digests |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
 | `Dockerfile.wc013-controller` | Immutable fixed-entrypoint controller image | Prepared |
+| `scripts/strict_select_wc013_contract.py` | Pre-login duplicate-free canonical contract selector | Prepared |
 | `apps/presentation-web/nginx.conf` | Same-origin MIME, caching, and CSP headers | Prepared |
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
