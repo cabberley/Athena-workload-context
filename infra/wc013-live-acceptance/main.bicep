@@ -151,6 +151,13 @@ var resourceTags = union(tags, {
 var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
   ? acceptanceImage
   : fail('acceptanceImage must be pinned by a sha256 manifest digest')
+var rejectedPresentationImageSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
+  toLower(presentationImage),
+  '${toLower(presentationImageRegistryServer)}/'
+) && !endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)
+  ? presentationImage
+  : fail('presentationImage must use a real non-placeholder sha256 digest from presentationImageRegistryServer')
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
 var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
 var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
@@ -240,7 +247,7 @@ resource collectorControllerRoleDefinition 'Microsoft.Authorization/roleDefiniti
   name: collectorControllerRoleDefinitionGuid
   properties: {
     roleName: 'Athena WC013 Collector Controller ${uniqueString(foundationResourceGroup.id)}'
-    description: 'Read and start only the fixed WC-013 collector Jobs. No write, exec, or data-plane permission.'
+    description: 'Read and start only the fixed WC-013 collector Jobs. No deployment read, write, exec, or data-plane permission.'
     type: 'CustomRole'
     permissions: [
       {
@@ -277,7 +284,7 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     location: location
     namePrefix: namePrefix
     managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
-    presentationImage: presentationImage
+    presentationImage: validatedPresentationImage
     presentationImageRegistryServer: presentationImageRegistryServer
     presentationImageRegistryResourceId: presentationImageRegistryResourceId
     tags: resourceTags

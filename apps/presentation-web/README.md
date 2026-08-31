@@ -109,8 +109,8 @@ az acr repository show `
 ```
 
 Replace the all-zero `presentationImage` digest in `.azure/wc013.parameters.json` only after this
-build. The zero digest is valid parameter syntax but cannot resolve to an image, preventing an
-accidental presentation deployment during preparation.
+build returns the immutable ACR manifest digest. The root and presentation-module Bicep both reject
+the zero digest, so ARM validation, what-if, and deployment fail closed during preparation.
 
 ## Local development
 

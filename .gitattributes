@@ -3,3 +3,4 @@
 /apps/presentation-web/public/fixtures/*.json text eol=lf
 /apps/presentation-web/public/trust/*.json text eol=lf
 /apps/presentation-web/json-not-found.json text eol=lf
+/infra/wc013-live-acceptance/reviewed-collector-contracts/*.json -text

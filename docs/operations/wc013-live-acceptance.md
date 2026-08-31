@@ -189,7 +189,8 @@ The identities remain disjoint:
 3. the presentation identity is attached only to the presentation app for ACR authentication and
    receives only `AcrPull` at the existing registry;
 4. the deployment-owned collector-controller identity is not attached to any runtime and receives
-   only the custom collector Job read/start/execution-read role on the four fixed collector Jobs;
+   only the custom collector Job read/start/execution-read role on the four fixed collector Jobs,
+   with no deployment read permission and no broad Reader role;
 5. the operator reader principal remains read-only on the operational artifact container; and
 6. the workload identity in `workloadReceiptWriterObjectIds` writes exact run-scoped receipts and
    is neither an operator reader nor an Athena runtime.
@@ -280,9 +281,10 @@ $presentationDigest = az acr repository show `
 
 Replace `.azure/wc013.parameters.json` `presentationImage` with
 `athenademoa6add389.azurecr.io/athena/presentation-web@$presentationDigest`. Until then it contains
-an all-zero digest that is syntactically valid but cannot resolve, so preparation cannot
-accidentally create a runnable app. Keep the current `acceptanceImage` value until the runner and
-delivery build step intentionally replaces it.
+an all-zero digest that both root and presentation-module Bicep reject with `fail()`. ARM
+validation, what-if, and deployment therefore fail closed until the real digest is supplied.
+Keep the current `acceptanceImage` value until the runner and delivery build step intentionally
+replaces it.
 
 Build the Bicep templates before a what-if or deployment:
 
@@ -299,9 +301,10 @@ redeployment uses `.azure/wc013.parameters.json`: operator Reader object ID
 `48bedd25-5a4d-4d5b-babd-56d259a41b0d`, and the confirmed subscription, location, resource names,
 ACR, Entra applications, and audiences. The controller principal is deployment-owned and is not a
 parameter. Review the two arrays independently and never reuse either principal for a runtime,
-presentation, or controller identity. Before any deployment, replace the all-zero presentation
-digest. Before any Job start, also replace bootstrap authority/assertion pins and the runner/delivery
-image with current reviewed renderer/build output.
+presentation, or controller identity. Before any ARM validation, what-if, or deployment, replace
+the all-zero presentation digest; the Bicep entrypoint deliberately rejects it. Before any Job
+start, also replace bootstrap authority/assertion pins and the runner/delivery image with current
+reviewed renderer/build output.
 
 ```powershell
 az deployment sub what-if `
@@ -367,22 +370,35 @@ deployment; if a new key version was intentionally produced, download that publi
 before starting any Job.
 
 ```powershell
+$sourceCommit = git rev-parse HEAD
+$readyDeploymentName = (
+  'wc013-ready-{0}-{1}' -f (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'),
+  $sourceCommit.Substring(0, 12)
+)
+
 az deployment sub what-if `
-  --name wc013-ready `
+  --name $readyDeploymentName `
   --location <region> `
   --template-file infra/wc013-live-acceptance/main.bicep `
   --parameters <operator-wc013.bicepparam>
 
 az deployment sub create `
-  --name wc013-ready `
+  --name $readyDeploymentName `
   --location <region> `
   --template-file infra/wc013-live-acceptance/main.bicep `
   --parameters <operator-wc013.bicepparam>
 
-# After merge, protected-environment approval, deployment, and output review only:
+# Capture once with the deployment identity; this is not run by the collector workflow.
+az deployment sub show `
+  --name $readyDeploymentName `
+  --query '{id:id,correlationId:properties.correlationId,templateHash:properties.templateHash,contracts:properties.outputs.evidenceCollectorStartContracts.value}' `
+  --output json
+
+# Only after the deployment-bound artifact and exact choice are reviewed and merged:
 gh workflow run wc013-collector-controller.yml `
   --ref main `
-  -f phase=baseline
+  -f phase=baseline `
+  -f deployment=$readyDeploymentName
 ```
 
 Before dispatch, configure the protected GitHub environment `athena-live` to allow deployments only
@@ -390,10 +406,23 @@ from `main`, require its human reviewers, and add non-secret environment variabl
 `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID`, and `WC013_COLLECTOR_CONTROLLER_CLIENT_ID`. Set the last
 value from the reviewed `collectorControllerIdentityClientId` deployment output. The federated
 credential subject is environment-bound, so a branch or job without `environment: athena-live`
-cannot exchange a token. The workflow grants only `contents: read` and `id-token: write`, uses
-`azure/login` without a secret, verifies the Azure CLI service-principal client ID, and accepts only
-`baseline`, `faulted`, or `recovered`. It selects the corresponding fixed contract from the
-`wc013-ready` deployment output; no image, command, args, environment, or template input exists.
+cannot exchange a token.
+
+After the uniquely named ready deployment, capture its output once with the deployment identity.
+Create and independently review the artifact described in
+`infra/wc013-live-acceptance/reviewed-collector-contracts/README.md`. It binds all three phase
+contracts to the exact deployment resource ID, correlation ID, ARM template hash, deployment source
+commit, canonical contracts digest, and complete artifact-byte digest. Commit that artifact, one literal workflow choice, and its exact `index.json` metadata entry
+together. The fixed selector path accepts no caller path and no template override. The current `pending-review-no-deployment` choice exits before Azure login and must remain
+the only choice until this review is complete.
+
+The workflow grants only `contents: read` and `id-token: write`, pins action revisions, checks out
+`${{ github.sha }}` rather than mutable `main`, verifies `HEAD`, and resolves the byte-pinned
+repository artifact before `azure/login`. It never calls `az deployment` and the OIDC identity has
+no deployment-read role. A pending environment-approved run therefore cannot drift when `main` or
+an Azure deployment record changes. Inputs remain closed choices for one exact deployment and one
+of `baseline`, `faulted`, or `recovered`; no image, command, args, environment, path, or template
+input exists.
 
 The controller first retrieves the deployed Job, rejects any identity, registry, image, command,
 argument, environment, resource, init-container, volume, trigger, retry, or timeout difference,

@@ -34,12 +34,13 @@ param tags object = {}
 
 var presentationName = '${namePrefix}-presentation'
 var presentationIdentityName = '${namePrefix}-presentation-id'
+var rejectedPresentationImageSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
   toLower(presentationImage),
   '${toLower(presentationImageRegistryServer)}/'
-)
+) && !endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)
   ? presentationImage
-  : fail('presentationImage must be hosted in presentationImageRegistryServer and pinned by a sha256 manifest digest')
+  : fail('presentationImage must be hosted in presentationImageRegistryServer and use a real non-placeholder sha256 digest')
 var presentationTags = union(tags, {
   component: 'wc013-presentation-web'
   dataBoundary: 'customer'

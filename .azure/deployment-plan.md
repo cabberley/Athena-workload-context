@@ -90,10 +90,13 @@ signing, and a private static presentation container.
   `athena-hackathon-workload-id` (`48bedd25-5a4d-4d5b-babd-56d259a41b0d`), not the operator reader.
 - The operator artifact reader remains `51425b07-8512-4c49-a763-23a09c347f0b`.
 - A new collector-controller identity is created with only the custom collector Job
-  read/start/execution-read role. It is not attached to any Athena runtime.
+  read/start/execution-read role. It is not attached to any Athena runtime and has no deployment
+  read permission or broad Reader role.
 - A GitHub OIDC federated credential binds that controller identity to the protected
   `cabberley/Athena-workload-context` deployment environment so collector starts execute reviewed
-  controller code without a client secret.
+  controller code without a client secret. The workflow checks out the immutable dispatch SHA and
+  selects only a byte-pinned, deployment-ID/correlation/template-hash-bound contract artifact from
+  that same reviewed commit; it never reads mutable Azure deployment outputs.
 - A new presentation identity receives only `AcrPull`; the presentation container receives no
   Blob, Key Vault, MCP, workload, or ARM role.
 - The presentation browser makes same-origin requests only and validates content hashes,
@@ -111,16 +114,20 @@ signing, and a private static presentation container.
 
 1. Add presentation container packaging, Bicep resources, controller identity federation, and
    deployment parameter updates.
-2. Build the runner and presentation images in ACR.
+2. Build the runner and presentation images in ACR and replace the rejected presentation
+   placeholder before any ARM validation or what-if.
 3. Run Bicep build/lint, repository tests, application tests, policy checks, ARM validation, and
-   full what-if.
+   full what-if. Placeholder parameters must fail closed.
 4. Deploy the bootstrap infrastructure without starting a Job.
 5. Verify and migrate Entra application-role assignments so MCP and trusted-ingestion roles are
    assigned only to the evidence identity.
 6. Download the exact Key Vault public key, rerender the reviewed WC-013 configuration and phase
    bundle, build the delivery image, and update exact image/digest parameters.
-7. Run a second validation/what-if and deploy the ready configuration.
-8. Verify identities, scoped RBAC, collector/evaluator job templates, immutable containers, private
+7. Run a second validation/what-if and deploy the ready configuration under a unique
+   timestamp/source-commit deployment name that is never reused.
+8. Capture and review the exact deployment ID, correlation ID, template hash, and collector
+   contracts; commit their byte-pinned artifact and exact workflow choice before enabling starts.
+9. Verify identities, scoped RBAC, collector/evaluator job templates, immutable containers, private
    DNS, image digests, and presentation headers/content from the jumpbox.
 
 ---
@@ -162,11 +169,15 @@ signing, and a private static presentation container.
 - [x] Add private presentation container packaging and CSP configuration
 - [x] Add presentation Container App and dedicated pull identity to Bicep
 - [x] Add governed controller identity and GitHub OIDC federation
+- [x] Bind workflow code to dispatch SHA and remove runtime deployment reads
+- [x] Add fail-closed reviewed deployment-contract artifact selection
+- [x] Hard-reject the all-zero presentation image digest in Bicep
 - [x] Correct operator reader, workload receipt writer, and controller parameters
 - [x] Add/update deterministic deployment tests and documentation
 - [x] Run local preparation tests, audits, container checks, Bicep build/lint, validator, and diff check
 - [ ] Build digest-pinned runner and presentation images
 - [ ] Generate current reviewed WC-013 configuration and delivery image
+- [ ] Replace the rejected presentation digest before ARM validation
 - [ ] Update plan status to `Ready for Validation`
 
 ### Phase 3: Validation
@@ -183,7 +194,8 @@ signing, and a private static presentation container.
 - [ ] Invoke `azure-deploy`
 - [ ] Deploy bootstrap infrastructure
 - [ ] Verify/migrate Entra application-role assignments
-- [ ] Deploy ready digest-pinned configuration
+- [ ] Deploy ready digest-pinned configuration under a unique immutable-style name
+- [ ] Review and commit the deployment-bound collector contract artifact/workflow choice
 - [ ] Verify live RBAC and managed-identity separation
 - [ ] Verify private presentation endpoint from the jumpbox
 - [ ] Report the fully qualified private HTTPS URL
@@ -212,12 +224,12 @@ counts, and timestamps before deployment.
 | File | Purpose | Status |
 |------|---------|--------|
 | `.azure/deployment-plan.md` | Deployment source of truth | Executing |
-| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Prepared; image digest pending |
+| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Blocked by rejected presentation digest |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
 | `apps/presentation-web/nginx.conf` | Same-origin MIME, caching, and CSP headers | Prepared |
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
-| `.github/workflows/wc013-collector-controller.yml` | Governed OIDC collector start | Prepared |
+| `.github/workflows/wc013-collector-controller.yml` | Immutable-SHA, artifact-bound OIDC collector start | Prepared; fail-closed pending final artifact |
 | Deployment tests/docs | Deterministic architecture and runbook coverage | Prepared |
 
 ---
@@ -226,8 +238,11 @@ counts, and timestamps before deployment.
 
 > Current: Preparation
 
-1. Build the runner and presentation images in ACR and replace the preparation placeholders with
-   reviewed manifest digests.
+1. Build the runner and presentation images in ACR and replace the hard-rejected presentation
+   placeholder with its reviewed manifest digest.
 2. Generate and review the current WC-013 configuration/delivery image and update its exact pins.
-3. Mark the plan `Ready for Validation`, then invoke `azure-validate`; deploy only after current
-   validation proof is `Validated`.
+3. Mark the plan `Ready for Validation`, then invoke `azure-validate`; the parameter path must fail
+   while any rejected placeholder remains. Deploy only after current proof is `Validated`.
+4. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
+   collector outputs, and commit the byte-pinned deployment artifact plus exact workflow choice/index entry.
+   Until that commit, the workflow intentionally exits before OIDC login.

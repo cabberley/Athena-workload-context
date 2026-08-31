@@ -41,9 +41,10 @@ assignment. The deployment owns this controller user-assigned identity and its o
 federated credential. The trust is limited to issuer
 `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject
 `repo:cabberley/Athena-workload-context:environment:athena-live`. A manually dispatched workflow
-runs only from protected `main` in the protected `athena-live` environment, accepts only the three
-phase names, loads the selected exact contract from deployment outputs, and executes the repository
-controller after `azure/login`; it has no client secret or image/template override.
+runs only from protected `main` in the protected `athena-live` environment, accepts only closed
+phase and immutable-deployment choices, checks out the dispatch SHA, and selects the byte-pinned
+contract artifact from that same commit before `azure/login`. It never reads Azure deployment
+outputs at run time and has no client secret, caller path, or image/template override.
 
 Collector artifacts use a dedicated immutable Blob container. The evidence identity has
 create/read capability only on that collector container and replay table. The context identity has
@@ -99,12 +100,16 @@ automation must sequence collector then evaluator and pass
 `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64`. Existing combined jobs must be redeployed so the
 evidence identity is detached before further execution. Collector start automation must use the
 `athena-context wc013-collector-controller` path and a reviewed
-`athena.wc013CollectorStartContract.v1`; direct human Job-start access is not supported.
+`athena.wc013CollectorStartContract.v1` selected from a byte-pinned repository artifact bound
+to one uniquely named deployment ID, correlation ID, template hash, and source commit. The
+protected workflow checks out its immutable dispatch SHA and never reads mutable deployment
+outputs. Direct human Job-start access is not supported.
 
 ## Validation
 
 - Static Bicep tests prove collector and evaluator jobs have disjoint identity sets and storage
-  roles, and that collector start permission is assigned only to the controller role.
+  roles, that collector start permission is assigned only to the controller role, and that this
+role has no deployment-read or broad Reader permission.
 - Deterministic tests cover exact deployed-template validation, exact-template-pinned start requests,
   plan/transport-bound handoff loading, cross-endpoint relabel rejection, exact immutable Blob
   reads, artifact-capacity boundaries, tampered envelope rejection, and evidence-only collector

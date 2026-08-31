@@ -159,21 +159,68 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
 
     assert "roleAssignments:" in resources
     assert "collectorControllerRoleDefinitionId" in resources
+    role_start = orchestration.index("resource collectorControllerRoleDefinition")
+    role_end = orchestration.index("\nmodule privateDns", role_start)
+    role = orchestration[role_start:role_end]
+    assert "'Microsoft.App/jobs/read'" in role
+    assert "'Microsoft.App/jobs/start/action'" in role
+    assert "'Microsoft.App/jobs/executions/read'" in role
+    assert "Microsoft.Resources/deployments/read" not in role
+    assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" not in role
+
     assert "environment: athena-live" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "ref: main" not in workflow
+    assert "DISPATCH_SHA: ${{ github.sha }}" in workflow
+    assert "git rev-parse HEAD" in workflow
+    assert "persist-credentials: false" in workflow
     assert "id-token: write" in workflow
-    assert "uses: azure/login@v2" in workflow
+    assert "uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474" in workflow
+    action_refs = re.findall(r"uses: [^@\s]+@([^\s]+)", workflow)
+    assert action_refs
+    assert all(re.fullmatch(r"[a-f0-9]{40}", ref) for ref in action_refs)
     assert "client-id: ${{ env.AZURE_CLIENT_ID }}" in workflow
     assert "client-secret" not in workflow.casefold()
     assert "--use-azure-cli-credential" in workflow
     assert "athena-context wc013-collector-controller" in workflow
-    assert "evidenceCollectorStartContracts.value[$contract_index]" in workflow
-    assert "--name wc013-ready" in workflow
-    phase_options = re.findall(r"^          - (\w+)$", workflow, re.MULTILINE)
+    assert "athena_context.wc013_reviewed_collector_contract" in workflow
+    assert "--index infra/wc013-live-acceptance/reviewed-collector-contracts/index.json" in workflow
+    assert '--deployment "$DEPLOYMENT_SELECTION"' in workflow
+    assert workflow.index("Select the immutable reviewed deployment contract") < (
+        workflow.index("Sign in as the deployment-owned controller identity")
+    )
+    assert "az deployment" not in workflow
+    assert "wc013-ready" not in workflow
+    assert "properties.outputs" not in workflow
+    assert "pending-review-no-deployment' ]]" in workflow
+    assert "No immutable reviewed deployment contract is enabled." in workflow
+    reviewed_index = json.loads(
+        _read(
+            "infra/wc013-live-acceptance/"
+            "reviewed-collector-contracts/index.json"
+        )
+    )
+    assert reviewed_index == {
+        "schemaVersion": "athena.wc013CollectorDeploymentContractIndex.v1",
+        "deployments": {},
+    }
+    assert (
+        "/infra/wc013-live-acceptance/reviewed-collector-contracts/*.json -text"
+        in _read(".gitattributes")
+    )
+
+    dispatch_inputs = workflow[workflow.index("    inputs:") : workflow.index("\npermissions:")]
+    phase_options = re.findall(
+        r"^          - (baseline|faulted|recovered)$",
+        dispatch_inputs,
+        re.MULTILINE,
+    )
     assert phase_options == ["baseline", "faulted", "recovered"]
-    input_block = workflow[workflow.index("    inputs:") : workflow.index("\npermissions:")]
-    for forbidden_input in ("image:", "command:", "args:", "env:", "template:"):
-        assert forbidden_input not in input_block
+    assert dispatch_inputs.count("type: choice") == 2
+    assert "          - pending-review-no-deployment" in dispatch_inputs
+    for forbidden_input in ("image:", "command:", "args:", "env:", "template:", "path:"):
+        assert forbidden_input not in dispatch_inputs
 
 
 def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None:
@@ -194,6 +241,24 @@ def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None
         r"@sha256:0{64}",
         presentation_image,
     )
+    orchestration = _read("infra/wc013-live-acceptance/main.bicep")
+    presentation = _read(
+        "infra/wc013-live-acceptance/modules/presentation-web.bicep"
+    )
+    rejected_suffix = "@sha256:" + "0" * 64
+    for bicep in (orchestration, presentation):
+        assert f"rejectedPresentationImageSuffix = '{rejected_suffix}'" in bicep
+        assert (
+            "!endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)"
+            in bicep
+        )
+        assert "real non-placeholder sha256 digest" in bicep
+    assert "presentationImage: validatedPresentationImage" in orchestration
+    example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
+    example_presentation_image = next(
+        line for line in example.splitlines() if line.startswith("param presentationImage =")
+    )
+    assert rejected_suffix not in example_presentation_image
     assert parameters["presentationImageRegistryServer"]["value"] == (
         "athenademoa6add389.azurecr.io"
     )

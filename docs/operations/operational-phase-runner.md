@@ -151,8 +151,10 @@ Missing or mismatched prior faulted indexes fail before WC-013 execution.
 
 ## Production composition
 
-For each phase, the controller first uses `athena-context wc013-collector-controller` to retrieve
-and validate the matching collector's exact deployed evidence-only template, then starts it with
+For each phase, the protected workflow selects the matching contract from a byte-pinned
+deployment-bound artifact in its immutable dispatch commit. The controller then uses
+`athena-context wc013-collector-controller` to retrieve and validate the exact deployed
+evidence-only template, then starts it with
 that same closed template supplied as the complete ARM execution body. This pins the execution
 even if the stored Job template changes after validation; the controller exposes no caller-supplied
 template or mutable field. It captures the collector's
