@@ -88,11 +88,6 @@ param operatorArtifactReaderObjectIds array
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
-@description('Object ID of the separately governed managed identity that alone receives collector Job read/start permission.')
-@minLength(36)
-@maxLength(36)
-param collectorControllerPrincipalId string
-
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -118,6 +113,21 @@ param acceptanceImageRegistryServer string
 @maxLength(2048)
 param acceptanceImageRegistryResourceId string
 
+@description('Digest-pinned production image for the private presentation web app.')
+@minLength(1)
+@maxLength(2048)
+param presentationImage string
+
+@description('Existing Azure Container Registry login server hosting the presentation image.')
+@minLength(1)
+@maxLength(255)
+param presentationImageRegistryServer string
+
+@description('Resource ID of the existing Azure Container Registry hosting the presentation image.')
+@minLength(1)
+@maxLength(2048)
+param presentationImageRegistryResourceId string
+
 @description('Reviewed Azure MCP release. Only the existing pinned implementation accepts this value.')
 @allowed([
   '2.0.5'
@@ -141,6 +151,9 @@ var resourceTags = union(tags, {
 var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
   ? acceptanceImage
   : fail('acceptanceImage must be pinned by a sha256 manifest digest')
+var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
+var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
+var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
 var collectorControllerRoleDefinitionGuid = guid(
   subscription().id,
   foundationResourceGroupName,
@@ -152,19 +165,44 @@ var forbiddenCollectorControllerPrincipalIds = concat(
   [
     toLower(evidenceIdentity.properties.principalId)
     toLower(acceptanceJobIdentity.properties.principalId)
+    toLower(presentationWeb.outputs.identityPrincipalId)
   ]
 )
 var validatedCollectorControllerPrincipalId = contains(
   forbiddenCollectorControllerPrincipalIds,
-  toLower(collectorControllerPrincipalId)
+  toLower(collectorControllerIdentity.outputs.principalId)
 )
-  ? fail('collectorControllerPrincipalId must be distinct from runtime and operator principals')
-  : collectorControllerPrincipalId
+  ? fail('deployment-owned collector controller identity must be distinct from runtime, presentation, operator, and workload principals')
+  : collectorControllerIdentity.outputs.principalId
 
 resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: foundationResourceGroupName
   location: location
   tags: resourceTags
+}
+
+module collectorControllerIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc013-collector-controller-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-collector-controller-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    federatedIdentityCredentials: [
+      {
+        name: 'github-athena-live'
+        issuer: collectorControllerFederatedCredentialIssuer
+        subject: collectorControllerFederatedCredentialSubject
+        audiences: [
+          collectorControllerFederatedCredentialAudience
+        ]
+      }
+    ]
+    tags: union(resourceTags, {
+      identityPurpose: 'github-oidc-collector-controller-only'
+    })
+  }
 }
 
 module azureMcp '../azure-mcp/main.bicep' = {
@@ -228,6 +266,20 @@ module privateDns 'modules/private-dns.bicep' = {
   params: {
     namePrefix: namePrefix
     virtualNetworkResourceId: azureMcp.outputs.virtualNetworkResourceId
+    tags: resourceTags
+  }
+}
+
+module presentationWeb 'modules/presentation-web.bicep' = {
+  name: 'wc013-private-presentation-web'
+  scope: foundationResourceGroup
+  params: {
+    location: location
+    namePrefix: namePrefix
+    managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
+    presentationImage: presentationImage
+    presentationImageRegistryServer: presentationImageRegistryServer
+    presentationImageRegistryResourceId: presentationImageRegistryResourceId
     tags: resourceTags
   }
 }
@@ -401,6 +453,36 @@ output evidenceCollectorStartContracts array = acceptanceResources.outputs.evide
 
 @description('Custom role definition assigned only to the governed collector controller.')
 output collectorControllerRoleDefinitionId string = collectorControllerRoleDefinition.id
+
+@description('Deployment-owned collector controller identity resource ID.')
+output collectorControllerIdentityResourceId string = collectorControllerIdentity.outputs.resourceId
+
+@description('Deployment-owned collector controller identity client ID used by GitHub OIDC login.')
+output collectorControllerIdentityClientId string = collectorControllerIdentity.outputs.clientId
+
+@description('Deployment-owned collector controller identity principal ID receiving only the collector controller role.')
+output collectorControllerIdentityPrincipalId string = validatedCollectorControllerPrincipalId
+
+@description('Name of the private presentation Container App.')
+output presentationContainerAppName string = presentationWeb.outputs.name
+
+@description('Resource ID of the private presentation Container App.')
+output presentationContainerAppResourceId string = presentationWeb.outputs.resourceId
+
+@description('VNet-scoped presentation FQDN.')
+output presentationFqdn string = presentationWeb.outputs.fqdn
+
+@description('Fully qualified private HTTPS presentation URL.')
+output presentationHttpsUrl string = presentationWeb.outputs.httpsUrl
+
+@description('Presentation identity resource ID. This identity receives only AcrPull.')
+output presentationIdentityResourceId string = presentationWeb.outputs.identityResourceId
+
+@description('Presentation identity client ID.')
+output presentationIdentityClientId string = presentationWeb.outputs.identityClientId
+
+@description('Presentation identity principal ID.')
+output presentationIdentityPrincipalId string = presentationWeb.outputs.identityPrincipalId
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId

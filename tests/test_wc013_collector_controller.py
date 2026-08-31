@@ -349,3 +349,41 @@ def test_arm_client_failure_suppresses_token_from_exception_and_logs(
     assert token not in caplog.text
     assert captured.value.__cause__ is None
     assert captured.value.__suppress_context__
+
+
+def test_arm_client_uses_azure_cli_only_when_explicitly_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class _Credential:
+        def get_token(self, scope: str) -> object:
+            observed["scope"] = scope
+            return SimpleNamespace(token="synthetic-oidc-token")
+
+    class _Http:
+        def request(self, **kwargs: object) -> tuple[int, str, bytes]:
+            observed.update(kwargs)
+            return 200, str(kwargs["url"]), b'{"id":"fixture"}'
+
+    monkeypatch.setattr(
+        controller_module,
+        "AzureCliCredential",
+        lambda: observed.setdefault("credential", "azure-cli") and _Credential(),
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "DefaultAzureCredential",
+        lambda **_kwargs: pytest.fail("managed identity credential was selected"),
+    )
+    monkeypatch.setattr(controller_module, "_ArmHttpStack", lambda: _Http())
+
+    client = AzureContainerAppsCollectorJobManagementClient(
+        controller_identity_client_id="44444444-4444-4444-4444-444444444444",
+        use_azure_cli_credential=True,
+    )
+    result = client.get_job(JOB_RESOURCE_ID)
+
+    assert result == {"id": "fixture"}
+    assert observed["credential"] == "azure-cli"
+    assert observed["scope"] == "https://management.azure.com/.default"

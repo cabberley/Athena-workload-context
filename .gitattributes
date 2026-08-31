@@ -2,3 +2,4 @@
 /apps/presentation-web/public/*.json text eol=lf
 /apps/presentation-web/public/fixtures/*.json text eol=lf
 /apps/presentation-web/public/trust/*.json text eol=lf
+/apps/presentation-web/json-not-found.json text eol=lf

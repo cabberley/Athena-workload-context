@@ -37,7 +37,13 @@ action with that exact validated template as the complete execution body. This r
 validation/start race: a concurrent change to the stored Job template cannot alter the execution
 body already pinned by the controller. The controller exposes no caller-supplied template or mutable
 field. Human operators and the Athena/evidence runtime identities receive no collector Job start
-assignment.
+assignment. The deployment owns this controller user-assigned identity and its one GitHub OIDC
+federated credential. The trust is limited to issuer
+`https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject
+`repo:cabberley/Athena-workload-context:environment:athena-live`. A manually dispatched workflow
+runs only from protected `main` in the protected `athena-live` environment, accepts only the three
+phase names, loads the selected exact contract from deployment outputs, and executes the repository
+controller after `azure/login`; it has no client secret or image/template override.
 
 Collector artifacts use a dedicated immutable Blob container. The evidence identity has
 create/read capability only on that collector container and replay table. The context identity has

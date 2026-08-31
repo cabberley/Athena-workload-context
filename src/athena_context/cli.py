@@ -138,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="retrieve and validate the deployed collector without starting it",
     )
+    collector_controller_parser.add_argument(
+        "--use-azure-cli-credential",
+        action="store_true",
+        help="use the Azure CLI session established by protected GitHub OIDC login",
+    )
     presentation_parser = subparsers.add_parser(
         "argus-presentation-export",
         help="export a verified synthetic-safe ARGUS presentation",
@@ -309,6 +314,7 @@ def main(
                 controller_identity_client_id=args.controller_identity_client_id,
                 management=wc013_collector_job_management_port,
                 validate_only=args.validate_only,
+                use_azure_cli_credential=args.use_azure_cli_credential,
             )
             output.write(
                 "WC-013 collector template validated\n"

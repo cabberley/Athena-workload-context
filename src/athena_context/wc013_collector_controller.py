@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential, DefaultAzureCredential
 from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
 
 from athena_context.contracts import AthenaBaseModel, compute_artifact_digest
@@ -335,19 +335,30 @@ class _ArmHttpStack:
 class AzureContainerAppsCollectorJobManagementClient:
     """ARM client exposing GET and exact-template start operations."""
 
-    def __init__(self, *, controller_identity_client_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        controller_identity_client_id: str,
+        use_azure_cli_credential: bool = False,
+    ) -> None:
         if _GUID_PATTERN.fullmatch(controller_identity_client_id) is None:
             raise ValueError("controller identity client ID must be a GUID")
-        self._credential = DefaultAzureCredential(
-            managed_identity_client_id=controller_identity_client_id,
-            exclude_environment_credential=True,
-            exclude_shared_token_cache_credential=True,
-            exclude_visual_studio_code_credential=True,
-            exclude_cli_credential=True,
-            exclude_powershell_credential=True,
-            exclude_developer_cli_credential=True,
-            exclude_workload_identity_credential=True,
-            exclude_broker_credential=True,
+        # The default remains the exact managed identity. Azure CLI authentication is an
+        # explicit path only for the protected GitHub environment after azure/login OIDC.
+        self._credential = (
+            AzureCliCredential()
+            if use_azure_cli_credential
+            else DefaultAzureCredential(
+                managed_identity_client_id=controller_identity_client_id,
+                exclude_environment_credential=True,
+                exclude_shared_token_cache_credential=True,
+                exclude_visual_studio_code_credential=True,
+                exclude_cli_credential=True,
+                exclude_powershell_credential=True,
+                exclude_developer_cli_credential=True,
+                exclude_workload_identity_credential=True,
+                exclude_broker_credential=True,
+            )
         )
         self._http = _ArmHttpStack()
 
@@ -489,10 +500,12 @@ def run_governed_wc013_collector_start(
     controller_identity_client_id: str,
     management: Wc013CollectorJobManagementPort | None = None,
     validate_only: bool = False,
+    use_azure_cli_credential: bool = False,
 ) -> Wc013CollectorStartResult:
     contract = load_wc013_collector_start_contract(contract_path)
     client = management or AzureContainerAppsCollectorJobManagementClient(
-        controller_identity_client_id=controller_identity_client_id
+        controller_identity_client_id=controller_identity_client_id,
+        use_azure_cli_credential=use_azure_cli_credential,
     )
     deployed = client.get_job(contract.job_resource_id)
     template_digest = validate_deployed_wc013_collector_job(contract, deployed)

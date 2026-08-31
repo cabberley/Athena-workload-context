@@ -406,7 +406,8 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
     acceptance = _job_module(resources, "acceptanceJob")
     collectors = _loop_job_module(resources, "evidenceCollectorJobs")
 
-    assert "param collectorControllerPrincipalId string" in orchestration
+    assert "param collectorControllerPrincipalId string" not in orchestration
+    assert "module collectorControllerIdentity" in orchestration
     assert "collectorControllerRoleDefinition" in orchestration
     assert "'Microsoft.App/jobs/read'" in orchestration
     assert "'Microsoft.App/jobs/start/action'" in orchestration
@@ -421,6 +422,7 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
         "collectorControllerPrincipalId: validatedCollectorControllerPrincipalId"
         in orchestration
     )
+    assert "collectorControllerIdentity.outputs.principalId" in orchestration
     assert (
         "collectorControllerRoleDefinitionId: collectorControllerRoleDefinition.id"
         in orchestration

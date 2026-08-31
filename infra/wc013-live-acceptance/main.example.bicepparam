@@ -35,9 +35,6 @@ param workloadReceiptWriterObjectIds = [
   '55555555-5555-5555-5555-555555555555'
 ]
 
-// Separately governed managed identity that alone receives collector Job read/start permission.
-// It must be distinct from both runtime identities and all operator/receipt principals.
-param collectorControllerPrincipalId = '77777777-7777-7777-7777-777777777777'
 
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.
 param wc007PinnedAuthorityDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
@@ -47,3 +44,8 @@ param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000
 param acceptanceImage = 'athenasynth.azurecr.io/athena/wc013-live@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param acceptanceImageRegistryServer = 'athenasynth.azurecr.io'
 param acceptanceImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+// The private presentation image must be replaced with an ACR manifest digest before deployment.
+// The all-zero digest is structurally valid but cannot resolve to an executable image.
+param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+param presentationImageRegistryServer = 'athenasynth.azurecr.io'
+param presentationImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'

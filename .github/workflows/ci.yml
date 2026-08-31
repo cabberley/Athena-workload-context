@@ -78,5 +78,8 @@ jobs:
         run: npm run lint
       - name: Build
         run: npm run build
+      - name: Test production container
+        shell: pwsh
+        run: ./test-container.ps1
       - name: Audit
         run: npm audit --audit-level=high
