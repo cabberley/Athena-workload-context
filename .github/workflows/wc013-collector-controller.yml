@@ -28,7 +28,7 @@ concurrency:
 jobs:
   start-reviewed-collector:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: athena-live
     permissions:
       contents: read
@@ -37,7 +37,12 @@ jobs:
       AZURE_CLIENT_ID: ${{ vars.WC013_COLLECTOR_CONTROLLER_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      CONTRACT_PATH: ${{ runner.temp }}/wc013-collector-start-contract.json
+      AZURE_LOGIN_PRE_CLEANUP: true
+      AZURE_LOGIN_POST_CLEANUP: true
+      ACR_SERVER: athenademoa6add389.azurecr.io
+      INDEX_PATH: infra/wc013-live-acceptance/reviewed-collector-contracts/index.json
+      CONTRACT_DIRECTORY: ${{ runner.temp }}/wc013-controller
+      CONTRACT_PATH: ${{ runner.temp }}/wc013-controller/collector-contract.json
     steps:
       - name: Check out the immutable dispatch commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -45,7 +50,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify the immutable checkout
+      - name: Verify immutable checkout and fixed runner plumbing
         shell: bash
         env:
           DISPATCH_SHA: ${{ github.sha }}
@@ -53,17 +58,13 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
           test -z "$(git status --porcelain)"
+          test "$(uname -m)" = 'x86_64'
+          command -v jq >/dev/null
+          command -v sha256sum >/dev/null
+          command -v docker >/dev/null
+          command -v curl >/dev/null
 
-      - name: Install the immutable repository controller
-        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
-        with:
-          python-version: '3.14'
-          cache: pip
-
-      - name: Install exact checked-out package
-        run: python -m pip install .
-
-      - name: Select the immutable reviewed deployment contract
+      - name: Select one byte-pinned reviewed contract and controller image
         shell: bash
         env:
           DEPLOYMENT_SELECTION: ${{ inputs.deployment }}
@@ -74,11 +75,68 @@ jobs:
             echo 'No immutable reviewed deployment contract is enabled.' >&2
             exit 1
           fi
-          python -m athena_context.wc013_reviewed_collector_contract \
-            --index infra/wc013-live-acceptance/reviewed-collector-contracts/index.json \
-            --deployment "$DEPLOYMENT_SELECTION" \
-            --phase "$PHASE" \
-            --output "$CONTRACT_PATH"
+          install -d -m 0700 "$CONTRACT_DIRECTORY"
+
+          entry="$(jq -ce --arg deployment "$DEPLOYMENT_SELECTION" '
+            select(.schemaVersion == "athena.wc013CollectorDeploymentContractIndex.v1")
+            | .deployments[$deployment]
+            | select(type == "object")
+            | select((keys | sort) == [
+                "artifactDigest",
+                "artifactFile",
+                "deploymentCorrelationId",
+                "deploymentResourceId",
+                "deploymentTemplateHash",
+                "sourceCommit"
+              ])
+          ' "$INDEX_PATH")"
+          artifact_file="$(jq -er '.artifactFile' <<<"$entry")"
+          expected_artifact_digest="$(jq -er '.artifactDigest' <<<"$entry")"
+          if [[ "$artifact_file" != "$DEPLOYMENT_SELECTION.json" ]]; then
+            echo 'Reviewed artifact filename does not match the selected deployment.' >&2
+            exit 1
+          fi
+          if [[ ! "$expected_artifact_digest" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+             [[ "$expected_artifact_digest" == "sha256:$(printf '0%.0s' {1..64})" ]]; then
+            echo 'Reviewed artifact digest is invalid.' >&2
+            exit 1
+          fi
+          artifact_path="${INDEX_PATH%/*}/$artifact_file"
+          actual_artifact_digest="sha256:$(sha256sum "$artifact_path" | cut -d ' ' -f 1)"
+          if [[ "$actual_artifact_digest" != "$expected_artifact_digest" ]]; then
+            echo 'Reviewed artifact bytes do not match the immutable index.' >&2
+            exit 1
+          fi
+
+          jq -e --argjson entry "$entry" '
+            .schemaVersion == "athena.wc013CollectorDeploymentContract.v2"
+            and .deploymentResourceId == $entry.deploymentResourceId
+            and .deploymentCorrelationId == $entry.deploymentCorrelationId
+            and .deploymentTemplateHash == $entry.deploymentTemplateHash
+            and .sourceCommit == $entry.sourceCommit
+            and ((.contracts | keys) == ["baseline", "faulted", "recovered"])
+            and ((.collectorContractDigests | keys) == ["baseline", "faulted", "recovered"])
+          ' "$artifact_path" >/dev/null
+          controller_image="$(jq -er '.controllerImage' "$artifact_path")"
+          controller_digest="${controller_image##*@sha256:}"
+          if [[ "$controller_image" != "$ACR_SERVER/athena/wc013-controller@sha256:$controller_digest" ]] ||
+             [[ ! "$controller_digest" =~ ^[a-f0-9]{64}$ ]] ||
+             [[ "$controller_digest" == "$(printf '0%.0s' {1..64})" ]]; then
+            echo 'Reviewed controller image is not the fixed ACR repository and digest.' >&2
+            exit 1
+          fi
+
+          expected_contract_digest="$(jq -er --arg phase "$PHASE" \
+            '.collectorContractDigests[$phase]' "$artifact_path")"
+          jq -jceS --arg phase "$PHASE" '.contracts[$phase]' \
+            "$artifact_path" >"$CONTRACT_PATH"
+          chmod 0444 "$CONTRACT_PATH"
+          actual_contract_digest="sha256:$(sha256sum "$CONTRACT_PATH" | cut -d ' ' -f 1)"
+          if [[ "$actual_contract_digest" != "$expected_contract_digest" ]]; then
+            echo 'Selected collector contract bytes do not match the reviewed digest.' >&2
+            exit 1
+          fi
+          echo "CONTROLLER_IMAGE=$controller_image" >>"$GITHUB_ENV"
 
       - name: Sign in as the deployment-owned controller identity
         uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474 # v2.3.0
@@ -97,9 +155,71 @@ jobs:
             exit 1
           fi
 
-      - name: Validate and start the exact reviewed collector
-        run: >-
-          athena-context wc013-collector-controller
-          --contract "$CONTRACT_PATH"
-          --controller-identity-client-id "$AZURE_CLIENT_ID"
-          --use-azure-cli-credential
+      - name: Pull and verify the exact reviewed controller image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/wc013-docker-auth"
+          install -d -m 0700 "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          az account get-access-token \
+            --resource https://management.azure.com/ \
+            --query accessToken \
+            --output tsv \
+          | curl --fail --silent --show-error \
+              --request POST \
+              --header 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode 'grant_type=access_token' \
+              --data-urlencode "service=$ACR_SERVER" \
+              --data-urlencode "tenant=$AZURE_TENANT_ID" \
+              --data-urlencode 'access_token@-' \
+              "https://$ACR_SERVER/oauth2/exchange" \
+          | jq -jer '.refresh_token' \
+          | docker login "$ACR_SERVER" \
+              --username 00000000-0000-0000-0000-000000000000 \
+              --password-stdin >/dev/null
+          docker pull "$CONTROLLER_IMAGE" >/dev/null
+          repo_digests="$(docker image inspect "$CONTROLLER_IMAGE" \
+            --format '{{json .RepoDigests}}')"
+          jq -e --arg expected "$CONTROLLER_IMAGE" \
+            'type == "array" and length == 1 and .[0] == $expected' \
+            <<<"$repo_digests" >/dev/null
+          image_config="$(docker image inspect "$CONTROLLER_IMAGE" \
+            --format '{{.Config.User}}|{{json .Config.Entrypoint}}')"
+          if [[ "$image_config" != '10001:10001|["athena-context","wc013-collector-controller"]' ]]; then
+            echo 'Reviewed controller image user or fixed entrypoint changed.' >&2
+            exit 1
+          fi
+          docker logout "$ACR_SERVER" >/dev/null 2>&1
+
+      - name: Validate and start through the immutable controller image
+        shell: bash
+        run: |
+          set -euo pipefail
+          az account get-access-token \
+            --resource https://management.azure.com/ \
+            --query accessToken \
+            --output tsv \
+          | docker run --rm --interactive \
+              --read-only \
+              --user 10001:10001 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 128 \
+              --memory 256m \
+              --cpus 1 \
+              --mount "type=bind,source=$CONTRACT_PATH,target=/run/athena/collector-contract.json,readonly" \
+              "$CONTROLLER_IMAGE" \
+              --contract /run/athena/collector-contract.json \
+              --controller-identity-client-id "$AZURE_CLIENT_ID" \
+              --use-arm-access-token-stdin
+
+      - name: Remove ephemeral local controller material
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$CONTRACT_PATH"
+          rm -rf "$RUNNER_TEMP/wc013-docker-auth"
+          if [[ -n "${CONTROLLER_IMAGE:-}" ]]; then
+            docker image rm "$CONTROLLER_IMAGE" >/dev/null 2>&1 || true
+          fi

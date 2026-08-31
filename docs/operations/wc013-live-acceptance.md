@@ -189,8 +189,9 @@ The identities remain disjoint:
 3. the presentation identity is attached only to the presentation app for ACR authentication and
    receives only `AcrPull` at the existing registry;
 4. the deployment-owned collector-controller identity is not attached to any runtime and receives
-   only the custom collector Job read/start/execution-read role on the four fixed collector Jobs,
-   with no deployment read permission and no broad Reader role;
+   only the custom collector Job read/start/execution-read role on the four fixed collector Jobs
+   plus `AcrPull` on the existing registry for its exact controller image, with no deployment-read
+   permission and no broad Reader role;
 5. the operator reader principal remains read-only on the operational artifact container; and
 6. the workload identity in `workloadReceiptWriterObjectIds` writes exact run-scoped receipts and
    is neither an operator reader nor an Athena runtime.
@@ -206,7 +207,7 @@ The collector identity has Key Vault sign/verify on the one key, Table Contribut
 table, and Blob Contributor on only the collected-evidence container. The context identity has
 key sign/verify, collected-evidence Reader, and operational-artifact Contributor. The presentation
 and controller identities receive none of those data-plane roles and receive no MCP, workload, or
-broad ARM role. The operator and workload arrays remain normalized and deployment fails if they
+broad ARM role. The controller has only its three Job actions and registry-scoped `AcrPull`. The operator and workload arrays remain normalized and deployment fails if they
 overlap or contain either Athena runtime identity.
 
 The presentation app uses a digest-pinned image and one 0.25-vCPU/0.5-GiB replica in
@@ -241,11 +242,12 @@ The deployment identity needs resource deployment rights in the hosting resource
 assignment rights at the supplied demo resource-group and ACR scopes, and permission to create the
 key-scoped and table-scoped data-plane role assignments and the narrowly assignable custom
 collector-controller role. The supplied existing ACR receives separate `AcrPull` assignments for
-the evidence, context, and presentation identities; no broader registry role is assigned. Review
+the evidence, context, presentation, and controller identities; no broader registry role is
+assigned. The controller identity receives no registry push or management-plane Reader role. Review
 the subscription what-if for deletes, public exposure, and all
 role assignments before creating a deployment.
 
-### Build the runner, presentation, and deployment configuration images
+### Build the runner, controller, presentation, and deployment configuration images
 
 The root `Dockerfile` packages this repository with its normal `pyproject.toml` installation and
 runs the `athena-context wc013-live-acceptance` CLI as a non-root user. It deliberately contains no
@@ -261,6 +263,28 @@ Job is manual and must not be started at this stage.
 docker build --file Dockerfile --tag <registry>/athena/wc013-runner:<reviewed-tag> .
 docker push <registry>/athena/wc013-runner:<reviewed-tag>
 ```
+
+Build the dedicated controller image from the reviewed source commit. It fixes the controller CLI
+entrypoint, includes its Python runtime and dependencies, and contains no deployment artifact or
+credential. Record the ACR manifest digest, not the local image ID or mutable tag.
+
+```powershell
+az acr build `
+  --registry athenademoa6add389 `
+  --image athena/wc013-controller:<reviewed-tag> `
+  --file Dockerfile.wc013-controller `
+  .
+
+$controllerDigest = az acr repository show `
+  --name athenademoa6add389 `
+  --image athena/wc013-controller:<reviewed-tag> `
+  --query digest `
+  --output tsv
+```
+
+Set `.azure/wc013.parameters.json` `collectorControllerImage` to
+`athenademoa6add389.azurecr.io/athena/wc013-controller@$controllerDigest`. The all-zero controller
+placeholder is rejected by Bicep, just like the presentation placeholder.
 
 Build the presentation from its dedicated context. ACR remote build uses the same multi-stage,
 digest-pinned Dockerfile without requiring a local Docker daemon:
@@ -302,9 +326,9 @@ redeployment uses `.azure/wc013.parameters.json`: operator Reader object ID
 ACR, Entra applications, and audiences. The controller principal is deployment-owned and is not a
 parameter. Review the two arrays independently and never reuse either principal for a runtime,
 presentation, or controller identity. Before any ARM validation, what-if, or deployment, replace
-the all-zero presentation digest; the Bicep entrypoint deliberately rejects it. Before any Job
-start, also replace bootstrap authority/assertion pins and the runner/delivery image with current
-reviewed renderer/build output.
+the all-zero presentation and controller-image digests; the Bicep entrypoint deliberately rejects
+both. Before any Job start, also replace bootstrap authority/assertion pins and the runner/delivery
+image with current reviewed renderer/build output.
 
 ```powershell
 az deployment sub what-if `
@@ -391,7 +415,7 @@ az deployment sub create `
 # Capture once with the deployment identity; this is not run by the collector workflow.
 az deployment sub show `
   --name $readyDeploymentName `
-  --query '{id:id,correlationId:properties.correlationId,templateHash:properties.templateHash,contracts:properties.outputs.evidenceCollectorStartContracts.value}' `
+  --query '{id:id,correlationId:properties.correlationId,templateHash:properties.templateHash,controllerImage:properties.outputs.collectorControllerImage.value,contracts:properties.outputs.evidenceCollectorStartContracts.value}' `
   --output json
 
 # Only after the deployment-bound artifact and exact choice are reviewed and merged:
@@ -411,18 +435,32 @@ cannot exchange a token.
 After the uniquely named ready deployment, capture its output once with the deployment identity.
 Create and independently review the artifact described in
 `infra/wc013-live-acceptance/reviewed-collector-contracts/README.md`. It binds all three phase
-contracts to the exact deployment resource ID, correlation ID, ARM template hash, deployment source
-commit, canonical contracts digest, and complete artifact-byte digest. Commit that artifact, one literal workflow choice, and its exact `index.json` metadata entry
-together. The fixed selector path accepts no caller path and no template override. The current `pending-review-no-deployment` choice exits before Azure login and must remain
-the only choice until this review is complete.
+contracts and individual hashes, the exact controller ACR RepoDigest, deployment resource ID,
+correlation ID, ARM template hash, source commit, canonical contracts digest, and complete
+artifact-byte digest. Commit that artifact, one literal workflow choice, and its exact `index.json`
+metadata entry together. The fixed selector path accepts no caller path, image, command, or template
+override. The current `pending-review-no-deployment` choice exits before Azure login and remains the
+only choice until review is complete.
 
-The workflow grants only `contents: read` and `id-token: write`, pins action revisions, checks out
-`${{ github.sha }}` rather than mutable `main`, verifies `HEAD`, and resolves the byte-pinned
-repository artifact before `azure/login`. It never calls `az deployment` and the OIDC identity has
-no deployment-read role. A pending environment-approved run therefore cannot drift when `main` or
-an Azure deployment record changes. Inputs remain closed choices for one exact deployment and one
-of `baseline`, `faulted`, or `recovered`; no image, command, args, environment, path, or template
-input exists.
+The workflow grants only `contents: read` and `id-token: write`, pins action revisions, runs on the
+specific available `ubuntu-24.04` label, checks out `${{ github.sha }}`, and verifies `HEAD`. It uses
+host `jq` and SHA-256 only to validate the immutable artifact and extract one allowlisted phase. It
+does not install or execute repository Python on the hosted runner. After OIDC login it exchanges a short-lived ARM token directly with the fixed ACR OAuth endpoint for a
+pull token, pulls the artifact-pinned image, deletes Docker auth state, and verifies the
+pulled RepoDigest exactly. It mounts only the selected mode-`0444` contract read-only into an
+unprivileged, read-only, capability-free container with the image's fixed controller entrypoint.
+
+One short-lived ARM access token is piped directly from Azure CLI to container stdin. It is never a
+command argument, environment variable, file, mount, log value, or persisted container credential.
+The dedicated stdin credential consumes it once, checks bounded JWT audience/expiry, keeps it only
+in process memory, and redacts all token-related failures. The workflow never reads a deployment;
+the identity has only the exact Job role plus ACR `AcrPull`. Inputs remain closed choices for one
+exact deployment and `baseline`, `faulted`, or `recovered`—never a path, token, image, command,
+arguments, environment, or template.
+
+The unavoidable residual boundary is GitHub's hosted `ubuntu-24.04` image and its Azure CLI, `curl`, `jq`,
+SHA-256, Docker client, and Docker daemon. Commit/action/image/contract digest checks and temporary
+credential cleanup reduce but cannot eliminate trust in that hosted substrate.
 
 The controller first retrieves the deployed Job, rejects any identity, registry, image, command,
 argument, environment, resource, init-container, volume, trigger, retry, or timeout difference,
@@ -446,7 +484,8 @@ The relevant final outputs include the MCP endpoint/environment, evidence and co
 Key Vault key, replay/artifact endpoints and scopes, all acceptance/phase/collector Job names and
 IDs, and `evidenceCollectorStartContracts`. Controller outputs are
 `collectorControllerRoleDefinitionId`, `collectorControllerIdentityClientId`,
-`collectorControllerIdentityPrincipalId`, and `collectorControllerIdentityResourceId`.
+`collectorControllerIdentityPrincipalId`, `collectorControllerIdentityResourceId`, and the exact
+`collectorControllerImage` RepoDigest.
 Presentation outputs are `presentationContainerAppName`, `presentationContainerAppResourceId`,
 `presentationFqdn`, `presentationHttpsUrl`, and all three presentation identity IDs. Use the fully
 qualified `presentationHttpsUrl` only from the linked VNet/jumpbox and verify `/healthz`, JSON MIME,

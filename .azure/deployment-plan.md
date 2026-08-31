@@ -38,7 +38,7 @@ The user reconfirmed the subscription, location, and private presentation access
 |-----------|------|------------|------|
 | Private Azure MCP | Internal service | Azure Container Apps | `infra/azure-mcp/` |
 | Isolated evidence collectors | Four manual jobs | Python 3.14 / Container Apps Jobs | `src/athena_context/wc013_evidence_collector.py` |
-| Governed collector controller | Control-plane client | Python 3.14 / GitHub OIDC managed identity | `src/athena_context/wc013_collector_controller.py` |
+| Governed collector controller | Control-plane client | Digest-pinned Python 3.14 container / GitHub OIDC | `src/athena_context/wc013_collector_controller.py` |
 | WC-013 evaluation | One manual job | Python 3.14 / Container Apps Jobs | `src/athena_context/live_acceptance.py` |
 | Operational phases | Three manual jobs | Python 3.14 / Container Apps Jobs | `src/athena_context/operational_phase_job.py` |
 | Immutable evidence plane | Storage | Private Blob and Table endpoints | `infra/wc013-live-acceptance/` |
@@ -79,7 +79,7 @@ signing, and a private static presentation container.
 | Presentation hosting | NGINX unprivileged container | Same-origin JSON, HTTPS ingress, CSP headers |
 | Operational artifacts | Existing StorageV2 account | OAuth only, versioned immutable containers |
 | Signing | Existing Key Vault key | Managed identity, RS256 |
-| Container images | Existing Basic ACR | Digest-pinned runner, delivery, and presentation images |
+| Container images | Existing Basic ACR | Digest-pinned runner, delivery, controller, and presentation images |
 
 ### Identity and trust boundaries
 
@@ -91,16 +91,21 @@ signing, and a private static presentation container.
 - The operator artifact reader remains `51425b07-8512-4c49-a763-23a09c347f0b`.
 - A new collector-controller identity is created with only the custom collector Job
   read/start/execution-read role. It is not attached to any Athena runtime and has no deployment
-  read permission or broad Reader role.
+  read permission or broad Reader role. It receives only one additional `AcrPull` assignment on
+  the existing ACR for the exact controller image.
 - A GitHub OIDC federated credential binds that controller identity to the protected
   `cabberley/Athena-workload-context` deployment environment so collector starts execute reviewed
-  controller code without a client secret. The workflow checks out the immutable dispatch SHA and
-  selects only a byte-pinned, deployment-ID/correlation/template-hash-bound contract artifact from
-  that same reviewed commit; it never reads mutable Azure deployment outputs.
+  controller code without a client secret. The workflow checks out the immutable dispatch SHA,
+  selects a byte-pinned deployment contract, pulls its exact reviewed controller RepoDigest, and
+  executes only that image with a one-shot ARM token piped through stdin. No repository Python or
+  dependencies execute on the host, and the workflow never reads mutable deployment outputs.
 - A new presentation identity receives only `AcrPull`; the presentation container receives no
   Blob, Key Vault, MCP, workload, or ARM role.
 - The presentation browser makes same-origin requests only and validates content hashes,
   RFC 8785 digests, RS256 signatures, key fingerprint, and lifecycle consistency before rendering.
+- The unavoidable execution substrate is GitHub's hosted `ubuntu-24.04` runner and its pinned-action
+  plumbing (`azure/login`, Azure CLI, curl, jq, SHA-256, Docker client/daemon). No repository Python
+  runs there; exact image/contract digests and ephemeral token pipes bound the residual trust.
 
 ### Network boundary
 
@@ -114,8 +119,8 @@ signing, and a private static presentation container.
 
 1. Add presentation container packaging, Bicep resources, controller identity federation, and
    deployment parameter updates.
-2. Build the runner and presentation images in ACR and replace the rejected presentation
-   placeholder before any ARM validation or what-if.
+2. Build the runner, controller, and presentation images in ACR and replace both rejected
+   controller/presentation placeholders before any ARM validation or what-if.
 3. Run Bicep build/lint, repository tests, application tests, policy checks, ARM validation, and
    full what-if. Placeholder parameters must fail closed.
 4. Deploy the bootstrap infrastructure without starting a Job.
@@ -125,8 +130,9 @@ signing, and a private static presentation container.
    bundle, build the delivery image, and update exact image/digest parameters.
 7. Run a second validation/what-if and deploy the ready configuration under a unique
    timestamp/source-commit deployment name that is never reused.
-8. Capture and review the exact deployment ID, correlation ID, template hash, and collector
-   contracts; commit their byte-pinned artifact and exact workflow choice before enabling starts.
+8. Capture and review the exact deployment ID, correlation ID, template hash, controller image,
+   and collector contracts; commit their byte-pinned artifact and exact workflow choice before
+   enabling starts.
 9. Verify identities, scoped RBAC, collector/evaluator job templates, immutable containers, private
    DNS, image digests, and presentation headers/content from the jumpbox.
 
@@ -171,13 +177,16 @@ signing, and a private static presentation container.
 - [x] Add governed controller identity and GitHub OIDC federation
 - [x] Bind workflow code to dispatch SHA and remove runtime deployment reads
 - [x] Add fail-closed reviewed deployment-contract artifact selection
-- [x] Hard-reject the all-zero presentation image digest in Bicep
+- [x] Package controller code/dependencies in a fixed-entrypoint digest-pinned image
+- [x] Replace host Python with verified ACR image execution and one-shot stdin ARM token
+- [x] Grant the OIDC controller identity only registry-scoped `AcrPull` in addition to Job actions
+- [x] Hard-reject all-zero controller and presentation image digests in Bicep
 - [x] Correct operator reader, workload receipt writer, and controller parameters
 - [x] Add/update deterministic deployment tests and documentation
 - [x] Run local preparation tests, audits, container checks, Bicep build/lint, validator, and diff check
-- [ ] Build digest-pinned runner and presentation images
+- [ ] Build digest-pinned runner, controller, and presentation images
 - [ ] Generate current reviewed WC-013 configuration and delivery image
-- [ ] Replace the rejected presentation digest before ARM validation
+- [ ] Replace the rejected controller and presentation digests before ARM validation
 - [ ] Update plan status to `Ready for Validation`
 
 ### Phase 3: Validation
@@ -224,8 +233,9 @@ counts, and timestamps before deployment.
 | File | Purpose | Status |
 |------|---------|--------|
 | `.azure/deployment-plan.md` | Deployment source of truth | Executing |
-| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Blocked by rejected presentation digest |
+| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Blocked by rejected controller/presentation digests |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
+| `Dockerfile.wc013-controller` | Immutable fixed-entrypoint controller image | Prepared |
 | `apps/presentation-web/nginx.conf` | Same-origin MIME, caching, and CSP headers | Prepared |
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
@@ -238,11 +248,11 @@ counts, and timestamps before deployment.
 
 > Current: Preparation
 
-1. Build the runner and presentation images in ACR and replace the hard-rejected presentation
-   placeholder with its reviewed manifest digest.
+1. Build the runner, controller, and presentation images in ACR and replace the hard-rejected
+   controller/presentation placeholders with reviewed manifest digests.
 2. Generate and review the current WC-013 configuration/delivery image and update its exact pins.
 3. Mark the plan `Ready for Validation`, then invoke `azure-validate`; the parameter path must fail
    while any rejected placeholder remains. Deploy only after current proof is `Validated`.
 4. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
-   collector outputs, and commit the byte-pinned deployment artifact plus exact workflow choice/index entry.
-   Until that commit, the workflow intentionally exits before OIDC login.
+   collector outputs, and commit the byte-pinned deployment artifact plus exact workflow
+   choice/index entry. Until that commit, the workflow intentionally exits before OIDC login.

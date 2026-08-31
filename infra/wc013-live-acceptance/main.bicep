@@ -113,6 +113,11 @@ param acceptanceImageRegistryServer string
 @maxLength(2048)
 param acceptanceImageRegistryResourceId string
 
+@description('Digest-pinned controller image executed only by the protected GitHub workflow.')
+@minLength(1)
+@maxLength(2048)
+param collectorControllerImage string
+
 @description('Digest-pinned production image for the private presentation web app.')
 @minLength(1)
 @maxLength(2048)
@@ -151,11 +156,17 @@ var resourceTags = union(tags, {
 var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
   ? acceptanceImage
   : fail('acceptanceImage must be pinned by a sha256 manifest digest')
-var rejectedPresentationImageSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var validatedControllerImage = contains(collectorControllerImage, '@sha256:') && startsWith(
+  toLower(collectorControllerImage),
+  '${toLower(acceptanceImageRegistryServer)}/athena/wc013-controller@sha256:'
+) && !endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)
+  ? collectorControllerImage
+  : fail('collectorControllerImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
 var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
   toLower(presentationImage),
   '${toLower(presentationImageRegistryServer)}/'
-) && !endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)
+) && !endsWith(toLower(presentationImage), rejectedImageDigestSuffix)
   ? presentationImage
   : fail('presentationImage must use a real non-placeholder sha256 digest from presentationImageRegistryServer')
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
@@ -359,6 +370,19 @@ module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
   }
 }
 
+module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
+  name: 'wc013-controller-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-collector-controller-id'
+    identityPrincipalId: collectorControllerIdentity.outputs.principalId
+  }
+}
+
 @description('Resource ID of the dedicated WC-013 hosting resource group.')
 output foundationResourceGroupResourceId string = foundationResourceGroup.id
 
@@ -469,6 +493,9 @@ output collectorControllerIdentityClientId string = collectorControllerIdentity.
 
 @description('Deployment-owned collector controller identity principal ID receiving only the collector controller role.')
 output collectorControllerIdentityPrincipalId string = validatedCollectorControllerPrincipalId
+
+@description('Exact digest-pinned ACR image containing the reviewed controller code and dependencies.')
+output collectorControllerImage string = validatedControllerImage
 
 @description('Name of the private presentation Container App.')
 output presentationContainerAppName string = presentationWeb.outputs.name

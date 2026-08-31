@@ -34,11 +34,11 @@ param tags object = {}
 
 var presentationName = '${namePrefix}-presentation'
 var presentationIdentityName = '${namePrefix}-presentation-id'
-var rejectedPresentationImageSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
   toLower(presentationImage),
   '${toLower(presentationImageRegistryServer)}/'
-) && !endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)
+) && !endsWith(toLower(presentationImage), rejectedImageDigestSuffix)
   ? presentationImage
   : fail('presentationImage must be hosted in presentationImageRegistryServer and use a real non-placeholder sha256 digest')
 var presentationTags = union(tags, {

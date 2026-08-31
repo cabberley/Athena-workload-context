@@ -44,6 +44,8 @@ param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000
 param acceptanceImage = 'athenasynth.azurecr.io/athena/wc013-live@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param acceptanceImageRegistryServer = 'athenasynth.azurecr.io'
 param acceptanceImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+// Synthetic controller image shape; replace with the reviewed ACR RepoDigest before validation.
+param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222'
 // Synthetic non-placeholder digest shape; replace with a real ACR manifest digest before deployment.
 // The Bicep entrypoint rejects the all-zero preparation placeholder.
 param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:1111111111111111111111111111111111111111111111111111111111111111'

@@ -30,6 +30,9 @@ jobs:
         run: python -m mypy src
       - name: Test
         run: python -m pytest
+      - name: Test immutable controller container
+        shell: pwsh
+        run: ./test-controller-container.ps1
 
   context-studio:
     runs-on: ubuntu-latest

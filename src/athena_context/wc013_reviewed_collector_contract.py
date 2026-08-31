@@ -29,6 +29,10 @@ _DEPLOYMENT_RESOURCE_ID_PATTERN = re.compile(
     r"wc013-ready-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$"
 )
 _TEMPLATE_HASH_PATTERN = re.compile(r"^[0-9]{1,32}$")
+_CONTROLLER_IMAGE_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{3,48}[a-z0-9])\.azurecr\.io/"
+    r"[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[a-f0-9]{64}$"
+)
 _DEPLOYMENT_NAME_PATTERN = re.compile(
     r"^wc013-ready-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}$"
 )
@@ -39,7 +43,9 @@ _OUTER_KEYS = frozenset(
         "deploymentCorrelationId",
         "deploymentTemplateHash",
         "sourceCommit",
+        "controllerImage",
         "collectorContractsDigest",
+        "collectorContractDigests",
         "contracts",
     }
 )
@@ -153,7 +159,7 @@ def select_reviewed_collector_contract(
         raise ReviewedCollectorContractError(
             "reviewed deployment contract artifact has unexpected fields"
         )
-    if parsed["schemaVersion"] != "athena.wc013CollectorDeploymentContract.v1":
+    if parsed["schemaVersion"] != "athena.wc013CollectorDeploymentContract.v2":
         raise ReviewedCollectorContractError(
             "reviewed deployment contract artifact schema is unsupported"
         )
@@ -168,11 +174,37 @@ def select_reviewed_collector_contract(
             "reviewed deployment contract metadata does not match the approved execution"
         )
 
+    controller_image = parsed["controllerImage"]
+    if (
+        not isinstance(controller_image, str)
+        or _CONTROLLER_IMAGE_PATTERN.fullmatch(controller_image) is None
+        or controller_image.endswith("@sha256:" + "0" * 64)
+    ):
+        raise ReviewedCollectorContractError(
+            "reviewed deployment contract controller image is not an exact ACR digest"
+        )
+
     contracts = parsed["contracts"]
     if not isinstance(contracts, dict) or set(contracts) != set(_PHASES):
         raise ReviewedCollectorContractError(
             "reviewed deployment contract must contain exactly the three phases"
         )
+    contract_digests = parsed["collectorContractDigests"]
+    if not isinstance(contract_digests, dict) or set(contract_digests) != set(_PHASES):
+        raise ReviewedCollectorContractError(
+            "reviewed deployment contract must pin each selected contract"
+        )
+    for contract_phase in _PHASES:
+        contract_digest = contract_digests[contract_phase]
+        if (
+            not isinstance(contract_digest, str)
+            or _SHA256_PATTERN.fullmatch(contract_digest) is None
+            or contract_digest == "sha256:" + "0" * 64
+            or _canonical_digest(contracts[contract_phase]) != contract_digest
+        ):
+            raise ReviewedCollectorContractError(
+                f"reviewed {contract_phase} collector contract digest does not match"
+            )
     contracts_digest = parsed["collectorContractsDigest"]
     if (
         not isinstance(contracts_digest, str)
@@ -228,6 +260,10 @@ def select_reviewed_collector_contract(
                 "reviewed phase collector contracts do not share one deployment binding"
             )
         reviewed[contract_phase] = contract
+    if common_binding is None or controller_image.split("/", 1)[0] != common_binding[4]:
+        raise ReviewedCollectorContractError(
+            "reviewed controller and collector images must use the same exact ACR"
+        )
     return reviewed[phase]
 
 

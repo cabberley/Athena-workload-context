@@ -123,14 +123,36 @@ def test_presentation_bicep_is_private_and_acr_pull_only() -> None:
         assert f"output {output}" in orchestration
 
 
+def test_controller_image_is_immutable_and_has_a_fixed_entrypoint() -> None:
+    dockerfile = _read("Dockerfile.wc013-controller")
+    container_test = _read("test-controller-container.ps1")
+    ci = _read(".github/workflows/ci.yml")
+
+    assert dockerfile.startswith("# syntax=docker/dockerfile:1.7@sha256:")
+    image = re.search(r"^FROM (\S+)$", dockerfile, re.MULTILINE)
+    assert image is not None
+    assert re.fullmatch(r"python:3\.14\.7-slim-bookworm@sha256:[a-f0-9]{64}", image[1])
+    assert "python -m pip install" in dockerfile
+    assert "USER 10001:10001" in dockerfile
+    assert 'ENTRYPOINT ["athena-context", "wc013-collector-controller"]' in dockerfile
+    assert "CMD " not in dockerfile
+    assert "AZURE_" not in dockerfile
+    assert "test-controller-container.ps1" in ci
+    assert "docker image inspect" in container_test
+    assert "--read-only" in container_test
+    assert "--use-arm-access-token-stdin" in container_test
+
+
 def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None:
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     resources = _read(
         "infra/wc013-live-acceptance/modules/acceptance-resources.bicep"
     )
     workflow = _read(".github/workflows/wc013-collector-controller.yml")
+    acr_pull = _read("infra/wc013-live-acceptance/modules/acr-pull-rbac.bicep")
 
     assert "param collectorControllerPrincipalId" not in orchestration
+    assert "param collectorControllerImage string" in orchestration
     assert (
         "br/public:avm/res/managed-identity/user-assigned-identity:0.6.0"
         in orchestration
@@ -154,6 +176,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
         "collectorControllerIdentityClientId",
         "collectorControllerIdentityPrincipalId",
         "collectorControllerIdentityResourceId",
+        "collectorControllerImage",
     ):
         assert f"output {output}" in orchestration
 
@@ -162,14 +185,25 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     role_start = orchestration.index("resource collectorControllerRoleDefinition")
     role_end = orchestration.index("\nmodule privateDns", role_start)
     role = orchestration[role_start:role_end]
-    assert "'Microsoft.App/jobs/read'" in role
-    assert "'Microsoft.App/jobs/start/action'" in role
-    assert "'Microsoft.App/jobs/executions/read'" in role
+    actions = re.findall(r"^          '([^']+)'$", role, re.MULTILINE)
+    assert actions == [
+        "Microsoft.App/jobs/read",
+        "Microsoft.App/jobs/start/action",
+        "Microsoft.App/jobs/executions/read",
+    ]
     assert "Microsoft.Resources/deployments/read" not in role
     assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" not in role
+    controller_pull_start = orchestration.index("module collectorControllerImagePull")
+    controller_pull_end = orchestration.index("\n@description", controller_pull_start)
+    controller_pull = orchestration[controller_pull_start:controller_pull_end]
+    assert "collectorControllerIdentity.outputs.principalId" in controller_pull
+    assert "acceptanceImageRegistryResourceId" in controller_pull
+    assert "7f951dda-4ed3-4680-a7ca-43fe172d538d" in acr_pull
 
     assert "environment: athena-live" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert "ubuntu-latest" not in workflow
     assert "ref: ${{ github.sha }}" in workflow
     assert "ref: main" not in workflow
     assert "DISPATCH_SHA: ${{ github.sha }}" in workflow
@@ -182,17 +216,39 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert all(re.fullmatch(r"[a-f0-9]{40}", ref) for ref in action_refs)
     assert "client-id: ${{ env.AZURE_CLIENT_ID }}" in workflow
     assert "client-secret" not in workflow.casefold()
-    assert "--use-azure-cli-credential" in workflow
-    assert "athena-context wc013-collector-controller" in workflow
-    assert "athena_context.wc013_reviewed_collector_contract" in workflow
-    assert "--index infra/wc013-live-acceptance/reviewed-collector-contracts/index.json" in workflow
-    assert '--deployment "$DEPLOYMENT_SELECTION"' in workflow
-    assert workflow.index("Select the immutable reviewed deployment contract") < (
-        workflow.index("Sign in as the deployment-owned controller identity")
-    )
+    assert "setup-python" not in workflow
+    assert "pip install" not in workflow
+    assert "python -m" not in workflow
+    assert "--use-azure-cli-credential" not in workflow
+    assert "--use-arm-access-token-stdin" in workflow
     assert "az deployment" not in workflow
-    assert "wc013-ready" not in workflow
     assert "properties.outputs" not in workflow
+    assert 'docker pull "$CONTROLLER_IMAGE"' in workflow
+    assert "az acr login" not in workflow
+    assert '"https://$ACR_SERVER/oauth2/exchange"' in workflow
+    assert "--data-urlencode 'access_token@-'" in workflow
+    assert "| jq -jer '.refresh_token'" in workflow
+    assert "--password-stdin" in workflow
+    assert "{{json .RepoDigests}}" in workflow
+    assert ".[0] == $expected" in workflow
+    assert '10001:10001|["athena-context","wc013-collector-controller"]' in workflow
+    assert "--entrypoint" not in workflow
+    assert "--read-only" in workflow
+    assert "--user 10001:10001" in workflow
+    assert "--cap-drop ALL" in workflow
+    assert "--security-opt no-new-privileges" in workflow
+    assert workflow.count("--mount ") == 1
+    assert "target=/run/athena/collector-contract.json,readonly" in workflow
+    assert "az account get-access-token" in workflow
+    assert "| docker run --rm --interactive" in workflow
+    assert "ARM_ACCESS_TOKEN" not in workflow
+    assert "accessToken" not in workflow.split("env:", 1)[1].split("steps:", 1)[0]
+    assert workflow.index("Select one byte-pinned reviewed contract") < workflow.index(
+        "Sign in as the deployment-owned controller identity"
+    )
+    assert workflow.index("Pull and verify the exact reviewed controller image") < (
+        workflow.index("Validate and start through the immutable controller image")
+    )
     assert "pending-review-no-deployment' ]]" in workflow
     assert "No immutable reviewed deployment contract is enabled." in workflow
     reviewed_index = json.loads(
@@ -219,9 +275,16 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert phase_options == ["baseline", "faulted", "recovered"]
     assert dispatch_inputs.count("type: choice") == 2
     assert "          - pending-review-no-deployment" in dispatch_inputs
-    for forbidden_input in ("image:", "command:", "args:", "env:", "template:", "path:"):
+    for forbidden_input in (
+        "image:",
+        "command:",
+        "args:",
+        "env:",
+        "template:",
+        "path:",
+        "token:",
+    ):
         assert forbidden_input not in dispatch_inputs
-
 
 def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None:
     parameters = json.loads(_read(".azure/wc013.parameters.json"))["parameters"]
@@ -247,13 +310,24 @@ def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None
     )
     rejected_suffix = "@sha256:" + "0" * 64
     for bicep in (orchestration, presentation):
-        assert f"rejectedPresentationImageSuffix = '{rejected_suffix}'" in bicep
+        assert f"rejectedImageDigestSuffix = '{rejected_suffix}'" in bicep
         assert (
-            "!endsWith(toLower(presentationImage), rejectedPresentationImageSuffix)"
+            "!endsWith(toLower(presentationImage), rejectedImageDigestSuffix)"
             in bicep
         )
         assert "real non-placeholder sha256 digest" in bicep
     assert "presentationImage: validatedPresentationImage" in orchestration
+    controller_image = parameters["collectorControllerImage"]["value"]
+    assert re.fullmatch(
+        r"athenademoa6add389\.azurecr\.io/athena/wc013-controller"
+        r"@sha256:0{64}",
+        controller_image,
+    )
+    assert (
+        "!endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)"
+        in orchestration
+    )
+    assert "collectorControllerImage must use the fixed ACR repository" in orchestration
     example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
     example_presentation_image = next(
         line for line in example.splitlines() if line.startswith("param presentationImage =")

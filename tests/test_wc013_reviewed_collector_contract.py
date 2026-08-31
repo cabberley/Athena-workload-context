@@ -25,6 +25,9 @@ DEPLOYMENT_RESOURCE_ID = (
 DEPLOYMENT_CORRELATION_ID = "22222222-2222-2222-2222-222222222222"
 DEPLOYMENT_TEMPLATE_HASH = "1234567890123456789"
 SOURCE_COMMIT = "a" * 40
+CONTROLLER_IMAGE = (
+    "athenafixture.azurecr.io/athena/wc013-controller@sha256:" + "5" * 64
+)
 EVIDENCE_IDENTITY_RESOURCE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture/providers/"
     "Microsoft.ManagedIdentity/userAssignedIdentities/athena-mcp-evidence"
@@ -124,12 +127,17 @@ def _write_artifact(
         phase: _contract(phase) for phase in ("baseline", "faulted", "recovered")
     }
     artifact: dict[str, object] = {
-        "schemaVersion": "athena.wc013CollectorDeploymentContract.v1",
+        "schemaVersion": "athena.wc013CollectorDeploymentContract.v2",
         "deploymentResourceId": DEPLOYMENT_RESOURCE_ID,
         "deploymentCorrelationId": DEPLOYMENT_CORRELATION_ID,
         "deploymentTemplateHash": DEPLOYMENT_TEMPLATE_HASH,
         "sourceCommit": SOURCE_COMMIT,
+        "controllerImage": CONTROLLER_IMAGE,
         "collectorContractsDigest": _canonical_digest(exact_contracts),
+        "collectorContractDigests": {
+            phase: _canonical_digest(contract)
+            for phase, contract in exact_contracts.items()
+        },
         "contracts": exact_contracts,
     }
     payload = json.dumps(
@@ -291,6 +299,40 @@ def test_rejects_artifact_byte_drift_and_unselected_contract_drift(
     _, changed_digest = _write_artifact(artifact_path, contracts=contracts)
     with pytest.raises(ReviewedCollectorContractError, match="one deployment binding"):
         _select(artifact_path, changed_digest, phase="baseline")
+
+
+def test_rejects_placeholder_or_cross_registry_controller_image(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "reviewed.json"
+    artifact, _ = _write_artifact(artifact_path)
+    artifact["controllerImage"] = (
+        "athenafixture.azurecr.io/athena/wc013-controller@sha256:" + "0" * 64
+    )
+    payload = json.dumps(
+        artifact,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    artifact_path.write_bytes(payload)
+    with pytest.raises(ReviewedCollectorContractError, match="exact ACR digest"):
+        _select(artifact_path, _digest(payload))
+
+    artifact["controllerImage"] = (
+        "otherfixture.azurecr.io/athena/wc013-controller@sha256:" + "5" * 64
+    )
+    payload = json.dumps(
+        artifact,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    artifact_path.write_bytes(payload)
+    with pytest.raises(ReviewedCollectorContractError, match="same exact ACR"):
+        _select(artifact_path, _digest(payload))
 
 
 def test_rejects_existing_selected_contract_output(tmp_path: Path) -> None:

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
+import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, BinaryIO, Literal, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from azure.identity import AzureCliCredential, DefaultAzureCredential
+from azure.identity import DefaultAzureCredential
 from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
 
 from athena_context.contracts import AthenaBaseModel, compute_artifact_digest
@@ -19,6 +22,12 @@ _ARM_SCOPE = "https://management.azure.com/.default"
 _ARM_API_VERSION = "2024-03-01"
 _MAX_CONTRACT_BYTES = 128 * 1024
 _MAX_ARM_RESPONSE_BYTES = 256 * 1024
+_MAX_ARM_ACCESS_TOKEN_BYTES = 32 * 1024
+_MAX_ARM_ACCESS_TOKEN_LIFETIME_SECONDS = 2 * 60 * 60
+_MIN_ARM_ACCESS_TOKEN_REMAINING_SECONDS = 30
+_COMPACT_JWT_PATTERN = re.compile(
+    r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"
+)
 _GUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -32,6 +41,73 @@ _IDENTITY_RESOURCE_ID_PATTERN = (
     r"providers/Microsoft\.ManagedIdentity/userAssignedIdentities/"
     r"[A-Za-z0-9-_]{1,128}$"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _EphemeralAccessToken:
+    token: str
+    expires_on: int
+
+
+class StdinArmAccessTokenCredential:
+    """One-process ARM credential that consumes one bounded token from stdin."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        try:
+            payload = stream.read(_MAX_ARM_ACCESS_TOKEN_BYTES + 1)
+        except OSError:
+            raise Wc013CollectorControllerError(
+                "short-lived ARM access token could not be consumed"
+            ) from None
+        if not payload or len(payload) > _MAX_ARM_ACCESS_TOKEN_BYTES:
+            raise Wc013CollectorControllerError(
+                "short-lived ARM access token is empty or oversized"
+            )
+        try:
+            token = payload.decode("ascii").strip()
+            if _COMPACT_JWT_PATTERN.fullmatch(token) is None:
+                raise ValueError("token is not a compact JWT")
+            segments = token.split(".")
+            claims_payload = segments[1] + "=" * (-len(segments[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(claims_payload))
+            expires_on = claims.get("exp") if isinstance(claims, dict) else None
+            audience = claims.get("aud") if isinstance(claims, dict) else None
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            raise Wc013CollectorControllerError(
+                "short-lived ARM access token failed closed validation"
+            ) from None
+        now = int(time.time())
+        if (
+            type(expires_on) is not int
+            or expires_on <= now + _MIN_ARM_ACCESS_TOKEN_REMAINING_SECONDS
+            or expires_on > now + _MAX_ARM_ACCESS_TOKEN_LIFETIME_SECONDS
+            or audience
+            not in {
+                "https://management.azure.com/",
+                "https://management.core.windows.net/",
+            }
+        ):
+            raise Wc013CollectorControllerError(
+                "short-lived ARM access token has invalid bounded claims"
+            )
+        self._access_token = _EphemeralAccessToken(
+            token=token,
+            expires_on=expires_on,
+        )
+
+    def get_token(self, scope: str) -> _EphemeralAccessToken:
+        if scope != _ARM_SCOPE:
+            raise Wc013CollectorControllerError(
+                "short-lived token credential was requested for an invalid scope"
+            )
+        if (
+            self._access_token.expires_on
+            <= int(time.time()) + _MIN_ARM_ACCESS_TOKEN_REMAINING_SECONDS
+        ):
+            raise Wc013CollectorControllerError(
+                "short-lived ARM access token expired before use"
+            )
+        return self._access_token
 
 
 class Wc013CollectorControllerError(RuntimeError):
@@ -339,15 +415,24 @@ class AzureContainerAppsCollectorJobManagementClient:
         self,
         *,
         controller_identity_client_id: str,
-        use_azure_cli_credential: bool = False,
+        use_arm_access_token_stdin: bool = False,
+        arm_access_token_stream: BinaryIO | None = None,
     ) -> None:
         if _GUID_PATTERN.fullmatch(controller_identity_client_id) is None:
             raise ValueError("controller identity client ID must be a GUID")
-        # The default remains the exact managed identity. Azure CLI authentication is an
-        # explicit path only for the protected GitHub environment after azure/login OIDC.
+        if arm_access_token_stream is not None and not use_arm_access_token_stdin:
+            raise ValueError(
+                "ARM access token stream requires explicit stdin credential selection"
+            )
+        # Managed identity remains the default. The protected workflow can select only the
+        # dedicated one-process stdin token credential; it cannot select a developer credential.
         self._credential = (
-            AzureCliCredential()
-            if use_azure_cli_credential
+            StdinArmAccessTokenCredential(
+                arm_access_token_stream
+                if arm_access_token_stream is not None
+                else sys.stdin.buffer
+            )
+            if use_arm_access_token_stdin
             else DefaultAzureCredential(
                 managed_identity_client_id=controller_identity_client_id,
                 exclude_environment_credential=True,
@@ -500,12 +585,14 @@ def run_governed_wc013_collector_start(
     controller_identity_client_id: str,
     management: Wc013CollectorJobManagementPort | None = None,
     validate_only: bool = False,
-    use_azure_cli_credential: bool = False,
+    use_arm_access_token_stdin: bool = False,
+    arm_access_token_stream: BinaryIO | None = None,
 ) -> Wc013CollectorStartResult:
     contract = load_wc013_collector_start_contract(contract_path)
     client = management or AzureContainerAppsCollectorJobManagementClient(
         controller_identity_client_id=controller_identity_client_id,
-        use_azure_cli_credential=use_azure_cli_credential,
+        use_arm_access_token_stdin=use_arm_access_token_stdin,
+        arm_access_token_stream=arm_access_token_stream,
     )
     deployed = client.get_job(contract.job_resource_id)
     template_digest = validate_deployed_wc013_collector_job(contract, deployed)

@@ -1,9 +1,9 @@
 targetScope = 'resourceGroup'
 
-metadata name = 'WC-013 runtime image pull role'
-metadata description = 'Grants one exact WC-013 runtime identity only AcrPull on the supplied existing registry.'
+metadata name = 'WC-013 image pull role'
+metadata description = 'Grants one exact WC-013 managed identity only AcrPull on the supplied existing registry.'
 
-@description('Name of the existing Azure Container Registry hosting the private acceptance image.')
+@description('Name of the existing Azure Container Registry hosting the private image.')
 param registryName string
 
 @description('Deterministic name of the managed identity receiving AcrPull.')
