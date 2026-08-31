@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Executing
+> **Status:** Ready for Validation
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -194,10 +194,10 @@ signing, and a private static presentation container.
 - [x] Correct operator reader, workload receipt writer, and controller parameters
 - [x] Add/update deterministic deployment tests and documentation
 - [x] Run local preparation tests, audits, container checks, Bicep build/lint, validator, and diff check
-- [ ] Build digest-pinned runner, controller, and presentation images
-- [ ] Generate current reviewed WC-013 configuration and delivery image
-- [ ] Replace the rejected controller and presentation digests before ARM validation
-- [ ] Update plan status to `Ready for Validation`
+- [x] Build digest-pinned runner, controller, presentation, and delivery images
+- [x] Reuse the reviewed WC-013 configuration and phase bundle with unchanged key/endpoint identities
+- [x] Replace the rejected controller and presentation digests before ARM validation
+- [x] Update plan status to `Ready for Validation`
 
 ### Phase 3: Validation
 
@@ -257,13 +257,9 @@ counts, and timestamps before deployment.
 
 ## 10. Next Steps
 
-> Current: Preparation
+> Current: Ready for Validation
 
-1. Build the runner, controller, and presentation images in ACR and replace the hard-rejected
-   controller/presentation placeholders with reviewed manifest digests.
-2. Generate and review the current WC-013 configuration/delivery image and update its exact pins.
-3. Mark the plan `Ready for Validation`, then invoke `azure-validate`; the parameter path must fail
-   while any rejected placeholder remains. Deploy only after current proof is `Validated`.
-4. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
+1. Invoke `azure-validate`; deploy only after current proof is `Validated`.
+2. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
    collector outputs, and commit the byte-pinned deployment artifact plus exact workflow
    choice/index entry. Until that commit, the workflow intentionally exits before OIDC login.
