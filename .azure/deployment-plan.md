@@ -244,10 +244,11 @@ signing, and a private static presentation container.
 | Collector endpoint correction | Canonicalized the generated Blob origin before embedding it in collector templates; reran `scripts/check.ps1`, Bicep build, ARM validation, and structured what-if | Passed: 709 tests, 0 deletes, and exact compatibility with the digest-pinned controller contract | 2026-09-01T13:51:32+10:00 |
 | Collector output parity | Bound both the deployed Job template and emitted reviewed contract to the same canonical Blob origin; added a regression assertion and reran the complete repository and ARM gates | Passed: 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:10:07+10:00 |
 | Independent-review hardening | Enforced exact lowercase 64-hex controller/presentation RepoDigests, bound the presentation registry server to its ACR resource ID, and made selected contract output canonical | Passed: GPT-5.4 findings resolved, 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:50:25+10:00 |
+| Canonical round-trip gate | Rejected any reviewed contract whose validated model would rewrite its pinned canonical bytes | Passed: independent follow-up finding resolved, 710 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T15:08:32+10:00 |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-01T14:50:25+10:00
+**Validation timestamp:** 2026-09-01T15:08:32+10:00
 
 ### Role Assignment Verification
 

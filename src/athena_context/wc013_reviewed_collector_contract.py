@@ -246,6 +246,16 @@ def select_reviewed_collector_contract(
             raise ReviewedCollectorContractError(
                 f"reviewed {contract_phase} collector contract failed validation"
             ) from exc
+        normalized_contract = contract.model_dump(
+            by_alias=True,
+            exclude_defaults=True,
+            exclude_none=True,
+            mode="json",
+        )
+        if _canonical_digest(normalized_contract) != contract_digests[contract_phase]:
+            raise ReviewedCollectorContractError(
+                f"reviewed {contract_phase} collector contract is not canonical"
+            )
         expected_suffix, expected_container_name, expected_config_path = (
             _PHASE_BINDINGS[contract_phase]
         )

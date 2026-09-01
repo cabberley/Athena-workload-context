@@ -487,6 +487,20 @@ def test_rejects_relabelled_swapped_contract_phase_semantics(
         _select(artifact_path, digest, phase="baseline")
 
 
+def test_rejects_contract_that_model_validation_would_normalize(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "reviewed.json"
+    contracts = {
+        phase: _contract(phase) for phase in ("baseline", "faulted", "recovered")
+    }
+    contracts["baseline"]["template"]["containers"][0]["resources"]["cpu"] = 0.5  # type: ignore[index]
+    _, digest = _write_artifact(artifact_path, contracts=contracts)
+
+    with pytest.raises(ReviewedCollectorContractError, match="not canonical"):
+        _select(artifact_path, digest)
+
+
 def test_rejects_placeholder_or_cross_registry_controller_image(
     tmp_path: Path,
 ) -> None:
