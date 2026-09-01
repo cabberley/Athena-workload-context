@@ -80,7 +80,8 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
 
     assert "workloadReadScopes: [" in orchestration
     assert "approvedLogWorkspaces: []" in orchestration
-    assert "contains(acceptanceImage, '@sha256:')" in orchestration
+    assert "acceptanceImageRepositoryPrefix" in orchestration
+    assert "validatedAcceptanceImage" in orchestration
     assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" in workload_rbac
     expected_reader_scope = (
         "scope: resourceGroup(readScope.subscriptionId, readScope.resourceGroupName)"
@@ -181,6 +182,70 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
     for forbidden in ("passwordSecretRef", "connectionString", "listKeys(", "secrets:"):
         assert forbidden not in resources
 
+
+def _acceptance_image_is_exact(image: str, registry_server: str) -> bool:
+    prefix = f"{registry_server}/athena/wc013-live@sha256:"
+    digest = image.removeprefix(prefix)
+    return (
+        re.fullmatch(r"[a-z0-9]{5,50}\.azurecr\.io", registry_server) is not None
+        and image == image.casefold()
+        and image.startswith(prefix)
+        and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+        and digest != "0" * 64
+    )
+
+
+def test_wc013_arm_bicep_rejects_foreign_acceptance_images() -> None:
+    registry_server = "athenafixture.azurecr.io"
+    prefix = registry_server + "/athena/wc013-live@sha256:"
+    valid = prefix + "a" * 64
+    repeated_prefix_tail = prefix + "a" * (64 - len(prefix))
+    invalid = (
+        "mcr.microsoft.com/athena/wc013-live@sha256:" + "a" * 64,
+        registry_server + "/other/wc013-live@sha256:" + "a" * 64,
+        "otherfixture.azurecr.io/athena/wc013-live@sha256:" + "a" * 64,
+        registry_server + "/athena/wc013-live@sha256:" + "A" * 64,
+        registry_server + "/athena/wc013-live@sha256:" + "0" * 64,
+        registry_server + "/athena/wc013-live:mutable",
+        prefix + repeated_prefix_tail,
+    )
+    assert _acceptance_image_is_exact(valid, registry_server)
+    assert all(
+        not _acceptance_image_is_exact(image, registry_server) for image in invalid
+    )
+
+    orchestration = _read("infra/wc013-live-acceptance/main.bicep")
+    resources = _read(
+        "infra/wc013-live-acceptance/modules/acceptance-resources.bicep"
+    )
+    for source in (orchestration, resources):
+        assert (
+            "acceptanceImageRepositoryPrefix = "
+            "'${validatedAcceptanceImageRegistryServer}/athena/wc013-live@sha256:'"
+            in source
+        )
+        assert "acceptanceImage == toLower(acceptanceImage)" in source
+        assert (
+            "length(acceptanceImage) == length(acceptanceImageRepositoryPrefix) + 64"
+            in source
+        )
+        assert re.search(
+            r"length\(\s*acceptanceImageDigestCandidate\s*\) == 64", source
+        )
+        assert re.search(
+            r"empty\(\s*acceptanceImageDigestInvalidCharacters\s*\)", source
+        )
+        assert "? acceptanceImage" in source
+        assert "exact acceptanceImageRegistryServer/athena/wc013-live repository" in source
+    assert "expectedAcceptanceImageRegistryServer" in orchestration
+    assert (
+        "acceptanceImageRegistryServer: validatedAcceptanceImageRegistryServer"
+        in orchestration
+    )
+    assert resources.count("image: validatedAcceptanceImage") == 6
+    assert resources.count("server: validatedAcceptanceImageRegistryServer") == 6
+    assert "image: acceptanceImage" not in resources
+    assert "server: acceptanceImageRegistryServer" not in resources
 
 def test_wc013_bicep_rejects_shared_operator_reader_and_receipt_writer_principals() -> None:
     resources = _read("infra/wc013-live-acceptance/modules/acceptance-resources.bicep")
@@ -406,7 +471,8 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
     acceptance = _job_module(resources, "acceptanceJob")
     collectors = _loop_job_module(resources, "evidenceCollectorJobs")
 
-    assert "param collectorControllerPrincipalId string" in orchestration
+    assert "param collectorControllerPrincipalId string" not in orchestration
+    assert "module collectorControllerIdentity" in orchestration
     assert "collectorControllerRoleDefinition" in orchestration
     assert "'Microsoft.App/jobs/read'" in orchestration
     assert "'Microsoft.App/jobs/start/action'" in orchestration
@@ -421,6 +487,7 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
         "collectorControllerPrincipalId: validatedCollectorControllerPrincipalId"
         in orchestration
     )
+    assert "collectorControllerIdentity.outputs.principalId" in orchestration
     assert (
         "collectorControllerRoleDefinitionId: collectorControllerRoleDefinition.id"
         in orchestration
@@ -431,5 +498,7 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
     assert "roleAssignments:" not in acceptance
     assert "output evidenceCollectorStartContracts array" in resources
     assert "evidenceCollectorStartContracts" in orchestration
+    assert resources.count("canonicalReplayBlobEndpoint") == 3
+    assert "substring(replayBlobEndpoint, 0, length(replayBlobEndpoint) - 1)" in resources
     assert "\naz containerapp job start `" not in operations
     assert "wc013-collector-controller" in operations

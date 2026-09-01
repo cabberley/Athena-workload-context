@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "athena.wc013CollectorDeploymentContractIndex.v1",
+  "deployments": {
+    "wc013-ready-20260901T041116Z-14f00fa76009": {
+      "artifactFile": "wc013-ready-20260901T041116Z-14f00fa76009.json",
+      "artifactDigest": "sha256:c9b5a9783ec6499449b11e561649f7824826b7f5030d3f085ecf28f64eedb1fe",
+      "deploymentResourceId": "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/Microsoft.Resources/deployments/wc013-ready-20260901T041116Z-14f00fa76009",
+      "deploymentCorrelationId": "08bf9e92-1c85-45bb-9675-1950c20aa3c1",
+      "deploymentTemplateHash": "5108852879602821134",
+      "sourceCommit": "14f00fa760093cc0ba5fec22c1dffafd3d3422b4"
+    }
+  }
+}

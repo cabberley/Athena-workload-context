@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
+import time
 import traceback
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import URLError
@@ -28,6 +31,27 @@ EVIDENCE_IDENTITY_RESOURCE_ID = (
     "userAssignedIdentities/athena-mcp-evidence"
 )
 EVIDENCE_CLIENT_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def _base64url_json(value: object) -> str:
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _arm_access_token(*, expires_on: int | None = None) -> str:
+    return ".".join(
+        (
+            _base64url_json({"alg": "RS256", "typ": "JWT"}),
+            _base64url_json(
+                {
+                    "aud": "https://management.azure.com/",
+                    "exp": expires_on or int(time.time()) + 300,
+                    "oid": "44444444-4444-4444-4444-444444444444",
+                }
+            ),
+            "syntheticsignature",
+        )
+    )
 
 
 def _contract_payload() -> dict[str, object]:
@@ -131,6 +155,39 @@ def _contract() -> Wc013CollectorStartContract:
     return Wc013CollectorStartContract.model_validate_json(
         json.dumps(_contract_payload())
     )
+
+
+@pytest.mark.parametrize(
+    ("registry_server", "image"),
+    [
+        (
+            "mcr.microsoft.com",
+            "mcr.microsoft.com/athena/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "athenafixture.azurecr.io/other/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "otherfixture.azurecr.io/athena/wc013-live@sha256:" + "a" * 64,
+        ),
+        (
+            "athenafixture.azurecr.io",
+            "athenafixture.azurecr.io/athena/wc013-live@sha256:" + "0" * 64,
+        ),
+    ],
+)
+def test_collector_contract_rejects_non_exact_acceptance_acr_image(
+    registry_server: str,
+    image: str,
+) -> None:
+    payload = _contract_payload()
+    payload["configuration"]["registries"][0]["server"] = registry_server  # type: ignore[index]
+    payload["template"]["containers"][0]["image"] = image  # type: ignore[index]
+
+    with pytest.raises(ValueError):
+        Wc013CollectorStartContract.model_validate(payload)
 
 
 def test_governed_collector_start_validates_then_pins_exact_template(
@@ -349,3 +406,67 @@ def test_arm_client_failure_suppresses_token_from_exception_and_logs(
     assert token not in caplog.text
     assert captured.value.__cause__ is None
     assert captured.value.__suppress_context__
+
+
+def test_arm_client_consumes_only_one_short_lived_stdin_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    token = _arm_access_token()
+    stream = BytesIO((token + "\n").encode("ascii"))
+
+    class _Http:
+        def request(self, **kwargs: object) -> tuple[int, str, bytes]:
+            observed.update(kwargs)
+            return 200, str(kwargs["url"]), b'{"id":"fixture"}'
+
+    monkeypatch.setattr(
+        controller_module,
+        "DefaultAzureCredential",
+        lambda **_kwargs: pytest.fail("managed identity credential was selected"),
+    )
+    monkeypatch.setattr(controller_module, "_ArmHttpStack", lambda: _Http())
+
+    client = AzureContainerAppsCollectorJobManagementClient(
+        controller_identity_client_id="44444444-4444-4444-4444-444444444444",
+        use_arm_access_token_stdin=True,
+        arm_access_token_stream=stream,
+    )
+    result = client.get_job(JOB_RESOURCE_ID)
+
+    assert result == {"id": "fixture"}
+    assert observed["token"] == token
+    assert stream.tell() == len(token) + 1
+
+
+def test_stdin_arm_token_errors_never_disclose_token() -> None:
+    token = _arm_access_token(expires_on=int(time.time()) - 1)
+    with pytest.raises(Wc013CollectorControllerError) as captured:
+        AzureContainerAppsCollectorJobManagementClient(
+            controller_identity_client_id=(
+                "44444444-4444-4444-4444-444444444444"
+            ),
+            use_arm_access_token_stdin=True,
+            arm_access_token_stream=BytesIO(token.encode("ascii")),
+        )
+
+    formatted = "".join(
+        traceback.format_exception(
+            type(captured.value),
+            captured.value,
+            captured.value.__traceback__,
+        )
+    )
+    assert token not in str(captured.value)
+    assert token not in formatted
+    assert captured.value.__cause__ is None
+
+
+def test_arm_token_stream_requires_explicit_stdin_mode() -> None:
+    with pytest.raises(ValueError, match="explicit stdin"):
+        AzureContainerAppsCollectorJobManagementClient(
+            controller_identity_client_id=(
+                "44444444-4444-4444-4444-444444444444"
+            ),
+            arm_access_token_stream=BytesIO(_arm_access_token().encode("ascii")),
+        )

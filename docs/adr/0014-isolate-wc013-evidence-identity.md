@@ -37,7 +37,22 @@ action with that exact validated template as the complete execution body. This r
 validation/start race: a concurrent change to the stored Job template cannot alter the execution
 body already pinned by the controller. The controller exposes no caller-supplied template or mutable
 field. Human operators and the Athena/evidence runtime identities receive no collector Job start
-assignment.
+assignment. The deployment owns this controller user-assigned identity and its one GitHub OIDC
+federated credential. The trust is limited to issuer
+`https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject
+`repo:cabberley/Athena-workload-context:environment:athena-live`. A manually dispatched workflow
+runs only from protected `main` in the protected `athena-live` environment on `ubuntu-24.04`,
+accepts only closed phase and immutable-deployment choices, and checks out the dispatch SHA. Before
+Azure login, a networkless, digest-pinned minimal Python verifier runs the immutable repository
+strict selector with no credentials and a read-only mount. It recursively rejects duplicate JSON
+keys and emits one canonical bounded selection. Only that output reaches `jq`, which independently
+binds the requested phase to the exact collector Job suffix, container name, fixed configuration
+path, and `athena/wc013-live` ACR RepoDigest. It then pulls and verifies the controller image and
+executes its fixed entrypoint in a read-only unprivileged container. Controller code is never
+installed on or executed through host Python. A short-lived ARM token is piped to container stdin,
+consumed once, and never stored in an argument, environment variable, file, or mount. The
+identity receives only the Job actions and ACR `AcrPull`; it cannot read deployments and has no client secret, caller
+path, command, or image/template override.
 
 Collector artifacts use a dedicated immutable Blob container. The evidence identity has
 create/read capability only on that collector container and replay table. The context identity has
@@ -93,14 +108,23 @@ automation must sequence collector then evaluator and pass
 `ATHENA_WC013_COLLECTED_EVIDENCE_HANDOFF_B64`. Existing combined jobs must be redeployed so the
 evidence identity is detached before further execution. Collector start automation must use the
 `athena-context wc013-collector-controller` path and a reviewed
-`athena.wc013CollectorStartContract.v1`; direct human Job-start access is not supported.
+`athena.wc013CollectorStartContract.v1` selected from a byte-pinned repository artifact bound
+to one uniquely named deployment ID, correlation ID, template hash, and source commit. The
+protected workflow checks out its immutable dispatch SHA, verifies the artifact-pinned
+controller RepoDigest, and runs the fixed entrypoint with a one-shot stdin ARM token. It never
+executes repository Python on the host or reads mutable deployment outputs. Direct human Job-start
+access is not supported.
 
 ## Validation
 
 - Static Bicep tests prove collector and evaluator jobs have disjoint identity sets and storage
-  roles, and that collector start permission is assigned only to the controller role.
+  roles, that collector start permission is assigned only to the controller role, and that this
+  identity has only one additional registry-scoped `AcrPull` assignment.
 - Deterministic tests cover exact deployed-template validation, exact-template-pinned start requests,
   plan/transport-bound handoff loading, cross-endpoint relabel rejection, exact immutable Blob
   reads, artifact-capacity boundaries, tampered envelope rejection, and evidence-only collector
-  credential selection.
+  credential selection, bounded stdin ARM token consumption/redaction, artifact-pinned controller
+  images, recursive duplicate-key rejection before Azure login/controller execution, exact
+  acceptance-image ACR/repository checks, swapped-phase rejection, exact pulled RepoDigest checks,
+  and fixed unprivileged container execution.
 - WC-013, operational phase, full pytest, Ruff, mypy, and Bicep build/lint validation must pass.

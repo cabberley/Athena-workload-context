@@ -65,6 +65,53 @@ asset requests to HTML. The included CSP limits scripts, styles, and connections
 origin. The hosting layer should additionally send `Content-Security-Policy:
 frame-ancestors 'none'`, because browsers do not enforce that directive from an HTML meta tag.
 
+## Production container
+
+`Dockerfile` uses digest-pinned Node and `nginx-unprivileged` stages. The build stage runs the
+lockfile-only production build; the final stage contains only NGINX, `nginx.conf`, and `dist/`,
+runs as UID/GID 101, and listens on port 8080. NGINX disables response compression so the generated
+JSON response bytes are unchanged, serves JSON as `application/json`, returns an explicit JSON 404
+for a missing `.json` path instead of the SPA document, and falls back to `index.html` only for SPA
+routes. `/healthz` is the Container Apps and image health endpoint.
+
+Every response includes CSP with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and `X-Frame-Options: DENY`.
+HTML, health, runtime-manifest, key, payload, and attestation responses use `Cache-Control:
+no-store`. Only Vite's content-addressed `/assets/` files use one-year immutable caching.
+
+Build locally from the app context:
+
+```powershell
+docker build --file apps/presentation-web/Dockerfile `
+  --tag athena-presentation-web:local `
+  apps/presentation-web
+docker run --rm --publish 127.0.0.1:8080:8080 athena-presentation-web:local
+
+# Builds, runs, and verifies bytes, routing, MIME, headers, caching, health, and UID.
+./apps/presentation-web/test-container.ps1
+```
+
+For deployment preparation, build in the existing ACR and resolve the resulting manifest digest;
+never deploy a tag:
+
+```powershell
+az acr build `
+  --registry athenademoa6add389 `
+  --image athena/presentation-web:<reviewed-tag> `
+  --file apps/presentation-web/Dockerfile `
+  apps/presentation-web
+
+az acr repository show `
+  --name athenademoa6add389 `
+  --image athena/presentation-web:<reviewed-tag> `
+  --query digest `
+  --output tsv
+```
+
+Replace the all-zero `presentationImage` digest in `.azure/wc013.parameters.json` only after this
+build returns the immutable ACR manifest digest. The root and presentation-module Bicep both reject
+the zero digest, so ARM validation, what-if, and deployment fail closed during preparation.
+
 ## Local development
 
 ```text

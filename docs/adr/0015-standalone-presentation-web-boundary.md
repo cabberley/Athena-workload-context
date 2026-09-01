@@ -49,6 +49,19 @@ fault/reset, verdict, and risk fields. Unsupported or inconsistent combinations 
 application makes no Azure SDK, Blob, ARM, MCP, storage, or workload request and has no mutation
 authority.
 
+Package the production build with digest-pinned Node and unprivileged NGINX stages. The final image
+runs as UID/GID 101 on port 8080, serves exact uncompressed JSON bytes, and never applies SPA
+fallback to a missing JSON path. The server provides a health endpoint, no-store caching for HTML
+and reviewed JSON, immutable caching only for Vite content-addressed assets, and CSP with
+`frame-ancestors 'none'` plus nosniff, referrer, permissions, and frame-denial headers.
+
+Deploy that image by digest as a Container App in the existing internal WC-013 managed environment.
+Ingress is HTTPS and VNet-scoped: the app's ingress is external to the Container Apps environment so
+the jumpbox can reach it, while the managed environment remains `internal: true` with
+`publicNetworkAccess: Disabled`. A dedicated user-assigned identity is attached only for registry
+authentication and receives only `AcrPull` on the existing ACR. It receives no Blob, Key Vault,
+ARM, MCP, workload, context, evidence, controller, or operator capability.
+
 ## Consequences
 
 - ARGUS can remove or abandon its temporary Athena-specific feature without adding Athena

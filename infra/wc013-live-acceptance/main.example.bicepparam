@@ -35,9 +35,6 @@ param workloadReceiptWriterObjectIds = [
   '55555555-5555-5555-5555-555555555555'
 ]
 
-// Separately governed managed identity that alone receives collector Job read/start permission.
-// It must be distinct from both runtime identities and all operator/receipt principals.
-param collectorControllerPrincipalId = '77777777-7777-7777-7777-777777777777'
 
 // Bootstrap values are deliberately unusable. Replace both with renderer output before starting the job.
 param wc007PinnedAuthorityDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
@@ -47,3 +44,10 @@ param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000
 param acceptanceImage = 'athenasynth.azurecr.io/athena/wc013-live@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param acceptanceImageRegistryServer = 'athenasynth.azurecr.io'
 param acceptanceImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+// Synthetic controller image shape; replace with the reviewed ACR RepoDigest before validation.
+param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222'
+// Synthetic non-placeholder digest shape; replace with a real ACR manifest digest before deployment.
+// The Bicep entrypoint rejects the all-zero preparation placeholder.
+param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:1111111111111111111111111111111111111111111111111111111111111111'
+param presentationImageRegistryServer = 'athenasynth.azurecr.io'
+param presentationImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'

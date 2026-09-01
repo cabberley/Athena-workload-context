@@ -130,6 +130,35 @@ var validatedWorkloadReceiptWriterObjectIds = !empty(overlappingArtifactAccessOb
   : empty(workloadRuntimeIdentityOverlap)
     ? workloadReceiptWriterObjectIds
     : fail('workloadReceiptWriterObjectIds must not contain acceptance or evidence runtime identities')
+var rejectedAcceptanceImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && endsWith(
+  acceptanceImageRegistryServer,
+  '.azurecr.io'
+) && !contains(acceptanceImageRegistryServer, '/')
+  ? acceptanceImageRegistryServer
+  : fail('acceptanceImageRegistryServer must be an exact lowercase Azure Container Registry login server')
+var acceptanceImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc013-live@sha256:'
+var acceptanceImageDigestCandidate = replace(acceptanceImage, acceptanceImageRepositoryPrefix, '')
+var acceptanceImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var acceptanceImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedAcceptanceImage = acceptanceImage == toLower(acceptanceImage) && startsWith(
+  acceptanceImage,
+  acceptanceImageRepositoryPrefix
+) && length(acceptanceImage) == length(acceptanceImageRepositoryPrefix) + 64 && length(
+  acceptanceImageDigestCandidate
+) == 64 && empty(
+  acceptanceImageDigestInvalidCharacters
+) && !endsWith(acceptanceImage, rejectedAcceptanceImageDigestSuffix)
+  ? acceptanceImage
+  : fail('acceptanceImage must use the exact acceptanceImageRegistryServer/athena/wc013-live repository and a real 64-character lowercase sha256 digest')
 var operationalPhaseBundlePath = '/opt/athena/wc013-live/delivery/operational-phase-bundle.json'
 var operationalScratchDirectory = '/tmp/athena-operational'
 var baselineOperationalJobName = '${namePrefix}-op-baseline'
@@ -148,25 +177,25 @@ var operationalJobResources = {
 var collectorJobDefinitions = [
   {
     key: 'acceptance'
-    name: '${namePrefix}-acceptance-collector'
+    name: '${namePrefix}-accept-col'
     containerName: 'wc013-acceptance-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/wc013-live-acceptance.json'
   }
   {
     key: 'baseline'
-    name: '${namePrefix}-op-baseline-collector'
+    name: '${namePrefix}-base-col'
     containerName: 'wc013-baseline-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/baseline.json'
   }
   {
     key: 'faulted'
-    name: '${namePrefix}-op-faulted-collector'
+    name: '${namePrefix}-fault-col'
     containerName: 'wc013-faulted-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/faulted.json'
   }
   {
     key: 'recovered'
-    name: '${namePrefix}-op-recovered-collector'
+    name: '${namePrefix}-recover-col'
     containerName: 'wc013-recovered-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/recovered.json'
   }
@@ -320,6 +349,11 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
     tags: resourceTags
   }
 }
+
+var replayBlobEndpoint = replayStorage.outputs.serviceEndpoints.blob
+var canonicalReplayBlobEndpoint = endsWith(replayBlobEndpoint, '/')
+  ? substring(replayBlobEndpoint, 0, length(replayBlobEndpoint) - 1)
+  : replayBlobEndpoint
 
 resource replayStorageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
   name: replayStorageAccountName
@@ -492,14 +526,14 @@ module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: acceptanceIdentityResourceId
       }
     ]
     containers: [
       {
         name: 'athena-wc013-live-acceptance'
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           '/bin/sh'
           '-c'
@@ -576,14 +610,14 @@ module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJ
     ]
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: evidenceIdentityResourceId
       }
     ]
     containers: [
       {
         name: collectorJob.containerName
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           'athena-context'
         ]
@@ -592,7 +626,7 @@ module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJ
           '--config'
           collectorJob.configurationPath
           '--artifact-blob-endpoint'
-          replayStorage.outputs.serviceEndpoints.blob
+          canonicalReplayBlobEndpoint
           '--artifact-container'
           collectorArtifactContainerName
           '--emit-handoff-base64'
@@ -644,14 +678,14 @@ module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: acceptanceIdentityResourceId
       }
     ]
     containers: [
       {
         name: 'athena-operational-baseline'
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           'athena-context'
         ]
@@ -709,14 +743,14 @@ module faultedOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: acceptanceIdentityResourceId
       }
     ]
     containers: [
       {
         name: 'athena-operational-faulted'
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           'athena-context'
         ]
@@ -774,14 +808,14 @@ module recoveredOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: acceptanceIdentityResourceId
       }
     ]
     containers: [
       {
         name: 'athena-operational-recovered'
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           'athena-context'
         ]
@@ -899,7 +933,7 @@ output evidenceCollectorStartContracts array = [for collectorJob in collectorJob
     }
     registries: [
       {
-        server: acceptanceImageRegistryServer
+        server: validatedAcceptanceImageRegistryServer
         identity: evidenceIdentityResourceId
       }
     ]
@@ -908,7 +942,7 @@ output evidenceCollectorStartContracts array = [for collectorJob in collectorJob
     containers: [
       {
         name: collectorJob.containerName
-        image: acceptanceImage
+        image: validatedAcceptanceImage
         command: [
           'athena-context'
         ]
@@ -917,7 +951,7 @@ output evidenceCollectorStartContracts array = [for collectorJob in collectorJob
           '--config'
           collectorJob.configurationPath
           '--artifact-blob-endpoint'
-          replayStorage.outputs.serviceEndpoints.blob
+          canonicalReplayBlobEndpoint
           '--artifact-container'
           collectorArtifactContainerName
           '--emit-handoff-base64'

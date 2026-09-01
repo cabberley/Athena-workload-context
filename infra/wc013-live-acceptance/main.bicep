@@ -88,11 +88,6 @@ param operatorArtifactReaderObjectIds array
 @maxLength(32)
 param workloadReceiptWriterObjectIds array = []
 
-@description('Object ID of the separately governed managed identity that alone receives collector Job read/start permission.')
-@minLength(36)
-@maxLength(36)
-param collectorControllerPrincipalId string
-
 @description('Exact non-secret WC-007 authority digest emitted by the reviewed configuration renderer.')
 @minLength(71)
 @maxLength(71)
@@ -118,6 +113,26 @@ param acceptanceImageRegistryServer string
 @maxLength(2048)
 param acceptanceImageRegistryResourceId string
 
+@description('Digest-pinned controller image executed only by the protected GitHub workflow.')
+@minLength(1)
+@maxLength(2048)
+param collectorControllerImage string
+
+@description('Digest-pinned production image for the private presentation web app.')
+@minLength(1)
+@maxLength(2048)
+param presentationImage string
+
+@description('Existing Azure Container Registry login server hosting the presentation image.')
+@minLength(1)
+@maxLength(255)
+param presentationImageRegistryServer string
+
+@description('Resource ID of the existing Azure Container Registry hosting the presentation image.')
+@minLength(1)
+@maxLength(2048)
+param presentationImageRegistryResourceId string
+
 @description('Reviewed Azure MCP release. Only the existing pinned implementation accepts this value.')
 @allowed([
   '2.0.5'
@@ -138,9 +153,84 @@ var resourceTags = union(tags, {
   dataBoundary: 'customer'
   managedBy: 'bicep'
 })
-var validatedAcceptanceImage = contains(acceptanceImage, '@sha256:')
+var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
+var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
+  ? acceptanceImageRegistryServer
+  : fail('acceptanceImageRegistryServer must exactly match the supplied Azure Container Registry resource ID')
+var acceptanceImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc013-live@sha256:'
+var acceptanceImageDigestCandidate = replace(acceptanceImage, acceptanceImageRepositoryPrefix, '')
+var acceptanceImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var acceptanceImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  acceptanceImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedAcceptanceImage = acceptanceImage == toLower(acceptanceImage) && startsWith(
+  acceptanceImage,
+  acceptanceImageRepositoryPrefix
+) && length(acceptanceImage) == length(acceptanceImageRepositoryPrefix) + 64 && length(
+  acceptanceImageDigestCandidate
+) == 64 && empty(
+  acceptanceImageDigestInvalidCharacters
+) && !endsWith(acceptanceImage, rejectedImageDigestSuffix)
   ? acceptanceImage
-  : fail('acceptanceImage must be pinned by a sha256 manifest digest')
+  : fail('acceptanceImage must use the exact acceptanceImageRegistryServer/athena/wc013-live repository and a real 64-character lowercase sha256 digest')
+var controllerImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc013-controller@sha256:'
+var controllerImageDigestCandidate = replace(collectorControllerImage, controllerImageRepositoryPrefix, '')
+var controllerImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  controllerImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var controllerImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  controllerImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedControllerImage = collectorControllerImage == toLower(collectorControllerImage) && startsWith(
+  collectorControllerImage,
+  controllerImageRepositoryPrefix
+) && length(collectorControllerImage) == length(controllerImageRepositoryPrefix) + 64 && length(
+  controllerImageDigestCandidate
+) == 64 && empty(
+  controllerImageDigestInvalidCharacters
+) && !endsWith(collectorControllerImage, rejectedImageDigestSuffix)
+  ? collectorControllerImage
+  : fail('collectorControllerImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
+var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
+var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
+  ? presentationImageRegistryServer
+  : fail('presentationImageRegistryServer must exactly match the supplied Azure Container Registry resource ID')
+var presentationImageRepositoryPrefix = '${validatedPresentationImageRegistryServer}/athena/presentation-web@sha256:'
+var presentationImageDigestCandidate = replace(presentationImage, presentationImageRepositoryPrefix, '')
+var presentationImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  presentationImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var presentationImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  presentationImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedPresentationImage = presentationImage == toLower(presentationImage) && startsWith(
+  presentationImage,
+  presentationImageRepositoryPrefix
+) && length(presentationImage) == length(presentationImageRepositoryPrefix) + 64 && length(
+  presentationImageDigestCandidate
+) == 64 && empty(
+  presentationImageDigestInvalidCharacters
+) && !endsWith(presentationImage, rejectedImageDigestSuffix)
+  ? presentationImage
+  : fail('presentationImage must use the exact presentationImageRegistryServer/athena/presentation-web repository and a real 64-character lowercase sha256 digest')
+var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
+var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
+var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
 var collectorControllerRoleDefinitionGuid = guid(
   subscription().id,
   foundationResourceGroupName,
@@ -152,19 +242,44 @@ var forbiddenCollectorControllerPrincipalIds = concat(
   [
     toLower(evidenceIdentity.properties.principalId)
     toLower(acceptanceJobIdentity.properties.principalId)
+    toLower(presentationWeb.outputs.identityPrincipalId)
   ]
 )
 var validatedCollectorControllerPrincipalId = contains(
   forbiddenCollectorControllerPrincipalIds,
-  toLower(collectorControllerPrincipalId)
+  toLower(collectorControllerIdentity.outputs.principalId)
 )
-  ? fail('collectorControllerPrincipalId must be distinct from runtime and operator principals')
-  : collectorControllerPrincipalId
+  ? fail('deployment-owned collector controller identity must be distinct from runtime, presentation, operator, and workload principals')
+  : collectorControllerIdentity.outputs.principalId
 
 resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: foundationResourceGroupName
   location: location
   tags: resourceTags
+}
+
+module collectorControllerIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc013-collector-controller-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-collector-controller-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    federatedIdentityCredentials: [
+      {
+        name: 'github-athena-live'
+        issuer: collectorControllerFederatedCredentialIssuer
+        subject: collectorControllerFederatedCredentialSubject
+        audiences: [
+          collectorControllerFederatedCredentialAudience
+        ]
+      }
+    ]
+    tags: union(resourceTags, {
+      identityPurpose: 'github-oidc-collector-controller-only'
+    })
+  }
 }
 
 module azureMcp '../azure-mcp/main.bicep' = {
@@ -202,7 +317,7 @@ resource collectorControllerRoleDefinition 'Microsoft.Authorization/roleDefiniti
   name: collectorControllerRoleDefinitionGuid
   properties: {
     roleName: 'Athena WC013 Collector Controller ${uniqueString(foundationResourceGroup.id)}'
-    description: 'Read and start only the fixed WC-013 collector Jobs. No write, exec, or data-plane permission.'
+    description: 'Read and start only the fixed WC-013 collector Jobs. No deployment read, write, exec, or data-plane permission.'
     type: 'CustomRole'
     permissions: [
       {
@@ -228,6 +343,20 @@ module privateDns 'modules/private-dns.bicep' = {
   params: {
     namePrefix: namePrefix
     virtualNetworkResourceId: azureMcp.outputs.virtualNetworkResourceId
+    tags: resourceTags
+  }
+}
+
+module presentationWeb 'modules/presentation-web.bicep' = {
+  name: 'wc013-private-presentation-web'
+  scope: foundationResourceGroup
+  params: {
+    location: location
+    namePrefix: namePrefix
+    managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
+    presentationImage: validatedPresentationImage
+    presentationImageRegistryServer: validatedPresentationImageRegistryServer
+    presentationImageRegistryResourceId: presentationImageRegistryResourceId
     tags: resourceTags
   }
 }
@@ -263,7 +392,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     wc007PinnedAuthorityDigest: wc007PinnedAuthorityDigest
     wc008PinnedAssertionDigest: wc008PinnedAssertionDigest
     acceptanceImage: validatedAcceptanceImage
-    acceptanceImageRegistryServer: acceptanceImageRegistryServer
+    acceptanceImageRegistryServer: validatedAcceptanceImageRegistryServer
     tags: resourceTags
   }
 }
@@ -297,6 +426,19 @@ module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
     registryName: last(split(acceptanceImageRegistryResourceId, '/'))
     identityName: '${namePrefix}-mcp-evidence-id'
     identityPrincipalId: evidenceIdentity.properties.principalId
+  }
+}
+
+module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
+  name: 'wc013-controller-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-collector-controller-id'
+    identityPrincipalId: collectorControllerIdentity.outputs.principalId
   }
 }
 
@@ -401,6 +543,39 @@ output evidenceCollectorStartContracts array = acceptanceResources.outputs.evide
 
 @description('Custom role definition assigned only to the governed collector controller.')
 output collectorControllerRoleDefinitionId string = collectorControllerRoleDefinition.id
+
+@description('Deployment-owned collector controller identity resource ID.')
+output collectorControllerIdentityResourceId string = collectorControllerIdentity.outputs.resourceId
+
+@description('Deployment-owned collector controller identity client ID used by GitHub OIDC login.')
+output collectorControllerIdentityClientId string = collectorControllerIdentity.outputs.clientId
+
+@description('Deployment-owned collector controller identity principal ID receiving only the collector controller role.')
+output collectorControllerIdentityPrincipalId string = validatedCollectorControllerPrincipalId
+
+@description('Exact digest-pinned ACR image containing the reviewed controller code and dependencies.')
+output collectorControllerImage string = validatedControllerImage
+
+@description('Name of the private presentation Container App.')
+output presentationContainerAppName string = presentationWeb.outputs.name
+
+@description('Resource ID of the private presentation Container App.')
+output presentationContainerAppResourceId string = presentationWeb.outputs.resourceId
+
+@description('VNet-scoped presentation FQDN.')
+output presentationFqdn string = presentationWeb.outputs.fqdn
+
+@description('Fully qualified private HTTPS presentation URL.')
+output presentationHttpsUrl string = presentationWeb.outputs.httpsUrl
+
+@description('Presentation identity resource ID. This identity receives only AcrPull.')
+output presentationIdentityResourceId string = presentationWeb.outputs.identityResourceId
+
+@description('Presentation identity client ID.')
+output presentationIdentityClientId string = presentationWeb.outputs.identityClientId
+
+@description('Presentation identity principal ID.')
+output presentationIdentityPrincipalId string = presentationWeb.outputs.identityPrincipalId
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId
