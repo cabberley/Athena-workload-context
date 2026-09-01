@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated
+> **Status:** Deployed
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -214,15 +214,15 @@ signing, and a private static presentation container.
 
 ### Phase 4: Deployment
 
-- [ ] Invoke `azure-deploy`
-- [ ] Deploy bootstrap infrastructure
-- [ ] Verify/migrate Entra application-role assignments
-- [ ] Deploy ready digest-pinned configuration under a unique immutable-style name
-- [ ] Review and commit the deployment-bound collector contract artifact/workflow choice
-- [ ] Verify live RBAC and managed-identity separation
-- [ ] Verify private presentation endpoint from the jumpbox
-- [ ] Report the fully qualified private HTTPS URL
-- [ ] Update plan status to `Deployed`
+- [x] Invoke `azure-deploy`
+- [x] Deploy bootstrap infrastructure
+- [x] Verify/migrate Entra application-role assignments
+- [x] Deploy ready digest-pinned configuration under a unique immutable-style name
+- [x] Review and commit the deployment-bound collector contract artifact/workflow choice
+- [x] Verify live RBAC and managed-identity separation
+- [x] Verify private presentation endpoint from the jumpbox
+- [x] Report the fully qualified private HTTPS URL
+- [x] Update plan status to `Deployed`
 
 ---
 
@@ -261,30 +261,46 @@ signing, and a private static presentation container.
 - **Issues:** None. Data-plane roles are scoped to the exact key, table, blob container, registry,
   or collector Job resources; no generic subscription or resource-group Contributor role is used.
 
+### Deployment Verification
+
+- **Deployment:** `wc013-ready-20260901T041116Z-14f00fa76009`
+- **Pull request:** [#37](https://github.com/cabberley/Athena-workload-context/pull/37),
+  merged as `e0381507622d621372a6622a3fa98175565eea29`
+- **Presentation:** `https://athena-wc013-live-presentation.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
+- **Jumpbox result:** private DNS resolved to `10.42.0.62`; `/healthz` returned
+  `200 healthy`; CSP, `frame-ancestors 'none'`, `DENY`, and `nosniff` headers were present
+- **Container Apps:** presentation and all four isolated collector Jobs are `Succeeded` and
+  use the reviewed immutable ACR digests
+- **Entra:** evidence identity has both Azure MCP and trusted-ingestion application roles;
+  context identity has neither, completing collector/evaluator separation
+- **GitHub OIDC:** `athena-live` has required reviewer protection, a `main` branch policy,
+  all three Azure variables, and the exact federated subject/audience
+- **Live RBAC:** verified exact key/table/container/registry/Job scopes for the context,
+  evidence, controller, presentation, operator, and workload identities
+
 ---
 
 ## 9. Files to Generate or Update
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `.azure/deployment-plan.md` | Deployment source of truth | Executing |
-| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Blocked by rejected controller/presentation digests |
+| `.azure/deployment-plan.md` | Deployment source of truth | Deployed |
+| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Deployed with immutable digests |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
 | `Dockerfile.wc013-controller` | Immutable fixed-entrypoint controller image | Prepared |
 | `scripts/strict_select_wc013_contract.py` | Pre-login duplicate-free canonical contract selector | Prepared |
 | `apps/presentation-web/nginx.conf` | Same-origin MIME, caching, and CSP headers | Prepared |
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
-| `.github/workflows/wc013-collector-controller.yml` | Immutable-SHA, artifact-bound OIDC collector start | Prepared; fail-closed pending final artifact |
-| Deployment tests/docs | Deterministic architecture and runbook coverage | Prepared |
+| `.github/workflows/wc013-collector-controller.yml` | Immutable-SHA, artifact-bound OIDC collector start | Active for the reviewed deployment |
+| Deployment tests/docs | Deterministic architecture and runbook coverage | Deployed and merged |
 
 ---
 
 ## 10. Next Steps
 
-> Current: Validated
+> Current: Deployed
 
-1. Invoke `azure-validate`; deploy only after current proof is `Validated`.
-2. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
-   collector outputs, and commit the byte-pinned deployment artifact plus exact workflow
-   choice/index entry. Until that commit, the workflow intentionally exits before OIDC login.
+1. Access the presentation from the jumpbox or another client connected to the private VNet.
+2. Use the protected `Start reviewed WC-013 evidence collector` workflow on `main` to run the
+   baseline, faulted, or recovered collector for the reviewed deployment.
