@@ -241,10 +241,11 @@ signing, and a private static presentation container.
 | Collector-name correction | Shortened all four Container Apps Job resource names to satisfy Azure's 32-character limit and updated the immutable phase bindings | Passed: Bicep build/lint and targeted contract/deployment tests | 2026-09-01T10:02:13+10:00 |
 | Post-correction repository validation | `scripts/check.ps1` | Passed: 709 tests; 2 live tests skipped | 2026-09-01T10:02:13+10:00 |
 | Post-correction ARM validation | Bicep validation plus structured `az deployment sub what-if --result-format FullResourcePayloads` | Passed: 0 deletes; private environment remains `internal: true` with `publicNetworkAccess: Disabled` | 2026-09-01T10:02:13+10:00 |
+| Collector endpoint correction | Canonicalized the generated Blob origin before embedding it in collector templates; reran `scripts/check.ps1`, Bicep build, ARM validation, and structured what-if | Passed: 709 tests, 0 deletes, and exact compatibility with the digest-pinned controller contract | 2026-09-01T13:51:32+10:00 |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-01T10:02:13+10:00
+**Validation timestamp:** 2026-09-01T13:51:32+10:00
 
 ### Role Assignment Verification
 

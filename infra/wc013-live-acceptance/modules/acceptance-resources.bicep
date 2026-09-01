@@ -350,6 +350,11 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
   }
 }
 
+var replayBlobEndpoint = replayStorage.outputs.serviceEndpoints.blob
+var canonicalReplayBlobEndpoint = endsWith(replayBlobEndpoint, '/')
+  ? substring(replayBlobEndpoint, 0, length(replayBlobEndpoint) - 1)
+  : replayBlobEndpoint
+
 resource replayStorageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
   name: replayStorageAccountName
 }
@@ -621,7 +626,7 @@ module evidenceCollectorJobs 'br/public:avm/res/app/job:0.7.2' = [for collectorJ
           '--config'
           collectorJob.configurationPath
           '--artifact-blob-endpoint'
-          replayStorage.outputs.serviceEndpoints.blob
+          canonicalReplayBlobEndpoint
           '--artifact-container'
           collectorArtifactContainerName
           '--emit-handoff-base64'
@@ -695,7 +700,7 @@ module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
           '--handoff-output'
           baselineOperationalHandoffPath
           '--artifact-blob-endpoint'
-          replayStorage.outputs.serviceEndpoints.blob
+          canonicalReplayBlobEndpoint
           '--artifact-container'
           artifactContainerName
           '--evidence-blob-endpoint'

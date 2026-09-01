@@ -64,7 +64,8 @@ selection; no controller code or dependencies run through host Python.
    contains no `acceptance` entry. Each digest is SHA-256 over UTF-8 JSON serialized with sorted
    keys, no insignificant whitespace, and separators `,` and `:`.
 4. Review all metadata, controller RepoDigest, all three contracts and their canonical digests.
-   Each phase must use its exact `-op-<phase>-collector` Job suffix,
+   Each phase must use its exact deployment-safe Job suffix (`-base-col`, `-fault-col`, or
+   `-recover-col`),
    `wc013-<phase>-evidence-collector` container, fixed
    `/opt/athena/wc013-live/delivery/configs/<phase>.json` path, and the deployment ACR
    `athena/wc013-live@sha256:<64-lowercase-hex>` image. Also review
