@@ -700,7 +700,7 @@ module baselineOperationalPhaseJob 'br/public:avm/res/app/job:0.7.2' = {
           '--handoff-output'
           baselineOperationalHandoffPath
           '--artifact-blob-endpoint'
-          canonicalReplayBlobEndpoint
+          replayStorage.outputs.serviceEndpoints.blob
           '--artifact-container'
           artifactContainerName
           '--evidence-blob-endpoint'
@@ -951,7 +951,7 @@ output evidenceCollectorStartContracts array = [for collectorJob in collectorJob
           '--config'
           collectorJob.configurationPath
           '--artifact-blob-endpoint'
-          replayStorage.outputs.serviceEndpoints.blob
+          canonicalReplayBlobEndpoint
           '--artifact-container'
           collectorArtifactContainerName
           '--emit-handoff-base64'

@@ -242,10 +242,11 @@ signing, and a private static presentation container.
 | Post-correction repository validation | `scripts/check.ps1` | Passed: 709 tests; 2 live tests skipped | 2026-09-01T10:02:13+10:00 |
 | Post-correction ARM validation | Bicep validation plus structured `az deployment sub what-if --result-format FullResourcePayloads` | Passed: 0 deletes; private environment remains `internal: true` with `publicNetworkAccess: Disabled` | 2026-09-01T10:02:13+10:00 |
 | Collector endpoint correction | Canonicalized the generated Blob origin before embedding it in collector templates; reran `scripts/check.ps1`, Bicep build, ARM validation, and structured what-if | Passed: 709 tests, 0 deletes, and exact compatibility with the digest-pinned controller contract | 2026-09-01T13:51:32+10:00 |
+| Collector output parity | Bound both the deployed Job template and emitted reviewed contract to the same canonical Blob origin; added a regression assertion and reran the complete repository and ARM gates | Passed: 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:10:07+10:00 |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-01T13:51:32+10:00
+**Validation timestamp:** 2026-09-01T14:10:07+10:00
 
 ### Role Assignment Verification
 

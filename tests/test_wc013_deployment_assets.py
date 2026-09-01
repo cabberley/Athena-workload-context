@@ -498,5 +498,7 @@ def test_wc013_collector_start_is_restricted_to_governed_controller() -> None:
     assert "roleAssignments:" not in acceptance
     assert "output evidenceCollectorStartContracts array" in resources
     assert "evidenceCollectorStartContracts" in orchestration
+    assert resources.count("canonicalReplayBlobEndpoint") == 3
+    assert "substring(replayBlobEndpoint, 0, length(replayBlobEndpoint) - 1)" in resources
     assert "\naz containerapp job start `" not in operations
     assert "wc013-collector-controller" in operations
