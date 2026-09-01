@@ -177,25 +177,25 @@ var operationalJobResources = {
 var collectorJobDefinitions = [
   {
     key: 'acceptance'
-    name: '${namePrefix}-acceptance-collector'
+    name: '${namePrefix}-accept-col'
     containerName: 'wc013-acceptance-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/wc013-live-acceptance.json'
   }
   {
     key: 'baseline'
-    name: '${namePrefix}-op-baseline-collector'
+    name: '${namePrefix}-base-col'
     containerName: 'wc013-baseline-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/baseline.json'
   }
   {
     key: 'faulted'
-    name: '${namePrefix}-op-faulted-collector'
+    name: '${namePrefix}-fault-col'
     containerName: 'wc013-faulted-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/faulted.json'
   }
   {
     key: 'recovered'
-    name: '${namePrefix}-op-recovered-collector'
+    name: '${namePrefix}-recover-col'
     containerName: 'wc013-recovered-evidence-collector'
     configurationPath: '/opt/athena/wc013-live/delivery/configs/recovered.json'
   }

@@ -291,8 +291,13 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert phase_binding_index < workflow.index(
         "Validate and start through the immutable controller image"
     )
-    for phase in ("baseline", "faulted", "recovered"):
-        assert f"expected_job_suffix='-op-{phase}-collector'" in workflow
+    phase_job_suffixes = {
+        "baseline": "-base-col",
+        "faulted": "-fault-col",
+        "recovered": "-recover-col",
+    }
+    for phase, job_suffix in phase_job_suffixes.items():
+        assert f"expected_job_suffix='{job_suffix}'" in workflow
         assert (
             f"expected_container_name='wc013-{phase}-evidence-collector'"
             in workflow
@@ -361,7 +366,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     ):
         assert forbidden_input not in dispatch_inputs
 
-def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None:
+def test_confirmed_parameters_use_published_images() -> None:
     parameters = json.loads(_read(".azure/wc013.parameters.json"))["parameters"]
 
     assert parameters["operatorArtifactReaderObjectIds"]["value"] == [
@@ -371,13 +376,11 @@ def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None
         "48bedd25-5a4d-4d5b-babd-56d259a41b0d"
     ]
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:c2eec01c2c66af0bee9bc495a2f5ab8816724c7d8f51e52dd019dcbf5fc6c9b6"
+        "@sha256:bea544ed3fdc4d86b4983b782d8cdcdc55be96dbcf48a99a343487db0a54c382"
     )
-    presentation_image = parameters["presentationImage"]["value"]
-    assert re.fullmatch(
-        r"athenademoa6add389\.azurecr\.io/athena/presentation-web"
-        r"@sha256:0{64}",
-        presentation_image,
+    assert parameters["presentationImage"]["value"] == (
+        "athenademoa6add389.azurecr.io/athena/presentation-web"
+        "@sha256:099ca8c3b9b44471374351713c9a78dc115ed411fbe83d4406a6b7bc682ae29f"
     )
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     presentation = _read(
@@ -392,11 +395,9 @@ def test_confirmed_parameters_keep_runner_and_block_presentation_start() -> None
         )
         assert "real non-placeholder sha256 digest" in bicep
     assert "presentationImage: validatedPresentationImage" in orchestration
-    controller_image = parameters["collectorControllerImage"]["value"]
-    assert re.fullmatch(
-        r"athenademoa6add389\.azurecr\.io/athena/wc013-controller"
-        r"@sha256:0{64}",
-        controller_image,
+    assert parameters["collectorControllerImage"]["value"] == (
+        "athenademoa6add389.azurecr.io/athena/wc013-controller"
+        "@sha256:c05d9a15939f3bb00ab600aaa49f3085921c9a3e18d9b53752a12374f4b09e27"
     )
     assert (
         "!endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)"

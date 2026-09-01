@@ -37,6 +37,11 @@ EVIDENCE_IDENTITY_RESOURCE_ID = (
     "Microsoft.ManagedIdentity/userAssignedIdentities/athena-mcp-evidence"
 )
 EVIDENCE_CLIENT_ID = "33333333-3333-3333-3333-333333333333"
+PHASE_JOB_SUFFIXES = {
+    "baseline": "base-col",
+    "faulted": "fault-col",
+    "recovered": "recover-col",
+}
 
 
 def _digest(payload: bytes) -> str:
@@ -60,7 +65,8 @@ def _contract(phase: str) -> dict[str, object]:
         "schemaVersion": "athena.wc013CollectorStartContract.v1",
         "jobResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-fixture/"
-            f"providers/Microsoft.App/jobs/athena-wc013-live-op-{phase}-collector"
+            "providers/Microsoft.App/jobs/athena-wc013-live-"
+            f"{PHASE_JOB_SUFFIXES[phase]}"
         ),
         "evidenceIdentityResourceId": EVIDENCE_IDENTITY_RESOURCE_ID,
         "evidenceIdentityClientId": EVIDENCE_CLIENT_ID,
@@ -326,7 +332,7 @@ def test_selects_one_phase_from_exact_deployment_bound_artifact(
     loaded = load_wc013_collector_start_contract(output_path)
 
     assert loaded == selected
-    assert loaded.job_resource_id.endswith("-op-faulted-collector")
+    assert loaded.job_resource_id.endswith("-fault-col")
 
 
 def test_index_resolves_only_exact_deployment_key_and_filename(
@@ -343,7 +349,7 @@ def test_index_resolves_only_exact_deployment_key_and_filename(
         deployment=deployment,
         phase="recovered",
     )
-    assert selected.job_resource_id.endswith("-op-recovered-collector")
+    assert selected.job_resource_id.endswith("-recover-col")
 
     with pytest.raises(ReviewedCollectorContractError, match="immutable reviewed"):
         select_indexed_reviewed_collector_contract(

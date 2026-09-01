@@ -19,17 +19,17 @@ _MAX_REVIEWED_DEPLOYMENTS = 16
 _PHASES = ("baseline", "faulted", "recovered")
 _PHASE_BINDINGS = {
     "baseline": (
-        "-op-baseline-collector",
+        "-base-col",
         "wc013-baseline-evidence-collector",
         "/opt/athena/wc013-live/delivery/configs/baseline.json",
     ),
     "faulted": (
-        "-op-faulted-collector",
+        "-fault-col",
         "wc013-faulted-evidence-collector",
         "/opt/athena/wc013-live/delivery/configs/faulted.json",
     ),
     "recovered": (
-        "-op-recovered-collector",
+        "-recover-col",
         "wc013-recovered-evidence-collector",
         "/opt/athena/wc013-live/delivery/configs/recovered.json",
     ),

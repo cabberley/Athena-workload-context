@@ -139,17 +139,17 @@ jobs:
 
           case "$PHASE" in
             baseline)
-              expected_job_suffix='-op-baseline-collector'
+              expected_job_suffix='-base-col'
               expected_container_name='wc013-baseline-evidence-collector'
               expected_config_path='/opt/athena/wc013-live/delivery/configs/baseline.json'
               ;;
             faulted)
-              expected_job_suffix='-op-faulted-collector'
+              expected_job_suffix='-fault-col'
               expected_container_name='wc013-faulted-evidence-collector'
               expected_config_path='/opt/athena/wc013-live/delivery/configs/faulted.json'
               ;;
             recovered)
-              expected_job_suffix='-op-recovered-collector'
+              expected_job_suffix='-recover-col'
               expected_container_name='wc013-recovered-evidence-collector'
               expected_config_path='/opt/athena/wc013-live/delivery/configs/recovered.json'
               ;;

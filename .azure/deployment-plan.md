@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Ready for Validation
+> **Status:** Validated
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -201,12 +201,16 @@ signing, and a private static presentation container.
 
 ### Phase 3: Validation
 
-- [ ] Invoke `azure-validate`
-- [ ] Run all repository, Python, frontend, Bicep, policy, and security checks
-- [ ] Run ARM validation and structured what-if
-- [ ] Confirm zero unexpected deletes or public exposure
-- [ ] Populate current validation proof
-- [ ] Update plan status to `Validated`
+- [x] Invoke `azure-validate`
+- [x] All validation checks pass
+  - [x] 1. Core Validation (CLI, auth, build, validate, what-if) - run the Bicep `validate-deployment` script
+  - [x] 2. Linting (optional)
+  - [x] 3. Azure Policy Validation
+- [x] Run all repository, Python, frontend, and security checks
+- [x] Run ARM validation and structured what-if
+- [x] Confirm zero unexpected deletes or public exposure
+- [x] Populate current validation proof
+- [x] Update plan status to `Validated`
 
 ### Phase 4: Deployment
 
@@ -224,17 +228,34 @@ signing, and a private static presentation container.
 
 ## 8. Validation Proof
 
-The 2026-08-21 proof applied to the previous combined-identity architecture and is intentionally
-invalidated. The `azure-validate` workflow must populate current commands, results, what-if
-counts, and timestamps before deployment.
-
 | Check | Command Run | Result | Timestamp |
 |-------|-------------|--------|-----------|
-| Pending | Pending `azure-validate` | Pending | Pending |
+| Repository validation | `scripts/check.ps1` | Passed: repository validator, deterministic assets, Ruff, mypy, 709 tests; 2 live tests skipped | 2026-09-01T08:17:11+10:00 |
+| Athena web | `npm run lint`; `npm run typecheck`; `npm test -- --run --silent`; `npm run build` | Passed: 20 tests and production build | 2026-09-01T08:17:11+10:00 |
+| Presentation web | `npm run lint`; `npm run typecheck`; `npm test -- --run --silent`; `npm run build` | Passed: 27 tests and production build | 2026-09-01T08:17:11+10:00 |
+| Bicep build and lint | `az bicep build`; `az bicep lint` for `infra/wc013-live-acceptance/main.bicep` | Passed | 2026-09-01T08:17:11+10:00 |
+| ARM validation | `az deployment sub validate` in `australiaeast` with `.azure/wc013.parameters.json` | Passed against subscription `a6add389-9978-47ac-ab1e-a09212e321d4` | 2026-09-01T08:17:11+10:00 |
+| Azure Policy | Azure Policy assignment review plus ARM subscription validation | Passed; the internal VNet-integrated Container Apps design satisfies the applicable ACA network policy and no deny policy blocked validation | 2026-09-01T08:17:11+10:00 |
+| Structured what-if | `az deployment sub what-if --result-format FullResourcePayloads` | 8 create, 11 modify, 0 delete, 27 ignore, 5 no-change, 4 runtime-expression unsupported | 2026-09-01T08:17:11+10:00 |
+| Private exposure review | Reviewed presentation app and managed-environment payloads | Passed: app ingress is environment-external on port 8080, while the environment remains `internal: true`, `publicNetworkAccess: Disabled`, and VNet integrated | 2026-09-01T08:17:11+10:00 |
+| Collector-name correction | Shortened all four Container Apps Job resource names to satisfy Azure's 32-character limit and updated the immutable phase bindings | Passed: Bicep build/lint and targeted contract/deployment tests | 2026-09-01T10:02:13+10:00 |
+| Post-correction repository validation | `scripts/check.ps1` | Passed: 709 tests; 2 live tests skipped | 2026-09-01T10:02:13+10:00 |
+| Post-correction ARM validation | Bicep validation plus structured `az deployment sub what-if --result-format FullResourcePayloads` | Passed: 0 deletes; private environment remains `internal: true` with `publicNetworkAccess: Disabled` | 2026-09-01T10:02:13+10:00 |
 
-**Validated by:** Pending
+**Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** Pending
+**Validation timestamp:** 2026-09-01T10:02:13+10:00
+
+### Role Assignment Verification
+
+- **Status:** Verified
+- **Identities checked:** acceptance/context, isolated evidence collector, collector controller,
+  presentation, operator artifact reader, and workload receipt writer
+- **Roles confirmed:** key-scoped Key Vault Crypto User; table-scoped Storage Table Data
+  Contributor; container-scoped Storage Blob Data Contributor/Reader; registry-scoped AcrPull;
+  and the custom collector-controller role limited to Job read/start/execution-read operations
+- **Issues:** None. Data-plane roles are scoped to the exact key, table, blob container, registry,
+  or collector Job resources; no generic subscription or resource-group Contributor role is used.
 
 ---
 
@@ -257,7 +278,7 @@ counts, and timestamps before deployment.
 
 ## 10. Next Steps
 
-> Current: Ready for Validation
+> Current: Validated
 
 1. Invoke `azure-validate`; deploy only after current proof is `Validated`.
 2. Deploy ready configuration under a unique timestamp/source-commit name, review its exact
