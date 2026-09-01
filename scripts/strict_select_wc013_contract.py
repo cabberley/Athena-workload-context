@@ -362,8 +362,7 @@ def _phase_contract_binding(
         f"reviewed {phase} resources",
     )
     if (
-        isinstance(resources["cpu"], bool)
-        or resources["cpu"] not in (0.5, "0.5")
+        resources["cpu"] != "0.5"
         or resources["memory"] != "1Gi"
     ):
         raise StrictWc013SelectionError(

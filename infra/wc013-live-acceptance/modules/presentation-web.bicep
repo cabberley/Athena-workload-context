@@ -35,12 +35,32 @@ param tags object = {}
 var presentationName = '${namePrefix}-presentation'
 var presentationIdentityName = '${namePrefix}-presentation-id'
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
-var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
-  toLower(presentationImage),
-  '${toLower(presentationImageRegistryServer)}/'
-) && !endsWith(toLower(presentationImage), rejectedImageDigestSuffix)
+var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
+var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
+  ? presentationImageRegistryServer
+  : fail('presentationImageRegistryServer must exactly match the supplied Azure Container Registry resource ID')
+var presentationImageRepositoryPrefix = '${validatedPresentationImageRegistryServer}/athena/presentation-web@sha256:'
+var presentationImageDigestCandidate = replace(presentationImage, presentationImageRepositoryPrefix, '')
+var presentationImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  presentationImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var presentationImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  presentationImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedPresentationImage = presentationImage == toLower(presentationImage) && startsWith(
+  presentationImage,
+  presentationImageRepositoryPrefix
+) && length(presentationImage) == length(presentationImageRepositoryPrefix) + 64 && length(
+  presentationImageDigestCandidate
+) == 64 && empty(
+  presentationImageDigestInvalidCharacters
+) && !endsWith(presentationImage, rejectedImageDigestSuffix)
   ? presentationImage
-  : fail('presentationImage must be hosted in presentationImageRegistryServer and use a real non-placeholder sha256 digest')
+  : fail('presentationImage must use the exact presentationImageRegistryServer/athena/presentation-web repository and a real 64-character lowercase sha256 digest')
 var presentationTags = union(tags, {
   component: 'wc013-presentation-web'
   dataBoundary: 'customer'

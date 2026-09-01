@@ -16,7 +16,7 @@ on:
         required: true
         type: choice
         options:
-          - pending-review-no-deployment
+          - wc013-ready-20260901T041116Z-14f00fa76009
 
 permissions:
   contents: read

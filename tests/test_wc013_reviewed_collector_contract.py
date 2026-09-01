@@ -121,7 +121,7 @@ def _contract(phase: str) -> dict[str, object]:
                             "value": "sha256:" + "8" * 64,
                         },
                     ],
-                    "resources": {"cpu": 0.5, "memory": "1Gi"},
+                    "resources": {"cpu": "0.5", "memory": "1Gi"},
                 }
             ]
         },
@@ -333,6 +333,13 @@ def test_selects_one_phase_from_exact_deployment_bound_artifact(
 
     assert loaded == selected
     assert loaded.job_resource_id.endswith("-fault-col")
+    assert output_path.read_bytes() == json.dumps(
+        _contract("faulted"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def test_index_resolves_only_exact_deployment_key_and_filename(

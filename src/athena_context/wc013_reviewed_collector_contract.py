@@ -394,9 +394,17 @@ def write_reviewed_collector_contract(
     contract: Wc013CollectorStartContract,
     output_path: Path,
 ) -> None:
-    payload = contract.model_dump_json(
-        by_alias=True,
-        exclude_none=True,
+    payload = json.dumps(
+        contract.model_dump(
+            by_alias=True,
+            exclude_defaults=True,
+            exclude_none=True,
+            mode="json",
+        ),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode("utf-8")
     try:
         with output_path.open("xb") as stream:

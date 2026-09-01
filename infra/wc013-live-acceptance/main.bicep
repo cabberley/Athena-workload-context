@@ -180,18 +180,54 @@ var validatedAcceptanceImage = acceptanceImage == toLower(acceptanceImage) && st
 ) && !endsWith(acceptanceImage, rejectedImageDigestSuffix)
   ? acceptanceImage
   : fail('acceptanceImage must use the exact acceptanceImageRegistryServer/athena/wc013-live repository and a real 64-character lowercase sha256 digest')
-var validatedControllerImage = contains(collectorControllerImage, '@sha256:') && startsWith(
-  toLower(collectorControllerImage),
-  '${validatedAcceptanceImageRegistryServer}/athena/wc013-controller@sha256:'
-) && !endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)
+var controllerImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc013-controller@sha256:'
+var controllerImageDigestCandidate = replace(collectorControllerImage, controllerImageRepositoryPrefix, '')
+var controllerImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  controllerImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var controllerImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  controllerImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedControllerImage = collectorControllerImage == toLower(collectorControllerImage) && startsWith(
+  collectorControllerImage,
+  controllerImageRepositoryPrefix
+) && length(collectorControllerImage) == length(controllerImageRepositoryPrefix) + 64 && length(
+  controllerImageDigestCandidate
+) == 64 && empty(
+  controllerImageDigestInvalidCharacters
+) && !endsWith(collectorControllerImage, rejectedImageDigestSuffix)
   ? collectorControllerImage
   : fail('collectorControllerImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
-var validatedPresentationImage = contains(presentationImage, '@sha256:') && startsWith(
-  toLower(presentationImage),
-  '${toLower(presentationImageRegistryServer)}/'
-) && !endsWith(toLower(presentationImage), rejectedImageDigestSuffix)
+var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
+var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
+  ? presentationImageRegistryServer
+  : fail('presentationImageRegistryServer must exactly match the supplied Azure Container Registry resource ID')
+var presentationImageRepositoryPrefix = '${validatedPresentationImageRegistryServer}/athena/presentation-web@sha256:'
+var presentationImageDigestCandidate = replace(presentationImage, presentationImageRepositoryPrefix, '')
+var presentationImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  presentationImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var presentationImageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  presentationImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedPresentationImage = presentationImage == toLower(presentationImage) && startsWith(
+  presentationImage,
+  presentationImageRepositoryPrefix
+) && length(presentationImage) == length(presentationImageRepositoryPrefix) + 64 && length(
+  presentationImageDigestCandidate
+) == 64 && empty(
+  presentationImageDigestInvalidCharacters
+) && !endsWith(presentationImage, rejectedImageDigestSuffix)
   ? presentationImage
-  : fail('presentationImage must use a real non-placeholder sha256 digest from presentationImageRegistryServer')
+  : fail('presentationImage must use the exact presentationImageRegistryServer/athena/presentation-web repository and a real 64-character lowercase sha256 digest')
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
 var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
 var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
@@ -319,7 +355,7 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     namePrefix: namePrefix
     managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
     presentationImage: validatedPresentationImage
-    presentationImageRegistryServer: presentationImageRegistryServer
+    presentationImageRegistryServer: validatedPresentationImageRegistryServer
     presentationImageRegistryResourceId: presentationImageRegistryResourceId
     tags: resourceTags
   }

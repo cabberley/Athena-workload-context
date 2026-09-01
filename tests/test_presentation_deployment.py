@@ -337,9 +337,23 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    assert reviewed_index == {
-        "schemaVersion": "athena.wc013CollectorDeploymentContractIndex.v1",
-        "deployments": {},
+    deployment_name = "wc013-ready-20260901T041116Z-14f00fa76009"
+    assert f"          - {deployment_name}" in workflow
+    assert reviewed_index["schemaVersion"] == (
+        "athena.wc013CollectorDeploymentContractIndex.v1"
+    )
+    assert reviewed_index["deployments"][deployment_name] == {
+        "artifactFile": f"{deployment_name}.json",
+        "artifactDigest": (
+            "sha256:c9b5a9783ec6499449b11e561649f7824826b7f5030d3f085ecf28f64eedb1fe"
+        ),
+        "deploymentResourceId": (
+            "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
+            f"Microsoft.Resources/deployments/{deployment_name}"
+        ),
+        "deploymentCorrelationId": "08bf9e92-1c85-45bb-9675-1950c20aa3c1",
+        "deploymentTemplateHash": "5108852879602821134",
+        "sourceCommit": "14f00fa760093cc0ba5fec22c1dffafd3d3422b4",
     }
     assert (
         "/infra/wc013-live-acceptance/reviewed-collector-contracts/*.json -text"
@@ -354,7 +368,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     )
     assert phase_options == ["baseline", "faulted", "recovered"]
     assert dispatch_inputs.count("type: choice") == 2
-    assert "          - pending-review-no-deployment" in dispatch_inputs
+    assert f"          - {deployment_name}" in dispatch_inputs
     for forbidden_input in (
         "image:",
         "command:",
@@ -390,18 +404,34 @@ def test_confirmed_parameters_use_published_images() -> None:
     for bicep in (orchestration, presentation):
         assert f"rejectedImageDigestSuffix = '{rejected_suffix}'" in bicep
         assert (
-            "!endsWith(toLower(presentationImage), rejectedImageDigestSuffix)"
+            "!endsWith(presentationImage, rejectedImageDigestSuffix)"
             in bicep
         )
-        assert "real non-placeholder sha256 digest" in bicep
+        assert "presentationImageDigestInvalidCharacters" in bicep
+        assert re.search(
+            r"length\(\s*presentationImageDigestCandidate\s*\)\s*==\s*64",
+            bicep,
+        )
+        assert "expectedPresentationImageRegistryServer" in bicep
+        assert (
+            "presentationImageRegistryServer must exactly match the supplied Azure "
+            "Container Registry resource ID"
+            in bicep
+        )
+        assert "real 64-character lowercase sha256 digest" in bicep
     assert "presentationImage: validatedPresentationImage" in orchestration
     assert parameters["collectorControllerImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/wc013-controller"
         "@sha256:c05d9a15939f3bb00ab600aaa49f3085921c9a3e18d9b53752a12374f4b09e27"
     )
     assert (
-        "!endsWith(toLower(collectorControllerImage), rejectedImageDigestSuffix)"
+        "!endsWith(collectorControllerImage, rejectedImageDigestSuffix)"
         in orchestration
+    )
+    assert "controllerImageDigestInvalidCharacters" in orchestration
+    assert re.search(
+        r"length\(\s*controllerImageDigestCandidate\s*\)\s*==\s*64",
+        orchestration,
     )
     assert "collectorControllerImage must use the fixed ACR repository" in orchestration
     example = _read("infra/wc013-live-acceptance/main.example.bicepparam")
