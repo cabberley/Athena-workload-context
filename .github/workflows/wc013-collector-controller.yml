@@ -41,9 +41,6 @@ jobs:
       AZURE_LOGIN_POST_CLEANUP: true
       ACR_SERVER: athenademoa6add389.azurecr.io
       INDEX_PATH: infra/wc013-live-acceptance/reviewed-collector-contracts/index.json
-      CONTRACT_DIRECTORY: ${{ runner.temp }}/wc013-controller
-      CONTRACT_PATH: ${{ runner.temp }}/wc013-controller/collector-contract.json
-      STRICT_SELECTION_PATH: ${{ runner.temp }}/wc013-controller/strict-selection.json
       VERIFIER_IMAGE: python:3.14.7-slim-bookworm@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
       VERIFIER_REPO_DIGEST: python@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
     steps:
@@ -66,6 +63,11 @@ jobs:
           command -v sha256sum >/dev/null
           command -v docker >/dev/null
           command -v curl >/dev/null
+          {
+            echo "CONTRACT_DIRECTORY=$RUNNER_TEMP/wc013-controller"
+            echo "CONTRACT_PATH=$RUNNER_TEMP/wc013-controller/collector-contract.json"
+            echo "STRICT_SELECTION_PATH=$RUNNER_TEMP/wc013-controller/strict-selection.json"
+          } >> "$GITHUB_ENV"
 
       - name: Select one byte-pinned reviewed contract and controller image
         shell: bash
