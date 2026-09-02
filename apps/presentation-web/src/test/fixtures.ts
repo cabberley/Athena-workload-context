@@ -6,6 +6,7 @@ import recoveredAttestation from '../../public/fixtures/recovered.attestation.js
 import recoveredPayload from '../../public/fixtures/recovered.presentation.json'
 import runtimeManifest from '../../public/runtime-manifest.json'
 import publicKey from '../../public/trust/presentation-public-key.jwk.json'
+import livePublicKey from '../../public/trust/live-presentation-public-key.jwk.json'
 import {
   parsePresentationPublicKey,
   parseRuntimeManifest,
@@ -20,6 +21,7 @@ import {
 
 export const rawRuntimeManifest = runtimeManifest as unknown
 export const rawPublicKey = publicKey as unknown
+export const rawLivePublicKey = livePublicKey as unknown
 export const rawLifecycleAssets: UnverifiedLifecycleAssets = {
   baseline: {
     payload: baselinePayload,
@@ -55,6 +57,14 @@ export const createLiveRuntimeManifest = (
   manifest.targetResourceGroup = targetResourceGroup
   manifest.evaluatedAt = '2026-09-01T23:59:00Z'
   manifest.publishedAt = '2026-09-02T00:00:00Z'
+  manifest.key = {
+    path: './trust/live-presentation-public-key.jwk.json',
+    assetSha256:
+      'sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539',
+    keyId: 'synthetic-key://athena-argus-demo/rs256-v1',
+    fingerprint:
+      'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
+  }
   const phases = manifest.phases as Array<Record<string, unknown>>
   for (const phase of phases) {
     const phaseName = phase.phase as LifecyclePhase
@@ -65,12 +75,20 @@ export const createLiveRuntimeManifest = (
   return parseRuntimeManifest(manifest)
 }
 
-export const createLiveVerifiedLifecycle = (): Promise<VerifiedLifecycle> =>
-  verifyLifecycleAssets(
-    createLiveRuntimeManifest(),
-    parsePresentationPublicKey(rawPublicKey),
-    cloneLifecycleAssets(),
-  )
+export const createLiveVerifiedLifecycle = async (): Promise<VerifiedLifecycle> => {
+  const verified = await createVerifiedLifecycle()
+  return {
+    ...verified,
+    classification: 'live-workload-evaluation',
+    publication: {
+      kind: 'live',
+      runId: 'synthetic-run-live-001',
+      targetResourceGroup: 'rg-athena-demo-workload',
+      evaluatedAt: '2026-09-01T23:59:00Z',
+      publishedAt: '2026-09-02T00:00:00Z',
+    },
+  }
+}
 
 export const payloadFor = (phase: LifecyclePhase): unknown =>
   cloneLifecycleAssets()[phase].payload

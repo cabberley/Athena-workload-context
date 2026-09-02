@@ -19,24 +19,24 @@ PRESENTATION_ASSET_CONTAINER_NAME: Final[Literal["presentation-assets"]] = (
     "presentation-assets"
 )
 PRESENTATION_PUBLIC_KEY_PATH: Final[
-    Literal["./trust/presentation-public-key.jwk.json"]
-] = "./trust/presentation-public-key.jwk.json"
+    Literal["./trust/live-presentation-public-key.jwk.json"]
+] = "./trust/live-presentation-public-key.jwk.json"
 PRESENTATION_PUBLIC_KEY_ASSET_SHA256: Final[
     Literal[
-        "sha256:0259687206cff5a27bcc32e0456f8a1e13fe10f0db2ef19935bf4a87a437b107"
+        "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
     ]
 ] = (
-    "sha256:0259687206cff5a27bcc32e0456f8a1e13fe10f0db2ef19935bf4a87a437b107"
+    "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
 )
 PRESENTATION_PUBLIC_KEY_ID: Final[
     Literal["synthetic-key://athena-argus-demo/rs256-v1"]
 ] = "synthetic-key://athena-argus-demo/rs256-v1"
 PRESENTATION_PUBLIC_KEY_FINGERPRINT: Final[
     Literal[
-        "sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a"
+        "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
     ]
 ] = (
-    "sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a"
+    "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
 )
 PRESENTATION_RUNTIME_MANIFEST_BLOB_NAME: Final[
     Literal["runtime-manifest.json"]
@@ -70,15 +70,15 @@ class _StrictPresentationRuntimeModel(BaseModel):
 
 
 class PresentationRuntimeKey(_StrictPresentationRuntimeModel):
-    path: Literal["./trust/presentation-public-key.jwk.json"]
+    path: Literal["./trust/live-presentation-public-key.jwk.json"]
     asset_sha256: Literal[
-        "sha256:0259687206cff5a27bcc32e0456f8a1e13fe10f0db2ef19935bf4a87a437b107"
+        "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
     ] = Field(alias="assetSha256")
     key_id: Literal["synthetic-key://athena-argus-demo/rs256-v1"] = Field(
         alias="keyId"
     )
     fingerprint: Literal[
-        "sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a"
+        "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
     ]
 
 
