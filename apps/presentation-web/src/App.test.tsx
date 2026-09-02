@@ -2,7 +2,10 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { axe } from 'jest-axe'
 import App from './App'
-import { createVerifiedLifecycle } from './test/fixtures'
+import {
+  createLiveVerifiedLifecycle,
+  createVerifiedLifecycle,
+} from './test/fixtures'
 import type { VerifiedLifecycle } from './verification'
 
 describe('standalone Athena presentation', () => {
@@ -79,5 +82,20 @@ describe('standalone Athena presentation', () => {
       screen.getByText(/no database, worker, load balancer, geographic, or customer impact/i),
     ).toBeInTheDocument()
     expect((await axe(container)).violations).toHaveLength(0)
+  })
+
+  it('labels live workload publication scope and signed result derivations', async () => {
+    render(<App loader={() => createLiveVerifiedLifecycle()} />)
+
+    expect(await screen.findByLabelText(/live workload evaluation/i)).toBeInTheDocument()
+    expect(screen.getByText('rg-athena-demo-workload')).toBeInTheDocument()
+    expect(screen.getByText('synthetic-run-live-001')).toBeInTheDocument()
+    expect(screen.getByText('2026-09-02T00:00:00Z')).toBeInTheDocument()
+    expect(
+      screen.getAllByText(/signed control\/evidence-plane results/i).length,
+    ).toBeGreaterThan(0)
+    expect(
+      screen.getByText(/private managed-identity sidecar reads the allowlisted blob assets/i),
+    ).toBeInTheDocument()
   })
 })

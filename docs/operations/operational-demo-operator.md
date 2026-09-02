@@ -12,7 +12,9 @@ See [ADR 0011](../adr/0011-external-operational-demo-operator.md).
 1. a workload-owned controller that exposes fixed `status`, `inject`, and `reset` actions;
 2. a phase-job controller that starts one reviewed phase Job and polls only that exact execution;
 3. a governed handoff that returns the exact completion-index Blob reference for that execution; and
-4. an exact-version Blob reader that retrieves only the named version and hash.
+4. an exact-version Blob reader that retrieves only the named version and hash; and
+5. when configured, a presentation publisher that writes only the already verified presentation
+   pairs to `presentation-assets`.
 
 Athena itself still performs no workload mutation. ARGUS remains presentation-only.
 
@@ -54,6 +56,7 @@ Live behavior is fixed:
 5. Always attempt `reset` once `inject` was attempted, even if inject or faulted failed
    ambiguously.
 6. Run the recovered phase only after a confirmed successful reset.
+7. If `presentationPublisher` is configured, publish only after recovered verification succeeds.
 
 Baseline failure before injection never resets. Recovery is never reported on failure.
 
@@ -86,6 +89,11 @@ The operator reads `athena.operationalDemoOperator.v1`:
     "blobEndpoint": "https://athenareplay.blob.core.windows.net",
     "containerName": "operational-artifacts",
     "managedIdentityClientId": "11111111-1111-1111-1111-111111111111"
+  },
+  "presentationPublisher": {
+    "blobEndpoint": "https://athenareplay.blob.core.windows.net",
+    "containerName": "presentation-assets",
+    "managedIdentityClientId": "11111111-1111-1111-1111-111111111111"
   }
 }
 ```
@@ -96,6 +104,12 @@ token acquisition; the Bicep deployment parameter uses the corresponding object 
 scoped Reader RBAC. That reader principal must be distinct from every workload-controller receipt
 writer principal because the writer's Blob Contributor role would otherwise defeat the operator's
 read-only boundary.
+
+`presentationPublisher` is optional for compatibility. When present, its container name must be
+exactly `presentation-assets`. The operator identity receives Blob Data Contributor only on that
+container so it can create immutable run assets and replace the one current pointer. See
+[Live presentation publication](live-presentation-publication.md) for the exact pointer-last
+sequence and failure behavior.
 
 ## Controller output contracts
 
@@ -199,6 +213,10 @@ For every phase, the operator:
 
 If any artifact or verification step is ambiguous, the operator fails closed.
 
+After all three phases verify, the optional publisher copies only the exact verified payload and
+attestation bytes. It never republishes snapshots, source envelopes, results, receipts, or
+completion indexes. All phase receipts must target the same resource group.
+
 ## Expected output
 
 Success output is compact and synthetic-safe:
@@ -221,4 +239,6 @@ paths, tokens, command stdout/stderr, or raw boundary exceptions.
 - reset failure -> recovery blocked;
 - combined faulted/reset failure -> both failures surfaced; and
 - recovered success is reported only after a confirmed successful reset plus recovered-phase
-  verification.
+  verification; and
+- presentation publication failure -> command failure with reset explicitly reported as
+  succeeded; the previous current pointer remains unchanged.

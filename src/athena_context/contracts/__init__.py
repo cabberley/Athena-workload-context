@@ -23,6 +23,10 @@ from athena_context.contracts.operational_phase import (
 )
 from athena_context.contracts.presentation import *  # noqa: F403
 from athena_context.contracts.presentation import __all__ as _presentation_all
+from athena_context.contracts.presentation_runtime import *  # noqa: F403
+from athena_context.contracts.presentation_runtime import (
+    __all__ as _presentation_runtime_all,
+)
 
 LegacyWorkloadManifest = WorkloadManifest  # type: ignore[used-before-def]  # noqa: F405
 WorkloadManifest = CanonicalWorkloadManifest  # type: ignore[misc,assignment]  # noqa: F405
@@ -33,6 +37,7 @@ __all__ = [
     *list(_operational_demo_all),
     *list(_operational_phase_all),
     *list(_presentation_all),
+    *list(_presentation_runtime_all),
     "AthenaValidationError",
     "NormalizationCollisionError",
     "LegacyWorkloadManifest",

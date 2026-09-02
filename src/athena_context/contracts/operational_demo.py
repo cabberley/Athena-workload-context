@@ -188,6 +188,35 @@ class ArtifactReaderConfiguration(_StrictOperationalDemoContract):
         return value
 
 
+class PresentationPublisherConfiguration(_StrictOperationalDemoContract):
+    blob_endpoint: str = Field(alias="blobEndpoint", min_length=12, max_length=2048)
+    container_name: Literal["presentation-assets"] = Field(alias="containerName")
+    managed_identity_client_id: str = Field(
+        alias="managedIdentityClientId",
+        pattern=_GUID_PATTERN,
+    )
+
+    @field_validator("blob_endpoint")
+    @classmethod
+    def validate_blob_endpoint(cls, value: str) -> str:
+        normalized = ArtifactReaderConfiguration.validate_blob_endpoint(value)
+        parsed = urlsplit(normalized)
+        hostname = parsed.hostname
+        if (
+            hostname is None
+            or parsed.port is not None
+            or re.fullmatch(
+                r"[a-z0-9]{3,24}\.blob\.core\.windows\.net",
+                hostname,
+            )
+            is None
+        ):
+            raise AthenaValidationError(
+                "presentationPublisher blobEndpoint must be an Azure Blob HTTPS origin"
+            )
+        return normalized
+
+
 class OperationalDemoOperatorConfiguration(_StrictOperationalDemoContract):
     schema_version: Literal[
         "athena.operationalDemoOperator.v1"
@@ -207,6 +236,10 @@ class OperationalDemoOperatorConfiguration(_StrictOperationalDemoContract):
         alias="phaseJobController"
     )
     artifact_reader: ArtifactReaderConfiguration = Field(alias="artifactReader")
+    presentation_publisher: PresentationPublisherConfiguration | None = Field(
+        default=None,
+        alias="presentationPublisher",
+    )
 
     @field_validator("bundle_file", "presentation_public_key_file")
     @classmethod
@@ -360,6 +393,7 @@ __all__ = [
     "OperationalPhaseExecutionStatus",
     "OperationalPhaseReferenceHandoff",
     "PhaseJobControllerConfiguration",
+    "PresentationPublisherConfiguration",
     "SubprocessControllerConfiguration",
     "build_operational_phase_reference_handoff",
 ]

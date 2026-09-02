@@ -183,6 +183,69 @@ def test_wc013_bicep_keeps_runtime_private_keyless_and_least_privileged() -> Non
         assert forbidden not in resources
 
 
+def test_live_presentation_container_and_rbac_are_narrow_and_non_worm() -> None:
+    orchestration = _read("infra/wc013-live-acceptance/main.bicep")
+    resources = _read(
+        "infra/wc013-live-acceptance/modules/acceptance-resources.bicep"
+    )
+    presentation = _read(
+        "infra/wc013-live-acceptance/modules/presentation-web.bicep"
+    )
+
+    assert "param presentationAssetContainerName string = 'presentation-assets'" in (
+        orchestration
+    )
+    assert "@allowed([\n  'presentation-assets'\n])" in orchestration
+    assert "presentationAssetContainerName: presentationAssetContainerName" in (
+        orchestration
+    )
+    container = re.search(
+        r"\{\s+name: presentationAssetContainerName\s+publicAccess: 'None'\s+\}",
+        resources,
+        re.DOTALL,
+    )
+    assert container is not None
+    assert "immutableStorageWithVersioningEnabled" not in container.group(0)
+    assert "immutabilityPolicy" not in container.group(0)
+    assert "isVersioningEnabled: true" in resources
+
+    operator_publisher = _loop_role_assignment(
+        resources,
+        "operatorPresentationAssetBlobDataContributors",
+    )
+    assert "scope: presentationAssetContainer" in operator_publisher
+    assert "validatedOperatorArtifactReaderObjectIds" in operator_publisher
+    assert "storageBlobDataContributorRoleDefinitionId" in operator_publisher
+    assert "artifactContainer" not in operator_publisher
+
+    presentation_reader = _role_assignment(
+        resources,
+        "presentationAssetBlobDataReader",
+    )
+    assert "scope: presentationAssetContainer" in presentation_reader
+    assert "principalId: presentationIdentityPrincipalId" in presentation_reader
+    assert "storageBlobDataReaderRoleDefinitionId" in presentation_reader
+    assert "artifactContainer" not in presentation_reader
+    operational_reader = _loop_role_assignment(
+        resources,
+        "operatorArtifactBlobDataReaders",
+    )
+    assert "scope: artifactContainer" in operational_reader
+    assert "presentationIdentityPrincipalId" not in operational_reader
+
+    assert "toLower(presentationIdentityPrincipalId)" in resources
+    assert "deliveryImage: validatedAcceptanceImage" in orchestration
+    assert (
+        "validatedPresentationDeliveryRegistryServer = "
+        "validatedPresentationImageRegistryServer == "
+        "validatedAcceptanceImageRegistryServer"
+        in orchestration
+    )
+    assert "image: validatedDeliveryImage" in presentation
+    assert "athena-context" in presentation
+    assert "presentation-asset-gateway" in presentation
+
+
 def _acceptance_image_is_exact(image: str, registry_server: str) -> bool:
     prefix = f"{registry_server}/athena/wc013-live@sha256:"
     digest = image.removeprefix(prefix)
@@ -290,6 +353,7 @@ def test_wc013_bicep_rejects_runtime_identities_in_operator_arrays() -> None:
         "var normalizedRuntimeIdentityPrincipalIds = [\n"
         "  toLower(acceptanceIdentityPrincipalId)\n"
         "  toLower(evidenceIdentityPrincipalId)\n"
+        "  toLower(presentationIdentityPrincipalId)\n"
         "]"
         in resources
     )
@@ -313,15 +377,15 @@ def test_wc013_bicep_rejects_runtime_identities_in_operator_arrays() -> None:
         in resources
     )
     assert (
-        "fail('operatorArtifactReaderObjectIds must not contain acceptance or "
-        "evidence runtime identities')"
+        "fail('operatorArtifactReaderObjectIds must not contain acceptance, "
+        "evidence, or presentation runtime identities')"
         in resources
     )
     assert (
         "empty(workloadRuntimeIdentityOverlap)\n"
         "    ? workloadReceiptWriterObjectIds\n"
-        "    : fail('workloadReceiptWriterObjectIds must not contain acceptance "
-        "or evidence runtime identities')"
+        "    : fail('workloadReceiptWriterObjectIds must not contain acceptance, "
+        "evidence, or presentation runtime identities')"
         in resources
     )
 

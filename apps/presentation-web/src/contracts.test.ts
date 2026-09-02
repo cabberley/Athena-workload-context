@@ -7,6 +7,7 @@ import {
 } from './contracts'
 import {
   cloneLifecycleAssets,
+  createLiveRuntimeManifest,
   rawPublicKey,
   rawRuntimeManifest,
 } from './test/fixtures'
@@ -74,5 +75,24 @@ describe('frozen presentation contract validation', () => {
       e: 'AQAB',
       key_ops: ['verify'],
     })
+
+  })
+
+  it('pins v2 run paths and the reviewed static public-key path', () => {
+    const manifest = createLiveRuntimeManifest()
+    expect(manifest.classification).toBe('live-workload-evaluation')
+
+    const wrongRunPath = structuredClone(manifest) as {
+      phases: { payloadPath: string }[]
+    }
+    wrongRunPath.phases[0]!.payloadPath =
+      './live/runs/synthetic-run-other/baseline/argus-presentation.json'
+    expect(() => parseRuntimeManifest(wrongRunPath)).toThrow(/live paths/i)
+
+    const wrongKeyPath = structuredClone(manifest) as {
+      key: { path: string }
+    }
+    wrongKeyPath.key.path = './live/runs/synthetic-run-live-001/key.json'
+    expect(() => parseRuntimeManifest(wrongKeyPath)).toThrow(/reviewed static key/i)
   })
 })

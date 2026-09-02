@@ -6,6 +6,7 @@ import {
   PresentationLoadError,
   resolveSameOriginAssetUrl,
 } from './runtime'
+import { createLiveRuntimeManifest } from './test/fixtures'
 
 const assetBytes = new Map<string, Uint8Array>(
   [
@@ -50,6 +51,36 @@ describe('same-origin bounded runtime asset loading', () => {
       cache: 'no-store',
       credentials: 'same-origin',
       redirect: 'error',
+    })
+  })
+
+  it('loads a live v2 manifest through same-origin run-scoped paths', async () => {
+    const manifest = createLiveRuntimeManifest()
+    const overrides: Partial<Record<string, Uint8Array>> = {
+      'runtime-manifest.json': new TextEncoder().encode(
+        `${JSON.stringify(manifest)}\n`,
+      ),
+    }
+    for (const phase of manifest.phases) {
+      overrides[phase.payloadPath.replace(/^\.\//, '')] = assetBytes.get(
+        `fixtures/${phase.phase}.presentation.json`,
+      )
+      overrides[phase.attestationPath.replace(/^\.\//, '')] = assetBytes.get(
+        `fixtures/${phase.phase}.attestation.json`,
+      )
+    }
+    const lifecycle = await loadVerifiedLifecycle({
+      fetchImpl: createAssetFetch(overrides) as typeof fetch,
+      manifestUrl: new URL('https://demo.invalid/runtime-manifest.json'),
+      origin: 'https://demo.invalid',
+    })
+
+    expect(lifecycle.publication).toEqual({
+      kind: 'live',
+      runId: 'synthetic-run-live-001',
+      targetResourceGroup: 'rg-athena-demo-workload',
+      evaluatedAt: '2026-09-01T23:59:00Z',
+      publishedAt: '2026-09-02T00:00:00Z',
     })
   })
 

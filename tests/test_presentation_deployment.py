@@ -56,6 +56,14 @@ def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
     assert '"public, max-age=31536000, immutable"' in nginx
     assert "location = /healthz" in nginx
     assert 'return 200 "healthy\\n"' in nginx
+    assert "location = /runtime-manifest.json" in nginx
+    assert "location ^~ /live/" in nginx
+    assert nginx.count("proxy_pass http://127.0.0.1:8081") == 2
+    assert 'proxy_set_header Authorization ""' in nginx
+    assert 'proxy_set_header Cookie ""' in nginx
+    assert "proxy_pass_request_body off" in nginx
+    assert "proxy_redirect off" in nginx
+    assert "proxy_buffering off" in nginx
     assert "location ~* \\.json$" in nginx
     assert "application/json json" in nginx
     assert "error_page 404 =404 /json-not-found.json" in nginx
@@ -65,13 +73,20 @@ def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
     assert (ROOT / "apps/presentation-web/json-not-found.json").read_bytes() == (
         b'{"error":"not found"}\n'
     )
+    assert nginx.index("location = /runtime-manifest.json") < nginx.index(
+        "location ~* \\.json$"
+    )
+    assert nginx.index("location ^~ /live/") < nginx.index("location ~* \\.json$")
     assert nginx.index("location ~* \\.json$") < nginx.index("location / {")
     assert "try_files $uri $uri/ /index.html" in nginx
 
 
-def test_presentation_bicep_is_private_and_acr_pull_only() -> None:
+def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> None:
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     foundation = _read("infra/azure-mcp/main.bicep")
+    resources = _read(
+        "infra/wc013-live-acceptance/modules/acceptance-resources.bicep"
+    )
     presentation = _read(
         "infra/wc013-live-acceptance/modules/presentation-web.bicep"
     )
@@ -94,7 +109,18 @@ def test_presentation_bicep_is_private_and_acr_pull_only() -> None:
     assert "presentationIdentity.outputs.resourceId" in presentation
     assert "systemAssigned" not in presentation
     assert "secrets:" not in presentation
-    assert "env:" not in presentation
+    assert "name: 'athena-presentation-asset-gateway'" in presentation
+    assert "image: validatedDeliveryImage" in presentation
+    assert "'presentation-asset-gateway'" in presentation
+    assert "'--blob-endpoint'" in presentation
+    assert "presentationAssetBlobEndpoint" in presentation
+    assert "'--container'" in presentation
+    assert "presentationAssetContainerName" in presentation
+    assert "'--managed-identity-client-id'" in presentation
+    assert "presentationIdentity.outputs.clientId" in presentation
+    assert "'--port'" in presentation
+    assert "'8081'" in presentation
+    assert "name: 'AZURE_CLIENT_ID'" in presentation
     assert "minReplicas: 1" in presentation
     assert "maxReplicas: 1" in presentation
     assert "path: '/healthz'" in presentation
@@ -104,13 +130,25 @@ def test_presentation_bicep_is_private_and_acr_pull_only() -> None:
     assert "7f951dda-4ed3-4680-a7ca-43fe172d538d" in acr_pull
     for forbidden in (
         "Key Vault Crypto User",
-        "Storage Blob",
         "Storage Table",
-        "Reader",
-        "Contributor",
         "Microsoft.App/jobs",
+        "operational-artifacts",
     ):
         assert forbidden not in presentation
+    assert "deliveryImageRepositoryPrefix" in presentation
+    assert "/athena/wc013-live@sha256:" in presentation
+    assert "deliveryImageDigestInvalidCharacters" in presentation
+    assert "!endsWith(deliveryImage, rejectedImageDigestSuffix)" in presentation
+    assert "scope: presentationAssetContainer" in resources
+    presentation_reader = re.search(
+        r"resource presentationAssetBlobDataReader .*?\n\}",
+        resources,
+        re.DOTALL,
+    )
+    assert presentation_reader is not None
+    assert "presentationIdentityPrincipalId" in presentation_reader.group(0)
+    assert "storageBlobDataReaderRoleDefinitionId" in presentation_reader.group(0)
+    assert "artifactContainer" not in presentation_reader.group(0)
     for output in (
         "presentationContainerAppName",
         "presentationContainerAppResourceId",
@@ -119,6 +157,9 @@ def test_presentation_bicep_is_private_and_acr_pull_only() -> None:
         "presentationIdentityResourceId",
         "presentationIdentityClientId",
         "presentationIdentityPrincipalId",
+        "presentationAssetContainerName",
+        "presentationAssetContainerResourceId",
+        "presentationAssetBlobEndpoint",
     ):
         assert f"output {output}" in orchestration
 
@@ -389,6 +430,9 @@ def test_confirmed_parameters_use_published_images() -> None:
     assert parameters["workloadReceiptWriterObjectIds"]["value"] == [
         "48bedd25-5a4d-4d5b-babd-56d259a41b0d"
     ]
+    assert parameters["presentationAssetContainerName"]["value"] == (
+        "presentation-assets"
+    )
     assert parameters["acceptanceImage"]["value"].endswith(
         "@sha256:bea544ed3fdc4d86b4983b782d8cdcdc55be96dbcf48a99a343487db0a54c382"
     )

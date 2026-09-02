@@ -171,8 +171,9 @@ configuration, idempotency key, exact command, and relative input-file paths.
 `infra/wc013-live-acceptance/main.bicep` is the subscription-scope composition for this gate. It
 reuses the private Azure MCP foundation and existing internal managed environment and adds private
 Key Vault, Table, and Blob dependencies, immutable collector and operational artifact containers,
-four collector Jobs, one acceptance Job, three phase-fixed Jobs, and the private presentation
-Container App. No public IP or public Container Apps environment is introduced.
+one private non-WORM `presentation-assets` container, four collector Jobs, one acceptance Job,
+three phase-fixed Jobs, and the private presentation Container App. No public IP or public
+Container Apps environment is introduced.
 
 The composition pins Azure Verified Modules for Key Vault
 (`avm/res/key-vault/vault:0.14.0`), Storage
@@ -187,7 +188,8 @@ The identities remain disjoint:
 1. the MCP/evidence identity is attached only to collector Jobs and alone has workload Reader;
 2. the context identity is attached only to acceptance and phase Jobs and has no workload Reader;
 3. the presentation identity is attached only to the presentation app for ACR authentication and
-   receives only `AcrPull` at the existing registry;
+   the private asset gateway, receiving only `AcrPull` at the existing registry plus Blob Data
+   Reader on `presentation-assets`;
 4. the deployment-owned collector-controller identity is not attached to any runtime and receives
    only the custom collector Job read/start/execution-read role on the four fixed collector Jobs
    plus `AcrPull` on the existing registry for its exact controller image, with no deployment-read
@@ -206,15 +208,18 @@ no longer exists.
 The collector identity has Key Vault sign/verify on the one key, Table Contributor on the replay
 table, and Blob Contributor on only the collected-evidence container. The context identity has
 key sign/verify, collected-evidence Reader, and operational-artifact Contributor. The presentation
-and controller identities receive none of those data-plane roles and receive no MCP, workload, or
-broad ARM role. The controller has only its three Job actions and registry-scoped `AcrPull`. The operator and workload arrays remain normalized and deployment fails if they
+identity receives only presentation-assets Reader and the controller receives none of those data-
+plane roles; neither receives MCP, workload, or broad ARM access. Operator principals retain
+operational-artifacts Reader and receive presentation-assets Contributor only for verified
+publication. The controller has only its three Job actions and registry-scoped `AcrPull`. The operator and workload arrays remain normalized and deployment fails if they
 overlap or contain either Athena runtime identity.
 
 The presentation app uses a digest-pinned image and one 0.25-vCPU/0.5-GiB replica in
 `athena-wc013-live-mcp-env`. Its ingress is external to the Container Apps environment only so it
 is reachable from the linked VNet; the environment remains `internal: true` with
 `publicNetworkAccess: Disabled`, making the HTTPS FQDN private to the VNet/jumpbox. HTTP redirects
-to HTTPS and the container listens as non-root on port 8080. NGINX returns `/healthz`, preserves
+to HTTPS and the web container listens as non-root on port 8080. NGINX returns `/healthz`,
+preserves
 JSON bytes and MIME, excludes missing JSON from SPA fallback, sends the reviewed security headers,
 disables caching for HTML/reviewed JSON, and caches only content-addressed assets as immutable.
 
@@ -507,10 +512,15 @@ IDs, and `evidenceCollectorStartContracts`. Controller outputs are
 `collectorControllerIdentityPrincipalId`, `collectorControllerIdentityResourceId`, and the exact
 `collectorControllerImage` RepoDigest.
 Presentation outputs are `presentationContainerAppName`, `presentationContainerAppResourceId`,
-`presentationFqdn`, `presentationHttpsUrl`, and all three presentation identity IDs. Use the fully
+`presentationFqdn`, `presentationHttpsUrl`, `presentationAssetBlobEndpoint`,
+`presentationAssetContainerName`, `presentationAssetContainerResourceId`, and all three
+presentation identity IDs. Use the fully
 qualified `presentationHttpsUrl` only from the linked VNet/jumpbox and verify `/healthz`, JSON MIME,
 exact bytes, no-cache and immutable-cache boundaries, CSP, nosniff, referrer, permissions, and frame
-headers before acceptance.
+headers before acceptance. The same replica runs the digest-pinned WC-013 delivery image as
+`athena-context presentation-asset-gateway` on localhost port 8081. NGINX proxies only the exact
+current manifest and `/live/` paths; the gateway has no listing or write capability. See
+[Live presentation publication](live-presentation-publication.md).
 
 No Context API Container App, internet-reachable environment endpoint, client secret, storage
 account key, or exported private key is required for this initial one-shot gate.

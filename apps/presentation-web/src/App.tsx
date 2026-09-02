@@ -81,6 +81,8 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
 
   const selected = lifecycle.phases[selectedPhase]
   const payload = selected.payload
+  const livePublication =
+    lifecycle.publication.kind === 'live' ? lifecycle.publication : null
 
   const selectFromKeyboard = (
     event: KeyboardEvent<HTMLButtonElement>,
@@ -107,12 +109,19 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
           <p className="eyebrow">Athena operational context</p>
           <h1>Verified web-node lifecycle</h1>
           <p className="hero-summary">
-            A standalone, presentation-only view of one signed synthetic demonstration.
+            {livePublication
+              ? 'A presentation-only view of one verified live workload evaluation.'
+              : 'A standalone, presentation-only view of one signed synthetic fixture.'}
           </p>
         </div>
-        <div className="synthetic-badge" aria-label="Synthetic demo data">
+        <div
+          className="synthetic-badge"
+          aria-label={
+            livePublication ? 'Live workload evaluation' : 'Synthetic demo data'
+          }
+        >
           <span aria-hidden="true">◇</span>
-          Synthetic demo data
+          {livePublication ? 'Live workload evaluation' : 'Synthetic fixture'}
         </div>
       </header>
 
@@ -132,6 +141,43 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
             detached {lifecycle.trust.algorithm} verification.
           </p>
           <dl className="trust-details">
+            {livePublication ? (
+              <>
+                <div>
+                  <dt>Target resource group</dt>
+                  <dd>
+                    <code>{livePublication.targetResourceGroup}</code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Run ID</dt>
+                  <dd>
+                    <code>{livePublication.runId}</code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last evaluated</dt>
+                  <dd>
+                    <time dateTime={livePublication.evaluatedAt}>
+                      {livePublication.evaluatedAt}
+                    </time>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Published</dt>
+                  <dd>
+                    <time dateTime={livePublication.publishedAt}>
+                      {livePublication.publishedAt}
+                    </time>
+                  </dd>
+                </div>
+              </>
+            ) : (
+              <div>
+                <dt>Publication mode</dt>
+                <dd>Reviewed deterministic static fixture</dd>
+              </div>
+            )}
             <div>
               <dt>Reviewed key</dt>
               <dd>
@@ -185,7 +231,11 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
 
           <div className="card-grid">
             <section className="metric-card" aria-labelledby="blast-radius-heading">
-              <p className="card-label">Derived only from signed node state</p>
+              <p className="card-label">
+                {livePublication
+                  ? 'Derived from signed control/evidence-plane results'
+                  : 'Derived only from signed synthetic node state'}
+              </p>
               <h3 id="blast-radius-heading">Blast radius</h3>
               <p className={`metric-value tone-${selected.blastRadius}`}>
                 {BLAST_RADIUS_LABELS[selected.blastRadius]}
@@ -194,7 +244,11 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
             </section>
 
             <section className="metric-card" aria-labelledby="impact-heading">
-              <p className="card-label">Deterministic signed-field mapping</p>
+              <p className="card-label">
+                {livePublication
+                  ? 'Bounded mapping of signed control/evidence-plane results'
+                  : 'Deterministic signed-fixture field mapping'}
+              </p>
               <h3 id="impact-heading">Impact level</h3>
               <ImpactDetails impact={selected.impact} />
             </section>
@@ -269,10 +323,18 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
                 <strong>Bounded derivation:</strong> blast radius and impact use only signed phase,
                 service state, node counts, fault/reset state, verdict, and risk level.
               </li>
+              {livePublication ? (
+                <li>
+                  <strong>Live scope binding:</strong> the published target resource group is
+                  case-folded and hashed in the browser, then matched to the signed synthetic
+                  workload resource-group binding for all three phases.
+                </li>
+              ) : null}
             </ol>
             <p className="boundary-note">
-              No database, worker, load balancer, geographic, or customer impact is inferred
-              because those fields are absent from the signed presentation contract.
+              {livePublication
+                ? 'Impact and blast radius describe only the signed control/evidence-plane results. No broader database, worker, load balancer, geographic, or customer impact is inferred.'
+                : 'No database, worker, load balancer, geographic, or customer impact is inferred because those fields are absent from the signed synthetic presentation contract.'}
             </p>
           </section>
 
@@ -307,7 +369,9 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       </main>
 
       <footer>
-        Presentation-only browser boundary. No Azure, Blob, ARM, MCP, or workload calls are made.
+        {livePublication
+          ? 'Presentation-only browser boundary. The browser makes same-origin reads only; a private managed-identity sidecar reads the allowlisted Blob assets.'
+          : 'Presentation-only browser boundary. No Azure, Blob, ARM, MCP, or workload calls are made.'}
       </footer>
     </div>
   )

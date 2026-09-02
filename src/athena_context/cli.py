@@ -47,6 +47,11 @@ from athena_context.presentation import (
     PresentationSigner,
     TrustedDemoEvaluationVerifier,
 )
+from athena_context.presentation_asset_gateway import (
+    PresentationAssetGatewayError,
+    run_presentation_asset_gateway,
+)
+from athena_context.presentation_assets import PresentationAssetPublisherPort
 from athena_context.presentation_export import (
     PresentationExportError,
     run_argus_presentation_export,
@@ -200,6 +205,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm",
         help="exact confirmation phrase printed by --validate-only",
     )
+    gateway_parser = subparsers.add_parser(
+        "presentation-asset-gateway",
+        help="serve the current verified private presentation asset set",
+    )
+    gateway_parser.add_argument("--blob-endpoint", required=True)
+    gateway_parser.add_argument(
+        "--container",
+        default="presentation-assets",
+        choices=("presentation-assets",),
+    )
+    gateway_parser.add_argument("--managed-identity-client-id", required=True)
+    gateway_parser.add_argument("--port", type=int, default=8081)
     return parser
 
 
@@ -230,6 +247,9 @@ def main(
     operational_demo_phase_job_port: PhaseJobPort | None = None,
     operational_demo_handoff_port: ReferenceHandoffPort | None = None,
     operational_demo_artifact_reader: VersionPinnedArtifactReaderPort | None = None,
+    operational_demo_presentation_publisher: (
+        PresentationAssetPublisherPort | None
+    ) = None,
     wc013_collector_job_management_port: (
         Wc013CollectorJobManagementPort | None
     ) = None,
@@ -427,8 +447,17 @@ def main(
                 phase_job_port=operational_demo_phase_job_port,
                 handoff_port=operational_demo_handoff_port,
                 artifact_reader=operational_demo_artifact_reader,
+                presentation_publisher=operational_demo_presentation_publisher,
             )
             output.write(render_operational_demo_result(result))
+            return 0
+        if args.command == "presentation-asset-gateway":
+            run_presentation_asset_gateway(
+                blob_endpoint=args.blob_endpoint,
+                container_name=args.container,
+                managed_identity_client_id=args.managed_identity_client_id,
+                port=args.port,
+            )
             return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
@@ -449,6 +478,9 @@ def main(
         return 1
     except OperationalDemoOperatorError as exc:
         errors.write(f"operational demo operator failed: {exc}\n")
+        return 1
+    except PresentationAssetGatewayError as exc:
+        errors.write(f"presentation asset gateway failed: {exc}\n")
         return 1
     return 0
 
