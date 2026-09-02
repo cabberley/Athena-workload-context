@@ -248,6 +248,9 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert "ref: ${{ github.sha }}" in workflow
     assert "ref: main" not in workflow
     assert "DISPATCH_SHA: ${{ github.sha }}" in workflow
+    job_env = workflow[workflow.index("    env:") : workflow.index("    steps:")]
+    assert "runner.temp" not in job_env
+    assert 'CONTRACT_DIRECTORY=$RUNNER_TEMP/wc013-controller' in workflow
     assert "git rev-parse HEAD" in workflow
     assert "persist-credentials: false" in workflow
     assert "id-token: write" in workflow
