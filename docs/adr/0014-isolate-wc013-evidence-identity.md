@@ -40,7 +40,8 @@ field. Human operators and the Athena/evidence runtime identities receive no col
 assignment. The deployment owns this controller user-assigned identity and its one GitHub OIDC
 federated credential. The trust is limited to issuer
 `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and subject
-`repo:cabberley/Athena-workload-context:environment:athena-live`. A manually dispatched workflow
+`repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live`.
+A manually dispatched workflow
 runs only from protected `main` in the protected `athena-live` environment on `ubuntu-24.04`,
 accepts only closed phase and immutable-deployment choices, and checks out the dispatch SHA. Before
 Azure login, a networkless, digest-pinned minimal Python verifier runs the immutable repository

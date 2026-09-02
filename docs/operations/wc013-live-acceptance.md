@@ -200,7 +200,9 @@ The identities remain disjoint:
 
 The deployment creates the controller identity and a single GitHub federated credential with
 issuer `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and
-subject `repo:cabberley/Athena-workload-context:environment:athena-live`. The Bicep composition
+subject
+`repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live`.
+The Bicep composition
 rejects any overlap between its principal ID and the runtime, presentation, operator, or workload
 principals. No client secret is created. The `collectorControllerPrincipalId` deployment parameter
 no longer exists.

@@ -260,11 +260,12 @@ signing, and a private static presentation container.
 | Live presentation structured what-if | `az deployment sub what-if --result-format FullResourcePayloads --no-pretty-print` | Passed: 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 actual deletes | 2026-09-02T01:12:56Z |
 | Live signing-key correction | Full repository gate; presentation typecheck/lint/tests/build; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, 32 presentation tests, ARM validation, 9 no-change, 15 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T04:24:00Z |
 | Current controller provenance | ACR build `cr2d`; targeted controller/deployment tests; strict selector for all operational phases; `az deployment sub validate`; structured full-payload what-if | Passed: controller `sha256:a300b1ff...` built from merged commit `0620492968a1`; ARM validation and 0 deletes | 2026-09-02T04:55:00Z |
+| GitHub OIDC subject correction | Live workflow-dispatch token inspection; `scripts/check.ps1`; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, ARM validation, 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 deletes; the validated template will update Entra federation to GitHub's immutable owner/repository-ID subject `repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live` | 2026-09-02T06:07:00Z |
 | Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-02T04:55:00Z
+**Validation timestamp:** 2026-09-02T06:07:00Z
 
 ### Role Assignment Verification
 
@@ -289,7 +290,7 @@ signing, and a private static presentation container.
   `0620492968a123f5b380c62bc3ebfa9bbeab5cd5`
 - **Reviewed contract:** artifact digest
   `sha256:4bed6560e142193a43132872fd038075ce339a6cc7740a0e43ed7f2a3f06aa14`;
-  final contract pull request pending
+  merged in [#42](https://github.com/cabberley/Athena-workload-context/pull/42)
 - **Presentation:** `https://athena-wc013-live-presentation.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
 - **Jumpbox result:** private DNS resolved to `10.42.0.62`; `/healthz` returned
   `200 healthy`; CSP, `frame-ancestors 'none'`, `DENY`, and `nosniff` headers were present
@@ -298,7 +299,8 @@ signing, and a private static presentation container.
 - **Entra:** evidence identity has both Azure MCP and trusted-ingestion application roles;
   context identity has neither, completing collector/evaluator separation
 - **GitHub OIDC:** `athena-live` has required reviewer protection, a `main` branch policy,
-  all three Azure variables, and the exact federated subject/audience
+  and all three Azure variables. Azure still has the legacy name-only subject until this
+  validated correction is deployed and read back.
 - **Live RBAC:** verified exact key/table/container/registry/Job scopes for the context,
   evidence, controller, presentation, operator, and workload identities
 
@@ -323,7 +325,7 @@ signing, and a private static presentation container.
 
 ## 10. Next Steps
 
-> Current: Infrastructure deployed; operational verification pending
+> Current: OIDC correction validated; deployment and operational verification pending
 
 1. Merge the reviewed contract for `wc013-ready-20260902T050729Z-0620492968a1`.
 2. Run the baseline, faulted, and recovered collectors through the protected workflow at their
