@@ -226,11 +226,11 @@ signing, and a private static presentation container.
 - [x] Deploy bootstrap infrastructure
 - [x] Verify/migrate Entra application-role assignments
 - [x] Deploy ready digest-pinned configuration under a unique immutable-style name
-- [x] Review and commit the deployment-bound collector contract artifact/workflow choice
+- [ ] Review and commit the deployment-bound collector contract artifact/workflow choice
 - [x] Verify live RBAC and managed-identity separation
 - [x] Verify private presentation endpoint from the jumpbox
 - [x] Report the fully qualified private HTTPS URL
-- [x] Update plan status to `Deployed`
+- [ ] Update plan status to `Deployed` after operational lifecycle verification
 
 ---
 
@@ -254,15 +254,17 @@ signing, and a private static presentation container.
 | Independent-review hardening | Enforced exact lowercase 64-hex controller/presentation RepoDigests, bound the presentation registry server to its ACR resource ID, and made selected contract output canonical | Passed: GPT-5.4 findings resolved, 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:50:25+10:00 |
 | Canonical round-trip gate | Rejected any reviewed contract whose validated model would rewrite its pinned canonical bytes | Passed: independent follow-up finding resolved, 710 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T15:08:32+10:00 |
 | Live presentation repository gate | `scripts/check.ps1` from merged commit `c734dadd` | Passed: repository validator, deterministic assets, Ruff, mypy, 727 tests; 2 live tests skipped | 2026-09-02T01:12:56Z |
-| Live presentation images | ACR remote builds `cr27`, `cr28`, and `cr29` | Passed: presentation `sha256:3920524b...`, runner `sha256:a461860d...`, delivery `sha256:833fe1c7...` | 2026-09-02T00:58:02Z |
+| Current live images | ACR remote builds and exact RepoDigest checks | Passed: presentation `sha256:998393cc...`, runner `sha256:0037340a...`, delivery `sha256:02c314ca...`, controller `sha256:a300b1ff...`; application images derive from merged commit `0620492968a1` | 2026-09-02T04:55:00Z |
 | Live presentation ARM validation | Authoritative `azure-validate` Bicep workflow with `.azure/wc013.parameters.json` | Passed against subscription `a6add389-9978-47ac-ab1e-a09212e321d4` in `australiaeast` | 2026-09-02T01:12:56Z |
 | Live presentation Azure Policy | Reviewed all three enforced subscription assignments and completed ARM validation | Passed: shared-key prevention is preserved and no assigned deny policy blocked the deployment | 2026-09-02T01:12:56Z |
 | Live presentation structured what-if | `az deployment sub what-if --result-format FullResourcePayloads --no-pretty-print` | Passed: 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 actual deletes | 2026-09-02T01:12:56Z |
+| Live signing-key correction | Full repository gate; presentation typecheck/lint/tests/build; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, 32 presentation tests, ARM validation, 9 no-change, 15 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T04:24:00Z |
+| Current controller provenance | ACR build `cr2d`; targeted controller/deployment tests; strict selector for all operational phases; `az deployment sub validate`; structured full-payload what-if | Passed: controller `sha256:a300b1ff...` built from merged commit `0620492968a1`; ARM validation and 0 deletes | 2026-09-02T04:55:00Z |
 | Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-02T01:12:56Z
+**Validation timestamp:** 2026-09-02T04:55:00Z
 
 ### Role Assignment Verification
 
@@ -281,9 +283,13 @@ signing, and a private static presentation container.
 
 ### Deployment Verification
 
-- **Deployment:** `wc013-ready-20260901T041116Z-14f00fa76009`
-- **Pull request:** [#37](https://github.com/cabberley/Athena-workload-context/pull/37),
-  merged as `e0381507622d621372a6622a3fa98175565eea29`
+- **Deployment:** `wc013-ready-20260902T050729Z-0620492968a1`
+- **Deployment proof:** correlation ID `9e37ca1e-4d60-436a-aa17-071dd5201a80`;
+  template hash `5355939670410545896`; source commit
+  `0620492968a123f5b380c62bc3ebfa9bbeab5cd5`
+- **Reviewed contract:** artifact digest
+  `sha256:4bed6560e142193a43132872fd038075ce339a6cc7740a0e43ed7f2a3f06aa14`;
+  final contract pull request pending
 - **Presentation:** `https://athena-wc013-live-presentation.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
 - **Jumpbox result:** private DNS resolved to `10.42.0.62`; `/healthz` returned
   `200 healthy`; CSP, `frame-ancestors 'none'`, `DENY`, and `nosniff` headers were present
@@ -302,8 +308,8 @@ signing, and a private static presentation container.
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `.azure/deployment-plan.md` | Deployment source of truth | Deployed |
-| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Deployed with immutable digests |
+| `.azure/deployment-plan.md` | Deployment source of truth | Validated; operational verification pending |
+| `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Deployed with current immutable digests |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
 | `Dockerfile.wc013-controller` | Immutable fixed-entrypoint controller image | Prepared |
 | `scripts/strict_select_wc013_contract.py` | Pre-login duplicate-free canonical contract selector | Prepared |
@@ -311,14 +317,15 @@ signing, and a private static presentation container.
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
 | `.github/workflows/wc013-collector-controller.yml` | Immutable-SHA, artifact-bound OIDC collector start | Active for the reviewed deployment |
-| Deployment tests/docs | Deterministic architecture and runbook coverage | Deployed and merged |
+| Deployment tests/docs | Deterministic architecture and runbook coverage | Deployment contract pending merge |
 
 ---
 
 ## 10. Next Steps
 
-> Current: Deployed
+> Current: Infrastructure deployed; operational verification pending
 
-1. Access the presentation from the jumpbox or another client connected to the private VNet.
-2. Use the protected `Start reviewed WC-013 evidence collector` workflow on `main` to run the
-   baseline, faulted, or recovered collector for the reviewed deployment.
+1. Merge the reviewed contract for `wc013-ready-20260902T050729Z-0620492968a1`.
+2. Run the baseline, faulted, and recovered collectors through the protected workflow at their
+   matching lifecycle points.
+3. Publish and verify the signed runtime-v2 presentation from the jumpbox.
