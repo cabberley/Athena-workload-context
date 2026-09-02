@@ -201,7 +201,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert "https://token.actions.githubusercontent.com" in orchestration
     assert "api://AzureADTokenExchange" in orchestration
     assert (
-        "repo:cabberley/Athena-workload-context:environment:athena-live"
+        "repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live"
         in orchestration
     )
     assert (

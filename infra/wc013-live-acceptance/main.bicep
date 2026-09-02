@@ -240,7 +240,7 @@ var validatedPresentationDeliveryRegistryServer = validatedPresentationImageRegi
 var presentationAssetBlobEndpoint = 'https://${replayStorageAccountName}.blob.${environment().suffixes.storage}'
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
 var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
-var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
+var collectorControllerFederatedCredentialSubject = 'repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live'
 var collectorControllerRoleDefinitionGuid = guid(
   subscription().id,
   foundationResourceGroupName,
