@@ -381,7 +381,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    deployment_name = "wc013-ready-20260902T050729Z-0620492968a1"
+    deployment_name = "wc013-ready-20260902T215725Z-ab0d01d49f50"
     assert f"          - {deployment_name}" in workflow
     assert reviewed_index["schemaVersion"] == (
         "athena.wc013CollectorDeploymentContractIndex.v1"
@@ -389,15 +389,15 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert reviewed_index["deployments"][deployment_name] == {
         "artifactFile": f"{deployment_name}.json",
         "artifactDigest": (
-            "sha256:4bed6560e142193a43132872fd038075ce339a6cc7740a0e43ed7f2a3f06aa14"
+            "sha256:1ab394d6c5cb3314865cd87de3a4448e4d7f63c0f7a91de0b4a76a42bdc4585a"
         ),
         "deploymentResourceId": (
             "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
             f"Microsoft.Resources/deployments/{deployment_name}"
         ),
-        "deploymentCorrelationId": "9e37ca1e-4d60-436a-aa17-071dd5201a80",
-        "deploymentTemplateHash": "5355939670410545896",
-        "sourceCommit": "0620492968a123f5b380c62bc3ebfa9bbeab5cd5",
+        "deploymentCorrelationId": "77bddd24-f5c5-4859-aa20-1a16499dbe1f",
+        "deploymentTemplateHash": "8373313941976686749",
+        "sourceCommit": "ab0d01d49f5026c7da7f52d245e5238ff7823f8d",
     }
     assert list(reviewed_index["deployments"]) == [deployment_name]
     assert (
@@ -438,7 +438,7 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:fbd1e6784ac34309c3ad98f26503f7daf832feaa7dc045aeccae8732dc602b7c"
+        "@sha256:fd679e086188a3b3be8e85d292fccf70e9ac1cb48c32be60cfe446333c13e917"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"

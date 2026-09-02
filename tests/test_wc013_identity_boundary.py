@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +57,13 @@ from wc013_support import (
     StepClock,
     key_resolver,
 )
+
+
+def test_collector_system_clock_returns_utc_millisecond_precision() -> None:
+    current = collector_module._SystemClock().now()
+
+    assert current.tzinfo is UTC
+    assert current.microsecond % 1000 == 0
 
 
 def _prepared_and_collected(

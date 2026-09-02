@@ -21,7 +21,7 @@ from athena_context.azure_adapters import (
     KeyVaultTrustedKeyResolver,
 )
 from athena_context.contracts import EvidenceGapRecord, VersionPinnedBlobReference, sha256_hex
-from athena_context.evidence import EvidenceCollectionCommand
+from athena_context.evidence import EvidenceBoundaryError, EvidenceCollectionCommand
 from athena_context.live_acceptance import (
     PreparedWc013LiveAcceptance,
     Wc013LiveAcceptanceError,
@@ -147,6 +147,11 @@ def collect_prepared_wc013_evidence(
         )
     except Wc013LiveAcceptanceError:
         raise
+    except EvidenceBoundaryError as exc:
+        raise Wc013LiveAcceptanceError(
+            "isolated WC-013 evidence collection failed closed "
+            f"(EvidenceBoundaryError: {str(exc)[:256]})"
+        ) from exc
     except Exception as exc:
         raise Wc013LiveAcceptanceError(
             "isolated WC-013 evidence collection failed closed "
@@ -211,7 +216,8 @@ def run_wc013_evidence_collector_job(
 
 class _SystemClock:
     def now(self) -> datetime:
-        return datetime.now(UTC)
+        current = datetime.now(UTC)
+        return current.replace(microsecond=(current.microsecond // 1000) * 1000)
 
 
 __all__ = [
