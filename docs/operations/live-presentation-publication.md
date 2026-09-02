@@ -44,7 +44,7 @@ After status, injection, reset, and all three recovered phase checks succeed, th
 1. confirms all three signed receipts target the same case-insensitive resource group;
 2. confirms the presentation public key matches key ID
    `synthetic-key://athena-argus-demo/rs256-v1` and SPKI fingerprint
-   `sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a`;
+   `sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515`;
 3. create-writes the exact verified payload and attestation bytes to:
    `live/runs/<runId>/<phase>/argus-presentation.json` and
    `live/runs/<runId>/<phase>/presentation-attestation.json`;
@@ -54,6 +54,10 @@ After status, injection, reset, and all three recovered phase checks succeed, th
 The pointer-last sequence is the atomic publication boundary. A failed asset write leaves the
 previous pointer unchanged. Retrying the same run is safe only when any existing immutable asset
 has the exact expected bytes, content type, and digest; a mismatch fails closed.
+
+Runtime v2 pins `./trust/live-presentation-public-key.jwk.json`, which contains the reviewed
+WC-013 Key Vault public key. Runtime v1 keeps the separate deterministic synthetic fixture key;
+the two trust anchors must not be substituted for one another.
 
 If any publication action fails, the command exits non-zero with
 `presentation publication failed closed; reset succeeded`. Do not interpret the successful reset

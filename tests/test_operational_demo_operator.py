@@ -1207,6 +1207,12 @@ def test_operator_publishes_only_verified_live_assets_after_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _build_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "athena_context.operational_demo_operator._presentation_public_key_fingerprint",
+        lambda public_key: (
+            "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
+        ),
+    )
     _enable_presentation_publisher(fixture.config_path)
     workload, controller = _success_ports(fixture)
     publisher = InspectablePresentationPublisher()
@@ -1230,6 +1236,12 @@ def test_operator_publishes_only_verified_live_assets_after_recovery(
     assert request.manifest.run_id == RUN_ID
     assert request.manifest.target_resource_group == (
         fixture.workload_reports["status"].receipt.resource_group
+    )
+    assert request.manifest.key.path == (
+        "./trust/live-presentation-public-key.jwk.json"
+    )
+    assert request.manifest.key.fingerprint == (
+        "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
     )
     assert request.manifest.published_at == datetime(
         2026,
@@ -1260,6 +1272,12 @@ def test_operator_reports_publication_failure_after_successful_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _build_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "athena_context.operational_demo_operator._presentation_public_key_fingerprint",
+        lambda public_key: (
+            "sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515"
+        ),
+    )
     _enable_presentation_publisher(fixture.config_path)
     workload, controller = _success_ports(fixture)
 

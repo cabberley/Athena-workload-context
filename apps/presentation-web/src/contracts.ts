@@ -8,6 +8,10 @@ export const REVIEWED_PUBLIC_KEY_PATH =
   './trust/presentation-public-key.jwk.json' as const
 export const REVIEWED_PUBLIC_KEY_ASSET_SHA256 =
   'sha256:0259687206cff5a27bcc32e0456f8a1e13fe10f0db2ef19935bf4a87a437b107' as const
+export const REVIEWED_LIVE_PUBLIC_KEY_PATH =
+  './trust/live-presentation-public-key.jwk.json' as const
+export const REVIEWED_LIVE_PUBLIC_KEY_ASSET_SHA256 =
+  'sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9' as const
 export const SCENARIO_ID = 'athena-web-node-fault.v1' as const
 export const SYNTHETIC_WORKLOAD_NAME = 'Synthetic Athena web workload' as const
 export const LIFECYCLE_PHASES = ['baseline', 'faulted', 'recovered'] as const
@@ -418,10 +422,10 @@ export const parseRuntimeManifest = (value: unknown): RuntimeManifest => {
     fail('runtime manifest publishedAt must not precede evaluatedAt')
   }
   if (
-    keyPath !== REVIEWED_PUBLIC_KEY_PATH ||
-    keyAssetSha256 !== REVIEWED_PUBLIC_KEY_ASSET_SHA256
+    keyPath !== REVIEWED_LIVE_PUBLIC_KEY_PATH ||
+    keyAssetSha256 !== REVIEWED_LIVE_PUBLIC_KEY_ASSET_SHA256
   ) {
-    fail('runtime manifest live key asset does not match the reviewed static key')
+    fail('runtime manifest live key asset does not match the reviewed live key')
   }
   for (const phase of phases) {
     const prefix = `./live/runs/${runId}/${phase.phase}`

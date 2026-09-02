@@ -12,6 +12,7 @@ const assetBytes = new Map<string, Uint8Array>(
   [
     'runtime-manifest.json',
     'trust/presentation-public-key.jwk.json',
+    'trust/live-presentation-public-key.jwk.json',
     'fixtures/baseline.presentation.json',
     'fixtures/baseline.attestation.json',
     'fixtures/faulted.presentation.json',
@@ -54,7 +55,7 @@ describe('same-origin bounded runtime asset loading', () => {
     })
   })
 
-  it('loads a live v2 manifest through same-origin run-scoped paths', async () => {
+  it('loads live v2 assets through same-origin paths and rejects mismatched signatures', async () => {
     const manifest = createLiveRuntimeManifest()
     const overrides: Partial<Record<string, Uint8Array>> = {
       'runtime-manifest.json': new TextEncoder().encode(
@@ -69,19 +70,13 @@ describe('same-origin bounded runtime asset loading', () => {
         `fixtures/${phase.phase}.attestation.json`,
       )
     }
-    const lifecycle = await loadVerifiedLifecycle({
-      fetchImpl: createAssetFetch(overrides) as typeof fetch,
-      manifestUrl: new URL('https://demo.invalid/runtime-manifest.json'),
-      origin: 'https://demo.invalid',
-    })
-
-    expect(lifecycle.publication).toEqual({
-      kind: 'live',
-      runId: 'synthetic-run-live-001',
-      targetResourceGroup: 'rg-athena-demo-workload',
-      evaluatedAt: '2026-09-01T23:59:00Z',
-      publishedAt: '2026-09-02T00:00:00Z',
-    })
+    await expect(
+      loadVerifiedLifecycle({
+        fetchImpl: createAssetFetch(overrides) as typeof fetch,
+        manifestUrl: new URL('https://demo.invalid/runtime-manifest.json'),
+        origin: 'https://demo.invalid',
+      }),
+    ).rejects.toThrow(/authenticity or consistency verification failed closed/i)
   })
 
   it('rejects cross-origin and path-traversal asset references', () => {

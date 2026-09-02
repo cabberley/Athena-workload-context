@@ -554,6 +554,15 @@ def _load_rsa_public_key(path: Path) -> rsa.RSAPublicKey:
     return public_key
 
 
+def _presentation_public_key_fingerprint(public_key: rsa.RSAPublicKey) -> str:
+    return sha256_hex(
+        public_key.public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+
 def _identity_result_verifier(result: DemoEvaluationResult) -> DemoEvaluationResult:
     return result
 
@@ -651,12 +660,7 @@ def prepare_operational_demo_operator(
     )
     public_key = _load_rsa_public_key(public_key_path)
     if configuration.presentation_publisher is not None:
-        fingerprint = sha256_hex(
-            public_key.public_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-        )
+        fingerprint = _presentation_public_key_fingerprint(public_key)
         if (
             fingerprint != PRESENTATION_PUBLIC_KEY_FINGERPRINT
             or bundle.synthetic_presentation_key_id != PRESENTATION_PUBLIC_KEY_ID

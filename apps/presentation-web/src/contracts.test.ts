@@ -78,7 +78,7 @@ describe('frozen presentation contract validation', () => {
 
   })
 
-  it('pins v2 run paths and the reviewed static public-key path', () => {
+  it('pins v2 run paths and the reviewed live public-key path', () => {
     const manifest = createLiveRuntimeManifest()
     expect(manifest.classification).toBe('live-workload-evaluation')
 
@@ -93,6 +93,6 @@ describe('frozen presentation contract validation', () => {
       key: { path: string }
     }
     wrongKeyPath.key.path = './live/runs/synthetic-run-live-001/key.json'
-    expect(() => parseRuntimeManifest(wrongKeyPath)).toThrow(/reviewed static key/i)
+    expect(() => parseRuntimeManifest(wrongKeyPath)).toThrow(/reviewed live key/i)
   })
 })
