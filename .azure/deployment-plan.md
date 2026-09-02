@@ -261,11 +261,12 @@ signing, and a private static presentation container.
 | Live signing-key correction | Full repository gate; presentation typecheck/lint/tests/build; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, 32 presentation tests, ARM validation, 9 no-change, 15 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T04:24:00Z |
 | Current controller provenance | ACR build `cr2d`; targeted controller/deployment tests; strict selector for all operational phases; `az deployment sub validate`; structured full-payload what-if | Passed: controller `sha256:a300b1ff...` built from merged commit `0620492968a1`; ARM validation and 0 deletes | 2026-09-02T04:55:00Z |
 | GitHub OIDC subject correction | Live workflow-dispatch token inspection; `scripts/check.ps1`; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, ARM validation, 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 deletes; the validated template will update Entra federation to GitHub's immutable owner/repository-ID subject `repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live` | 2026-09-02T06:07:00Z |
+| Fresh operational delivery | Generated run `synthetic-run-20260902212858-a7a67f6d`; ACR build `cr2f`; `scripts/check.ps1`; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: delivery image `sha256:fbd1e678...` contains the fresh baseline/faulted/recovered configurations; 729 tests with 2 intentional skips, ARM validation, 9 no-change, 15 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T21:42:00Z |
 | Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-02T06:07:00Z
+**Validation timestamp:** 2026-09-02T21:42:00Z
 
 ### Role Assignment Verification
 
@@ -325,7 +326,7 @@ signing, and a private static presentation container.
 
 ## 10. Next Steps
 
-> Current: OIDC correction validated; deployment and operational verification pending
+> Current: Fresh operational delivery validated; deployment and operational verification pending
 
 1. Merge the reviewed contract for `wc013-ready-20260902T050729Z-0620492968a1`.
 2. Run the baseline, faulted, and recovered collectors through the protected workflow at their

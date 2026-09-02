@@ -438,7 +438,7 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:02c314cafdf8c265965d1d471751ee0ade886a0a7fc58fba645811c71e0927f3"
+        "@sha256:fbd1e6784ac34309c3ad98f26503f7daf832feaa7dc045aeccae8732dc602b7c"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"

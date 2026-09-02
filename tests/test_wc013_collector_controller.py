@@ -213,6 +213,7 @@ def test_governed_collector_start_validates_then_pins_exact_template(
             assert template == contract.template.model_dump(
                 mode="json",
                 by_alias=True,
+                exclude_defaults=True,
                 exclude_none=True,
             )
             self.calls.append(("start-exact-template", job_resource_id))
@@ -262,6 +263,58 @@ def test_governed_collector_start_rejects_template_mutation(
         validate_deployed_wc013_collector_job(contract, deployed)
 
 
+def test_governed_collector_start_accepts_only_empty_arm_configuration_defaults() -> None:
+    contract = _contract()
+    deployed = deepcopy(_deployed_job(contract))
+    deployed["properties"]["configuration"].update(  # type: ignore[index]
+        {
+            "dapr": None,
+            "eventTriggerConfig": None,
+            "identitySettings": [],
+            "scheduleTriggerConfig": None,
+            "secrets": None,
+        }
+    )
+
+    assert (
+        validate_deployed_wc013_collector_job(contract, deployed)
+        == contract.execution_template_digest
+    )
+
+    deployed["properties"]["configuration"]["secrets"] = [  # type: ignore[index]
+        {"name": "unexpected", "value": "secret"}
+    ]
+    with pytest.raises(
+        Wc013CollectorControllerError,
+        match="exact reviewed template",
+    ):
+        validate_deployed_wc013_collector_job(contract, deployed)
+
+
+def test_governed_collector_start_accepts_only_exact_arm_template_defaults() -> None:
+    contract = _contract()
+    deployed = deepcopy(_deployed_job(contract))
+    deployed["properties"]["template"]["initContainers"] = None  # type: ignore[index]
+    deployed["properties"]["template"]["volumes"] = None  # type: ignore[index]
+    deployed["properties"]["template"]["containers"][0]["resources"][  # type: ignore[index]
+        "ephemeralStorage"
+    ] = "2Gi"
+
+    assert (
+        validate_deployed_wc013_collector_job(contract, deployed)
+        == contract.execution_template_digest
+    )
+
+    deployed["properties"]["template"]["containers"][0]["resources"][  # type: ignore[index]
+        "ephemeralStorage"
+    ] = "4Gi"
+    with pytest.raises(
+        Wc013CollectorControllerError,
+        match="exact reviewed template",
+    ):
+        validate_deployed_wc013_collector_job(contract, deployed)
+
+
 def test_arm_client_posts_only_the_exact_controller_template(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,6 +346,7 @@ def test_arm_client_posts_only_the_exact_controller_template(
     exact_template = contract.template.model_dump(
         mode="json",
         by_alias=True,
+        exclude_defaults=True,
         exclude_none=True,
     )
     response = client.start_job_with_exact_template(
