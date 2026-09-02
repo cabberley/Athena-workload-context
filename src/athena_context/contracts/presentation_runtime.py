@@ -23,10 +23,10 @@ PRESENTATION_PUBLIC_KEY_PATH: Final[
 ] = "./trust/live-presentation-public-key.jwk.json"
 PRESENTATION_PUBLIC_KEY_ASSET_SHA256: Final[
     Literal[
-        "sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9"
+        "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
     ]
 ] = (
-    "sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9"
+    "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
 )
 PRESENTATION_PUBLIC_KEY_ID: Final[
     Literal["synthetic-key://athena-argus-demo/rs256-v1"]
@@ -72,7 +72,7 @@ class _StrictPresentationRuntimeModel(BaseModel):
 class PresentationRuntimeKey(_StrictPresentationRuntimeModel):
     path: Literal["./trust/live-presentation-public-key.jwk.json"]
     asset_sha256: Literal[
-        "sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9"
+        "sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539"
     ] = Field(alias="assetSha256")
     key_id: Literal["synthetic-key://athena-argus-demo/rs256-v1"] = Field(
         alias="keyId"

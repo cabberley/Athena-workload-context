@@ -60,7 +60,7 @@ export const createLiveRuntimeManifest = (
   manifest.key = {
     path: './trust/live-presentation-public-key.jwk.json',
     assetSha256:
-      'sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9',
+      'sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539',
     keyId: 'synthetic-key://athena-argus-demo/rs256-v1',
     fingerprint:
       'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',

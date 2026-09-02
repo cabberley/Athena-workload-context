@@ -11,7 +11,7 @@ export const REVIEWED_PUBLIC_KEY_ASSET_SHA256 =
 export const REVIEWED_LIVE_PUBLIC_KEY_PATH =
   './trust/live-presentation-public-key.jwk.json' as const
 export const REVIEWED_LIVE_PUBLIC_KEY_ASSET_SHA256 =
-  'sha256:a8937fd9e7acb7b3010369184aa439284dfd6d0da072ff47360f8034152eb9b9' as const
+  'sha256:3f7fed42e04eb015245fb08dec57e0441ca1b5077a6a9389853f01d339352539' as const
 export const SCENARIO_ID = 'athena-web-node-fault.v1' as const
 export const SYNTHETIC_WORKLOAD_NAME = 'Synthetic Athena web workload' as const
 export const LIFECYCLE_PHASES = ['baseline', 'faulted', 'recovered'] as const
