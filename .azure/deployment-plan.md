@@ -1,8 +1,16 @@
 # Azure Deployment Plan
 
-> **Status:** Deployed
+> **Status:** Validated
 
 Generated: 2026-08-31T12:28:07+10:00
+
+Updated: 2026-09-02T00:58:02Z for the live workload presentation connection.
+
+The follow-on deployment adds a private `presentation-assets` container, operator-only
+publication of the fully verified lifecycle, a managed-identity read-only gateway sidecar, and
+same-origin delivery to the presentation browser. The browser displays the exact target resource
+group and separate verified evaluation/publication times only after signature, digest, lifecycle,
+key, and resource-group binding checks pass.
 
 ---
 
@@ -245,10 +253,16 @@ signing, and a private static presentation container.
 | Collector output parity | Bound both the deployed Job template and emitted reviewed contract to the same canonical Blob origin; added a regression assertion and reran the complete repository and ARM gates | Passed: 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:10:07+10:00 |
 | Independent-review hardening | Enforced exact lowercase 64-hex controller/presentation RepoDigests, bound the presentation registry server to its ACR resource ID, and made selected contract output canonical | Passed: GPT-5.4 findings resolved, 709 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T14:50:25+10:00 |
 | Canonical round-trip gate | Rejected any reviewed contract whose validated model would rewrite its pinned canonical bytes | Passed: independent follow-up finding resolved, 710 tests, ARM validation, and 0 authoritative what-if deletes | 2026-09-01T15:08:32+10:00 |
+| Live presentation repository gate | `scripts/check.ps1` from merged commit `c734dadd` | Passed: repository validator, deterministic assets, Ruff, mypy, 727 tests; 2 live tests skipped | 2026-09-02T01:12:56Z |
+| Live presentation images | ACR remote builds `cr27`, `cr28`, and `cr29` | Passed: presentation `sha256:3920524b...`, runner `sha256:a461860d...`, delivery `sha256:833fe1c7...` | 2026-09-02T00:58:02Z |
+| Live presentation ARM validation | Authoritative `azure-validate` Bicep workflow with `.azure/wc013.parameters.json` | Passed against subscription `a6add389-9978-47ac-ab1e-a09212e321d4` in `australiaeast` | 2026-09-02T01:12:56Z |
+| Live presentation Azure Policy | Reviewed all three enforced subscription assignments and completed ARM validation | Passed: shared-key prevention is preserved and no assigned deny policy blocked the deployment | 2026-09-02T01:12:56Z |
+| Live presentation structured what-if | `az deployment sub what-if --result-format FullResourcePayloads --no-pretty-print` | Passed: 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 actual deletes | 2026-09-02T01:12:56Z |
+| Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-01T15:08:32+10:00
+**Validation timestamp:** 2026-09-02T01:12:56Z
 
 ### Role Assignment Verification
 
@@ -256,10 +270,14 @@ signing, and a private static presentation container.
 - **Identities checked:** acceptance/context, isolated evidence collector, collector controller,
   presentation, operator artifact reader, and workload receipt writer
 - **Roles confirmed:** key-scoped Key Vault Crypto User; table-scoped Storage Table Data
-  Contributor; container-scoped Storage Blob Data Contributor/Reader; registry-scoped AcrPull;
-  and the custom collector-controller role limited to Job read/start/execution-read operations
+  Contributor; operator Blob Data Reader on `operational-artifacts`; operator Blob Data
+  Contributor only on `presentation-assets`; presentation Blob Data Reader only on
+  `presentation-assets`; registry-scoped AcrPull; and the custom collector-controller role
+  limited to Job read/start/execution-read operations
 - **Issues:** None. Data-plane roles are scoped to the exact key, table, blob container, registry,
-  or collector Job resources; no generic subscription or resource-group Contributor role is used.
+  or collector Job resources. The presentation identity has no access to operational artifacts,
+  workload resources, Key Vault, MCP, Table storage, or Job control, and no generic subscription
+  or resource-group Contributor role is used.
 
 ### Deployment Verification
 
