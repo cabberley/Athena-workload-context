@@ -52,6 +52,13 @@ from athena_context.contracts.models import (
     compute_verified_claims_digest,
 )
 from athena_context.evidence import TrustedIngestionBinding
+from athena_context.presentation_assets import (
+    PresentationAssetAlreadyExistsError,
+    PresentationAssetReadResult,
+    PresentationAssetUnavailableError,
+    PresentationPublicationReceipt,
+    PresentationPublicationRequest,
+)
 
 _GUID_CLAIMS = ("tid", "oid", "sub")
 _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
@@ -74,6 +81,17 @@ def _production_credential(
         exclude_developer_cli_credential=True,
         exclude_workload_identity_credential=True,
         exclude_broker_credential=True,
+    )
+
+
+def production_managed_identity_credential(
+    *,
+    managed_identity_client_id: str,
+) -> DefaultAzureCredential:
+    """Build the production managed-identity-only credential chain."""
+
+    return _production_credential(
+        managed_identity_client_id=managed_identity_client_id
     )
 
 
@@ -364,6 +382,192 @@ class AzureBlobCreateOnlyArtifactWriter:
             last_modified=last_modified,
             size_bytes=size_bytes,
             payload_sha256=request.hashes.payload_sha256,
+        )
+
+
+class AzureBlobPresentationAssetPublisher:
+    """Publish only to the private presentation-assets Blob container."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+    ) -> None:
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
+        if container_name != "presentation-assets":
+            raise ValueError("container_name must be exactly presentation-assets")
+        credential = production_managed_identity_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_put_size=MAX_ARTIFACT_PAYLOAD_BYTES,
+        )
+        self._container = service.get_container_client(container_name)
+
+    def publish(
+        self,
+        request: PresentationPublicationRequest,
+    ) -> PresentationPublicationReceipt:
+        if type(request) is not PresentationPublicationRequest:
+            raise TypeError(
+                "request must be an exact PresentationPublicationRequest"
+            )
+        for asset in request.assets:
+            blob = self._container.get_blob_client(asset.blob_name)
+            try:
+                blob.upload_blob(
+                    asset.payload,
+                    blob_type=BlobType.BLOCKBLOB,
+                    length=len(asset.payload),
+                    metadata={"payload_sha256": asset.payload_sha256},
+                    overwrite=False,
+                    match_condition=MatchConditions.IfMissing,
+                    content_settings=ContentSettings(
+                        content_type="application/json"
+                    ),
+                )
+            except ResourceExistsError as exc:
+                error_code = getattr(exc, "error_code", None)
+                normalized_code = getattr(error_code, "value", error_code)
+                if normalized_code != "BlobAlreadyExists":
+                    raise
+                try:
+                    downloader = blob.download_blob(
+                        offset=0,
+                        length=asset.maximum_bytes + 1,
+                        max_concurrency=1,
+                    )
+                    properties = downloader.properties
+                    size = getattr(downloader, "size", None)
+                    content_settings = getattr(properties, "content_settings", None)
+                    metadata = getattr(properties, "metadata", None)
+                    existing_payload = downloader.readall()
+                except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
+                    raise PresentationAssetAlreadyExistsError(
+                        "an immutable presentation run asset could not be verified"
+                    ) from read_exc
+                if (
+                    size != len(asset.payload)
+                    or existing_payload != asset.payload
+                    or getattr(content_settings, "content_type", None)
+                    != "application/json"
+                    or type(metadata) is not dict
+                    or metadata.get("payload_sha256") != asset.payload_sha256
+                ):
+                    raise PresentationAssetAlreadyExistsError(
+                        "an immutable presentation run asset already exists with different content"
+                    ) from exc
+        manifest_bytes = request.manifest.canonical_bytes()
+        manifest_sha256 = sha256_hex(manifest_bytes)
+        manifest_blob = self._container.get_blob_client("runtime-manifest.json")
+        manifest_blob.upload_blob(
+            manifest_bytes,
+            blob_type=BlobType.BLOCKBLOB,
+            length=len(manifest_bytes),
+            metadata={"payload_sha256": manifest_sha256},
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/json"),
+        )
+        return PresentationPublicationReceipt(
+            run_id=request.manifest.run_id,
+            manifest_blob_name="runtime-manifest.json",
+            manifest_sha256=manifest_sha256,
+        )
+
+class AzureBlobPresentationAssetReader:
+    """Read current blobs only from the private presentation-assets container."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+    ) -> None:
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
+        if container_name != "presentation-assets":
+            raise ValueError("container_name must be exactly presentation-assets")
+        credential = production_managed_identity_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_get_size=MAX_ARTIFACT_PAYLOAD_BYTES + 1,
+            max_chunk_get_size=MAX_ARTIFACT_PAYLOAD_BYTES + 1,
+        )
+        self._container = service.get_container_client(container_name)
+
+    def read_current(
+        self,
+        *,
+        blob_name: str,
+        maximum_bytes: int,
+    ) -> PresentationAssetReadResult:
+        if (
+            type(blob_name) is not str
+            or not blob_name
+            or blob_name.startswith("/")
+            or "\\" in blob_name
+            or "%" in blob_name
+            or any(segment in {"", ".", ".."} for segment in blob_name.split("/"))
+        ):
+            raise ValueError("blob_name is not a bounded relative path")
+        if (
+            type(maximum_bytes) is not int
+            or not 1 <= maximum_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
+        ):
+            raise ValueError("maximum_bytes is outside the presentation bound")
+        blob = self._container.get_blob_client(blob_name)
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            size = getattr(downloader, "size", None)
+            if type(size) is not int or not 1 <= size <= maximum_bytes:
+                raise PresentationAssetUnavailableError(
+                    "presentation asset size is invalid"
+                )
+            content_settings = getattr(properties, "content_settings", None)
+            if getattr(content_settings, "content_type", None) != "application/json":
+                raise PresentationAssetUnavailableError(
+                    "presentation asset content type is invalid"
+                )
+            payload = downloader.readall()
+            if type(payload) is not bytes or not 1 <= len(payload) <= maximum_bytes:
+                raise PresentationAssetUnavailableError(
+                    "presentation asset transfer is invalid"
+                )
+            payload_sha256 = sha256_hex(payload)
+            metadata = getattr(properties, "metadata", None)
+            if (
+                type(metadata) is not dict
+                or metadata.get("payload_sha256") != payload_sha256
+            ):
+                raise PresentationAssetUnavailableError(
+                    "presentation asset metadata digest is invalid"
+                )
+        except ResourceNotFoundError as exc:
+            raise PresentationAssetUnavailableError(
+                "presentation asset is unavailable"
+            ) from exc
+        except HttpResponseError as exc:
+            raise PresentationAssetUnavailableError(
+                "presentation asset is unavailable"
+            ) from exc
+        return PresentationAssetReadResult(
+            blob_name=blob_name,
+            payload=payload,
+            payload_sha256=payload_sha256,
         )
 
 
@@ -740,9 +944,12 @@ class DefaultAzureCredentialTrustedIngestionSigner:
 
 __all__ = [
     "AzureBlobCreateOnlyArtifactWriter",
+    "AzureBlobPresentationAssetPublisher",
+    "AzureBlobPresentationAssetReader",
     "AzureBlobVersionPinnedArtifactReader",
     "AzureTableAttemptReplayGuard",
     "DefaultAzureCredentialTrustedIngestionSigner",
     "KeyVaultRsaSigner",
     "KeyVaultTrustedKeyResolver",
+    "production_managed_identity_credential",
 ]

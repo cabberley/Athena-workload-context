@@ -2,7 +2,12 @@ export const PRESENTATION_SCHEMA_VERSION = 'athena.argus.presentation.v1' as con
 export const ATTESTATION_SCHEMA_VERSION =
   'athena.argus.presentationAttestation.v1' as const
 export const RUNTIME_SCHEMA_VERSION = 'athena.presentationWeb.runtime.v1' as const
+export const LIVE_RUNTIME_SCHEMA_VERSION = 'athena.presentationWeb.runtime.v2' as const
 export const PUBLIC_KEY_SCHEMA_VERSION = 'athena.presentationWeb.publicKey.v1' as const
+export const REVIEWED_PUBLIC_KEY_PATH =
+  './trust/presentation-public-key.jwk.json' as const
+export const REVIEWED_PUBLIC_KEY_ASSET_SHA256 =
+  'sha256:0259687206cff5a27bcc32e0456f8a1e13fe10f0db2ef19935bf4a87a437b107' as const
 export const SCENARIO_ID = 'athena-web-node-fault.v1' as const
 export const SYNTHETIC_WORKLOAD_NAME = 'Synthetic Athena web workload' as const
 export const LIFECYCLE_PHASES = ['baseline', 'faulted', 'recovered'] as const
@@ -78,17 +83,32 @@ export interface RuntimePhaseAsset {
   attestationSha256: Sha256Digest
 }
 
-export interface RuntimeManifest {
+export interface RuntimeManifestKey {
+  path: string
+  assetSha256: Sha256Digest
+  keyId: string
+  fingerprint: Sha256Digest
+}
+
+export interface StaticRuntimeManifest {
   schemaVersion: typeof RUNTIME_SCHEMA_VERSION
   classification: 'synthetic-demo-only'
-  key: {
-    path: string
-    assetSha256: Sha256Digest
-    keyId: string
-    fingerprint: Sha256Digest
-  }
+  key: RuntimeManifestKey
   phases: RuntimePhaseAsset[]
 }
+
+export interface LiveRuntimeManifest {
+  schemaVersion: typeof LIVE_RUNTIME_SCHEMA_VERSION
+  classification: 'live-workload-evaluation'
+  runId: string
+  targetResourceGroup: string
+  evaluatedAt: string
+  publishedAt: string
+  key: RuntimeManifestKey
+  phases: RuntimePhaseAsset[]
+}
+
+export type RuntimeManifest = StaticRuntimeManifest | LiveRuntimeManifest
 
 export interface PresentationPublicKey {
   schemaVersion: typeof PUBLIC_KEY_SCHEMA_VERSION
@@ -143,6 +163,11 @@ const SYNTHETIC_KEY_PATTERN = /^synthetic-key:\/\/[a-z0-9][a-z0-9._/-]{0,199}$/
 const SEMVER_PATTERN =
   /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 const ASSET_PATH_PATTERN = /^\.\/[a-z0-9][a-z0-9./-]*\.json$/
+const LIVE_RUN_ID_PATTERN =
+  /^synthetic-run-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
+const RESOURCE_GROUP_PATTERN = /^[A-Za-z0-9_().-]{1,90}$/
+const UTC_TIMESTAMP_PATTERN =
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$/
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/
 const JWK_COMPONENT_PATTERN = /^[A-Za-z0-9_-]+$/
 
@@ -254,9 +279,29 @@ export const parsePresentationAttestation = (
 
 export const parseRuntimeManifest = (value: unknown): RuntimeManifest => {
   const manifest = requireRecord(value, 'runtime manifest')
+  const schemaVersion = requireString(
+    manifest.schemaVersion,
+    64,
+    'runtime manifest schemaVersion',
+  )
+  const live = schemaVersion === LIVE_RUNTIME_SCHEMA_VERSION
+  if (!live && schemaVersion !== RUNTIME_SCHEMA_VERSION) {
+    fail('runtime manifest schemaVersion has an unexpected value')
+  }
   assertExactKeys(
     manifest,
-    ['schemaVersion', 'classification', 'key', 'phases'],
+    live
+      ? [
+          'schemaVersion',
+          'classification',
+          'runId',
+          'targetResourceGroup',
+          'evaluatedAt',
+          'publishedAt',
+          'key',
+          'phases',
+        ]
+      : ['schemaVersion', 'classification', 'key', 'phases'],
     'runtime manifest',
   )
   const key = requireRecord(manifest.key, 'runtime manifest key')
@@ -302,28 +347,103 @@ export const parseRuntimeManifest = (value: unknown): RuntimeManifest => {
   })
   const assetPaths = phases.flatMap((item) => [item.payloadPath, item.attestationPath])
   const keyPath = requireAssetPath(key.path, 'runtime manifest key path')
+  const keyAssetSha256 = requireDigest(
+    key.assetSha256,
+    'runtime manifest key assetSha256',
+  )
+  const keyId = requireSyntheticKeyId(key.keyId, 'runtime manifest keyId')
+  const keyFingerprint = requireDigest(
+    key.fingerprint,
+    'runtime manifest key fingerprint',
+  )
   if (new Set([...assetPaths, keyPath]).size !== assetPaths.length + 1) {
     fail('runtime manifest asset paths must be unique')
   }
 
-  return {
-    schemaVersion: requireLiteral(
-      manifest.schemaVersion,
-      RUNTIME_SCHEMA_VERSION,
-      'runtime manifest schemaVersion',
-    ),
-    classification: requireLiteral(
-      manifest.classification,
-      'synthetic-demo-only',
-      'runtime manifest classification',
-    ),
+  const common = {
     key: {
       path: keyPath,
-      assetSha256: requireDigest(key.assetSha256, 'runtime manifest key assetSha256'),
-      keyId: requireSyntheticKeyId(key.keyId, 'runtime manifest keyId'),
-      fingerprint: requireDigest(key.fingerprint, 'runtime manifest key fingerprint'),
+      assetSha256: keyAssetSha256,
+      keyId,
+      fingerprint: keyFingerprint,
     },
     phases,
+  }
+  if (!live) {
+    return {
+      schemaVersion: RUNTIME_SCHEMA_VERSION,
+      classification: requireLiteral(
+        manifest.classification,
+        'synthetic-demo-only',
+        'runtime manifest classification',
+      ),
+      ...common,
+    }
+  }
+
+  const runId = requirePatternString(
+    manifest.runId,
+    LIVE_RUN_ID_PATTERN,
+    76,
+    'runtime manifest runId',
+  )
+  const targetResourceGroup = requirePatternString(
+    manifest.targetResourceGroup,
+    RESOURCE_GROUP_PATTERN,
+    90,
+    'runtime manifest targetResourceGroup',
+  )
+  if (targetResourceGroup.endsWith('.')) {
+    fail('runtime manifest targetResourceGroup must not end with a period')
+  }
+  const publishedAt = requirePatternString(
+    manifest.publishedAt,
+    UTC_TIMESTAMP_PATTERN,
+    32,
+    'runtime manifest publishedAt',
+  )
+  if (!Number.isFinite(Date.parse(publishedAt))) {
+    fail('runtime manifest publishedAt is not one valid UTC timestamp')
+  }
+  const evaluatedAt = requirePatternString(
+    manifest.evaluatedAt,
+    UTC_TIMESTAMP_PATTERN,
+    32,
+    'runtime manifest evaluatedAt',
+  )
+  if (!Number.isFinite(Date.parse(evaluatedAt))) {
+    fail('runtime manifest evaluatedAt is not one valid UTC timestamp')
+  }
+  if (Date.parse(publishedAt) < Date.parse(evaluatedAt)) {
+    fail('runtime manifest publishedAt must not precede evaluatedAt')
+  }
+  if (
+    keyPath !== REVIEWED_PUBLIC_KEY_PATH ||
+    keyAssetSha256 !== REVIEWED_PUBLIC_KEY_ASSET_SHA256
+  ) {
+    fail('runtime manifest live key asset does not match the reviewed static key')
+  }
+  for (const phase of phases) {
+    const prefix = `./live/runs/${runId}/${phase.phase}`
+    if (
+      phase.payloadPath !== `${prefix}/argus-presentation.json` ||
+      phase.attestationPath !== `${prefix}/presentation-attestation.json`
+    ) {
+      fail('runtime manifest live paths do not match the selected run and phase')
+    }
+  }
+  return {
+    schemaVersion: LIVE_RUNTIME_SCHEMA_VERSION,
+    classification: requireLiteral(
+      manifest.classification,
+      'live-workload-evaluation',
+      'runtime manifest classification',
+    ),
+    runId,
+    targetResourceGroup,
+    evaluatedAt,
+    publishedAt,
+    ...common,
   }
 }
 

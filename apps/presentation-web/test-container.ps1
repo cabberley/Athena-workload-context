@@ -64,7 +64,8 @@ try {
         }
         if (-not $Ready) { throw 'presentation container did not become healthy' }
 
-        $Manifest = Get-Response -Client $Client -Path '/runtime-manifest.json'
+        $NoGatewayManifest = Get-Response -Client $Client -Path '/runtime-manifest.json'
+        $PublicKey = Get-Response -Client $Client -Path '/trust/presentation-public-key.jwk.json'
         $MissingJson = Get-Response -Client $Client -Path '/missing.json'
         $Spa = Get-Response -Client $Client -Path '/reviewed/route'
         $Index = Get-Response -Client $Client -Path '/'
@@ -76,18 +77,23 @@ try {
         if ($Health.Status -ne 200 -or $Health.ContentType -ne 'text/plain') {
             throw 'health endpoint contract changed'
         }
-        if ($Manifest.Status -ne 200 -or $Manifest.ContentType -ne 'application/json') {
-            throw 'runtime manifest MIME or status changed'
+        if ($NoGatewayManifest.Status -eq 200) {
+            throw 'runtime manifest unexpectedly bypassed the private gateway'
         }
-        $ExpectedManifest = [IO.File]::ReadAllBytes((Join-Path $Root 'public/runtime-manifest.json'))
+        if ($PublicKey.Status -ne 200 -or $PublicKey.ContentType -ne 'application/json') {
+            throw 'reviewed public key MIME or status changed'
+        }
+        $ExpectedPublicKey = [IO.File]::ReadAllBytes(
+            (Join-Path $Root 'public/trust/presentation-public-key.jwk.json')
+        )
         $ObservedHash = [Convert]::ToHexString(
-            [Security.Cryptography.SHA256]::HashData($Manifest.Bytes)
+            [Security.Cryptography.SHA256]::HashData($PublicKey.Bytes)
         )
         $ExpectedHash = [Convert]::ToHexString(
-            [Security.Cryptography.SHA256]::HashData($ExpectedManifest)
+            [Security.Cryptography.SHA256]::HashData($ExpectedPublicKey)
         )
         if ($ObservedHash -ne $ExpectedHash) {
-            throw 'NGINX changed generated runtime manifest bytes'
+            throw 'NGINX changed the reviewed public key bytes'
         }
         if (
             $MissingJson.Status -ne 404 -or
@@ -99,13 +105,13 @@ try {
         if ($Spa.Status -ne 200 -or -not [Text.Encoding]::UTF8.GetString($Spa.Bytes).Contains('<!doctype html>')) {
             throw 'SPA root fallback changed'
         }
-        if ($Index.CacheControl -ne 'no-store' -or $Manifest.CacheControl -ne 'no-store') {
-            throw 'HTML or runtime manifest caching is unsafe'
+        if ($Index.CacheControl -ne 'no-store' -or $PublicKey.CacheControl -ne 'no-store') {
+            throw 'HTML or reviewed public key caching is unsafe'
         }
         if ($Asset.CacheControl -ne 'public, max-age=31536000, immutable') {
             throw 'content-addressed asset caching changed'
         }
-        foreach ($Response in @($Health, $Manifest, $MissingJson, $Spa, $Asset)) {
+        foreach ($Response in @($Health, $NoGatewayManifest, $PublicKey, $MissingJson, $Spa, $Asset)) {
             if (
                 -not $Response.Csp.Contains("frame-ancestors 'none'") -or
                 $Response.NoSniff -ne 'nosniff' -or

@@ -6,12 +6,14 @@ import {
 } from './contracts'
 import {
   cloneLifecycleAssets,
+  createLiveRuntimeManifest,
   createVerifiedLifecycle,
   rawLifecycleAssets,
   rawPublicKey,
   rawRuntimeManifest,
 } from './test/fixtures'
 import {
+  deriveSyntheticResourceGroupBinding,
   validateLifecycleConsistency,
   VerificationError,
   verifyLifecycleAssets,
@@ -31,6 +33,39 @@ describe('detached RS256 lifecycle verification', () => {
       verifiedPhases: 3,
     })
     expect(verified.phases.faulted.blastRadius).toBe('contained-web-tier')
+    expect(verified.publication).toEqual({ kind: 'static-fixture' })
+  })
+
+  it('verifies live publication metadata and its cryptographic resource-group binding', async () => {
+    const verified = await verifyLifecycleAssets(
+      createLiveRuntimeManifest(),
+      parsePresentationPublicKey(rawPublicKey),
+      cloneLifecycleAssets(),
+    )
+
+    expect(verified.classification).toBe('live-workload-evaluation')
+    expect(verified.publication).toEqual({
+      kind: 'live',
+      runId: 'synthetic-run-live-001',
+      targetResourceGroup: 'rg-athena-demo-workload',
+      evaluatedAt: '2026-09-01T23:59:00Z',
+      publishedAt: '2026-09-02T00:00:00Z',
+    })
+    expect(
+      await deriveSyntheticResourceGroupBinding('RG-ATHENA-DEMO-WORKLOAD'),
+    ).toBe(
+      'synthetic-rg-36c4a74ac567d0bba5e5e4d9e940d5f685bfad399f3fc045d69d8a58eca8a0bf',
+    )
+  })
+
+  it('rejects a live manifest whose target resource group differs from signed workload scope', async () => {
+    await expect(
+      verifyLifecycleAssets(
+        createLiveRuntimeManifest('other-reviewed-rg'),
+        parsePresentationPublicKey(rawPublicKey),
+        cloneLifecycleAssets(),
+      ),
+    ).rejects.toThrow(/target resource group/i)
   })
 
   it('rejects a structurally valid tampered payload digest', async () => {

@@ -10,6 +10,7 @@ import {
   parsePresentationPublicKey,
   parseRuntimeManifest,
   type LifecyclePhase,
+  type RuntimeManifest,
 } from '../contracts'
 import {
   verifyLifecycleAssets,
@@ -40,6 +41,33 @@ export const cloneLifecycleAssets = (): UnverifiedLifecycleAssets =>
 export const createVerifiedLifecycle = (): Promise<VerifiedLifecycle> =>
   verifyLifecycleAssets(
     parseRuntimeManifest(rawRuntimeManifest),
+    parsePresentationPublicKey(rawPublicKey),
+    cloneLifecycleAssets(),
+  )
+
+export const createLiveRuntimeManifest = (
+  targetResourceGroup = 'rg-athena-demo-workload',
+): RuntimeManifest => {
+  const manifest = structuredClone(rawRuntimeManifest) as Record<string, unknown>
+  manifest.schemaVersion = 'athena.presentationWeb.runtime.v2'
+  manifest.classification = 'live-workload-evaluation'
+  manifest.runId = 'synthetic-run-live-001'
+  manifest.targetResourceGroup = targetResourceGroup
+  manifest.evaluatedAt = '2026-09-01T23:59:00Z'
+  manifest.publishedAt = '2026-09-02T00:00:00Z'
+  const phases = manifest.phases as Array<Record<string, unknown>>
+  for (const phase of phases) {
+    const phaseName = phase.phase as LifecyclePhase
+    const prefix = `./live/runs/synthetic-run-live-001/${phaseName}`
+    phase.payloadPath = `${prefix}/argus-presentation.json`
+    phase.attestationPath = `${prefix}/presentation-attestation.json`
+  }
+  return parseRuntimeManifest(manifest)
+}
+
+export const createLiveVerifiedLifecycle = (): Promise<VerifiedLifecycle> =>
+  verifyLifecycleAssets(
+    createLiveRuntimeManifest(),
     parsePresentationPublicKey(rawPublicKey),
     cloneLifecycleAssets(),
   )

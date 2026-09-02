@@ -37,7 +37,18 @@ export interface VerifiedPhase {
 }
 
 export interface VerifiedLifecycle {
-  classification: 'synthetic-demo-only'
+  classification: 'synthetic-demo-only' | 'live-workload-evaluation'
+  publication:
+    | {
+        kind: 'static-fixture'
+      }
+    | {
+        kind: 'live'
+        runId: string
+        targetResourceGroup: string
+        evaluatedAt: string
+        publishedAt: string
+      }
   trust: {
     status: 'verified'
     algorithm: 'RS256'
@@ -85,8 +96,25 @@ export const verifyLifecycleAssets = async (
   )
   const phases = Object.fromEntries(verifiedEntries) as Record<LifecyclePhase, VerifiedPhase>
   validateLifecycleConsistency(phases)
+  if (manifest.schemaVersion === 'athena.presentationWeb.runtime.v2') {
+    await validateLiveResourceGroupBinding(
+      manifest.targetResourceGroup,
+      phases,
+      cryptoProvider,
+    )
+  }
   return {
-    classification: 'synthetic-demo-only',
+    classification: manifest.classification,
+    publication:
+      manifest.schemaVersion === 'athena.presentationWeb.runtime.v2'
+        ? {
+            kind: 'live',
+            runId: manifest.runId,
+            targetResourceGroup: manifest.targetResourceGroup,
+            evaluatedAt: manifest.evaluatedAt,
+            publishedAt: manifest.publishedAt,
+          }
+        : { kind: 'static-fixture' },
     trust: {
       status: 'verified',
       algorithm: 'RS256',
@@ -96,6 +124,17 @@ export const verifyLifecycleAssets = async (
     },
     phases,
   }
+}
+
+export const deriveSyntheticResourceGroupBinding = async (
+  targetResourceGroup: string,
+  cryptoProvider: Crypto = globalThis.crypto,
+): Promise<string> => {
+  const preimage = new TextEncoder().encode(
+    `${SCENARIO_BINDING_PREFIX}${targetResourceGroup.toLowerCase()}`,
+  )
+  const digest = await sha256Digest(preimage, cryptoProvider)
+  return `synthetic-rg-${digest.slice('sha256:'.length)}`
 }
 
 export const verifyPhaseSignature = async (
@@ -186,6 +225,7 @@ export const validateLifecycleConsistency = (
   ) {
     throw new VerificationError('Lifecycle workload binding is inconsistent.')
   }
+
   if (
     faulted.runtimeState.webTier.expectedNodes !==
       baseline.runtimeState.webTier.expectedNodes ||
@@ -233,6 +273,28 @@ export const validateLifecycleConsistency = (
     LIFECYCLE_PHASES.map((phase) => phases[phase].payload.athena.semanticDigest),
     'snapshot semantic digests',
   )
+}
+
+const SCENARIO_BINDING_PREFIX = 'athena-web-node-fault.v1\0rg\0'
+
+const validateLiveResourceGroupBinding = async (
+  targetResourceGroup: string,
+  phases: Record<LifecyclePhase, VerifiedPhase>,
+  cryptoProvider: Crypto,
+): Promise<void> => {
+  const expected = await deriveSyntheticResourceGroupBinding(
+    targetResourceGroup,
+    cryptoProvider,
+  )
+  if (
+    LIFECYCLE_PHASES.some(
+      (phase) => phases[phase].payload.workload.resourceGroup !== expected,
+    )
+  ) {
+    throw new VerificationError(
+      'Live target resource group does not match the signed workload binding.',
+    )
+  }
 }
 
 const requireDistinctSignedValues = (values: string[], label: string): void => {

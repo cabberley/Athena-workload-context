@@ -4,7 +4,7 @@ import base64
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +65,10 @@ from athena_context.operational_phase_runner import (
     CreateOnlyArtifact,
     OperationalPhaseRunResult,
     run_operational_phase,
+)
+from athena_context.presentation_assets import (
+    PresentationPublicationReceipt,
+    PresentationPublicationRequest,
 )
 from wc013_support import PUBLISHER, DemoHarness, build_harness
 
@@ -915,6 +919,38 @@ class FakeClock:
         self.sleeps.append(seconds)
         self.current += seconds
 
+    def utc_now(self) -> datetime:
+        return datetime(2026, 9, 2, 0, 0, tzinfo=UTC)
+
+
+class InspectablePresentationPublisher:
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.requests: list[PresentationPublicationRequest] = []
+
+    def publish(
+        self,
+        request: PresentationPublicationRequest,
+    ) -> PresentationPublicationReceipt:
+        self.requests.append(request)
+        if self.failure is not None:
+            raise self.failure
+        return PresentationPublicationReceipt(
+            run_id=request.manifest.run_id,
+            manifest_blob_name="runtime-manifest.json",
+            manifest_sha256=sha256_hex(request.manifest.canonical_bytes()),
+        )
+
+
+def _enable_presentation_publisher(config_path: Path) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["presentationPublisher"] = {
+        "blobEndpoint": "https://athenareplay.blob.core.windows.net",
+        "containerName": "presentation-assets",
+        "managedIdentityClientId": "11111111-1111-1111-1111-111111111111",
+    }
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
 
 def _success_ports(
     fixture: OperatorFixture,
@@ -1127,6 +1163,7 @@ def test_operator_runs_lifecycle_in_order_and_reads_exact_versions(
     assert result.faulted.verdict == "fail"
     assert result.recovered.verdict == "resolved"
     assert result.reset_status == "reset succeeded"
+    assert result.publication is None
     assert workload.events == ["status", "inject", "reset"]
     assert controller.events == [
         ("start", "baseline"),
@@ -1163,6 +1200,108 @@ def test_operator_runs_lifecycle_in_order_and_reads_exact_versions(
         for reference in expected_reads
     ]
     assert clock.sleeps == [1, 1, 1]
+
+
+def test_operator_publishes_only_verified_live_assets_after_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture(tmp_path, monkeypatch)
+    _enable_presentation_publisher(fixture.config_path)
+    workload, controller = _success_ports(fixture)
+    publisher = InspectablePresentationPublisher()
+
+    result = run_operational_demo_operator(
+        fixture.config_path,
+        confirmation_phrase=fixture.confirmation_phrase,
+        workload_port=workload,
+        phase_job_port=controller,
+        handoff_port=controller,
+        artifact_reader=fixture.reader,
+        presentation_publisher=publisher,
+        clock=FakeClock(),
+    )
+
+    assert result.publication is not None
+    assert result.publication.manifest_digest.startswith("sha256:")
+    assert len(publisher.requests) == 1
+    request = publisher.requests[0]
+    assert request.manifest.classification == "live-workload-evaluation"
+    assert request.manifest.run_id == RUN_ID
+    assert request.manifest.target_resource_group == (
+        fixture.workload_reports["status"].receipt.resource_group
+    )
+    assert request.manifest.published_at == datetime(
+        2026,
+        9,
+        2,
+        0,
+        0,
+        tzinfo=UTC,
+    )
+    assert [asset.blob_name for asset in request.assets] == [
+        f"live/runs/{RUN_ID}/baseline/argus-presentation.json",
+        f"live/runs/{RUN_ID}/baseline/presentation-attestation.json",
+        f"live/runs/{RUN_ID}/faulted/argus-presentation.json",
+        f"live/runs/{RUN_ID}/faulted/presentation-attestation.json",
+        f"live/runs/{RUN_ID}/recovered/argus-presentation.json",
+        f"live/runs/{RUN_ID}/recovered/presentation-attestation.json",
+    ]
+    assert all(
+        asset.payload_sha256 == sha256_hex(asset.payload)
+        for asset in request.assets
+    )
+    assert workload.events == ["status", "inject", "reset"]
+    assert controller.events[-1] == ("handoff", "recovered")
+
+
+def test_operator_reports_publication_failure_after_successful_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture(tmp_path, monkeypatch)
+    _enable_presentation_publisher(fixture.config_path)
+    workload, controller = _success_ports(fixture)
+
+    with pytest.raises(
+        OperationalDemoOperatorError,
+        match=r"presentation publication failed closed; reset succeeded$",
+    ):
+        run_operational_demo_operator(
+            fixture.config_path,
+            confirmation_phrase=fixture.confirmation_phrase,
+            workload_port=workload,
+            phase_job_port=controller,
+            handoff_port=controller,
+            artifact_reader=fixture.reader,
+            presentation_publisher=InspectablePresentationPublisher(
+                RuntimeError("private detail")
+            ),
+            clock=FakeClock(),
+        )
+
+    assert workload.events == ["status", "inject", "reset"]
+    assert controller.events[-1] == ("handoff", "recovered")
+
+
+def test_operator_rejects_non_presentation_assets_publisher_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_fixture(tmp_path, monkeypatch)
+    config = json.loads(fixture.config_path.read_text(encoding="utf-8"))
+    config["presentationPublisher"] = {
+        "blobEndpoint": "https://athenareplay.blob.core.windows.net",
+        "containerName": "operational-artifacts",
+        "managedIdentityClientId": "11111111-1111-1111-1111-111111111111",
+    }
+    fixture.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(
+        OperationalDemoOperatorError,
+        match="operator configuration failed closed validation",
+    ):
+        build_operational_demo_validation(fixture.config_path)
 
 
 def test_operator_rejects_missing_source_envelope_artifact(

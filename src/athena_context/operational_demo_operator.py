@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
 
@@ -20,8 +20,15 @@ from athena_context.artifacts import (
     ArtifactReadResult,
     VersionPinnedArtifactReaderPort,
 )
-from athena_context.azure_adapters import AzureBlobVersionPinnedArtifactReader
+from athena_context.azure_adapters import (
+    AzureBlobPresentationAssetPublisher,
+    AzureBlobVersionPinnedArtifactReader,
+)
 from athena_context.contracts import (
+    PRESENTATION_PUBLIC_KEY_ASSET_SHA256,
+    PRESENTATION_PUBLIC_KEY_FINGERPRINT,
+    PRESENTATION_PUBLIC_KEY_ID,
+    PRESENTATION_PUBLIC_KEY_PATH,
     ArgusPresentationPayload,
     ArgusPresentationPhase,
     EvidenceSnapshot,
@@ -35,12 +42,16 @@ from athena_context.contracts import (
     OperationalPhaseInputs,
     OperationalPhaseReferenceHandoff,
     PresentationAttestation,
+    PresentationRuntimeKey,
+    PresentationRuntimeManifestV2,
+    PresentationRuntimePhaseAsset,
     ReceiptAction,
     SnapshotPublicationRecord,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     VersionPinnedBlobReference,
     compute_fault_lineage_digest,
+    live_presentation_asset_paths,
     sha256_hex,
 )
 from athena_context.contracts.common import (
@@ -60,6 +71,14 @@ from athena_context.presentation import (
     project_argus_presentation,
     verify_demo_evaluation_result,
     verify_presentation_attestation,
+)
+from athena_context.presentation_assets import (
+    MAX_PRESENTATION_ATTESTATION_BYTES,
+    MAX_PRESENTATION_PAYLOAD_BYTES,
+    PresentationAsset,
+    PresentationAssetPublisherPort,
+    PresentationPublicationReceipt,
+    PresentationPublicationRequest,
 )
 
 _MAX_CONFIG_BYTES = 128 * 1024
@@ -89,6 +108,15 @@ class OperationalDemoOperatorResult:
     faulted: OperationalDemoPhaseSummary
     recovered: OperationalDemoPhaseSummary
     reset_status: str
+    publication: OperationalDemoPublicationSummary | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationalDemoPublicationSummary:
+    target_resource_group: str
+    evaluated_at: datetime
+    published_at: datetime
+    manifest_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +150,10 @@ class _VerifiedPhaseArtifacts:
     completion_index: OperationalPhaseCompletionIndex
     completion_index_reference: VersionPinnedBlobReference
     summary: OperationalDemoPhaseSummary
+    presentation_payload: bytes
+    presentation_attestation: bytes
+    target_resource_group: str
+    evaluated_at: datetime
 
 
 class WorkloadActionPort(Protocol):
@@ -171,6 +203,8 @@ class _Clock(Protocol):
 
     def sleep(self, seconds: int) -> None: ...
 
+    def utc_now(self) -> datetime: ...
+
 
 class _SystemClock:
     def monotonic(self) -> float:
@@ -178,6 +212,9 @@ class _SystemClock:
 
     def sleep(self, seconds: int) -> None:
         time.sleep(seconds)
+
+    def utc_now(self) -> datetime:
+        return datetime.now(UTC)
 
 
 class _RsaPresentationVerifier(PresentationSignatureVerifier):
@@ -612,7 +649,22 @@ def prepare_operational_demo_operator(
         config_root,
         configuration.presentation_public_key_file,
     )
-    verifier = _RsaPresentationVerifier(_load_rsa_public_key(public_key_path))
+    public_key = _load_rsa_public_key(public_key_path)
+    if configuration.presentation_publisher is not None:
+        fingerprint = sha256_hex(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        if (
+            fingerprint != PRESENTATION_PUBLIC_KEY_FINGERPRINT
+            or bundle.synthetic_presentation_key_id != PRESENTATION_PUBLIC_KEY_ID
+        ):
+            raise OperationalDemoOperatorError(
+                "presentation publisher trust anchor does not match the reviewed browser key"
+            )
+    verifier = _RsaPresentationVerifier(public_key)
     return PreparedOperationalDemoOperator(
         configuration=configuration,
         configuration_path=config_path,
@@ -665,6 +717,16 @@ def render_operational_demo_result(
             f"index {summary.completion_index_digest}"
         )
 
+    publication_line = (
+        ""
+        if result.publication is None
+        else (
+            "presentation publication: "
+            f"{result.publication.manifest_digest} | "
+            f"evaluated {result.publication.evaluated_at.isoformat()} | "
+            f"published {result.publication.published_at.isoformat()}\n"
+        )
+    )
     return (
         "operational demo operator passed\n"
         f"run: {result.run_id}\n"
@@ -672,6 +734,7 @@ def render_operational_demo_result(
         f"{_phase_lines(result.faulted)}\n"
         f"reset: {result.reset_status}\n"
         f"{_phase_lines(result.recovered)}\n"
+        f"{publication_line}"
     )
 
 
@@ -1151,6 +1214,105 @@ def _verify_phase_artifacts(
             service_state=presentation.runtime_state.web_tier.service_state,
             completion_index_digest=completion_index.index_digest,
         ),
+        presentation_payload=artifact_results[2].payload,
+        presentation_attestation=artifact_results[3].payload,
+        target_resource_group=receipt_report.receipt.resource_group,
+        evaluated_at=result.publication.published_at,
+    )
+
+
+def _build_presentation_publication(
+    *,
+    prepared: PreparedOperationalDemoOperator,
+    baseline: _VerifiedPhaseArtifacts,
+    faulted: _VerifiedPhaseArtifacts,
+    recovered: _VerifiedPhaseArtifacts,
+    published_at: datetime,
+) -> PresentationPublicationRequest:
+    verified_phases = (baseline, faulted, recovered)
+    resource_groups = {
+        item.target_resource_group.casefold() for item in verified_phases
+    }
+    if len(resource_groups) != 1:
+        raise OperationalDemoOperatorError(
+            "verified phase receipts do not target one resource group"
+        )
+    phase_models: list[PresentationRuntimePhaseAsset] = []
+    assets: list[PresentationAsset] = []
+    for phase, verified in zip(
+        ("baseline", "faulted", "recovered"),
+        verified_phases,
+        strict=True,
+    ):
+        selected_phase = cast(ArgusPresentationPhase, phase)
+        payload_path, attestation_path = live_presentation_asset_paths(
+            prepared.configuration.run_id,
+            selected_phase,
+        )
+        payload_digest = sha256_hex(verified.presentation_payload)
+        attestation_digest = sha256_hex(verified.presentation_attestation)
+        phase_models.append(
+            PresentationRuntimePhaseAsset(
+                phase=selected_phase,
+                payloadPath=payload_path,
+                payloadSha256=payload_digest,
+                attestationPath=attestation_path,
+                attestationSha256=attestation_digest,
+            )
+        )
+        assets.extend(
+            (
+                PresentationAsset(
+                    blob_name=payload_path.removeprefix("./"),
+                    payload=verified.presentation_payload,
+                    payload_sha256=payload_digest,
+                    maximum_bytes=MAX_PRESENTATION_PAYLOAD_BYTES,
+                ),
+                PresentationAsset(
+                    blob_name=attestation_path.removeprefix("./"),
+                    payload=verified.presentation_attestation,
+                    payload_sha256=attestation_digest,
+                    maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
+                ),
+            )
+        )
+    phase_tuple = cast(
+        tuple[
+            PresentationRuntimePhaseAsset,
+            PresentationRuntimePhaseAsset,
+            PresentationRuntimePhaseAsset,
+        ],
+        tuple(phase_models),
+    )
+    asset_tuple = cast(
+        tuple[
+            PresentationAsset,
+            PresentationAsset,
+            PresentationAsset,
+            PresentationAsset,
+            PresentationAsset,
+            PresentationAsset,
+        ],
+        tuple(assets),
+    )
+    manifest = PresentationRuntimeManifestV2(
+        schemaVersion="athena.presentationWeb.runtime.v2",
+        classification="live-workload-evaluation",
+        runId=prepared.configuration.run_id,
+        targetResourceGroup=baseline.target_resource_group,
+        evaluatedAt=recovered.evaluated_at,
+        publishedAt=published_at,
+        key=PresentationRuntimeKey(
+            path=PRESENTATION_PUBLIC_KEY_PATH,
+            assetSha256=PRESENTATION_PUBLIC_KEY_ASSET_SHA256,
+            keyId=PRESENTATION_PUBLIC_KEY_ID,
+            fingerprint=PRESENTATION_PUBLIC_KEY_FINGERPRINT,
+        ),
+        phases=phase_tuple,
+    )
+    return PresentationPublicationRequest(
+        manifest=manifest,
+        assets=asset_tuple,
     )
 
 
@@ -1210,6 +1372,7 @@ def run_operational_demo_operator(
     phase_job_port: PhaseJobPort | None = None,
     handoff_port: ReferenceHandoffPort | None = None,
     artifact_reader: VersionPinnedArtifactReaderPort | None = None,
+    presentation_publisher: PresentationAssetPublisherPort | None = None,
     clock: _Clock | None = None,
 ) -> OperationalDemoOperatorResult:
     prepared = prepare_operational_demo_operator(config_path)
@@ -1245,6 +1408,16 @@ def run_operational_demo_operator(
             prepared.configuration.artifact_reader.managed_identity_client_id
         ),
     )
+    active_publisher: PresentationAssetPublisherPort | None = None
+    publisher_configuration = prepared.configuration.presentation_publisher
+    if publisher_configuration is not None:
+        active_publisher = presentation_publisher or AzureBlobPresentationAssetPublisher(
+            blob_endpoint=publisher_configuration.blob_endpoint,
+            container_name=publisher_configuration.container_name,
+            managed_identity_client_id=(
+                publisher_configuration.managed_identity_client_id
+            ),
+        )
 
     try:
         baseline_report = _invoke_workload_action(
@@ -1350,12 +1523,49 @@ def run_operational_demo_operator(
         raise OperationalDemoOperatorError(
             f"{exc}; reset succeeded"
         ) from exc
+    publication_summary: OperationalDemoPublicationSummary | None = None
+    if active_publisher is not None:
+        published_at = max(runtime_clock.utc_now(), recovered.evaluated_at)
+        try:
+            publication_request = _build_presentation_publication(
+                prepared=prepared,
+                baseline=baseline,
+                faulted=faulted,
+                recovered=recovered,
+                published_at=published_at,
+            )
+            publication_receipt = active_publisher.publish(publication_request)
+            expected_manifest_digest = sha256_hex(
+                publication_request.manifest.canonical_bytes()
+            )
+            if (
+                type(publication_receipt) is not PresentationPublicationReceipt
+                or publication_receipt.run_id != prepared.configuration.run_id
+                or publication_receipt.manifest_blob_name
+                != "runtime-manifest.json"
+                or publication_receipt.manifest_sha256
+                != expected_manifest_digest
+            ):
+                raise OperationalDemoOperatorError(
+                    "presentation publisher returned an invalid receipt"
+                )
+        except Exception as exc:  # noqa: BLE001 - publisher boundary is injected.
+            raise OperationalDemoOperatorError(
+                "presentation publication failed closed; reset succeeded"
+            ) from exc
+        publication_summary = OperationalDemoPublicationSummary(
+            target_resource_group=publication_request.manifest.target_resource_group,
+            evaluated_at=publication_request.manifest.evaluated_at,
+            published_at=publication_request.manifest.published_at,
+            manifest_digest=publication_receipt.manifest_sha256,
+        )
     return OperationalDemoOperatorResult(
         run_id=prepared.configuration.run_id,
         baseline=baseline.summary,
         faulted=faulted.summary,
         recovered=recovered.summary,
         reset_status="reset succeeded",
+        publication=publication_summary,
     )
 
 
@@ -1363,6 +1573,7 @@ __all__ = [
     "OperationalDemoOperatorError",
     "OperationalDemoOperatorResult",
     "OperationalDemoPhaseSummary",
+    "OperationalDemoPublicationSummary",
     "OperationalDemoValidation",
     "PhaseJobPort",
     "PreparedOperationalDemoOperator",

@@ -62,12 +62,21 @@ param artifactContainerName string
 @description('Dedicated immutable Blob container written only by the isolated evidence collector.')
 param collectorArtifactContainerName string
 
+@description('Dedicated private non-WORM Blob container for current and immutable presentation assets.')
+@allowed([
+  'presentation-assets'
+])
+param presentationAssetContainerName string
+
+@description('Principal ID of the presentation sidecar identity receiving read-only access to presentation-assets.')
+param presentationIdentityPrincipalId string
+
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds or match either runtime identity.')
+@description('Object IDs of operator managed identities that read exact operational artifacts and publish verified presentation assets. Contributor is scoped only to presentation-assets.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
@@ -109,6 +118,7 @@ var normalizedWorkloadReceiptWriterObjectIds = map(workloadReceiptWriterObjectId
 var normalizedRuntimeIdentityPrincipalIds = [
   toLower(acceptanceIdentityPrincipalId)
   toLower(evidenceIdentityPrincipalId)
+  toLower(presentationIdentityPrincipalId)
 ]
 var overlappingArtifactAccessObjectIds = intersection(
   normalizedOperatorArtifactReaderObjectIds,
@@ -124,12 +134,12 @@ var workloadRuntimeIdentityOverlap = intersection(
 )
 var validatedOperatorArtifactReaderObjectIds = empty(operatorRuntimeIdentityOverlap)
   ? operatorArtifactReaderObjectIds
-  : fail('operatorArtifactReaderObjectIds must not contain acceptance or evidence runtime identities')
+  : fail('operatorArtifactReaderObjectIds must not contain acceptance, evidence, or presentation runtime identities')
 var validatedWorkloadReceiptWriterObjectIds = !empty(overlappingArtifactAccessObjectIds)
   ? fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds must contain distinct principals')
   : empty(workloadRuntimeIdentityOverlap)
     ? workloadReceiptWriterObjectIds
-    : fail('workloadReceiptWriterObjectIds must not contain acceptance or evidence runtime identities')
+    : fail('workloadReceiptWriterObjectIds must not contain acceptance, evidence, or presentation runtime identities')
 var rejectedAcceptanceImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && endsWith(
   acceptanceImageRegistryServer,
@@ -316,6 +326,10 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
             allowProtectedAppendWritesAll: false
           }
         }
+        {
+          name: presentationAssetContainerName
+          publicAccess: 'None'
+        }
       ]
     }
     privateEndpoints: [
@@ -386,6 +400,11 @@ resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 resource collectorArtifactContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
   parent: replayBlobService
   name: collectorArtifactContainerName
+}
+
+resource presentationAssetContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
+  parent: replayBlobService
+  name: presentationAssetContainerName
 }
 
 resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -504,6 +523,46 @@ resource operatorArtifactBlobDataReaders 'Microsoft.Authorization/roleAssignment
     replayStorage
   ]
 }]
+
+resource operatorPresentationAssetBlobDataContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for operatorArtifactReaderObjectId in validatedOperatorArtifactReaderObjectIds: {
+  name: guid(
+    presentationAssetContainer.id,
+    operatorArtifactReaderObjectId,
+    storageBlobDataContributorRoleDefinitionId
+  )
+  scope: presentationAssetContainer
+  properties: {
+    principalId: operatorArtifactReaderObjectId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}]
+
+resource presentationAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    presentationAssetContainer.id,
+    presentationIdentityPrincipalId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: presentationAssetContainer
+  properties: {
+    principalId: presentationIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
 
 module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
   name: 'wc013-one-shot-job'
@@ -890,6 +949,12 @@ output collectorArtifactContainerName string = collectorArtifactContainerName
 
 @description('Resource ID of the dedicated immutable collector artifact container.')
 output collectorArtifactContainerResourceId string = collectorArtifactContainer.id
+
+@description('Dedicated private presentation asset container name.')
+output presentationAssetContainerName string = presentationAssetContainerName
+
+@description('Resource ID of the private presentation asset container.')
+output presentationAssetContainerResourceId string = presentationAssetContainer.id
 
 @description('Configured unlocked WORM retention period for artifact blob versions.')
 output artifactRetentionDays int = artifactRetentionDays

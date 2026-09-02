@@ -75,12 +75,18 @@ param artifactContainerName string = 'operational-artifacts'
 @maxLength(63)
 param collectorArtifactContainerName string = 'collected-evidence'
 
+@description('Dedicated private non-WORM Blob container for presentation assets.')
+@allowed([
+  'presentation-assets'
+])
+param presentationAssetContainerName string = 'presentation-assets'
+
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
 @maxValue(146000)
 param artifactRetentionDays int
 
-@description('Object IDs of operator managed identities that read exact artifact versions. These principals must not appear in workloadReceiptWriterObjectIds or match either runtime identity.')
+@description('Object IDs of operator managed identities that read exact operational artifact versions and publish verified presentation assets. These principals receive Contributor only on presentation-assets and must not match workload or runtime identities.')
 @maxLength(32)
 param operatorArtifactReaderObjectIds array
 
@@ -228,6 +234,10 @@ var validatedPresentationImage = presentationImage == toLower(presentationImage)
 ) && !endsWith(presentationImage, rejectedImageDigestSuffix)
   ? presentationImage
   : fail('presentationImage must use the exact presentationImageRegistryServer/athena/presentation-web repository and a real 64-character lowercase sha256 digest')
+var validatedPresentationDeliveryRegistryServer = validatedPresentationImageRegistryServer == validatedAcceptanceImageRegistryServer
+  ? validatedPresentationImageRegistryServer
+  : fail('presentation and WC-013 delivery images must use the same reviewed Azure Container Registry')
+var presentationAssetBlobEndpoint = 'https://${replayStorageAccountName}.blob.${environment().suffixes.storage}'
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
 var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
 var collectorControllerFederatedCredentialSubject = 'repo:cabberley/Athena-workload-context:environment:athena-live'
@@ -355,8 +365,11 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     namePrefix: namePrefix
     managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
     presentationImage: validatedPresentationImage
-    presentationImageRegistryServer: validatedPresentationImageRegistryServer
+    presentationImageRegistryServer: validatedPresentationDeliveryRegistryServer
     presentationImageRegistryResourceId: presentationImageRegistryResourceId
+    deliveryImage: validatedAcceptanceImage
+    presentationAssetBlobEndpoint: presentationAssetBlobEndpoint
+    presentationAssetContainerName: presentationAssetContainerName
     tags: resourceTags
   }
 }
@@ -384,6 +397,8 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     replayTableName: replayTableName
     artifactContainerName: artifactContainerName
     collectorArtifactContainerName: collectorArtifactContainerName
+    presentationAssetContainerName: presentationAssetContainerName
+    presentationIdentityPrincipalId: presentationWeb.outputs.identityPrincipalId
     artifactRetentionDays: artifactRetentionDays
     operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
     workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds
@@ -523,6 +538,15 @@ output collectorArtifactContainerName string = acceptanceResources.outputs.colle
 @description('Collector artifact container resource ID used as the exact Blob data-role scope.')
 output collectorArtifactContainerResourceId string = acceptanceResources.outputs.collectorArtifactContainerResourceId
 
+@description('Dedicated private presentation asset container name.')
+output presentationAssetContainerName string = acceptanceResources.outputs.presentationAssetContainerName
+
+@description('Presentation asset container resource ID used as the exact Blob data-role scope.')
+output presentationAssetContainerResourceId string = acceptanceResources.outputs.presentationAssetContainerResourceId
+
+@description('Private HTTPS Azure Blob endpoint used by the presentation publisher and sidecar.')
+output presentationAssetBlobEndpoint string = presentationAssetBlobEndpoint
+
 @description('Configured unlocked WORM retention period for artifact blob versions.')
 output artifactRetentionDays int = acceptanceResources.outputs.artifactRetentionDays
 
@@ -568,13 +592,13 @@ output presentationFqdn string = presentationWeb.outputs.fqdn
 @description('Fully qualified private HTTPS presentation URL.')
 output presentationHttpsUrl string = presentationWeb.outputs.httpsUrl
 
-@description('Presentation identity resource ID. This identity receives only AcrPull.')
+@description('Presentation identity resource ID. This identity receives only AcrPull and Blob Data Reader on presentation-assets.')
 output presentationIdentityResourceId string = presentationWeb.outputs.identityResourceId
 
-@description('Presentation identity client ID.')
+@description('Presentation identity client ID for ACR pull and read-only presentation asset access.')
 output presentationIdentityClientId string = presentationWeb.outputs.identityClientId
 
-@description('Presentation identity principal ID.')
+@description('Presentation identity principal ID scoped to ACR pull and Blob Data Reader on presentation-assets.')
 output presentationIdentityPrincipalId string = presentationWeb.outputs.identityPrincipalId
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')

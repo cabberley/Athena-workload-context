@@ -21,9 +21,11 @@ param replayStorageAccountName = 'athenasynthwc013replay'
 param replayTableName = 'Wc013Replay'
 param replayPartitionKey = 'wc013-live-synthetic'
 param artifactContainerName = 'operational-artifacts'
+param presentationAssetContainerName = 'presentation-assets'
 param artifactRetentionDays = 30
 
-// Demo jumpbox/operator verification reader for exact version-pinned artifact reads.
+// Demo jumpbox/operator verification reader for exact version-pinned artifact reads and
+// create-only presentation publication plus current-pointer replacement.
 // Replace with a reviewed Entra object ID that is not used by the receipt writer.
 param operatorArtifactReaderObjectIds = [
   '44444444-4444-4444-4444-444444444444'

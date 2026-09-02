@@ -6,9 +6,10 @@ separate from ARGUS so ARGUS `main` can remain Overlake-only.
 
 ## Trust boundary
 
-The browser reads only same-origin static JSON:
+The browser reads only same-origin JSON:
 
-1. `runtime-manifest.json`, a closed `athena.presentationWeb.runtime.v1` file;
+1. `runtime-manifest.json`, either a closed static `athena.presentationWeb.runtime.v1` fixture or
+   a closed live `athena.presentationWeb.runtime.v2` pointer;
 2. one frozen `athena.argus.presentation.v1` payload per lifecycle phase;
 3. one detached `athena.argus.presentationAttestation.v1` per payload; and
 4. one reviewed RSA verification-only JWK.
@@ -28,10 +29,14 @@ Before any lifecycle data is rendered, the browser:
 - binds payload, attestation, reviewed key ID, and SPKI fingerprint;
 - validates phase-distinct snapshot artifact, semantic, and result digests; and
 - validates one baseline-to-faulted-to-recovered workload, clause, node-count, and fault/reset
-  lineage.
+  lineage; and
+- for v2, hashes the case-folded `targetResourceGroup` with the frozen scenario/domain separator
+  and requires it to equal the signed synthetic workload resource-group binding.
 
-Any failure withholds the complete lifecycle. The app has no Azure SDK, Blob, ARM, MCP, storage
-credential, direct cloud call, mutation, or remediation capability.
+Any failure withholds the complete lifecycle. The browser has no Azure SDK, Blob URL, ARM, MCP,
+storage credential, direct cloud call, mutation, or remediation capability. In live deployment,
+NGINX proxies only `/runtime-manifest.json` and `/live/` to a localhost managed-identity sidecar;
+the browser remains same-origin and the static reviewed key remains at `/trust/...`.
 
 ## Synthetic fixtures
 
@@ -77,7 +82,10 @@ routes. `/healthz` is the Container Apps and image health endpoint.
 Every response includes CSP with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and `X-Frame-Options: DENY`.
 HTML, health, runtime-manifest, key, payload, and attestation responses use `Cache-Control:
-no-store`. Only Vite's content-addressed `/assets/` files use one-year immutable caching.
+no-store`. Only Vite's content-addressed `/assets/` files use one-year immutable caching. Deployed
+live operation requires the WC-013 delivery-image sidecar and private `presentation-assets`
+container described in
+[`docs/operations/live-presentation-publication.md`](../../docs/operations/live-presentation-publication.md).
 
 Build locally from the app context:
 
