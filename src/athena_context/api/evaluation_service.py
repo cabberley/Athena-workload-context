@@ -235,8 +235,7 @@ class DemoEvaluationService:
                 )
             except (AthenaValidationError, ValueError) as exc:
                 raise EvaluationFailedClosedError(
-                    "canonical evidence snapshot assembly or signing failed "
-                    f"({type(exc).__name__}: {str(exc)[:256]})"
+                    "canonical evidence snapshot assembly or signing failed"
                 ) from exc
 
             evaluated_at = self._now()

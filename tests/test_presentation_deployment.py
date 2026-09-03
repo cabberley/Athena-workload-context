@@ -381,7 +381,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    deployment_name = "wc013-ready-20260903T012000Z-b0ff4bacc81c"
+    deployment_name = "wc013-ready-20260903T022000Z-9faf7e0b6072"
     assert f"          - {deployment_name}" in workflow
     assert reviewed_index["schemaVersion"] == (
         "athena.wc013CollectorDeploymentContractIndex.v1"
@@ -389,15 +389,15 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert reviewed_index["deployments"][deployment_name] == {
         "artifactFile": f"{deployment_name}.json",
         "artifactDigest": (
-            "sha256:6dddfe9dbb794961b9282a79bc4d7745dd037d047418e571cb62efe7a4727f88"
+            "sha256:a07cea67a2bee36c39420f3702ed8b1499d11cfd26dd001d794259fc0d79d0f4"
         ),
         "deploymentResourceId": (
             "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
             f"Microsoft.Resources/deployments/{deployment_name}"
         ),
-        "deploymentCorrelationId": "5176a073-85a3-416e-9fef-f05da2611e79",
+        "deploymentCorrelationId": "04d286e5-d9bb-4c0b-bd28-3878f2ec4385",
         "deploymentTemplateHash": "8373313941976686749",
-        "sourceCommit": "b0ff4bacc81c4d68043f0a0115dff669a0acf10e",
+        "sourceCommit": "9faf7e0b6072b9bbc82c5138256ef0451a2d610e",
     }
     assert list(reviewed_index["deployments"]) == [deployment_name]
     assert (
