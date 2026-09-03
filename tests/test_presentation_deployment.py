@@ -381,7 +381,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    deployment_name = "wc013-ready-20260902T231500Z-a69248da7ac4"
+    deployment_name = "wc013-ready-20260903T002200Z-f8d5d599290d"
     assert f"          - {deployment_name}" in workflow
     assert reviewed_index["schemaVersion"] == (
         "athena.wc013CollectorDeploymentContractIndex.v1"
@@ -389,15 +389,15 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert reviewed_index["deployments"][deployment_name] == {
         "artifactFile": f"{deployment_name}.json",
         "artifactDigest": (
-            "sha256:989917ac1772c7ec6e8ce4fda4ec5c175efd8d80a4f23c76e6cb52219d0402be"
+            "sha256:47587af061e87fb1fb68ba3f0c84e55f9d7d95abf25d9160e718a101132e8a7c"
         ),
         "deploymentResourceId": (
             "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
             f"Microsoft.Resources/deployments/{deployment_name}"
         ),
-        "deploymentCorrelationId": "7581388b-3d22-48f6-8605-8eaf88745c4b",
+        "deploymentCorrelationId": "4201da90-d0b5-468b-b101-8aa3ba0ee806",
         "deploymentTemplateHash": "8373313941976686749",
-        "sourceCommit": "a69248da7ac49fd8f7b23e4612639cbb561fa184",
+        "sourceCommit": "f8d5d599290d4c5ec0641cea7df1848c81aec43f",
     }
     assert list(reviewed_index["deployments"]) == [deployment_name]
     assert (
@@ -438,7 +438,7 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:14dfeae02a3095a44704bae77ca09c5f3fd8dadc40c3108b7941fe639a902a59"
+        "@sha256:706a7c0e32019e694be0dc08081121911e6415977afc474af4bf5d1730719c66"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"

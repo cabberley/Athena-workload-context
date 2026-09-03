@@ -16,7 +16,7 @@ on:
         required: true
         type: choice
         options:
-          - wc013-ready-20260902T231500Z-a69248da7ac4
+          - wc013-ready-20260903T002200Z-f8d5d599290d
 
 permissions:
   contents: read
