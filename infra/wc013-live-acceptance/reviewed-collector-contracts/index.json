@@ -1,13 +1,13 @@
 {
   "schemaVersion": "athena.wc013CollectorDeploymentContractIndex.v1",
   "deployments": {
-    "wc013-ready-20260903T022000Z-9faf7e0b6072": {
-      "artifactFile": "wc013-ready-20260903T022000Z-9faf7e0b6072.json",
-      "artifactDigest": "sha256:a07cea67a2bee36c39420f3702ed8b1499d11cfd26dd001d794259fc0d79d0f4",
-      "deploymentResourceId": "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/Microsoft.Resources/deployments/wc013-ready-20260903T022000Z-9faf7e0b6072",
-      "deploymentCorrelationId": "04d286e5-d9bb-4c0b-bd28-3878f2ec4385",
+    "wc013-ready-20260903T025500Z-c9a420be0cbb": {
+      "artifactFile": "wc013-ready-20260903T025500Z-c9a420be0cbb.json",
+      "artifactDigest": "sha256:0868d2d4a2d8e6bc48eaef802b0203ecc58d3c0cd02fb13497aa06407f5b9ef4",
+      "deploymentResourceId": "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/Microsoft.Resources/deployments/wc013-ready-20260903T025500Z-c9a420be0cbb",
+      "deploymentCorrelationId": "6d1a2892-6384-46a8-9a78-d18f647d54d4",
       "deploymentTemplateHash": "8373313941976686749",
-      "sourceCommit": "9faf7e0b6072b9bbc82c5138256ef0451a2d610e"
+      "sourceCommit": "c9a420be0cbbf2596f179c5e80dbb164a0637609"
     }
   }
 }
