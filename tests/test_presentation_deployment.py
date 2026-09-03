@@ -381,7 +381,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    deployment_name = "wc013-ready-20260903T002200Z-f8d5d599290d"
+    deployment_name = "wc013-ready-20260903T012000Z-b0ff4bacc81c"
     assert f"          - {deployment_name}" in workflow
     assert reviewed_index["schemaVersion"] == (
         "athena.wc013CollectorDeploymentContractIndex.v1"
@@ -389,15 +389,15 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert reviewed_index["deployments"][deployment_name] == {
         "artifactFile": f"{deployment_name}.json",
         "artifactDigest": (
-            "sha256:47587af061e87fb1fb68ba3f0c84e55f9d7d95abf25d9160e718a101132e8a7c"
+            "sha256:6dddfe9dbb794961b9282a79bc4d7745dd037d047418e571cb62efe7a4727f88"
         ),
         "deploymentResourceId": (
             "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
             f"Microsoft.Resources/deployments/{deployment_name}"
         ),
-        "deploymentCorrelationId": "4201da90-d0b5-468b-b101-8aa3ba0ee806",
+        "deploymentCorrelationId": "5176a073-85a3-416e-9fef-f05da2611e79",
         "deploymentTemplateHash": "8373313941976686749",
-        "sourceCommit": "f8d5d599290d4c5ec0641cea7df1848c81aec43f",
+        "sourceCommit": "b0ff4bacc81c4d68043f0a0115dff669a0acf10e",
     }
     assert list(reviewed_index["deployments"]) == [deployment_name]
     assert (
@@ -470,7 +470,7 @@ def test_confirmed_parameters_use_published_images() -> None:
     assert "presentationImage: validatedPresentationImage" in orchestration
     assert parameters["collectorControllerImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/wc013-controller"
-        "@sha256:a300b1ff5f679b7589599cde475ae9077f90ceec44b1f4b79bd33bfb7af2c23b"
+        "@sha256:be16f0695a73f59775ad1c89e3d04f998c4e8b2bcc12df4397b16c89c60dcfdc"
     )
     assert (
         "!endsWith(collectorControllerImage, rejectedImageDigestSuffix)"
