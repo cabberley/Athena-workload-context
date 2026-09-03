@@ -551,7 +551,8 @@ def run_operational_phase(
         accepted = executor(selected.plan, selected.configuration_path)
     except Exception as exc:  # noqa: BLE001 - production composition is a trust boundary.
         raise OperationalPhaseRunnerError(
-            "WC-013 phase execution failed closed"
+            "WC-013 phase execution failed closed "
+            f"({type(exc).__name__}: {str(exc)[:256]})"
         ) from exc
     if accepted.snapshot_path is not None:
         raise OperationalPhaseRunnerError(

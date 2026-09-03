@@ -554,6 +554,44 @@ def load_wc013_collector_start_contract(
         ) from exc
 
 
+def _normalize_arm_job_configuration(
+    configuration: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    normalized = dict(configuration)
+    for key in ("dapr", "eventTriggerConfig", "scheduleTriggerConfig", "secrets"):
+        if normalized.get(key) is None:
+            normalized.pop(key, None)
+    if normalized.get("identitySettings") == []:
+        normalized.pop("identitySettings")
+    return normalized
+
+
+def _normalize_arm_job_template(
+    template: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    normalized = dict(template)
+    for key in ("initContainers", "volumes"):
+        if normalized.get(key) is None:
+            normalized.pop(key, None)
+    containers = normalized.get("containers")
+    if isinstance(containers, list):
+        normalized_containers: list[JsonValue] = []
+        for container in containers:
+            if not isinstance(container, dict):
+                normalized_containers.append(container)
+                continue
+            normalized_container = dict(container)
+            resources = normalized_container.get("resources")
+            if isinstance(resources, dict):
+                normalized_resources = dict(resources)
+                if normalized_resources.get("ephemeralStorage") == "2Gi":
+                    normalized_resources.pop("ephemeralStorage")
+                normalized_container["resources"] = normalized_resources
+            normalized_containers.append(normalized_container)
+        normalized["containers"] = normalized_containers
+    return normalized
+
+
 def validate_deployed_wc013_collector_job(
     contract: Wc013CollectorStartContract,
     deployed: Mapping[str, JsonValue],
@@ -576,10 +614,18 @@ def validate_deployed_wc013_collector_job(
             str(resource_id).casefold() for resource_id in assigned
         } != {contract.evidence_identity_resource_id.casefold()}:
             raise ValueError("collector job identity is not the exact evidence identity")
+        raw_configuration = properties.get("configuration")
+        if not isinstance(raw_configuration, dict):
+            raise ValueError("collector job configuration is invalid")
         configuration = _CollectorJobConfiguration.model_validate(
-            properties.get("configuration")
+            _normalize_arm_job_configuration(raw_configuration)
         )
-        template = _CollectorJobTemplate.model_validate(properties.get("template"))
+        raw_template = properties.get("template")
+        if not isinstance(raw_template, dict):
+            raise ValueError("collector job template is invalid")
+        template = _CollectorJobTemplate.model_validate(
+            _normalize_arm_job_template(raw_template)
+        )
         if configuration != contract.configuration or template != contract.template:
             raise ValueError("collector job execution template changed after review")
         return contract.execution_template_digest
@@ -613,6 +659,7 @@ def run_governed_wc013_collector_start(
             contract.template.model_dump(
                 mode="json",
                 by_alias=True,
+                exclude_defaults=True,
                 exclude_none=True,
             ),
         )

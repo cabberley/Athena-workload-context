@@ -381,7 +381,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
             "reviewed-collector-contracts/index.json"
         )
     )
-    deployment_name = "wc013-ready-20260902T050729Z-0620492968a1"
+    deployment_name = "wc013-ready-20260903T025500Z-c9a420be0cbb"
     assert f"          - {deployment_name}" in workflow
     assert reviewed_index["schemaVersion"] == (
         "athena.wc013CollectorDeploymentContractIndex.v1"
@@ -389,15 +389,15 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert reviewed_index["deployments"][deployment_name] == {
         "artifactFile": f"{deployment_name}.json",
         "artifactDigest": (
-            "sha256:4bed6560e142193a43132872fd038075ce339a6cc7740a0e43ed7f2a3f06aa14"
+            "sha256:0868d2d4a2d8e6bc48eaef802b0203ecc58d3c0cd02fb13497aa06407f5b9ef4"
         ),
         "deploymentResourceId": (
             "/subscriptions/a6add389-9978-47ac-ab1e-a09212e321d4/providers/"
             f"Microsoft.Resources/deployments/{deployment_name}"
         ),
-        "deploymentCorrelationId": "9e37ca1e-4d60-436a-aa17-071dd5201a80",
-        "deploymentTemplateHash": "5355939670410545896",
-        "sourceCommit": "0620492968a123f5b380c62bc3ebfa9bbeab5cd5",
+        "deploymentCorrelationId": "6d1a2892-6384-46a8-9a78-d18f647d54d4",
+        "deploymentTemplateHash": "8373313941976686749",
+        "sourceCommit": "c9a420be0cbbf2596f179c5e80dbb164a0637609",
     }
     assert list(reviewed_index["deployments"]) == [deployment_name]
     assert (
@@ -438,7 +438,7 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:02c314cafdf8c265965d1d471751ee0ade886a0a7fc58fba645811c71e0927f3"
+        "@sha256:873c7a48e52b81d3ab5d5e064eb28e8677c9b3c784eeb39a563a773a08eae3f5"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"
@@ -470,7 +470,7 @@ def test_confirmed_parameters_use_published_images() -> None:
     assert "presentationImage: validatedPresentationImage" in orchestration
     assert parameters["collectorControllerImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/wc013-controller"
-        "@sha256:a300b1ff5f679b7589599cde475ae9077f90ceec44b1f4b79bd33bfb7af2c23b"
+        "@sha256:be16f0695a73f59775ad1c89e3d04f998c4e8b2bcc12df4397b16c89c60dcfdc"
     )
     assert (
         "!endsWith(collectorControllerImage, rejectedImageDigestSuffix)"

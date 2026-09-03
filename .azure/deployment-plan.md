@@ -261,11 +261,16 @@ signing, and a private static presentation container.
 | Live signing-key correction | Full repository gate; presentation typecheck/lint/tests/build; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, 32 presentation tests, ARM validation, 9 no-change, 15 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T04:24:00Z |
 | Current controller provenance | ACR build `cr2d`; targeted controller/deployment tests; strict selector for all operational phases; `az deployment sub validate`; structured full-payload what-if | Passed: controller `sha256:a300b1ff...` built from merged commit `0620492968a1`; ARM validation and 0 deletes | 2026-09-02T04:55:00Z |
 | GitHub OIDC subject correction | Live workflow-dispatch token inspection; `scripts/check.ps1`; Bicep build/lint; `az deployment sub validate`; structured full-payload what-if | Passed: 727 tests with 2 intentional skips, ARM validation, 8 no-change, 16 modify, 31 ignore, 4 unsupported, and 0 deletes; the validated template will update Entra federation to GitHub's immutable owner/repository-ID subject `repo:cabberley@26394346/Athena-workload-context@1334641162:environment:athena-live` | 2026-09-02T06:07:00Z |
+| Fresh operational delivery | Generated run `synthetic-run-20260902212858-a7a67f6d`; ACR build `cr2f`; full repository gate; targeted contract/deployment tests; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: delivery image `sha256:fbd1e678...` contains the fresh baseline/faulted/recovered configurations and pins authority digest `sha256:062b5a14...`; 729 tests with 2 intentional skips, targeted tests, ARM validation, 10 no-change, 14 modify, 31 ignore, 4 unsupported, and 0 deletes | 2026-09-02T21:55:00Z |
+| Collector clock precision correction | ACR builds `cr2j` and `cr2k`; targeted collector/deployment tests; Bicep build/lint; ARM validation; structured full-payload what-if; one-off live baseline collector execution | Passed: delivery image `sha256:fd679e08...` truncates the system clock to UTC millisecond precision; 30 targeted tests passed, ARM validation and zero deletes passed, and live execution `athena-wc013-live-base-col-fme7hiq` succeeded | 2026-09-02T22:16:00Z |
+| Fresh post-diagnostic operational run | Generated run `synthetic-run-20260903000955-7872b649`; ACR delivery build; full repository gate; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: delivery image `sha256:14dfeae0...` contains unused phase attempt IDs and pins authority digest `sha256:bccc445a...`; 730 tests with 2 intentional skips, ARM validation, and zero deletes | 2026-09-03T00:20:00Z |
+| Hour-fresh operational release | Generated run `synthetic-run-20260903010325-4fcc3e1c`; ACR runner and delivery builds; full repository gate; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: delivery image `sha256:706a7c0e...` uses corrected clocks, diagnostic error provenance, and a 3600-second evidence freshness bound; 730 tests with 2 intentional skips, ARM validation, and zero deletes | 2026-09-03T01:15:00Z |
+| Independent-review controller correction | GPT-5.4 review; current-source controller ACR build; targeted operator/controller/deployment tests; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: publication errors remain redacted, controller `sha256:be16f069...` contains the exact ARM normalization/start-body fixes, targeted tests passed, ARM validation passed, and zero deletes | 2026-09-03T02:15:00Z |
 | Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-02T06:07:00Z
+**Validation timestamp:** 2026-09-02T21:55:00Z
 
 ### Role Assignment Verification
 
@@ -284,13 +289,13 @@ signing, and a private static presentation container.
 
 ### Deployment Verification
 
-- **Deployment:** `wc013-ready-20260902T050729Z-0620492968a1`
-- **Deployment proof:** correlation ID `9e37ca1e-4d60-436a-aa17-071dd5201a80`;
-  template hash `5355939670410545896`; source commit
-  `0620492968a123f5b380c62bc3ebfa9bbeab5cd5`
+- **Deployment:** `wc013-ready-20260902T215725Z-ab0d01d49f50`
+- **Deployment proof:** correlation ID `77bddd24-f5c5-4859-aa20-1a16499dbe1f`;
+  template hash `8373313941976686749`; source commit
+  `ab0d01d49f5026c7da7f52d245e5238ff7823f8d`
 - **Reviewed contract:** artifact digest
-  `sha256:4bed6560e142193a43132872fd038075ce339a6cc7740a0e43ed7f2a3f06aa14`;
-  merged in [#42](https://github.com/cabberley/Athena-workload-context/pull/42)
+  `sha256:1ab394d6c5cb3314865cd87de3a4448e4d7f63c0f7a91de0b4a76a42bdc4585a`;
+  final fresh contract pull request pending
 - **Presentation:** `https://athena-wc013-live-presentation.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
 - **Jumpbox result:** private DNS resolved to `10.42.0.62`; `/healthz` returned
   `200 healthy`; CSP, `frame-ancestors 'none'`, `DENY`, and `nosniff` headers were present
@@ -325,9 +330,10 @@ signing, and a private static presentation container.
 
 ## 10. Next Steps
 
-> Current: OIDC correction validated; deployment and operational verification pending
+> Current: Fresh operational delivery authority binding validated; final deployment pending
 
-1. Merge the reviewed contract for `wc013-ready-20260902T050729Z-0620492968a1`.
+1. Merge the fresh authority-bound reviewed contract for
+   `wc013-ready-20260902T215725Z-ab0d01d49f50`.
 2. Run the baseline, faulted, and recovered collectors through the protected workflow at their
    matching lifecycle points.
 3. Publish and verify the signed runtime-v2 presentation from the jumpbox.

@@ -71,7 +71,12 @@ def prepare_snapshot_signing_material(
         collected.collector_identity_evidence.ingestion_signature.signed_at,
     )
     if attested_at < latest_signed_component or attested_at >= expires_at:
-        raise ValueError("snapshot attestation time must follow collection and remain fresh")
+        raise ValueError(
+            "snapshot attestation time must follow collection and remain fresh: "
+            f"attestedAt={attested_at.isoformat()}, "
+            f"latestSignedComponent={latest_signed_component.isoformat()}, "
+            f"expiresAt={expires_at.isoformat()}"
+        )
 
     references = collected.references(
         SnapshotReferenceBinding(
