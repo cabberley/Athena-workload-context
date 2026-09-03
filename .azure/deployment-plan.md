@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated
+> **Status:** Deployed
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -289,18 +289,23 @@ signing, and a private static presentation container.
 
 ### Deployment Verification
 
-- **Deployment:** `wc013-ready-20260902T215725Z-ab0d01d49f50`
-- **Deployment proof:** correlation ID `77bddd24-f5c5-4859-aa20-1a16499dbe1f`;
+- **Deployment:** `wc013-ready-20260903T025500Z-c9a420be0cbb`
+- **Deployment proof:** correlation ID `6d1a2892-6384-46a8-9a78-d18f647d54d4`;
   template hash `8373313941976686749`; source commit
-  `ab0d01d49f5026c7da7f52d245e5238ff7823f8d`
+  `c9a420be0cbbf2596f179c5e80dbb164a0637609`
 - **Reviewed contract:** artifact digest
-  `sha256:1ab394d6c5cb3314865cd87de3a4448e4d7f63c0f7a91de0b4a76a42bdc4585a`;
-  final fresh contract pull request pending
+  `sha256:0868d2d4a2d8e6bc48eaef802b0203ecc58d3c0cd02fb13497aa06407f5b9ef4`;
+  merged in pull request `#45`
 - **Presentation:** `https://athena-wc013-live-presentation.delightfulmeadow-2f7be892.australiaeast.azurecontainerapps.io`
 - **Jumpbox result:** private DNS resolved to `10.42.0.62`; `/healthz` returned
   `200 healthy`; CSP, `frame-ancestors 'none'`, `DENY`, and `nosniff` headers were present
 - **Container Apps:** presentation and all four isolated collector Jobs are `Succeeded` and
   use the reviewed immutable ACR digests
+- **Operational lifecycle:** run `synthetic-run-20260903010325-4fcc3e1c` completed baseline,
+  faulted, and recovered evaluations against `rg-athena-demo-workload`; all three workload VMs
+  were restored to `PowerState/running`
+- **Runtime publication:** runtime-v2 manifest and all six phase payload/attestation assets were
+  published to `presentation-assets` and verified from the jumpbox
 - **Entra:** evidence identity has both Azure MCP and trusted-ingestion application roles;
   context identity has neither, completing collector/evaluator separation
 - **GitHub OIDC:** `athena-live` has required reviewer protection, a `main` branch policy,
@@ -315,7 +320,7 @@ signing, and a private static presentation container.
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `.azure/deployment-plan.md` | Deployment source of truth | Validated; operational verification pending |
+| `.azure/deployment-plan.md` | Deployment source of truth | Deployed and operationally verified |
 | `.azure/wc013.parameters.json` | Current non-secret deployment inputs | Deployed with current immutable digests |
 | `apps/presentation-web/Dockerfile` | Reproducible static web image | Prepared |
 | `Dockerfile.wc013-controller` | Immutable fixed-entrypoint controller image | Prepared |
@@ -324,16 +329,13 @@ signing, and a private static presentation container.
 | `infra/wc013-live-acceptance/main.bicep` | Controller/presentation composition | Prepared |
 | `infra/wc013-live-acceptance/modules/presentation-web.bicep` | Private web app and identity | Prepared |
 | `.github/workflows/wc013-collector-controller.yml` | Immutable-SHA, artifact-bound OIDC collector start | Active for the reviewed deployment |
-| Deployment tests/docs | Deterministic architecture and runbook coverage | Deployment contract pending merge |
+| Deployment tests/docs | Deterministic architecture and runbook coverage | Merged and deployed |
 
 ---
 
 ## 10. Next Steps
 
-> Current: Fresh operational delivery authority binding validated; final deployment pending
+> Current: Operational demonstration deployed and verified.
 
-1. Merge the fresh authority-bound reviewed contract for
-   `wc013-ready-20260902T215725Z-ab0d01d49f50`.
-2. Run the baseline, faulted, and recovered collectors through the protected workflow at their
-   matching lifecycle points.
-3. Publish and verify the signed runtime-v2 presentation from the jumpbox.
+1. Preserve the approved enterprise-claim workaround for collector execution until the repository
+   is hosted in an allowed GitHub enterprise or an Azure-hosted managed-identity runner is adopted.
