@@ -38,6 +38,7 @@ from athena_context.artifacts import (
     ArtifactWriteRequest,
 )
 from athena_context.contracts import (
+    IncidentFeedPointer,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
@@ -53,6 +54,8 @@ from athena_context.contracts.models import (
 )
 from athena_context.evidence import TrustedIngestionBinding
 from athena_context.presentation_assets import (
+    IncidentPublicationReceipt,
+    IncidentPublicationRequest,
     PresentationAssetAlreadyExistsError,
     PresentationAssetReadResult,
     PresentationAssetUnavailableError,
@@ -477,6 +480,102 @@ class AzureBlobPresentationAssetPublisher:
             run_id=request.manifest.run_id,
             manifest_blob_name="runtime-manifest.json",
             manifest_sha256=manifest_sha256,
+        )
+
+    def publish_incident(
+        self,
+        request: IncidentPublicationRequest,
+    ) -> IncidentPublicationReceipt:
+        if type(request) is not IncidentPublicationRequest:
+            raise TypeError("request must be an exact IncidentPublicationRequest")
+        for asset in (
+            request.state,
+            request.attestation,
+            request.pointer_attestation_asset,
+        ):
+            blob = self._container.get_blob_client(asset.blob_name)
+            try:
+                blob.upload_blob(
+                    asset.payload,
+                    blob_type=BlobType.BLOCKBLOB,
+                    length=len(asset.payload),
+                    metadata={"payload_sha256": asset.payload_sha256},
+                    overwrite=False,
+                    match_condition=MatchConditions.IfMissing,
+                    content_settings=ContentSettings(content_type="application/json"),
+                )
+            except ResourceExistsError as exc:
+                error_code = getattr(exc, "error_code", None)
+                normalized_code = getattr(error_code, "value", error_code)
+                if normalized_code != "BlobAlreadyExists":
+                    raise
+                try:
+                    downloader = blob.download_blob(
+                        offset=0,
+                        length=asset.maximum_bytes + 1,
+                        max_concurrency=1,
+                    )
+                    properties = downloader.properties
+                    content_settings = getattr(properties, "content_settings", None)
+                    metadata = getattr(properties, "metadata", None)
+                    existing_payload = downloader.readall()
+                except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
+                    raise PresentationAssetAlreadyExistsError(
+                        "an immutable incident asset could not be verified"
+                    ) from read_exc
+                if (
+                    existing_payload != asset.payload
+                    or getattr(content_settings, "content_type", None)
+                    != "application/json"
+                    or type(metadata) is not dict
+                    or metadata.get("payload_sha256") != asset.payload_sha256
+                ):
+                    raise PresentationAssetAlreadyExistsError(
+                        "an immutable incident asset already exists with different content"
+                    ) from exc
+        pointer_bytes = request.pointer.canonical_bytes()
+        pointer_sha256 = sha256_hex(pointer_bytes)
+        pointer_blob = self._container.get_blob_client("incidents/current.json")
+        try:
+            current = pointer_blob.download_blob(
+                offset=0,
+                length=MAX_ARTIFACT_PAYLOAD_BYTES,
+                max_concurrency=1,
+            )
+            current_bytes = current.readall()
+            current_pointer = IncidentFeedPointer.model_validate_json(current_bytes)
+            if request.pointer.published_at <= current_pointer.published_at:
+                raise PresentationAssetAlreadyExistsError(
+                    "incident pointer publication is not newer than the current state"
+                )
+            etag = getattr(current.properties, "etag", None)
+            if not isinstance(etag, str) or not etag:
+                raise PresentationAssetAlreadyExistsError(
+                    "incident pointer omitted its concurrency token"
+                )
+            pointer_blob.upload_blob(
+                pointer_bytes,
+                blob_type=BlobType.BLOCKBLOB,
+                length=len(pointer_bytes),
+                metadata={"payload_sha256": pointer_sha256},
+                overwrite=True,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        except ResourceNotFoundError:
+            pointer_blob.upload_blob(
+                pointer_bytes,
+                blob_type=BlobType.BLOCKBLOB,
+                length=len(pointer_bytes),
+                metadata={"payload_sha256": pointer_sha256},
+                overwrite=False,
+                match_condition=MatchConditions.IfMissing,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        return IncidentPublicationReceipt(
+            incident_id=request.state.blob_name.split("/")[1],
+            pointer_sha256=pointer_sha256,
         )
 
 class AzureBlobPresentationAssetReader:

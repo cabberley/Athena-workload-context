@@ -5,12 +5,15 @@ import {
   type PresentationPayload,
 } from './contracts'
 import { loadVerifiedLifecycle } from './runtime'
+import { loadVerifiedIncident, type VerifiedIncident } from './incidents'
 import type { BlastRadius, ImpactLevel } from './derivations'
 import type { VerifiedLifecycle } from './verification'
 import './App.css'
 
 export interface AppProps {
   loader?: () => Promise<VerifiedLifecycle>
+  incidentLoader?: () => Promise<VerifiedIncident>
+  incidentPollMs?: number
 }
 
 const PHASE_LABELS: Record<LifecyclePhase, string> = {
@@ -25,11 +28,17 @@ const BLAST_RADIUS_LABELS: Record<BlastRadius, string> = {
   resolved: 'Resolved',
 }
 
-function App({ loader = loadVerifiedLifecycle }: AppProps) {
+function App({
+  loader = loadVerifiedLifecycle,
+  incidentLoader = loadVerifiedIncident,
+  incidentPollMs = 8_000,
+}: AppProps) {
   const [lifecycle, setLifecycle] = useState<VerifiedLifecycle | null>(null)
   const [failed, setFailed] = useState(false)
   const [selectedPhase, setSelectedPhase] = useState<LifecyclePhase>('baseline')
   const phaseHeadingRef = useRef<HTMLHeadingElement>(null)
+  const [incident, setIncident] = useState<VerifiedIncident | null>(null)
+  const [incidentUnavailable, setIncidentUnavailable] = useState(false)
 
   useEffect(() => {
     let current = true
@@ -44,6 +53,36 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       current = false
     }
   }, [loader])
+
+  useEffect(() => {
+    let current = true
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+    let latestUpdatedAt = 0
+    const refresh = async (): Promise<void> => {
+      try {
+        const verified = await incidentLoader()
+        if (!current) return
+        const updatedAt = Date.parse(verified.state.updatedAt)
+        if (updatedAt >= latestUpdatedAt) {
+          latestUpdatedAt = updatedAt
+          setIncident(verified)
+          setIncidentUnavailable(false)
+        }
+      } catch {
+        if (current) {
+          setIncident(null)
+          setIncidentUnavailable(true)
+        }
+      } finally {
+        if (current) timer = globalThis.setTimeout(() => void refresh(), incidentPollMs)
+      }
+    }
+    void refresh()
+    return () => {
+      current = false
+      if (timer !== undefined) globalThis.clearTimeout(timer)
+    }
+  }, [incidentLoader, incidentPollMs])
 
   useEffect(() => {
     if (lifecycle) phaseHeadingRef.current?.focus()
@@ -126,6 +165,7 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       </header>
 
       <main>
+        <IncidentPanel incident={incident} unavailable={incidentUnavailable} />
         <section className="trust-strip" aria-labelledby="trust-heading">
           <div>
             <p className="status-kicker">Trust status</p>
@@ -375,6 +415,88 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       </footer>
     </div>
   )
+}
+
+function IncidentPanel({
+  incident,
+  unavailable,
+}: {
+  incident: VerifiedIncident | null
+  unavailable: boolean
+}) {
+  if (!incident) {
+    return (
+      <section className="incident-panel" aria-labelledby="incident-heading">
+        <p className="status-kicker">Dynamic operational status</p>
+        <h2 id="incident-heading">No verified active incident</h2>
+        <p role="status">
+          {unavailable
+            ? 'The incident feed is unavailable or failed verification; no incident data was rendered.'
+            : 'Athena is polling the signed incident feed every few seconds.'}
+        </p>
+      </section>
+    )
+  }
+  const state = incident.state
+  return (
+    <section
+      className={`incident-panel incident-${state.lifecycle}`}
+      aria-labelledby="incident-heading"
+    >
+      <p className="status-kicker">Dynamic operational status</p>
+      <h2 id="incident-heading">
+        {state.lifecycle === 'resolved' ? 'Incident resolved' : 'Verified incident'}:{' '}
+        {scenarioLabel(state.scenario)}
+      </h2>
+      <p role="status" aria-live="polite">
+        {state.findings[0]!.summary}
+      </p>
+      <dl className="incident-details">
+        <div>
+          <dt>Status</dt>
+          <dd>{state.lifecycle}</dd>
+        </div>
+        <div>
+          <dt>Availability</dt>
+          <dd>{state.availability}</dd>
+        </div>
+        <div>
+          <dt>Blast radius</dt>
+          <dd>{state.blastRadius}</dd>
+        </div>
+        <div>
+          <dt>Operator attention</dt>
+          <dd>{state.operatorAttention}</dd>
+        </div>
+        <div>
+          <dt>Notification</dt>
+          <dd>{state.notificationStatus}</dd>
+        </div>
+        <div>
+          <dt>Last update</dt>
+          <dd>
+            <time dateTime={state.updatedAt}>{state.updatedAt}</time>
+          </dd>
+        </div>
+      </dl>
+      <h3>How Athena determined the impact</h3>
+      <ol>
+        {state.reasoning.map((reason) => (
+          <li key={reason}>{reason}</li>
+        ))}
+      </ol>
+      <p className="no-remediation">
+        Athena does not remediate automatically. Recovery requires a separately governed operator
+        action.
+      </p>
+    </section>
+  )
+}
+
+const scenarioLabel = (scenario: VerifiedIncident['state']['scenario']): string => {
+  if (scenario === 'singletonDatabaseFailure') return 'database server failure'
+  if (scenario === 'webServerFailure') return 'web server failure'
+  return 'Azure Load Balancer failure'
 }
 
 const Verdict = ({ payload }: { payload: PresentationPayload }) => (

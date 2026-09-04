@@ -7,6 +7,48 @@ import {
   createVerifiedLifecycle,
 } from './test/fixtures'
 import type { VerifiedLifecycle } from './verification'
+import type { VerifiedIncident } from './incidents'
+
+const incidentFixture = (
+  scenario: VerifiedIncident['state']['scenario'],
+  updatedAt: string,
+): VerifiedIncident => ({
+  publishedAt: updatedAt,
+  keyFingerprint:
+    'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
+  state: {
+    schemaVersion: 'athena.incidentState.v1',
+    incidentId: 'inc-123456789abc',
+    scenario,
+    lifecycle: 'active',
+    workloadRole:
+      scenario === 'singletonDatabaseFailure'
+        ? 'database-primary'
+        : scenario === 'webServerFailure'
+          ? 'web'
+          : 'load-balancer',
+    detectedAt: '2026-09-04T03:40:00Z',
+    updatedAt,
+    targetBinding:
+      'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+    availability: 'critical',
+    blastRadius: scenario === 'loadBalancerFailure' ? 'ingress-edge' : 'whole-workload',
+    operatorAttention: 'urgent',
+    findings: [
+      {
+        clauseId: 'synthetic-operational-health',
+        verdict: 'fail',
+        summary: 'The approved synthetic role is unavailable.',
+        evidenceRefs: ['synthetic-monitor-alert-001'],
+      },
+    ],
+    reasoning: ['Azure Monitor reported the approved workload role as unavailable.'],
+    notificationStatus: 'sent',
+    resultDigest:
+      'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+    noAutoRemediation: true,
+  },
+})
 
 describe('standalone Athena presentation', () => {
   it('withholds all lifecycle data until the complete set verifies', async () => {
@@ -97,5 +139,105 @@ describe('standalone Athena presentation', () => {
     expect(
       screen.getByText(/private managed-identity sidecar reads the allowlisted blob assets/i),
     ).toBeInTheDocument()
+  })
+
+  it('renders a separately verified database, web, or load balancer incident', async () => {
+    const incident: VerifiedIncident = {
+      publishedAt: '2026-09-04T03:40:03Z',
+      keyFingerprint:
+        'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
+      state: {
+        schemaVersion: 'athena.incidentState.v1',
+        incidentId: 'inc-123456789abc',
+        scenario: 'loadBalancerFailure',
+        lifecycle: 'active',
+        workloadRole: 'load-balancer',
+        detectedAt: '2026-09-04T03:40:00Z',
+        updatedAt: '2026-09-04T03:40:03Z',
+        targetBinding:
+          'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+        availability: 'critical',
+        blastRadius: 'ingress-edge',
+        operatorAttention: 'urgent',
+        findings: [
+          {
+            clauseId: 'synthetic-load-balancer-health',
+            verdict: 'fail',
+            summary: 'The synthetic ingress load balancer is unavailable.',
+            evidenceRefs: ['synthetic-monitor-alert-001'],
+          },
+        ],
+        reasoning: [
+          'Azure Monitor reported failed VIP availability.',
+          'Approved context binds the resource to the workload ingress edge.',
+        ],
+        notificationStatus: 'sent',
+        resultDigest:
+          'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+        noAutoRemediation: true,
+      },
+    }
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() => Promise.resolve(incident)}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /verified incident: azure load balancer failure/i,
+      }),
+    ).toBeInTheDocument()
+    expect(screen.getByText('ingress-edge')).toBeInTheDocument()
+    expect(screen.getByText(/does not remediate automatically/i)).toBeInTheDocument()
+  })
+
+  it('does not replace a newer incident with an older poll response', async () => {
+    const incidentLoader = vi
+      .fn()
+      .mockResolvedValueOnce(incidentFixture('loadBalancerFailure', '2026-09-04T03:40:03Z'))
+      .mockResolvedValue(incidentFixture('singletonDatabaseFailure', '2026-09-04T03:40:02Z'))
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={incidentLoader}
+        incidentPollMs={100}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', {
+        name: /verified incident: azure load balancer failure/i,
+      }),
+    ).toBeInTheDocument()
+    await waitFor(() => expect(incidentLoader).toHaveBeenCalledTimes(2))
+    expect(
+      screen.queryByRole('heading', { name: /verified incident: database server failure/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('clears previously rendered incident data when a later poll fails closed', async () => {
+    const incidentLoader = vi
+      .fn()
+      .mockResolvedValueOnce(incidentFixture('webServerFailure', '2026-09-04T03:40:03Z'))
+      .mockRejectedValue(new Error('untrusted incident asset'))
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={incidentLoader}
+        incidentPollMs={100}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: /verified incident: web server failure/i }),
+    ).toBeInTheDocument()
+    expect(
+      await screen.findByText(/incident feed is unavailable or failed verification/i),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: /verified incident: web server failure/i }),
+    ).not.toBeInTheDocument()
   })
 })

@@ -9,9 +9,12 @@ from pydantic import ValidationError
 from athena_context.azure_adapters import AzureBlobPresentationAssetReader
 from athena_context.contracts import (
     PRESENTATION_RUNTIME_MANIFEST_BLOB_NAME,
+    IncidentFeedPointer,
     PresentationRuntimeManifestV2,
 )
 from athena_context.presentation_assets import (
+    MAX_INCIDENT_FEED_POINTER_BYTES,
+    MAX_INCIDENT_STATE_BYTES,
     MAX_PRESENTATION_ATTESTATION_BYTES,
     MAX_PRESENTATION_PAYLOAD_BYTES,
     MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES,
@@ -56,6 +59,27 @@ class PresentationAssetGatewayApplication:
         if path == "/healthz":
             return GatewayResponse(status=200, payload=_HEALTHY)
         try:
+            if path == "/incidents/current.json":
+                _, pointer_bytes = self._load_incident_pointer()
+                return GatewayResponse(status=200, payload=pointer_bytes)
+            if path.startswith("/incidents/"):
+                pointer, _ = self._load_incident_pointer()
+                if path == "/" + pointer.pointer_attestation_path.removeprefix("./"):
+                    result = self._reader.read_current(
+                        blob_name=path.removeprefix("/"),
+                        maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
+                    )
+                    return GatewayResponse(status=200, payload=result.payload)
+                digest, maximum_bytes = self._allowlisted_incident_asset(pointer, path)
+                if digest is None:
+                    return GatewayResponse(status=404, payload=_ERROR_NOT_FOUND)
+                result = self._reader.read_current(
+                    blob_name=path.removeprefix("/"),
+                    maximum_bytes=maximum_bytes,
+                )
+                if result.payload_sha256 != digest:
+                    return GatewayResponse(status=503, payload=_ERROR_UNAVAILABLE)
+                return GatewayResponse(status=200, payload=result.payload)
             manifest, manifest_bytes = self._load_manifest()
             if path == "/runtime-manifest.json":
                 return GatewayResponse(status=200, payload=manifest_bytes)
@@ -85,7 +109,15 @@ class PresentationAssetGatewayApplication:
         parsed = urlsplit(raw_path)
         if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
             return None
-        if parsed.path in {"/healthz", "/runtime-manifest.json"}:
+        if parsed.path in {
+            "/healthz",
+            "/runtime-manifest.json",
+            "/incidents/current.json",
+        }:
+            return parsed.path
+        if parsed.path.startswith("/incidents/"):
+            if any(segment in {"", ".", ".."} for segment in parsed.path[1:].split("/")):
+                return None
             return parsed.path
         if not parsed.path.startswith("/live/runs/"):
             return None
@@ -106,6 +138,27 @@ class PresentationAssetGatewayApplication:
         if result.payload != manifest.canonical_bytes():
             raise ValueError("runtime manifest bytes are not canonical")
         return manifest, result.payload
+
+    def _load_incident_pointer(self) -> tuple[IncidentFeedPointer, bytes]:
+        result = self._reader.read_current(
+            blob_name="incidents/current.json",
+            maximum_bytes=MAX_INCIDENT_FEED_POINTER_BYTES,
+        )
+        pointer = IncidentFeedPointer.model_validate_json(result.payload)
+        if result.payload != pointer.canonical_bytes():
+            raise ValueError("incident feed pointer bytes are not canonical")
+        return pointer, result.payload
+
+    @staticmethod
+    def _allowlisted_incident_asset(
+        pointer: IncidentFeedPointer,
+        path: str,
+    ) -> tuple[str | None, int]:
+        if path == "/" + pointer.state_path.removeprefix("./"):
+            return pointer.state_sha256, MAX_INCIDENT_STATE_BYTES
+        if path == "/" + pointer.attestation_path.removeprefix("./"):
+            return pointer.attestation_sha256, MAX_PRESENTATION_ATTESTATION_BYTES
+        return None, 0
 
     @staticmethod
     def _allowlisted_asset(

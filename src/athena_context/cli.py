@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -10,7 +11,12 @@ from athena_context import __version__
 from athena_context.artifacts import VersionPinnedArtifactReaderPort
 from athena_context.binding.verification import TrustedSnapshotVerifier
 from athena_context.contracts import build_operational_phase_reference_handoff
+from athena_context.contracts.eventing import WorkloadRole
 from athena_context.contracts.presentation import ArgusPresentationPhase
+from athena_context.eventing import (
+    run_event_processor,
+    run_incident_orchestrator_worker,
+)
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
     prepare_wc013_live_acceptance,
@@ -217,7 +223,87 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gateway_parser.add_argument("--managed-identity-client-id", required=True)
     gateway_parser.add_argument("--port", type=int, default=8081)
+    event_parser = subparsers.add_parser(
+        "wc016-event-processor",
+        help="normalize one queued Azure event and emit one context-bound reassessment request",
+    )
+    event_parser.add_argument("--service-bus-namespace", required=True)
+    event_parser.add_argument("--raw-queue", default="raw-monitor-events")
+    event_parser.add_argument(
+        "--reassessment-queue",
+        default="incident-reassessment-requests",
+    )
+    event_parser.add_argument("--managed-identity-client-id", required=True)
+    event_parser.add_argument("--approved-resource-roles", required=True, type=Path)
+    event_parser.add_argument("--approved-alert-rules", required=True, type=Path)
+    incident_parser = subparsers.add_parser(
+        "wc016-incident-orchestrator",
+        help="consume one reassessment request and publish one signed incident update",
+    )
+    incident_parser.add_argument("--service-bus-namespace", required=True)
+    incident_parser.add_argument(
+        "--reassessment-queue",
+        default="incident-reassessment-requests",
+    )
+    incident_parser.add_argument(
+        "--notification-queue",
+        default="incident-notification-outbox",
+    )
+    incident_parser.add_argument("--managed-identity-client-id", required=True)
+    incident_parser.add_argument("--reassessment-endpoint", required=True)
+    incident_parser.add_argument("--reassessment-audience", required=True)
+    incident_parser.add_argument("--blob-endpoint", required=True)
+    incident_parser.add_argument("--presentation-url", required=True)
+    incident_parser.add_argument("--key-vault-key-id", required=True)
+    incident_parser.add_argument("--signing-key-id", required=True)
+    incident_parser.add_argument("--signing-key-fingerprint", required=True)
     return parser
+
+
+def _load_approved_resource_roles(path: Path) -> dict[str, WorkloadRole]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("approved resource role bindings could not be loaded") from exc
+    if not isinstance(value, dict) or not 1 <= len(value) <= 128:
+        raise ValueError("approved resource role bindings must be one bounded object")
+    roles: dict[str, WorkloadRole] = {}
+    allowed = {"database-primary", "web", "load-balancer"}
+    for resource_id, role in value.items():
+        if (
+            not isinstance(resource_id, str)
+            or not resource_id.startswith("/subscriptions/")
+            or len(resource_id) > 2048
+            or role not in allowed
+        ):
+            raise ValueError("approved resource role binding is invalid")
+        normalized = resource_id.lower().rstrip("/")
+        if normalized in roles:
+            raise ValueError("approved resource role binding collides after normalization")
+        roles[normalized] = cast(WorkloadRole, role)
+    return roles
+
+
+def _load_approved_alert_rules(path: Path) -> tuple[str, ...]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("approved alert rules could not be loaded") from exc
+    if (
+        not isinstance(value, list)
+        or not 1 <= len(value) <= 128
+        or any(
+            not isinstance(rule, str)
+            or not 1 <= len(rule) <= 256
+            or rule.strip() != rule
+            for rule in value
+        )
+    ):
+        raise ValueError("approved alert rules must be one bounded string array")
+    normalized = tuple(rule.casefold() for rule in value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("approved alert rules collide after normalization")
+    return normalized
 
 
 def _write_exclusive_json_file(path: Path, content: str, *, message: str) -> None:
@@ -459,6 +545,45 @@ def main(
                 port=args.port,
             )
             return 0
+        if args.command == "wc016-event-processor":
+            processed = run_event_processor(
+                fully_qualified_namespace=args.service_bus_namespace,
+                raw_queue_name=args.raw_queue,
+                reassessment_queue_name=args.reassessment_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                approved_resource_roles=_load_approved_resource_roles(
+                    args.approved_resource_roles
+                ),
+                approved_metric_alert_rules=_load_approved_alert_rules(
+                    args.approved_alert_rules
+                ),
+            )
+            output.write(
+                "WC-016 event processed\n"
+                if processed
+                else "WC-016 event queue was empty\n"
+            )
+            return 0
+        if args.command == "wc016-incident-orchestrator":
+            processed = run_incident_orchestrator_worker(
+                fully_qualified_namespace=args.service_bus_namespace,
+                reassessment_queue_name=args.reassessment_queue,
+                notification_queue_name=args.notification_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                reassessment_endpoint=args.reassessment_endpoint,
+                reassessment_audience=args.reassessment_audience,
+                blob_endpoint=args.blob_endpoint,
+                presentation_url=args.presentation_url,
+                key_vault_key_id=args.key_vault_key_id,
+                signing_key_id=args.signing_key_id,
+                signing_key_fingerprint=args.signing_key_fingerprint,
+            )
+            output.write(
+                "WC-016 incident published\n"
+                if processed
+                else "WC-016 reassessment queue was empty or rejected\n"
+            )
+            return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
@@ -482,6 +607,11 @@ def main(
     except PresentationAssetGatewayError as exc:
         errors.write(f"presentation asset gateway failed: {exc}\n")
         return 1
+    except ValueError as exc:
+        if args.command in {"wc016-event-processor", "wc016-incident-orchestrator"}:
+            errors.write(f"{args.command} failed: {exc}\n")
+            return 1
+        raise
     return 0
 
 

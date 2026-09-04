@@ -58,7 +58,8 @@ def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
     assert 'return 200 "healthy\\n"' in nginx
     assert "location = /runtime-manifest.json" in nginx
     assert "location ^~ /live/" in nginx
-    assert nginx.count("proxy_pass http://127.0.0.1:8081") == 2
+    assert "location ^~ /incidents/" in nginx
+    assert nginx.count("proxy_pass http://127.0.0.1:8081") == 3
     assert 'proxy_set_header Authorization ""' in nginx
     assert 'proxy_set_header Cookie ""' in nginx
     assert "proxy_pass_request_body off" in nginx

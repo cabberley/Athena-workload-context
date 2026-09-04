@@ -11,6 +11,7 @@ from athena_context.contracts import (
     PRESENTATION_PUBLIC_KEY_FINGERPRINT,
     PRESENTATION_PUBLIC_KEY_ID,
     PRESENTATION_PUBLIC_KEY_PATH,
+    IncidentFeedPointer,
     PresentationRuntimeKey,
     PresentationRuntimeManifestV2,
     PresentationRuntimePhaseAsset,
@@ -189,3 +190,49 @@ def test_gateway_cli_defaults_to_the_bounded_private_sidecar_port() -> None:
 
     assert args.container == "presentation-assets"
     assert args.port == 8081
+
+
+def test_gateway_serves_only_the_current_incident_pointer_allowlist() -> None:
+    _, content = _manifest_and_content()
+    state = _asset_bytes("active", "incident-state")
+    attestation = _asset_bytes("active", "incident-attestation")
+    state_path = "./incidents/inc-123456789abc/state.json"
+    attestation_path = "./incidents/inc-123456789abc/attestation.json"
+    pointer = IncidentFeedPointer(
+        schemaVersion="athena.incidentFeed.v1",
+        statePath=state_path,
+        stateSha256=sha256_hex(state),
+        attestationPath=attestation_path,
+        attestationSha256=sha256_hex(attestation),
+        pointerAttestationPath="./incidents/inc-123456789abc/pointer-attestation.json",
+        keyId=PRESENTATION_PUBLIC_KEY_ID,
+        keyFingerprint=PRESENTATION_PUBLIC_KEY_FINGERPRINT,
+        publishedAt=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    content["incidents/current.json"] = pointer.canonical_bytes()
+    content["incidents/inc-123456789abc/pointer-attestation.json"] = _asset_bytes(
+        "active",
+        "pointer-attestation",
+    )
+    content[state_path.removeprefix("./")] = state
+    content[attestation_path.removeprefix("./")] = attestation
+    app = PresentationAssetGatewayApplication(InMemoryPresentationReader(content))
+
+    current = app.handle(method="GET", raw_path="/incidents/current.json")
+    current_attestation = app.handle(
+        method="GET",
+        raw_path="/incidents/inc-123456789abc/pointer-attestation.json",
+    )
+    incident = app.handle(
+        method="GET",
+        raw_path="/" + state_path.removeprefix("./"),
+    )
+    arbitrary = app.handle(
+        method="GET",
+        raw_path="/incidents/inc-123456789abc/private.json",
+    )
+
+    assert current.status == 200
+    assert current_attestation.status == 200
+    assert incident.status == 200
+    assert arbitrary.status == 404

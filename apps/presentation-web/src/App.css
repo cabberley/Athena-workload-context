@@ -98,6 +98,52 @@ code {
   box-shadow: 0 18px 48px rgb(0 0 0 / 18%);
 }
 
+.incident-panel {
+  margin-bottom: 1.5rem;
+  padding: 1.5rem;
+  border: 1px solid #5e7f9f;
+  border-radius: 1rem;
+  background: rgb(14 28 47 / 92%);
+}
+
+.incident-panel h2 {
+  margin: 0;
+}
+
+.incident-panel > p {
+  color: var(--muted);
+}
+
+.incident-active,
+.incident-failedClosed {
+  border-color: var(--amber);
+  background: linear-gradient(135deg, rgb(75 49 11 / 90%), rgb(14 28 47 / 92%));
+}
+
+.incident-resolved {
+  border-color: var(--green);
+}
+
+.incident-details {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+}
+
+.incident-details dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.incident-details dd {
+  margin: 0.25rem 0 0;
+  font-weight: 700;
+}
+
+.no-remediation {
+  font-weight: 700;
+}
+
 .trust-strip h2 {
   margin: 0;
   font-size: 1.4rem;

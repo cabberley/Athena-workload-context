@@ -5,6 +5,8 @@ from typing import Protocol
 
 from athena_context.contracts import (
     PRESENTATION_RUNTIME_MANIFEST_BLOB_NAME,
+    IncidentFeedAttestation,
+    IncidentFeedPointer,
     PresentationRuntimeManifestV2,
     sha256_hex,
 )
@@ -12,6 +14,8 @@ from athena_context.contracts import (
 MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES = 16 * 1024
 MAX_PRESENTATION_PAYLOAD_BYTES = 128 * 1024
 MAX_PRESENTATION_ATTESTATION_BYTES = 24 * 1024
+MAX_INCIDENT_FEED_POINTER_BYTES = 16 * 1024
+MAX_INCIDENT_STATE_BYTES = 64 * 1024
 
 
 class PresentationAssetError(RuntimeError):
@@ -105,6 +109,49 @@ class PresentationPublicationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class IncidentPublicationRequest:
+    pointer: IncidentFeedPointer
+    pointer_attestation: IncidentFeedAttestation
+    pointer_attestation_asset: PresentationAsset
+    state: PresentationAsset
+    attestation: PresentationAsset
+
+    def __post_init__(self) -> None:
+        pointer_bytes = self.pointer.canonical_bytes()
+        if self.pointer_attestation.pointer_digest != sha256_hex(pointer_bytes):
+            raise ValueError("incident pointer attestation does not bind the pointer")
+        if (
+            self.pointer_attestation_asset.blob_name
+            != self.pointer.pointer_attestation_path.removeprefix("./")
+            or self.pointer_attestation_asset.payload
+            != self.pointer_attestation.canonical_bytes()
+        ):
+            raise ValueError("incident pointer attestation asset is invalid")
+        expected = (
+            (
+                self.pointer.state_path.removeprefix("./"),
+                self.pointer.state_sha256,
+            ),
+            (
+                self.pointer.attestation_path.removeprefix("./"),
+                self.pointer.attestation_sha256,
+            ),
+        )
+        actual = (
+            (self.state.blob_name, self.state.payload_sha256),
+            (self.attestation.blob_name, self.attestation.payload_sha256),
+        )
+        if actual != expected:
+            raise ValueError("incident assets do not exactly match their current pointer")
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentPublicationReceipt:
+    incident_id: str
+    pointer_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class PresentationAssetReadResult:
     blob_name: str
     payload: bytes
@@ -118,6 +165,13 @@ class PresentationAssetPublisherPort(Protocol):
     ) -> PresentationPublicationReceipt: ...
 
 
+class IncidentAssetPublisherPort(Protocol):
+    def publish_incident(
+        self,
+        request: IncidentPublicationRequest,
+    ) -> IncidentPublicationReceipt: ...
+
+
 class PresentationAssetReaderPort(Protocol):
     def read_current(
         self,
@@ -129,8 +183,13 @@ class PresentationAssetReaderPort(Protocol):
 
 __all__ = [
     "MAX_PRESENTATION_ATTESTATION_BYTES",
+    "MAX_INCIDENT_FEED_POINTER_BYTES",
+    "MAX_INCIDENT_STATE_BYTES",
     "MAX_PRESENTATION_PAYLOAD_BYTES",
     "MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES",
+    "IncidentAssetPublisherPort",
+    "IncidentPublicationReceipt",
+    "IncidentPublicationRequest",
     "PresentationAsset",
     "PresentationAssetAlreadyExistsError",
     "PresentationAssetError",

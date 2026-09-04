@@ -77,6 +77,8 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 | Context Studio | Workload configuration, cohort approval, topology, findings, Copilot |
 | Standalone presentation web | Same-origin, fail-closed verification and display of frozen synthetic lifecycle payloads; no Azure or storage access |
 | Event processor | Normalizes Azure resource, health, monitoring, and change events |
+| Incident orchestrator | Deduplicates context-bound events, starts scoped reassessment, and publishes signed incident state without remediation authority |
+| Incident notification outbox | Delivers bounded active/resolved messages to an operator-owned Teams workflow |
 | Forecast worker | Evaluates trends and time-to-limit against workload objectives |
 
 ## Architectural invariants
@@ -95,6 +97,7 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 12. Operational phase execution uses reviewed bundle paths, phase-fixed Jobs, bounded exact-reference inputs, and governed handoff files.
 13. The workload-owned controller, not Athena phase Jobs, creates exact run-scoped receipt Blobs with create-only semantics enforced in application code; Azure RBAC stays container-scoped because Blob roles cannot be narrowed to a prefix.
 14. The standalone presentation browser renders no lifecycle data until all reviewed static payloads, detached attestations, content digests, lifecycle bindings, and the pinned RSA public-key fingerprint verify locally.
+15. Dynamic incidents use a separate signed current-pointer feed; invalid incident data is withheld without weakening or replacing the verified lifecycle.
 
 ## Relationship classes
 

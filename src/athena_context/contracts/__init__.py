@@ -9,6 +9,8 @@ from athena_context.contracts.common import (
     compute_semantic_digest,
     sha256_hex,
 )
+from athena_context.contracts.eventing import *  # noqa: F403
+from athena_context.contracts.eventing import __all__ as _eventing_all
 from athena_context.contracts.manifest import *  # noqa: F403
 from athena_context.contracts.manifest import __all__ as _manifest_all
 from athena_context.contracts.models import *  # noqa: F403
@@ -33,6 +35,7 @@ WorkloadManifest = CanonicalWorkloadManifest  # type: ignore[misc,assignment]  #
 
 __all__ = [
     *list(_model_all),
+    *list(_eventing_all),
     *list(_manifest_all),
     *list(_operational_demo_all),
     *list(_operational_phase_all),
