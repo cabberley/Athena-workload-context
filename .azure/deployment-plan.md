@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Deployed
+> **Status:** WC-016 security activation hold
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -11,6 +11,22 @@ publication of the fully verified lifecycle, a managed-identity read-only gatewa
 same-origin delivery to the presentation browser. The browser displays the exact target resource
 group and separate verified evaluation/publication times only after signature, digest, lifecycle,
 key, and resource-group binding checks pass.
+
+WC-016 security remediation is staged separately. Incremental ARM deployment does not remove the
+previous detector, normalizer, orchestrator, notification Jobs, queues, identities, or role
+assignments. The first deployment therefore keeps `wc016RuntimeEnabled=false` and
+`wc016LegacyCleanupConfirmed=false` while creating only the hardened v2 identities and the
+dedicated incident key, `incident-assets` container, and detector state table. WC-016 runtime RBAC,
+queues, and Jobs remain absent. The hardened Jobs have distinct `-v2` names and cannot update the
+legacy Jobs or inherit their principals.
+
+Before activation, run `scripts/audit-remove-wc016-legacy-runtime.ps1` in its default read-only
+mode, review the exact allowlist, then run it with `-Apply`. The confirmation parameter may become
+`true` only when the apply report has `zeroResidualReadback=true`. After cleanup, export and pin the
+deployed public key in both verification layers, rebuild and digest-pin all affected images, and
+complete repository, Bicep, ARM validation, and what-if checks. Only then may the reviewed second
+deployment set both `wc016LegacyCleanupConfirmed=true` and `wc016RuntimeEnabled=true`. There is no
+lifecycle-trust fallback.
 
 ---
 
@@ -111,8 +127,14 @@ signing, and a private static presentation container.
   exact reviewed controller RepoDigest and executes only that image with a one-shot ARM token piped
   through stdin. No repository Python or dependencies execute through the hosted runner Python,
   and the workflow never reads mutable deployment outputs.
-- A new presentation identity receives only `AcrPull`; the presentation container receives no
-  Blob, Key Vault, MCP, workload, or ARM role.
+- The presentation identity receives `AcrPull` plus Blob Data Reader on only
+  `presentation-assets` and `incident-assets`; it receives no Blob write, Key Vault, MCP, workload,
+  or ARM role.
+- WC-016 uses dedicated detector, orchestrator, and notification identities. Detector and
+  orchestrator live reads are limited to VM instance view and Azure Monitor metrics in the exact
+  approved workload resource group, with application allowlists binding exact resource IDs.
+- The notification dispatcher calls an Entra-authorized Logic App request trigger with a managed
+  identity token. SAS authentication is disabled, so no callback secret is stored in the Job.
 - The presentation browser makes same-origin requests only and validates content hashes,
   RFC 8785 digests, RS256 signatures, key fingerprint, and lifecycle consistency before rendering.
 - The unavoidable execution substrate is GitHub's hosted `ubuntu-24.04` runner and its pinned-action
@@ -230,7 +252,7 @@ signing, and a private static presentation container.
 - [x] Verify live RBAC and managed-identity separation
 - [x] Verify private presentation endpoint from the jumpbox
 - [x] Report the fully qualified private HTTPS URL
-- [ ] Update plan status to `Deployed` after operational lifecycle verification
+- [x] Update plan status to `Deployed` after operational lifecycle verification
 
 ---
 
@@ -267,21 +289,30 @@ signing, and a private static presentation container.
 | Hour-fresh operational release | Generated run `synthetic-run-20260903010325-4fcc3e1c`; ACR runner and delivery builds; full repository gate; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: delivery image `sha256:706a7c0e...` uses corrected clocks, diagnostic error provenance, and a 3600-second evidence freshness bound; 730 tests with 2 intentional skips, ARM validation, and zero deletes | 2026-09-03T01:15:00Z |
 | Independent-review controller correction | GPT-5.4 review; current-source controller ACR build; targeted operator/controller/deployment tests; Bicep build/lint; ARM validation; structured full-payload what-if | Passed: publication errors remain redacted, controller `sha256:be16f069...` contains the exact ARM normalization/start-body fixes, targeted tests passed, ARM validation passed, and zero deletes | 2026-09-03T02:15:00Z |
 | Live presentation independent review | GPT-5.4 code and architecture reviews | Passed after adding retry-safe immutable publication and enforcing publication/evaluation chronology | 2026-09-02T01:12:56Z |
+| WC-016 runtime repository gate | `scripts/check.ps1`; targeted WC-016/deployment tests; presentation typecheck, lint, tests, and build | Passed: 767 tests with 2 intentional live skips after image-pin updates; Ruff and mypy passed across 81 source files; 35 presentation tests and production build passed | 2026-09-04T18:49:00Z |
+| WC-016 immutable images | Interactive ACR builds `cr2x`, `cr2y`, `cr30`, `cr31`, `cr32`, and `cr33` using `chabberl@microsoft.com` | Passed: presentation `sha256:c73c0551...`, delivery `sha256:cdc8e1c2...`, detector `sha256:a934a034...`, normalizer `sha256:ec6762e2...`, orchestrator `sha256:e6354c3f...` | 2026-09-04T18:39:43Z |
+| WC-016 Bicep and ARM validation | Bicep build/lint and `az deployment sub validate` using `.azure/wc013.parameters.json` | Passed against subscription `a6add389-9978-47ac-ab1e-a09212e321d4` in `australiaeast` | 2026-09-04T18:40:00Z |
+| WC-016 policy and structured what-if | Reviewed all three enforced policy assignments; `az deployment sub what-if --result-format FullResourcePayloads --no-pretty-print` | Passed: 16 create, 15 modify, 31 ignore, 9 no-change, 9 unsupported, and 0 deletes; private networking and shared-key prevention remain enforced | 2026-09-04T18:40:00Z |
+| WC-016 interactive deployment | `az deployment sub create` using `athena-wc016-20260904-202738`, `athena-wc016-fix-20260904-210957`, and `athena-wc016-notify-20260904-221117` | Passed under `chabberl@microsoft.com`; private Service Bus, detector/normalizer/orchestrator/notification Jobs, scoped identities/RBAC, presentation revision, Teams Logic App, and Teams connection provisioned | 2026-09-04T22:17:29Z |
+| WC-016 bounded live web failure | Stopped and restarted `athena-hackathon-web-01`; observed detector and orchestrator executions; queried the signed incident feed from the jumpbox | Passed: webpage reported `webServerFailure`, `active`, `warning`, `web-tier`, then `resolved`, `normal`, `none`; VM restored to `PowerState/running` | 2026-09-04T21:34:38Z |
+| WC-016 runtime precision correction | Live failure exposed non-canonical microsecond timestamps; rounded the runtime clock to UTC milliseconds; ACR builds `cr34` and `cr35` | Passed: active and resolved incident publications succeeded with final runtime digest `sha256:6a6038a1...`; targeted local test rerun was blocked by workstation PyPI TLS, while Python compilation, ACR build, Bicep build, ARM validation, zero-delete what-if, and live execution passed | 2026-09-04T22:11:17Z |
+| WC-016 Teams notification bridge | Authorized `teams`; deployed `athena-wc016-teams-notifier` and private Job `athena-wc013-live-w16-notify`; consumed queued active/resolved messages | Passed: connector `Connected`, two dispatcher executions succeeded, logs reported `WC-016 notification delivered`, and outbox active/dead-letter counts are zero | 2026-09-04T22:17:29Z |
 
 **Validated by:** GitHub Copilot CLI using the authoritative `azure-validate` workflow
 
-**Validation timestamp:** 2026-09-02T21:55:00Z
+**Validation timestamp:** 2026-09-04T18:49:00Z
 
 ### Role Assignment Verification
 
 - **Status:** Verified
-- **Identities checked:** acceptance/context, isolated evidence collector, collector controller,
-  presentation, operator artifact reader, and workload receipt writer
+- **Identities checked:** acceptance/context, isolated evidence collector and scheduled detector,
+  collector controller, presentation, WC-016 normalizer, WC-016 orchestrator, operator artifact
+  reader, and workload receipt writer
 - **Roles confirmed:** key-scoped Key Vault Crypto User; table-scoped Storage Table Data
   Contributor; operator Blob Data Reader on `operational-artifacts`; operator Blob Data
   Contributor only on `presentation-assets`; presentation Blob Data Reader only on
-  `presentation-assets`; registry-scoped AcrPull; and the custom collector-controller role
-  limited to Job read/start/execution-read operations
+  `presentation-assets`; queue-scoped Service Bus Data Sender/Receiver; registry-scoped AcrPull;
+  and the custom collector-controller role limited to Job read/start/execution-read operations
 - **Issues:** None. Data-plane roles are scoped to the exact key, table, blob container, registry,
   or collector Job resources. The presentation identity has no access to operational artifacts,
   workload resources, Key Vault, MCP, Table storage, or Job control, and no generic subscription
@@ -313,6 +344,14 @@ signing, and a private static presentation container.
   validated correction is deployed and read back.
 - **Live RBAC:** verified exact key/table/container/registry/Job scopes for the context,
   evidence, controller, presentation, operator, and workload identities
+- **WC-016 live RBAC:** detector has workload Reader plus reassessment send; normalizer has raw
+  receive plus reassessment send; orchestrator has reassessment receive, notification send,
+  signing-key Crypto User, and presentation-assets Blob contributor; notification dispatcher
+  has only notification-outbox receive plus AcrPull; presentation has Blob reader plus AcrPull
+- **Dynamic incident loop:** verified active and resolved web-server states from the jumpbox;
+  scheduled detector and orchestrator executions succeeded and the signed feed returned HTTP 200
+- **Teams notifications:** authorized connection is `Connected`; the private dispatcher delivered
+  both queued notifications and left the outbox empty with no dead letters
 
 ---
 

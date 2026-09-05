@@ -76,7 +76,9 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 | Agent core | Grounded explanations using policy results and cited evidence |
 | Context Studio | Workload configuration, cohort approval, topology, findings, Copilot |
 | Standalone presentation web | Same-origin, fail-closed verification and display of frozen synthetic lifecycle payloads; no Azure or storage access |
-| Event processor | Normalizes Azure resource, health, monitoring, and change events |
+| Scheduled signal detector | Uses a dedicated identity and durable pending/committed state to query only approved VM instanceView and Load Balancer VIP/DIP metrics, then emits idempotent transition-bound hints |
+| Incident orchestrator | Treats queue requests as untrusted, rederives every binding, independently queries live approved signals, and publishes only separately signed incident assets without remediation authority |
+| Incident notification outbox | Delivers bounded active/resolved messages to an operator-owned Teams workflow |
 | Forecast worker | Evaluates trends and time-to-limit against workload objectives |
 
 ## Architectural invariants
@@ -95,6 +97,9 @@ Azure RBAC cannot be narrowed to a Blob prefix.
 12. Operational phase execution uses reviewed bundle paths, phase-fixed Jobs, bounded exact-reference inputs, and governed handoff files.
 13. The workload-owned controller, not Athena phase Jobs, creates exact run-scoped receipt Blobs with create-only semantics enforced in application code; Azure RBAC stays container-scoped because Blob roles cannot be narrowed to a prefix.
 14. The standalone presentation browser renders no lifecycle data until all reviewed static payloads, detached attestations, content digests, lifecycle bindings, and the pinned RSA public-key fingerprint verify locally.
+15. Dynamic incidents use a dedicated Blob container, signing key, and pinned trust anchor; neither lifecycle trust nor unsigned content is a fallback.
+16. Every incident has a signed pointer and the signed deterministic active index preserves all concurrent active incidents.
+17. Reassessment queues carry untrusted hints only; the orchestrator must rederive bindings and independently read current approved state before signing or storage.
 
 ## Relationship classes
 

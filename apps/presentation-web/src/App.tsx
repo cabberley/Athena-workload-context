@@ -5,12 +5,19 @@ import {
   type PresentationPayload,
 } from './contracts'
 import { loadVerifiedLifecycle } from './runtime'
+import {
+  loadVerifiedIncidents,
+  type VerifiedIncident,
+  type VerifiedIncidentFeed,
+} from './incidents'
 import type { BlastRadius, ImpactLevel } from './derivations'
 import type { VerifiedLifecycle } from './verification'
 import './App.css'
 
 export interface AppProps {
   loader?: () => Promise<VerifiedLifecycle>
+  incidentLoader?: () => Promise<VerifiedIncidentFeed>
+  incidentPollMs?: number
 }
 
 const PHASE_LABELS: Record<LifecyclePhase, string> = {
@@ -25,11 +32,17 @@ const BLAST_RADIUS_LABELS: Record<BlastRadius, string> = {
   resolved: 'Resolved',
 }
 
-function App({ loader = loadVerifiedLifecycle }: AppProps) {
+function App({
+  loader = loadVerifiedLifecycle,
+  incidentLoader = loadVerifiedIncidents,
+  incidentPollMs = 8_000,
+}: AppProps) {
   const [lifecycle, setLifecycle] = useState<VerifiedLifecycle | null>(null)
   const [failed, setFailed] = useState(false)
   const [selectedPhase, setSelectedPhase] = useState<LifecyclePhase>('baseline')
   const phaseHeadingRef = useRef<HTMLHeadingElement>(null)
+  const [incidentFeed, setIncidentFeed] = useState<VerifiedIncidentFeed | null>(null)
+  const [incidentUnavailable, setIncidentUnavailable] = useState(false)
 
   useEffect(() => {
     let current = true
@@ -44,6 +57,36 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       current = false
     }
   }, [loader])
+
+  useEffect(() => {
+    let current = true
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined
+    let latestPublishedAt = 0
+    const refresh = async (): Promise<void> => {
+      try {
+        const verified = await incidentLoader()
+        if (!current) return
+        const publishedAt = Date.parse(verified.publishedAt)
+        if (publishedAt >= latestPublishedAt) {
+          latestPublishedAt = publishedAt
+          setIncidentFeed(verified)
+          setIncidentUnavailable(false)
+        }
+      } catch {
+        if (current) {
+          setIncidentFeed(null)
+          setIncidentUnavailable(true)
+        }
+      } finally {
+        if (current) timer = globalThis.setTimeout(() => void refresh(), incidentPollMs)
+      }
+    }
+    void refresh()
+    return () => {
+      current = false
+      if (timer !== undefined) globalThis.clearTimeout(timer)
+    }
+  }, [incidentLoader, incidentPollMs])
 
   useEffect(() => {
     if (lifecycle) phaseHeadingRef.current?.focus()
@@ -126,6 +169,10 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       </header>
 
       <main>
+        <IncidentPanel
+          incidents={incidentFeed?.incidents ?? null}
+          unavailable={incidentUnavailable}
+        />
         <section className="trust-strip" aria-labelledby="trust-heading">
           <div>
             <p className="status-kicker">Trust status</p>
@@ -375,6 +422,96 @@ function App({ loader = loadVerifiedLifecycle }: AppProps) {
       </footer>
     </div>
   )
+}
+
+function IncidentPanel({
+  incidents,
+  unavailable,
+}: {
+  incidents: VerifiedIncident[] | null
+  unavailable: boolean
+}) {
+  if (!incidents || incidents.length === 0) {
+    return (
+      <section className="incident-panel" aria-labelledby="incident-heading">
+        <p className="status-kicker">Dynamic operational status</p>
+        <h2 id="incident-heading">No verified active incident</h2>
+        <p role="status">
+          {unavailable
+            ? 'The incident feed is unavailable or failed verification; no incident data was rendered.'
+            : 'Athena is polling the signed incident feed every few seconds.'}
+        </p>
+      </section>
+    )
+  }
+  return (
+    <section className="incident-panel" aria-labelledby="incident-heading">
+      <p className="status-kicker">Dynamic operational status</p>
+      <h2 id="incident-heading">
+        {incidents.length === 1
+          ? '1 verified active incident'
+          : `${incidents.length} verified active incidents`}
+      </h2>
+      {incidents.map(({ state }) => (
+        <article
+          key={state.incidentId}
+          className={`incident-entry incident-${state.lifecycle}`}
+          aria-labelledby={`incident-${state.incidentId}`}
+        >
+          <h3 id={`incident-${state.incidentId}`}>
+            Verified incident: {scenarioLabel(state.scenario)}
+          </h3>
+          <p role="status" aria-live="polite">
+            {state.findings[0]!.summary}
+          </p>
+          <dl className="incident-details">
+            <div>
+              <dt>Status</dt>
+              <dd>{state.lifecycle}</dd>
+            </div>
+            <div>
+              <dt>Availability</dt>
+              <dd>{state.availability}</dd>
+            </div>
+            <div>
+              <dt>Blast radius</dt>
+              <dd>{state.blastRadius}</dd>
+            </div>
+            <div>
+              <dt>Operator attention</dt>
+              <dd>{state.operatorAttention}</dd>
+            </div>
+            <div>
+              <dt>Notification</dt>
+              <dd>{state.notificationStatus}</dd>
+            </div>
+            <div>
+              <dt>Last update</dt>
+              <dd>
+                <time dateTime={state.updatedAt}>{state.updatedAt}</time>
+              </dd>
+            </div>
+          </dl>
+          <h4>How Athena determined the impact</h4>
+          <ol>
+            {state.reasoning.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ol>
+          <p className="no-remediation">
+            Athena does not remediate automatically. Recovery requires a separately governed
+            operator action.
+          </p>
+        </article>
+      ))}
+    </section>
+  )
+}
+
+const scenarioLabel = (scenario: VerifiedIncident['state']['scenario']): string => {
+  if (scenario === 'singletonDatabaseFailure') return 'database server failure'
+  if (scenario === 'webServerFailure') return 'web server failure'
+  return 'Azure Load Balancer failure'
 }
 
 const Verdict = ({ payload }: { payload: PresentationPayload }) => (

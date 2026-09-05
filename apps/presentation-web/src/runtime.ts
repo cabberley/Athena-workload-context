@@ -279,11 +279,18 @@ const assertSameOriginUrl = (url: URL, expectedOrigin: string): void => {
   }
 }
 
-const requireContentDigest = async (
+export const requireContentDigest = async (
   bytes: Uint8Array,
   expected: Sha256Digest,
   cryptoProvider: Crypto,
-  label: `${LifecyclePhase} payload` | `${LifecyclePhase} attestation` | 'reviewed public key',
+  label:
+    | `${LifecyclePhase} payload`
+    | `${LifecyclePhase} attestation`
+    | 'reviewed public key'
+    | 'active incident index'
+    | 'incident pointer'
+    | 'incident state'
+    | 'incident attestation',
 ): Promise<void> => {
   if ((await sha256Digest(bytes, cryptoProvider)) !== expected) {
     throw new PresentationLoadError(

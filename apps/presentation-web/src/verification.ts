@@ -23,6 +23,10 @@ export const PINNED_STATIC_PRESENTATION_KEY_FINGERPRINT =
   'sha256:9323d86eb7d1fffccc409a89795e04ef71db7c9b011dad9c2f3e3fcf6e81784a'
 export const PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT =
   'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515'
+export const PINNED_INCIDENT_KEY_ID =
+  'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
+export const PINNED_INCIDENT_KEY_FINGERPRINT =
+  'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e'
 
 export interface UnverifiedPhaseAssets {
   payload: unknown

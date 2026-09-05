@@ -1,5 +1,6 @@
 **
 !pyproject.toml
+!requirements-wc016.lock
 !README.md
 !src/
 !src/**

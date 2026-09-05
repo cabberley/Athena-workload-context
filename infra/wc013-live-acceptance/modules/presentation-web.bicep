@@ -45,6 +45,20 @@ param presentationAssetBlobEndpoint string
 ])
 param presentationAssetContainerName string
 
+@description('Exact private incident Blob container read by the presentation sidecar.')
+@allowed([
+  'incident-assets'
+])
+param incidentAssetContainerName string
+
+@description('Logical incident key ID pinned by the gateway and browser.')
+param incidentSigningKeyId string
+
+@description('SHA-256 fingerprint of the separately pinned incident public key.')
+@minLength(71)
+@maxLength(71)
+param incidentSigningKeyFingerprint string
+
 @description('Resource tags applied to presentation resources.')
 param tags object = {}
 
@@ -214,6 +228,14 @@ module presentationApp 'br/public:avm/res/app/container-app:0.23.0' = {
           presentationAssetBlobEndpoint
           '--container'
           presentationAssetContainerName
+          '--incident-container'
+          incidentAssetContainerName
+          '--incident-key-id'
+          incidentSigningKeyId
+          '--incident-key-fingerprint'
+          incidentSigningKeyFingerprint
+          '--incident-public-key'
+          '/opt/athena/wc016-incident-public-key.pem'
           '--managed-identity-client-id'
           presentationIdentity.outputs.clientId
           '--port'

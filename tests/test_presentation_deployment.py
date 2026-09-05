@@ -58,7 +58,8 @@ def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
     assert 'return 200 "healthy\\n"' in nginx
     assert "location = /runtime-manifest.json" in nginx
     assert "location ^~ /live/" in nginx
-    assert nginx.count("proxy_pass http://127.0.0.1:8081") == 2
+    assert "location ^~ /incidents/" in nginx
+    assert nginx.count("proxy_pass http://127.0.0.1:8081") == 3
     assert 'proxy_set_header Authorization ""' in nginx
     assert 'proxy_set_header Cookie ""' in nginx
     assert "proxy_pass_request_body off" in nginx
@@ -116,6 +117,11 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
     assert "presentationAssetBlobEndpoint" in presentation
     assert "'--container'" in presentation
     assert "presentationAssetContainerName" in presentation
+    assert "'--incident-container'" in presentation
+    assert "incidentAssetContainerName" in presentation
+    assert "'--incident-key-id'" in presentation
+    assert "'--incident-key-fingerprint'" in presentation
+    assert "'--incident-public-key'" in presentation
     assert "'--managed-identity-client-id'" in presentation
     assert "presentationIdentity.outputs.clientId" in presentation
     assert "'--port'" in presentation
@@ -140,6 +146,7 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
     assert "deliveryImageDigestInvalidCharacters" in presentation
     assert "!endsWith(deliveryImage, rejectedImageDigestSuffix)" in presentation
     assert "scope: presentationAssetContainer" in resources
+    assert "scope: incidentAssetContainer" in resources
     presentation_reader = re.search(
         r"resource presentationAssetBlobDataReader .*?\n\}",
         resources,
@@ -149,6 +156,24 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
     assert "presentationIdentityPrincipalId" in presentation_reader.group(0)
     assert "storageBlobDataReaderRoleDefinitionId" in presentation_reader.group(0)
     assert "artifactContainer" not in presentation_reader.group(0)
+    incident_reader = re.search(
+        r"resource incidentAssetBlobDataReader .*?\n\}",
+        resources,
+        re.DOTALL,
+    )
+    assert incident_reader is not None
+    assert "presentationIdentityPrincipalId" in incident_reader.group(0)
+    assert "storageBlobDataReaderRoleDefinitionId" in incident_reader.group(0)
+    incident_writer = re.search(
+        r"resource incidentPresentationAssetBlobDataContributor .*?\n\}",
+        resources,
+        re.DOTALL,
+    )
+    assert incident_writer is not None
+    assert "scope: incidentAssetContainer" in incident_writer.group(0)
+    assert "presentationAssetContainer" not in incident_writer.group(0)
+    assert "incidentSigningKeyName" in resources
+    assert "wc016-incident-public-key.pem" in _read("Dockerfile.wc013-delivery")
     for output in (
         "presentationContainerAppName",
         "presentationContainerAppResourceId",
@@ -224,7 +249,9 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert "roleAssignments:" in resources
     assert "collectorControllerRoleDefinitionId" in resources
     role_start = orchestration.index("resource collectorControllerRoleDefinition")
-    role_end = orchestration.index("\nmodule privateDns", role_start)
+    role_end = orchestration.index(
+        "\nmodule wc016SignalReaderRole", role_start
+    )
     role = orchestration[role_start:role_end]
     actions = re.findall(r"^          '([^']+)'$", role, re.MULTILINE)
     assert actions == [
@@ -438,11 +465,11 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:873c7a48e52b81d3ab5d5e064eb28e8677c9b3c784eeb39a563a773a08eae3f5"
+        "@sha256:cdc8e1c290eb0b75f63a218e8b4c9fd6ea35ff4062edf3368cc7a24302eebccf"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"
-        "@sha256:998393cc3153c7f975141a8d8a3036a1596d01f612092ad6c7158cf9d9e27025"
+        "@sha256:c73c05510ad38a20c16fa517da3c53a18da01eba3b75015b1b9c1e6460d6bbd9"
     )
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     presentation = _read(

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "athena.presentationWeb.publicKey.v1",
+  "keyId": "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1",
+  "fingerprint": "sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e",
+  "jwk": {
+    "kty": "RSA",
+    "n": "pRV3lYNRzX3AA2Ji1FCWySdJDjsK1or-3_13K587zVQ7ByEMB8fpozdQ_8AGZu7UKVyfkUY-nmUmTNfH7I1axGOMvMd4l2ZdBpnHIy2WZO17nkg-RYsWJ0Qz-5FHw0pHtJOmC_w8RvgNk3sdWjJ1tRniGnX7lywyCi9SNM4E-NgHp0Gp37M9iNVB-PaSO4soGq7l_oUZcPUOVDsl-hwgw4_bu9oo-YGvOojCQauX8kGL0Nf8exJwv8Ii0N6uAv97KmI-2NCQFaWlJPGKuwA5R2DH_iVQVcutt9Ar6xtV517LPgYxxbuD2RVhou1ZRWsG1KmKEGKDyuMDyygC6-td6THJ3i3-gddDhROzvU7BOq7-rbgWHA0lEmXbzELIOseDRhDUtC8KjeeZOR7NpnZuueVF0ThdXmpsDmrFUTEc3tJWSAYu9JtFkBAwG7Bsni_7YskR7l7acLzGwMvAnnFDi4GW8Y3romEJK7AyqoTSNqgivP-P4aBxxOz2F5ToAPd5",
+    "e": "AQAB",
+    "alg": "RS256",
+    "key_ops": [
+      "verify"
+    ],
+    "ext": true
+  }
+}
