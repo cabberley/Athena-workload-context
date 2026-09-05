@@ -354,6 +354,9 @@ def test_wc013_bicep_rejects_runtime_identities_in_operator_arrays() -> None:
         "  toLower(acceptanceIdentityPrincipalId)\n"
         "  toLower(evidenceIdentityPrincipalId)\n"
         "  toLower(presentationIdentityPrincipalId)\n"
+        "  toLower(detectorIdentityPrincipalId)\n"
+        "  toLower(incidentOrchestratorPrincipalId)\n"
+        "  toLower(notificationDispatcherPrincipalId)\n"
         "]"
         in resources
     )
@@ -377,15 +380,15 @@ def test_wc013_bicep_rejects_runtime_identities_in_operator_arrays() -> None:
         in resources
     )
     assert (
-        "fail('operatorArtifactReaderObjectIds must not contain acceptance, "
-        "evidence, or presentation runtime identities')"
+        "fail('operatorArtifactReaderObjectIds must not contain any Athena "
+        "runtime identity')"
         in resources
     )
     assert (
         "empty(workloadRuntimeIdentityOverlap)\n"
         "    ? workloadReceiptWriterObjectIds\n"
-        "    : fail('workloadReceiptWriterObjectIds must not contain acceptance, "
-        "evidence, or presentation runtime identities')"
+        "    : fail('workloadReceiptWriterObjectIds must not contain any Athena "
+        "runtime identity')"
         in resources
     )
 

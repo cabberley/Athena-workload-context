@@ -22,6 +22,7 @@ param replayTableName = 'Wc013Replay'
 param replayPartitionKey = 'wc013-live-synthetic'
 param artifactContainerName = 'operational-artifacts'
 param presentationAssetContainerName = 'presentation-assets'
+param incidentAssetContainerName = 'incident-assets'
 param artifactRetentionDays = 30
 
 // Demo jumpbox/operator verification reader for exact version-pinned artifact reads and
@@ -53,3 +54,22 @@ param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller
 param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:1111111111111111111111111111111111111111111111111111111111111111'
 param presentationImageRegistryServer = 'athenasynth.azurecr.io'
 param presentationImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+
+// WC-016 images deliberately use rejected all-zero digests until the deployer supplies RepoDigests.
+param wc016DetectorImage = 'athenasynth.azurecr.io/athena/wc016-detector@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+param wc016OrchestratorImage = 'athenasynth.azurecr.io/athena/wc016-orchestrator@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+param wc016DatabaseVmResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-demo-workload-rg/providers/Microsoft.Compute/virtualMachines/athena-synth-db-01'
+param wc016WebVmResourceIds = [
+  '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-demo-workload-rg/providers/Microsoft.Compute/virtualMachines/athena-synth-web-01'
+  '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-demo-workload-rg/providers/Microsoft.Compute/virtualMachines/athena-synth-web-02'
+]
+param wc016LoadBalancerResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-demo-workload-rg/providers/Microsoft.Network/loadBalancers/athena-synth-lb-01'
+param wc016DetectorStatePartitionKey = 'wc016-signal-state'
+param wc016DetectorStateTableName = 'Wc016DetectorState'
+param wc016NotificationStatePartitionKey = 'wc016-notification-delivery'
+param wc016NotificationStateTableName = 'Wc016NotificationState'
+param incidentSigningKeyName = 'wc016-incident-signing'
+param incidentSigningKeyId = 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
+param wc016RuntimeEnabled = false
+param wc016LegacyCleanupConfirmed = false
+param signingKeyFingerprint = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'

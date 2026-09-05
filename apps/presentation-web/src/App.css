@@ -114,8 +114,7 @@ code {
   color: var(--muted);
 }
 
-.incident-active,
-.incident-failedClosed {
+.incident-active {
   border-color: var(--amber);
   background: linear-gradient(135deg, rgb(75 49 11 / 90%), rgb(14 28 47 / 92%));
 }

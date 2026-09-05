@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, NoReturn, cast
 from urllib.parse import urlsplit
@@ -13,6 +14,7 @@ from azure.core import MatchConditions
 from azure.core.exceptions import (
     HttpResponseError,
     ResourceExistsError,
+    ResourceModifiedError,
     ResourceNotFoundError,
 )
 from azure.data.tables import TableServiceClient
@@ -38,7 +40,12 @@ from athena_context.artifacts import (
     ArtifactWriteRequest,
 )
 from athena_context.contracts import (
+    ActiveIncidentIndex,
+    ActiveIncidentIndexAttestation,
+    IncidentFeedAttestation,
     IncidentFeedPointer,
+    IncidentState,
+    IncidentStateAttestation,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     canonicalize_json,
@@ -54,6 +61,12 @@ from athena_context.contracts.models import (
 )
 from athena_context.evidence import TrustedIngestionBinding
 from athena_context.presentation_assets import (
+    MAX_INCIDENT_FEED_POINTER_BYTES,
+    MAX_INCIDENT_STATE_BYTES,
+    MAX_PRESENTATION_ATTESTATION_BYTES,
+    ActiveIncidentIndexPublicationRequest,
+    ActiveIncidentIndexSnapshot,
+    CurrentIncidentStateSnapshot,
     IncidentPublicationReceipt,
     IncidentPublicationRequest,
     PresentationAssetAlreadyExistsError,
@@ -175,6 +188,28 @@ class KeyVaultRsaSigner:
         if not signature:
             raise ValueError("Key Vault returned an empty RS256 signature")
         return base64.b64encode(signature).decode("ascii")
+
+    def verify_preimage(
+        self,
+        canonical_preimage: bytes,
+        detached_signature: str,
+    ) -> bool:
+        try:
+            signature = base64.urlsafe_b64decode(
+                detached_signature + "=" * (-len(detached_signature) % 4)
+            )
+        except (TypeError, ValueError):
+            return False
+        if not signature:
+            return False
+        digest = hashlib.sha256(canonical_preimage).digest()
+        return bool(
+            self._client.verify(
+                SignatureAlgorithm.rs256,
+                digest,
+                signature,
+            ).is_valid
+        )
 
 
 class KeyVaultTrustedKeyResolver:
@@ -482,102 +517,6 @@ class AzureBlobPresentationAssetPublisher:
             manifest_sha256=manifest_sha256,
         )
 
-    def publish_incident(
-        self,
-        request: IncidentPublicationRequest,
-    ) -> IncidentPublicationReceipt:
-        if type(request) is not IncidentPublicationRequest:
-            raise TypeError("request must be an exact IncidentPublicationRequest")
-        for asset in (
-            request.state,
-            request.attestation,
-            request.pointer_attestation_asset,
-        ):
-            blob = self._container.get_blob_client(asset.blob_name)
-            try:
-                blob.upload_blob(
-                    asset.payload,
-                    blob_type=BlobType.BLOCKBLOB,
-                    length=len(asset.payload),
-                    metadata={"payload_sha256": asset.payload_sha256},
-                    overwrite=False,
-                    match_condition=MatchConditions.IfMissing,
-                    content_settings=ContentSettings(content_type="application/json"),
-                )
-            except ResourceExistsError as exc:
-                error_code = getattr(exc, "error_code", None)
-                normalized_code = getattr(error_code, "value", error_code)
-                if normalized_code != "BlobAlreadyExists":
-                    raise
-                try:
-                    downloader = blob.download_blob(
-                        offset=0,
-                        length=asset.maximum_bytes + 1,
-                        max_concurrency=1,
-                    )
-                    properties = downloader.properties
-                    content_settings = getattr(properties, "content_settings", None)
-                    metadata = getattr(properties, "metadata", None)
-                    existing_payload = downloader.readall()
-                except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
-                    raise PresentationAssetAlreadyExistsError(
-                        "an immutable incident asset could not be verified"
-                    ) from read_exc
-                if (
-                    existing_payload != asset.payload
-                    or getattr(content_settings, "content_type", None)
-                    != "application/json"
-                    or type(metadata) is not dict
-                    or metadata.get("payload_sha256") != asset.payload_sha256
-                ):
-                    raise PresentationAssetAlreadyExistsError(
-                        "an immutable incident asset already exists with different content"
-                    ) from exc
-        pointer_bytes = request.pointer.canonical_bytes()
-        pointer_sha256 = sha256_hex(pointer_bytes)
-        pointer_blob = self._container.get_blob_client("incidents/current.json")
-        try:
-            current = pointer_blob.download_blob(
-                offset=0,
-                length=MAX_ARTIFACT_PAYLOAD_BYTES,
-                max_concurrency=1,
-            )
-            current_bytes = current.readall()
-            current_pointer = IncidentFeedPointer.model_validate_json(current_bytes)
-            if request.pointer.published_at <= current_pointer.published_at:
-                raise PresentationAssetAlreadyExistsError(
-                    "incident pointer publication is not newer than the current state"
-                )
-            etag = getattr(current.properties, "etag", None)
-            if not isinstance(etag, str) or not etag:
-                raise PresentationAssetAlreadyExistsError(
-                    "incident pointer omitted its concurrency token"
-                )
-            pointer_blob.upload_blob(
-                pointer_bytes,
-                blob_type=BlobType.BLOCKBLOB,
-                length=len(pointer_bytes),
-                metadata={"payload_sha256": pointer_sha256},
-                overwrite=True,
-                etag=etag,
-                match_condition=MatchConditions.IfNotModified,
-                content_settings=ContentSettings(content_type="application/json"),
-            )
-        except ResourceNotFoundError:
-            pointer_blob.upload_blob(
-                pointer_bytes,
-                blob_type=BlobType.BLOCKBLOB,
-                length=len(pointer_bytes),
-                metadata={"payload_sha256": pointer_sha256},
-                overwrite=False,
-                match_condition=MatchConditions.IfMissing,
-                content_settings=ContentSettings(content_type="application/json"),
-            )
-        return IncidentPublicationReceipt(
-            incident_id=request.state.blob_name.split("/")[1],
-            pointer_sha256=pointer_sha256,
-        )
-
 class AzureBlobPresentationAssetReader:
     """Read current blobs only from the private presentation-assets container."""
 
@@ -668,6 +607,503 @@ class AzureBlobPresentationAssetReader:
             payload=payload,
             payload_sha256=payload_sha256,
         )
+
+
+class AzureBlobIncidentAssetPublisher:
+    """Publish only signed WC-016 assets to the private incident-assets container."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+        signing_key_id: str,
+        signing_key_fingerprint: str,
+        signature_verifier: Callable[[bytes, str], bool],
+    ) -> None:
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
+        if container_name != "incident-assets":
+            raise ValueError("container_name must be exactly incident-assets")
+        if not signing_key_id or not re.fullmatch(
+            r"sha256:[a-f0-9]{64}", signing_key_fingerprint
+        ):
+            raise ValueError("incident signing trust anchor is invalid")
+        credential = production_managed_identity_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_put_size=MAX_ARTIFACT_PAYLOAD_BYTES,
+            max_single_get_size=MAX_INCIDENT_STATE_BYTES + 1,
+            max_chunk_get_size=MAX_INCIDENT_STATE_BYTES + 1,
+        )
+        self._container = service.get_container_client(container_name)
+        self._signing_key_id = signing_key_id
+        self._signing_key_fingerprint = signing_key_fingerprint
+        self._signature_verifier = signature_verifier
+
+    def read_active_incident_index(self) -> ActiveIncidentIndexSnapshot | None:
+        blob = self._container.get_blob_client("incidents/active.json")
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=MAX_INCIDENT_STATE_BYTES + 1,
+                max_concurrency=1,
+            )
+            payload = downloader.readall()
+        except ResourceNotFoundError:
+            return None
+        except HttpResponseError as exc:
+            raise PresentationAssetUnavailableError(
+                "active incident index is unavailable"
+            ) from exc
+        if not 1 <= len(payload) <= MAX_INCIDENT_STATE_BYTES:
+            raise PresentationAssetUnavailableError(
+                "active incident index is outside its byte bound"
+            )
+        index = ActiveIncidentIndex.model_validate_json(payload)
+        if (
+            payload != index.canonical_bytes()
+            or index.key_id != self._signing_key_id
+            or index.key_fingerprint != self._signing_key_fingerprint
+        ):
+            raise PresentationAssetUnavailableError(
+                "active incident index trust binding is invalid"
+            )
+        attestation_blob = self._container.get_blob_client(
+            index.index_attestation_path.removeprefix("./")
+        )
+        try:
+            attestation_payload = attestation_blob.download_blob(
+                offset=0,
+                length=MAX_PRESENTATION_ATTESTATION_BYTES + 1,
+                max_concurrency=1,
+            ).readall()
+        except (ResourceNotFoundError, HttpResponseError) as exc:
+            raise PresentationAssetUnavailableError(
+                "active incident index attestation is unavailable"
+            ) from exc
+        if not 1 <= len(attestation_payload) <= MAX_PRESENTATION_ATTESTATION_BYTES:
+            raise PresentationAssetUnavailableError(
+                "active incident index attestation is outside its byte bound"
+            )
+        try:
+            attestation = ActiveIncidentIndexAttestation.model_validate_json(
+                attestation_payload
+            )
+        except ValueError as exc:
+            raise PresentationAssetUnavailableError(
+                "active incident index attestation is invalid"
+            ) from exc
+        if (
+            attestation_payload != attestation.canonical_bytes()
+            or attestation.index_digest != sha256_hex(payload)
+            or attestation.key_vault_key_id != self._signing_key_id
+            or not self._signature_verifier(
+                payload,
+                attestation.detached_signature,
+            )
+        ):
+            raise PresentationAssetUnavailableError(
+                "active incident index signature is invalid"
+            )
+        return ActiveIncidentIndexSnapshot(
+            index=index,
+            payload_sha256=sha256_hex(payload),
+        )
+
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None:
+        if re.fullmatch(r"inc-[a-f0-9]{12}", incident_id) is None:
+            raise ValueError("incident_id is invalid")
+        pointer_payload = self._read_incident_json_blob(
+            f"incidents/{incident_id}/current.json",
+            maximum_bytes=MAX_INCIDENT_FEED_POINTER_BYTES,
+            allow_missing=True,
+        )
+        if pointer_payload is None:
+            return None
+        try:
+            pointer = IncidentFeedPointer.model_validate_json(pointer_payload)
+        except ValueError as exc:
+            raise PresentationAssetUnavailableError(
+                "current incident pointer is invalid"
+            ) from exc
+        if (
+            pointer_payload != pointer.canonical_bytes()
+            or pointer.incident_id != incident_id
+            or pointer.key_id != self._signing_key_id
+            or pointer.key_fingerprint != self._signing_key_fingerprint
+        ):
+            raise PresentationAssetUnavailableError(
+                "current incident pointer trust binding is invalid"
+            )
+        pointer_attestation_payload = self._read_incident_json_blob(
+            pointer.pointer_attestation_path.removeprefix("./"),
+            maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
+        )
+        state_payload = self._read_incident_json_blob(
+            pointer.state_path.removeprefix("./"),
+            maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+        )
+        state_attestation_payload = self._read_incident_json_blob(
+            pointer.attestation_path.removeprefix("./"),
+            maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
+        )
+        if (
+            pointer_attestation_payload is None
+            or state_payload is None
+            or state_attestation_payload is None
+        ):
+            raise PresentationAssetUnavailableError(
+                "current incident state is unavailable"
+            )
+        try:
+            pointer_attestation = IncidentFeedAttestation.model_validate_json(
+                pointer_attestation_payload
+            )
+            state = IncidentState.model_validate_json(state_payload)
+            state_attestation = IncidentStateAttestation.model_validate_json(
+                state_attestation_payload
+            )
+        except ValueError as exc:
+            raise PresentationAssetUnavailableError(
+                "current incident state is invalid"
+            ) from exc
+        unsigned_state = state.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"result_digest"},
+        )
+        state_preimage = canonicalize_json(unsigned_state).encode("utf-8")
+        state_version = pointer.state_path.removeprefix(
+            f"./incidents/{incident_id}/versions/"
+        ).removesuffix("/state.json")
+        if (
+            pointer_attestation_payload != pointer_attestation.canonical_bytes()
+            or pointer_attestation.pointer_digest != sha256_hex(pointer_payload)
+            or pointer_attestation.key_vault_key_id != self._signing_key_id
+            or not self._signature_verifier(
+                pointer_payload,
+                pointer_attestation.detached_signature,
+            )
+            or state_payload != state.canonical_bytes()
+            or pointer.state_sha256 != sha256_hex(state_payload)
+            or state.incident_id != incident_id
+            or state.result_digest != sha256_hex(state_preimage)
+            or state_version != state.result_digest.removeprefix("sha256:")
+            or state_attestation_payload != state_attestation.canonical_bytes()
+            or pointer.attestation_sha256 != sha256_hex(state_attestation_payload)
+            or state_attestation.result_digest != state.result_digest
+            or state_attestation.key_vault_key_id != self._signing_key_id
+            or not self._signature_verifier(
+                state_preimage,
+                state_attestation.detached_signature,
+            )
+            or pointer.published_at < state.updated_at
+        ):
+            raise PresentationAssetUnavailableError(
+                "current incident state trust binding is invalid"
+            )
+        return CurrentIncidentStateSnapshot(
+            state=state,
+            pointer=pointer,
+            pointer_sha256=sha256_hex(pointer_payload),
+        )
+
+    def publish_incident(
+        self,
+        request: IncidentPublicationRequest,
+    ) -> IncidentPublicationReceipt:
+        if type(request) is not IncidentPublicationRequest:
+            raise TypeError("request must be an exact IncidentPublicationRequest")
+        if (
+            request.pointer.key_id != self._signing_key_id
+            or request.pointer.key_fingerprint != self._signing_key_fingerprint
+            or request.active_index.key_id != self._signing_key_id
+            or request.active_index.key_fingerprint
+            != self._signing_key_fingerprint
+        ):
+            raise ValueError("incident publication trust anchor is invalid")
+        for asset in (
+            request.state,
+            request.attestation,
+            request.pointer_asset,
+            request.pointer_attestation_asset,
+            request.active_index_attestation_asset,
+        ):
+            self._upload_immutable(asset)
+        self._publish_current_pointer(request)
+        self._publish_active_index(request)
+        return IncidentPublicationReceipt(
+            incident_id=request.pointer.incident_id,
+            pointer_sha256=request.pointer_asset.payload_sha256,
+            active_index_sha256=request.active_index_asset.payload_sha256,
+        )
+
+    def publish_active_incident_index(
+        self,
+        request: ActiveIncidentIndexPublicationRequest,
+    ) -> ActiveIncidentIndexSnapshot:
+        if type(request) is not ActiveIncidentIndexPublicationRequest:
+            raise TypeError(
+                "request must be an exact ActiveIncidentIndexPublicationRequest"
+            )
+        if (
+            request.active_index.key_id != self._signing_key_id
+            or request.active_index.key_fingerprint
+            != self._signing_key_fingerprint
+        ):
+            raise ValueError("active incident index trust anchor is invalid")
+        self._upload_immutable(request.active_index_attestation_asset)
+        self._publish_active_index(request)
+        return ActiveIncidentIndexSnapshot(
+            index=request.active_index,
+            payload_sha256=request.active_index_asset.payload_sha256,
+        )
+
+    def _upload_immutable(self, asset: Any) -> None:
+        blob = self._container.get_blob_client(asset.blob_name)
+        try:
+            blob.upload_blob(
+                asset.payload,
+                blob_type=BlobType.BLOCKBLOB,
+                length=len(asset.payload),
+                metadata={"payload_sha256": asset.payload_sha256},
+                overwrite=False,
+                match_condition=MatchConditions.IfMissing,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        except ResourceExistsError as exc:
+            error_code = getattr(exc, "error_code", None)
+            normalized_code = getattr(error_code, "value", error_code)
+            if normalized_code != "BlobAlreadyExists":
+                raise
+            try:
+                downloader = blob.download_blob(
+                    offset=0,
+                    length=asset.maximum_bytes + 1,
+                    max_concurrency=1,
+                )
+                properties = downloader.properties
+                existing_payload = downloader.readall()
+            except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
+                raise PresentationAssetAlreadyExistsError(
+                    "an immutable incident asset could not be verified"
+                ) from read_exc
+            content_settings = getattr(properties, "content_settings", None)
+            metadata = getattr(properties, "metadata", None)
+            if (
+                existing_payload != asset.payload
+                or getattr(content_settings, "content_type", None)
+                != "application/json"
+                or type(metadata) is not dict
+                or metadata.get("payload_sha256") != asset.payload_sha256
+            ):
+                raise PresentationAssetAlreadyExistsError(
+                    "an immutable incident asset already exists with different content"
+                ) from exc
+
+    def _read_incident_json_blob(
+        self,
+        blob_name: str,
+        *,
+        maximum_bytes: int,
+        allow_missing: bool = False,
+    ) -> bytes | None:
+        blob = self._container.get_blob_client(blob_name)
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            payload = downloader.readall()
+        except ResourceNotFoundError:
+            if allow_missing:
+                return None
+            raise PresentationAssetUnavailableError(
+                "current incident asset is unavailable"
+            ) from None
+        except HttpResponseError as exc:
+            raise PresentationAssetUnavailableError(
+                "current incident asset is unavailable"
+            ) from exc
+        content_settings = getattr(properties, "content_settings", None)
+        metadata = getattr(properties, "metadata", None)
+        if (
+            type(payload) is not bytes
+            or not 1 <= len(payload) <= maximum_bytes
+            or getattr(content_settings, "content_type", None) != "application/json"
+            or type(metadata) is not dict
+            or metadata.get("payload_sha256") != sha256_hex(payload)
+        ):
+            raise PresentationAssetUnavailableError(
+                "current incident asset metadata is invalid"
+            )
+        return payload
+
+    def _publish_current_pointer(self, request: IncidentPublicationRequest) -> None:
+        asset = request.current_pointer_asset
+        blob = self._container.get_blob_client(asset.blob_name)
+        try:
+            current = blob.download_blob(
+                offset=0,
+                length=asset.maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            current_bytes = current.readall()
+        except ResourceNotFoundError:
+            self._upload_missing_mutable(blob, asset)
+            return
+        except HttpResponseError as exc:
+            raise PresentationAssetAlreadyExistsError(
+                "current incident pointer is unavailable"
+            ) from exc
+        content_settings = getattr(current.properties, "content_settings", None)
+        metadata = getattr(current.properties, "metadata", None)
+        if (
+            type(current_bytes) is not bytes
+            or not 1 <= len(current_bytes) <= asset.maximum_bytes
+            or getattr(content_settings, "content_type", None) != "application/json"
+            or type(metadata) is not dict
+            or metadata.get("payload_sha256") != sha256_hex(current_bytes)
+        ):
+            raise PresentationAssetAlreadyExistsError(
+                "current incident pointer is invalid"
+            )
+        if current_bytes == asset.payload:
+            return
+        try:
+            current_pointer = IncidentFeedPointer.model_validate_json(current_bytes)
+        except ValueError as exc:
+            raise PresentationAssetAlreadyExistsError(
+                "current incident pointer is invalid"
+            ) from exc
+        if (
+            current_bytes != current_pointer.canonical_bytes()
+            or current_pointer.incident_id != request.pointer.incident_id
+            or current_pointer.key_id != self._signing_key_id
+            or current_pointer.key_fingerprint != self._signing_key_fingerprint
+            or request.pointer.published_at <= current_pointer.published_at
+        ):
+            raise PresentationAssetAlreadyExistsError(
+                "current incident pointer publication is not newer and trusted"
+            )
+        self._replace_mutable(blob, asset, current)
+
+    def _publish_active_index(
+        self,
+        request: IncidentPublicationRequest | ActiveIncidentIndexPublicationRequest,
+    ) -> None:
+        blob = self._container.get_blob_client(request.active_index_asset.blob_name)
+        try:
+            current = blob.download_blob(
+                offset=0,
+                length=request.active_index_asset.maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            current_bytes = current.readall()
+        except ResourceNotFoundError:
+            if request.previous_active_index_sha256 is not None:
+                raise PresentationAssetAlreadyExistsError(
+                    "active incident index disappeared during publication"
+                ) from None
+            self._upload_missing_mutable(blob, request.active_index_asset)
+            return
+        if current_bytes == request.active_index_asset.payload:
+            return
+        if (
+            request.previous_active_index_sha256 is None
+            or sha256_hex(current_bytes) != request.previous_active_index_sha256
+        ):
+            raise PresentationAssetAlreadyExistsError(
+                "active incident index changed during publication"
+            )
+        current_index = ActiveIncidentIndex.model_validate_json(current_bytes)
+        if (
+            current_bytes != current_index.canonical_bytes()
+            or current_index.key_id != self._signing_key_id
+            or current_index.key_fingerprint != self._signing_key_fingerprint
+            or request.active_index.published_at <= current_index.published_at
+        ):
+            raise PresentationAssetAlreadyExistsError(
+                "active incident index publication is not newer and trusted"
+            )
+        self._replace_mutable(blob, request.active_index_asset, current)
+
+    @staticmethod
+    def _upload_missing_mutable(blob: Any, asset: Any) -> None:
+        try:
+            blob.upload_blob(
+                asset.payload,
+                blob_type=BlobType.BLOCKBLOB,
+                length=len(asset.payload),
+                metadata={"payload_sha256": asset.payload_sha256},
+                overwrite=False,
+                match_condition=MatchConditions.IfMissing,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        except ResourceExistsError as exc:
+            raise PresentationAssetAlreadyExistsError(
+                "mutable incident asset was created concurrently"
+            ) from exc
+
+    @staticmethod
+    def _replace_mutable(blob: Any, asset: Any, current: Any) -> None:
+        etag = getattr(current.properties, "etag", None)
+        if not isinstance(etag, str) or not etag:
+            raise PresentationAssetAlreadyExistsError(
+                "mutable incident asset omitted its concurrency token"
+            )
+        try:
+            blob.upload_blob(
+                asset.payload,
+                blob_type=BlobType.BLOCKBLOB,
+                length=len(asset.payload),
+                metadata={"payload_sha256": asset.payload_sha256},
+                overwrite=True,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        except ResourceModifiedError as exc:
+            raise PresentationAssetAlreadyExistsError(
+                "mutable incident asset changed during conditional publication"
+            ) from exc
+
+
+class AzureBlobIncidentAssetReader(AzureBlobPresentationAssetReader):
+    """Read only from the dedicated private incident-assets container."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+    ) -> None:
+        _validate_blob_endpoint(blob_endpoint)
+        _validate_container_name(container_name)
+        if container_name != "incident-assets":
+            raise ValueError("container_name must be exactly incident-assets")
+        credential = production_managed_identity_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        service = BlobServiceClient(
+            account_url=blob_endpoint,
+            credential=credential,
+            max_single_get_size=MAX_ARTIFACT_PAYLOAD_BYTES + 1,
+            max_chunk_get_size=MAX_ARTIFACT_PAYLOAD_BYTES + 1,
+        )
+        self._container = service.get_container_client(container_name)
 
 
 class AzureBlobVersionPinnedArtifactReader:
@@ -1043,6 +1479,8 @@ class DefaultAzureCredentialTrustedIngestionSigner:
 
 __all__ = [
     "AzureBlobCreateOnlyArtifactWriter",
+    "AzureBlobIncidentAssetPublisher",
+    "AzureBlobIncidentAssetReader",
     "AzureBlobPresentationAssetPublisher",
     "AzureBlobPresentationAssetReader",
     "AzureBlobVersionPinnedArtifactReader",

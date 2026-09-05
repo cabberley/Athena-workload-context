@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -14,8 +15,11 @@ from athena_context.contracts import build_operational_phase_reference_handoff
 from athena_context.contracts.eventing import WorkloadRole
 from athena_context.contracts.presentation import ArgusPresentationPhase
 from athena_context.eventing import (
-    run_event_processor,
+    SignalDetectionError,
+    run_incident_feed_heartbeat,
     run_incident_orchestrator_worker,
+    run_notification_dispatcher_worker,
+    run_scheduled_signal_detector,
 )
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
@@ -221,21 +225,39 @@ def build_parser() -> argparse.ArgumentParser:
         default="presentation-assets",
         choices=("presentation-assets",),
     )
+    gateway_parser.add_argument(
+        "--incident-container",
+        default="incident-assets",
+        choices=("incident-assets",),
+    )
+    gateway_parser.add_argument("--incident-key-id", required=True)
+    gateway_parser.add_argument("--incident-key-fingerprint", required=True)
+    gateway_parser.add_argument("--incident-public-key", required=True, type=Path)
     gateway_parser.add_argument("--managed-identity-client-id", required=True)
     gateway_parser.add_argument("--port", type=int, default=8081)
-    event_parser = subparsers.add_parser(
-        "wc016-event-processor",
-        help="normalize one queued Azure event and emit one context-bound reassessment request",
+    detector_parser = subparsers.add_parser(
+        "wc016-signal-detector",
+        help="query only approved Azure signals and emit context-bound reassessments",
     )
-    event_parser.add_argument("--service-bus-namespace", required=True)
-    event_parser.add_argument("--raw-queue", default="raw-monitor-events")
-    event_parser.add_argument(
+    detector_parser.add_argument("--service-bus-namespace", required=True)
+    detector_parser.add_argument(
         "--reassessment-queue",
         default="incident-reassessment-requests",
     )
-    event_parser.add_argument("--managed-identity-client-id", required=True)
-    event_parser.add_argument("--approved-resource-roles", required=True, type=Path)
-    event_parser.add_argument("--approved-alert-rules", required=True, type=Path)
+    detector_parser.add_argument("--managed-identity-client-id", required=True)
+    detector_parser.add_argument("--approved-resource-roles", type=Path)
+    detector_parser.add_argument("--approved-resource-roles-json")
+    detector_parser.add_argument("--approved-alert-rules", type=Path)
+    detector_parser.add_argument("--approved-alert-rules-json")
+    detector_parser.add_argument("--state-table-endpoint", required=True)
+    detector_parser.add_argument("--state-table-name", required=True)
+    detector_parser.add_argument("--state-partition-key", required=True)
+    detector_parser.add_argument(
+        "--metric-window-minutes",
+        type=int,
+        default=5,
+        choices=range(2, 11),
+    )
     incident_parser = subparsers.add_parser(
         "wc016-incident-orchestrator",
         help="consume one reassessment request and publish one signed incident update",
@@ -250,21 +272,101 @@ def build_parser() -> argparse.ArgumentParser:
         default="incident-notification-outbox",
     )
     incident_parser.add_argument("--managed-identity-client-id", required=True)
-    incident_parser.add_argument("--reassessment-endpoint", required=True)
-    incident_parser.add_argument("--reassessment-audience", required=True)
+    incident_parser.add_argument("--approved-resource-roles", type=Path)
+    incident_parser.add_argument("--approved-resource-roles-json")
+    incident_parser.add_argument(
+        "--metric-window-minutes",
+        type=int,
+        default=5,
+        choices=range(2, 11),
+    )
     incident_parser.add_argument("--blob-endpoint", required=True)
     incident_parser.add_argument("--presentation-url", required=True)
     incident_parser.add_argument("--key-vault-key-id", required=True)
     incident_parser.add_argument("--signing-key-id", required=True)
     incident_parser.add_argument("--signing-key-fingerprint", required=True)
+    heartbeat_parser = subparsers.add_parser(
+        "wc016-incident-feed-heartbeat",
+        help="publish a signed feed heartbeat after independently verifying live health",
+    )
+    heartbeat_parser.add_argument("--managed-identity-client-id", required=True)
+    heartbeat_parser.add_argument("--approved-resource-roles", type=Path)
+    heartbeat_parser.add_argument("--approved-resource-roles-json")
+    heartbeat_parser.add_argument("--approved-alert-rules", type=Path)
+    heartbeat_parser.add_argument("--approved-alert-rules-json")
+    heartbeat_parser.add_argument(
+        "--metric-window-minutes",
+        type=int,
+        default=5,
+        choices=range(2, 11),
+    )
+    heartbeat_parser.add_argument("--blob-endpoint", required=True)
+    heartbeat_parser.add_argument("--key-vault-key-id", required=True)
+    heartbeat_parser.add_argument("--signing-key-id", required=True)
+    heartbeat_parser.add_argument("--signing-key-fingerprint", required=True)
+    notification_parser = subparsers.add_parser(
+        "wc016-notification-dispatcher",
+        help="deliver one bounded incident notification through the approved Teams workflow",
+    )
+    notification_parser.add_argument("--service-bus-namespace", required=True)
+    notification_parser.add_argument(
+        "--notification-queue",
+        default="incident-notification-outbox",
+    )
+    notification_parser.add_argument("--managed-identity-client-id", required=True)
+    notification_parser.add_argument("--webhook-url")
+    notification_parser.add_argument(
+        "--notification-state-table-endpoint",
+        required=True,
+    )
+    notification_parser.add_argument("--notification-state-table-name", required=True)
+    notification_parser.add_argument(
+        "--notification-state-partition-key",
+        required=True,
+    )
     return parser
 
 
-def _load_approved_resource_roles(path: Path) -> dict[str, WorkloadRole]:
+def _load_json_configuration(
+    *,
+    path: Path | None,
+    inline_json: str | None,
+    label: str,
+    environment_name: str,
+) -> object:
+    environment_json = os.environ.get(environment_name)
+    sources = sum(value is not None for value in (path, inline_json, environment_json))
+    if sources != 1:
+        raise ValueError(
+            f"{label} must be supplied by exactly one file, JSON argument, or "
+            f"{environment_name}"
+        )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        content = (
+            path.read_text(encoding="utf-8")
+            if path is not None
+            else inline_json
+            if inline_json is not None
+            else environment_json
+        )
+        assert content is not None
+        if not 1 <= len(content.encode("utf-8")) <= 256 * 1024:
+            raise ValueError(f"{label} is outside its byte bound")
+        return json.loads(content)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("approved resource role bindings could not be loaded") from exc
+        raise ValueError(f"{label} could not be loaded") from exc
+
+
+def _load_approved_resource_roles(
+    path: Path | None,
+    inline_json: str | None = None,
+) -> dict[str, WorkloadRole]:
+    value = _load_json_configuration(
+        path=path,
+        inline_json=inline_json,
+        label="approved resource role bindings",
+        environment_name="ATHENA_WC016_APPROVED_RESOURCE_ROLES_JSON",
+    )
     if not isinstance(value, dict) or not 1 <= len(value) <= 128:
         raise ValueError("approved resource role bindings must be one bounded object")
     roles: dict[str, WorkloadRole] = {}
@@ -284,11 +386,16 @@ def _load_approved_resource_roles(path: Path) -> dict[str, WorkloadRole]:
     return roles
 
 
-def _load_approved_alert_rules(path: Path) -> tuple[str, ...]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("approved alert rules could not be loaded") from exc
+def _load_approved_alert_rules(
+    path: Path | None,
+    inline_json: str | None = None,
+) -> tuple[str, ...]:
+    value = _load_json_configuration(
+        path=path,
+        inline_json=inline_json,
+        label="approved alert rules",
+        environment_name="ATHENA_WC016_APPROVED_ALERT_RULES_JSON",
+    )
     if (
         not isinstance(value, list)
         or not 1 <= len(value) <= 128
@@ -541,28 +648,33 @@ def main(
             run_presentation_asset_gateway(
                 blob_endpoint=args.blob_endpoint,
                 container_name=args.container,
+                incident_container_name=args.incident_container,
+                incident_key_id=args.incident_key_id,
+                incident_key_fingerprint=args.incident_key_fingerprint,
+                incident_public_key_path=args.incident_public_key,
                 managed_identity_client_id=args.managed_identity_client_id,
                 port=args.port,
             )
             return 0
-        if args.command == "wc016-event-processor":
-            processed = run_event_processor(
+        if args.command == "wc016-signal-detector":
+            emitted = run_scheduled_signal_detector(
                 fully_qualified_namespace=args.service_bus_namespace,
-                raw_queue_name=args.raw_queue,
                 reassessment_queue_name=args.reassessment_queue,
                 managed_identity_client_id=args.managed_identity_client_id,
                 approved_resource_roles=_load_approved_resource_roles(
-                    args.approved_resource_roles
+                    args.approved_resource_roles,
+                    args.approved_resource_roles_json,
                 ),
                 approved_metric_alert_rules=_load_approved_alert_rules(
-                    args.approved_alert_rules
+                    args.approved_alert_rules,
+                    args.approved_alert_rules_json,
                 ),
+                detector_state_table_endpoint=args.state_table_endpoint,
+                detector_state_table_name=args.state_table_name,
+                detector_state_partition_key=args.state_partition_key,
+                metric_window_minutes=args.metric_window_minutes,
             )
-            output.write(
-                "WC-016 event processed\n"
-                if processed
-                else "WC-016 event queue was empty\n"
-            )
+            output.write(f"WC-016 detector emitted {emitted} reassessment request(s)\n")
             return 0
         if args.command == "wc016-incident-orchestrator":
             processed = run_incident_orchestrator_worker(
@@ -570,18 +682,65 @@ def main(
                 reassessment_queue_name=args.reassessment_queue,
                 notification_queue_name=args.notification_queue,
                 managed_identity_client_id=args.managed_identity_client_id,
-                reassessment_endpoint=args.reassessment_endpoint,
-                reassessment_audience=args.reassessment_audience,
+                approved_resource_roles=_load_approved_resource_roles(
+                    args.approved_resource_roles,
+                    args.approved_resource_roles_json,
+                ),
                 blob_endpoint=args.blob_endpoint,
                 presentation_url=args.presentation_url,
                 key_vault_key_id=args.key_vault_key_id,
                 signing_key_id=args.signing_key_id,
                 signing_key_fingerprint=args.signing_key_fingerprint,
+                metric_window_minutes=args.metric_window_minutes,
             )
             output.write(
                 "WC-016 incident published\n"
                 if processed
                 else "WC-016 reassessment queue was empty or rejected\n"
+            )
+            return 0
+        if args.command == "wc016-incident-feed-heartbeat":
+            run_incident_feed_heartbeat(
+                managed_identity_client_id=args.managed_identity_client_id,
+                approved_resource_roles=_load_approved_resource_roles(
+                    args.approved_resource_roles,
+                    args.approved_resource_roles_json,
+                ),
+                approved_metric_alert_rules=_load_approved_alert_rules(
+                    args.approved_alert_rules,
+                    args.approved_alert_rules_json,
+                ),
+                blob_endpoint=args.blob_endpoint,
+                key_vault_key_id=args.key_vault_key_id,
+                signing_key_id=args.signing_key_id,
+                signing_key_fingerprint=args.signing_key_fingerprint,
+                metric_window_minutes=args.metric_window_minutes,
+            )
+            output.write("WC-016 incident feed heartbeat published\n")
+            return 0
+        if args.command == "wc016-notification-dispatcher":
+            webhook_url = args.webhook_url or os.environ.get(
+                "ATHENA_WC016_TEAMS_WEBHOOK_URL"
+            )
+            if webhook_url is None:
+                raise ValueError("notification webhook URL is required")
+            processed = run_notification_dispatcher_worker(
+                fully_qualified_namespace=args.service_bus_namespace,
+                notification_queue_name=args.notification_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                webhook_url=webhook_url,
+                notification_state_table_endpoint=(
+                    args.notification_state_table_endpoint
+                ),
+                notification_state_table_name=args.notification_state_table_name,
+                notification_state_partition_key=(
+                    args.notification_state_partition_key
+                ),
+            )
+            output.write(
+                "WC-016 notification delivered\n"
+                if processed
+                else "WC-016 notification queue was empty or rejected\n"
             )
             return 0
     except Wc013LiveAcceptanceError as exc:
@@ -607,8 +766,16 @@ def main(
     except PresentationAssetGatewayError as exc:
         errors.write(f"presentation asset gateway failed: {exc}\n")
         return 1
+    except SignalDetectionError as exc:
+        errors.write(f"wc016-signal-detector failed: {exc}\n")
+        return 1
     except ValueError as exc:
-        if args.command in {"wc016-event-processor", "wc016-incident-orchestrator"}:
+        if args.command in {
+            "wc016-signal-detector",
+            "wc016-incident-orchestrator",
+            "wc016-incident-feed-heartbeat",
+            "wc016-notification-dispatcher",
+        }:
             errors.write(f"{args.command} failed: {exc}\n")
             return 1
         raise

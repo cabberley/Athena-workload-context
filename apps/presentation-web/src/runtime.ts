@@ -287,6 +287,7 @@ export const requireContentDigest = async (
     | `${LifecyclePhase} payload`
     | `${LifecyclePhase} attestation`
     | 'reviewed public key'
+    | 'active incident index'
     | 'incident pointer'
     | 'incident state'
     | 'incident attestation',

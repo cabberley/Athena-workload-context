@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from athena_context.cli import build_parser
 from athena_context.contracts import (
@@ -11,6 +17,10 @@ from athena_context.contracts import (
     PRESENTATION_PUBLIC_KEY_FINGERPRINT,
     PRESENTATION_PUBLIC_KEY_ID,
     PRESENTATION_PUBLIC_KEY_PATH,
+    ActiveIncidentEntry,
+    ActiveIncidentIndex,
+    ActiveIncidentIndexAttestation,
+    IncidentFeedAttestation,
     IncidentFeedPointer,
     PresentationRuntimeKey,
     PresentationRuntimeManifestV2,
@@ -23,6 +33,7 @@ from athena_context.presentation_asset_gateway import (
 from athena_context.presentation_assets import PresentationAssetReadResult
 
 RUN_ID = "synthetic-run-live-001"
+ROOT = Path(__file__).parents[1]
 
 
 class InMemoryPresentationReader:
@@ -45,6 +56,56 @@ class InMemoryPresentationReader:
             payload=payload,
             payload_sha256=sha256_hex(payload),
         )
+
+
+def test_incident_gateway_and_browser_pin_the_same_public_key() -> None:
+    public_key = serialization.load_pem_public_key(
+        (ROOT / "wc016-incident-public-key.pem").read_bytes()
+    )
+    assert isinstance(public_key, rsa.RSAPublicKey)
+    numbers = public_key.public_numbers()
+    modulus = numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")
+    exponent = numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")
+
+    def encode(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+    browser_key = json.loads(
+        (
+            ROOT
+            / "apps"
+            / "presentation-web"
+            / "public"
+            / "trust"
+            / "incident-public-key.jwk.json"
+        ).read_text(encoding="utf-8")
+    )
+    fingerprint = "sha256:" + hashlib.sha256(
+        public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).hexdigest()
+
+    assert browser_key["jwk"]["n"] == encode(modulus)
+    assert browser_key["jwk"]["e"] == encode(exponent)
+    assert browser_key["fingerprint"] == fingerprint
+    parameters = json.loads(
+        (ROOT / ".azure" / "wc013.parameters.json").read_text(encoding="utf-8")
+    )
+    assert (
+        parameters["parameters"]["signingKeyFingerprint"]["value"]
+        == fingerprint
+    )
+    verification_source = (
+        ROOT / "apps" / "presentation-web" / "src" / "verification.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"PINNED_INCIDENT_KEY_FINGERPRINT\s*=\s*\n\s*'([^']+)'",
+        verification_source,
+    )
+    assert match is not None
+    assert match.group(1) == fingerprint
 
 
 def _asset_bytes(phase: str, kind: str) -> bytes:
@@ -185,6 +246,12 @@ def test_gateway_cli_defaults_to_the_bounded_private_sidecar_port() -> None:
             "https://athenareplay.blob.core.windows.net",
             "--managed-identity-client-id",
             "11111111-1111-1111-1111-111111111111",
+            "--incident-key-id",
+            "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1",
+            "--incident-key-fingerprint",
+            "sha256:" + "1" * 64,
+            "--incident-public-key",
+            "wc016-incident-public-key.pem",
         ]
     )
 
@@ -194,34 +261,96 @@ def test_gateway_cli_defaults_to_the_bounded_private_sidecar_port() -> None:
 
 def test_gateway_serves_only_the_current_incident_pointer_allowlist() -> None:
     _, content = _manifest_and_content()
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    fingerprint = "sha256:" + hashlib.sha256(
+        public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).hexdigest()
+    key_id = "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
     state = _asset_bytes("active", "incident-state")
     attestation = _asset_bytes("active", "incident-attestation")
-    state_path = "./incidents/inc-123456789abc/state.json"
-    attestation_path = "./incidents/inc-123456789abc/attestation.json"
+    version = "a" * 64
+    state_path = f"./incidents/inc-123456789abc/versions/{version}/state.json"
+    attestation_path = (
+        f"./incidents/inc-123456789abc/versions/{version}/attestation.json"
+    )
     pointer = IncidentFeedPointer(
         schemaVersion="athena.incidentFeed.v1",
+        incidentId="inc-123456789abc",
         statePath=state_path,
         stateSha256=sha256_hex(state),
         attestationPath=attestation_path,
         attestationSha256=sha256_hex(attestation),
-        pointerAttestationPath="./incidents/inc-123456789abc/pointer-attestation.json",
-        keyId=PRESENTATION_PUBLIC_KEY_ID,
-        keyFingerprint=PRESENTATION_PUBLIC_KEY_FINGERPRINT,
+        pointerAttestationPath=(
+            f"./incidents/inc-123456789abc/versions/{version}/pointer-attestation.json"
+        ),
+        keyId=key_id,
+        keyFingerprint=fingerprint,
         publishedAt=datetime(2026, 9, 4, tzinfo=UTC),
     )
-    content["incidents/current.json"] = pointer.canonical_bytes()
-    content["incidents/inc-123456789abc/pointer-attestation.json"] = _asset_bytes(
-        "active",
-        "pointer-attestation",
+    pointer_bytes = pointer.canonical_bytes()
+    pointer_attestation = IncidentFeedAttestation(
+        schemaVersion="athena.incidentFeedAttestation.v1",
+        pointerDigest=sha256_hex(pointer_bytes),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=key_id,
+        detachedSignature=_signature(private_key, pointer_bytes),
+    )
+    pointer_path = f"incidents/inc-123456789abc/versions/{version}/pointer.json"
+    index = ActiveIncidentIndex(
+        schemaVersion="athena.activeIncidentIndex.v1",
+        incidents=(
+            ActiveIncidentEntry(
+                incidentId="inc-123456789abc",
+                scenario="webServerFailure",
+                lifecycle="active",
+                workloadRole="web",
+                pointerPath=f"./{pointer_path}",
+                pointerSha256=sha256_hex(pointer_bytes),
+                detectedAt=datetime(2026, 9, 4, tzinfo=UTC),
+                updatedAt=datetime(2026, 9, 4, tzinfo=UTC),
+            ),
+        ),
+        indexAttestationPath="./incidents/index-attestations/" + "a" * 64 + ".json",
+        keyId=key_id,
+        keyFingerprint=fingerprint,
+        publishedAt=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    index_bytes = index.canonical_bytes()
+    index_attestation = ActiveIncidentIndexAttestation(
+        schemaVersion="athena.activeIncidentIndexAttestation.v1",
+        indexDigest=sha256_hex(index_bytes),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=key_id,
+        detachedSignature=_signature(private_key, index_bytes),
+    )
+    content["incidents/active.json"] = index_bytes
+    content[index.index_attestation_path.removeprefix("./")] = (
+        index_attestation.canonical_bytes()
+    )
+    content[pointer_path] = pointer_bytes
+    content[pointer.pointer_attestation_path.removeprefix("./")] = (
+        pointer_attestation.canonical_bytes()
     )
     content[state_path.removeprefix("./")] = state
     content[attestation_path.removeprefix("./")] = attestation
-    app = PresentationAssetGatewayApplication(InMemoryPresentationReader(content))
+    reader = InMemoryPresentationReader(content)
+    app = PresentationAssetGatewayApplication(
+        reader,
+        incident_reader=reader,
+        incident_key_id=key_id,
+        incident_key_fingerprint=fingerprint,
+        incident_public_key=public_key,
+    )
 
-    current = app.handle(method="GET", raw_path="/incidents/current.json")
+    current = app.handle(method="GET", raw_path="/incidents/active.json")
+    incident_pointer = app.handle(method="GET", raw_path="/" + pointer_path)
     current_attestation = app.handle(
         method="GET",
-        raw_path="/incidents/inc-123456789abc/pointer-attestation.json",
+        raw_path="/" + pointer.pointer_attestation_path.removeprefix("./"),
     )
     incident = app.handle(
         method="GET",
@@ -233,6 +362,34 @@ def test_gateway_serves_only_the_current_incident_pointer_allowlist() -> None:
     )
 
     assert current.status == 200
+    assert incident_pointer.status == 200
     assert current_attestation.status == 200
     assert incident.status == 200
     assert arbitrary.status == 404
+
+    content[index.index_attestation_path.removeprefix("./")] = (
+        index_attestation.model_copy(
+            update={"detached_signature": "AAAA"}
+        ).canonical_bytes()
+    )
+    assert app.handle(method="GET", raw_path="/incidents/active.json").status == 503
+    content[index.index_attestation_path.removeprefix("./")] = (
+        index_attestation.canonical_bytes()
+    )
+    content[pointer.pointer_attestation_path.removeprefix("./")] = (
+        pointer_attestation.model_copy(
+            update={"detached_signature": "AAAA"}
+        ).canonical_bytes()
+    )
+    assert (
+        app.handle(
+            method="GET",
+            raw_path="/" + state_path.removeprefix("./"),
+        ).status
+        == 503
+    )
+
+
+def _signature(private_key: rsa.RSAPrivateKey, payload: bytes) -> str:
+    signature = private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+    return base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")

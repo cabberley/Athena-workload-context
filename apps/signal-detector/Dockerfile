@@ -27,4 +27,4 @@ RUN python -m pip install \
 
 USER 10001:10001
 
-ENTRYPOINT ["athena-context", "wc016-incident-orchestrator"]
+ENTRYPOINT ["athena-context", "wc016-signal-detector"]

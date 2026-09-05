@@ -5,8 +5,11 @@ from typing import Protocol
 
 from athena_context.contracts import (
     PRESENTATION_RUNTIME_MANIFEST_BLOB_NAME,
+    ActiveIncidentIndex,
+    ActiveIncidentIndexAttestation,
     IncidentFeedAttestation,
     IncidentFeedPointer,
+    IncidentState,
     PresentationRuntimeManifestV2,
     sha256_hex,
 )
@@ -108,18 +111,85 @@ class PresentationPublicationReceipt:
             raise ValueError("publication receipt has the wrong manifest blob name")
 
 
+def _validate_active_incident_index_assets(
+    *,
+    active_index: ActiveIncidentIndex,
+    active_index_attestation: ActiveIncidentIndexAttestation,
+    active_index_asset: PresentationAsset,
+    active_index_attestation_asset: PresentationAsset,
+    previous_active_index_sha256: str | None,
+) -> None:
+    index_bytes = active_index.canonical_bytes()
+    if (
+        active_index_asset.blob_name != "incidents/active.json"
+        or active_index_asset.payload != index_bytes
+        or active_index_asset.payload_sha256 != sha256_hex(index_bytes)
+        or active_index_attestation.index_digest != sha256_hex(index_bytes)
+        or active_index_attestation_asset.blob_name
+        != active_index.index_attestation_path.removeprefix("./")
+        or active_index_attestation_asset.payload
+        != active_index_attestation.canonical_bytes()
+    ):
+        raise ValueError("active incident index assets are invalid")
+    if (
+        previous_active_index_sha256 is not None
+        and not previous_active_index_sha256.startswith("sha256:")
+    ):
+        raise ValueError("previous active incident index digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveIncidentIndexPublicationRequest:
+    active_index: ActiveIncidentIndex
+    active_index_attestation: ActiveIncidentIndexAttestation
+    active_index_asset: PresentationAsset
+    active_index_attestation_asset: PresentationAsset
+    previous_active_index_sha256: str | None
+
+    def __post_init__(self) -> None:
+        _validate_active_incident_index_assets(
+            active_index=self.active_index,
+            active_index_attestation=self.active_index_attestation,
+            active_index_asset=self.active_index_asset,
+            active_index_attestation_asset=self.active_index_attestation_asset,
+            previous_active_index_sha256=self.previous_active_index_sha256,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class IncidentPublicationRequest:
     pointer: IncidentFeedPointer
     pointer_attestation: IncidentFeedAttestation
+    pointer_asset: PresentationAsset
+    current_pointer_asset: PresentationAsset
     pointer_attestation_asset: PresentationAsset
     state: PresentationAsset
     attestation: PresentationAsset
+    active_index: ActiveIncidentIndex
+    active_index_attestation: ActiveIncidentIndexAttestation
+    active_index_asset: PresentationAsset
+    active_index_attestation_asset: PresentationAsset
+    previous_active_index_sha256: str | None
 
     def __post_init__(self) -> None:
         pointer_bytes = self.pointer.canonical_bytes()
         if self.pointer_attestation.pointer_digest != sha256_hex(pointer_bytes):
             raise ValueError("incident pointer attestation does not bind the pointer")
+        if (
+            self.pointer_asset.blob_name
+            != self.pointer.state_path.removesuffix("/state.json").removeprefix("./")
+            + "/pointer.json"
+            or self.pointer_asset.payload != pointer_bytes
+            or self.pointer_asset.payload_sha256 != sha256_hex(pointer_bytes)
+        ):
+            raise ValueError("incident pointer asset is invalid")
+        if (
+            self.current_pointer_asset.blob_name
+            != f"incidents/{self.pointer.incident_id}/current.json"
+            or self.current_pointer_asset.payload != pointer_bytes
+            or self.current_pointer_asset.payload_sha256 != sha256_hex(pointer_bytes)
+        ):
+            raise ValueError("current incident pointer asset is invalid")
         if (
             self.pointer_attestation_asset.blob_name
             != self.pointer.pointer_attestation_path.removeprefix("./")
@@ -143,12 +213,45 @@ class IncidentPublicationRequest:
         )
         if actual != expected:
             raise ValueError("incident assets do not exactly match their current pointer")
+        _validate_active_incident_index_assets(
+            active_index=self.active_index,
+            active_index_attestation=self.active_index_attestation,
+            active_index_asset=self.active_index_asset,
+            active_index_attestation_asset=self.active_index_attestation_asset,
+            previous_active_index_sha256=self.previous_active_index_sha256,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class IncidentPublicationReceipt:
     incident_id: str
     pointer_sha256: str
+    active_index_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveIncidentIndexSnapshot:
+    index: ActiveIncidentIndex
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.payload_sha256 != sha256_hex(self.index.canonical_bytes()):
+            raise ValueError("active incident index snapshot digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentIncidentStateSnapshot:
+    state: IncidentState
+    pointer: IncidentFeedPointer
+    pointer_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.pointer.incident_id != self.state.incident_id
+            or self.pointer.state_sha256 != sha256_hex(self.state.canonical_bytes())
+            or self.pointer_sha256 != sha256_hex(self.pointer.canonical_bytes())
+        ):
+            raise ValueError("current incident state snapshot binding is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,10 +269,23 @@ class PresentationAssetPublisherPort(Protocol):
 
 
 class IncidentAssetPublisherPort(Protocol):
+    def read_active_incident_index(self) -> ActiveIncidentIndexSnapshot | None: ...
+
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None: ...
+
     def publish_incident(
         self,
         request: IncidentPublicationRequest,
     ) -> IncidentPublicationReceipt: ...
+
+    def publish_active_incident_index(
+        self,
+        request: ActiveIncidentIndexPublicationRequest,
+    ) -> ActiveIncidentIndexSnapshot: ...
 
 
 class PresentationAssetReaderPort(Protocol):
@@ -187,6 +303,9 @@ __all__ = [
     "MAX_INCIDENT_STATE_BYTES",
     "MAX_PRESENTATION_PAYLOAD_BYTES",
     "MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES",
+    "ActiveIncidentIndexPublicationRequest",
+    "ActiveIncidentIndexSnapshot",
+    "CurrentIncidentStateSnapshot",
     "IncidentAssetPublisherPort",
     "IncidentPublicationReceipt",
     "IncidentPublicationRequest",

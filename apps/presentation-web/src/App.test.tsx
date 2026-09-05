@@ -7,18 +7,23 @@ import {
   createVerifiedLifecycle,
 } from './test/fixtures'
 import type { VerifiedLifecycle } from './verification'
-import type { VerifiedIncident } from './incidents'
+import type { VerifiedIncident, VerifiedIncidentFeed } from './incidents'
 
 const incidentFixture = (
   scenario: VerifiedIncident['state']['scenario'],
   updatedAt: string,
-): VerifiedIncident => ({
+): VerifiedIncidentFeed => ({
   publishedAt: updatedAt,
   keyFingerprint:
-    'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
-  state: {
+    'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
+  incidents: [{
+    publishedAt: updatedAt,
+    keyFingerprint:
+      'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
+    state: {
     schemaVersion: 'athena.incidentState.v1',
     incidentId: 'inc-123456789abc',
+    transitionId: `wc016-${'1'.repeat(64)}`,
     scenario,
     lifecycle: 'active',
     workloadRole:
@@ -43,11 +48,12 @@ const incidentFixture = (
       },
     ],
     reasoning: ['Azure Monitor reported the approved workload role as unavailable.'],
-    notificationStatus: 'sent',
+    notificationStatus: 'pendingDispatch',
     resultDigest:
       'sha256:2222222222222222222222222222222222222222222222222222222222222222',
     noAutoRemediation: true,
-  },
+    },
+  }],
 })
 
 describe('standalone Athena presentation', () => {
@@ -145,10 +151,11 @@ describe('standalone Athena presentation', () => {
     const incident: VerifiedIncident = {
       publishedAt: '2026-09-04T03:40:03Z',
       keyFingerprint:
-        'sha256:b2e63939232aa747228751288082c7310996c4e00e45b4bf167d269a61d1f515',
+        'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
       state: {
         schemaVersion: 'athena.incidentState.v1',
         incidentId: 'inc-123456789abc',
+        transitionId: `wc016-${'1'.repeat(64)}`,
         scenario: 'loadBalancerFailure',
         lifecycle: 'active',
         workloadRole: 'load-balancer',
@@ -171,7 +178,7 @@ describe('standalone Athena presentation', () => {
           'Azure Monitor reported failed VIP availability.',
           'Approved context binds the resource to the workload ingress edge.',
         ],
-        notificationStatus: 'sent',
+        notificationStatus: 'pendingDispatch',
         resultDigest:
           'sha256:2222222222222222222222222222222222222222222222222222222222222222',
         noAutoRemediation: true,
@@ -180,7 +187,13 @@ describe('standalone Athena presentation', () => {
     render(
       <App
         loader={() => createLiveVerifiedLifecycle()}
-        incidentLoader={() => Promise.resolve(incident)}
+        incidentLoader={() =>
+          Promise.resolve({
+            incidents: [incident],
+            publishedAt: incident.publishedAt,
+            keyFingerprint: incident.keyFingerprint,
+          })
+        }
       />,
     )
 

@@ -5,8 +5,8 @@ import {
   type Sha256Digest,
 } from './contracts'
 import {
-  PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT,
-  PINNED_PRESENTATION_KEY_ID,
+  PINNED_INCIDENT_KEY_FINGERPRINT,
+  PINNED_INCIDENT_KEY_ID,
   VerificationError,
   computePublicKeyFingerprint,
 } from './verification'
@@ -17,9 +17,12 @@ import {
   type LoadPresentationOptions,
 } from './runtime'
 
+const MAX_INCIDENT_INDEX_BYTES = 64 * 1024
 const MAX_INCIDENT_POINTER_BYTES = 16 * 1024
 const MAX_INCIDENT_STATE_BYTES = 64 * 1024
 const MAX_INCIDENT_ATTESTATION_BYTES = 24 * 1024
+const MAX_INCIDENT_FEED_AGE_MS = 15 * 60_000
+const MAX_CLOCK_SKEW_MS = 60_000
 
 export type IncidentScenario =
   | 'singletonDatabaseFailure'
@@ -32,11 +35,11 @@ export type IncidentLifecycle =
   | 'active'
   | 'recoveryObserved'
   | 'resolved'
-  | 'failedClosed'
 
 export interface IncidentState {
   schemaVersion: 'athena.incidentState.v1'
   incidentId: string
+  transitionId: string
   scenario: IncidentScenario
   lifecycle: IncidentLifecycle
   workloadRole: 'database-primary' | 'web' | 'load-balancer'
@@ -59,7 +62,7 @@ export interface IncidentState {
     evidenceRefs: string[]
   }>
   reasoning: string[]
-  notificationStatus: 'notRequired' | 'pending' | 'sent' | 'failed'
+  notificationStatus: 'notRequired' | 'pendingDispatch'
   resultDigest: Sha256Digest
   noAutoRemediation: true
 }
@@ -74,6 +77,7 @@ interface IncidentAttestation {
 
 interface IncidentPointer {
   schemaVersion: 'athena.incidentFeed.v1'
+  incidentId: string
   statePath: string
   stateSha256: Sha256Digest
   attestationPath: string
@@ -92,58 +96,188 @@ interface IncidentPointerAttestation {
   detachedSignature: string
 }
 
+interface ActiveIncidentEntry {
+  incidentId: string
+  scenario: IncidentScenario
+  lifecycle: 'active'
+  workloadRole: IncidentState['workloadRole']
+  pointerPath: string
+  pointerSha256: Sha256Digest
+  detectedAt: string
+  updatedAt: string
+}
+
+interface ActiveIncidentIndex {
+  schemaVersion: 'athena.activeIncidentIndex.v1'
+  incidents: ActiveIncidentEntry[]
+  indexAttestationPath: string
+  keyId: string
+  keyFingerprint: Sha256Digest
+  publishedAt: string
+}
+
+interface ActiveIncidentIndexAttestation {
+  schemaVersion: 'athena.activeIncidentIndexAttestation.v1'
+  indexDigest: Sha256Digest
+  signatureAlgorithm: 'RS256'
+  keyVaultKeyId: string
+  detachedSignature: string
+}
+
 export interface VerifiedIncident {
   state: IncidentState
   publishedAt: string
   keyFingerprint: Sha256Digest
 }
 
-export const loadVerifiedIncident = async (
+export interface VerifiedIncidentFeed {
+  incidents: VerifiedIncident[]
+  publishedAt: string
+  keyFingerprint: Sha256Digest
+}
+
+export const assertIncidentFeedFreshness = (
+  publishedAt: string,
+  nowMs = Date.now(),
+): void => {
+  const ageMs = nowMs - Date.parse(publishedAt)
+  if (!Number.isFinite(ageMs) || ageMs < -MAX_CLOCK_SKEW_MS || ageMs > MAX_INCIDENT_FEED_AGE_MS) {
+    throw new VerificationError('Active incident feed is outside its freshness window.')
+  }
+}
+
+export const loadVerifiedIncidents = async (
   options: LoadPresentationOptions = {},
-): Promise<VerifiedIncident> => {
+): Promise<VerifiedIncidentFeed> => {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const cryptoProvider = options.cryptoProvider ?? globalThis.crypto
-  const pointerUrl =
-    options.manifestUrl ?? new URL('./incidents/current.json', document.baseURI)
+  const indexUrl =
+    options.manifestUrl ?? new URL('./incidents/active.json', document.baseURI)
   const origin = options.origin ?? globalThis.location.origin
   const timeoutMs = options.timeoutMs ?? 5_000
-  const pointerAsset = await fetchBoundedJsonAsset(
-    pointerUrl,
-    MAX_INCIDENT_POINTER_BYTES,
+  const indexAsset = await fetchBoundedJsonAsset(
+    indexUrl,
+    MAX_INCIDENT_INDEX_BYTES,
     fetchImpl,
     timeoutMs,
   )
-  const pointer = parseIncidentPointer(pointerAsset.value)
+  const index = parseActiveIncidentIndex(indexAsset.value)
   const applicationRoot = new URL('/', `${origin}/`)
-  const pointerAttestationUrl = resolveSameOriginAssetUrl(
-    pointer.pointerAttestationPath,
+  const indexAttestationUrl = resolveSameOriginAssetUrl(
+    index.indexAttestationPath,
     applicationRoot,
     origin,
   )
   const keyUrl = resolveSameOriginAssetUrl(
-    './trust/live-presentation-public-key.jwk.json',
+    './trust/incident-public-key.jwk.json',
     applicationRoot,
     origin,
   )
-  const [pointerAttestationAsset, keyAsset] = await Promise.all([
+  const [indexAttestationAsset, keyAsset] = await Promise.all([
     fetchBoundedJsonAsset(
-      pointerAttestationUrl,
+      indexAttestationUrl,
       MAX_INCIDENT_ATTESTATION_BYTES,
       fetchImpl,
       timeoutMs,
     ),
     fetchBoundedJsonAsset(keyUrl, MAX_INCIDENT_POINTER_BYTES, fetchImpl, timeoutMs),
   ])
+  const indexAttestation = parseActiveIncidentIndexAttestation(
+    indexAttestationAsset.value,
+  )
+  const key = parsePresentationPublicKey(keyAsset.value)
+  const importedKey = await verifySignedBytes(
+    indexAsset.bytes,
+    indexAttestation.indexDigest,
+    indexAttestation.detachedSignature,
+    index.keyId,
+    index.keyFingerprint,
+    indexAttestation.keyVaultKeyId,
+    key,
+    cryptoProvider,
+    'Active incident index',
+  )
+  assertIncidentFeedFreshness(index.publishedAt)
+  const incidents = await Promise.all(
+    index.incidents.map((entry) =>
+      loadVerifiedIncidentEntry(
+        entry,
+        applicationRoot,
+        origin,
+        fetchImpl,
+        timeoutMs,
+        key,
+        importedKey,
+        cryptoProvider,
+      ),
+    ),
+  )
+  return {
+    incidents,
+    publishedAt: index.publishedAt,
+    keyFingerprint: key.fingerprint,
+  }
+}
+
+const loadVerifiedIncidentEntry = async (
+  entry: ActiveIncidentEntry,
+  applicationRoot: URL,
+  origin: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  key: PresentationPublicKey,
+  importedKey: CryptoKey,
+  cryptoProvider: Crypto,
+): Promise<VerifiedIncident> => {
+  const pointerUrl = resolveSameOriginAssetUrl(
+    entry.pointerPath,
+    applicationRoot,
+    origin,
+  )
+  const pointerAsset = await fetchBoundedJsonAsset(
+    pointerUrl,
+    MAX_INCIDENT_POINTER_BYTES,
+    fetchImpl,
+    timeoutMs,
+  )
+  await requireContentDigest(
+    pointerAsset.bytes,
+    entry.pointerSha256,
+    cryptoProvider,
+    'incident pointer',
+  )
+  const pointer = parseIncidentPointer(pointerAsset.value)
+  if (
+    entry.pointerPath !==
+    `${pointer.statePath.slice(0, -'/state.json'.length)}/pointer.json`
+  ) {
+    throw new VerificationError('Active incident pointer version binding is invalid.')
+  }
+  const pointerAttestationUrl = resolveSameOriginAssetUrl(
+    pointer.pointerAttestationPath,
+    applicationRoot,
+    origin,
+  )
+  const pointerAttestationAsset = await fetchBoundedJsonAsset(
+    pointerAttestationUrl,
+    MAX_INCIDENT_ATTESTATION_BYTES,
+    fetchImpl,
+    timeoutMs,
+  )
   const pointerAttestation = parseIncidentPointerAttestation(
     pointerAttestationAsset.value,
   )
-  const key = parsePresentationPublicKey(keyAsset.value)
-  await verifyIncidentPointer(
+  await verifySignedBytes(
     pointerAsset.bytes,
-    pointer,
-    pointerAttestation,
+    pointerAttestation.pointerDigest,
+    pointerAttestation.detachedSignature,
+    pointer.keyId,
+    pointer.keyFingerprint,
+    pointerAttestation.keyVaultKeyId,
     key,
     cryptoProvider,
+    'Incident pointer',
+    importedKey,
   )
   const stateUrl = resolveSameOriginAssetUrl(
     pointer.statePath,
@@ -180,47 +314,60 @@ export const loadVerifiedIncident = async (
   ])
   const state = parseIncidentState(stateAsset.value)
   const attestation = parseIncidentAttestation(attestationAsset.value)
-  await verifyIncident(pointer, state, attestation, key, cryptoProvider)
-  const ageMs = Date.now() - Date.parse(state.updatedAt)
-  if (ageMs < -60_000 || ageMs > 15 * 60_000) {
-    throw new VerificationError('Incident state is outside its freshness window.')
+  await verifyIncident(pointer, state, attestation, key, cryptoProvider, importedKey)
+  if (
+    state.incidentId !== entry.incidentId ||
+    state.scenario !== entry.scenario ||
+    state.lifecycle !== entry.lifecycle ||
+    state.workloadRole !== entry.workloadRole ||
+    state.detectedAt !== entry.detectedAt ||
+    state.updatedAt !== entry.updatedAt
+  ) {
+    throw new VerificationError('Active incident entry binding is invalid.')
+  }
+  if (Date.parse(state.updatedAt) - Date.now() > 60_000) {
+    throw new VerificationError('Incident state timestamp is in the future.')
   }
   return { state, publishedAt: pointer.publishedAt, keyFingerprint: key.fingerprint }
 }
 
-const verifyIncidentPointer = async (
-  pointerBytes: Uint8Array,
-  pointer: IncidentPointer,
-  attestation: IncidentPointerAttestation,
+const verifySignedBytes = async (
+  payload: Uint8Array,
+  digest: Sha256Digest,
+  signatureValue: string,
+  keyId: string,
+  keyFingerprint: Sha256Digest,
+  attestationKeyId: string,
   key: PresentationPublicKey,
   cryptoProvider: Crypto,
-): Promise<void> => {
+  label: 'Active incident index' | 'Incident pointer',
+  importedKey?: CryptoKey,
+): Promise<CryptoKey> => {
   if (
-    pointer.keyId !== PINNED_PRESENTATION_KEY_ID ||
-    key.keyId !== PINNED_PRESENTATION_KEY_ID ||
-    pointer.keyFingerprint !== PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT ||
-    key.fingerprint !== PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT ||
-    attestation.keyVaultKeyId !== PINNED_PRESENTATION_KEY_ID
+    keyId !== PINNED_INCIDENT_KEY_ID ||
+    key.keyId !== PINNED_INCIDENT_KEY_ID ||
+    keyFingerprint !== PINNED_INCIDENT_KEY_FINGERPRINT ||
+    key.fingerprint !== PINNED_INCIDENT_KEY_FINGERPRINT ||
+    attestationKeyId !== PINNED_INCIDENT_KEY_ID
   ) {
-    throw new VerificationError('Incident pointer trust binding is invalid.')
+    throw new VerificationError(`${label} trust binding is invalid.`)
   }
-  await requireContentDigest(
-    pointerBytes,
-    attestation.pointerDigest,
-    cryptoProvider,
-    'incident pointer',
-  )
-  const imported = await cryptoProvider.subtle.importKey(
-    'jwk',
-    key.jwk,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    true,
-    ['verify'],
-  )
+  const digestLabel =
+    label === 'Active incident index' ? 'active incident index' : 'incident pointer'
+  await requireContentDigest(payload, digest, cryptoProvider, digestLabel)
+  const imported =
+    importedKey ??
+    (await cryptoProvider.subtle.importKey(
+      'jwk',
+      key.jwk,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      true,
+      ['verify'],
+    ))
   if ((await computePublicKeyFingerprint(imported, cryptoProvider)) !== key.fingerprint) {
-    throw new VerificationError('Incident pointer key fingerprint is invalid.')
+    throw new VerificationError(`${label} key fingerprint is invalid.`)
   }
-  const signature = decodeBase64Url(attestation.detachedSignature)
+  const signature = decodeBase64Url(signatureValue)
   const algorithm = imported.algorithm as RsaHashedKeyAlgorithm
   if (
     signature.byteLength !== algorithm.modulusLength / 8 ||
@@ -228,11 +375,12 @@ const verifyIncidentPointer = async (
       'RSASSA-PKCS1-v1_5',
       imported,
       signature,
-      pointerBytes,
+      payload,
     ))
   ) {
-    throw new VerificationError('Incident pointer signature is invalid.')
+    throw new VerificationError(`${label} signature is invalid.`)
   }
+  return imported
 }
 
 export const verifyIncident = async (
@@ -241,28 +389,33 @@ export const verifyIncident = async (
   attestation: IncidentAttestation,
   key: PresentationPublicKey,
   cryptoProvider: Crypto = globalThis.crypto,
+  importedKey?: CryptoKey,
 ): Promise<void> => {
   if (
-    pointer.keyId !== PINNED_PRESENTATION_KEY_ID ||
-    key.keyId !== PINNED_PRESENTATION_KEY_ID ||
-    pointer.keyFingerprint !== PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT ||
-    key.fingerprint !== PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT ||
-    attestation.keyVaultKeyId !== PINNED_PRESENTATION_KEY_ID ||
+    pointer.incidentId !== state.incidentId ||
+    pointer.keyId !== PINNED_INCIDENT_KEY_ID ||
+    key.keyId !== PINNED_INCIDENT_KEY_ID ||
+    pointer.keyFingerprint !== PINNED_INCIDENT_KEY_FINGERPRINT ||
+    key.fingerprint !== PINNED_INCIDENT_KEY_FINGERPRINT ||
+    attestation.keyVaultKeyId !== PINNED_INCIDENT_KEY_ID ||
     attestation.resultDigest !== state.resultDigest ||
-    !pointer.statePath.startsWith(`./incidents/${state.incidentId}/`) ||
-    !pointer.attestationPath.startsWith(`./incidents/${state.incidentId}/`) ||
-    Date.parse(pointer.publishedAt) < Date.parse(state.updatedAt) ||
-    Date.parse(pointer.publishedAt) - Date.parse(state.updatedAt) > 60_000
+    !pointer.statePath.startsWith(`./incidents/${state.incidentId}/versions/`) ||
+    !pointer.attestationPath.startsWith(
+      `./incidents/${state.incidentId}/versions/`,
+    ) ||
+    Date.parse(pointer.publishedAt) < Date.parse(state.updatedAt)
   ) {
     throw new VerificationError('Incident trust binding is invalid.')
   }
-  const imported = await cryptoProvider.subtle.importKey(
-    'jwk',
-    key.jwk,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    true,
-    ['verify'],
-  )
+  const imported =
+    importedKey ??
+    (await cryptoProvider.subtle.importKey(
+      'jwk',
+      key.jwk,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      true,
+      ['verify'],
+    ))
   if ((await computePublicKeyFingerprint(imported, cryptoProvider)) !== key.fingerprint) {
     throw new VerificationError('Incident key fingerprint is invalid.')
   }
@@ -290,9 +443,74 @@ const incidentCanonicalPreimage = (state: IncidentState): Uint8Array => {
   return new TextEncoder().encode(canonicalizeJson(value))
 }
 
+const parseActiveIncidentIndex = (value: unknown): ActiveIncidentIndex => {
+  const record = exactRecord(value, [
+    'schemaVersion',
+    'incidents',
+    'indexAttestationPath',
+    'keyId',
+    'keyFingerprint',
+    'publishedAt',
+  ])
+  if (
+    record.schemaVersion !== 'athena.activeIncidentIndex.v1' ||
+    !Array.isArray(record.incidents) ||
+    record.incidents.length > 64 ||
+    !isIndexAttestationPath(record.indexAttestationPath) ||
+    typeof record.keyId !== 'string' ||
+    !isDigest(record.keyFingerprint) ||
+    !isTimestamp(record.publishedAt)
+  ) {
+    throw new VerificationError('Active incident index contract is invalid.')
+  }
+  const incidents = record.incidents.map(parseActiveIncidentEntry)
+  const incidentIds = incidents.map((entry) => entry.incidentId)
+  if (
+    incidentIds.some((value, index) => index > 0 && incidentIds[index - 1]! >= value)
+  ) {
+    throw new VerificationError('Active incident index ordering is invalid.')
+  }
+  return { ...record, incidents } as unknown as ActiveIncidentIndex
+}
+
+const parseActiveIncidentEntry = (value: unknown): ActiveIncidentEntry => {
+  const record = exactRecord(value, [
+    'incidentId',
+    'scenario',
+    'lifecycle',
+    'workloadRole',
+    'pointerPath',
+    'pointerSha256',
+    'detectedAt',
+    'updatedAt',
+  ])
+  if (
+    typeof record.incidentId !== 'string' ||
+    !/^inc-[a-f0-9]{12}$/.test(record.incidentId) ||
+    !['singletonDatabaseFailure', 'webServerFailure', 'loadBalancerFailure'].includes(
+      String(record.scenario),
+    ) ||
+    record.lifecycle !== 'active' ||
+    !['database-primary', 'web', 'load-balancer'].includes(
+      String(record.workloadRole),
+    ) ||
+    !new RegExp(
+      `^\\./incidents/${record.incidentId}/versions/[a-f0-9]{64}/pointer\\.json$`,
+    ).test(String(record.pointerPath)) ||
+    !isDigest(record.pointerSha256) ||
+    !isTimestamp(record.detectedAt) ||
+    !isTimestamp(record.updatedAt) ||
+    Date.parse(record.updatedAt) < Date.parse(record.detectedAt)
+  ) {
+    throw new VerificationError('Active incident entry contract is invalid.')
+  }
+  return record as unknown as ActiveIncidentEntry
+}
+
 const parseIncidentPointer = (value: unknown): IncidentPointer => {
   const record = exactRecord(value, [
     'schemaVersion',
+    'incidentId',
     'statePath',
     'stateSha256',
     'attestationPath',
@@ -304,6 +522,8 @@ const parseIncidentPointer = (value: unknown): IncidentPointer => {
   ])
   if (
     record.schemaVersion !== 'athena.incidentFeed.v1' ||
+    typeof record.incidentId !== 'string' ||
+    !/^inc-[a-f0-9]{12}$/.test(record.incidentId) ||
     !isAssetPath(record.statePath) ||
     !isAssetPath(record.attestationPath) ||
     !isDigest(record.stateSha256) ||
@@ -315,13 +535,30 @@ const parseIncidentPointer = (value: unknown): IncidentPointer => {
   ) {
     throw new VerificationError('Incident pointer contract is invalid.')
   }
-  return record as unknown as IncidentPointer
+  const pointer = record as unknown as IncidentPointer
+  const versionPrefix = `./incidents/${pointer.incidentId}/versions/`
+  const stateMatch = pointer.statePath.match(
+    new RegExp(
+      `^${versionPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([a-f0-9]{64})/state\\.json$`,
+    ),
+  )
+  if (
+    stateMatch === null ||
+    pointer.attestationPath !==
+      `${versionPrefix}${stateMatch[1]!}/attestation.json` ||
+    pointer.pointerAttestationPath !==
+      `${versionPrefix}${stateMatch[1]!}/pointer-attestation.json`
+  ) {
+    throw new VerificationError('Incident pointer version binding is invalid.')
+  }
+  return pointer
 }
 
 const parseIncidentState = (value: unknown): IncidentState => {
   const record = exactRecord(value, [
     'schemaVersion',
     'incidentId',
+    'transitionId',
     'scenario',
     'lifecycle',
     'workloadRole',
@@ -340,6 +577,8 @@ const parseIncidentState = (value: unknown): IncidentState => {
   if (
     record.schemaVersion !== 'athena.incidentState.v1' ||
     typeof record.incidentId !== 'string' ||
+    typeof record.transitionId !== 'string' ||
+    !/^wc016-[a-f0-9]{64}$/.test(record.transitionId) ||
     !['singletonDatabaseFailure', 'webServerFailure', 'loadBalancerFailure'].includes(
       String(record.scenario),
     ) ||
@@ -350,7 +589,6 @@ const parseIncidentState = (value: unknown): IncidentState => {
       'active',
       'recoveryObserved',
       'resolved',
-      'failedClosed',
     ].includes(String(record.lifecycle)) ||
     !['database-primary', 'web', 'load-balancer'].includes(
       String(record.workloadRole),
@@ -362,15 +600,14 @@ const parseIncidentState = (value: unknown): IncidentState => {
     record.noAutoRemediation !== true ||
     !Array.isArray(record.findings) ||
     record.findings.length < 1 ||
+    record.findings.length > 32 ||
+    record.findings.some((finding) => !isIncidentFinding(finding)) ||
     !Array.isArray(record.reasoning) ||
     record.reasoning.length < 1 ||
     record.reasoning.length > 16 ||
     record.reasoning.some(
       (item) => typeof item !== 'string' || item.length < 1 || item.length > 512,
     ) ||
-    !Array.isArray(record.findings) ||
-    record.findings.length > 32 ||
-    record.findings.some((finding) => !isIncidentFinding(finding)) ||
     !['normal', 'warning', 'critical', 'unknown'].includes(
       String(record.availability),
     ) ||
@@ -383,11 +620,15 @@ const parseIncidentState = (value: unknown): IncidentState => {
       'unknown',
     ].includes(String(record.blastRadius)) ||
     !['normal', 'required', 'urgent'].includes(String(record.operatorAttention)) ||
-    !['notRequired', 'pending', 'sent', 'failed'].includes(
-      String(record.notificationStatus),
-    ) ||
+    !['notRequired', 'pendingDispatch'].includes(String(record.notificationStatus)) ||
     !/^inc-[a-f0-9]{12}$/.test(record.incidentId) ||
-    Date.parse(record.updatedAt) < Date.parse(record.detectedAt)
+    Date.parse(record.updatedAt) < Date.parse(record.detectedAt) ||
+    (record.lifecycle === 'active' && record.availability === 'normal') ||
+    (record.lifecycle === 'resolved' && record.availability !== 'normal') ||
+    (['active', 'resolved'].includes(String(record.lifecycle)) &&
+      record.notificationStatus !== 'pendingDispatch') ||
+    (!['active', 'resolved'].includes(String(record.lifecycle)) &&
+      record.notificationStatus !== 'notRequired')
   ) {
     throw new VerificationError('Incident state contract is invalid.')
   }
@@ -438,6 +679,31 @@ const parseIncidentPointerAttestation = (
   return record as unknown as IncidentPointerAttestation
 }
 
+const parseActiveIncidentIndexAttestation = (
+  value: unknown,
+): ActiveIncidentIndexAttestation => {
+  const record = exactRecord(value, [
+    'schemaVersion',
+    'indexDigest',
+    'signatureAlgorithm',
+    'keyVaultKeyId',
+    'detachedSignature',
+  ])
+  if (
+    record.schemaVersion !== 'athena.activeIncidentIndexAttestation.v1' ||
+    !isDigest(record.indexDigest) ||
+    record.signatureAlgorithm !== 'RS256' ||
+    typeof record.keyVaultKeyId !== 'string' ||
+    typeof record.detachedSignature !== 'string' ||
+    !/^[A-Za-z0-9_-]+$/.test(record.detachedSignature)
+  ) {
+    throw new VerificationError(
+      'Active incident index attestation contract is invalid.',
+    )
+  }
+  return record as unknown as ActiveIncidentIndexAttestation
+}
+
 const exactRecord = (value: unknown, keys: string[]): Record<string, unknown> => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new VerificationError('Incident asset must be an object.')
@@ -455,11 +721,16 @@ const exactRecord = (value: unknown, keys: string[]): Record<string, unknown> =>
 const isDigest = (value: unknown): value is Sha256Digest =>
   typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value)
 const isTimestamp = (value: unknown): value is string =>
-  typeof value === 'string' && !Number.isNaN(Date.parse(value))
+  typeof value === 'string' &&
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) &&
+  !Number.isNaN(Date.parse(value))
 const isAssetPath = (value: unknown): value is string =>
   typeof value === 'string' &&
   /^\.\/incidents\/[a-z0-9][a-z0-9./-]*\.json$/.test(value) &&
   !value.includes('..')
+const isIndexAttestationPath = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  /^\.\/incidents\/index-attestations\/[a-f0-9]{64}\.json$/.test(value)
 
 const isIncidentFinding = (value: unknown): boolean => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false

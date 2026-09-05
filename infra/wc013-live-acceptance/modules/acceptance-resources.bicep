@@ -50,11 +50,23 @@ param keyVaultName string
 @description('Name of the one RSA signing key.')
 param signingKeyName string
 
+@description('Name of the dedicated WC-016 incident RSA signing key.')
+param incidentSigningKeyName string
+
 @description('Globally unique lowercase Storage account name for replay reservations.')
 param replayStorageAccountName string
 
 @description('Dedicated replay table name.')
 param replayTableName string
+
+@description('Dedicated WC-016 detector state table name.')
+param detectorStateTableName string
+
+@description('Dedicated WC-016 notification delivery reservation table name.')
+param notificationStateTableName string
+
+@description('Principal ID of the dedicated WC-016 detector identity.')
+param detectorIdentityPrincipalId string
 
 @description('Dedicated immutable Blob container for operational artifacts.')
 param artifactContainerName string
@@ -68,8 +80,23 @@ param collectorArtifactContainerName string
 ])
 param presentationAssetContainerName string
 
+@description('Dedicated private Blob container for WC-016 incident assets.')
+@allowed([
+  'incident-assets'
+])
+param incidentAssetContainerName string
+
 @description('Principal ID of the presentation sidecar identity receiving read-only access to presentation-assets.')
 param presentationIdentityPrincipalId string
+
+@description('Principal ID of the WC-016 incident orchestrator receiving incident signing and incident-assets publication access only.')
+param incidentOrchestratorPrincipalId string
+
+@description('Principal ID of the WC-016 notification dispatcher.')
+param notificationDispatcherPrincipalId string
+
+@description('Grants WC-016 runtime data-plane roles only during the confirmed activation deployment.')
+param wc016RuntimeEnabled bool = false
 
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
@@ -119,6 +146,9 @@ var normalizedRuntimeIdentityPrincipalIds = [
   toLower(acceptanceIdentityPrincipalId)
   toLower(evidenceIdentityPrincipalId)
   toLower(presentationIdentityPrincipalId)
+  toLower(detectorIdentityPrincipalId)
+  toLower(incidentOrchestratorPrincipalId)
+  toLower(notificationDispatcherPrincipalId)
 ]
 var overlappingArtifactAccessObjectIds = intersection(
   normalizedOperatorArtifactReaderObjectIds,
@@ -134,12 +164,12 @@ var workloadRuntimeIdentityOverlap = intersection(
 )
 var validatedOperatorArtifactReaderObjectIds = empty(operatorRuntimeIdentityOverlap)
   ? operatorArtifactReaderObjectIds
-  : fail('operatorArtifactReaderObjectIds must not contain acceptance, evidence, or presentation runtime identities')
+  : fail('operatorArtifactReaderObjectIds must not contain any Athena runtime identity')
 var validatedWorkloadReceiptWriterObjectIds = !empty(overlappingArtifactAccessObjectIds)
   ? fail('operatorArtifactReaderObjectIds and workloadReceiptWriterObjectIds must contain distinct principals')
   : empty(workloadRuntimeIdentityOverlap)
     ? workloadReceiptWriterObjectIds
-    : fail('workloadReceiptWriterObjectIds must not contain acceptance, evidence, or presentation runtime identities')
+    : fail('workloadReceiptWriterObjectIds must not contain any Athena runtime identity')
 var rejectedAcceptanceImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && endsWith(
   acceptanceImageRegistryServer,
@@ -272,6 +302,28 @@ module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
           }
         ]
       }
+      {
+        name: incidentSigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+        roleAssignments: wc016RuntimeEnabled
+          ? [
+              {
+                roleDefinitionIdOrName: 'Key Vault Crypto User'
+                principalId: incidentOrchestratorPrincipalId
+                principalType: 'ServicePrincipal'
+                description: 'The WC-016 orchestrator can sign only the dedicated incident feed.'
+              }
+            ]
+          : []
+      }
     ]
     tags: resourceTags
   }
@@ -328,6 +380,10 @@ module replayStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
         }
         {
           name: presentationAssetContainerName
+          publicAccess: 'None'
+        }
+        {
+          name: incidentAssetContainerName
           publicAccess: 'None'
         }
       ]
@@ -387,6 +443,24 @@ resource replayTable 'Microsoft.Storage/storageAccounts/tableServices/tables@202
   ]
 }
 
+resource detectorStateTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
+  parent: replayTableService
+  name: detectorStateTableName
+  properties: {}
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource notificationStateTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
+  parent: replayTableService
+  name: notificationStateTableName
+  properties: {}
+  dependsOn: [
+    replayStorage
+  ]
+}
+
 resource replayBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' existing = {
   parent: replayStorageAccount
   name: 'default'
@@ -407,6 +481,11 @@ resource presentationAssetContainer 'Microsoft.Storage/storageAccounts/blobServi
   name: presentationAssetContainerName
 }
 
+resource incidentAssetContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
+  parent: replayBlobService
+  name: incidentAssetContainerName
+}
+
 resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(
     replayTable.id,
@@ -416,6 +495,40 @@ resource replayTableDataContributor 'Microsoft.Authorization/roleAssignments@202
   scope: replayTable
   properties: {
     principalId: evidenceIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageTableDataContributorRoleDefinitionId
+    )
+  }
+}
+
+resource detectorStateTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    detectorStateTable.id,
+    detectorIdentityPrincipalId,
+    storageTableDataContributorRoleDefinitionId
+  )
+  scope: detectorStateTable
+  properties: {
+    principalId: detectorIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageTableDataContributorRoleDefinitionId
+    )
+  }
+}
+
+resource notificationStateTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    notificationStateTable.id,
+    notificationDispatcherPrincipalId,
+    storageTableDataContributorRoleDefinitionId
+  )
+  scope: notificationStateTable
+  properties: {
+    principalId: notificationDispatcherPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
@@ -551,6 +664,46 @@ resource presentationAssetBlobDataReader 'Microsoft.Authorization/roleAssignment
     storageBlobDataReaderRoleDefinitionId
   )
   scope: presentationAssetContainer
+  properties: {
+    principalId: presentationIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource incidentPresentationAssetBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    incidentAssetContainer.id,
+    incidentOrchestratorPrincipalId,
+    storageBlobDataContributorRoleDefinitionId
+  )
+  scope: incidentAssetContainer
+  properties: {
+    principalId: incidentOrchestratorPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
+resource incidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    incidentAssetContainer.id,
+    presentationIdentityPrincipalId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: incidentAssetContainer
   properties: {
     principalId: presentationIdentityPrincipalId
     principalType: 'ServicePrincipal'
@@ -923,6 +1076,9 @@ output signingKeyName string = signingKeyName
 @description('Exact versioned signing-key URI; it contains no private key material.')
 output signingKeyUriWithVersion string = signingKeyVault.outputs.keys[0].uriWithVersion
 
+@description('Exact versioned WC-016 incident signing-key URI.')
+output incidentSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[1].uriWithVersion
+
 @description('Resource ID of the replay Storage account.')
 output replayStorageAccountResourceId string = replayStorage.outputs.resourceId
 
@@ -934,6 +1090,18 @@ output replayTableName string = replayTableName
 
 @description('Resource ID of the dedicated replay table.')
 output replayTableResourceId string = replayTable.id
+
+@description('Dedicated WC-016 detector state table name.')
+output detectorStateTableName string = detectorStateTableName
+
+@description('Resource ID of the dedicated WC-016 detector state table.')
+output detectorStateTableResourceId string = detectorStateTable.id
+
+@description('Dedicated WC-016 notification delivery reservation table name.')
+output notificationStateTableName string = notificationStateTableName
+
+@description('Resource ID of the dedicated WC-016 notification delivery reservation table.')
+output notificationStateTableResourceId string = notificationStateTable.id
 
 @description('Private Azure Blob service endpoint for immutable operational artifacts.')
 output artifactBlobEndpoint string = replayStorage.outputs.serviceEndpoints.blob
@@ -955,6 +1123,12 @@ output presentationAssetContainerName string = presentationAssetContainerName
 
 @description('Resource ID of the private presentation asset container.')
 output presentationAssetContainerResourceId string = presentationAssetContainer.id
+
+@description('Dedicated private incident asset container name.')
+output incidentAssetContainerName string = incidentAssetContainerName
+
+@description('Resource ID of the private incident asset container.')
+output incidentAssetContainerResourceId string = incidentAssetContainer.id
 
 @description('Configured unlocked WORM retention period for artifact blob versions.')
 output artifactRetentionDays int = artifactRetentionDays

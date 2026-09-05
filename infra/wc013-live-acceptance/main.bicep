@@ -35,7 +35,7 @@ param trustedIngestionAudience string
 @description('Subscription containing the one reviewed synthetic demo workload resource group.')
 param targetDemoWorkloadSubscriptionId string
 
-@description('One reviewed synthetic demo workload resource group. The MCP evidence identity receives Reader only here.')
+@description('One reviewed synthetic demo workload resource group. The MCP evidence identity receives Reader; WC-016 identities receive only the custom signal-reader role.')
 @minLength(1)
 @maxLength(90)
 param targetDemoWorkloadResourceGroupName string
@@ -49,6 +49,11 @@ param keyVaultName string
 @minLength(1)
 @maxLength(127)
 param signingKeyName string = 'wc013-signing'
+
+@description('Name of the dedicated non-exportable WC-016 incident signing key.')
+@minLength(1)
+@maxLength(127)
+param incidentSigningKeyName string = 'wc016-incident-signing'
 
 @description('Globally unique lowercase Storage account name for WC-013 replay reservations.')
 @minLength(3)
@@ -80,6 +85,12 @@ param collectorArtifactContainerName string = 'collected-evidence'
   'presentation-assets'
 ])
 param presentationAssetContainerName string = 'presentation-assets'
+
+@description('Dedicated private Blob container for signed WC-016 incident assets.')
+@allowed([
+  'incident-assets'
+])
+param incidentAssetContainerName string = 'incident-assets'
 
 @description('Explicit unlocked WORM retention period for artifact blob versions.')
 @minValue(1)
@@ -129,6 +140,64 @@ param collectorControllerImage string
 @maxLength(2048)
 param presentationImage string
 
+@description('Digest-pinned WC-016 scheduled signal detector image.')
+@minLength(1)
+@maxLength(2048)
+param wc016DetectorImage string
+
+@description('Digest-pinned WC-016 incident orchestrator image.')
+@minLength(1)
+@maxLength(2048)
+param wc016OrchestratorImage string
+
+@description('Exact approved singleton database VM resource ID for WC-016.')
+param wc016DatabaseVmResourceId string
+
+@description('Exact approved web VM resource IDs for WC-016.')
+@minLength(1)
+@maxLength(16)
+param wc016WebVmResourceIds array
+
+@description('Exact approved Azure Load Balancer resource ID for WC-016.')
+param wc016LoadBalancerResourceId string
+
+@description('Dedicated replay-table partition for WC-016 detector transition state.')
+@minLength(1)
+@maxLength(128)
+param wc016DetectorStatePartitionKey string = 'wc016-signal-state'
+
+@description('Dedicated Azure Table for WC-016 detector transition state.')
+@minLength(3)
+@maxLength(63)
+param wc016DetectorStateTableName string = 'Wc016DetectorState'
+
+@description('Dedicated Azure Table partition for WC-016 notification delivery reservations.')
+@minLength(1)
+@maxLength(128)
+param wc016NotificationStatePartitionKey string = 'wc016-notification-delivery'
+
+@description('Dedicated Azure Table for WC-016 notification delivery reservations.')
+@minLength(3)
+@maxLength(63)
+param wc016NotificationStateTableName string = 'Wc016NotificationState'
+
+@description('SHA-256 fingerprint of the exact deployed WC-016 incident signing public key.')
+@minLength(71)
+@maxLength(71)
+param signingKeyFingerprint string
+
+@description('Exact logical WC-016 incident signing key ID pinned separately by the browser and gateway.')
+@allowed([
+  'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
+])
+param incidentSigningKeyId string = 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
+
+@description('Activates WC-016 queues and Jobs only after the deployed incident key public material is pinned in both presentation verification layers.')
+param wc016RuntimeEnabled bool = false
+
+@description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
+param wc016LegacyCleanupConfirmed bool = false
+
 @description('Existing Azure Container Registry login server hosting the presentation image.')
 @minLength(1)
 @maxLength(255)
@@ -160,6 +229,12 @@ var resourceTags = union(tags, {
   managedBy: 'bicep'
 })
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var rejectedIncidentFixtureFingerprint = 'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e'
+var validatedWc016RuntimeEnabled = wc016RuntimeEnabled && !wc016LegacyCleanupConfirmed
+  ? fail('WC-016 cannot be activated until the exact legacy cleanup report confirms zero residuals')
+  : wc016RuntimeEnabled && signingKeyFingerprint == rejectedIncidentFixtureFingerprint
+    ? fail('WC-016 cannot be activated with the checked-in incident trust fixture; pin the deployed key first')
+    : wc016RuntimeEnabled
 var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
   ? acceptanceImageRegistryServer
@@ -237,6 +312,50 @@ var validatedPresentationImage = presentationImage == toLower(presentationImage)
 var validatedPresentationDeliveryRegistryServer = validatedPresentationImageRegistryServer == validatedAcceptanceImageRegistryServer
   ? validatedPresentationImageRegistryServer
   : fail('presentation and WC-013 delivery images must use the same reviewed Azure Container Registry')
+var wc016DetectorImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc016-detector@sha256:'
+var wc016DetectorImageDigestCandidate = replace(wc016DetectorImage, wc016DetectorImageRepositoryPrefix, '')
+var wc016DetectorDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc016DetectorImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc016DetectorDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc016DetectorDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedWc016DetectorImage = wc016DetectorImage == toLower(wc016DetectorImage) && startsWith(
+  wc016DetectorImage,
+  wc016DetectorImageRepositoryPrefix
+) && length(wc016DetectorImage) == length(wc016DetectorImageRepositoryPrefix) + 64 && length(
+  wc016DetectorImageDigestCandidate
+) == 64 && empty(
+  wc016DetectorDigestInvalidCharacters
+) && !endsWith(wc016DetectorImage, rejectedImageDigestSuffix)
+  ? wc016DetectorImage
+  : fail('wc016DetectorImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
+var wc016OrchestratorImageRepositoryPrefix = '${validatedAcceptanceImageRegistryServer}/athena/wc016-orchestrator@sha256:'
+var wc016OrchestratorImageDigestCandidate = replace(wc016OrchestratorImage, wc016OrchestratorImageRepositoryPrefix, '')
+var wc016OrchestratorDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc016OrchestratorImageDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc016OrchestratorDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc016OrchestratorDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedWc016OrchestratorImage = wc016OrchestratorImage == toLower(wc016OrchestratorImage) && startsWith(
+  wc016OrchestratorImage,
+  wc016OrchestratorImageRepositoryPrefix
+) && length(wc016OrchestratorImage) == length(wc016OrchestratorImageRepositoryPrefix) + 64 && length(
+  wc016OrchestratorImageDigestCandidate
+) == 64 && empty(
+  wc016OrchestratorDigestInvalidCharacters
+) && !endsWith(wc016OrchestratorImage, rejectedImageDigestSuffix)
+  ? wc016OrchestratorImage
+  : fail('wc016OrchestratorImage must use the fixed ACR repository and a real non-placeholder sha256 digest')
 var presentationAssetBlobEndpoint = 'https://${replayStorageAccountName}.blob.${environment().suffixes.storage}'
 var collectorControllerFederatedCredentialIssuer = 'https://token.actions.githubusercontent.com'
 var collectorControllerFederatedCredentialAudience = 'api://AzureADTokenExchange'
@@ -246,6 +365,11 @@ var collectorControllerRoleDefinitionGuid = guid(
   foundationResourceGroupName,
   'athena-wc013-collector-controller'
 )
+var wc016SignalReaderRoleDefinitionGuid = guid(
+  targetDemoWorkloadSubscriptionId,
+  targetDemoWorkloadResourceGroupName,
+  'athena-wc016-approved-signal-reader'
+)
 var forbiddenCollectorControllerPrincipalIds = concat(
   map(operatorArtifactReaderObjectIds, objectId => toLower(string(objectId))),
   map(workloadReceiptWriterObjectIds, objectId => toLower(string(objectId))),
@@ -253,6 +377,9 @@ var forbiddenCollectorControllerPrincipalIds = concat(
     toLower(evidenceIdentity.properties.principalId)
     toLower(acceptanceJobIdentity.properties.principalId)
     toLower(presentationWeb.outputs.identityPrincipalId)
+    toLower(wc016DetectorIdentity.outputs.principalId)
+    toLower(wc016OrchestratorIdentity.outputs.principalId)
+    toLower(wc016NotificationIdentity.outputs.principalId)
   ]
 )
 var validatedCollectorControllerPrincipalId = contains(
@@ -288,6 +415,48 @@ module collectorControllerIdentity 'br/public:avm/res/managed-identity/user-assi
     ]
     tags: union(resourceTags, {
       identityPurpose: 'github-oidc-collector-controller-only'
+    })
+  }
+}
+
+module wc016DetectorIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc016-detector-v2-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-wc016-detector-v2-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    tags: union(resourceTags, {
+      identityPurpose: 'wc016-approved-signal-read-queue-send-state-only'
+    })
+  }
+}
+
+module wc016OrchestratorIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc016-orchestrator-v2-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-wc016-orchestrator-v2-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    tags: union(resourceTags, {
+      identityPurpose: 'wc016-servicebus-signing-publication-only'
+    })
+  }
+}
+
+module wc016NotificationIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc016-notification-v2-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-wc016-notification-v2-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    tags: union(resourceTags, {
+      identityPurpose: 'wc016-servicebus-teams-notification-only'
     })
   }
 }
@@ -347,6 +516,28 @@ resource collectorControllerRoleDefinition 'Microsoft.Authorization/roleDefiniti
   }
 }
 
+module wc016SignalReaderRole 'modules/wc016-signal-reader-role.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-approved-signal-reader-role'
+  scope: subscription(targetDemoWorkloadSubscriptionId)
+  params: {
+    resourceGroupName: targetDemoWorkloadResourceGroupName
+    roleDefinitionGuid: wc016SignalReaderRoleDefinitionGuid
+  }
+}
+
+module wc016SignalReaderRbac 'modules/wc016-signal-reader-rbac.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-approved-signal-reader-rbac'
+  scope: resourceGroup(
+    targetDemoWorkloadSubscriptionId,
+    targetDemoWorkloadResourceGroupName
+  )
+  params: {
+    detectorPrincipalId: wc016DetectorIdentity.outputs.principalId
+    orchestratorPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    roleDefinitionId: wc016SignalReaderRole!.outputs.roleDefinitionId
+  }
+}
+
 module privateDns 'modules/private-dns.bicep' = {
   name: 'wc013-private-endpoint-dns'
   scope: foundationResourceGroup
@@ -370,6 +561,9 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     deliveryImage: validatedAcceptanceImage
     presentationAssetBlobEndpoint: presentationAssetBlobEndpoint
     presentationAssetContainerName: presentationAssetContainerName
+    incidentAssetContainerName: incidentAssetContainerName
+    incidentSigningKeyId: incidentSigningKeyId
+    incidentSigningKeyFingerprint: signingKeyFingerprint
     tags: resourceTags
   }
 }
@@ -393,12 +587,20 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     acceptanceIdentityClientId: acceptanceJobIdentity.properties.clientId
     keyVaultName: keyVaultName
     signingKeyName: signingKeyName
+    incidentSigningKeyName: incidentSigningKeyName
     replayStorageAccountName: replayStorageAccountName
     replayTableName: replayTableName
+    detectorStateTableName: wc016DetectorStateTableName
+    notificationStateTableName: wc016NotificationStateTableName
+    detectorIdentityPrincipalId: wc016DetectorIdentity.outputs.principalId
     artifactContainerName: artifactContainerName
     collectorArtifactContainerName: collectorArtifactContainerName
     presentationAssetContainerName: presentationAssetContainerName
+    incidentAssetContainerName: incidentAssetContainerName
     presentationIdentityPrincipalId: presentationWeb.outputs.identityPrincipalId
+    incidentOrchestratorPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    notificationDispatcherPrincipalId: wc016NotificationIdentity.outputs.principalId
+    wc016RuntimeEnabled: validatedWc016RuntimeEnabled
     artifactRetentionDays: artifactRetentionDays
     operatorArtifactReaderObjectIds: operatorArtifactReaderObjectIds
     workloadReceiptWriterObjectIds: workloadReceiptWriterObjectIds
@@ -457,6 +659,95 @@ module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
   }
 }
 
+module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-detector-v2-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-wc016-detector-v2-id'
+    identityPrincipalId: wc016DetectorIdentity.outputs.principalId
+  }
+}
+
+module wc016OrchestratorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-orchestrator-v2-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-wc016-orchestrator-v2-id'
+    identityPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+  }
+}
+
+module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-notification-v2-image-pull'
+  scope: resourceGroup(
+    split(acceptanceImageRegistryResourceId, '/')[2],
+    split(acceptanceImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
+    identityName: '${namePrefix}-wc016-notification-v2-id'
+    identityPrincipalId: wc016NotificationIdentity.outputs.principalId
+  }
+}
+
+module wc016Runtime '../wc016-event-reassessment/main.bicep' = if (validatedWc016RuntimeEnabled) {
+  name: 'wc016-deployable-runtime'
+  scope: foundationResourceGroup
+  dependsOn: [
+    evidenceCollectorImagePull
+    wc016DetectorImagePull
+    wc016OrchestratorImagePull
+    wc016NotificationImagePull
+    wc016SignalReaderRbac
+  ]
+  params: {
+    namePrefix: namePrefix
+    location: location
+    managedEnvironmentResourceId: azureMcp.outputs.managedEnvironmentResourceId
+    virtualNetworkResourceId: azureMcp.outputs.virtualNetworkResourceId
+    privateEndpointSubnetResourceId: azureMcp.outputs.privateEndpointSubnetResourceId
+    registryServer: validatedAcceptanceImageRegistryServer
+    detectorIdentityResourceId: wc016DetectorIdentity.outputs.resourceId
+    detectorIdentityClientId: wc016DetectorIdentity.outputs.clientId
+    detectorIdentityPrincipalId: wc016DetectorIdentity.outputs.principalId
+    orchestratorIdentityResourceId: wc016OrchestratorIdentity.outputs.resourceId
+    orchestratorIdentityClientId: wc016OrchestratorIdentity.outputs.clientId
+    orchestratorIdentityPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    notificationIdentityResourceId: wc016NotificationIdentity.outputs.resourceId
+    notificationIdentityClientId: wc016NotificationIdentity.outputs.clientId
+    notificationIdentityPrincipalId: wc016NotificationIdentity.outputs.principalId
+    detectorImage: validatedWc016DetectorImage
+    orchestratorImage: validatedWc016OrchestratorImage
+    databaseVmResourceId: wc016DatabaseVmResourceId
+    webVmResourceIds: wc016WebVmResourceIds
+    loadBalancerResourceId: wc016LoadBalancerResourceId
+    workloadSubscriptionId: targetDemoWorkloadSubscriptionId
+    workloadResourceGroupName: targetDemoWorkloadResourceGroupName
+    detectorStateTableEndpoint: acceptanceResources.outputs.replayTableEndpoint
+    detectorStateTableName: acceptanceResources.outputs.detectorStateTableName
+    detectorStatePartitionKey: wc016DetectorStatePartitionKey
+    notificationStateTableEndpoint: acceptanceResources.outputs.replayTableEndpoint
+    notificationStateTableName: acceptanceResources.outputs.notificationStateTableName
+    notificationStatePartitionKey: wc016NotificationStatePartitionKey
+    incidentAssetBlobEndpoint: presentationAssetBlobEndpoint
+    presentationUrl: presentationWeb.outputs.httpsUrl
+    signingKeyUriWithVersion: acceptanceResources.outputs.incidentSigningKeyUriWithVersion
+    signingKeyId: incidentSigningKeyId
+    signingKeyFingerprint: signingKeyFingerprint
+    teamsConnectionName: 'teams'
+    teamsNotifierWorkflowName: 'athena-wc016-teams-notifier'
+    tags: resourceTags
+  }
+}
+
 @description('Resource ID of the dedicated WC-013 hosting resource group.')
 output foundationResourceGroupResourceId string = foundationResourceGroup.id
 
@@ -508,6 +799,9 @@ output signingKeyName string = acceptanceResources.outputs.signingKeyName
 @description('Exact versioned non-exportable Key Vault signing-key URI for the configuration renderer.')
 output signingKeyUriWithVersion string = acceptanceResources.outputs.signingKeyUriWithVersion
 
+@description('Exact versioned WC-016 incident signing-key URI.')
+output incidentSigningKeyUriWithVersion string = acceptanceResources.outputs.incidentSigningKeyUriWithVersion
+
 @description('Replay Storage account resource ID.')
 output replayStorageAccountResourceId string = acceptanceResources.outputs.replayStorageAccountResourceId
 
@@ -522,6 +816,18 @@ output replayPartitionKey string = replayPartitionKey
 
 @description('Replay table resource ID.')
 output replayTableResourceId string = acceptanceResources.outputs.replayTableResourceId
+
+@description('Dedicated WC-016 detector and notification state-table boundaries.')
+output wc016StateTables object = {
+  detectorStateTableEndpoint: acceptanceResources.outputs.replayTableEndpoint
+  detectorStateTableName: acceptanceResources.outputs.detectorStateTableName
+  detectorStateTableResourceId: acceptanceResources.outputs.detectorStateTableResourceId
+  detectorStatePartitionKey: wc016DetectorStatePartitionKey
+  notificationStateTableEndpoint: acceptanceResources.outputs.replayTableEndpoint
+  notificationStateTableName: acceptanceResources.outputs.notificationStateTableName
+  notificationStateTableResourceId: acceptanceResources.outputs.notificationStateTableResourceId
+  notificationStatePartitionKey: wc016NotificationStatePartitionKey
+}
 
 @description('Private HTTPS Azure Blob endpoint for immutable operational artifacts.')
 output artifactBlobEndpoint string = acceptanceResources.outputs.artifactBlobEndpoint
@@ -543,6 +849,12 @@ output presentationAssetContainerName string = acceptanceResources.outputs.prese
 
 @description('Presentation asset container resource ID used as the exact Blob data-role scope.')
 output presentationAssetContainerResourceId string = acceptanceResources.outputs.presentationAssetContainerResourceId
+
+@description('Dedicated private incident asset container name.')
+output incidentAssetContainerName string = acceptanceResources.outputs.incidentAssetContainerName
+
+@description('Resource ID of the private incident asset container.')
+output incidentAssetContainerResourceId string = acceptanceResources.outputs.incidentAssetContainerResourceId
 
 @description('Private HTTPS Azure Blob endpoint used by the presentation publisher and sidecar.')
 output presentationAssetBlobEndpoint string = presentationAssetBlobEndpoint
@@ -592,13 +904,13 @@ output presentationFqdn string = presentationWeb.outputs.fqdn
 @description('Fully qualified private HTTPS presentation URL.')
 output presentationHttpsUrl string = presentationWeb.outputs.httpsUrl
 
-@description('Presentation identity resource ID. This identity receives only AcrPull and Blob Data Reader on presentation-assets.')
+@description('Presentation identity resource ID. This identity receives only AcrPull and Blob Data Reader on presentation-assets and incident-assets.')
 output presentationIdentityResourceId string = presentationWeb.outputs.identityResourceId
 
 @description('Presentation identity client ID for ACR pull and read-only presentation asset access.')
 output presentationIdentityClientId string = presentationWeb.outputs.identityClientId
 
-@description('Presentation identity principal ID scoped to ACR pull and Blob Data Reader on presentation-assets.')
+@description('Presentation identity principal ID scoped to ACR pull and read-only access to the two presentation containers.')
 output presentationIdentityPrincipalId string = presentationWeb.outputs.identityPrincipalId
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
@@ -612,3 +924,40 @@ output targetDemoWorkloadResourceGroupScope string = '/subscriptions/${targetDem
 
 @description('Exact reviewed read-only Azure MCP tool allowlist.')
 output allowedTools array = azureMcp.outputs.allowedTools
+
+@description('Dedicated hardened WC-016 v2 detector identity resource ID.')
+output wc016DetectorIdentityResourceId string = wc016DetectorIdentity.outputs.resourceId
+
+@description('Dedicated hardened WC-016 v2 detector identity client ID.')
+output wc016DetectorIdentityClientId string = wc016DetectorIdentity.outputs.clientId
+
+@description('Hardened WC-016 v2 orchestrator identity resource ID. This identity has no broad workload Reader role.')
+output wc016OrchestratorIdentityResourceId string = wc016OrchestratorIdentity.outputs.resourceId
+
+@description('Hardened WC-016 v2 orchestrator identity client ID.')
+output wc016OrchestratorIdentityClientId string = wc016OrchestratorIdentity.outputs.clientId
+
+@description('Private WC-016 Service Bus fully qualified namespace.')
+output wc016ServiceBusNamespace string = validatedWc016RuntimeEnabled
+  ? wc016Runtime!.outputs.namespaceHostName
+  : ''
+
+@description('Exact approved WC-016 resource-role and alert-rule JSON for deployment diagnostics.')
+output wc016ApprovedConfiguration object = {
+  wc016ApprovedResourceRolesJson: validatedWc016RuntimeEnabled
+    ? wc016Runtime!.outputs.approvedResourceRolesJson
+    : ''
+  wc016ApprovedAlertRulesJson: validatedWc016RuntimeEnabled
+    ? wc016Runtime!.outputs.approvedAlertRulesJson
+    : ''
+}
+
+@description('WC-016 scheduled detector Job resource ID.')
+output wc016DetectorJobResourceId string = validatedWc016RuntimeEnabled
+  ? wc016Runtime!.outputs.detectorJobResourceId
+  : ''
+
+@description('WC-016 session queue-scaled orchestrator Job resource ID.')
+output wc016OrchestratorJobResourceId string = validatedWc016RuntimeEnabled
+  ? wc016Runtime!.outputs.orchestratorJobResourceId
+  : ''
