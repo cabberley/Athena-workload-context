@@ -109,8 +109,10 @@ signed state includes that exact transition ID. If enqueue fails after publicati
 verifies the bounded per-incident current pointer, immutable state, and both attestations. It
 re-enqueues only when the signed transition ID and live actionable lifecycle still match; a newly
 minted hint with a different transition ID remains a no-op. Service Bus duplicate detection absorbs
-an already-successful enqueue of the same deterministic notification ID. The Logic App request
-body includes `notificationId` as the downstream idempotency key. The dispatcher provides
+an already-successful enqueue of the same deterministic notification ID. The Logic App callback
+uses the exact API version returned by `listCallbackURL`, and its AAD policy binds the notification
+identity token's exact `https://management.azure.com` audience. The request body includes
+`notificationId` as the downstream idempotency key. The dispatcher provides
 at-most-once posting with explicit uncertainty: it first acquires its Logic Apps managed-identity
 token, creates a durable `reserved` record in `Wc016NotificationState`, and uses ETag
 compare-and-swap to mark it `dispatching` immediately before HTTP and `delivered` after a 2xx

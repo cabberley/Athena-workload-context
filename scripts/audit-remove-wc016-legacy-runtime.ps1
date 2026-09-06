@@ -288,18 +288,20 @@ function Get-PrincipalRoleAssignments {
         [string]$PrincipalName
     )
 
-    $assignments = @(
-        Invoke-AzJson -Arguments @(
-            'role'
-            'assignment'
-            'list'
-            '--subscription'
-            $SubscriptionId
-            '--assignee-object-id'
-            $PrincipalId
-            '--all'
-        )
+    $assignmentResult = Invoke-AzJson -Arguments @(
+        'role'
+        'assignment'
+        'list'
+        '--subscription'
+        $SubscriptionId
+        '--assignee-object-id'
+        $PrincipalId
+        '--all'
     )
+    if ($null -eq $assignmentResult) {
+        return @()
+    }
+    $assignments = @($assignmentResult)
     $subscriptionPrefix = "/subscriptions/$SubscriptionId/"
     $normalized = foreach ($assignment in $assignments) {
         if (
@@ -321,6 +323,9 @@ function Get-PrincipalRoleAssignments {
                 roleDefinitionId = ([string]$assignment.roleDefinitionId).ToLowerInvariant()
             }
         }
+    }
+    if ($null -eq $normalized) {
+        return @()
     }
     return @($normalized | Sort-Object -Property assignmentId)
 }
@@ -425,7 +430,7 @@ $beforeLegacyRoleAssignments = @(
                 -PrincipalId ([string]$principal.principalId) `
                 -PrincipalName ([string]$principal.name)
         }
-    ) | Sort-Object -Property assignmentId
+    ) | Where-Object { $null -ne $_ } | Sort-Object -Property assignmentId
 )
 $expectedRoleAssignmentAllowlist = @(
     [pscustomobject][ordered]@{
@@ -511,7 +516,8 @@ $beforeUnexpectedLegacyRoleAssignments = @(
 $beforeEvidenceRoleAssignments = @(
     Get-PrincipalRoleAssignments `
         -PrincipalId $evidencePrincipalId `
-        -PrincipalName $evidenceIdentityName
+        -PrincipalName $evidenceIdentityName |
+        Where-Object { $null -ne $_ }
 )
 $beforeEvidenceSenderAssignments = @(
     $beforeEvidenceRoleAssignments | Where-Object {
@@ -519,9 +525,14 @@ $beforeEvidenceSenderAssignments = @(
         (Test-SameResourceId -Left $_.roleDefinitionId -Right $senderRoleDefinitionId)
     }
 )
+$beforeEvidenceSenderAssignmentIds = @(
+    $beforeEvidenceSenderAssignments | ForEach-Object {
+        [string]$_.assignmentId
+    }
+)
 $beforeProtectedEvidenceRoleAssignments = @(
     $beforeEvidenceRoleAssignments | Where-Object {
-        @($beforeEvidenceSenderAssignments.assignmentId) -notcontains $_.assignmentId
+        $beforeEvidenceSenderAssignmentIds -notcontains [string]$_.assignmentId
     }
 )
 $mutationBlocked = $beforeUnexpectedLegacyRoleAssignments.Count -ne 0
@@ -628,7 +639,7 @@ $afterLegacyRoleAssignments = @(
                 -PrincipalId ([string]$principal.principalId) `
                 -PrincipalName ([string]$principal.name)
         }
-    ) | Sort-Object -Property assignmentId
+    ) | Where-Object { $null -ne $_ } | Sort-Object -Property assignmentId
 )
 $afterExpectedLegacyRoleAssignments = @(
     $afterLegacyRoleAssignments | Where-Object {
@@ -657,7 +668,8 @@ $afterUnexpectedLegacyRoleAssignments = @(
 $afterEvidenceRoleAssignments = @(
     Get-PrincipalRoleAssignments `
         -PrincipalId $evidencePrincipalId `
-        -PrincipalName $evidenceIdentityName
+        -PrincipalName $evidenceIdentityName |
+        Where-Object { $null -ne $_ }
 )
 $afterEvidenceSenderAssignments = @(
     $afterEvidenceRoleAssignments | Where-Object {
@@ -665,9 +677,14 @@ $afterEvidenceSenderAssignments = @(
         (Test-SameResourceId -Left $_.roleDefinitionId -Right $senderRoleDefinitionId)
     }
 )
+$afterEvidenceSenderAssignmentIds = @(
+    $afterEvidenceSenderAssignments | ForEach-Object {
+        [string]$_.assignmentId
+    }
+)
 $afterProtectedEvidenceRoleAssignments = @(
     $afterEvidenceRoleAssignments | Where-Object {
-        @($afterEvidenceSenderAssignments.assignmentId) -notcontains $_.assignmentId
+        $afterEvidenceSenderAssignmentIds -notcontains [string]$_.assignmentId
     }
 )
 

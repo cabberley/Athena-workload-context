@@ -1,10 +1,10 @@
 {
   "schemaVersion": "athena.presentationWeb.publicKey.v1",
   "keyId": "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1",
-  "fingerprint": "sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e",
+  "fingerprint": "sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964",
   "jwk": {
     "kty": "RSA",
-    "n": "pRV3lYNRzX3AA2Ji1FCWySdJDjsK1or-3_13K587zVQ7ByEMB8fpozdQ_8AGZu7UKVyfkUY-nmUmTNfH7I1axGOMvMd4l2ZdBpnHIy2WZO17nkg-RYsWJ0Qz-5FHw0pHtJOmC_w8RvgNk3sdWjJ1tRniGnX7lywyCi9SNM4E-NgHp0Gp37M9iNVB-PaSO4soGq7l_oUZcPUOVDsl-hwgw4_bu9oo-YGvOojCQauX8kGL0Nf8exJwv8Ii0N6uAv97KmI-2NCQFaWlJPGKuwA5R2DH_iVQVcutt9Ar6xtV517LPgYxxbuD2RVhou1ZRWsG1KmKEGKDyuMDyygC6-td6THJ3i3-gddDhROzvU7BOq7-rbgWHA0lEmXbzELIOseDRhDUtC8KjeeZOR7NpnZuueVF0ThdXmpsDmrFUTEc3tJWSAYu9JtFkBAwG7Bsni_7YskR7l7acLzGwMvAnnFDi4GW8Y3romEJK7AyqoTSNqgivP-P4aBxxOz2F5ToAPd5",
+    "n": "18hAPu-MTwd6ySzzQbD8RubSSRPGu5sv5pAdij0pxCC1V5H8R8SfltmR_vQipTR5Wx3ZQaetjIxKKaVWXlz73C4F-f7uZGTgs6RiX2AZquBm5diCK9UWLufguEYgAL9317fRyW2VSrdVCJjylwSzGCFKVM8vDxphheaI5JW7xITgBPlkdIpPmGuxRrvqYhSjTxDNaItPAl7AgYmaEfIvt8qpT-o7Y85u4sU9VAOqiPBGxofKa5i4mPGKlBAv95-rQJSprNKFRcdq2C_Zxv09OONcXHGfxbbNTlrNJ0LasN9fwcEVqGDpG-Xzmhyqx_b2ayoivskPpT2c1IsYAgIbY4s8h-IcXLhv8LULt24rhQzIeVd_1XAwLDh8S7CyISbDxFlnKKawNk2MWI_oJTEcTRTh9h4Vvf0RQPF0Bb5K_qc89cUF-EdRyMWyqC5OMJF8Vc4Cl0XZvsVN9tGLWHbFVJlBcapFBz5U7rHjmlDpdWFmEQ3QJqLP-xnVPXipuMaN",
     "e": "AQAB",
     "alg": "RS256",
     "key_ops": [

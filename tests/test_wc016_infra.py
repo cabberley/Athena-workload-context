@@ -119,6 +119,7 @@ def test_wc016_runtime_has_four_managed_identity_jobs_without_raw_normalizer() -
     assert "Post_a_message_to_myself" in source
     assert "listCallbackURL(" in source
     assert "teamsCallback.basePath" in source
+    assert "teamsCallback.queries['api-version']" in source
     assert "teamsCallback.value" not in source
     assert "sasAuthenticationPolicy" in source
     assert "state: 'Disabled'" in source
@@ -145,7 +146,7 @@ def test_wc016_runtime_has_four_managed_identity_jobs_without_raw_normalizer() -
     assert "notificationStatePartitionKey" in notification_job
     assert "detectorStateTableName" not in notification_job
     assert "detectorStatePartitionKey" not in notification_job
-    assert "'https://management.azure.com/'" in source
+    assert "value: 'https://management.azure.com'" in source
     assert "'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'" in source
     assert "raw-monitor-events" not in source
     assert "normalizer" not in source.casefold()
@@ -280,12 +281,12 @@ def test_wc016_deployment_parameters_use_published_image_digests() -> None:
     assert rejected not in source
     assert (
         "athena/wc016-detector@sha256:"
-        "a934a034b900f5f36a1485e4772bb80f71db608be91c55042577a3904b0964bb"
+        "8367751e8a1b6bc340422f9f9316863676febae39816b8873c1a1cedef545272"
     ) in source
     assert "wc016-normalizer" not in source
     assert (
         "athena/wc016-orchestrator@sha256:"
-        "6a6038a103bd92132e7c2baf5f9a0ff77a4b520ba0a9a847b1c53e494b301818"
+        "720b84f232ff0cabae240864579176383065306bcac8a72148f051ceb665d9f8"
     ) in source
     assert "athena-hackathon-sqlvm-01" in source
     assert "athena-hackathon-web-03" in source
@@ -295,10 +296,9 @@ def test_wc016_deployment_parameters_use_published_image_digests() -> None:
     assert "wc016-notification-delivery" in source
     assert '"wc016RuntimeEnabled"' in source
     assert '"wc016LegacyCleanupConfirmed"' in source
-    assert source.count('"value": false') >= 2
-    assert '"value": false' in source
+    assert source.count('"value": true') >= 2
     assert (
-        "sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e"
+        "sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964"
         in source
     )
 
@@ -342,6 +342,9 @@ def test_wc016_cleanup_script_is_exact_auditable_and_read_only_by_default() -> N
     assert "if ($Apply)" in source
     assert "wouldDelete" in source
     assert "zeroResidualReadback" in source
+    assert "if ($null -eq $assignmentResult)" in source
+    assert "$beforeEvidenceSenderAssignmentIds" in source
+    assert "$afterEvidenceSenderAssignmentIds" in source
     assert "payloadDigestSha256" in source
     assert "[pscustomobject][ordered]@{" in source
     assert "Sort-Object -Property assignmentId -Unique" not in source
