@@ -999,7 +999,7 @@ def _notification_arguments(
         ),
         "webhook_url": (
             "https://example.logic.azure.com/workflows/synthetic/triggers/manual/"
-            "paths/invoke?api-version=2016-10-01"
+            "paths/invoke?api-version=2019-05-01"
         ),
         "delivery_store": store,
     }
@@ -1405,7 +1405,7 @@ def test_notification_token_failure_does_not_create_delivery_reservation() -> No
             credential=SimpleNamespace(get_token=fail_token),
             webhook_url=(
                 "https://example.logic.azure.com/workflows/synthetic/triggers/manual/"
-                "paths/invoke?api-version=2016-10-01"
+                "paths/invoke?api-version=2019-05-01"
             ),
             delivery_store=_Store(),
         )

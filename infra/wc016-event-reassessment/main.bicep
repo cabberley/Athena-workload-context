@@ -200,7 +200,7 @@ resource teamsNotifier 'Microsoft.Logic/workflows@2019-05-01' = {
                 {
                   name: 'aud'
                   #disable-next-line no-hardcoded-env-urls // Logic Apps validates the public-cloud ARM token audience.
-                  value: 'https://management.azure.com/'
+                  value: 'https://management.azure.com'
                 }
                 {
                   name: 'appid'
@@ -312,7 +312,7 @@ var teamsCallback = listCallbackURL(
   '${teamsNotifier.id}/triggers/receive_incident_notification',
   '2019-05-01'
 )
-var teamsWebhookUrl = '${teamsCallback.basePath}?api-version=2016-10-01'
+var teamsWebhookUrl = '${teamsCallback.basePath}?api-version=${teamsCallback.queries['api-version']}'
 
 resource serviceBusPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
   #disable-next-line no-hardcoded-env-urls // Azure Service Bus Private Link requires this zone.

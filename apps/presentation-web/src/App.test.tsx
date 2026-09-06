@@ -15,11 +15,11 @@ const incidentFixture = (
 ): VerifiedIncidentFeed => ({
   publishedAt: updatedAt,
   keyFingerprint:
-    'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
+    'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964',
   incidents: [{
     publishedAt: updatedAt,
     keyFingerprint:
-      'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
+      'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964',
     state: {
     schemaVersion: 'athena.incidentState.v1',
     incidentId: 'inc-123456789abc',
@@ -151,7 +151,7 @@ describe('standalone Athena presentation', () => {
     const incident: VerifiedIncident = {
       publishedAt: '2026-09-04T03:40:03Z',
       keyFingerprint:
-        'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e',
+        'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964',
       state: {
         schemaVersion: 'athena.incidentState.v1',
         incidentId: 'inc-123456789abc',

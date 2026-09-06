@@ -26,7 +26,7 @@ export const PINNED_LIVE_PRESENTATION_KEY_FINGERPRINT =
 export const PINNED_INCIDENT_KEY_ID =
   'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
 export const PINNED_INCIDENT_KEY_FINGERPRINT =
-  'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e'
+  'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964'
 
 export interface UnverifiedPhaseAssets {
   payload: unknown

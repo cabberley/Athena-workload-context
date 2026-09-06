@@ -567,7 +567,7 @@ def run_notification_dispatcher_worker(
         or parsed_webhook.password is not None
         or parsed_webhook.fragment
         or not parsed_webhook.path.startswith("/workflows/")
-        or query != {"api-version": ["2016-10-01"]}
+        or query != {"api-version": ["2019-05-01"]}
         or not 1 <= max_wait_time_seconds <= 300
     ):
         raise ValueError("notification dispatcher configuration is invalid")

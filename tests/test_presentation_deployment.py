@@ -465,11 +465,11 @@ def test_confirmed_parameters_use_published_images() -> None:
         "presentation-assets"
     )
     assert parameters["acceptanceImage"]["value"].endswith(
-        "@sha256:cdc8e1c290eb0b75f63a218e8b4c9fd6ea35ff4062edf3368cc7a24302eebccf"
+        "@sha256:fb9503b3a9db31a518f5d18c1e3a27ee6f203e1e84d35640ff8b58f5438720a1"
     )
     assert parameters["presentationImage"]["value"] == (
         "athenademoa6add389.azurecr.io/athena/presentation-web"
-        "@sha256:c73c05510ad38a20c16fa517da3c53a18da01eba3b75015b1b9c1e6460d6bbd9"
+        "@sha256:e0116228ea3e6e17d382de2bd1172481e876de525f4c1fcd16466ef267bf7146"
     )
     orchestration = _read("infra/wc013-live-acceptance/main.bicep")
     presentation = _read(
