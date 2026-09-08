@@ -217,8 +217,6 @@ class Wc013ConfigurationInput(_ConfigurationModel):
 
     @model_validator(mode="after")
     def require_exact_selection(self) -> Wc013ConfigurationInput:
-        if self.selection.manifest_version is None:
-            raise ValueError("live acceptance requires an exact manifest version")
         if (
             self.evaluation_command.manifest_id != self.selection.manifest_id
             or self.evaluation_command.manifest_version
@@ -260,8 +258,6 @@ class Wc013LiveAcceptancePlan(_ConfigurationModel):
 
     @model_validator(mode="after")
     def require_exact_selection(self) -> Wc013LiveAcceptancePlan:
-        if self.selection.manifest_version is None:
-            raise ValueError("live acceptance requires an exact manifest version")
         if (
             self.evaluation_command.manifest_id != self.selection.manifest_id
             or self.evaluation_command.manifest_version
@@ -425,8 +421,7 @@ def _validate_authority(
     if view.supersession is not None:
         raise Wc013LiveAcceptanceError("WC-007 authority selects a superseded manifest")
     if (
-        selection.manifest_version is None
-        or published.manifest_id != selection.manifest_id
+        published.manifest_id != selection.manifest_id
         or published.manifest_version != selection.manifest_version
         or published.manifest_digest
         != published.manifest.compatibility.artifact_digest
@@ -757,8 +752,6 @@ def render_wc013_configuration(
 
 def _powershell_environment_template(plan: Wc013LiveAcceptancePlan) -> str:
     manifest_version = plan.selection.manifest_version
-    if manifest_version is None:
-        raise Wc013LiveAcceptanceError("rendered live selection lost its exact version")
     values = {
         "ATHENA_WC013_WC008_DEPLOYMENT_ASSERTION_FILE": (
             "$configurationRoot\\wc008-deployment-assertion.json"

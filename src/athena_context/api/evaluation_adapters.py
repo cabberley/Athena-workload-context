@@ -23,7 +23,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from athena_context.api.domain import Actor, PublishedManifestView
 from athena_context.api.errors import (
-    AmbiguousLookupError,
     DemoEvaluationConfigurationError,
     ResourceNotFoundError,
 )
@@ -2203,26 +2202,10 @@ class ContextApiPublishedContextResolver:
         *,
         as_of: datetime,
     ) -> ResolvedPublishedContext:
-        if selection.manifest_version is None:
-            active = [
-                view
-                for view in self._reader.list_published(selection.manifest_id)
-                if view.supersession is None
-            ]
-            if not active:
-                raise ResourceNotFoundError(
-                    "published manifest has no active version"
-                )
-            if len(active) != 1:
-                raise AmbiguousLookupError(
-                    "published manifest has multiple active versions"
-                )
-            view = active[0]
-        else:
-            view = self._reader.get_published(
-                selection.manifest_id,
-                selection.manifest_version,
-            )
+        view = self._reader.get_published(
+            selection.manifest_id,
+            selection.manifest_version,
+        )
         profile = resolve_manifest_profile(
             view.published.manifest,
             selection.profile_id,

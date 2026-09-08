@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import TypeAdapter
 
+from athena_context.api.audit import audit_event_digest, verify_audit_chain
 from athena_context.api.domain import (
     Actor,
     AuditEvent,
@@ -831,21 +832,33 @@ class _MemoryTransaction(ContextTransactionPort):
         self._dirty = True
 
     def append_audit(self, event: PendingAuditEvent) -> AuditEvent:
+        verify_audit_chain(self._audit)
         sequence = len(self._audit) + 1
+        event_id = f"audit-{sequence:08d}"
+        previous_event_digest = (
+            None if not self._audit else self._audit[-1].event_digest
+        )
         stored = AuditEvent(
             **event.model_dump(),
             sequence=sequence,
-            event_id=f"audit-{sequence:08d}",
+            event_id=event_id,
+            previous_event_digest=previous_event_digest,
+            event_digest=audit_event_digest(
+                event,
+                sequence=sequence,
+                event_id=event_id,
+                previous_event_digest=previous_event_digest,
+            ),
         )
         self._audit.append(stored.model_copy(deep=True))
         self._dirty = True
         return stored
 
-    def list_audit(self, *, manifest_id: str) -> list[AuditEvent]:
+    def list_audit(self, *, manifest_id: str | None = None) -> list[AuditEvent]:
         return [
             event.model_copy(deep=True)
             for event in self._audit
-            if event.manifest_id == manifest_id
+            if manifest_id is None or event.manifest_id == manifest_id
         ]
 
     def get_receipt(self, actor_id: str, idempotency_key: str) -> MutationReceipt | None:

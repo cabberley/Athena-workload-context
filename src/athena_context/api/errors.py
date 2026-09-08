@@ -71,6 +71,10 @@ class PersistenceConflictError(ContextApiError):
     code = "persistence_conflict"
 
 
+class AuditIntegrityError(ContextApiError):
+    code = "audit_integrity_failed"
+
+
 class DemoEvaluationConfigurationError(ContextApiError):
     code = "demo_evaluation_configuration"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -24,6 +25,10 @@ _VERSION_PATTERN = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
 def ensure_concrete_workload_id(value: str) -> str:
     if value == "*":
         raise ValueError("'*' is reserved for typed all-workloads grant scope")
+    if re.fullmatch(_ID_PATTERN, value) is None:
+        raise ValueError(
+            "workload identifier must use route-safe ASCII letters, digits, '.', '_', or '-'"
+        )
     return value
 
 
@@ -31,7 +36,12 @@ type WorkloadIdentifier = Annotated[
     str,
     StringConstraints(min_length=1, max_length=128),
     AfterValidator(ensure_concrete_workload_id),
-    Field(json_schema_extra={"not": {"const": "*"}}),
+    Field(
+        json_schema_extra={
+            "not": {"const": "*"},
+            "pattern": _ID_PATTERN,
+        }
+    ),
 ]
 
 
@@ -232,6 +242,11 @@ class PendingAuditEvent(ApiModel):
 class AuditEvent(PendingAuditEvent):
     sequence: int = Field(ge=1)
     event_id: str = Field(pattern=r"^audit-[0-9]{8}$")
+    previous_event_digest: str | None = Field(
+        default=None,
+        pattern=_DIGEST_PATTERN,
+    )
+    event_digest: str = Field(pattern=_DIGEST_PATTERN)
 
 
 class MutationTarget(ApiModel):

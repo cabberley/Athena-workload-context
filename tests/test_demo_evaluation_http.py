@@ -1179,6 +1179,24 @@ def test_api_requires_verified_human_publisher_and_ignores_spoofed_actor() -> No
     assert harness.store.publication_count == 0
 
 
+def test_api_rejects_route_unsafe_workload_id_before_side_effects() -> None:
+    harness, client = _client()
+    payload = {
+        **harness.command.model_dump(mode="json", by_alias=True),
+        "manifest_id": "wl/unsafe",
+    }
+
+    response = client.post(
+        "/v1/demo-evaluations",
+        headers=_headers(PUBLISHER_TOKEN, "wc013-http-route-unsafe"),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert harness.transport.calls == 0
+    assert harness.store.publication_count == 0
+
+
 def test_api_maps_closed_mcp_outcome_without_a_publication() -> None:
     harness, client = _client("unavailable")
 

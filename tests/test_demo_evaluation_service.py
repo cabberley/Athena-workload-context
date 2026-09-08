@@ -52,7 +52,10 @@ from athena_context.api.errors import (
 from athena_context.api.evaluation_context import (
     validate_published_context_binding,
 )
-from athena_context.api.evaluation_domain import EvaluationAuthorityToken
+from athena_context.api.evaluation_domain import (
+    DemoEvaluationCommand,
+    EvaluationAuthorityToken,
+)
 from athena_context.api.evaluation_ports import (
     EvaluationCollectionAuthority,
     EvaluationCommitAuthorityCondition,
@@ -382,6 +385,32 @@ def test_approval_creation_uses_authenticated_actor_and_millisecond_clock() -> N
     assert harness.store.publication_count == 1
 
 
+def test_evaluation_contracts_reject_route_unsafe_workload_identifiers() -> None:
+    harness = build_harness(
+        as_of=CURRENT_NOW,
+        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
+    )
+    approval_payload = {
+        **harness.approval.model_dump(mode="python"),
+        "manifest_id": "wl/unsafe",
+    }
+    command_payload = {
+        **harness.command.model_dump(mode="python"),
+        "manifest_id": "wl/unsafe",
+    }
+
+    with pytest.raises(ValidationError, match="route-safe"):
+        PublishedContextSelection(
+            manifest_id="wl/unsafe",
+            manifest_version=harness.command.manifest_version,
+            profile_id=harness.command.profile_id,
+        )
+    with pytest.raises(ValidationError, match="route-safe"):
+        CreateDemoEvaluationApprovalCommand.model_validate(approval_payload)
+    with pytest.raises(ValidationError, match="route-safe"):
+        DemoEvaluationCommand.model_validate(command_payload)
+
+
 def test_current_2026_manifest_is_human_published_then_fully_evaluated() -> None:
     candidate = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(
@@ -438,7 +467,7 @@ def test_manifest_defined_prod_east_profile_normalizes_and_evaluates() -> None:
     } == EXPECTED_VERDICTS
 
 
-def test_unicode_profile_normalization_succeeds_with_versionless_atomic_commit() -> None:
+def test_unicode_profile_normalization_succeeds_with_exact_version_atomic_commit() -> None:
     composed = "café-east"
     decomposed = "cafe\u0301-east"
     manifest = build_current_synthetic_manifest(
@@ -453,14 +482,13 @@ def test_unicode_profile_normalization_succeeds_with_versionless_atomic_commit()
     command = type(harness.command).model_validate(
         {
             **harness.command.model_dump(mode="python"),
-            "manifest_version": None,
             "profile_id": decomposed,
         }
     )
     resolved = harness.context_resolver.resolve(
         PublishedContextSelection(
             manifest_id=command.manifest_id,
-            manifest_version=None,
+            manifest_version=command.manifest_version,
             profile_id=decomposed,
         ),
         as_of=CURRENT_NOW,
@@ -2351,29 +2379,27 @@ def test_supersession_after_final_evaluation_aborts_conditional_commit() -> None
     _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
 
 
-def test_unique_active_selection_becoming_ambiguous_aborts_conditional_commit() -> None:
+def test_exact_selection_remains_bound_when_another_active_version_is_published() -> None:
     manifest = build_current_synthetic_manifest(as_of=CURRENT_NOW)
     harness = build_harness(as_of=CURRENT_NOW, manifest=manifest)
-    command = harness.command.model_copy(update={"manifest_version": None})
     concurrent = build_current_synthetic_manifest(
         as_of=CURRENT_NOW,
         manifest_version="2.1.0",
     )
-    idempotency_key = "wc013-unique-selection-ambiguity-race"
+    idempotency_key = "wc013-exact-selection-new-version-race"
     harness.commit_hook.before_commit = lambda: (
         harness.context_resolver.publish_additional_active(concurrent)
     )
 
-    with pytest.raises(EvaluationFailedClosedError, match="ambiguous"):
-        harness.service.evaluate(
-            PUBLISHER,
-            idempotency_key,
-            command,
-        )
+    result = harness.service.evaluate(
+        PUBLISHER,
+        idempotency_key,
+        harness.command,
+    )
 
     assert harness.transport.calls == 1
     assert harness.snapshot_signer.calls == 1
-    _assert_no_artifact(harness=harness, idempotency_key=idempotency_key)
+    assert result.publication.manifest_version == harness.command.manifest_version
 
 
 def test_explicit_selection_remains_exact_when_another_version_is_published() -> None:
@@ -2676,52 +2702,15 @@ def test_empty_context_service_state_fails_before_collection() -> None:
     assert harness.store.publication_count == 0
 
 
-def test_multiple_real_active_versions_execute_production_ambiguity_branch() -> None:
-    harness = build_harness(
-        as_of=CURRENT_NOW,
-        manifest=build_current_synthetic_manifest(as_of=CURRENT_NOW),
-    )
-    harness.context_resolver.publish_additional_active(
-        build_current_synthetic_manifest(
-            as_of=CURRENT_NOW,
-            manifest_version="2.1.0",
-        )
-    )
-    unique_selection = harness.command.model_copy(
-        update={"manifest_version": None}
-    )
-
-    with pytest.raises(EvaluationFailedClosedError, match="missing, ambiguous"):
-        harness.service.evaluate(
-            PUBLISHER,
-            "wc013-real-ambiguous-context",
-            unique_selection,
-        )
-
-    assert harness.transport.calls == 0
-    assert harness.snapshot_signer.calls == 0
-    assert harness.store.publication_count == 0
-
-
-def test_wc007_resolver_can_select_the_unique_active_published_version() -> None:
+def test_wc007_resolver_requires_an_exact_published_version() -> None:
     harness = build_harness()
 
-    resolved = harness.context_resolver.resolve(
+    with pytest.raises(ValidationError):
         PublishedContextSelection(
             manifest_id=harness.command.manifest_id,
             manifest_version=None,
             profile_id=harness.command.profile_id,
-        ),
-        as_of=NOW,
-    )
-
-    assert resolved.view.published.manifest_version == (
-        harness.command.manifest_version
-    )
-    assert resolved.profile.resolved_profile_digest == (
-        harness.command.expected_resolved_profile_digest
-    )
-    assert resolved.authority_token.selection_mode == "uniqueActiveVersion"
+        )
 
     explicit = harness.context_resolver.resolve(
         PublishedContextSelection(
@@ -2732,7 +2721,6 @@ def test_wc007_resolver_can_select_the_unique_active_published_version() -> None
         as_of=NOW,
     )
     assert explicit.authority_token.selection_mode == "exactVersion"
-    assert explicit.authority_token.etag != resolved.authority_token.etag
 
 
 def test_success_result_is_idempotent_before_any_repeat_collection_or_signing() -> None:

@@ -508,14 +508,19 @@ class ContextMcpServer:
         self,
         actor: Actor,
         workload_id: str,
-        manifest_version: str | None,
+        manifest_version: str,
     ) -> PublishedManifestView:
-        if manifest_version is not None:
-            return self._context_api.get_published(
-                actor,
-                manifest_version,
-                manifest_id=workload_id,
-            )
+        return self._context_api.get_published(
+            actor,
+            manifest_version,
+            manifest_id=workload_id,
+        )
+
+    def _active_published_for_listing(
+        self,
+        actor: Actor,
+        workload_id: str,
+    ) -> PublishedManifestView:
         versions = self._context_api.list_published(actor, workload_id)
         active = [view for view in versions if view.supersession is None]
         if len(active) != 1:
@@ -649,7 +654,7 @@ class ContextMcpServer:
         summaries: list[WorkloadSummary] = []
         citations: list[Citation] = []
         for workload_id in page_ids:
-            view = self._published(actor, workload_id, None)
+            view = self._active_published_for_listing(actor, workload_id)
             manifest = view.published.manifest
             profile_id = _profile_key(manifest, request.profile_id)
             summaries.append(

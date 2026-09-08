@@ -35,6 +35,7 @@ from athena_context.api.domain import (
     WorkloadGrantScope,
     WorkloadIdentifier,
 )
+from athena_context.api.durable import AzureTableContextStore
 from athena_context.api.evaluation_adapters import (
     AZURE_RESOURCE_INVENTORY_DEPLOYMENT_TOOL,
     AZURE_VM_GET_DEPLOYMENT_TOOL,
@@ -110,6 +111,7 @@ __all__ = [
     "ContextServicePublishedContextResolver",
     "DefaultAzureCredentialPrivateMcpToken",
     "AllWorkloadsGrantScope",
+    "AzureTableContextStore",
     "CallableTrustedEvidenceSnapshotVerifier",
     "CohortDraftBinding",
     "CohortEvidenceBinding",

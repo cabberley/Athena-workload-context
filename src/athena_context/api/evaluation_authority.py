@@ -149,41 +149,16 @@ class TransactionEvaluationAuthorityUnitOfWork:
         as_of: datetime,
     ) -> tuple[ResolvedPublishedContext, AuthorizationGrantToken]:
         tx = self._context_transaction
-        if selection.manifest_version is None:
-            reader_authorization = self.authorize(
-                self._reader_actor,
-                Permission.LIST,
-                selection.manifest_id,
-            )
-            active = [
-                item
-                for item in tx.list_published(manifest_id=selection.manifest_id)
-                if tx.get_supersession(
-                    item.manifest_id,
-                    item.manifest_version,
-                )
-                is None
-            ]
-            if not active:
-                raise ResourceNotFoundError(
-                    "published manifest has no active version"
-                )
-            if len(active) != 1:
-                raise AmbiguousLookupError(
-                    "published manifest has multiple active versions"
-                )
-            published = active[0]
-        else:
-            published = self._require_published(
-                tx,
-                selection.manifest_id,
-                selection.manifest_version,
-            )
-            reader_authorization = self.authorize(
-                self._reader_actor,
-                Permission.READ,
-                selection.manifest_id,
-            )
+        published = self._require_published(
+            tx,
+            selection.manifest_id,
+            selection.manifest_version,
+        )
+        reader_authorization = self.authorize(
+            self._reader_actor,
+            Permission.READ,
+            selection.manifest_id,
+        )
         view = PublishedManifestView(
             published=published,
             supersession=tx.get_supersession(
@@ -403,19 +378,13 @@ def validate_loaded_evaluation_authority(
         manifest_version=command.manifest_version,
         profile_id=command.profile_id,
     )
-    if sealed_expected_authority is not None:
-        expected_selection_mode = (
-            "uniqueActiveVersion"
-            if command.manifest_version is None
-            else "exactVersion"
+    if (
+        sealed_expected_authority is not None
+        and sealed_expected_authority.context.selection_mode != "exactVersion"
+    ):
+        raise EvaluationFailedClosedError(
+            "published context authority token changed selection mode"
         )
-        if (
-            sealed_expected_authority.context.selection_mode
-            != expected_selection_mode
-        ):
-            raise EvaluationFailedClosedError(
-                "published context authority token changed selection mode"
-            )
     try:
         if resolved.view.supersession is not None:
             raise AthenaValidationError(
