@@ -8,10 +8,12 @@ from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 import athena_context.azure_adapters as azure_adapters
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
+    ArtifactCurrentReadRequest,
     ArtifactNotFoundError,
     ArtifactReadRequest,
     ArtifactReadTooLargeError,
     ArtifactVerificationError,
+    CurrentArtifactReaderPort,
     VersionPinnedArtifactReaderPort,
 )
 from athena_context.azure_adapters import AzureBlobVersionPinnedArtifactReader
@@ -63,7 +65,12 @@ def _reader(
             return downloader
 
     class _Container:
-        def get_blob_client(self, blob_name: str, *, version_id: str) -> _Blob:
+        def get_blob_client(
+            self,
+            blob_name: str,
+            *,
+            version_id: str | None = None,
+        ) -> _Blob:
             calls.append(("get_blob_client", blob_name, version_id))
             return _Blob()
 
@@ -145,6 +152,45 @@ def test_reader_accepts_exactly_one_mib_of_valid_json(
     result = reader.read(_request(payload))
 
     assert result.size_bytes == MAX_ARTIFACT_PAYLOAD_BYTES
+
+
+def test_reader_recovers_only_one_known_current_blob_after_digest_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"artifact":"synthetic"}'
+    digest = sha256_hex(payload)
+    calls: list[tuple[object, ...]] = []
+    downloader = SimpleNamespace(
+        size=len(payload),
+        properties=_properties(payload_digest=digest),
+        readall=lambda: payload,
+    )
+    reader = _reader(monkeypatch, downloader, calls)
+
+    result = reader.read_current(
+        ArtifactCurrentReadRequest(blob_name="runs/run-0001/result.json")
+    )
+
+    assert result.version_id == VERSION_ID
+    assert result.payload_sha256 == digest
+    assert calls[0] == ("get_blob_client", "runs/run-0001/result.json", None)
+
+
+def test_current_reader_rejects_digest_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"artifact":"synthetic"}'
+    downloader = SimpleNamespace(
+        size=len(payload),
+        properties=_properties(payload_digest=sha256_hex(b"other")),
+        readall=lambda: payload,
+    )
+    reader = _reader(monkeypatch, downloader, [])
+
+    with pytest.raises(ArtifactVerificationError, match="SHA-256"):
+        reader.read_current(
+            ArtifactCurrentReadRequest(blob_name="runs/run-0001/result.json")
+        )
 
 
 def test_reader_rejects_oversize_before_consuming_stream(
@@ -384,3 +430,13 @@ def test_reader_port_exposes_only_read() -> None:
     }
 
     assert methods == {"read"}
+
+
+def test_current_reader_port_exposes_only_named_current_read() -> None:
+    methods = {
+        name
+        for name, value in vars(CurrentArtifactReaderPort).items()
+        if not name.startswith("_") and callable(value)
+    }
+
+    assert methods == {"read_current"}

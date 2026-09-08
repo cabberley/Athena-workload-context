@@ -161,6 +161,16 @@ class ArtifactReadRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactCurrentReadRequest:
+    """One known logical Blob name whose current version must be verified before recovery."""
+
+    blob_name: str
+
+    def __post_init__(self) -> None:
+        _validate_blob_name(self.blob_name)
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactReadResult:
     """Verified JSON-media-type bytes from one exact immutable Blob version."""
 
@@ -191,9 +201,16 @@ class VersionPinnedArtifactReaderPort(Protocol):
     def read(self, request: ArtifactReadRequest) -> ArtifactReadResult: ...
 
 
+class CurrentArtifactReaderPort(Protocol):
+    """Capability-minimized recovery from one known Blob name without enumeration."""
+
+    def read_current(self, request: ArtifactCurrentReadRequest) -> ArtifactReadResult: ...
+
+
 __all__ = [
     "ArtifactAlreadyExistsError",
     "ArtifactContentType",
+    "ArtifactCurrentReadRequest",
     "ArtifactMetadataHashes",
     "ArtifactNotFoundError",
     "ArtifactPayloadTooLargeError",
@@ -206,6 +223,7 @@ __all__ = [
     "ArtifactWriteReceipt",
     "ArtifactWriteRequest",
     "CreateOnlyArtifactWriterPort",
+    "CurrentArtifactReaderPort",
     "MAX_ARTIFACT_PAYLOAD_BYTES",
     "MAX_ARTIFACT_TRANSFER_BYTES",
     "VersionPinnedArtifactReaderPort",

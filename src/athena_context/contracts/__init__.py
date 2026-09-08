@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from athena_context.contracts.change_ingestion import *  # noqa: F403
+from athena_context.contracts.change_ingestion import __all__ as _change_ingestion_all
 from athena_context.contracts.common import (
     AthenaValidationError,
     NormalizationCollisionError,
@@ -35,6 +37,7 @@ WorkloadManifest = CanonicalWorkloadManifest  # type: ignore[misc,assignment]  #
 
 __all__ = [
     *list(_model_all),
+    *list(_change_ingestion_all),
     *list(_eventing_all),
     *list(_manifest_all),
     *list(_operational_demo_all),
