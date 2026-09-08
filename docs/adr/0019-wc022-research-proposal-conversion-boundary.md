@@ -1,4 +1,4 @@
-# ADR 0018: Keep WC-022 research conversion outside the runtime manifest boundary
+# ADR 0019: Keep WC-022 research conversion outside the runtime manifest boundary
 
 - **Status:** Proposed
 - **Date:** 2026-09-06
@@ -23,8 +23,10 @@ for an `athena.wc022.governedProposal.v1` artifact. The artifact is permanently 
 or monitoring code.
 
 The sole public conversion operation takes no input. It reads the canonical repository draft and
-dossier from their exact repository paths, verifies their reviewed SHA-256 digests, parses and
-validates the source shape, then converts the fresh in-memory result before it can be exposed.
+dossier from their exact repository paths, normalizes text line endings to LF, verifies their
+reviewed SHA-256 digests, parses and validates the source shape, then converts the fresh in-memory
+result before it can be exposed. Line-ending normalization makes the review seal independent of
+Git checkout behavior without normalizing any semantic YAML or Markdown content.
 There is no reviewed descriptor, seal token, Mapping-accepting converter, or caller-supplied
 `--input` path that can mint canonical provenance. The private conversion helper also accepts no
 authority input and re-verifies canonical bytes before applying canonical provenance. Internal
@@ -35,7 +37,7 @@ Validation requires both that `proposalDigest` is the self-digest of its canonic
 that it equals the pinned reviewed conversion output. A modified artifact therefore cannot become
 valid merely by recomputing its checksum; source and conversion changes require an explicit
 reviewed-attestation update. The reviewed WC-022 output digest is
-`sha256:3ae604242a77d0174f41e584d95d102ef008ffc0d5efbde287b665060e3c439a`.
+`sha256:7ecfab336e3146886bbc28dd614f866e010784f392ced1500d19e2c107479a7a`.
 
 The draft must have all four research-boundary markers:
 

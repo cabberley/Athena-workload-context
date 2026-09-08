@@ -29,13 +29,13 @@ WC022_PROPOSAL_CONTRACT_VERSION = "athena.wc022.governedProposal.v1"
 WC022_RESEARCH_DRAFT_LOCATION = "docs/research/drafts/epic-on-azure.draft.yaml"
 WC022_SOURCE_DOSSIER = "docs/research/epic-on-azure-source-dossier.md"
 WC022_REVIEWED_DRAFT_DIGEST = (
-    "sha256:82bcda3bfaa9f2a1045c37c1f3c93703c3c83742673bc703d5be3c439bafd444"
+    "sha256:fa39195b71211ad272f4a5de0952f22e6907dd920344777040588124114fa049"
 )
 WC022_REVIEWED_DOSSIER_DIGEST = (
-    "sha256:de465922b47ca93b2790657392cd74b104010b600d4357fc33d9b180190bc4a0"
+    "sha256:085780d80e36813dd9112c84c451c5cf60040ead19beb973a18b829aa02f5512"
 )
 WC022_REVIEWED_PROPOSAL_DIGEST = (
-    "sha256:3ae604242a77d0174f41e584d95d102ef008ffc0d5efbde287b665060e3c439a"
+    "sha256:7ecfab336e3146886bbc28dd614f866e010784f392ced1500d19e2c107479a7a"
 )
 _FrozenItem = TypeVar("_FrozenItem")
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,127}$")
@@ -115,7 +115,7 @@ class Wc022BaseModel(BaseModel):
 class UnknownValue(Wc022BaseModel):
     """An explicitly retained unsupported or customer-specific value gap."""
 
-    state: Literal["unknown"] = "unknown"
+    state: Literal["unknown"]
     subject: str = Field(..., min_length=1, max_length=160)
     rationale: str = Field(..., min_length=1, max_length=1000)
     source_refs: FrozenList[SafeIdentifier] = Field(
@@ -126,7 +126,7 @@ class UnknownValue(Wc022BaseModel):
 class HumanDecision(Wc022BaseModel):
     """A value that only an authorized human owner may provide."""
 
-    state: Literal["humanDecisionRequired"] = "humanDecisionRequired"
+    state: Literal["humanDecisionRequired"]
     subject: str = Field(..., min_length=1, max_length=160)
     rationale: str = Field(..., min_length=1, max_length=1000)
     source_refs: FrozenList[SafeIdentifier] = Field(
@@ -141,9 +141,7 @@ class ProposalWorkloadIdentity(Wc022BaseModel):
         ..., alias="workloadFamily", min_length=1, max_length=128
     )
     description: str = Field(..., min_length=1, max_length=2000)
-    classification: Literal["publicSafeSynthetic"] = Field(
-        "publicSafeSynthetic", alias="classification"
-    )
+    classification: Literal["publicSafeSynthetic"] = Field(..., alias="classification")
     business_criticality: UnknownValue = Field(..., alias="businessCriticality")
 
 
@@ -152,7 +150,7 @@ class EnvironmentProposal(Wc022BaseModel):
     profile_type: Literal[
         "production", "development", "training", "test", "disasterRecovery"
     ] = Field(..., alias="profileType")
-    declaration_required: Literal[True] = Field(True, alias="declarationRequired")
+    declaration_required: Literal[True] = Field(..., alias="declarationRequired")
     objective: HumanDecision
     criticality: UnknownValue
     recovery_intent: HumanDecision = Field(..., alias="recoveryIntent")
@@ -162,7 +160,7 @@ class EnvironmentProposal(Wc022BaseModel):
         ..., alias="monitoringSemantics", min_length=1, max_length=8
     )
     ownership: FrozenList[HumanDecision] = Field(..., min_length=1, max_length=4)
-    unknowns: FrozenList[UnknownValue] = Field(default_factory=tuple, max_length=16)
+    unknowns: FrozenList[UnknownValue] = Field(..., max_length=16)
     source_refs: FrozenList[SafeIdentifier] = Field(
         ..., alias="sourceRefs", min_length=1, max_length=8
     )
@@ -184,7 +182,7 @@ class RoleProposal(Wc022BaseModel):
     role_id: SafeIdentifier = Field(..., alias="roleId", min_length=1, max_length=128)
     purpose: str = Field(..., min_length=1, max_length=1000)
     candidate_status: Literal["humanApprovalRequired"] = Field(
-        "humanApprovalRequired", alias="candidateStatus"
+        ..., alias="candidateStatus"
     )
     runtime_role_kind: HumanDecision = Field(..., alias="runtimeRoleKind")
     discovery_hint: HumanDecision | None = Field(default=None, alias="discoveryHint")
@@ -200,7 +198,7 @@ class DependencyCategoryProposal(Wc022BaseModel):
     dependency_id: SafeIdentifier = Field(
         ..., alias="dependencyId", min_length=1, max_length=128
     )
-    status: Literal["candidateCategory"] = "candidateCategory"
+    status: Literal["candidateCategory"]
     semantics: str = Field(..., min_length=1, max_length=1000)
     human_decisions: FrozenList[HumanDecision] = Field(
         ..., alias="humanDecisions", min_length=1, max_length=8
@@ -225,12 +223,14 @@ class RelationshipHypothesisProposal(Wc022BaseModel):
     )
     intent: str = Field(..., min_length=1, max_length=1000)
     candidate_status: Literal["humanApprovalRequired"] = Field(
-        "humanApprovalRequired", alias="candidateStatus"
+        ..., alias="candidateStatus"
     )
     environment_scope: HumanDecision = Field(..., alias="environmentScope")
     semantics: UnknownValue
-    confidence: Literal["hypothesis-unvalidated"] = "hypothesis-unvalidated"
-    human_validation_required: Literal[True] = Field(True, alias="humanValidationRequired")
+    confidence: Literal["hypothesis-unvalidated"]
+    human_validation_required: Literal[True] = Field(
+        ..., alias="humanValidationRequired"
+    )
     source_refs: FrozenList[SafeIdentifier] = Field(
         ..., alias="sourceRefs", min_length=1, max_length=8
     )
@@ -256,7 +256,7 @@ class RecoveryIntentProposal(Wc022BaseModel):
 
 
 class MonitoringSemanticsProposal(Wc022BaseModel):
-    signal_intent_only: Literal[True] = Field(True, alias="signalIntentOnly")
+    signal_intent_only: Literal[True] = Field(..., alias="signalIntentOnly")
     platform_evidence_categories: FrozenList[str] = Field(
         ..., alias="platformEvidenceCategories", min_length=1, max_length=16
     )
@@ -270,10 +270,10 @@ class MonitoringSemanticsProposal(Wc022BaseModel):
 
 class EvidenceRequirementsProposal(Wc022BaseModel):
     declared_and_observed_separate: Literal[True] = Field(
-        True, alias="declaredAndObservedSeparate"
+        ..., alias="declaredAndObservedSeparate"
     )
     evidence_plane: Literal["privateAzureMcpReadOnly"] = Field(
-        "privateAzureMcpReadOnly", alias="evidencePlane"
+        ..., alias="evidencePlane"
     )
     required_categories: FrozenList[str] = Field(
         ..., alias="requiredCategories", min_length=1, max_length=16
@@ -299,7 +299,7 @@ class ExceptionCandidate(Wc022BaseModel):
         ..., alias="exceptionId", min_length=1, max_length=128
     )
     candidate_status: Literal["humanApprovalRequired"] = Field(
-        "humanApprovalRequired", alias="candidateStatus"
+        ..., alias="candidateStatus"
     )
     required_declarations: FrozenList[str] = Field(
         ..., alias="requiredDeclarations", min_length=1, max_length=16
@@ -323,16 +323,16 @@ class ProposalProvenance(Wc022BaseModel):
         ..., alias="sourceRefs", min_length=1, max_length=16
     )
     conversion_basis: Literal["publicSafeConceptsOnly"] = Field(
-        "publicSafeConceptsOnly", alias="conversionBasis"
+        ..., alias="conversionBasis"
     )
 
 
 class ProposalGovernance(Wc022BaseModel):
-    publication_state: Literal["unpublished"] = Field("unpublished", alias="publicationState")
-    runtime_use: Literal["prohibited"] = Field("prohibited", alias="runtimeUse")
-    human_approval_required: Literal[True] = Field(True, alias="humanApprovalRequired")
+    publication_state: Literal["unpublished"] = Field(..., alias="publicationState")
+    runtime_use: Literal["prohibited"] = Field(..., alias="runtimeUse")
+    human_approval_required: Literal[True] = Field(..., alias="humanApprovalRequired")
     authority_boundary: Literal["contextApiHumanPublicationOnly"] = Field(
-        "contextApiHumanPublicationOnly", alias="authorityBoundary"
+        ..., alias="authorityBoundary"
     )
 
 
@@ -340,10 +340,10 @@ class GovernedWorkloadContextProposal(Wc022BaseModel):
     """The deterministic WC-022 output, intentionally not a runtime manifest."""
 
     contract_version: Literal["athena.wc022.governedProposal.v1"] = Field(
-        "athena.wc022.governedProposal.v1", alias="contractVersion"
+        ..., alias="contractVersion"
     )
     proposal_kind: Literal["governedWorkloadContextProposal"] = Field(
-        "governedWorkloadContextProposal", alias="proposalKind"
+        ..., alias="proposalKind"
     )
     proposal_id: SafeIdentifier = Field(..., alias="proposalId", min_length=1, max_length=128)
     governance: ProposalGovernance

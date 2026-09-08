@@ -31,6 +31,7 @@ from athena_context.wc022_epic_proposal.contracts import (
     GovernedWorkloadContextProposal,
 )
 from athena_context.wc022_epic_proposal.conversion import (
+    _content_digest,
     _validate_mapping_boundary,
     _validate_source_shape,
 )
@@ -127,6 +128,52 @@ def test_invalid_proposal_digest_cannot_bypass_normal_contract_validation() -> N
         )
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("contractVersion",),
+        ("proposalKind",),
+        ("governance", "publicationState"),
+        ("governance", "runtimeUse"),
+        ("governance", "humanApprovalRequired"),
+        ("governance", "authorityBoundary"),
+        ("workload", "classification"),
+        ("workload", "businessCriticality", "state"),
+        ("environments", 0, "declarationRequired"),
+        ("environments", 0, "objective", "state"),
+        ("roles", 0, "candidateStatus"),
+        ("dependencies", 0, "status"),
+        ("relationshipHypotheses", 0, "candidateStatus"),
+        ("relationshipHypotheses", 0, "confidence"),
+        ("relationshipHypotheses", 0, "humanValidationRequired"),
+        ("monitoringSemantics", "signalIntentOnly"),
+        ("evidenceRequirements", "declaredAndObservedSeparate"),
+        ("evidenceRequirements", "evidencePlane"),
+        ("exceptionCandidates", 0, "candidateStatus"),
+        ("provenance", "conversionBasis"),
+    ],
+)
+def test_digest_covered_governance_markers_are_required(
+    path: tuple[str | int, ...],
+) -> None:
+    proposal_payload = _proposal_payload()
+    payload: object = proposal_payload
+    for part in path[:-1]:
+        if isinstance(part, int):
+            assert isinstance(payload, list)
+            payload = payload[part]
+        else:
+            assert isinstance(payload, dict)
+            payload = payload[part]
+    assert isinstance(payload, dict)
+    final_part = path[-1]
+    assert isinstance(final_part, str)
+    payload.pop(final_part)
+
+    with pytest.raises(ValidationError):
+        GovernedWorkloadContextProposal.model_validate(proposal_payload)
+
+
 def test_contract_rejects_modified_content_even_when_self_digest_is_recomputed() -> None:
     payload = _proposal_payload()
     workload = payload["workload"]
@@ -173,6 +220,17 @@ def test_conversion_is_deterministic_from_canonical_reviewed_bytes() -> None:
 
     assert first.canonical_json() == second.canonical_json()
     assert first.proposal_digest == second.proposal_digest
+
+
+def test_reviewed_text_digests_are_independent_of_checkout_line_endings() -> None:
+    canonical = b"reviewed\npublic-safe\ncontent\n"
+
+    assert _content_digest(canonical) == _content_digest(
+        b"reviewed\r\npublic-safe\r\ncontent\r\n"
+    )
+    assert _content_digest(canonical) == _content_digest(
+        b"reviewed\rpublic-safe\rcontent\r"
+    )
 
 
 def test_conversion_exposes_only_an_atomic_input_free_authority_boundary() -> None:
@@ -467,6 +525,36 @@ def test_atomic_conversion_rejects_changed_reviewed_source_or_dossier_digest(
         "sha256:" + "0" * 64,
     )
     with pytest.raises(ResearchDraftConversionError, match="sealed reviewed dossier digest"):
+        convert_canonical_public_safe_research_draft()
+
+
+@pytest.mark.parametrize(
+    ("path_attribute", "maximum_bytes", "message"),
+    [
+        (
+            "_CANONICAL_RESEARCH_DRAFT_PATH",
+            conversion_module._MAX_RESEARCH_DRAFT_BYTES,
+            "research draft is outside its byte bound",
+        ),
+        (
+            "_CANONICAL_SOURCE_DOSSIER_PATH",
+            conversion_module._MAX_SOURCE_DOSSIER_BYTES,
+            "research source dossier is outside its byte bound",
+        ),
+    ],
+)
+def test_atomic_conversion_bounds_source_reads_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    path_attribute: str,
+    maximum_bytes: int,
+    message: str,
+) -> None:
+    oversized = tmp_path / "oversized-source"
+    oversized.write_bytes(b"x" * (maximum_bytes + 1))
+    monkeypatch.setattr(conversion_module, path_attribute, oversized)
+
+    with pytest.raises(ResearchDraftConversionError, match=message):
         convert_canonical_public_safe_research_draft()
 
 

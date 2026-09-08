@@ -47,6 +47,7 @@ _CANONICAL_RESEARCH_DRAFT_PATH = (
 )
 _CANONICAL_SOURCE_DOSSIER_PATH = _REPOSITORY_ROOT / WC022_SOURCE_DOSSIER
 _MAX_RESEARCH_DRAFT_BYTES = 128 * 1024
+_MAX_SOURCE_DOSSIER_BYTES = 64 * 1024
 _MAX_RESEARCH_DRAFT_ITEMS = 1024
 _MAX_RESEARCH_DRAFT_DEPTH = 16
 _ENVIRONMENT_TYPES = {
@@ -223,21 +224,22 @@ class ResearchDraftConversionError(ValueError):
 def _read_canonical_reviewed_source() -> Mapping[str, object]:
     """Read and validate the reviewed bytes immediately before conversion."""
 
-    try:
-        source_bytes = _CANONICAL_RESEARCH_DRAFT_PATH.read_bytes()
-    except OSError as exc:
-        raise ResearchDraftConversionError("research draft could not be read") from exc
-    if not 0 < len(source_bytes) <= _MAX_RESEARCH_DRAFT_BYTES:
-        raise ResearchDraftConversionError("research draft is outside its byte bound")
+    source_bytes = _read_bounded_bytes(
+        _CANONICAL_RESEARCH_DRAFT_PATH,
+        maximum_bytes=_MAX_RESEARCH_DRAFT_BYTES,
+        label="research draft",
+    )
     source_digest = _content_digest(source_bytes)
     if source_digest != WC022_REVIEWED_DRAFT_DIGEST:
         raise ResearchDraftConversionError(
             "research draft does not match the sealed reviewed source digest"
         )
-    try:
-        dossier_digest = _content_digest(_CANONICAL_SOURCE_DOSSIER_PATH.read_bytes())
-    except OSError as exc:
-        raise ResearchDraftConversionError("research source dossier could not be read") from exc
+    dossier_bytes = _read_bounded_bytes(
+        _CANONICAL_SOURCE_DOSSIER_PATH,
+        maximum_bytes=_MAX_SOURCE_DOSSIER_BYTES,
+        label="research source dossier",
+    )
+    dossier_digest = _content_digest(dossier_bytes)
     if dossier_digest != WC022_REVIEWED_DOSSIER_DIGEST:
         raise ResearchDraftConversionError(
             "research source dossier does not match the sealed reviewed dossier digest"
@@ -922,6 +924,7 @@ def _dependency_proposals(
         result.append(
             DependencyCategoryProposal(
                 dependencyId=dependency_id,
+                status="candidateCategory",
                 semantics=_string(item, "semantics"),
                 humanDecisions=tuple(decisions),
                 sourceRefs=tuple(sources),
@@ -949,6 +952,7 @@ def _relationship_proposal(relationship: Mapping[str, object]) -> RelationshipHy
             _string(relationship, "unknownState"),
             sources,
         ),
+        confidence="hypothesis-unvalidated",
         humanValidationRequired=True,
         sourceRefs=tuple(sources),
     )
@@ -1143,6 +1147,7 @@ def _value_decisions(
 
 def _unknown(subject: str, rationale: str, source_refs: list[str]) -> UnknownValue:
     return UnknownValue(
+        state="unknown",
         subject=subject,
         rationale=rationale,
         sourceRefs=_require_source_refs(source_refs),
@@ -1155,6 +1160,7 @@ def _human_decision(
     source_refs: list[str],
 ) -> HumanDecision:
     return HumanDecision(
+        state="humanDecisionRequired",
         subject=subject,
         rationale=rationale,
         sourceRefs=_require_source_refs(source_refs),
@@ -1289,7 +1295,24 @@ def _sorted_mappings(values: list[object], key: str) -> list[Mapping[str, object
 
 
 def _content_digest(content: bytes) -> str:
-    return f"sha256:{sha256(content).hexdigest()}"
+    canonical_content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return f"sha256:{sha256(canonical_content).hexdigest()}"
+
+
+def _read_bounded_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> bytes:
+    try:
+        with path.open("rb") as source:
+            content = source.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise ResearchDraftConversionError(f"{label} could not be read") from exc
+    if not 0 < len(content) <= maximum_bytes:
+        raise ResearchDraftConversionError(f"{label} is outside its byte bound")
+    return content
 
 
 __all__ = [
