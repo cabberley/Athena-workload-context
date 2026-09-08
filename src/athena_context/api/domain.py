@@ -137,6 +137,7 @@ class AuditAction(StrEnum):
     VERSION_SUPERSEDED = "version_superseded"
     DEMO_EVALUATION_APPROVAL_CREATED = "demo_evaluation_approval_created"
     DEMO_EVALUATION_APPROVAL_REVOKED = "demo_evaluation_approval_revoked"
+    COHORT_DECISION_RECORDED = "cohort_decision_recorded"
 
 
 class ValidationRecord(ApiModel):

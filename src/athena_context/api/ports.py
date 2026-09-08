@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from athena_context.api.domain import (
     Actor,
@@ -17,6 +17,14 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadIdentifier,
 )
+from athena_context.api.selector_provenance import DraftSelectorBaseline
+
+if TYPE_CHECKING:
+    from athena_context.api.cohort_decision_domain import (
+        CohortDecisionReceipt,
+        CohortDecisionRecord,
+        CohortProposalSetVersion,
+    )
 
 
 class ClockPort(Protocol):
@@ -61,6 +69,23 @@ class ContextTransactionPort(Protocol):
         expected_revision: int | None,
     ) -> None: ...
 
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None: ...
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]: ...
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None: ...
+
     def get_published(
         self,
         manifest_id: str,
@@ -86,6 +111,39 @@ class ContextTransactionPort(Protocol):
     def get_receipt(self, actor_id: str, idempotency_key: str) -> MutationReceipt | None: ...
 
     def put_receipt(self, receipt: MutationReceipt) -> None: ...
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None: ...
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]: ...
+
+    def list_overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]: ...
+
+    def put_cohort_decision(self, decision: CohortDecisionRecord) -> None: ...
+
+    def get_cohort_decision_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> CohortDecisionReceipt | None: ...
+
+    def put_cohort_decision_receipt(
+        self,
+        receipt: CohortDecisionReceipt,
+    ) -> None: ...
 
 
 class ContextStorePort(Protocol):

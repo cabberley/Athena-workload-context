@@ -14,6 +14,12 @@ from azure.data.tables import TableServiceClient, UpdateMode
 from pydantic import BaseModel, ValidationError
 
 from athena_context.api.audit import audit_event_digest, verify_audit_chain
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionReceipt,
+    CohortDecisionRecord,
+    CohortProposalSetVersion,
+    rejection_authorities_overlap,
+)
 from athena_context.api.domain import (
     AuditEvent,
     DraftRecord,
@@ -35,6 +41,7 @@ from athena_context.api.errors import (
     StaleRevisionError,
 )
 from athena_context.api.ports import ContextTransactionPort
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.azure_adapters import production_managed_identity_credential
 from athena_context.contracts import compute_artifact_digest
@@ -104,6 +111,15 @@ def _row_key_for_draft(draft: DraftRecord) -> str:
     return _row_key_for_components("draft", draft.draft_id)
 
 
+def _row_key_for_draft_selector_baseline(
+    baseline: DraftSelectorBaseline,
+) -> str:
+    return _row_key_for_components(
+        "draft-selector-baseline",
+        baseline.draft_id,
+    )
+
+
 def _row_key_for_published(published: PublishedManifest) -> str:
     return _row_key_for_components(
         "published",
@@ -128,6 +144,24 @@ def _row_key_for_receipt(receipt: MutationReceipt) -> str:
     )
 
 
+def _row_key_for_cohort_decision(decision: CohortDecisionRecord) -> str:
+    return _row_key_for_components(
+        "cohort-decision",
+        decision.manifest_id,
+        decision.decision_id,
+    )
+
+
+def _row_key_for_cohort_decision_receipt(
+    receipt: CohortDecisionReceipt,
+) -> str:
+    return _row_key_for_components(
+        "cohort-decision-receipt",
+        receipt.actor_id,
+        receipt.idempotency_key,
+    )
+
+
 def _row_key_for_audit(event: AuditEvent) -> str:
     return f"audit:{event.sequence:08d}"
 
@@ -143,6 +177,18 @@ def _row_key_for_components(kind: str, *components: str) -> str:
         }
     )
     return f"{kind}:{digest.removeprefix('sha256:')}"
+
+
+def _cohort_overlap_binding_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, str]:
+    return version.authority_overlap_identity()
+
+
+def _cohort_selected_version_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, ...]:
+    return version.authority_selected_identity()
 
 
 def _record_json_fits_table_property_bound(record_json: str) -> bool:
@@ -331,10 +377,23 @@ class _AzureTableTransaction(ContextTransactionPort):
         self._state_entity: Mapping[str, Any] | None = None
         self._generation = 0
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._cohort_decisions: dict[
+            tuple[str, str],
+            CohortDecisionRecord,
+        ] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
         self._creates: dict[str, dict[str, object]] = {}
         self._updates: dict[str, dict[str, object]] = {}
         self._dirty = False
@@ -383,6 +442,17 @@ class _AzureTableTransaction(ContextTransactionPort):
                 if _row_key_for_draft(draft) != row_key or draft.draft_id in self._drafts:
                     raise RuntimeError("context store draft key is invalid")
                 self._drafts[draft.draft_id] = draft
+            elif kind == "draft-selector-baseline":
+                baseline = self._decode_model(entity, DraftSelectorBaseline)
+                self._require_persisted_workload(baseline.manifest_id)
+                if (
+                    _row_key_for_draft_selector_baseline(baseline) != row_key
+                    or baseline.draft_id in self._draft_selector_baselines
+                ):
+                    raise RuntimeError(
+                        "context store draft selector baseline key is invalid"
+                    )
+                self._draft_selector_baselines[baseline.draft_id] = baseline
             elif kind == "published":
                 published = self._decode_model(entity, PublishedManifest)
                 self._require_persisted_workload(published.manifest_id)
@@ -409,6 +479,38 @@ class _AzureTableTransaction(ContextTransactionPort):
                 if _row_key_for_receipt(receipt) != row_key or key in self._receipts:
                     raise RuntimeError("context store receipt key is invalid")
                 self._receipts[key] = receipt
+            elif kind == "cohort-decision":
+                decision = self._decode_model(entity, CohortDecisionRecord)
+                self._require_persisted_workload(decision.manifest_id)
+                key = (decision.manifest_id, decision.decision_id)
+                version = decision.proposal_set_version()
+                version_key = _cohort_selected_version_key(version)
+                if (
+                    _row_key_for_cohort_decision(decision) != row_key
+                    or key in self._cohort_decisions
+                    or version_key in self._cohort_decision_versions
+                    or self._overlapping_cohort_decisions(version)
+                ):
+                    raise RuntimeError(
+                        "context store cohort decision key or authority is invalid"
+                    )
+                self._cohort_decisions[key] = decision
+                self._cohort_decision_versions[version_key] = key
+            elif kind == "cohort-decision-receipt":
+                receipt = self._decode_model(entity, CohortDecisionReceipt)
+                key = (receipt.actor_id, receipt.idempotency_key)
+                if (
+                    _row_key_for_cohort_decision_receipt(receipt) != row_key
+                    or key in self._cohort_decision_receipts
+                ):
+                    raise RuntimeError(
+                        "context store cohort decision receipt key is invalid"
+                    )
+                self._require_cohort_receipt_workload(
+                    receipt,
+                    persisted=True,
+                )
+                self._cohort_decision_receipts[key] = receipt
             else:
                 raise RuntimeError("context store contains an unknown entity kind")
         if self._state_entity is None and self._persisted:
@@ -460,6 +562,60 @@ class _AzureTableTransaction(ContextTransactionPort):
             self._require_persisted_workload(draft.manifest_id)
         else:
             self._require_workload(draft.manifest_id)
+
+    def _require_cohort_receipt_workload(
+        self,
+        receipt: CohortDecisionReceipt,
+        *,
+        persisted: bool,
+    ) -> None:
+        try:
+            decision = CohortDecisionRecord.model_validate_json(
+                receipt.response_json
+            )
+        except ValidationError as exc:
+            if persisted:
+                raise RuntimeError(
+                    "context store cohort decision receipt is invalid"
+                ) from exc
+            raise PersistenceConflictError(
+                "cohort decision receipt is invalid"
+            ) from exc
+        if persisted:
+            self._require_persisted_workload(decision.manifest_id)
+        else:
+            self._require_workload(decision.manifest_id)
+
+    def _overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]:
+        binding_key = _cohort_overlap_binding_key(version)
+        batch_key = version.batch_overlap_identity()
+        selected_proposal_ids = set(version.source_proposal_ids)
+        return [
+            decision
+            for decision in self._cohort_decisions.values()
+            if (
+                (
+                    _cohort_overlap_binding_key(
+                        decision.proposal_set_version()
+                    )
+                    == binding_key
+                    and rejection_authorities_overlap(
+                        version.source_rejection_authorities,
+                        decision.source_rejection_authorities,
+                    )
+                )
+                or (
+                    decision.proposal_set_version().batch_overlap_identity()
+                    == batch_key
+                    and selected_proposal_ids.intersection(
+                        decision.source_proposal_ids
+                    )
+                )
+            )
+        ]
 
     def _load_state(self, entity: Mapping[str, Any]) -> None:
         if self._state_entity is not None or entity.get("kind") != "state":
@@ -678,6 +834,55 @@ class _AzureTableTransaction(ContextTransactionPort):
             self._stage_update(row_key, entity)
         self._drafts[draft.draft_id] = normalized
 
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None:
+        baseline = self._draft_selector_baselines.get(draft_id)
+        return None if baseline is None else baseline.model_copy(deep=True)
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]:
+        self._require_workload(manifest_id)
+        matches = sorted(
+            (
+                baseline
+                for baseline in self._draft_selector_baselines.values()
+                if baseline.manifest_id == manifest_id
+                and (
+                    manifest_version is None
+                    or baseline.manifest_version == manifest_version
+                )
+            ),
+            key=lambda baseline: (baseline.captured_at, baseline.draft_id),
+        )
+        return [baseline.model_copy(deep=True) for baseline in matches]
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        self._require_workload(baseline.manifest_id)
+        if baseline.draft_id in self._draft_selector_baselines:
+            raise PersistenceConflictError(
+                "draft selector baseline is immutable"
+            )
+        normalized = baseline.model_copy(deep=True)
+        row_key = _row_key_for_draft_selector_baseline(normalized)
+        self._stage_create(
+            row_key,
+            self._record_entity(
+                row_key=row_key,
+                kind="draft-selector-baseline",
+                record=normalized,
+            ),
+        )
+        self._draft_selector_baselines[baseline.draft_id] = normalized
+
     def get_published(
         self,
         manifest_id: str,
@@ -809,3 +1014,120 @@ class _AzureTableTransaction(ContextTransactionPort):
             ),
         )
         self._receipts[key] = normalized
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None:
+        self._require_workload(manifest_id)
+        decision = self._cohort_decisions.get((manifest_id, decision_id))
+        return None if decision is None else decision.model_copy(deep=True)
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]:
+        self._require_workload(manifest_id)
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if decision.manifest_id == manifest_id
+                and (profile_id is None or decision.profile_id == profile_id)
+                and (
+                    draft_id is None
+                    or decision.source_draft.draft_id == draft_id
+                )
+                and (
+                    proposal_set_digest is None
+                    or decision.proposal_set_digest == proposal_set_digest
+                )
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
+        )
+        return [decision.model_copy(deep=True) for decision in matches]
+
+    def list_overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]:
+        self._require_workload(version.manifest_id)
+        return [
+            decision.model_copy(deep=True)
+            for decision in sorted(
+                self._overlapping_cohort_decisions(version),
+                key=lambda item: (item.decided_at, item.decision_id),
+            )
+        ]
+
+    def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
+        self._require_workload(decision.manifest_id)
+        decision_key = (decision.manifest_id, decision.decision_id)
+        version = decision.proposal_set_version()
+        version_key = _cohort_selected_version_key(version)
+        if decision_key in self._cohort_decisions:
+            raise PersistenceConflictError(
+                "cohort decision identifier already exists"
+            )
+        if version_key in self._cohort_decision_versions:
+            raise PersistenceConflictError(
+                "the proposal-set version already has an authoritative decision"
+            )
+        if self._overlapping_cohort_decisions(version):
+            raise PersistenceConflictError(
+                "an overlapping selected proposal already has an authoritative decision"
+            )
+        normalized = decision.model_copy(deep=True)
+        row_key = _row_key_for_cohort_decision(normalized)
+        self._stage_create(
+            row_key,
+            self._record_entity(
+                row_key=row_key,
+                kind="cohort-decision",
+                record=normalized,
+            ),
+        )
+        self._cohort_decisions[decision_key] = normalized
+        self._cohort_decision_versions[version_key] = decision_key
+
+    def get_cohort_decision_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> CohortDecisionReceipt | None:
+        receipt = self._cohort_decision_receipts.get(
+            (actor_id, idempotency_key)
+        )
+        if receipt is not None:
+            self._require_cohort_receipt_workload(
+                receipt,
+                persisted=False,
+            )
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_cohort_decision_receipt(
+        self,
+        receipt: CohortDecisionReceipt,
+    ) -> None:
+        self._require_cohort_receipt_workload(receipt, persisted=False)
+        key = (receipt.actor_id, receipt.idempotency_key)
+        if key in self._cohort_decision_receipts:
+            raise IdempotencyConflictError(
+                "cohort decision idempotency key has already been recorded"
+            )
+        normalized = receipt.model_copy(deep=True)
+        row_key = _row_key_for_cohort_decision_receipt(normalized)
+        self._stage_create(
+            row_key,
+            self._record_entity(
+                row_key=row_key,
+                kind="cohort-decision-receipt",
+                record=normalized,
+            ),
+        )
+        self._cohort_decision_receipts[key] = normalized

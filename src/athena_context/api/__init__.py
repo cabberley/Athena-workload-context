@@ -3,6 +3,14 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionAudit,
+    CohortDecisionKind,
+    CohortDecisionRecord,
+    CohortDecisionRequest,
+    CohortDecisionResponse,
+)
+from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortDraftBinding,
     CohortEvidenceBinding,
@@ -113,6 +121,12 @@ __all__ = [
     "AllWorkloadsGrantScope",
     "AzureTableContextStore",
     "CallableTrustedEvidenceSnapshotVerifier",
+    "CohortDecisionAudit",
+    "CohortDecisionKind",
+    "CohortDecisionRecord",
+    "CohortDecisionRequest",
+    "CohortDecisionResponse",
+    "CohortDecisionService",
     "CohortDraftBinding",
     "CohortEvidenceBinding",
     "CohortProposalBatchResponse",

@@ -725,7 +725,7 @@ def test_durable_store_rejects_partition_overflow_without_writing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     table, store_type = durable_store_factory
-    monkeypatch.setattr(durable, "_MAX_PARTITION_ENTITIES", 4)
+    monkeypatch.setattr(durable, "_MAX_PARTITION_ENTITIES", 5)
     service = _service(_initialized_store(store_type))
     draft = create_draft(
         service,

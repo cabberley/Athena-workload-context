@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from copy import deepcopy
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import Field, model_validator
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode
@@ -1442,10 +1442,37 @@ def _selector_override_is_narrower(
     previous: ManifestSelector | AtomicSelector,
     current: ManifestSelector | AtomicSelector,
 ) -> bool:
-    if (
-        previous.selector_type != current.selector_type
-        or current.max_matches > previous.max_matches
-    ):
+    if current.max_matches > previous.max_matches:
+        return False
+    if isinstance(current, CompositeAllSelector):
+        # A conjunction remains within an inherited selector when it retains
+        # every inherited conjunct, one inherited alternative, or the complete
+        # semantics of an inherited atomic selector.
+        if isinstance(previous, CompositeAllSelector):
+            return all(
+                any(
+                    _selector_override_is_narrower(
+                        previous_child,
+                        current_child,
+                    )
+                    for current_child in current.children
+                )
+                for previous_child in previous.children
+            )
+        if isinstance(previous, CompositeAnySelector):
+            return any(
+                _selector_override_is_narrower(
+                    previous_child,
+                    current_child,
+                )
+                for previous_child in previous.children
+                for current_child in current.children
+            )
+        return any(
+            _selector_override_is_narrower(previous, child)
+            for child in current.children
+        )
+    if previous.selector_type != current.selector_type:
         return False
     if isinstance(previous, ResourceIdListSelector) and isinstance(
         current, ResourceIdListSelector
@@ -1552,12 +1579,77 @@ def _selector_override_is_narrower(
     return False
 
 
+def is_guarded_selector_replacement_narrower(
+    previous: list[ManifestSelector],
+    current: list[ManifestSelector],
+) -> bool:
+    """Return whether a complete selector replacement is provably narrowing.
+
+    New selector identities are accepted only as guarded conjunctions. Each
+    conjunction must retain one inherited selector's complete semantics, and
+    the aggregate match bound cannot increase. Raw disjoint selectors remain
+    invalid even when their identifiers or payloads appear innocuous.
+    """
+
+    return (
+        bool(previous)
+        and bool(current)
+        and all(isinstance(selector, CompositeAllSelector) for selector in current)
+        and sum(selector.max_matches for selector in current)
+        <= sum(selector.max_matches for selector in previous)
+        and all(
+            any(
+                _selector_override_is_narrower(inherited, replacement)
+                for inherited in previous
+            )
+            for replacement in current
+        )
+    )
+
+
+class _CohortDecisionSelectorCapability(Protocol):
+    """Internal authority for one exact cohort-decision selector replacement."""
+
+    def permits_selector_identity_replacement(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str,
+        profile_id: str,
+        inherited_role: ManifestRole,
+        replacement_role: ManifestRole,
+    ) -> bool: ...
+
+
 def _normalized_filters_overlap(left: list[str], right: list[str]) -> bool:
     if not left or not right:
         return True
     return bool(
         {_normalized_id(value) for value in left}
         & {_normalized_id(value) for value in right}
+    )
+
+
+def _resource_ids_may_match_name(
+    resource_ids: list[str],
+    selector: NamePredicateSelector,
+) -> bool:
+    prefix = (
+        None if selector.prefix is None else _normalized_id(selector.prefix)
+    )
+    suffix = (
+        None if selector.suffix is None else _normalized_id(selector.suffix)
+    )
+    return any(
+        (
+            prefix is None
+            or _normalized_id(resource_id.rsplit("/", 1)[-1]).startswith(prefix)
+        )
+        and (
+            suffix is None
+            or _normalized_id(resource_id.rsplit("/", 1)[-1]).endswith(suffix)
+        )
+        for resource_id in resource_ids
     )
 
 
@@ -1580,6 +1672,14 @@ def _selectors_may_overlap(
             {_normalized_id(value) for value in left.resource_ids}
             & {_normalized_id(value) for value in right.resource_ids}
         )
+    if isinstance(left, ResourceIdListSelector) and isinstance(
+        right, NamePredicateSelector
+    ):
+        return _resource_ids_may_match_name(left.resource_ids, right)
+    if isinstance(left, NamePredicateSelector) and isinstance(
+        right, ResourceIdListSelector
+    ):
+        return _resource_ids_may_match_name(right.resource_ids, left)
     if isinstance(left, TagPredicateSelector) and isinstance(
         right, TagPredicateSelector
     ):
@@ -1727,6 +1827,8 @@ def _normalized_optional_ref_list(value: Any) -> tuple[str, ...] | None:
 
 def _validate_inherited_semantics(
     *,
+    manifest_id: str,
+    manifest_version: str,
     child: ManifestProfile,
     inherited_roles: list[ManifestRole],
     roles: list[ManifestRole],
@@ -1739,6 +1841,7 @@ def _validate_inherited_semantics(
     inherited_risks: list[ManifestRiskAcceptance],
     risks: list[ManifestRiskAcceptance],
     as_of: datetime,
+    selector_capability: _CohortDecisionSelectorCapability | None,
 ) -> None:
     inherited_roles_by_id = {
         _normalized_id(item.role_id): item for item in inherited_roles
@@ -1755,8 +1858,20 @@ def _validate_inherited_semantics(
             _normalized_id(item.selector_id): item for item in current.selectors
         }
         if current_selectors.keys() != previous_selectors.keys():
+            if selector_capability is not None and (
+                previous_selectors.keys().isdisjoint(current_selectors.keys())
+                and selector_capability.permits_selector_identity_replacement(
+                    manifest_id=manifest_id,
+                    manifest_version=manifest_version,
+                    profile_id=child.profile_id,
+                    inherited_role=previous,
+                    replacement_role=current,
+                )
+            ):
+                continue
             raise AthenaValidationError(
-                f"direct selector set expansion is ambiguous for inherited role {current.role_id}"
+                "inherited selector identities are immutable outside an exact "
+                f"cohort decision for role {current.role_id}"
             )
         for selector_id, previous_selector in previous_selectors.items():
             current_selector = current_selectors[selector_id]
@@ -1918,6 +2033,10 @@ def _merge_keyed[T: AthenaBaseModel](
     additions: list[T],
     *,
     key_attribute: str,
+    manifest_id: str | None = None,
+    manifest_version: str | None = None,
+    profile_id: str | None = None,
+    selector_capability: _CohortDecisionSelectorCapability | None = None,
 ) -> list[T]:
     merged = {_normalized_id(_item_key(item, key_attribute)): item for item in current}
     for item in additions:
@@ -1937,11 +2056,39 @@ def _merge_keyed[T: AthenaBaseModel](
                 f"protected constraint cannot be unprotected: {item.constraint_id}"
             )
         if isinstance(previous, ManifestRole) and isinstance(item, ManifestRole):
-            selectors = _merge_keyed(
-                list(previous.selectors),
-                list(item.selectors),
-                key_attribute="selector_id",
-            )
+            previous_selector_ids = {
+                _normalized_id(selector.selector_id)
+                for selector in previous.selectors
+            }
+            local_selector_ids = {
+                _normalized_id(selector.selector_id)
+                for selector in item.selectors
+            }
+            if previous_selector_ids.isdisjoint(local_selector_ids):
+                if (
+                    selector_capability is None
+                    or manifest_id is None
+                    or manifest_version is None
+                    or profile_id is None
+                    or not selector_capability.permits_selector_identity_replacement(
+                        manifest_id=manifest_id,
+                        manifest_version=manifest_version,
+                        profile_id=profile_id,
+                        inherited_role=previous,
+                        replacement_role=item,
+                    )
+                ):
+                    raise AthenaValidationError(
+                        "inherited selector identities are immutable outside "
+                        f"an exact cohort decision for role {item.role_id}"
+                    )
+                selectors = list(item.selectors)
+            else:
+                selectors = _merge_keyed(
+                    list(previous.selectors),
+                    list(item.selectors),
+                    key_attribute="selector_id",
+                )
             payload = item.model_dump(mode="python", by_alias=True)
             payload["selectors"] = selectors
             item = ManifestRole.model_validate(payload)  # type: ignore[assignment]
@@ -2963,6 +3110,140 @@ def validate_resolved_manifest_profile(
     _validate_canonical_protected_constraints(profile)
 
 
+def validate_manifest_selector_identity_inheritance(
+    manifest: CanonicalWorkloadManifest,
+) -> None:
+    """Fail closed on selector identity changes in every generic profile path."""
+
+    profiles = {
+        _normalized_id(profile.profile_id): profile
+        for profile in manifest.profiles.values()
+    }
+    resolved_roles: dict[str, list[ManifestRole]] = {}
+
+    def roles_for(profile: ManifestProfile) -> list[ManifestRole]:
+        profile_id = _normalized_id(profile.profile_id)
+        cached = resolved_roles.get(profile_id)
+        if cached is not None:
+            return cached
+        inherited = (
+            list(manifest.roles)
+            if profile.extends is None
+            else list(roles_for(profiles[_normalized_id(profile.extends)]))
+        )
+        inherited_by_id = {
+            _normalized_id(role.role_id): role for role in inherited
+        }
+        for role in profile.roles:
+            previous = inherited_by_id.get(_normalized_id(role.role_id))
+            if previous is None:
+                continue
+            previous_selectors = {
+                _normalized_id(selector.selector_id): selector
+                for selector in previous.selectors
+            }
+            current_selectors = {
+                _normalized_id(selector.selector_id): selector
+                for selector in role.selectors
+            }
+            if current_selectors.keys() != previous_selectors.keys():
+                raise AthenaValidationError(
+                    "inherited selector identities are immutable outside an "
+                    f"exact cohort decision for role {role.role_id}"
+                )
+            for selector_id, previous_selector in previous_selectors.items():
+                current_selector = current_selectors[selector_id]
+                if (
+                    current_selector != previous_selector
+                    and not _selector_override_is_narrower(
+                        previous_selector,
+                        current_selector,
+                    )
+                ):
+                    raise AthenaValidationError(
+                        "direct selector weakening or ambiguous selector override "
+                        f"is invalid for inherited role {role.role_id}"
+                    )
+        resolved = _merge_keyed(
+            inherited,
+            list(profile.roles),
+            key_attribute="role_id",
+        )
+        resolved_roles[profile_id] = resolved
+        return resolved
+
+    for profile in profiles.values():
+        roles_for(profile)
+
+
+def validate_manifest_selector_identity_transition(
+    current: CanonicalWorkloadManifest,
+    replacement: CanonicalWorkloadManifest,
+) -> None:
+    """Reject selector identity changes hidden by moving an existing role.
+
+    A generic draft replacement has no cohort-decision authority. Compare both
+    global roles and every profile-local override so a replacement cannot make
+    reviewed selector identities the new global inheritance baseline.
+    """
+
+    def inventory(
+        manifest: CanonicalWorkloadManifest,
+    ) -> tuple[
+        dict[str, frozenset[str]],
+        dict[tuple[str, str], frozenset[str]],
+    ]:
+        by_role: dict[str, set[str]] = {}
+        by_location: dict[tuple[str, str], frozenset[str]] = {}
+
+        def add_roles(location: str, roles: list[ManifestRole]) -> None:
+            for role in roles:
+                role_id = _normalized_id(role.role_id)
+                selector_ids = frozenset(
+                    _normalized_id(nested.selector_id)
+                    for selector in role.selectors
+                    for nested in _selector_tree(selector)
+                )
+                by_role.setdefault(role_id, set()).update(selector_ids)
+                by_location[(location, role_id)] = selector_ids
+
+        add_roles("global", list(manifest.roles))
+        for profile in manifest.profiles.values():
+            add_roles(
+                f"profile:{_normalized_id(profile.profile_id)}",
+                list(profile.roles),
+            )
+        return (
+            {
+                role_id: frozenset(selector_ids)
+                for role_id, selector_ids in by_role.items()
+            },
+            by_location,
+        )
+
+    current_by_role, current_by_location = inventory(current)
+    replacement_by_role, replacement_by_location = inventory(replacement)
+    for role_id in current_by_role.keys() & replacement_by_role.keys():
+        if current_by_role[role_id] != replacement_by_role[role_id]:
+            raise AthenaValidationError(
+                "selector identities for an existing role are immutable "
+                f"outside an exact cohort decision for role {role_id}"
+            )
+    for location_and_role in (
+        current_by_location.keys() & replacement_by_location.keys()
+    ):
+        if (
+            current_by_location[location_and_role]
+            != replacement_by_location[location_and_role]
+        ):
+            location, role_id = location_and_role
+            raise AthenaValidationError(
+                "selector identities for an existing role are immutable "
+                "outside an exact cohort decision for "
+                f"role {role_id} at {location}"
+            )
+
+
 def resolve_manifest_profile(
     manifest: CanonicalWorkloadManifest,
     profile_id: str,
@@ -2970,18 +3251,60 @@ def resolve_manifest_profile(
     as_of: datetime,
     _validate_complete_graph: bool = True,
 ) -> ResolvedManifestProfile:
+    """Resolve a manifest without any authority to replace selector identities."""
+
+    return _resolve_manifest_profile(
+        manifest,
+        profile_id,
+        as_of=as_of,
+        validate_complete_graph=_validate_complete_graph,
+        selector_capability=None,
+    )
+
+
+def _resolve_manifest_profile_for_cohort_decision(
+    manifest: CanonicalWorkloadManifest,
+    profile_id: str,
+    *,
+    as_of: datetime,
+    selector_capability: _CohortDecisionSelectorCapability,
+) -> ResolvedManifestProfile:
+    """Resolve one exact decision-bound selector replacement.
+
+    This internal entry point is intentionally absent from the public contract
+    exports. Generic manifest validation always resolves without a capability.
+    """
+
+    return _resolve_manifest_profile(
+        manifest,
+        profile_id,
+        as_of=as_of,
+        validate_complete_graph=True,
+        selector_capability=selector_capability,
+    )
+
+
+def _resolve_manifest_profile(
+    manifest: CanonicalWorkloadManifest,
+    profile_id: str,
+    *,
+    as_of: datetime,
+    validate_complete_graph: bool,
+    selector_capability: _CohortDecisionSelectorCapability | None,
+) -> ResolvedManifestProfile:
     if (
         manifest.compatibility.artifact_digest != manifest.compute_artifact_digest_value()
         or manifest.compatibility.semantic_digest != manifest.compute_semantic_digest_value()
     ):
         raise AthenaValidationError("manifest changed after digest validation")
-    if _validate_complete_graph:
+    if validate_complete_graph:
         resolved_profiles = {
-            _normalized_id(candidate.profile_id): resolve_manifest_profile(
+            _normalized_id(candidate.profile_id): _resolve_manifest_profile(
                 manifest,
                 candidate.profile_id,
                 as_of=as_of,
-                _validate_complete_graph=False,
+                validate_complete_graph=False,
+                selector_capability=selector_capability,
             )
             for candidate in manifest.profiles.values()
         }
@@ -3029,7 +3352,15 @@ def resolve_manifest_profile(
         inherited_constraints = list(constraints)
         inherited_controls = list(controls)
         inherited_risks = list(risks)
-        roles = _merge_keyed(roles, list(profile.roles), key_attribute="role_id")
+        roles = _merge_keyed(
+            roles,
+            list(profile.roles),
+            key_attribute="role_id",
+            manifest_id=manifest.manifest_id,
+            manifest_version=manifest.manifest_version,
+            profile_id=profile.profile_id,
+            selector_capability=selector_capability,
+        )
         _validate_role_requirement_weakening(
             inherited_roles,
             roles,
@@ -3063,6 +3394,8 @@ def resolve_manifest_profile(
         )
         owners = _merge_keyed(owners, list(profile.ownership), key_attribute="owner_ref")
         _validate_inherited_semantics(
+            manifest_id=manifest.manifest_id,
+            manifest_version=manifest.manifest_version,
             child=profile,
             inherited_roles=inherited_roles,
             roles=roles,
@@ -3075,6 +3408,7 @@ def resolve_manifest_profile(
             inherited_risks=inherited_risks,
             risks=risks,
             as_of=as_of,
+            selector_capability=selector_capability,
         )
         _validate_override_owners(
             profile,
@@ -3568,6 +3902,7 @@ __all__ = [
     "EvidenceContextVerifier",
     "GovernedWeakeningOverride",
     "ImageSelector",
+    "is_guarded_selector_replacement_narrower",
     "LoadBalancerBackendSelector",
     "ManifestConstraint",
     "ManifestControl",
@@ -3599,5 +3934,7 @@ __all__ = [
     "canonicalize_manifest_payload",
     "resolve_manifest_profile",
     "validate_resolved_manifest_profile",
+    "validate_manifest_selector_identity_inheritance",
+    "validate_manifest_selector_identity_transition",
     "verified_snapshot_context_verifier",
 ]

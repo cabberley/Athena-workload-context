@@ -34,7 +34,7 @@ PUBLICATION_SERVICE = Actor(actor_id="athena-context-api", kind=ActorKind.SERVIC
 
 class StepClock:
     def __init__(self) -> None:
-        self._value = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+        self._value = datetime(2025, 6, 1, 0, 0, tzinfo=UTC)
 
     def now(self) -> datetime:
         value = self._value
@@ -42,7 +42,10 @@ class StepClock:
         return value
 
 
-def build_service() -> ContextService:
+def build_service(
+    *,
+    store: InMemoryContextStore | None = None,
+) -> ContextService:
     grants = [
         RoleGrant(actor_id=AGENT.actor_id, role=Role.PROPOSER),
         # Deliberately privileged grants prove that actor-kind checks remain authoritative.
@@ -54,7 +57,7 @@ def build_service() -> ContextService:
         RoleGrant(actor_id=AUDITOR.actor_id, role=Role.AUDITOR),
     ]
     return ContextService(
-        store=InMemoryContextStore(),
+        store=store or InMemoryContextStore(),
         authorization=RoleBasedAuthorization(grants),
         clock=StepClock(),
         publication_actor=PUBLICATION_SERVICE,
@@ -69,6 +72,20 @@ def canonical_manifest(
 ) -> CanonicalWorkloadManifest:
     fixture = files("athena_context.data.fixtures").joinpath("canonical-manifest.json")
     payload = json.loads(fixture.read_text(encoding="utf-8"))
+    original_manifest_id = payload["manifestId"]
+    if manifest_id != "*" and manifest_id != original_manifest_id:
+        def replace_manifest_scope(value: object) -> object:
+            if isinstance(value, dict):
+                return {
+                    key: replace_manifest_scope(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [replace_manifest_scope(item) for item in value]
+            return manifest_id if value == original_manifest_id else value
+
+        payload = replace_manifest_scope(payload)
+        assert isinstance(payload, dict)
     payload["manifestId"] = manifest_id
     payload["manifestVersion"] = version
     if display_suffix:

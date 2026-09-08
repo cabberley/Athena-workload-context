@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
 
 import pytest
@@ -11,12 +12,20 @@ from athena_context.api.domain import (
     Actor,
     AuthenticationMethod,
     CreateDraftCommand,
+    DraftState,
     PublishCommand,
+    ReplaceDraftCommand,
     TransitionCommand,
+    ValidationRecord,
     VerifiedAuthentication,
 )
 from athena_context.api.http import SystemClock, create_app
+from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
+from athena_context.contracts.manifest import (
+    CanonicalWorkloadManifest,
+    canonicalize_manifest_payload,
+)
 from context_api_support import (
     AGENT,
     APPROVER,
@@ -53,8 +62,11 @@ def _verified(actor: Actor) -> VerifiedAuthentication:
     )
 
 
-def _client() -> tuple[ContextService, TestClient]:
-    service = build_service()
+def _client(
+    *,
+    store: InMemoryContextStore | None = None,
+) -> tuple[ContextService, TestClient]:
+    service = build_service(store=store)
     authenticator = StaticTestAuthenticator(
         {
             _TOKENS[actor.actor_id]: _verified(actor)
@@ -63,6 +75,39 @@ def _client() -> tuple[ContextService, TestClient]:
     )
     return service, TestClient(
         create_app(service=service, authentication=authenticator)
+    )
+
+
+def _invalid_inherited_selector_manifest(
+    base: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = base.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    worker = next(
+        role for role in payload["roles"] if role["roleId"] == "worker"
+    )
+    replacement = deepcopy(worker)
+    replacement["selectors"][0]["selectorId"] = "arbitrary-inherited-selector"
+    payload["profiles"]["production"]["roles"] = [replacement]
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+
+
+def _unresolved_profile_manifest(
+    base: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = base.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["roles"][0]["ownerRef"] = "missing-synthetic-owner"
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
     )
 
 
@@ -297,6 +342,215 @@ def test_http_digest_failure_is_typed() -> None:
 
     assert digest_response.status_code == 409
     assert digest_response.json()["error"]["code"] == "digest_mismatch"
+
+
+def test_http_create_resolves_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    _, client = _client(store=store)
+    manifest = _invalid_inherited_selector_manifest(canonical_manifest())
+    create = CreateDraftCommand(
+        draft_id="invalid-inheritance-workflow",
+        manifest=manifest,
+        manifest_digest=manifest.compatibility.artifact_digest,
+        reason="Create a structurally valid but unresolved synthetic draft",
+    )
+    created = client.post(
+        "/v1/drafts",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-create"),
+        json=create.model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert created.status_code == 422, created.text
+    assert created.json()["error"]["code"] == "manifest_validation_failed"
+    with store.transaction() as tx:
+        assert tx.get_draft(create.draft_id) is None
+        assert tx.get_draft_selector_baseline(create.draft_id) is None
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == []
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-create",
+        ) is None
+
+
+def test_http_put_resolves_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-profile-put",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    command = ReplaceDraftCommand(
+        expected_revision=initial.revision,
+        expected_manifest_version=initial.manifest.manifest_version,
+        expected_digest=initial.manifest_digest,
+        replacement_manifest=manifest,
+        replacement_digest=manifest.compatibility.artifact_digest,
+        reason="Reject an unresolved profile before ordinary replacement",
+    )
+    with store.transaction() as tx:
+        audit_before = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    response = client.put(
+        f"/v1/drafts/{initial.draft_id}",
+        headers=_headers(AGENT.actor_id, "invalid-profile-put"),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == initial
+    with store.transaction() as tx:
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
+        assert tx.get_receipt(AGENT.actor_id, "invalid-profile-put") is None
+
+
+def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-inheritance-workflow",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    tampered = initial.model_copy(
+        update={
+            "manifest": manifest,
+            "manifest_digest": manifest.compatibility.artifact_digest,
+        }
+    )
+    with store.transaction() as tx:
+        tx.put_draft(tampered, expected_revision=initial.revision)
+        audit_before_validate = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    validate = client.post(
+        f"/v1/drafts/{initial.draft_id}/validate",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-validate"),
+        json=transition(
+            tampered,
+            "Reject unresolved selector inheritance during validation",
+        ).model_dump(mode="json"),
+    )
+
+    assert validate.status_code == 422, validate.text
+    assert validate.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == tampered
+    with store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=manifest.manifest_id
+        ) == audit_before_validate
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-validate",
+        ) is None
+        current = tx.get_draft(initial.draft_id)
+        assert current is not None
+        previously_validated = current.model_copy(
+            update={
+                "state": DraftState.VALIDATED,
+                "revision": 2,
+                "validation": ValidationRecord(
+                    validated_by=AGENT,
+                    validated_at=current.updated_at,
+                    validated_revision=2,
+                    manifest_digest=current.manifest_digest,
+                ),
+            }
+        )
+        tx.put_draft(previously_validated, expected_revision=current.revision)
+    with store.transaction() as tx:
+        audit_before_submit = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    submit = client.post(
+        f"/v1/drafts/{initial.draft_id}/submit",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-submit"),
+        json=transition(
+            previously_validated,
+            "Reject unresolved selector inheritance during submission",
+        ).model_dump(mode="json"),
+    )
+
+    assert submit.status_code == 422, submit.text
+    assert submit.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == previously_validated
+    with store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=manifest.manifest_id
+        ) == audit_before_submit
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-submit",
+        ) is None
+
+
+def test_http_publish_rechecks_profile_resolution_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    approved = approve_draft(
+        service,
+        create_draft(
+            service,
+            canonical_manifest(),
+            draft_id="invalid-inheritance-publish",
+        ),
+        key_prefix="invalid-inheritance-publish",
+    )
+    assert approved.review is not None
+    assert approved.publication_candidate is not None
+    assert approved.approval is not None
+    manifest = _unresolved_profile_manifest(approved.manifest)
+    digest = manifest.compatibility.artifact_digest
+    tampered = approved.model_copy(
+        update={
+            "manifest": manifest,
+            "manifest_digest": digest,
+            "review": approved.review.model_copy(
+                update={"publication_candidate_digest": digest}
+            ),
+            "publication_candidate": approved.publication_candidate.model_copy(
+                update={
+                    "manifest_digest": digest,
+                    "semantic_digest": manifest.compatibility.semantic_digest,
+                }
+            ),
+            "approval": approved.approval.model_copy(
+                update={"manifest_digest": digest}
+            ),
+        }
+    )
+    with store.transaction() as tx:
+        tx.put_draft(tampered, expected_revision=approved.revision)
+        audit_before = tx.list_audit(manifest_id=manifest.manifest_id)
+    command = PublishCommand(
+        **transition(
+            tampered,
+            "Reject unresolved selector inheritance before publication",
+        ).model_dump(),
+        approval_id=tampered.approval.decision_id,
+    )
+
+    response = client.post(
+        f"/v1/drafts/{tampered.draft_id}/publish",
+        headers=_headers(PUBLISHER.actor_id, "invalid-inheritance-publish-final"),
+        json=command.model_dump(mode="json"),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(PUBLISHER, tampered.draft_id) == tampered
+    with store.transaction() as tx:
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
+        assert tx.get_receipt(
+            PUBLISHER.actor_id,
+            "invalid-inheritance-publish-final",
+        ) is None
+        assert tx.list_published(manifest_id=manifest.manifest_id) == []
 
 
 def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None:

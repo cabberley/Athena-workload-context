@@ -11,11 +11,20 @@ from athena_context.api.authorization import (
     RejectUnverifiedAuthentication,
     RoleBasedAuthorization,
 )
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionRequest,
+    CohortDecisionResponse,
+    decision_response,
+)
+from athena_context.api.cohort_decision_ports import CohortDecisionStorePort
+from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
+    CohortDraftBinding,
     CohortProposalBatchResponse,
     CohortProposalQuery,
     CohortReviewCandidate,
     CohortReviewPreviewRequest,
+    ProfileType,
 )
 from athena_context.api.cohort_memory import (
     EmptyEvidenceSnapshotRepository,
@@ -75,6 +84,7 @@ from athena_context.api.ports import (
     ContextStorePort,
 )
 from athena_context.api.service import ContextService
+from athena_context.binding.domain import ProposalScope
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _VERSION_PATTERN = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
@@ -149,6 +159,7 @@ def create_app(
     demo_evaluation_dependencies: DemoEvaluationDependencies | None = None,
     demo_evaluation_service: DemoEvaluationService | None = None,
     cohort_service: CohortProposalService | None = None,
+    cohort_decision_service: CohortDecisionService | None = None,
 ) -> FastAPI:
     if service is not None and store is not None:
         raise ValueError("provide either a ContextService or its context store, not both")
@@ -196,16 +207,29 @@ def create_app(
             ),
             demo_evaluation_trust=demo_trust,
         )
+    cohort_persistence = InMemoryCohortPersistence()
+    decision_store = cast(
+        CohortDecisionStorePort,
+        default_store or InMemoryContextStore(),
+    )
     if cohort_service is None:
-        cohort_persistence = InMemoryCohortPersistence()
         cohort_service = CohortProposalService(
-            context_store=default_store or InMemoryContextStore(),
+            context_store=decision_store,
             authorization=effective_authorization,
             clock=SystemClock(),
             snapshot_repository=EmptyEvidenceSnapshotRepository(),
             snapshot_verifier=RejectingTrustedEvidenceSnapshotVerifier(),
             proposal_cache=cohort_persistence,
             preview_receipts=cohort_persistence,
+        )
+    if cohort_decision_service is None:
+        cohort_decision_service = CohortDecisionService(
+            store=decision_store,
+            authorization=effective_authorization,
+            clock=SystemClock(),
+            context_service=service,
+            proposal_service=cohort_service,
+            candidate_repository=cohort_persistence,
         )
     authenticator = authentication or RejectUnverifiedAuthentication()
     bound_demo_evaluation = (
@@ -311,6 +335,132 @@ def create_app(
         actor: ActorDependency,
     ) -> CohortReviewCandidate:
         return cohort_service.preview(actor, idempotency_key, command)
+
+    @application.post(
+        "/v1/cohort-proposals/decisions",
+        response_model=CohortDecisionResponse,
+        response_model_exclude_none=False,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    def decide_cohort_proposals(
+        command: CohortDecisionRequest,
+        idempotency_key: IdempotencyHeader,
+        actor: ActorDependency,
+    ) -> CohortDecisionResponse:
+        return decision_response(
+            cohort_decision_service.decide(
+                actor,
+                idempotency_key,
+                command,
+            )
+        )
+
+    @application.get(
+        "/v1/cohort-proposals/decisions/{decision_id}",
+        response_model=CohortDecisionResponse,
+        response_model_exclude_none=False,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+        },
+    )
+    def get_cohort_decision(
+        decision_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+        manifest_id: WorkloadQuery,
+        actor: ActorDependency,
+    ) -> CohortDecisionResponse:
+        return decision_response(
+            cohort_decision_service.get(
+                actor,
+                manifest_id=manifest_id,
+                decision_id=decision_id,
+            )
+        )
+
+    @application.get(
+        "/v1/cohort-proposals/decisions",
+        response_model=list[CohortDecisionResponse],
+        response_model_exclude_none=False,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+        },
+    )
+    def list_cohort_decisions(
+        manifest_id: WorkloadQuery,
+        manifest_version: Annotated[str, Query(pattern=_VERSION_PATTERN)],
+        profile_id: Annotated[str, Query(pattern=_ID_PATTERN)],
+        profile_type: Annotated[
+            ProfileType,
+            Query(
+                pattern=(
+                    "^(production|development|training|test|"
+                    "disasterRecovery|sandbox)$"
+                )
+            ),
+        ],
+        resolved_profile_digest: Annotated[
+            str,
+            Query(pattern=r"^sha256:[a-f0-9]{64}$"),
+        ],
+        draft_id: Annotated[str, Query(pattern=_ID_PATTERN)],
+        expected_revision: Annotated[
+            int,
+            Query(ge=1, le=9_007_199_254_740_991),
+        ],
+        expected_digest: Annotated[
+            str,
+            Query(pattern=r"^sha256:[a-f0-9]{64}$"),
+        ],
+        proposal_ids: Annotated[
+            list[str],
+            Query(min_length=1, max_length=200),
+        ],
+        proposal_set_digest: Annotated[
+            str,
+            Query(pattern=r"^sha256:[a-f0-9]{64}$"),
+        ],
+        snapshot_artifact_digest: Annotated[
+            str,
+            Query(pattern=r"^sha256:[a-f0-9]{64}$"),
+        ],
+        actor: ActorDependency,
+        limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    ) -> list[CohortDecisionResponse]:
+        scope = ProposalScope(
+            manifestId=manifest_id,
+            manifestVersion=manifest_version,
+            profileId=profile_id,
+            profileType=profile_type,
+            resolvedProfileDigest=resolved_profile_digest,
+        )
+        source_draft = CohortDraftBinding(
+            draftId=draft_id,
+            revision=expected_revision,
+            manifestDigest=expected_digest,
+        )
+        return [
+            decision_response(decision)
+            for decision in cohort_decision_service.list_decisions(
+            actor,
+            manifest_id=manifest_id,
+            scope=scope,
+            source_draft=source_draft,
+            proposal_ids=proposal_ids,
+            proposal_set_digest=proposal_set_digest,
+            snapshot_artifact_digest=snapshot_artifact_digest,
+            limit=limit,
+            )
+        ]
 
     @application.post(
         "/v1/drafts",

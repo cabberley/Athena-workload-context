@@ -73,7 +73,18 @@ class CohortPreviewReceiptPort(Protocol):
     ) -> CohortPreviewReceipt: ...
 
 
+class CohortCandidateRepositoryPort(Protocol):
+    """Actor-scoped immutable lookup of server-generated candidates."""
+
+    def get_candidate(
+        self,
+        actor_id: str,
+        candidate_id: str,
+    ) -> CohortPreviewReceipt | None: ...
+
+
 __all__ = [
+    "CohortCandidateRepositoryPort",
     "CohortPreviewReceiptPort",
     "CohortProposalCachePort",
     "EvidenceSnapshotRepositoryPort",
