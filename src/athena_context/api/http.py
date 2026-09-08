@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from time import time_ns
-from typing import Annotated, cast
+from typing import Annotated, Protocol, cast
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -22,6 +22,7 @@ from athena_context.api.cohort_memory import (
     InMemoryCohortPersistence,
     RejectingTrustedEvidenceSnapshotVerifier,
 )
+from athena_context.api.cohort_ports import ExplicitWorkloadAuthorizationPort
 from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
@@ -68,7 +69,11 @@ from athena_context.api.evaluation_service import (
     DemoEvaluationService,
 )
 from athena_context.api.memory import InMemoryContextStore
-from athena_context.api.ports import AuthenticationPort
+from athena_context.api.ports import (
+    AuthenticationPort,
+    AuthorizationPort,
+    ContextStorePort,
+)
 from athena_context.api.service import ContextService
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
@@ -84,6 +89,14 @@ IdempotencyHeader = Annotated[
 VersionQuery = Annotated[str, Query(pattern=_VERSION_PATTERN)]
 WorkloadQuery = Annotated[WorkloadIdentifier, Query()]
 WorkloadPath = Annotated[WorkloadIdentifier, Path()]
+
+
+class _ApplicationAuthorizationPort(
+    AuthorizationPort,
+    ExplicitWorkloadAuthorizationPort,
+    Protocol,
+):
+    pass
 
 
 class ErrorDetail(ApiModel):
@@ -130,18 +143,25 @@ ActorDependency = Annotated[Actor, Depends(_current_actor)]
 def create_app(
     *,
     service: ContextService | None = None,
+    store: ContextStorePort | None = None,
     authentication: AuthenticationPort | None = None,
+    authorization: _ApplicationAuthorizationPort | None = None,
     demo_evaluation_dependencies: DemoEvaluationDependencies | None = None,
     demo_evaluation_service: DemoEvaluationService | None = None,
     cohort_service: CohortProposalService | None = None,
 ) -> FastAPI:
+    if service is not None and store is not None:
+        raise ValueError("provide either a ContextService or its context store, not both")
     if demo_evaluation_service is not None:
         raise DemoEvaluationConfigurationError(
             "preconstructed demo evaluation services are rejected; provide only "
             "non-authoritative dependencies for composition with the app-owned "
             "ContextService"
         )
-    default_store: InMemoryContextStore | None = None
+    default_store: ContextStorePort | None = None
+    effective_authorization: _ApplicationAuthorizationPort = (
+        authorization or RoleBasedAuthorization()
+    )
     if service is None:
         default_clock = SystemClock()
         demo_trust: DemoEvaluationTrustConfiguration | None = None
@@ -162,13 +182,13 @@ def create_app(
                 record=record,
                 revision=1,
             )
-        default_store = InMemoryContextStore(
+        default_store = store or InMemoryContextStore(
             authoritative_clock=default_clock,
             demo_evaluation_trusted_key=trusted_key,
         )
         service = ContextService(
             store=default_store,
-            authorization=RoleBasedAuthorization(),
+            authorization=effective_authorization,
             clock=default_clock,
             publication_actor=Actor(
                 actor_id="athena-context-api",
@@ -180,7 +200,7 @@ def create_app(
         cohort_persistence = InMemoryCohortPersistence()
         cohort_service = CohortProposalService(
             context_store=default_store or InMemoryContextStore(),
-            authorization=RoleBasedAuthorization(),
+            authorization=effective_authorization,
             clock=SystemClock(),
             snapshot_repository=EmptyEvidenceSnapshotRepository(),
             snapshot_verifier=RejectingTrustedEvidenceSnapshotVerifier(),

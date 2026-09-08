@@ -180,6 +180,7 @@ def test_context_and_explanation_are_deterministic_without_raw_bodies(
         "get_context",
         {
             "workload_id": WORKLOAD_ID,
+            "manifest_version": "1.1.0",
             "profile_id": "production",
             "sections": ["constraints", "riskAcceptances"],
         },
@@ -189,6 +190,7 @@ def test_context_and_explanation_are_deterministic_without_raw_bodies(
         "explain_finding",
         {
             "workload_id": WORKLOAD_ID,
+            "manifest_version": "1.1.0",
             "profile_id": "production",
             "clause_id": "db-zone-loss-spof",
         },

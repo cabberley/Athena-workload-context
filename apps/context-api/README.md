@@ -4,16 +4,90 @@ This ASGI service is the sole authoritative writer for workload manifests. It ex
 optimistically concurrent draft, validation, review, human approval, publication, supersession,
 comparison, and audit operations.
 
-The default composition root intentionally rejects every credential and has no grants. A
-deployment must inject an authentication port that verifies Entra/JWT credentials before returning
-typed actor claims, plus manifest-scoped role grants. `X-Athena-Actor` and other caller-supplied
-identity assertions are never trusted. Agent actors are denied approval, publication, and
-supersession even if they are accidentally granted a privileged role.
+The test/default composition intentionally rejects every credential and has no grants.
+`apps/context-api/main.py` is the production composition root; it configures Entra/JWT
+authentication and deployment-owned exact-workload role grants before exposing the API.
+`X-Athena-Actor` and other caller-supplied identity assertions are never trusted. Service actors
+are denied approval, publication, and supersession even if they are accidentally granted a
+privileged role.
 
 Published manifest values are immutable. Supersession is stored as a separate append-only relation.
 Submission replaces untrusted draft audit values with a server-finalized publication candidate and
 recomputes canonical digests. Human approval binds that exact candidate; publication does not
 mutate it.
+
+## Durable production persistence
+
+`apps/context-api/main.py` is the production ASGI root. It refuses startup unless these
+deployment-provided settings select the dedicated Azure Table context store:
+
+- `ATHENA_CONTEXT_STORE_ENDPOINT`
+- `ATHENA_CONTEXT_STORE_TABLE_NAME`
+- `ATHENA_CONTEXT_STORE_PARTITION_KEY`
+- `ATHENA_CONTEXT_IDENTITY_CLIENT_ID`
+- `ATHENA_CONTEXT_STORE_WORKLOAD_ID`
+- `ATHENA_CONTEXT_AUTH_TENANT_ID`
+- `ATHENA_CONTEXT_AUTH_AUDIENCE`
+- `ATHENA_CONTEXT_AUTH_DELEGATED_SCOPE`
+- `ATHENA_CONTEXT_ROLE_GRANTS_JSON`
+
+`ATHENA_CONTEXT_AUTH_TENANT_ID` must be the deployment's Entra tenant GUID.
+`ATHENA_CONTEXT_AUTH_AUDIENCE` is the exact Context API resource audience. The API accepts only
+bounded RS256 tokens resolved from that tenant's v2 JWKS endpoint, with the exact v2 issuer,
+audience, `exp`, `nbf`, `iat`, `tid`, `sub`, and `oid` claims verified. A delegated token must
+contain the exact deployment-owned `ATHENA_CONTEXT_AUTH_DELEGATED_SCOPE` value in its signed
+space-delimited `scp` claim; the optional `idtyp=user` claim is accepted but not required.
+Ordinary delegated identities map the lower-case Entra object ID (`oid`) to a human actor, while
+signed Entra agent-identity facet claims map the same subject to an agent so it cannot satisfy
+human-only approval, publication, or supersession checks. A signed `idtyp=app` token maps to a
+service actor, requires one consistent signed application client ID, and cannot contain a
+delegated scope. Any conflicting or unknown identity shape fails closed.
+
+`ATHENA_CONTEXT_ROLE_GRANTS_JSON` is a UTF-8 JSON array of one to 64 `RoleGrant` objects and is
+deployment configuration, never request input. Every grant must explicitly use
+`{"scope_type":"workload","workload_id":"<ATHENA_CONTEXT_STORE_WORKLOAD_ID>"}`; omitted or
+`all_workloads` scopes, duplicates, empty arrays, invalid JSON, and foreign workload grants fail
+startup. The configured workload ID also bounds the durable adapter: it rejects any lifecycle
+record or read for another workload. Workload identifiers use the same route-safe ASCII contract
+as the HTTP API.
+
+An empty partition is never a normal store state. On the controlled first deployment only, an
+operator runs `python apps/context-api/bootstrap.py` as a one-shot deployment step under the
+Context API managed identity. That command invokes the explicit `initialize_empty_partition`
+operation and exits after creating the generation-one state-row continuity root. Normal API
+startup never has bootstrap authority and rejects the obsolete
+`ATHENA_CONTEXT_STORE_BOOTSTRAP_ENABLED` setting. It validates the complete committed partition
+and fails closed if the continuity root is absent, so a deleted complete partition cannot become a
+new store merely because an API replica restarts. Run the bootstrap step before starting scaled
+API replicas, then retain its deployment record with the initial state-anchor checkpoint.
+
+The Table and its private networking and data-plane RBAC are provisioned separately. The API uses
+only the supplied managed identity; it does not accept connection strings, create the table, or
+give Context MCP, presentation, agent, or evidence identities direct store write access. The
+partition is dedicated to one Context API deployment so a manifest mutation, idempotency receipt,
+and linked audit event commit as one conditional Azure Table batch. A stale writer receives a
+conflict without a partial commit. Each commit also replaces an ETag-protected state anchor over
+the complete partition record set and audit tail, so deleted immutable rows or a truncated audit
+history fail closed on the next load. Lifecycle row keys never expose logical identifiers: each
+untrusted component is represented by a domain-separated canonical SHA-256 digest, while original
+identifiers remain in the canonical `recordJson` and are verified against the same derivation on
+load. `recordJson` uses the 60 KiB operational margin measured as UTF-16LE bytes (without a BOM),
+which matches Azure Table `Edm.String` property encoding limits rather than UTF-8 byte length.
+
+This adapter deliberately stores exactly one workload in one atomic Azure Table partition, so
+drafts, receipts, publication provenance, supersessions, and audit events retain single-batch
+semantics. It emits a capacity warning at 3,584 entities (87.5% of the 4,096 hard limit) on
+startup/read and attempted commits. The operational alert contract is the warning event
+`athena_context_store_capacity_warning`, with `workload_id`, `entity_count`, `capacity`, and a
+required migration action; deployments must route that event to their normal operational alerting.
+Before the hard limit, operators must approve a retention/cutover plan. It must freeze writers,
+verify and retain the old partition's state-anchor checkpoint, and leave that partition
+read-only—never delete or prune rows from the active audit chain. A successor per-workload shard
+requires a separately reviewed adapter and explicit continuity record/resolver before it accepts
+writes; this adapter does not silently replay history or invent cross-partition transactions.
+Demo-evaluation approvals, findings, receipts, and artifacts are outside `ContextStorePort`, are
+not migrated by this adapter, and the production root deliberately does not compose demo
+evaluation routes on this store.
 
 ## WC-013 bounded demo evaluation
 
@@ -62,7 +136,7 @@ The integration composes the merged components without introducing direct Azure 
 - The app-owned `ContextService` resolves WC-007 context, approvals, and evaluation grants before
   collection directly through its configured persistence transaction. `DemoEvaluationService`
   has no commit, resolver, approval, authorization, store, lock, or backend adapter injection
-  point. The evaluation rejects missing, ambiguous, or superseded context and requires every
+  point. The evaluation rejects missing, wrong-version, or superseded context and requires every
   applicable weakening override and resolved risk acceptance to be approved and active before MCP
   collection. The service never renews, edits, approves, or publishes a manifest on an agent's
   behalf.
@@ -145,9 +219,9 @@ The integration composes the merged components without introducing direct Azure 
   independently locked registries are not accepted as evidence of atomicity. Approval
   revoke/expiry, inherited override or risk-acceptance expiry,
   supersession, authorization removal, or revision change after evaluation leaves no artifact.
-  Authority tokens bind whether the caller selected an exact version or the unique active version.
-  A unique-active commit repeats that lookup with no version inside the transaction, so a
-  concurrently published second active version aborts rather than silently pinning the first.
+  Authority tokens bind an exact manifest ID and immutable version. Evaluation and runtime
+  selection never use a unique-active fallback, so publishing another active version cannot
+  silently alter an in-flight selection.
 - Pure snapshot assembly computes canonical component digests. A trusted signing port supplies the
   RS256 attestation; production composition must back it with the configured versioned Key Vault
   key and managed identity rather than key material in configuration.
@@ -156,7 +230,7 @@ The integration composes the merged components without introducing direct Azure 
   and authoritative WC-004 evaluation of the resolved canonical profile succeeds.
 
 Authorization failure, stale or malformed output, endpoint/tool unavailability, scope mismatch,
-gaps, inactive governance, missing or ambiguous context, superseded context, signature failure, or
+gaps, inactive governance, missing or exact context, superseded context, signature failure, or
 policy-evaluation failure produces no publication.
 The context identity configuration forbids Azure workload roles. The MCP identity configuration
 permits only reviewed read roles and forbids Context API permissions.

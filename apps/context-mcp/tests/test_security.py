@@ -51,6 +51,7 @@ def test_unknown_tool_cross_workload_and_unverified_context_fail_closed(
             "get_context",
             {
                 "workload_id": "wl-synthetic-other",
+                "manifest_version": "1.1.0",
                 "profile_id": "production",
             },
             harness.context,
@@ -63,6 +64,47 @@ def test_unknown_tool_cross_workload_and_unverified_context_fail_closed(
             {},
             None,
         )
+
+
+def test_context_reads_require_an_exact_manifest_version(harness: Harness) -> None:
+    production = harness.policy_views["production"]
+    common = {
+        "workload_id": WORKLOAD_ID,
+        "profile_id": "production",
+    }
+    calls = [
+        (
+            "resolve_resource",
+            {
+                **common,
+                "resource_id": production.evidence.resources[0].resource_id,
+            },
+        ),
+        ("get_context", common),
+        (
+            "compare_environments",
+            {
+                "workload_id": WORKLOAD_ID,
+                "profile_ids": ["production", "development"],
+            },
+        ),
+        (
+            "explain_finding",
+            {
+                **common,
+                "clause_id": production.findings[0].clause_id,
+            },
+        ),
+        ("read_history", common),
+    ]
+
+    for tool_name, arguments in calls:
+        with pytest.raises(ToolInputError, match="closed typed schema"):
+            harness.server.call_tool(
+                tool_name,
+                arguments,
+                harness.context,
+            )
 
 
 @pytest.mark.parametrize(

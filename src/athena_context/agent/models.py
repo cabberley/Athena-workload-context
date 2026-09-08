@@ -324,14 +324,14 @@ class ListWorkloadsInput(AgentModel):
 
 class ResolveResourceInput(AgentModel):
     workload_id: str = Field(pattern=_ID_PATTERN)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     resource_id: str = Field(min_length=1, max_length=2048, pattern=_RESOURCE_ID_PATTERN)
 
 
 class GetContextInput(AgentModel):
     workload_id: str = Field(pattern=_ID_PATTERN)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     sections: tuple[ContextSection, ...] = Field(
         default=(
@@ -365,7 +365,7 @@ class GetContextInput(AgentModel):
 
 class CompareEnvironmentsInput(AgentModel):
     workload_id: str = Field(pattern=_ID_PATTERN)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_ids: tuple[str, ...] = Field(min_length=2, max_length=3)
     max_clauses: int = Field(default=25, ge=1, le=25)
 
@@ -387,14 +387,14 @@ class CompareEnvironmentsInput(AgentModel):
 
 class ExplainFindingInput(AgentModel):
     workload_id: str = Field(pattern=_ID_PATTERN)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     clause_id: str = Field(pattern=_ID_PATTERN)
 
 
 class ReadHistoryInput(AgentModel):
     workload_id: str = Field(pattern=_ID_PATTERN)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: str = Field(pattern=_ID_PATTERN)
     before_sequence: int | None = Field(default=None, ge=1)
     limit: int = Field(default=20, ge=1, le=50)

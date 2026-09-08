@@ -8,6 +8,7 @@ from typing import TypeVar
 
 from pydantic import ValidationError
 
+from athena_context.api.audit import verify_audit_chain
 from athena_context.api.domain import (
     Actor,
     ActorKind,
@@ -1900,7 +1901,13 @@ class ContextService:
     def audit_history(self, actor: Actor, manifest_id: str) -> list[AuditEvent]:
         self._authorization.require(actor, Permission.AUDIT, manifest_id)
         with self._store.transaction() as tx:
-            return tx.list_audit(manifest_id=manifest_id)
+            audit = tx.list_audit()
+            verify_audit_chain(audit)
+            return [
+                event
+                for event in audit
+                if event.manifest_id == manifest_id
+            ]
 
     def _mutate(
         self,

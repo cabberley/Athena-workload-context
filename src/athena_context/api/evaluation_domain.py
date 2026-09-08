@@ -19,6 +19,7 @@ from athena_context.api.domain import (
     ApiModel,
     Permission,
     PublishedManifestView,
+    WorkloadIdentifier,
 )
 from athena_context.contracts import (
     EvidenceScope,
@@ -234,21 +235,18 @@ class VerifiedWc008DeploymentConfiguration(ApiModel):
 
 
 class PublishedContextSelection(ApiModel):
-    """Exact WC-007 context identity, or one manifest with a unique active version."""
+    """Exact immutable WC-007 context identity for one evaluation."""
 
-    manifest_id: str = Field(min_length=1, max_length=128)
-    manifest_version: str | None = Field(
-        default=None,
-        pattern=_VERSION_PATTERN,
-    )
+    manifest_id: WorkloadIdentifier
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     profile_id: NormalizedProfileId
 
 
 class PublishedContextAuthorityToken(ApiModel):
     """Opaque-revision contract for a resolved immutable WC-007 publication."""
 
-    selection_mode: Literal["exactVersion", "uniqueActiveVersion"]
-    manifest_id: str = Field(min_length=1, max_length=128)
+    selection_mode: Literal["exactVersion"]
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     source_draft_id: str = Field(pattern=_ID_PATTERN)
@@ -271,7 +269,7 @@ class AuthorizationGrantToken(ApiModel):
 
     actor_id: str = Field(pattern=_ID_PATTERN)
     permission: Permission
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     grant_revision: int = Field(ge=1)
     grant_digest: str = Field(pattern=_DIGEST_PATTERN)
 
@@ -444,7 +442,7 @@ def normalize_evaluation_authority_token(
     return EvaluationAuthorityToken(
         context=PublishedContextAuthorityToken(
             selection_mode=cast(
-                Literal["exactVersion", "uniqueActiveVersion"],
+                Literal["exactVersion"],
                 sealed.context.selection_mode,
             ),
             manifest_id=sealed.context.manifest_id,
@@ -501,26 +499,18 @@ def build_published_context_authority_token(
     view: PublishedManifestView,
     profile: ResolvedManifestProfile,
     *,
-    requested_manifest_version: str | None,
+    requested_manifest_version: str,
 ) -> PublishedContextAuthorityToken:
     published = view.published
-    if (
-        requested_manifest_version is not None
-        and requested_manifest_version != published.manifest_version
-    ):
+    if requested_manifest_version != published.manifest_version:
         raise ValueError(
             "explicit context selection does not match the resolved version"
         )
-    selection_mode: Literal["exactVersion", "uniqueActiveVersion"] = (
-        "uniqueActiveVersion"
-        if requested_manifest_version is None
-        else "exactVersion"
-    )
     revision = published.source_draft_revision + (
         1 if view.supersession is not None else 0
     )
     payload = {
-        "selectionMode": selection_mode,
+        "selectionMode": "exactVersion",
         "requestedManifestVersion": requested_manifest_version,
         "manifestId": published.manifest_id,
         "manifestVersion": published.manifest_version,
@@ -536,7 +526,7 @@ def build_published_context_authority_token(
         "resolvedProfileDigest": profile.resolved_profile_digest,
     }
     return PublishedContextAuthorityToken(
-        selection_mode=selection_mode,
+        selection_mode="exactVersion",
         manifest_id=published.manifest_id,
         manifest_version=published.manifest_version,
         manifest_digest=published.manifest_digest,
@@ -565,12 +555,7 @@ class ResolvedPublishedContext(ApiModel):
             != build_published_context_authority_token(
                 self.view,
                 self.profile,
-                requested_manifest_version=(
-                    None
-                    if self.authority_token.selection_mode
-                    == "uniqueActiveVersion"
-                    else self.authority_token.manifest_version
-                ),
+                requested_manifest_version=self.authority_token.manifest_version,
             )
         ):
             raise ValueError(
@@ -642,7 +627,7 @@ class DemoEvaluationApproval(ApiModel):
     approved_by: Actor
     approved_at: AwareDatetime
     expires_at: AwareDatetime
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     profile_id: NormalizedProfileId
@@ -680,7 +665,7 @@ class CreateDemoEvaluationApprovalCommand(ApiModel):
 
     decision_id: str = Field(pattern=_ID_PATTERN)
     expires_at: AwareDatetime
-    manifest_id: str = Field(min_length=1, max_length=128)
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     profile_id: NormalizedProfileId
@@ -723,8 +708,8 @@ class DemoEvaluationCommand(ApiModel):
     approval_decision_id: str = Field(pattern=_ID_PATTERN)
     attempt_id: str = Field(pattern=r"^attempt-[a-f0-9]{12}$")
     snapshot_id: str = Field(pattern=r"^snap-[a-f0-9]{12}$")
-    manifest_id: str = Field(min_length=1, max_length=128)
-    manifest_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    manifest_id: WorkloadIdentifier
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
     expected_manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     profile_id: NormalizedProfileId
     expected_resolved_profile_digest: str = Field(pattern=_DIGEST_PATTERN)
@@ -748,7 +733,7 @@ class AuthorizedSnapshotPublication(ApiModel):
     publication_authorized_by: Actor
     publication_authorized_at: AwareDatetime
     published_by: Actor
-    manifest_id: str
+    manifest_id: WorkloadIdentifier
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     profile_id: str
