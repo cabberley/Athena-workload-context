@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import urlsplit
 
 import jwt
@@ -24,11 +24,11 @@ from azure.keyvault.keys.crypto import CryptographyClient, SignatureAlgorithm
 from azure.storage.blob import BlobServiceClient, BlobType, ContentSettings
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
     MAX_ARTIFACT_TRANSFER_BYTES,
     ArtifactAlreadyExistsError,
+    ArtifactCurrentReadRequest,
     ArtifactNotFoundError,
     ArtifactPayloadTooLargeError,
     ArtifactReadRequest,
@@ -75,6 +75,9 @@ from athena_context.presentation_assets import (
     PresentationPublicationReceipt,
     PresentationPublicationRequest,
 )
+
+if TYPE_CHECKING:
+    from athena_context.api.evaluation_ports import SnapshotSigningRequest
 
 _GUID_CLAIMS = ("tid", "oid", "sub")
 _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
@@ -1244,6 +1247,121 @@ class AzureBlobVersionPinnedArtifactReader:
             content_type="application/json",
             payload_sha256=computed_digest,
         )
+
+
+    def read_current(self, request: ArtifactCurrentReadRequest) -> ArtifactReadResult:
+        """Recover one known current Blob version only after bounded integrity validation."""
+
+        if type(request) is not ArtifactCurrentReadRequest:
+            raise TypeError("request must be an exact ArtifactCurrentReadRequest")
+        blob = self._container.get_blob_client(request.blob_name)
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=self._max_payload_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            version_id = getattr(properties, "version_id", None)
+            if type(version_id) is not str or not version_id:
+                raise ArtifactVerificationError(
+                    "Blob response omitted the current version identity"
+                )
+            size = getattr(downloader, "size", None)
+            if type(size) is not int or size < 1:
+                raise ArtifactVerificationError(
+                    "Blob response omitted a valid positive content length"
+                )
+            if size > self._max_payload_bytes:
+                raise ArtifactReadTooLargeError(
+                    f"artifact payload exceeds {self._max_payload_bytes} bytes"
+                )
+            content_settings = getattr(properties, "content_settings", None)
+            content_type = getattr(content_settings, "content_type", None)
+            if content_type != "application/json":
+                raise ArtifactVerificationError(
+                    "Blob version content type is not exactly application/json"
+                )
+            metadata = getattr(properties, "metadata", None)
+            metadata_digest = (
+                metadata.get("payload_sha256")
+                if type(metadata) is dict
+                else None
+            )
+            if type(metadata_digest) is not str:
+                raise ArtifactVerificationError(
+                    "Blob payload hash metadata is missing or invalid"
+                )
+            payload = downloader.readall()
+        except ResourceNotFoundError as exc:
+            self._raise_if_blob_not_found(exc)
+        except HttpResponseError as exc:
+            self._raise_if_empty_blob_range(exc)
+            raise
+
+        if type(payload) is not bytes:
+            raise ArtifactVerificationError("Blob download did not return immutable bytes")
+        if len(payload) != size or len(payload) > self._max_payload_bytes:
+            raise ArtifactVerificationError(
+                "Blob download length does not match the bounded response metadata"
+            )
+        computed_digest = sha256_hex(payload)
+        if computed_digest != metadata_digest:
+            raise ArtifactVerificationError(
+                "Blob payload bytes do not match the metadata SHA-256 digest"
+            )
+        try:
+            json.loads(
+                payload.decode("utf-8"),
+                parse_constant=_reject_non_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ArtifactVerificationError(
+                "Blob payload is not valid UTF-8 JSON"
+            ) from exc
+        return ArtifactReadResult(
+            container_name=self._container_name,
+            blob_name=request.blob_name,
+            version_id=version_id,
+            payload=payload,
+            size_bytes=size,
+            content_type="application/json",
+            payload_sha256=computed_digest,
+        )
+
+
+class AzureBlobChangeEvidenceReplayStore:
+    """Create and recover WC-025 artifacts without listing or unverified reads."""
+
+    def __init__(
+        self,
+        *,
+        blob_endpoint: str,
+        container_name: str,
+        managed_identity_client_id: str,
+        max_payload_bytes: int = MAX_ARTIFACT_PAYLOAD_BYTES,
+    ) -> None:
+        self._writer = AzureBlobCreateOnlyArtifactWriter(
+            blob_endpoint=blob_endpoint,
+            container_name=container_name,
+            managed_identity_client_id=managed_identity_client_id,
+            max_payload_bytes=max_payload_bytes,
+        )
+        self._reader = AzureBlobVersionPinnedArtifactReader(
+            blob_endpoint=blob_endpoint,
+            container_name=container_name,
+            managed_identity_client_id=managed_identity_client_id,
+            max_payload_bytes=max_payload_bytes,
+        )
+
+    def create(self, request: ArtifactWriteRequest) -> ArtifactWriteReceipt:
+        return self._writer.create(request)
+
+    def read(self, request: ArtifactReadRequest) -> ArtifactReadResult:
+        return self._reader.read(request)
+
+    def read_current(self, request: ArtifactCurrentReadRequest) -> ArtifactReadResult:
+        return self._reader.read_current(request)
 
 
 class DefaultAzureCredentialTrustedIngestionSigner:

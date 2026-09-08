@@ -5,20 +5,28 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import TextIO, cast
 
 from athena_context import __version__
 from athena_context.artifacts import VersionPinnedArtifactReaderPort
 from athena_context.binding.verification import TrustedSnapshotVerifier
-from athena_context.contracts import build_operational_phase_reference_handoff
+from athena_context.contracts import (
+    ApprovedChangeScope,
+    build_operational_phase_reference_handoff,
+)
 from athena_context.contracts.eventing import WorkloadRole
 from athena_context.contracts.presentation import ArgusPresentationPhase
 from athena_context.eventing import (
+    ChangeIngestionError,
     SignalDetectionError,
+    run_event_grid_change_ingestion_worker,
+    run_event_grid_dead_letter_purge_worker,
     run_incident_feed_heartbeat,
     run_incident_orchestrator_worker,
     run_notification_dispatcher_worker,
+    run_resource_graph_change_history_worker,
     run_scheduled_signal_detector,
 )
 from athena_context.live_acceptance import (
@@ -324,6 +332,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--notification-state-partition-key",
         required=True,
     )
+    change_event_parser = subparsers.add_parser(
+        "wc025-change-event-ingester",
+        help="normalize only approved resource-group Event Grid changes into signed evidence",
+    )
+    change_event_parser.add_argument("--service-bus-namespace", required=True)
+    change_event_parser.add_argument(
+        "--change-events-queue",
+        default="change-evidence-events",
+    )
+    change_event_parser.add_argument("--managed-identity-client-id", required=True)
+    change_event_parser.add_argument("--approved-change-scope", type=Path)
+    change_event_parser.add_argument("--approved-change-scope-json")
+    change_event_parser.add_argument("--artifact-blob-endpoint", required=True)
+    change_event_parser.add_argument("--artifact-container", required=True)
+    change_event_parser.add_argument("--key-vault-key-id", required=True)
+    change_dead_letter_parser = subparsers.add_parser(
+        "wc025-change-dead-letter-purge",
+        help="purge raw poison deliveries from the WC-025 Service Bus dead-letter paths",
+    )
+    change_dead_letter_parser.add_argument("--service-bus-namespace", required=True)
+    change_dead_letter_parser.add_argument(
+        "--change-events-queue",
+        default="change-evidence-events",
+    )
+    change_dead_letter_parser.add_argument("--managed-identity-client-id", required=True)
+    change_dead_letter_parser.add_argument("--artifact-blob-endpoint", required=True)
+    change_dead_letter_parser.add_argument(
+        "--failure-container",
+        default="change-ingestion-failures",
+    )
+    change_dead_letter_parser.add_argument(
+        "--maximum-messages-per-subqueue",
+        type=int,
+        choices=range(1, 1001),
+        default=100,
+    )
+    change_history_parser = subparsers.add_parser(
+        "wc025-change-history-query",
+        help="query only approved Azure Resource Graph change history into signed evidence",
+    )
+    change_history_parser.add_argument("--managed-identity-client-id", required=True)
+    change_history_parser.add_argument("--approved-change-scope", type=Path)
+    change_history_parser.add_argument("--approved-change-scope-json")
+    change_history_parser.add_argument("--artifact-blob-endpoint", required=True)
+    change_history_parser.add_argument("--artifact-container", required=True)
+    change_history_parser.add_argument("--key-vault-key-id", required=True)
+    change_history_parser.add_argument(
+        "--lookback-minutes",
+        type=int,
+        choices=range(1, 16),
+        default=10,
+    )
     return parser
 
 
@@ -338,8 +398,7 @@ def _load_json_configuration(
     sources = sum(value is not None for value in (path, inline_json, environment_json))
     if sources != 1:
         raise ValueError(
-            f"{label} must be supplied by exactly one file, JSON argument, or "
-            f"{environment_name}"
+            f"{label} must be supplied by exactly one file, JSON argument, or {environment_name}"
         )
     try:
         content = (
@@ -400,9 +459,7 @@ def _load_approved_alert_rules(
         not isinstance(value, list)
         or not 1 <= len(value) <= 128
         or any(
-            not isinstance(rule, str)
-            or not 1 <= len(rule) <= 256
-            or rule.strip() != rule
+            not isinstance(rule, str) or not 1 <= len(rule) <= 256 or rule.strip() != rule
             for rule in value
         )
     ):
@@ -411,6 +468,36 @@ def _load_approved_alert_rules(
     if len(set(normalized)) != len(normalized):
         raise ValueError("approved alert rules collide after normalization")
     return normalized
+
+
+def _load_approved_change_scope(
+    path: Path | None,
+    inline_json: str | None = None,
+) -> ApprovedChangeScope:
+    value = _load_json_configuration(
+        path=path,
+        inline_json=inline_json,
+        label="approved change scope",
+        environment_name="ATHENA_WC025_APPROVED_CHANGE_SCOPE_JSON",
+    )
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion",
+        "subscriptionId",
+        "resourceGroupName",
+        "approvedResourceIds",
+    }:
+        raise ValueError("approved change scope is invalid")
+    approved_resource_ids = value.get("approvedResourceIds")
+    if not isinstance(approved_resource_ids, list):
+        raise ValueError("approved change scope is invalid")
+    normalized = {
+        **value,
+        "approvedResourceIds": tuple(sorted(approved_resource_ids)),
+    }
+    try:
+        return ApprovedChangeScope.model_validate(normalized)
+    except ValueError as exc:
+        raise ValueError("approved change scope is invalid") from exc
 
 
 def _write_exclusive_json_file(path: Path, content: str, *, message: str) -> None:
@@ -440,12 +527,8 @@ def main(
     operational_demo_phase_job_port: PhaseJobPort | None = None,
     operational_demo_handoff_port: ReferenceHandoffPort | None = None,
     operational_demo_artifact_reader: VersionPinnedArtifactReaderPort | None = None,
-    operational_demo_presentation_publisher: (
-        PresentationAssetPublisherPort | None
-    ) = None,
-    wc013_collector_job_management_port: (
-        Wc013CollectorJobManagementPort | None
-    ) = None,
+    operational_demo_presentation_publisher: (PresentationAssetPublisherPort | None) = None,
+    wc013_collector_job_management_port: (Wc013CollectorJobManagementPort | None) = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
@@ -485,9 +568,7 @@ def main(
                 )
                 return 0
             if not args.evidence_blob_endpoint or not args.evidence_container:
-                raise Wc013LiveAcceptanceError(
-                    "evidence Blob endpoint and container are required"
-                )
+                raise Wc013LiveAcceptanceError("evidence Blob endpoint and container are required")
             accepted = run_wc013_live_acceptance(
                 args.config,
                 evidence_blob_endpoint=args.evidence_blob_endpoint,
@@ -517,8 +598,7 @@ def main(
             )
             if args.emit_handoff_base64:
                 output.write(
-                    f"{COLLECTED_EVIDENCE_HANDOFF_BASE64_PREFIX}"
-                    f"{collected.handoff.base64()}\n"
+                    f"{COLLECTED_EVIDENCE_HANDOFF_BASE64_PREFIX}{collected.handoff.base64()}\n"
                 )
             return 0
         if args.command == "wc013-collector-controller":
@@ -535,9 +615,7 @@ def main(
                 f"template digest: {started.execution_template_digest}\n"
             )
             if not args.validate_only:
-                output.write(
-                    f"execution: {started.execution_name or 'accepted'}\n"
-                )
+                output.write(f"execution: {started.execution_name or 'accepted'}\n")
             return 0
         if args.command == "argus-presentation-export":
             if (
@@ -624,9 +702,7 @@ def main(
                 f"{job.completed.completion_index_digest}\n"
             )
             if args.emit_handoff_base64:
-                output.write(
-                    f"{HANDOFF_BASE64_PREFIX}{job.handoff_base64()}\n"
-                )
+                output.write(f"{HANDOFF_BASE64_PREFIX}{job.handoff_base64()}\n")
             return 0
         if args.command == "operational-demo-operator":
             if args.validate_only:
@@ -719,9 +795,7 @@ def main(
             output.write("WC-016 incident feed heartbeat published\n")
             return 0
         if args.command == "wc016-notification-dispatcher":
-            webhook_url = args.webhook_url or os.environ.get(
-                "ATHENA_WC016_TEAMS_WEBHOOK_URL"
-            )
+            webhook_url = args.webhook_url or os.environ.get("ATHENA_WC016_TEAMS_WEBHOOK_URL")
             if webhook_url is None:
                 raise ValueError("notification webhook URL is required")
             processed = run_notification_dispatcher_worker(
@@ -729,18 +803,58 @@ def main(
                 notification_queue_name=args.notification_queue,
                 managed_identity_client_id=args.managed_identity_client_id,
                 webhook_url=webhook_url,
-                notification_state_table_endpoint=(
-                    args.notification_state_table_endpoint
-                ),
+                notification_state_table_endpoint=(args.notification_state_table_endpoint),
                 notification_state_table_name=args.notification_state_table_name,
-                notification_state_partition_key=(
-                    args.notification_state_partition_key
-                ),
+                notification_state_partition_key=(args.notification_state_partition_key),
             )
             output.write(
                 "WC-016 notification delivered\n"
                 if processed
                 else "WC-016 notification queue was empty or rejected\n"
+            )
+            return 0
+        if args.command == "wc025-change-event-ingester":
+            event_count = run_event_grid_change_ingestion_worker(
+                fully_qualified_namespace=args.service_bus_namespace,
+                queue_name=args.change_events_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                scope=_load_approved_change_scope(
+                    args.approved_change_scope,
+                    args.approved_change_scope_json,
+                ),
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                artifact_container_name=args.artifact_container,
+                signing_key_id=args.key_vault_key_id,
+            )
+            output.write(f"WC-025 change event ingester processed {event_count} change record(s)\n")
+            return 0
+        if args.command == "wc025-change-dead-letter-purge":
+            purged_count = run_event_grid_dead_letter_purge_worker(
+                fully_qualified_namespace=args.service_bus_namespace,
+                queue_name=args.change_events_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                failure_container_name=args.failure_container,
+                maximum_messages_per_subqueue=args.maximum_messages_per_subqueue,
+            )
+            output.write(
+                f"WC-025 dead-letter purge removed {purged_count} raw message(s)\n"
+            )
+            return 0
+        if args.command == "wc025-change-history-query":
+            history_count = run_resource_graph_change_history_worker(
+                managed_identity_client_id=args.managed_identity_client_id,
+                scope=_load_approved_change_scope(
+                    args.approved_change_scope,
+                    args.approved_change_scope_json,
+                ),
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                artifact_container_name=args.artifact_container,
+                signing_key_id=args.key_vault_key_id,
+                lookback=timedelta(minutes=args.lookback_minutes),
+            )
+            output.write(
+                f"WC-025 change history query processed {history_count} change record(s)\n"
             )
             return 0
     except Wc013LiveAcceptanceError as exc:
@@ -754,9 +868,9 @@ def main(
         return 1
     except OperationalPhaseRunnerError as exc:
         label = (
-            'operational phase job'
-            if args.command == 'operational-phase-job'
-            else 'operational phase runner'
+            "operational phase job"
+            if args.command == "operational-phase-job"
+            else "operational phase runner"
         )
         errors.write(f"{label} failed: {exc}\n")
         return 1
@@ -769,12 +883,18 @@ def main(
     except SignalDetectionError as exc:
         errors.write(f"wc016-signal-detector failed: {exc}\n")
         return 1
+    except ChangeIngestionError as exc:
+        errors.write(f"{args.command} failed: {exc}\n")
+        return 1
     except ValueError as exc:
         if args.command in {
             "wc016-signal-detector",
             "wc016-incident-orchestrator",
             "wc016-incident-feed-heartbeat",
             "wc016-notification-dispatcher",
+            "wc025-change-event-ingester",
+            "wc025-change-dead-letter-purge",
+            "wc025-change-history-query",
         }:
             errors.write(f"{args.command} failed: {exc}\n")
             return 1
