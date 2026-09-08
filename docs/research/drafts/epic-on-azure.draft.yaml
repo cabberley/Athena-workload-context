@@ -247,36 +247,55 @@ workloadContextDraft:
       declarationRequired: true
       semantics: access control and administrative boundary intent
       exactProviders: TODO(human)
+      supportedBy:
+        - SRC-A
     networkAndConnectivity:
       status: candidate-category
       declarationRequired: true
       semantics: source/destination intent, segmentation, private/public delivery category
       exactFlows: prohibited
+      supportedBy:
+        - SRC-C
     computeAndPlacement:
       status: candidate-category
       declarationRequired: true
       semantics: role placement, zone/region intent, and fleet-distribution expectations
       exactSkuOrSize: prohibited
+      supportedBy:
+        - SRC-A
+        - SRC-G
     storageAndDataProtection:
       status: candidate-category
       declarationRequired: true
       semantics: persistence, backup, restore, replication, and protective-copy intent
       exactSizing: prohibited
+      supportedBy:
+        - SRC-D
+        - SRC-E
     monitoringAndObservability:
       status: candidate-category
       declarationRequired: true
       semantics: signal meaning, evidence category, freshness, and response intent
       rawTelemetryValues: prohibited
+      supportedBy:
+        - SRC-D
+        - SRC-G
     supportAndEscalation:
       status: candidate-category
       declarationRequired: true
       semantics: accountable owner, consulted owner, and review cadence
       personalContacts: TODO(human)
+      supportedBy:
+        - SRC-D
+        - SRC-H
     applicationDelivery:
       status: candidate-category
       declarationRequired: true
       semantics: persistence, health, maintenance, and availability behavior expectations
       implementationSettings: prohibited
+      supportedBy:
+        - SRC-A
+        - SRC-B
 
   placementConstraints:
     primaryPlacement:
