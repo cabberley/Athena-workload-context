@@ -33,6 +33,15 @@ param eventIngesterIdentityClientId string
 @description('Dedicated Event Grid queue-ingester identity principal ID.')
 param eventIngesterIdentityPrincipalId string
 
+@description('Dedicated dead-letter purge identity resource ID.')
+param purgeIdentityResourceId string
+
+@description('Dedicated dead-letter purge identity client ID.')
+param purgeIdentityClientId string
+
+@description('Dedicated dead-letter purge identity principal ID.')
+param purgeIdentityPrincipalId string
+
 @description('Dedicated Azure Resource Graph change-history identity resource ID.')
 param queryIdentityResourceId string
 
@@ -47,6 +56,9 @@ param evidenceStorageAccountName string
 
 @description('Existing private container receiving create-only signed change-evidence artifacts.')
 param evidenceContainerName string
+
+@description('Dedicated private container receiving bounded dead-letter failure receipts.')
+param failureReceiptContainerName string
 
 @description('Existing Key Vault name containing the dedicated WC-025 key.')
 param keyVaultName string
@@ -100,6 +112,11 @@ resource evidenceContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
   name: evidenceContainerName
 }
 
+resource failureReceiptContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-06-01' existing = {
+  parent: evidenceBlobService
+  name: failureReceiptContainerName
+}
+
 resource signingVault 'Microsoft.KeyVault/vaults@2025-05-01' existing = {
   name: keyVaultName
 }
@@ -116,6 +133,26 @@ resource eventIngesterQueueReceiver 'Microsoft.Authorization/roleAssignments@202
     principalId: eventIngesterIdentityPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: serviceBusDataReceiverRoleId
+  }
+}
+
+resource purgeQueueReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(changeEventsQueue.id, purgeIdentityPrincipalId, serviceBusDataReceiverRoleId)
+  scope: changeEventsQueue
+  properties: {
+    principalId: purgeIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: serviceBusDataReceiverRoleId
+  }
+}
+
+resource purgeFailureReceiptWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(failureReceiptContainer.id, purgeIdentityPrincipalId, storageBlobDataContributorRoleId)
+  scope: failureReceiptContainer
+  properties: {
+    principalId: purgeIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobDataContributorRoleId
   }
 }
 
@@ -164,6 +201,16 @@ resource eventIngesterAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-0
   scope: registry
   properties: {
     principalId: eventIngesterIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: acrPullRoleId
+  }
+}
+
+resource purgeAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, purgeIdentityPrincipalId, acrPullRoleId)
+  scope: registry
+  properties: {
+    principalId: purgeIdentityPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: acrPullRoleId
   }
@@ -271,6 +318,75 @@ resource eventIngesterJob 'Microsoft.App/jobs@2025-01-01' = {
   ]
 }
 
+resource deadLetterPurgeJob 'Microsoft.App/jobs@2025-01-01' = {
+  name: '${jobNamePrefix}-dlq-purge'
+  location: location
+  tags: resourceTags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${purgeIdentityResourceId}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironmentResourceId
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 300
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '*/1 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: registryServer
+          identity: purgeIdentityResourceId
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'wc025-change-dead-letter-purge'
+          image: changeIngesterImage
+          command: [
+            'athena-context'
+          ]
+          args: [
+            'wc025-change-dead-letter-purge'
+            '--service-bus-namespace'
+            serviceBusHostName
+            '--change-events-queue'
+            changeEventsQueueName
+            '--managed-identity-client-id'
+            purgeIdentityClientId
+            '--artifact-blob-endpoint'
+            evidenceBlobEndpoint
+            '--failure-container'
+            failureReceiptContainerName
+            '--maximum-messages-per-subqueue'
+            '1000'
+          ]
+          env: [
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: purgeIdentityClientId
+            }
+          ]
+          resources: jobResources
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    purgeQueueReceiver
+    purgeFailureReceiptWriter
+    purgeAcrPull
+  ]
+}
+
 resource queryWorkerJob 'Microsoft.App/jobs@2025-01-01' = {
   name: '${jobNamePrefix}-change-query'
   location: location
@@ -343,4 +459,5 @@ resource queryWorkerJob 'Microsoft.App/jobs@2025-01-01' = {
 }
 
 output eventIngesterJobResourceId string = eventIngesterJob.id
+output deadLetterPurgeJobResourceId string = deadLetterPurgeJob.id
 output queryWorkerJobResourceId string = queryWorkerJob.id

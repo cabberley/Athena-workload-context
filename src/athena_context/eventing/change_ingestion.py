@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -29,6 +30,7 @@ from athena_context.contracts import canonicalize_json, sha256_hex
 from athena_context.contracts.change_ingestion import (
     ApprovedChangeScope,
     ChangeActor,
+    ChangeDeliveryFailureReceipt,
     ChangedProperty,
     ChangeEvidenceArtifact,
     ChangeEvidenceAttestation,
@@ -45,6 +47,7 @@ MAX_RESOURCE_GRAPH_RESPONSE_BYTES = 256 * 1024
 MAX_RESOURCE_GRAPH_RESULTS = 100
 MAX_RESOURCE_GRAPH_QUERY_RESULTS = MAX_RESOURCE_GRAPH_RESULTS + 1
 MAX_CHANGE_EVIDENCE_AGE = timedelta(minutes=15)
+MAX_DEAD_LETTER_MESSAGE_BYTES = 1024 * 1024
 _ARM_SCOPE = "https://management.azure.com/.default"
 _RESOURCE_GRAPH_ENDPOINT = (
     "https://management.azure.com/providers/Microsoft.ResourceGraph/resources"
@@ -54,6 +57,7 @@ _KEY_VAULT_KEY_ID_PATTERN = re.compile(
     r"^https://[a-z0-9-]{3,24}\.vault\.azure\.net/keys/"
     r"[A-Za-z0-9-]{1,127}/[A-Za-z0-9-]{1,127}$"
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChangeIngestionError(RuntimeError):
@@ -87,6 +91,16 @@ class ResourceGraphChangeHistoryQueryPort(Protocol):
         query: str,
         subscriptions: tuple[str, ...],
     ) -> Sequence[Mapping[str, object]]: ...
+
+
+def _bearer_authorization(access_token: object) -> str:
+    if (
+        type(access_token) is not str
+        or not access_token
+        or any(character.isspace() for character in access_token)
+    ):
+        raise ChangeIngestionError("managed identity access token is invalid")
+    return " ".join(("Bearer", access_token))
 
 
 class _ServiceBusReceiverPort(Protocol):
@@ -680,9 +694,9 @@ def build_resource_graph_change_history_query(
             ),
             f"| where targetResourceId in~ ({resource_ids})",
             (f"| where changeTime between (datetime({since_text}) .. datetime({until_text}))"),
-            "| project id, properties",
             "| order by changeTime asc",
             f"| take {MAX_RESOURCE_GRAPH_QUERY_RESULTS}",
+            "| project id, properties",
         )
     )
 
@@ -769,7 +783,10 @@ class ManagedIdentityResourceGraphChangeHistoryClient:
             method="POST",
         )
         token = self._credential.get_token(_ARM_SCOPE)
-        request.add_unredirected_header("Authorization", f"Bearer {token.token}")
+        request.add_unredirected_header(
+            "Authorization",
+            _bearer_authorization(token.token),
+        )
         try:
             with urlopen(request, timeout=30) as response:  # noqa: S310
                 payload = response.read(MAX_RESOURCE_GRAPH_RESPONSE_BYTES + 1)
@@ -958,12 +975,7 @@ def _validate_recovered_artifact(
         or base64.b64encode(signature).decode("ascii") != artifact.attestation.signature
     ):
         raise ChangeIngestionError("recovered change evidence artifact signature is malformed")
-    try:
-        verified = signer.verify_preimage(canonical_preimage, signature)
-    except Exception as exc:
-        raise ChangeIngestionError(
-            "recovered change evidence artifact signature verification failed"
-        ) from exc
+    verified = signer.verify_preimage(canonical_preimage, signature)
     if verified is not True:
         raise ChangeIngestionError(
             "recovered change evidence artifact signature verification failed"
@@ -1194,6 +1206,13 @@ def _event_grid_records(message: object) -> tuple[Mapping[str, object], ...]:
     return tuple(_mapping(record, "Event Grid delivery record") for record in records)
 
 
+def _message_digest(message: object) -> str:
+    try:
+        return sha256_hex(_message_body(message))
+    except ChangeIngestionError:
+        return "unavailable"
+
+
 def _process_event_grid_message(
     *,
     receiver: _ServiceBusReceiverPort,
@@ -1214,20 +1233,21 @@ def _process_event_grid_message(
             )
             for record in records
         )
-        for item in evidence:
-            persist_change_evidence(
-                item,
-                writer=writer,
-                signer=signer,
-                signing_key_id=signing_key_id,
-            )
     except (ChangeIngestionError, ValueError) as exc:
-        receiver.dead_letter_message(
-            message,
-            reason="AthenaChangeEvidenceRejected",
-            error_description=str(exc)[:512],
+        _LOGGER.warning(
+            "Discarding definitively rejected WC-025 delivery category=%s digest=%s",
+            exc.__class__.__name__,
+            _message_digest(message),
         )
+        receiver.complete_message(message)
         return 0
+    for item in evidence:
+        persist_change_evidence(
+            item,
+            writer=writer,
+            signer=signer,
+            signing_key_id=signing_key_id,
+        )
     receiver.complete_message(message)
     return len(records)
 
@@ -1295,6 +1315,119 @@ def run_event_grid_change_ingestion_worker(
         )
 
 
+def run_event_grid_dead_letter_purge_worker(
+    *,
+    fully_qualified_namespace: str,
+    queue_name: str,
+    managed_identity_client_id: str,
+    artifact_blob_endpoint: str,
+    failure_container_name: str,
+    maximum_messages_per_subqueue: int = 100,
+    max_wait_time_seconds: int = 5,
+) -> int:
+    """Permanently discard raw poison deliveries from both Service Bus DLQ paths."""
+
+    from azure.identity import ManagedIdentityCredential
+
+    from athena_context.azure_adapters import AzureBlobChangeEvidenceReplayStore
+
+    service_bus = import_module("azure.servicebus")
+    if (
+        not fully_qualified_namespace.endswith(".servicebus.windows.net")
+        or "/" in fully_qualified_namespace
+        or not 1 <= maximum_messages_per_subqueue <= 1_000
+        or not 1 <= max_wait_time_seconds <= 60
+    ):
+        raise ValueError("change dead-letter purge configuration is invalid")
+    credential = ManagedIdentityCredential(client_id=managed_identity_client_id)
+    writer = AzureBlobChangeEvidenceReplayStore(
+        blob_endpoint=artifact_blob_endpoint,
+        container_name=failure_container_name,
+        managed_identity_client_id=managed_identity_client_id,
+        max_payload_bytes=MAX_CHANGE_EVENT_BYTES,
+    )
+    purged = 0
+    with service_bus.ServiceBusClient(
+        fully_qualified_namespace=fully_qualified_namespace,
+        credential=credential,
+        logging_enable=False,
+    ) as client:
+        for sub_queue in (
+            ("deadLetter", service_bus.ServiceBusSubQueue.DEAD_LETTER),
+            (
+                "transferDeadLetter",
+                service_bus.ServiceBusSubQueue.TRANSFER_DEAD_LETTER,
+            ),
+        ):
+            with client.get_queue_receiver(
+                queue_name=queue_name,
+                sub_queue=sub_queue[1],
+                max_wait_time=max_wait_time_seconds,
+            ) as receiver:
+                messages = receiver.receive_messages(
+                    max_message_count=maximum_messages_per_subqueue,
+                    max_wait_time=max_wait_time_seconds,
+                )
+                for message in messages:
+                    _persist_change_delivery_failure_receipt(
+                        message=message,
+                        dead_letter_subqueue=sub_queue[0],
+                        writer=writer,
+                    )
+                    receiver.complete_message(message)
+                purged += len(messages)
+    return purged
+
+
+def _persist_change_delivery_failure_receipt(
+    *,
+    message: object,
+    dead_letter_subqueue: Literal["deadLetter", "transferDeadLetter"],
+    writer: ChangeEvidenceReplayStorePort,
+) -> None:
+    body = _message_body(message)
+    if len(body) > MAX_DEAD_LETTER_MESSAGE_BYTES:
+        raise ChangeIngestionError("dead-letter message is outside its byte bound")
+    source_message_digest = sha256_hex(body)
+    failure_id = (
+        "chg-failure-"
+        + hashlib.sha256(
+            f"{dead_letter_subqueue}\0{source_message_digest}".encode()
+        ).hexdigest()[:12]
+    )
+    receipt = ChangeDeliveryFailureReceipt(
+        schemaVersion="athena.changeDeliveryFailureReceipt.v1",
+        failureId=failure_id,
+        sourceMessageDigest=source_message_digest,
+        deadLetterSubqueue=dead_letter_subqueue,
+        disposition="rawMessageCompletedAfterReceipt",
+    )
+    payload = receipt.canonical_bytes()
+    payload_sha256 = sha256_hex(payload)
+    blob_name = f"change-delivery-failures/{failure_id}/receipt.json"
+    request = ArtifactWriteRequest(
+        blob_name=blob_name,
+        payload=payload,
+        content_type="application/json",
+        hashes=ArtifactMetadataHashes(payload_sha256=payload_sha256),
+        maximum_payload_bytes=MAX_CHANGE_EVENT_BYTES,
+    )
+    try:
+        writer.create(request)
+    except ArtifactAlreadyExistsError:
+        recovered = writer.read_current(
+            ArtifactCurrentReadRequest(blob_name=blob_name)
+        )
+        if (
+            recovered.payload != payload
+            or recovered.payload_sha256 != payload_sha256
+            or sha256_hex(recovered.payload) != payload_sha256
+        ):
+            raise ChangeIngestionError(
+                "recovered change delivery failure receipt is invalid"
+            ) from None
+
+
 def run_resource_graph_change_history_worker(
     *,
     managed_identity_client_id: str,
@@ -1349,6 +1482,7 @@ __all__ = [
     "normalize_event_grid_change",
     "normalize_resource_graph_change",
     "persist_change_evidence",
+    "run_event_grid_dead_letter_purge_worker",
     "run_event_grid_change_ingestion_worker",
     "run_resource_graph_change_history_worker",
 ]

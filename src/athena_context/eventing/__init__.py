@@ -10,6 +10,7 @@ from athena_context.eventing.change_ingestion import (
     normalize_resource_graph_change,
     persist_change_evidence,
     run_event_grid_change_ingestion_worker,
+    run_event_grid_dead_letter_purge_worker,
     run_resource_graph_change_history_worker,
 )
 from athena_context.eventing.detector import (
@@ -65,6 +66,7 @@ __all__ = [
     "normalize_event_grid_change",
     "normalize_resource_graph_change",
     "persist_change_evidence",
+    "run_event_grid_dead_letter_purge_worker",
     "run_incident_reassessment",
     "run_active_incident_index_heartbeat",
     "run_incident_feed_heartbeat",

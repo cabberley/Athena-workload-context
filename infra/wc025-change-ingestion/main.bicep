@@ -37,29 +37,17 @@ param registryServer string
 @description('Digest-pinned WC-025 change-ingester image.')
 param changeIngesterImage string
 
-@description('Dedicated Event Grid delivery identity resource ID.')
-param eventGridDeliveryIdentityResourceId string
+@description('Dedicated Event Grid delivery managed-identity name in hostingResourceGroupName.')
+param eventGridDeliveryIdentityName string
 
-@description('Dedicated Event Grid delivery identity principal ID.')
-param eventGridDeliveryIdentityPrincipalId string
+@description('Dedicated Event Grid queue-ingester managed-identity name in hostingResourceGroupName.')
+param eventIngesterIdentityName string
 
-@description('Dedicated Event Grid queue-ingester identity resource ID.')
-param eventIngesterIdentityResourceId string
+@description('Dedicated dead-letter purge managed-identity name in hostingResourceGroupName.')
+param purgeIdentityName string
 
-@description('Dedicated Event Grid queue-ingester identity client ID.')
-param eventIngesterIdentityClientId string
-
-@description('Dedicated Event Grid queue-ingester identity principal ID.')
-param eventIngesterIdentityPrincipalId string
-
-@description('Dedicated Azure Resource Graph change-history identity resource ID.')
-param queryIdentityResourceId string
-
-@description('Dedicated Azure Resource Graph change-history identity client ID.')
-param queryIdentityClientId string
-
-@description('Dedicated Azure Resource Graph change-history identity principal ID.')
-param queryIdentityPrincipalId string
+@description('Dedicated Azure Resource Graph change-history managed-identity name in hostingResourceGroupName.')
+param queryIdentityName string
 
 @description('Exact approved resource IDs in rg-athena-demo-workload. No selector is supported.')
 @minLength(1)
@@ -76,6 +64,12 @@ param evidenceStorageAccountName string
   'change-evidence'
 ])
 param evidenceContainerName string = 'change-evidence'
+
+@description('Private container receiving bounded non-authoritative dead-letter failure receipts.')
+@allowed([
+  'change-ingestion-failures'
+])
+param failureReceiptContainerName string = 'change-ingestion-failures'
 
 @description('Existing Key Vault name in hostingResourceGroupName containing the dedicated WC-025 key.')
 @minLength(3)
@@ -102,16 +96,25 @@ var validatedApprovedResourceIds = map(approvedResourceIds, resourceId => length
 var uniqueApprovedResourceIds = length(union(validatedApprovedResourceIds, [])) == length(validatedApprovedResourceIds)
   ? validatedApprovedResourceIds
   : fail('approvedResourceIds must be unique after canonicalization')
-var distinctWorkerIdentities = eventGridDeliveryIdentityResourceId != eventIngesterIdentityResourceId && eventGridDeliveryIdentityResourceId != queryIdentityResourceId && eventIngesterIdentityResourceId != queryIdentityResourceId && eventGridDeliveryIdentityPrincipalId != eventIngesterIdentityPrincipalId && eventGridDeliveryIdentityPrincipalId != queryIdentityPrincipalId && eventIngesterIdentityPrincipalId != queryIdentityPrincipalId
+var normalizedIdentityNames = [
+  toLower(eventGridDeliveryIdentityName)
+  toLower(eventIngesterIdentityName)
+  toLower(purgeIdentityName)
+  toLower(queryIdentityName)
+]
+var distinctWorkerIdentities = length(union(normalizedIdentityNames, [])) == 4
 var validatedEventGridDeliveryIdentityResourceId = distinctWorkerIdentities
-  ? eventGridDeliveryIdentityResourceId
-  : fail('WC-025 Event Grid delivery, event ingestion, and query workers require separate managed identities')
+  ? eventGridDeliveryIdentity.id
+  : fail('WC-025 Event Grid delivery, event ingestion, dead-letter purge, and query workers require separate managed identities')
 var validatedEventIngesterIdentityResourceId = distinctWorkerIdentities
-  ? eventIngesterIdentityResourceId
-  : fail('WC-025 Event Grid delivery, event ingestion, and query workers require separate managed identities')
+  ? eventIngesterIdentity.id
+  : fail('WC-025 Event Grid delivery, event ingestion, dead-letter purge, and query workers require separate managed identities')
+var validatedPurgeIdentityResourceId = distinctWorkerIdentities
+  ? purgeIdentity.id
+  : fail('WC-025 Event Grid delivery, event ingestion, dead-letter purge, and query workers require separate managed identities')
 var validatedQueryIdentityResourceId = distinctWorkerIdentities
-  ? queryIdentityResourceId
-  : fail('WC-025 Event Grid delivery, event ingestion, and query workers require separate managed identities')
+  ? queryIdentity.id
+  : fail('WC-025 Event Grid delivery, event ingestion, dead-letter purge, and query workers require separate managed identities')
 var validatedRegistryName = registryName == toLower(registryName)
   ? registryName
   : fail('registryName must be lowercase')
@@ -167,6 +170,26 @@ resource hostingResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' ex
   name: hostingResourceGroupName
 }
 
+resource eventGridDeliveryIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: eventGridDeliveryIdentityName
+  scope: hostingResourceGroup
+}
+
+resource eventIngesterIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: eventIngesterIdentityName
+  scope: hostingResourceGroup
+}
+
+resource purgeIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: purgeIdentityName
+  scope: hostingResourceGroup
+}
+
+resource queryIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: queryIdentityName
+  scope: hostingResourceGroup
+}
+
 resource workloadResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
   name: workloadResourceGroupName
 }
@@ -179,6 +202,15 @@ resource evidenceStorageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' e
 resource evidenceBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-06-01' existing = {
   parent: evidenceStorageAccount
   name: 'default'
+}
+
+module failureReceiptContainer 'modules/failure-receipt-container.bicep' = {
+  name: 'wc025-failure-receipt-container'
+  scope: hostingResourceGroup
+  params: {
+    storageAccountName: evidenceStorageAccountName
+    containerName: failureReceiptContainerName
+  }
 }
 
 module evidenceBlobVersioningGate 'modules/evidence-blob-versioning-gate.bicep' = {
@@ -231,7 +263,7 @@ module eventGridDeliveryRbac 'modules/event-grid-delivery-rbac.bicep' = {
   params: {
     namespaceName: privateTransport.outputs.namespaceName
     changeEventsQueueName: privateTransport.outputs.changeEventsQueueName
-    eventGridDeliveryPrincipalId: eventGridDeliveryIdentityPrincipalId
+    eventGridDeliveryPrincipalId: eventGridDeliveryIdentity.properties.principalId
   }
 }
 
@@ -253,7 +285,7 @@ module queryReaderRbac 'modules/query-reader-rbac.bicep' = {
   name: 'wc025-query-reader-rbac'
   scope: workloadResourceGroup
   params: {
-    queryIdentityPrincipalId: queryIdentityPrincipalId
+    queryIdentityPrincipalId: queryIdentity.properties.principalId
     changeHistoryReaderRoleDefinitionId: changeHistoryReaderRole.id
   }
 }
@@ -271,13 +303,17 @@ module workers 'modules/workers.bicep' = {
     namespaceName: privateTransport.outputs.namespaceName
     changeEventsQueueName: privateTransport.outputs.changeEventsQueueName
     eventIngesterIdentityResourceId: validatedEventIngesterIdentityResourceId
-    eventIngesterIdentityClientId: eventIngesterIdentityClientId
-    eventIngesterIdentityPrincipalId: eventIngesterIdentityPrincipalId
+    eventIngesterIdentityClientId: eventIngesterIdentity.properties.clientId
+    eventIngesterIdentityPrincipalId: eventIngesterIdentity.properties.principalId
+    purgeIdentityResourceId: validatedPurgeIdentityResourceId
+    purgeIdentityClientId: purgeIdentity.properties.clientId
+    purgeIdentityPrincipalId: purgeIdentity.properties.principalId
     queryIdentityResourceId: validatedQueryIdentityResourceId
-    queryIdentityClientId: queryIdentityClientId
-    queryIdentityPrincipalId: queryIdentityPrincipalId
+    queryIdentityClientId: queryIdentity.properties.clientId
+    queryIdentityPrincipalId: queryIdentity.properties.principalId
     evidenceStorageAccountName: evidenceStorageAccountName
     evidenceContainerName: evidenceContainerName
+    failureReceiptContainerName: failureReceiptContainerName
     keyVaultName: keyVaultName
     changeSigningKeyName: changeSigningKeyName
     changeSigningKeyUriWithVersion: validatedChangeSigningKeyUriWithVersion
@@ -286,6 +322,7 @@ module workers 'modules/workers.bicep' = {
   dependsOn: [
     evidenceBlobVersioningGate
     eventGridDeliveryRbac
+    failureReceiptContainer
     queryReaderRbac
   ]
 }
@@ -304,6 +341,9 @@ output resourceChangeSystemTopicId string = resourceGroupRouting.outputs.resourc
 
 @description('Event Grid queue-ingester Job resource ID.')
 output eventIngesterJobResourceId string = workers.outputs.eventIngesterJobResourceId
+
+@description('Scheduled raw dead-letter purge Job resource ID.')
+output deadLetterPurgeJobResourceId string = workers.outputs.deadLetterPurgeJobResourceId
 
 @description('Identity-isolated Resource Graph change-history Job resource ID.')
 output queryWorkerJobResourceId string = workers.outputs.queryWorkerJobResourceId

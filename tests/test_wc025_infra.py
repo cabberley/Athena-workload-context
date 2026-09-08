@@ -63,10 +63,26 @@ def test_wc025_resource_group_event_grid_topic_uses_the_global_location() -> Non
 def test_wc025_bicep_uses_separate_least_privilege_workers_and_persistence() -> None:
     source = _bicep_source()
 
-    assert "eventIngesterIdentityResourceId" in source
-    assert "queryIdentityResourceId" in source
-    assert "eventGridDeliveryIdentityResourceId" in source
-    assert "WC-025 Event Grid delivery, event ingestion, and query workers require" in source
+    assert "param eventIngesterIdentityName string" in source
+    assert "param purgeIdentityName string" in source
+    assert "param queryIdentityName string" in source
+    assert "param eventGridDeliveryIdentityName string" in source
+    assert (
+        "WC-025 Event Grid delivery, event ingestion, dead-letter purge, and query workers require"
+        in source
+    )
+    assert "normalizedIdentityNames" in source
+    assert "toLower(purgeIdentityName)" in source
+    assert source.count(
+        "'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing"
+    ) == 4
+    assert "eventGridDeliveryIdentity.properties.principalId" in source
+    assert "eventIngesterIdentity.properties.clientId" in source
+    assert "eventIngesterIdentity.properties.principalId" in source
+    assert "purgeIdentity.properties.clientId" in source
+    assert "purgeIdentity.properties.principalId" in source
+    assert "queryIdentity.properties.clientId" in source
+    assert "queryIdentity.properties.principalId" in source
     assert "Athena WC025 Bounded Resource Change History Reader" in source
     assert "'Microsoft.Resources/changes/read'" in source
     assert "'Microsoft.ResourceGraph/resources/read'" in source
@@ -74,9 +90,11 @@ def test_wc025_bicep_uses_separate_least_privilege_workers_and_persistence() -> 
     assert "workloadResourceGroup.id" in source
     assert "scope: evidenceContainer" in source
     assert "scope: changeSigningKey" in source
-    assert source.count("Microsoft.App/jobs@2025-01-01") == 2
+    assert source.count("Microsoft.App/jobs@2025-01-01") == 3
     assert "'wc025-change-event-ingester'" in source
+    assert "'wc025-change-dead-letter-purge'" in source
     assert "'wc025-change-history-query'" in source
+    assert "cronExpression: '*/1 * * * *'" in source
     assert "cronExpression: '*/5 * * * *'" in source
     assert "ATHENA_WC025_APPROVED_CHANGE_SCOPE_JSON" in source
     assert "approvedResourceIds: uniqueApprovedResourceIds" in source
@@ -85,6 +103,18 @@ def test_wc025_bicep_uses_separate_least_privilege_workers_and_persistence() -> 
     assert "validatedChangeSigningKeyUriWithVersion" in source
     assert "listKeys(" not in source
     assert "connectionString" not in source
+    purge_job = source[
+        source.index("resource deadLetterPurgeJob ") : source.index(
+            "resource queryWorkerJob "
+        )
+    ]
+    assert "'${purgeIdentityResourceId}': {}" in purge_job
+    assert "identity: purgeIdentityResourceId" in purge_job
+    assert "purgeIdentityClientId" in purge_job
+    assert "failureReceiptContainerName" in purge_job
+    assert "evidenceContainerName" not in purge_job
+    assert "changeSigningKeyUriWithVersion" not in purge_job
+    assert "scope: failureReceiptContainer" in source
 
 
 def test_wc025_bicep_assigns_workers_the_key_vault_crypto_user_role() -> None:

@@ -4,8 +4,11 @@ import base64
 import hashlib
 import hmac
 import json
+import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request
 
@@ -27,6 +30,7 @@ from athena_context.cli import _load_approved_change_scope
 from athena_context.contracts import sha256_hex
 from athena_context.contracts.change_ingestion import (
     ApprovedChangeScope,
+    ChangeDeliveryFailureReceipt,
     ChangedProperty,
     ChangeEvidenceArtifact,
     ChangePolicyContext,
@@ -44,6 +48,7 @@ from athena_context.eventing.change_ingestion import (
     ingest_resource_graph_changes,
     normalize_event_grid_change,
     normalize_resource_graph_change,
+    run_event_grid_dead_letter_purge_worker,
 )
 
 SUBSCRIPTION_ID = "a6add389-9978-47ac-ab1e-a09212e321d4"
@@ -351,6 +356,31 @@ class _Receiver:
         error_description: str,
     ) -> None:
         self.dead_letters.append((message, reason, error_description))
+
+
+class _PurgeReceiver:
+    def __init__(self, messages: list[object]) -> None:
+        self.messages = messages
+        self.completed: list[object] = []
+
+    def __enter__(self) -> _PurgeReceiver:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def receive_messages(
+        self,
+        *,
+        max_message_count: int,
+        max_wait_time: int,
+    ) -> list[object]:
+        assert max_message_count == 100
+        assert max_wait_time == 5
+        return self.messages
+
+    def complete_message(self, message: object) -> None:
+        self.completed.append(message)
 
 
 def _resource_graph_client() -> ManagedIdentityResourceGraphChangeHistoryClient:
@@ -661,6 +691,7 @@ def test_resource_graph_adapter_uses_one_narrow_deterministic_query() -> None:
     assert DB_ID.lower() in query
     assert WEB_ID.lower() in query
     assert "| take 101" in query
+    assert query.index("| order by changeTime asc") < query.index("| project id, properties")
     assert "resourceactions" not in query.casefold()
     assert "activitylogs" not in query.casefold()
 
@@ -1218,7 +1249,66 @@ def test_event_grid_message_is_not_settled_until_the_durable_handoff_exists() ->
     assert len(writer.requests) == 2
 
 
-def test_malformed_later_event_grid_record_is_rejected_before_any_batch_write() -> None:
+def test_transient_signature_verification_failure_leaves_message_unsettled() -> None:
+    class _UnavailableSigner(_Signer):
+        def verify_preimage(
+            self,
+            canonical_preimage: bytes,
+            signature: bytes,
+        ) -> bool:
+            del canonical_preimage, signature
+            raise TimeoutError("synthetic Key Vault timeout")
+
+    message = SimpleNamespace(body=json.dumps(_event()).encode("utf-8"))
+    receiver = _Receiver()
+    writer = _Writer()
+    _preclaim_change_evidence(writer, signer=_Signer())
+
+    with pytest.raises(TimeoutError, match="Key Vault timeout"):
+        _process_event_grid_message(
+            receiver=receiver,
+            message=message,
+            scope=_scope(),
+            received_at=NOW + timedelta(minutes=1),
+            writer=writer,
+            signer=_UnavailableSigner(),
+            signing_key_id=KEY_ID,
+        )
+
+    assert receiver.completed == []
+    assert receiver.dead_letters == []
+
+
+def test_persisted_integrity_failure_leaves_message_unsettled() -> None:
+    message = SimpleNamespace(body=json.dumps(_event()).encode("utf-8"))
+    receiver = _Receiver()
+    writer = _Writer()
+    signer = _Signer()
+    _preclaim_change_evidence(
+        writer,
+        signer=signer,
+        signature=base64.b64encode(b"forged-signature").decode("ascii"),
+    )
+
+    with pytest.raises(
+        ChangeIngestionError,
+        match="signature verification failed",
+    ):
+        _process_event_grid_message(
+            receiver=receiver,
+            message=message,
+            scope=_scope(),
+            received_at=NOW + timedelta(minutes=1),
+            writer=writer,
+            signer=signer,
+            signing_key_id=KEY_ID,
+        )
+
+    assert receiver.completed == []
+    assert receiver.dead_letters == []
+
+
+def test_malformed_later_event_grid_record_is_discarded_before_any_batch_write() -> None:
     malformed = _event()
     malformed_data = malformed["data"]
     assert isinstance(malformed_data, dict)
@@ -1241,8 +1331,122 @@ def test_malformed_later_event_grid_record_is_rejected_before_any_batch_write() 
     assert processed == 0
     assert writer.requests == {}
     assert signer.preimages == []
-    assert receiver.completed == []
-    assert receiver.dead_letters[0][1] == "AthenaChangeEvidenceRejected"
+    assert receiver.completed == [message]
+    assert receiver.dead_letters == []
+
+
+def test_cli_imports_in_a_fresh_interpreter_without_an_api_import_cycle() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'src'); import athena_context.cli",
+        ],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dead_letter_purge_drains_standard_and_transfer_subqueues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dead_letter_messages = [
+        SimpleNamespace(body=b'{"synthetic":"dead-letter-1"}'),
+        SimpleNamespace(body=b'{"synthetic":"dead-letter-2"}'),
+    ]
+    transfer_messages = [
+        SimpleNamespace(body=b'{"synthetic":"transfer-dead-letter"}'),
+    ]
+    receivers = {
+        "deadletter": _PurgeReceiver(dead_letter_messages),
+        "transferdeadletter": _PurgeReceiver(transfer_messages),
+    }
+    receiver_calls: list[tuple[str, str, int]] = []
+    writer = _Writer()
+
+    class _Credential:
+        def __init__(self, *, client_id: str) -> None:
+            assert client_id == "00000000-0000-0000-0000-000000000025"
+
+    class _Client:
+        def __init__(
+            self,
+            *,
+            fully_qualified_namespace: str,
+            credential: object,
+            logging_enable: bool,
+        ) -> None:
+            assert fully_qualified_namespace == "synthetic.servicebus.windows.net"
+            assert isinstance(credential, _Credential)
+            assert logging_enable is False
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def get_queue_receiver(
+            self,
+            *,
+            queue_name: str,
+            sub_queue: str,
+            max_wait_time: int,
+        ) -> _PurgeReceiver:
+            receiver_calls.append((queue_name, sub_queue, max_wait_time))
+            return receivers[sub_queue]
+
+    service_bus = SimpleNamespace(
+        ServiceBusClient=_Client,
+        ServiceBusSubQueue=SimpleNamespace(
+            DEAD_LETTER="deadletter",
+            TRANSFER_DEAD_LETTER="transferdeadletter",
+        ),
+    )
+    monkeypatch.setattr(change_ingestion, "import_module", lambda _: service_bus)
+    from azure import identity
+
+    from athena_context import azure_adapters
+
+    monkeypatch.setattr(identity, "ManagedIdentityCredential", _Credential)
+    monkeypatch.setattr(
+        azure_adapters,
+        "AzureBlobChangeEvidenceReplayStore",
+        lambda **_: writer,
+    )
+
+    purged = run_event_grid_dead_letter_purge_worker(
+        fully_qualified_namespace="synthetic.servicebus.windows.net",
+        queue_name="change-evidence-events",
+        managed_identity_client_id="00000000-0000-0000-0000-000000000025",
+        artifact_blob_endpoint="https://synthetic.blob.core.windows.net",
+        failure_container_name="change-ingestion-failures",
+    )
+
+    assert purged == 3
+    assert receiver_calls == [
+        ("change-evidence-events", "deadletter", 5),
+        ("change-evidence-events", "transferdeadletter", 5),
+    ]
+    assert all(
+        receiver.completed == receiver.messages
+        for receiver in receivers.values()
+    )
+    assert len(writer.requests) == 3
+    receipts = [
+        ChangeDeliveryFailureReceipt.model_validate_json(request.payload)
+        for request in writer.requests.values()
+    ]
+    assert {receipt.dead_letter_subqueue for receipt in receipts} == {
+        "deadLetter",
+        "transferDeadLetter",
+    }
+    assert all(receipt.disposition == "rawMessageCompletedAfterReceipt" for receipt in receipts)
+    assert all(b"synthetic" not in request.payload for request in writer.requests.values())
 
 
 def test_query_replay_deduplicates_per_source_without_discarding_event_provenance() -> None:

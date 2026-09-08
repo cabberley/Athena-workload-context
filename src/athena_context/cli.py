@@ -22,6 +22,7 @@ from athena_context.eventing import (
     ChangeIngestionError,
     SignalDetectionError,
     run_event_grid_change_ingestion_worker,
+    run_event_grid_dead_letter_purge_worker,
     run_incident_feed_heartbeat,
     run_incident_orchestrator_worker,
     run_notification_dispatcher_worker,
@@ -346,6 +347,27 @@ def build_parser() -> argparse.ArgumentParser:
     change_event_parser.add_argument("--artifact-blob-endpoint", required=True)
     change_event_parser.add_argument("--artifact-container", required=True)
     change_event_parser.add_argument("--key-vault-key-id", required=True)
+    change_dead_letter_parser = subparsers.add_parser(
+        "wc025-change-dead-letter-purge",
+        help="purge raw poison deliveries from the WC-025 Service Bus dead-letter paths",
+    )
+    change_dead_letter_parser.add_argument("--service-bus-namespace", required=True)
+    change_dead_letter_parser.add_argument(
+        "--change-events-queue",
+        default="change-evidence-events",
+    )
+    change_dead_letter_parser.add_argument("--managed-identity-client-id", required=True)
+    change_dead_letter_parser.add_argument("--artifact-blob-endpoint", required=True)
+    change_dead_letter_parser.add_argument(
+        "--failure-container",
+        default="change-ingestion-failures",
+    )
+    change_dead_letter_parser.add_argument(
+        "--maximum-messages-per-subqueue",
+        type=int,
+        choices=range(1, 1001),
+        default=100,
+    )
     change_history_parser = subparsers.add_parser(
         "wc025-change-history-query",
         help="query only approved Azure Resource Graph change history into signed evidence",
@@ -806,6 +828,19 @@ def main(
             )
             output.write(f"WC-025 change event ingester processed {event_count} change record(s)\n")
             return 0
+        if args.command == "wc025-change-dead-letter-purge":
+            purged_count = run_event_grid_dead_letter_purge_worker(
+                fully_qualified_namespace=args.service_bus_namespace,
+                queue_name=args.change_events_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+                artifact_blob_endpoint=args.artifact_blob_endpoint,
+                failure_container_name=args.failure_container,
+                maximum_messages_per_subqueue=args.maximum_messages_per_subqueue,
+            )
+            output.write(
+                f"WC-025 dead-letter purge removed {purged_count} raw message(s)\n"
+            )
+            return 0
         if args.command == "wc025-change-history-query":
             history_count = run_resource_graph_change_history_worker(
                 managed_identity_client_id=args.managed_identity_client_id,
@@ -858,6 +893,7 @@ def main(
             "wc016-incident-feed-heartbeat",
             "wc016-notification-dispatcher",
             "wc025-change-event-ingester",
+            "wc025-change-dead-letter-purge",
             "wc025-change-history-query",
         }:
             errors.write(f"{args.command} failed: {exc}\n")

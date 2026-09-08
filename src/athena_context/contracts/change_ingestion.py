@@ -23,6 +23,7 @@ DeploymentSourceKind = Literal[
     "unknown",
 ]
 PolicyEnforcementMode = Literal["default", "doNotEnforce", "unknown"]
+DeadLetterSubqueue = Literal["deadLetter", "transferDeadLetter"]
 
 _AZURE_RESOURCE_ID_PATTERN = re.compile(
     r"^/subscriptions/(?P<subscription>[0-9a-f]{8}-[0-9a-f]{4}-"
@@ -391,6 +392,36 @@ class ChangeEvidencePersistenceHandoff(_StrictChangeModel):
         return self
 
 
+class ChangeDeliveryFailureReceipt(_StrictChangeModel):
+    """Non-authoritative proof that a raw poison delivery was durably discarded."""
+
+    schema_version: Literal["athena.changeDeliveryFailureReceipt.v1"] = Field(
+        alias="schemaVersion"
+    )
+    failure_id: str = Field(
+        alias="failureId",
+        pattern=r"^chg-failure-[a-f0-9]{12}$",
+    )
+    source_message_digest: str = Field(
+        alias="sourceMessageDigest",
+        pattern=_SHA256_PATTERN,
+    )
+    dead_letter_subqueue: DeadLetterSubqueue = Field(alias="deadLetterSubqueue")
+    disposition: Literal["rawMessageCompletedAfterReceipt"]
+
+    @model_validator(mode="after")
+    def validate_failure_id(self) -> ChangeDeliveryFailureReceipt:
+        expected = (
+            "chg-failure-"
+            + hashlib.sha256(
+                f"{self.dead_letter_subqueue}\0{self.source_message_digest}".encode()
+            ).hexdigest()[:12]
+        )
+        if self.failure_id != expected:
+            raise ValueError("change delivery failure receipt is not deterministically bound")
+        return self
+
+
 def change_evidence_attestation_preimage(
     evidence: NormalizedChangeEvidence,
 ) -> dict[str, object]:
@@ -410,6 +441,7 @@ __all__ = [
     "ChangeActor",
     "ChangeEvidenceArtifact",
     "ChangeEvidenceAttestation",
+    "ChangeDeliveryFailureReceipt",
     "ChangeEvidencePersistenceHandoff",
     "ChangeEvidenceSource",
     "ChangeOperation",
@@ -418,6 +450,7 @@ __all__ = [
     "ChangedProperty",
     "DeploymentSource",
     "DeploymentSourceKind",
+    "DeadLetterSubqueue",
     "NormalizedChangeEvidence",
     "PolicyEnforcementMode",
     "change_evidence_attestation_preimage",

@@ -27,6 +27,20 @@ has Data Sender on exactly this queue. The two Athena workers access the namespa
 the private endpoint and hold no shared identity with Event Grid. This is a documented, bounded
 ingress exception; it is not anonymous or unrestricted public queue access.
 
+Definitively invalid deliveries are logged only by bounded category and message digest, then
+completed so their raw bodies are not retained. Deliveries that exhaust retries or expire can
+still enter Service Bus dead-letter or transfer-dead-letter subqueues, so a separate scheduled
+job uses a dedicated identity with only queue-scoped receiver and image-pull access to drain and
+complete up to 1,000 messages from each subqueue every minute. Before completion, it writes a
+deterministic create-only failure receipt containing only the raw message digest, dead-letter
+subqueue category, and terminal disposition into a dedicated versioned container. Receipt
+persistence failure leaves the raw message unsettled. The purge identity has no accepted-evidence
+or signing-key access; the job never reads or writes workload resources, emits no raw message
+body, and prevents poison payloads from becoming an indefinite data store.
+All four managed identities are referenced by name in the hosting resource group; deployment
+derives their resource, client, and principal IDs from the existing Azure resources rather than
+trusting independently supplied identifiers.
+
 The Service Bus private DNS zone may exist before the namespace, but its VNet link is explicitly
 sequenced after the namespace and queue, private endpoint, and private DNS zone group. This
 prevents ARM from linking an empty Service Bus private zone that could temporarily override

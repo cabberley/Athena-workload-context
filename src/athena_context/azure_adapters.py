@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import urlsplit
 
 import jwt
@@ -24,7 +24,6 @@ from azure.keyvault.keys.crypto import CryptographyClient, SignatureAlgorithm
 from azure.storage.blob import BlobServiceClient, BlobType, ContentSettings
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from athena_context.api.evaluation_ports import SnapshotSigningRequest
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
     MAX_ARTIFACT_TRANSFER_BYTES,
@@ -76,6 +75,9 @@ from athena_context.presentation_assets import (
     PresentationPublicationReceipt,
     PresentationPublicationRequest,
 )
+
+if TYPE_CHECKING:
+    from athena_context.api.evaluation_ports import SnapshotSigningRequest
 
 _GUID_CLAIMS = ("tid", "oid", "sub")
 _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
