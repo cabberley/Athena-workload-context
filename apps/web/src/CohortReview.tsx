@@ -1,0 +1,1110 @@
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import {
+  applyCohortCandidateToDraft,
+  proposalReviewCandidate,
+} from './cohortDraft'
+import type {
+  CohortDecisionApiPort,
+  CohortDecisionRecord,
+  CohortDecisionState,
+  CohortProposal,
+  CohortProposalApiPort,
+  CohortProposalBatch,
+  CohortReviewCandidate,
+} from './cohortTypes'
+import type {
+  CanonicalManifestSelector,
+  ContextApiClientPort,
+  WorkloadContext,
+} from './types'
+
+const MEMBER_PAGE_SIZE = 25
+const REJECTED_PAGE_SIZE = 20
+
+const displayEnvironment = (value: string): string =>
+  value === 'disasterRecovery'
+    ? 'Disaster Recovery'
+    : `${value.charAt(0).toUpperCase()}${value.slice(1)}`
+
+const displayToken = (value: string): string =>
+  value.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, (letter) => letter.toUpperCase())
+
+const errorMessage = (error: unknown, fallback: string): string =>
+  error instanceof Error ? error.message : fallback
+
+const selectorSummary = (selector: CanonicalManifestSelector): string => {
+  switch (selector.selectorType) {
+    case 'resourceIdList':
+      return `${selector.resourceIds.length} explicit bounded resource IDs`
+    case 'tagPredicate':
+      return selector.predicates.map((item) => `${item.key} = ${item.value}`).join(' and ')
+    case 'namePredicate':
+      return [
+        selector.prefix ? `prefix ${selector.prefix}` : null,
+        selector.suffix ? `suffix ${selector.suffix}` : null,
+      ].filter(Boolean).join(', ')
+    case 'resourceType':
+      return `${selector.resourceType}; ${selector.locations.length || 'all'} location filters; ` +
+        `${selector.resourceGroups.length || 'all'} resource-group filters`
+    case 'vmScaleSet':
+      return `${selector.scaleSetResourceId}; ${selector.instanceIds.length || 'all'} instance filters`
+    case 'loadBalancerBackend':
+      return `${selector.loadBalancerResourceId}; backend ${selector.backendPoolName}`
+    case 'subnet':
+      return selector.subnetResourceId
+    case 'image':
+      return `${selector.publisher}/${selector.offer}/${selector.sku}/${selector.version ?? 'any version'}`
+    case 'provenance':
+      return `${selector.collectorToolName} ${selector.collectorToolVersion}; identity evidence ${selector.identityEvidenceRef}`
+    case 'compositeAll':
+      return `All of ${selector.children.map((child) => child.selectorId).join(', ')}`
+    case 'compositeAny':
+      return `Any of ${selector.children.map((child) => child.selectorId).join(', ')}`
+  }
+}
+
+const draftBinding = (context: WorkloadContext) => {
+  if (!context.draft) return null
+  return {
+    draftId: context.draft.draftId,
+    revision: context.draft.revision,
+    manifestDigest: context.draft.manifestDigest,
+  }
+}
+
+const relevantBatchConflicts = (
+  proposal: CohortProposal,
+  batch: CohortProposalBatch,
+) => batch.conflicts.filter(
+  (conflict) =>
+    conflict.roleRefs.length === 0 ||
+    conflict.roleRefs.some((roleRef) => roleRef === proposal.role.roleId),
+)
+
+const needsResolution = (
+  proposal: CohortProposal,
+  batch: CohortProposalBatch,
+): boolean =>
+  proposal.confidenceBand !== 'high' ||
+  proposal.dissent.length > 0 ||
+  proposal.conflicts.length > 0 ||
+  proposal.rejectedCandidates.some((candidate) => candidate.reasons.includes('crossEnvironment')) ||
+  relevantBatchConflicts(proposal, batch).length > 0
+
+const indexDecisionRecords = (
+  records: CohortDecisionRecord[],
+  batch: CohortProposalBatch,
+): Map<string, CohortDecisionRecord> => {
+  if (records.length > batch.proposals.length) {
+    throw new Error('Decision API returned too many final decisions for the proposal batch.')
+  }
+  const result = new Map<string, CohortDecisionRecord>()
+  const proposalIds = new Set(batch.proposals.map((proposal) => proposal.proposalId))
+  records.forEach((record) => {
+    const rejected = record.action === 'reject' && record.state === 'rejected'
+    const applied = record.action !== 'reject' && record.state === 'applied'
+    if (
+      !record.decisionId ||
+      record.rationale.length < 1 ||
+      record.rationale.length > 2000 ||
+      record.rationale !== record.rationale.trim() ||
+      record.publicationAllowed !== false ||
+      record.decisionId.length > 128 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(record.decisionId) ||
+      record.decidedBy.length < 1 ||
+      record.decidedBy.length > 128 ||
+      Number.isNaN(Date.parse(record.decidedAt)) ||
+      record.proposalIds.length < 1 ||
+      new Set(record.proposalIds).size !== record.proposalIds.length ||
+      record.proposalIds.some((proposalId) => !proposalIds.has(proposalId)) ||
+      record.sourceDraft.draftId !== batch.sourceDraft.draftId ||
+      record.sourceDraft.revision !== batch.sourceDraft.revision ||
+      record.sourceDraft.manifestDigest !== batch.sourceDraft.manifestDigest ||
+      record.scope.manifestId !== batch.scope.manifestId ||
+      record.scope.manifestVersion !== batch.scope.manifestVersion ||
+      record.scope.profileId !== batch.scope.profileId ||
+      record.scope.profileType !== batch.scope.profileType ||
+      record.scope.resolvedProfileDigest !== batch.scope.resolvedProfileDigest ||
+      record.proposalSetDigest !== batch.proposalSetDigest ||
+      record.snapshotArtifactDigest !== batch.snapshot.artifactDigest ||
+      (!rejected && !applied) ||
+      (rejected && (record.candidateId !== null || record.draftResult !== null)) ||
+      (applied && (
+        !record.candidateId ||
+        record.candidateId.length > 128 ||
+        !record.draftResult ||
+        record.draftResult.draftId !== record.sourceDraft.draftId ||
+        record.draftResult.revision !== record.sourceDraft.revision + 1 ||
+        !/^sha256:[a-f0-9]{64}$/.test(record.draftResult.manifestDigest)
+      ))
+    ) {
+      throw new Error('Decision API returned state outside the exact proposal batch or authority.')
+    }
+    record.proposalIds.forEach((proposalId) => {
+      if (result.has(proposalId)) {
+        throw new Error('Decision API returned multiple final decisions for one proposal.')
+      }
+      result.set(proposalId, record)
+    })
+  })
+  return result
+}
+
+type Confirmation =
+  | { action: 'approve' | 'reject' | 'split'; proposalIds: string[] }
+  | { action: 'merge'; proposalIds: string[] }
+  | { action: 'apply'; proposalIds: string[]; candidate: CohortReviewCandidate }
+
+interface CohortReviewProps {
+  context: WorkloadContext
+  contextClient: ContextApiClientPort
+  cohortClient: CohortProposalApiPort
+  decisionClient?: CohortDecisionApiPort
+  onContextChange: (context: WorkloadContext) => void
+  headingRef: RefObject<HTMLHeadingElement>
+}
+
+export default function CohortReview({
+  context,
+  contextClient,
+  cohortClient,
+  decisionClient,
+  onContextChange,
+  headingRef,
+}: CohortReviewProps) {
+  const [batch, setBatch] = useState<CohortProposalBatch | null>(null)
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error' | 'unavailable'>('loading')
+  const [statusMessage, setStatusMessage] = useState('Loading exact draft-bound cohort proposals.')
+  const [memberFilter, setMemberFilter] = useState('')
+  const [memberPage, setMemberPage] = useState(0)
+  const [rejectedPage, setRejectedPage] = useState(0)
+  const [resolution, setResolution] = useState('')
+  const [resolutionAcknowledged, setResolutionAcknowledged] = useState(false)
+  const [mergeSelection, setMergeSelection] = useState<Set<string>>(new Set())
+  const [decisions, setDecisions] = useState<Map<string, CohortDecisionRecord>>(new Map())
+  const [decisionLoadState, setDecisionLoadState] = useState<
+    'loading' | 'ready' | 'error' | 'unavailable'
+  >('loading')
+  const [candidate, setCandidate] = useState<CohortReviewCandidate | null>(null)
+  const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
+  const [busy, setBusy] = useState(false)
+  const confirmationButtonRef = useRef<HTMLButtonElement>(null)
+  const confirmationDialogRef = useRef<HTMLDivElement>(null)
+  const confirmationReturnFocusRef = useRef<HTMLElement | null>(null)
+
+  const activeManifest = context.draft?.manifest ?? context.manifest
+  const profile = Object.values(activeManifest.profiles).find(
+    (item) => item.profileType === context.environment,
+  )
+  const binding = useMemo(() => draftBinding(context), [context])
+
+  useEffect(() => {
+    if (!confirmation) return
+    confirmationButtonRef.current?.focus()
+  }, [confirmation])
+
+  useEffect(() => {
+    if (loadState === 'ready') headingRef.current?.focus()
+  }, [headingRef, loadState])
+
+  useEffect(() => {
+    let active = true
+    setBatch(null)
+    setCandidate(null)
+    setDecisions(new Map())
+    setDecisionLoadState('loading')
+    setSelectedProposalId(null)
+    setMergeSelection(new Set())
+    const draft = context.draft
+    if (!profile || !binding || draft?.state !== 'draft') {
+      setLoadState('unavailable')
+      setDecisionLoadState('unavailable')
+      setStatusMessage(
+        'Cohort review requires an active WC-007 draft in draft state. No proposal authority was inferred.',
+      )
+      return () => {
+        active = false
+      }
+    }
+    if (
+      contextClient.auth.actorId !== cohortClient.auth.actorId ||
+      !cohortClient.auth.authorizedWorkloadIds.includes(context.workloadId)
+    ) {
+      setLoadState('error')
+      setDecisionLoadState('error')
+      setStatusMessage('Context and cohort API identities or workload scopes do not match.')
+      return () => {
+        active = false
+      }
+    }
+    setLoadState('loading')
+    setStatusMessage('Loading exact draft-bound cohort proposals.')
+    void (async () => {
+      let proposalsLoaded = false
+      try {
+        const loaded = await cohortClient.loadProposalBatch({
+          workloadId: context.workloadId,
+          manifestVersion: draft.manifest.manifestVersion,
+          profileId: profile.profileId,
+          sourceDraft: binding,
+        })
+        proposalsLoaded = true
+        if (!active) return
+        setBatch(loaded)
+        setSelectedProposalId(loaded.proposals[0]?.proposalId ?? null)
+        setLoadState('ready')
+        if (!decisionClient) {
+          setDecisionLoadState('unavailable')
+          setStatusMessage(
+            'Proposals loaded for review. Durable decisions and draft apply are blocked until ' +
+            'the issue #34 decision API is merged.',
+          )
+          return
+        }
+        if (
+          decisionClient.auth.actorId !== contextClient.auth.actorId ||
+          decisionClient.auth.actorId !== cohortClient.auth.actorId ||
+          !decisionClient.auth.authorizedWorkloadIds.includes(context.workloadId)
+        ) {
+          setDecisionLoadState('error')
+          setStatusMessage(
+            'Proposal and decision API identities or workload scopes do not match. ' +
+            'All cohort actions are blocked.',
+          )
+          return
+        }
+        const loadedDecisions = await decisionClient.loadDecisions({
+          workloadId: context.workloadId,
+          manifestVersion: draft.manifest.manifestVersion,
+          profileId: profile.profileId,
+          sourceDraft: binding,
+          scope: loaded.scope,
+          proposalIds: loaded.proposals.map((proposal) => proposal.proposalId),
+          proposalSetDigest: loaded.proposalSetDigest,
+          snapshotArtifactDigest: loaded.snapshot.artifactDigest,
+        })
+        if (!active) return
+        setDecisions(indexDecisionRecords(loadedDecisions, loaded))
+        setDecisionLoadState('ready')
+        setStatusMessage(
+          loaded.proposals.length
+            ? `Loaded ${loaded.proposals.length} proposals and their durable decision state.`
+            : 'The cohort API returned no proposals for this exact draft and profile.',
+        )
+      } catch (error) {
+        if (!active) return
+        if (proposalsLoaded) {
+          setDecisionLoadState('error')
+          setStatusMessage(errorMessage(error, 'Unable to load durable cohort decisions.'))
+        } else {
+          setLoadState('error')
+          setDecisionLoadState('error')
+          setStatusMessage(errorMessage(error, 'Unable to load cohort proposals.'))
+        }
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [
+    cohortClient,
+    decisionClient,
+    binding,
+    context.workloadId,
+    context.draft,
+    context.environment,
+    contextClient.auth.actorId,
+    profile,
+  ])
+
+  const selected = batch?.proposals.find(
+    (proposal) => proposal.proposalId === selectedProposalId,
+  ) ?? null
+  const filteredMembers = useMemo(() => {
+    if (!selected) return []
+    const query = memberFilter.trim().toLowerCase()
+    return query
+      ? selected.members.filter((member) => member.toLowerCase().includes(query))
+      : selected.members
+  }, [memberFilter, selected])
+  const memberPageCount = Math.max(1, Math.ceil(filteredMembers.length / MEMBER_PAGE_SIZE))
+  const visibleMembers = filteredMembers.slice(
+    memberPage * MEMBER_PAGE_SIZE,
+    (memberPage + 1) * MEMBER_PAGE_SIZE,
+  )
+  const rejectedPageCount = Math.max(
+    1,
+    Math.ceil((selected?.rejectedCandidates.length ?? 0) / REJECTED_PAGE_SIZE),
+  )
+  const visibleRejected = selected?.rejectedCandidates.slice(
+    rejectedPage * REJECTED_PAGE_SIZE,
+    (rejectedPage + 1) * REJECTED_PAGE_SIZE,
+  ) ?? []
+  const isHuman =
+    contextClient.auth.kind === 'human' &&
+    cohortClient.auth.kind === 'human' &&
+    (!decisionClient || decisionClient.auth.kind === 'human')
+  const canSubmitDecision =
+    isHuman &&
+    contextClient.auth.role === 'proposer' &&
+    decisionLoadState === 'ready' &&
+    decisionClient !== undefined
+  const selectedNeedsResolution = Boolean(selected && batch && needsResolution(selected, batch))
+  const rationaleReady =
+    resolution.trim().length >= 1 &&
+    resolution.trim().length <= 2000
+  const resolutionReady =
+    resolution.trim().length >= 12 &&
+    resolution.trim().length <= 2000 &&
+    resolutionAcknowledged
+  const selectedDecisionRecord = selected ? decisions.get(selected.proposalId) : undefined
+  const selectedDecision: CohortDecisionState = selectedDecisionRecord?.state ?? 'pending'
+  const rejectedProposalIds = useMemo(
+    () => new Set(
+      [...decisions.entries()]
+        .filter(([, decision]) => decision.state === 'rejected')
+        .map(([proposalId]) => proposalId),
+    ),
+    [decisions],
+  )
+
+  useEffect(() => {
+    if (!rejectedProposalIds.size) return
+    setMergeSelection((current) =>
+      new Set([...current].filter((proposalId) => !rejectedProposalIds.has(proposalId))),
+    )
+    setCandidate((current) =>
+      current?.sourceProposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+        ? null
+        : current,
+    )
+    setConfirmation((current) =>
+      current?.proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+        ? null
+        : current,
+    )
+  }, [rejectedProposalIds])
+
+  const selectProposal = (proposalId: string): void => {
+    setSelectedProposalId(proposalId)
+    setMemberFilter('')
+    setMemberPage(0)
+    setRejectedPage(0)
+    setResolution('')
+    setResolutionAcknowledged(false)
+    setCandidate(null)
+  }
+
+  const updateMergeSelection = (proposalId: string, checked: boolean): void => {
+    if (checked && (decisionLoadState !== 'ready' || rejectedProposalIds.has(proposalId))) {
+      setStatusMessage('Rejected or unverified proposals cannot be selected for merge.')
+      return
+    }
+    setMergeSelection((current) => {
+      const next = new Set(current)
+      if (checked) next.add(proposalId)
+      else next.delete(proposalId)
+      return next
+    })
+  }
+
+  const openConfirmation = (
+    action: Confirmation['action'],
+    proposalIds: string[],
+    reviewCandidate?: CohortReviewCandidate,
+  ): void => {
+    if (
+      decisionLoadState !== 'ready' ||
+      proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+    ) {
+      setCandidate(null)
+      setStatusMessage('Rejected or unverified proposals cannot continue to another cohort action.')
+      return
+    }
+    confirmationReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    if (action === 'apply' && reviewCandidate) {
+      setConfirmation({ action, proposalIds, candidate: reviewCandidate })
+    } else if (action !== 'apply') {
+      setConfirmation({ action, proposalIds } as Confirmation)
+    }
+  }
+
+  const closeConfirmation = (): void => {
+    setConfirmation(null)
+    queueMicrotask(() => confirmationReturnFocusRef.current?.focus())
+  }
+
+  const previewTransformation = async (
+    action: 'split' | 'merge',
+    proposalIds: string[],
+  ): Promise<void> => {
+    if (
+      !batch ||
+      !binding ||
+      !profile ||
+      !resolutionReady ||
+      decisionLoadState !== 'ready' ||
+      proposalIds.some((proposalId) => rejectedProposalIds.has(proposalId))
+    ) {
+      setCandidate(null)
+      setStatusMessage('Split and merge require an acknowledged resolution rationale.')
+      return
+    }
+    setBusy(true)
+    try {
+      const preview = await cohortClient.previewReview({
+        action,
+        workloadId: context.workloadId,
+        manifestVersion: activeManifest.manifestVersion,
+        profileId: profile.profileId,
+        sourceDraft: binding,
+        proposalIds,
+        sourceRoles: [
+          ...new Map(
+            batch.proposals
+              .filter((proposal) => proposalIds.includes(proposal.proposalId))
+              .map((proposal) => [proposal.role.roleId, proposal.role]),
+          ).values(),
+        ],
+        sourceMembers: batch.proposals
+          .filter((proposal) => proposalIds.includes(proposal.proposalId))
+          .flatMap((proposal) => proposal.members),
+        proposalSetDigest: batch.proposalSetDigest,
+        snapshotArtifactDigest: batch.snapshot.artifactDigest,
+        resolution: resolution.trim(),
+      })
+      setCandidate(preview)
+      setStatusMessage(
+        `${displayToken(action)} preview loaded from the cohort API. It has not changed WC-007 state.`,
+      )
+    } catch (error) {
+      setCandidate(null)
+      setStatusMessage(errorMessage(error, `Unable to preview the ${action}.`))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submitDecision = async (
+    action: 'approve' | 'reject' | 'split' | 'merge',
+    proposalIds: string[],
+    reviewCandidate: CohortReviewCandidate | null,
+  ): Promise<void> => {
+    if (!canSubmitDecision || !decisionClient || !context.draft || !batch) {
+      setCandidate(null)
+      setStatusMessage(
+        'A verified human proposer and the durable cohort decision API are required for this action.',
+      )
+      return
+    }
+    if (
+      proposalIds.some((proposalId) => decisions.has(proposalId)) ||
+      (action === 'reject' && reviewCandidate !== null) ||
+      (action !== 'reject' && reviewCandidate === null)
+    ) {
+      setCandidate(null)
+      setStatusMessage('A final cohort decision already blocks this proposal or candidate.')
+      return
+    }
+    const rationale = reviewCandidate?.resolution.trim() ?? resolution.trim()
+    if (rationale.length < 1 || rationale.length > 2000) {
+      setStatusMessage('A durable cohort decision requires a rationale of 1 to 2,000 characters.')
+      return
+    }
+    setBusy(true)
+    try {
+      if (reviewCandidate) {
+        void applyCohortCandidateToDraft(
+          context,
+          reviewCandidate,
+          batch,
+          new Date(),
+        )
+      }
+      const decision = await decisionClient.submitDecision({
+        workloadId: context.workloadId,
+        manifestVersion: context.draft.manifest.manifestVersion,
+        profileId: batch.scope.profileId,
+        sourceDraft: batch.sourceDraft,
+        scope: batch.scope,
+        proposalIds,
+        proposalSetDigest: batch.proposalSetDigest,
+        snapshotArtifactDigest: batch.snapshot.artifactDigest,
+        action,
+        candidate: reviewCandidate,
+        rationale,
+      })
+      const indexed = indexDecisionRecords([decision], batch)
+      if (
+        decision.action !== action ||
+        decision.rationale !== rationale ||
+        JSON.stringify(decision.proposalIds) !== JSON.stringify(proposalIds)
+      ) {
+        throw new Error('Decision API returned a different durable decision.')
+      }
+      setDecisions((current) => {
+        const next = new Map(current)
+        indexed.forEach((record, proposalId) => next.set(proposalId, record))
+        return next
+      })
+      setCandidate(null)
+      setMergeSelection((current) =>
+        new Set([...current].filter((proposalId) => !proposalIds.includes(proposalId))),
+      )
+      if (decision.state === 'applied') {
+        const refreshed = await contextClient.loadWorkloadContext(context.workloadId)
+        onContextChange(refreshed)
+        setStatusMessage(
+          `Durable decision ${decision.decisionId} atomically applied bounded selectors to draft ` +
+          `revision ${decision.draftResult?.revision ?? 'unknown'}. Nothing was published.`,
+        )
+      } else {
+        setStatusMessage(
+          `Durable rejection ${decision.decisionId} recorded. The proposal is blocked from later ` +
+          'approve, split, merge, or apply actions.',
+        )
+      }
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'The durable cohort decision failed closed.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const confirmAction = async (): Promise<void> => {
+    const pending = confirmation
+    if (!pending || !batch) return
+    closeConfirmation()
+    if (pending.action === 'reject') {
+      await submitDecision('reject', pending.proposalIds, null)
+      return
+    }
+    if (pending.action === 'split' || pending.action === 'merge') {
+      await previewTransformation(pending.action, pending.proposalIds)
+      return
+    }
+    if (pending.action === 'apply') {
+      await submitDecision(
+        pending.candidate.action,
+        pending.proposalIds,
+        pending.candidate,
+      )
+      return
+    }
+    const proposal = batch.proposals.find(
+      (item) => item.proposalId === pending.proposalIds[0],
+    )
+    if (!proposal) {
+      setStatusMessage('The selected proposal is no longer in the exact loaded batch.')
+      return
+    }
+    try {
+      await submitDecision(
+        'approve',
+        pending.proposalIds,
+        proposalReviewCandidate(proposal, batch, resolution.trim()),
+      )
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'The proposal could not be bounded for the draft.'))
+    }
+  }
+
+  const mergeCandidates = batch?.proposals.filter(
+    (proposal) => mergeSelection.has(proposal.proposalId),
+  ) ?? []
+  const mergeRoleCount = new Set(mergeCandidates.map((proposal) => proposal.role.roleId)).size
+  const canMerge =
+    canSubmitDecision &&
+    mergeCandidates.length >= 2 &&
+    mergeCandidates.every((proposal) => !rejectedProposalIds.has(proposal.proposalId)) &&
+    mergeRoleCount === 1 &&
+    resolutionReady
+
+  if (loadState === 'loading') {
+    return <section className="panel cohort-panel" aria-live="polite">{statusMessage}</section>
+  }
+
+  if (loadState === 'error' || loadState === 'unavailable' || !batch) {
+    return (
+      <section className="panel cohort-panel" aria-labelledby="cohort-heading">
+        <h2 id="cohort-heading">Cohort proposal review</h2>
+        <div className="review-notice" role={loadState === 'error' ? 'alert' : 'status'}>
+          <strong>{loadState === 'error' ? 'Proposal API unavailable' : 'Draft required'}</strong>
+          <p>{statusMessage}</p>
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <section className="panel cohort-panel" aria-labelledby="cohort-heading">
+      <div className="panel-heading">
+        <div>
+          <p className="panel-kicker">Inferred proposals — explicit human review required</p>
+          <h2 id="cohort-heading" tabIndex={-1} ref={headingRef}>Cohort proposal review</h2>
+        </div>
+        <span className="meta-pill">Draft only</span>
+      </div>
+
+      <dl className="cohort-metadata">
+        <div><dt>Environment</dt><dd>{displayEnvironment(batch.scope.profileType)}</dd></div>
+        <div><dt>Manifest version</dt><dd>{batch.scope.manifestVersion}</dd></div>
+        <div><dt>Approval state</dt><dd>{context.draft?.state ?? context.approvalState}</dd></div>
+        <div>
+          <dt>Declared residual risk</dt>
+          <dd>
+            {profile?.riskAcceptances.length
+              ? `${profile.riskAcceptances.length} declared · ${profile.riskAcceptances[0]!.residualRiskStatement}`
+              : 'Not declared for this environment'}
+          </dd>
+        </div>
+        <div><dt>Evidence source</dt><dd>Observed snapshot {batch.snapshot.snapshotId}</dd></div>
+        <div><dt>Snapshot digest</dt><dd className="digest-value">{batch.snapshot.artifactDigest}</dd></div>
+        <div><dt>Proposal set digest</dt><dd className="digest-value">{batch.proposalSetDigest}</dd></div>
+        <div><dt>Draft binding</dt><dd>{batch.sourceDraft.draftId} · revision {batch.sourceDraft.revision}</dd></div>
+        <div><dt>Decision API</dt><dd>{displayToken(decisionLoadState)}</dd></div>
+        <div><dt>Publication</dt><dd>Not allowed by proposal contract</dd></div>
+      </dl>
+
+      <p className="relationship-legend">
+        <strong>Observed:</strong> bounded evidence summaries. <strong>Inferred:</strong> cohort membership.
+        {' '}<strong>Declared:</strong> selectors change only through a durable, atomic decision.
+        {' '}<strong>Exception:</strong> conflicts require an explicit resolution.
+      </p>
+
+      <div className="cohort-workspace">
+        <div>
+          <h3>Proposals</h3>
+          <ul className="proposal-list">
+            {batch.proposals.map((proposal) => {
+              const decision = decisions.get(proposal.proposalId)?.state ?? 'pending'
+              const rejected = decision === 'rejected'
+              return (
+                <li key={proposal.proposalId}>
+                  <button
+                    type="button"
+                    className={proposal.proposalId === selectedProposalId
+                      ? 'proposal-button is-selected'
+                      : 'proposal-button'}
+                    onClick={() => selectProposal(proposal.proposalId)}
+                    aria-pressed={proposal.proposalId === selectedProposalId}
+                  >
+                    <span>
+                      <strong>{proposal.role.roleId}</strong>
+                      <span className={`confidence-badge confidence-${proposal.confidenceBand}`}>
+                        {proposal.confidenceBand} · {Math.round(proposal.confidence * 100)}%
+                      </span>
+                    </span>
+                    <span>{proposal.members.length.toLocaleString()} members · {displayToken(decision)}</span>
+                  </button>
+                  <label className="merge-choice">
+                    <input
+                      type="checkbox"
+                      checked={mergeSelection.has(proposal.proposalId)}
+                      onChange={(event) =>
+                        updateMergeSelection(proposal.proposalId, event.target.checked)}
+                      disabled={!canSubmitDecision || busy || rejected}
+                    />
+                    Include {proposal.role.roleId} proposal in merge
+                  </label>
+                </li>
+              )
+            })}
+          </ul>
+          <button
+            type="button"
+            className="secondary-action merge-action"
+            disabled={!canMerge || busy}
+            onClick={() => openConfirmation(
+              'merge',
+              batch.proposals
+                .filter((proposal) => mergeSelection.has(proposal.proposalId))
+                .map((proposal) => proposal.proposalId),
+            )}
+          >
+            Preview merge of selected proposals
+          </button>
+          {mergeCandidates.length >= 2 && mergeRoleCount !== 1 && (
+            <p className="field-help" role="status">Merge requires proposals for the same declared role.</p>
+          )}
+        </div>
+
+        {selected && (
+          <div className="proposal-detail">
+            <div className="proposal-title">
+              <div>
+                <p className="relationship-kind">Inferred relationship</p>
+                <h3>{selected.role.roleId}</h3>
+              </div>
+              <span className={`confidence-badge confidence-${selected.confidenceBand}`}>
+                {displayToken(selected.confidenceBand)} confidence · {Math.round(selected.confidence * 100)}%
+              </span>
+            </div>
+            <dl className="proposal-summary">
+              <div><dt>Member count</dt><dd>{selected.members.length.toLocaleString()}</dd></div>
+              <div><dt>Review band</dt><dd>{displayToken(selected.disposition)}</dd></div>
+              <div><dt>Dissent</dt><dd>{selected.dissent.length.toLocaleString()}</dd></div>
+              <div><dt>Conflicts</dt><dd>{selected.conflicts.length + relevantBatchConflicts(selected, batch).length}</dd></div>
+              <div><dt>Rejected candidates</dt><dd>{selected.rejectedCandidates.length.toLocaleString()}</dd></div>
+              <div><dt>Durable decision</dt><dd>{displayToken(selectedDecision)}</dd></div>
+              <div>
+                <dt>Decision ID</dt>
+                <dd>{selectedDecisionRecord?.decisionId ?? 'Not recorded'}</dd>
+              </div>
+            </dl>
+
+            <div className="selector-preview">
+              <h4>Bounded selector preview</h4>
+              {selected.selectorPreview ? (
+                <>
+                  <p>
+                    <strong>{displayToken(selected.selectorPreview.selector.selectorType)}</strong>
+                    {' '}— {selectorSummary(selected.selectorPreview.selector)}
+                  </p>
+                  <p>
+                    Maximum matches: {selected.selectorPreview.maxMatches.toLocaleString()} ·
+                    Result digest: <span className="digest-value">
+                      {selected.selectorPreview.selectorResultDigest}
+                    </span>
+                  </p>
+                </>
+              ) : (
+                <p role="alert">
+                  No bounded selector preview was provided. Direct draft approval is blocked;
+                  a human may request a server-generated split preview after explicit resolution.
+                </p>
+              )}
+            </div>
+
+            <div className="evidence-grid">
+              <div>
+                <h4>Observed support evidence</h4>
+                {selected.supportingEvidence.length ? (
+                  <ul className="compact-list">
+                    {selected.supportingEvidence.map((evidence, index) => (
+                      <li key={`${evidence.signalType}-${index}`}>
+                        <strong>{displayToken(evidence.signalType)}</strong>
+                        <span>{evidence.signalValue}</span>
+                        <small>
+                          {evidence.memberCount.toLocaleString()} members ·
+                          {' '}{evidence.evidenceRefCount.toLocaleString()} bounded references
+                        </small>
+                      </li>
+                    ))}
+                  </ul>
+                ) : <p>No support evidence summary was provided.</p>}
+              </div>
+              <div>
+                <h4>Dissent</h4>
+                {selected.dissent.length ? (
+                  <ul className="compact-list">
+                    {selected.dissent.slice(0, REJECTED_PAGE_SIZE).map((item) => (
+                      <li key={`${item.resourceId}-${item.signalType}`}>
+                        <strong>{displayToken(item.signalType)}</strong>
+                        <span className="resource-id">{item.resourceId}</span>
+                        <span>{item.reason}</span>
+                        <small>Expected {item.expectedValue}; observed {item.observedValue ?? 'not provided'}</small>
+                      </li>
+                    ))}
+                  </ul>
+                ) : <p>No dissent was declared by the proposal API.</p>}
+              </div>
+            </div>
+
+            <div>
+              <h4>Conflicts and exceptions requiring resolution</h4>
+              {[...selected.conflicts, ...relevantBatchConflicts(selected, batch)].length ? (
+                <ul className="conflict-list">
+                  {[...selected.conflicts, ...relevantBatchConflicts(selected, batch)].map(
+                    (conflict, index) => (
+                      <li key={`${conflict.code}-${index}`}>
+                        <strong>{displayToken(conflict.code)}</strong>
+                        <span>{conflict.detail}</span>
+                        <small>
+                          {conflict.resourceIds.length.toLocaleString()} bounded resource references ·
+                          {' '}{conflict.roleRefs.length.toLocaleString()} role references
+                        </small>
+                      </li>
+                    ),
+                  )}
+                </ul>
+              ) : <p>No conflicts were declared by the proposal API.</p>}
+            </div>
+
+            <div className="member-browser">
+              <div className="member-browser-heading">
+                <h4>Members</h4>
+                <span>{filteredMembers.length.toLocaleString()} of {selected.members.length.toLocaleString()}</span>
+              </div>
+              <label htmlFor="member-filter">
+                Filter members
+                <input
+                  id="member-filter"
+                  type="search"
+                  value={memberFilter}
+                  onChange={(event) => {
+                    setMemberFilter(event.target.value)
+                    setMemberPage(0)
+                  }}
+                  placeholder="Filter by bounded resource ID"
+                />
+              </label>
+              <ul className="resource-page" aria-label="Filtered cohort members">
+                {visibleMembers.map((member) => <li key={member} className="resource-id">{member}</li>)}
+              </ul>
+              {!visibleMembers.length && <p>No members match this filter.</p>}
+              <div className="pagination" aria-label="Member pages">
+                <button
+                  type="button"
+                  className="small-button"
+                  disabled={memberPage === 0}
+                  onClick={() => setMemberPage((page) => Math.max(0, page - 1))}
+                >
+                  Previous members
+                </button>
+                <span>Page {Math.min(memberPage + 1, memberPageCount)} of {memberPageCount}</span>
+                <button
+                  type="button"
+                  className="small-button"
+                  disabled={memberPage + 1 >= memberPageCount}
+                  onClick={() => setMemberPage((page) => page + 1)}
+                >
+                  Next members
+                </button>
+              </div>
+            </div>
+
+            <div className="member-browser">
+              <div className="member-browser-heading">
+                <h4>Rejected candidates</h4>
+                <span>{selected.rejectedCandidates.length.toLocaleString()}</span>
+              </div>
+              {visibleRejected.length ? (
+                <ul className="resource-page" aria-label="Rejected candidates">
+                  {visibleRejected.map((item) => (
+                    <li key={item.resourceId}>
+                      <span className="resource-id">{item.resourceId}</span>
+                      <small>{item.reasons.map(displayToken).join(', ')}</small>
+                    </li>
+                  ))}
+                </ul>
+              ) : <p>No rejected candidates were declared.</p>}
+              {selected.rejectedCandidates.length > REJECTED_PAGE_SIZE && (
+                <div className="pagination" aria-label="Rejected candidate pages">
+                  <button
+                    type="button"
+                    className="small-button"
+                    disabled={rejectedPage === 0}
+                    onClick={() => setRejectedPage((page) => Math.max(0, page - 1))}
+                  >
+                    Previous rejected
+                  </button>
+                  <span>Page {rejectedPage + 1} of {rejectedPageCount}</span>
+                  <button
+                    type="button"
+                    className="small-button"
+                    disabled={rejectedPage + 1 >= rejectedPageCount}
+                    onClick={() => setRejectedPage((page) => page + 1)}
+                  >
+                    Next rejected
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <fieldset className="resolution-fieldset">
+              <legend>Explicit resolution</legend>
+              <label htmlFor="cohort-resolution">
+                Resolution rationale
+                <textarea
+                  id="cohort-resolution"
+                  value={resolution}
+                  maxLength={2000}
+                  onChange={(event) => {
+                    setResolution(event.target.value)
+                    setCandidate(null)
+                  }}
+                  disabled={!canSubmitDecision || busy}
+                  aria-describedby="cohort-resolution-help"
+                />
+              </label>
+              <p id="cohort-resolution-help" className="field-help">
+                A rationale of 1–2,000 characters is stored in the durable decision record.
+                At least 12 characters and acknowledgement are required for medium, low,
+                conflicting, cross-environment, split, or merge review.
+              </p>
+              <label className="review-confirmation">
+                <input
+                  type="checkbox"
+                  checked={resolutionAcknowledged}
+                  onChange={(event) => setResolutionAcknowledged(event.target.checked)}
+                  disabled={!canSubmitDecision || busy}
+                />
+                I explicitly resolved the listed dissent, conflicts, and environment boundary for
+                this exact snapshot and proposal digest.
+              </label>
+            </fieldset>
+
+            <div className="cohort-actions">
+              <button
+                type="button"
+                className="primary-action"
+                disabled={
+                  busy ||
+                  !canSubmitDecision ||
+                  !rationaleReady ||
+                  !selected.selectorPreview ||
+                  selectedDecision !== 'pending' ||
+                  (selectedNeedsResolution && !resolutionReady)
+                }
+                onClick={() => openConfirmation('approve', [selected.proposalId])}
+              >
+                Approve bounded cohort to draft
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={
+                  !canSubmitDecision ||
+                  busy ||
+                  !rationaleReady ||
+                  selectedDecision !== 'pending'
+                }
+                onClick={() => openConfirmation('reject', [selected.proposalId])}
+              >
+                Reject proposal
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={
+                  !canSubmitDecision ||
+                  busy ||
+                  selectedDecision !== 'pending' ||
+                  !resolutionReady
+                }
+                onClick={() => openConfirmation('split', [selected.proposalId])}
+              >
+                Preview split
+              </button>
+            </div>
+            {!canSubmitDecision && (
+              <p className="field-help" role="status">
+                Durable cohort decisions require a human WC-007 proposer and the merged issue #34
+                decision API. Current role: {contextClient.auth.role}; decision API:
+                {' '}{displayToken(decisionLoadState)}.
+              </p>
+            )}
+
+            {candidate && (
+              <div className="candidate-preview" aria-labelledby="candidate-preview-heading">
+                <h4 id="candidate-preview-heading">
+                  {displayToken(candidate.action)} result — API preview only
+                </h4>
+                <p>
+                  {candidate.roleUpdates.length} role update(s), bound to snapshot
+                  {' '}<span className="digest-value">{candidate.snapshot.artifactDigest}</span>.
+                </p>
+                <ul className="compact-list">
+                  {candidate.roleUpdates.map((update) => (
+                    <li key={update.role.roleId}>
+                      <strong>{update.role.roleId}</strong>
+                      <span>{update.memberCount.toLocaleString()} summarized members</span>
+                      {update.selectorPreviews.map((preview) => (
+                        <small key={preview.selector.selectorId}>
+                          {preview.selector.selectorId}: {selectorSummary(preview.selector)}
+                          {' '}· max {preview.maxMatches.toLocaleString()}
+                        </small>
+                      ))}
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={
+                    !canSubmitDecision ||
+                    busy ||
+                    candidate.sourceProposalIds.some((proposalId) => decisions.has(proposalId))
+                  }
+                  onClick={() => openConfirmation(
+                    'apply',
+                    candidate.sourceProposalIds,
+                    candidate,
+                  )}
+                >
+                  Apply preview as draft selector proposal
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="status-message" aria-live="polite">{statusMessage}</div>
+
+      {confirmation && (
+        <div
+          className="confirmation-backdrop"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="cohort-confirmation-heading"
+          aria-describedby="cohort-confirmation-description"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') closeConfirmation()
+            if (event.key === 'Tab') {
+              const controls = confirmationDialogRef.current?.querySelectorAll<HTMLButtonElement>(
+                'button:not(:disabled)',
+              )
+              if (!controls?.length) return
+              const first = controls[0]!
+              const last = controls[controls.length - 1]!
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault()
+                last.focus()
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault()
+                first.focus()
+              }
+            }
+          }}
+        >
+          <div className="confirmation-dialog" ref={confirmationDialogRef}>
+            <h3 id="cohort-confirmation-heading">
+              Confirm {displayToken(confirmation.action)}
+            </h3>
+            <p id="cohort-confirmation-description">
+              Confirm this action for {confirmation.proposalIds.length} exact proposal(s) in
+              {' '}{displayEnvironment(batch.scope.profileType)}, manifest {batch.scope.manifestVersion},
+              snapshot <span className="digest-value">{batch.snapshot.artifactDigest}</span>.
+              {confirmation.action === 'reject'
+                ? ' This persists a durable rejection and permanently blocks later actions for this proposal set.'
+                : confirmation.action === 'split' || confirmation.action === 'merge'
+                  ? ' This requests a non-authoritative selector preview and does not change the manifest.'
+                  : ' This records a durable decision and requests one atomic selector-only draft apply. The full rationale stays in the decision record; it never validates, approves, or publishes.'}
+            </p>
+            <div className="confirmation-actions">
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={closeConfirmation}
+              >
+                Cancel
+              </button>
+              <button
+                ref={confirmationButtonRef}
+                type="button"
+                className="primary-action"
+                onClick={() => void confirmAction()}
+              >
+                Confirm {displayToken(confirmation.action)}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}

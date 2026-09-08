@@ -937,7 +937,7 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
           replacement_digest: canonicalReplacement.compatibility.artifactDigest,
           reason: request.reason,
         }),
-      })
+      }, request.idempotencyKey)
       return toViewDraft(parseDraft(response))
     },
     validateDraft: async (request) => transition(request, 'validate'),

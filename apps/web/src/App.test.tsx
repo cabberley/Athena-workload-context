@@ -3,13 +3,23 @@ import userEvent from '@testing-library/user-event'
 import { axe } from 'jest-axe'
 import App from './App'
 import { SupersessionRecoveryRequiredError } from './client'
+import { createMockCohortProposalApiClient } from './test/mockCohortClient'
 import { createMockContextApiClient, mockAuthSession } from './test/mockClient'
 
-const renderStudio = async (client = createMockContextApiClient()) => {
+const renderStudio = async (
+  client = createMockContextApiClient(),
+  cohortClient = createMockCohortProposalApiClient({ session: client.auth }),
+) => {
   const initialContexts = await client.loadAuthorizedWorkloads()
   return {
     client,
-    ...render(<App client={client} initialContexts={initialContexts} />),
+    ...render(
+      <App
+        client={client}
+        cohortClient={cohortClient}
+        initialContexts={initialContexts}
+      />,
+    ),
   }
 }
 
