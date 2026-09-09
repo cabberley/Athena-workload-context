@@ -39,6 +39,7 @@ type MonitoringSignalKind = Literal[
 ]
 type MonitoringReadOperation = Literal[
     "Microsoft.OperationalInsights/workspaces/read",
+    "Microsoft.OperationalInsights/workspaces/query/read",
     "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
     "Microsoft.OperationalInsights/workspaces/query/Perf/read",
     "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
@@ -67,6 +68,25 @@ _SUBSCRIPTION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_KEY_VAULT_KEY_ID_PATTERN = re.compile(
+    r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/"
+    r"[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
+)
+_REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
+_REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
+_EXPECTED_APPROVED_VM_NAMES: tuple[str, ...] = (
+    "athena-hackathon-client-01",
+    "athena-hackathon-ecp-01",
+    "athena-hackathon-ecp-02",
+    "athena-hackathon-ecp-03",
+    "athena-hackathon-iris-01",
+    "athena-hackathon-mid-01",
+    "athena-hackathon-mid-02",
+    "athena-hackathon-sqlvm-01",
+    "athena-hackathon-web-01",
+    "athena-hackathon-web-02",
+    "athena-hackathon-web-03",
+)
 _EXPECTED_SIGNALS: tuple[MonitoringSignalKind, ...] = (
     "heartbeat",
     "perf",
@@ -79,6 +99,7 @@ _EXPECTED_SIGNALS: tuple[MonitoringSignalKind, ...] = (
 )
 _EXPECTED_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     "Microsoft.OperationalInsights/workspaces/read",
+    "Microsoft.OperationalInsights/workspaces/query/read",
     "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
     "Microsoft.OperationalInsights/workspaces/query/Perf/read",
     "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
@@ -174,6 +195,16 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
+    workload_virtual_network_resource_id: str = Field(
+        alias="workloadVirtualNetworkResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    approved_vm_names: tuple[str, ...] = Field(
+        alias="approvedVmNames",
+        min_length=len(_EXPECTED_APPROVED_VM_NAMES),
+        max_length=len(_EXPECTED_APPROVED_VM_NAMES),
+    )
     workspace_resource_id: str = Field(
         alias="workspaceResourceId",
         min_length=1,
@@ -228,6 +259,27 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         alias="connectionMonitorDeploymentMode"
     )
 
+    @field_validator("workload_virtual_network_resource_id")
+    @classmethod
+    def canonicalize_workload_vnet_id(cls, value: str) -> str:
+        subscription_id, resource_group, provider, resource_types = (
+            _parse_arm_resource_id(value)
+        )
+        if (
+            resource_group == _REVIEWED_WORKLOAD_RESOURCE_GROUP
+            and provider == "microsoft.network"
+            and resource_types == ("virtualnetworks",)
+            and value.rsplit("/", 1)[-1].casefold()
+            == _REVIEWED_WORKLOAD_VNET_NAME
+        ):
+            return (
+                f"/subscriptions/{subscription_id}/resourceGroups/"
+                f"{_REVIEWED_WORKLOAD_RESOURCE_GROUP}/providers/"
+                "Microsoft.Network/virtualNetworks/"
+                f"{_REVIEWED_WORKLOAD_VNET_NAME}"
+            )
+        return value
+
     @model_validator(mode="after")
     def require_complete_generic_monitoring_allowlist(self) -> MonitoringCollectorContract:
         if self.signal_kinds != _EXPECTED_SIGNALS:
@@ -249,13 +301,34 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         ) = _parse_arm_resource_id(self.monitoring_resource_group_id)
         if monitoring_provider is not None or monitoring_types:
             raise ValueError("monitoring scope must be a resource-group ID")
-        workload_subscription, _, workload_provider, workload_types = _parse_arm_resource_id(
-            self.workload_resource_group_id
+        workload_subscription, workload_resource_group, workload_provider, workload_types = (
+            _parse_arm_resource_id(self.workload_resource_group_id)
         )
         if workload_provider is not None or workload_types:
             raise ValueError("workload scope must be a resource-group ID")
         if workload_subscription != monitoring_subscription:
             raise ValueError("workload scope must use the monitoring deployment subscription")
+        if workload_resource_group != _REVIEWED_WORKLOAD_RESOURCE_GROUP:
+            raise ValueError("workload scope must be the reviewed WC-024 workload resource group")
+        if self.approved_vm_names != _EXPECTED_APPROVED_VM_NAMES:
+            raise ValueError("approved VMs must match the exact reviewed WC-024 VM allowlist")
+        (
+            workload_vnet_subscription,
+            workload_vnet_resource_group,
+            workload_vnet_provider,
+            workload_vnet_types,
+        ) = _parse_arm_resource_id(self.workload_virtual_network_resource_id)
+        if (
+            workload_vnet_subscription != monitoring_subscription
+            or workload_vnet_resource_group != _REVIEWED_WORKLOAD_RESOURCE_GROUP
+            or workload_vnet_provider != "microsoft.network"
+            or workload_vnet_types != ("virtualnetworks",)
+            or self.workload_virtual_network_resource_id.rsplit("/", 1)[-1].casefold()
+            != _REVIEWED_WORKLOAD_VNET_NAME
+        ):
+            raise ValueError("workload VNet must match the exact reviewed WC-024 boundary")
+        if _KEY_VAULT_KEY_ID_PATTERN.fullmatch(self.signing_key_resource_id) is None:
+            raise ValueError("signing key must be an exact versioned Key Vault key URI")
 
         resource_bindings = (
             (
@@ -281,12 +354,6 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 "microsoft.insights",
                 ("datacollectionendpoints",),
                 "data collection endpoint",
-            ),
-            (
-                self.signing_key_resource_id,
-                "microsoft.keyvault",
-                ("vaults", "keys"),
-                "signing key",
             ),
             (
                 self.evidence_storage_account_resource_id,
@@ -391,7 +458,8 @@ def _resolve_reviewed_contract_binding(
     reviewed_collector_contract: MonitoringCollectorContract | None,
     expected_collector_contract_digest: str | None,
     reviewed_maximum_evidence_age_seconds: int | None,
-) -> tuple[str, int]:
+    reviewed_signing_key_resource_id: str | None,
+) -> tuple[str, int, str]:
     if reviewed_collector_contract is not None:
         reviewed_digest = reviewed_collector_contract.compute_artifact_digest_value()
         reviewed_max_age = reviewed_collector_contract.maximum_evidence_age_seconds
@@ -407,7 +475,17 @@ def _resolve_reviewed_contract_binding(
             raise ValueError(
                 "monitoring handoff freshness policy does not match the reviewed contract"
             )
-        return reviewed_digest, reviewed_max_age
+        if (
+            reviewed_signing_key_resource_id is not None
+            and reviewed_signing_key_resource_id
+            != reviewed_collector_contract.signing_key_resource_id
+        ):
+            raise ValueError("monitoring handoff signing key does not match the reviewed contract")
+        return (
+            reviewed_digest,
+            reviewed_max_age,
+            reviewed_collector_contract.signing_key_resource_id,
+        )
 
     if expected_collector_contract_digest is None:
         raise ValueError(
@@ -417,11 +495,19 @@ def _resolve_reviewed_contract_binding(
         raise ValueError(
             "monitoring handoff verification requires the reviewed maximum evidence age"
         )
+    if reviewed_signing_key_resource_id is None:
+        raise ValueError("monitoring handoff verification requires the reviewed signing key")
     if not isinstance(reviewed_maximum_evidence_age_seconds, int) or not (
         60 <= reviewed_maximum_evidence_age_seconds <= 900
     ):
         raise ValueError("monitoring handoff reviewed maximum evidence age is invalid")
-    return expected_collector_contract_digest, reviewed_maximum_evidence_age_seconds
+    if _KEY_VAULT_KEY_ID_PATTERN.fullmatch(reviewed_signing_key_resource_id) is None:
+        raise ValueError("monitoring handoff reviewed signing key is invalid")
+    return (
+        expected_collector_contract_digest,
+        reviewed_maximum_evidence_age_seconds,
+        reviewed_signing_key_resource_id,
+    )
 
 
 def _require_trusted_as_of(value: datetime) -> None:
@@ -443,19 +529,21 @@ def verify_monitoring_evidence_handoff_attestation(
     reviewed_collector_contract: MonitoringCollectorContract | None = None,
     expected_collector_contract_digest: str | None = None,
     reviewed_maximum_evidence_age_seconds: int | None = None,
+    reviewed_signing_key_resource_id: str | None = None,
 ) -> None:
     """Fail closed unless a reviewed contract, trusted time, and exact key bind the handoff.
 
-    Callers must provide either the full reviewed collector contract, or both the reviewed
-    collector-contract digest and reviewed maximum evidence age. ``as_of`` is supplied by the
+    Callers must provide either the full reviewed collector contract, or the reviewed
+    collector-contract digest, maximum evidence age, and signing key. ``as_of`` is supplied by the
     trusted caller so verification never depends on local wall-clock time.
     """
 
     attestation = handoff.collector_attestation
-    expected_digest, maximum_age_seconds = _resolve_reviewed_contract_binding(
+    expected_digest, maximum_age_seconds, reviewed_signing_key = _resolve_reviewed_contract_binding(
         reviewed_collector_contract=reviewed_collector_contract,
         expected_collector_contract_digest=expected_collector_contract_digest,
         reviewed_maximum_evidence_age_seconds=reviewed_maximum_evidence_age_seconds,
+        reviewed_signing_key_resource_id=reviewed_signing_key_resource_id,
     )
     _require_trusted_as_of(as_of)
     if (
@@ -467,6 +555,8 @@ def verify_monitoring_evidence_handoff_attestation(
         raise ValueError("monitoring handoff observation time is in the future")
     if (as_of - handoff.observed_at).total_seconds() > maximum_age_seconds:
         raise ValueError("monitoring handoff evidence is older than the reviewed maximum age")
+    if reviewed_signing_key != trusted_key_anchor.key_vault_key_id:
+        raise ValueError("monitoring handoff signing key does not match the trusted key")
     if attestation.trust_anchor_ref != trusted_key_anchor.key_vault_key_id:
         raise ValueError("monitoring handoff attestation uses an untrusted key")
     record = key_resolver(trusted_key_anchor)
@@ -475,8 +565,8 @@ def verify_monitoring_evidence_handoff_attestation(
         or record.anchor != trusted_key_anchor
         or not record.enabled
         or record.activated_at > handoff.observed_at
-        or (record.retired_at is not None and record.retired_at <= handoff.observed_at)
-        or (record.expires_at is not None and record.expires_at <= handoff.observed_at)
+        or (record.retired_at is not None and record.retired_at <= as_of)
+        or (record.expires_at is not None and record.expires_at <= as_of)
         or not isinstance(record.public_key, rsa.RSAPublicKey)
     ):
         raise ValueError("monitoring handoff attestation key is not trusted")

@@ -40,12 +40,6 @@ resource blobPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
   tags: resourceTags
 }
 
-resource keyVaultPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: 'privatelink.vaultcore.azure.net'
-  location: 'global'
-  tags: resourceTags
-}
-
 output azureMonitorPrivateDnsZoneResourceIds array = [
   azureMonitorPrivateDnsZone.id
   omsPrivateDnsZone.id
@@ -53,4 +47,3 @@ output azureMonitorPrivateDnsZoneResourceIds array = [
   agentServicePrivateDnsZone.id
 ]
 output storageBlobPrivateDnsZoneResourceId string = blobPrivateDnsZone.id
-output keyVaultPrivateDnsZoneResourceId string = keyVaultPrivateDnsZone.id

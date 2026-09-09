@@ -9,8 +9,11 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 WC024_ROOT = ROOT / "infra" / "wc024-monitoring-foundation"
+WC024_CONNECTIVITY_ROOT = ROOT / "infra" / "wc024-monitoring-connectivity"
 MAIN = (WC024_ROOT / "main.bicep").read_text(encoding="utf-8")
 PARAMETERS = (WC024_ROOT / "main.example.bicepparam").read_text(encoding="utf-8")
+AMPLS_BOOTSTRAP = (WC024_ROOT / "bootstrap-ampls.bicep").read_text(encoding="utf-8")
+AMPLS_BOOTSTRAP_SCRIPT = (WC024_ROOT / "bootstrap-ampls.ps1").read_text(encoding="utf-8")
 DATA_PLATFORM = (WC024_ROOT / "modules" / "monitoring-data-platform.bicep").read_text(
     encoding="utf-8"
 )
@@ -39,15 +42,21 @@ PRIVATE_RUNTIME_TOPOLOGY_VALIDATION = (
     WC024_ROOT / "modules" / "private-runtime-topology-validation.bicep"
 ).read_text(encoding="utf-8")
 FLOW_LOG = (WC024_ROOT / "modules" / "vnet-flow-log.bicep").read_text(encoding="utf-8")
-PRIVATE_ACCESS = (
-    WC024_ROOT / "modules" / "monitoring-private-access.bicep"
+FLOW_LOG_VALIDATION = (
+    WC024_ROOT / "modules" / "canonical-flow-log-validation.bicep"
 ).read_text(encoding="utf-8")
+PRIVATE_ACCESS_SCRIPT = (WC024_ROOT / "set-private-access.ps1").read_text(
+    encoding="utf-8"
+)
 PRIVATE_DNS_VNET_LINKS = (
     WC024_ROOT / "modules" / "private-dns-vnet-links.bicep"
 ).read_text(encoding="utf-8")
 PRIVATE_DNS_ZONES = (WC024_ROOT / "modules" / "private-dns-zones.bicep").read_text(
     encoding="utf-8"
 )
+COLLECTOR_KEY_VAULT_DNS = (
+    WC024_ROOT / "modules" / "collector-key-vault-private-dns.bicep"
+).read_text(encoding="utf-8")
 LEGACY_FLOW_LOG_MIGRATION = (
     WC024_ROOT / "modules" / "legacy-flow-log-migration.bicep"
 ).read_text(encoding="utf-8")
@@ -60,6 +69,14 @@ COLLECTOR_CONTRACT = (
 ADR = (ROOT / "docs" / "adr" / "0020-wc024-generic-monitoring-foundation.md").read_text(
     encoding="utf-8"
 )
+CONNECTIVITY_MAIN = (WC024_CONNECTIVITY_ROOT / "main.bicep").read_text(
+    encoding="utf-8"
+)
+CONNECTIVITY_HUB = (
+    WC024_CONNECTIVITY_ROOT
+    / "modules"
+    / "monitoring-collector-network.bicep"
+).read_text(encoding="utf-8")
 
 
 def test_wc024_adr_uses_unique_sequential_number_after_wc021_wc022_merges() -> None:
@@ -76,6 +93,25 @@ def test_wc024_adopts_existing_law_dce_dcr_and_associations_without_duplicates()
         "resource monitoringResourceGroup "
         "'Microsoft.Resources/resourceGroups@2025-04-01' existing" in MAIN
     )
+    assert "@allowed([\n  'rg-athena-demo-workload'\n])\nparam workloadResourceGroupName" in MAIN
+    assert "var reviewedWorkloadVirtualNetworkResourceId" in MAIN
+    assert "virtualNetworks/athena-hackathon-vnet" in MAIN
+    assert "var reviewedApprovedVmNames = [" in MAIN
+    assert "var unreviewedApprovedVmNames" in MAIN
+    assert "var missingReviewedVmNames" in MAIN
+    assert "validatedApprovedVmNames" in MAIN
+    assert "validatedWorkloadVirtualNetworkResourceId" in MAIN
+    for vm_name in (
+        "athena-hackathon-client-01",
+        "athena-hackathon-ecp-01",
+        "athena-hackathon-ecp-03",
+        "athena-hackathon-iris-01",
+        "athena-hackathon-mid-01",
+        "athena-hackathon-mid-02",
+        "athena-hackathon-sqlvm-01",
+        "athena-hackathon-web-03",
+    ):
+        assert vm_name in MAIN
     assert "param workspaceName string = 'athena-hackathon-law'" in MAIN
     assert "param dataCollectionEndpointName string = 'athena-hackathon-linux-dce'" in MAIN
     assert "param dataCollectionRuleName string = 'athena-hackathon-linux-dcr'" in MAIN
@@ -183,7 +219,7 @@ def test_wc024_validates_preserved_dcr_associations_before_dce_association_puts(
     assert "module dcrAssociationValidation 'modules/dcr-association-validation.bicep'" in MAIN
     dcr_associations_declaration = MAIN.split(
         "module dcrAssociations", maxsplit=1
-    )[1].split("module privateDnsZones", maxsplit=1)[0]
+    )[1].split("module workloadPrivateDnsZones", maxsplit=1)[0]
     assert "dependsOn: [" in dcr_associations_declaration
     assert "dcrAssociationValidation" in dcr_associations_declaration
     assert (
@@ -199,33 +235,38 @@ def test_wc024_validates_preserved_dcr_associations_before_dce_association_puts(
 
 
 def test_wc024_private_networking_and_storage_lifecycle_are_enforced() -> None:
-    assert PRIVATE_ENDPOINTS.count("Microsoft.Network/privateEndpoints@2024-10-01") == 3
+    assert PRIVATE_ENDPOINTS.count("Microsoft.Network/privateEndpoints@2024-10-01") == 4
     assert "azuremonitor" in PRIVATE_ENDPOINTS
     assert "privateDnsZoneConfigs" in PRIVATE_ENDPOINTS
     assert "name: 'azure-monitor-blob'" in PRIVATE_ENDPOINTS
-    assert "privateDnsZoneId: storageBlobPrivateDnsZoneResourceId" in PRIVATE_ENDPOINTS
+    assert "workloadStorageBlobPrivateDnsZoneResourceId" in PRIVATE_ENDPOINTS
+    assert "collectorStorageBlobPrivateDnsZoneResourceId" in PRIVATE_ENDPOINTS
+    assert "collectorKeyVaultPrivateDnsZoneResourceId" in PRIVATE_ENDPOINTS
     assert "@minLength(4)" in PRIVATE_ENDPOINTS
-    assert PRIVATE_DNS_ZONES.count("Microsoft.Network/privateDnsZones@2024-06-01") == 6
+    assert PRIVATE_DNS_ZONES.count("Microsoft.Network/privateDnsZones@2024-06-01") == 5
     assert PRIVATE_DNS_VNET_LINKS.count(
         "Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01"
-    ) == 12
+    ) == 5
+    assert "privatelink.vaultcore.azure.net" not in PRIVATE_DNS_ZONES
+    assert "privatelink.vaultcore.azure.net" in COLLECTOR_KEY_VAULT_DNS
+    assert "accessBoundary: 'collector-only'" in COLLECTOR_KEY_VAULT_DNS
     for zone in (
         "privatelink.monitor.azure.com",
         "privatelink.oms.opinsights.azure.com",
         "privatelink.ods.opinsights.azure.com",
         "privatelink.agentsvc.azure-automation.net",
         "privatelink.blob.core.windows.net",
-        "privatelink.vaultcore.azure.net",
     ):
         assert zone in PRIVATE_DNS_ZONES
         assert zone in PRIVATE_DNS_VNET_LINKS
-    assert "id: workloadVirtualNetworkResourceId" in PRIVATE_DNS_VNET_LINKS
-    assert "id: collectorRuntimeVirtualNetworkResourceId" in PRIVATE_DNS_VNET_LINKS
-    assert "collectorRuntimeRequiresSeparateLinks" in PRIVATE_DNS_VNET_LINKS
+    assert "id: virtualNetworkResourceId" in PRIVATE_DNS_VNET_LINKS
+    assert "collectorRuntimeRequiresSeparateLinks" not in PRIVATE_DNS_VNET_LINKS
     assert "registrationEnabled: false" in PRIVATE_DNS_VNET_LINKS
     assert "existing = {" in PRIVATE_DNS_VNET_LINKS
     assert "virtualNetworkLinks" not in PRIVATE_DNS_ZONES
-    assert "privateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId" in MAIN
+    assert "workloadPrivateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId" in MAIN
+    assert "collectorPrivateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId" in MAIN
+    assert "collectorKeyVaultPrivateDns.outputs.keyVaultPrivateDnsZoneResourceId" in MAIN
     assert "allowBlobPublicAccess: false" in STORAGE
     assert "allowSharedKeyAccess: false" in STORAGE
     assert "defaultToOAuthAuthentication: true" in STORAGE
@@ -244,6 +285,20 @@ def test_wc024_private_networking_and_storage_lifecycle_are_enforced() -> None:
     assert "tierToArchive" not in STORAGE
     assert "publicNetworkAccess: 'Disabled'" in EVIDENCE_SEAMS
     assert "enablePurgeProtection: true" in EVIDENCE_SEAMS
+    assert "output monitoringEvidenceContainerResourceId string" in STORAGE
+    assert "param monitoringEvidenceContainerResourceId string" in EVIDENCE_SEAMS
+    assert "validatedMonitoringEvidenceContainerResourceId" in EVIDENCE_SEAMS
+    assert "guid(validatedMonitoringEvidenceContainerResourceId" in EVIDENCE_SEAMS
+    evidence_seams_declaration = MAIN.split("module monitoringEvidenceSeams", maxsplit=1)[
+        1
+    ].split("module monitoringPrivateEndpoints", maxsplit=1)[0]
+    assert "dependsOn: [" in evidence_seams_declaration
+    assert "monitoringStorage" in evidence_seams_declaration
+    assert (
+        "monitoringEvidenceContainerResourceId: "
+        "monitoringStorage.outputs.monitoringEvidenceContainerResourceId"
+        in evidence_seams_declaration
+    )
 
 
 def test_wc024_standardizes_vnet_flow_log_and_traffic_analytics() -> None:
@@ -261,17 +316,32 @@ def test_wc024_standardizes_vnet_flow_log_and_traffic_analytics() -> None:
     assert "name: flowLogName" in FLOW_LOG
     assert "athenahackathonflowwhtco" in MAIN
     assert "retainedLegacyFlowLogStorageAccountName" in MAIN
+    assert (
+        "@allowed([\n  'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'\n])"
+        in MAIN
+    )
+    assert "resource existingFlowLog" in FLOW_LOG_VALIDATION
+    assert "existingFlowLog.properties.targetResourceId" in FLOW_LOG_VALIDATION
+    assert "refuses to update the canonical flow log" in FLOW_LOG_VALIDATION
+    assert "canonicalFlowLogValidation.outputs.validatedFlowLogName" in MAIN
 
 
 def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover() -> None:
     assert "legacyFlowLogNames" in MAIN
     assert "legacyFlowLogTargetResourceIds" in MAIN
+    assert "reviewedLegacyFlowLogMigrationAllowlist" not in MAIN
+    assert "var reviewedLegacyFlowLogMigrationAllowlist = []" in LEGACY_FLOW_LOG_MIGRATION
     assert "canonicalVnetFlowLogCutoverConfirmed" in MAIN
     assert "dependsOn: [\n    vnetFlowLog\n  ]" in MAIN
     assert "@maxLength(32)" in LEGACY_FLOW_LOG_MIGRATION
     assert "length(legacyFlowLogNames) == length(legacyFlowLogTargetResourceIds)" in (
         LEGACY_FLOW_LOG_MIGRATION
     )
+    assert "reviewedLegacyFlowLogMigrationAllowlist" in LEGACY_FLOW_LOG_MIGRATION
+    assert "unreviewedLegacyFlowLogMigrationPairs" in LEGACY_FLOW_LOG_MIGRATION
+    assert "existingLegacyFlowLogs" in LEGACY_FLOW_LOG_MIGRATION
+    assert "properties.targetResourceId" in LEGACY_FLOW_LOG_MIGRATION
+    assert "existing target matches the reviewed allowlist" in LEGACY_FLOW_LOG_MIGRATION
     assert "toLower(canonicalVnetFlowLogName)" in (
         LEGACY_FLOW_LOG_MIGRATION
     )
@@ -282,136 +352,81 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
 
 
 def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> None:
-    assert "param createPrivateLinkScope bool = false" in MAIN
-    assert "validatedCreatePrivateLinkScope" in MAIN
-    assert "createPrivateLinkScope: validatedCreatePrivateLinkScope" in MAIN
+    assert "privateLinkScopeDeploymentPhase" not in MAIN
+    assert "privateLinkScopeDeploymentPhase" not in DATA_PLATFORM
     assert (
-        "cannot create an Open Azure Monitor Private Link Scope during the "
-        "private-only cutover"
-    ) in MAIN
-    assert "param createPrivateLinkScope bool = false" in DATA_PLATFORM
-    assert (
-        "resource createdPrivateLinkScope "
-        "'Microsoft.Insights/privateLinkScopes@2021-09-01' = "
-        "if (createPrivateLinkScope)" in DATA_PLATFORM
-    )
-    assert (
-        "resource adoptedPrivateLinkScope "
-        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing = "
-        "if (!createPrivateLinkScope)" in DATA_PLATFORM
-    )
-    created_private_link_scope = DATA_PLATFORM.split(
-        "resource createdPrivateLinkScope", maxsplit=1
-    )[1].split("resource adoptedPrivateLinkScope", maxsplit=1)[0]
-    assert "queryAccessMode: 'Open'" in created_private_link_scope
-    assert "ingestionAccessMode: 'Open'" in created_private_link_scope
-    assert (
-        "output privateLinkScopeResourceId string = createPrivateLinkScope"
+        "resource workloadPrivateLinkScope "
+        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing"
         in DATA_PLATFORM
     )
-    assert "adoptedPrivateLinkScope!.id" in DATA_PLATFORM
-    assert "adoptedPrivateLinkScope!.tags" in DATA_PLATFORM
-    assert "publicNetworkAccessForIngestion: 'Disabled'" in PRIVATE_ACCESS
-    assert "publicNetworkAccessForQuery: 'Disabled'" in PRIVATE_ACCESS
-    assert "publicNetworkAccess: 'Disabled'" in PRIVATE_ACCESS
-    assert "resource privateLinkScope" in PRIVATE_ACCESS
-    assert "queryAccessMode: 'PrivateOnly'" in PRIVATE_ACCESS
-    assert "ingestionAccessMode: 'PrivateOnly'" in PRIVATE_ACCESS
-    assert "privateLinkScopeName: '${namePrefix}-ampls'" in MAIN
+    assert (
+        "resource collectorPrivateLinkScope "
+        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing"
+        in DATA_PLATFORM
+    )
+    assert "resource privateLinkScope" in AMPLS_BOOTSTRAP
+    assert "queryAccessMode: 'Open'" in AMPLS_BOOTSTRAP
+    assert "ingestionAccessMode: 'Open'" in AMPLS_BOOTSTRAP
+    assert "athena-demo-monitoring-workload-ampls" in AMPLS_BOOTSTRAP
+    assert "athena-demo-monitoring-collector-ampls" in AMPLS_BOOTSTRAP
+    assert "properties: {}" not in AMPLS_BOOTSTRAP
+    assert "az resource show" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "already exists" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "$LASTEXITCODE -ne 3" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "az deployment group create" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "continue" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "--parameters privateLinkScopeName=$scopeName" in AMPLS_BOOTSTRAP_SCRIPT
+    assert "monitoring-private-access.bicep" not in MAIN
+    assert "privateMonitoringIngestionCutoverConfirmed" not in MAIN
+    assert "--ingestion-access Disabled" in PRIVATE_ACCESS_SCRIPT
+    assert "--query-access Disabled" in PRIVATE_ACCESS_SCRIPT
+    assert "--public-network-access Disabled" in PRIVATE_ACCESS_SCRIPT
+    assert "queryAccessMode = 'PrivateOnly'" in PRIVATE_ACCESS_SCRIPT
+    assert "ingestionAccessMode = 'PrivateOnly'" in PRIVATE_ACCESS_SCRIPT
+    for confirmation in (
+        "ConnectivityValidated",
+        "DnsValidated",
+        "IngestionValidated",
+    ):
+        assert f"[switch] ${confirmation}" in PRIVATE_ACCESS_SCRIPT
     assert "monitoringPrivateEndpoints" in MAIN
-    assert "privateDnsZones" in MAIN
-    assert "privateDnsVnetLinks" in MAIN
+    assert "workloadPrivateDnsZones" in MAIN
+    assert "collectorPrivateDnsZones" in MAIN
+    assert "workloadPrivateDnsVnetLinks" in MAIN
+    assert "collectorPrivateDnsVnetLinks" in MAIN
     assert "dcrAssociations" in MAIN
-    assert "disable-adopted-monitoring-public-access" in MAIN
-    assert "privateMonitoringIngestionCutoverConfirmed bool = false" in MAIN
-    assert (
-        "module monitoringPrivateAccess 'modules/monitoring-private-access.bicep' = "
-        "if (privateMonitoringIngestionCutoverConfirmed)" in MAIN
+    assert "az monitor log-analytics workspace update" in PRIVATE_ACCESS_SCRIPT
+    assert "az monitor data-collection endpoint update" in PRIVATE_ACCESS_SCRIPT
+    assert "az rest" in PRIVATE_ACCESS_SCRIPT
+    assert "--method put" in PRIVATE_ACCESS_SCRIPT
+    assert "If-Match" not in PRIVATE_ACCESS_SCRIPT
+    assert "$exclusions = @()" in PRIVATE_ACCESS_SCRIPT
+    assert "private cutover requires an empty exclusion set" in PRIVATE_ACCESS_SCRIPT
+    assert PRIVATE_ACCESS_SCRIPT.index(
+        "private cutover requires an empty exclusion set"
+    ) < PRIVATE_ACCESS_SCRIPT.index("--method put")
+    assert "exclusions = $exclusions" in PRIVATE_ACCESS_SCRIPT
+    assert "$updatedTags -ne $expectedTags" in PRIVATE_ACCESS_SCRIPT
+    assert "$updatedExclusions -ne $expectedExclusions" in PRIVATE_ACCESS_SCRIPT
+    assert "scopedResources?api-version=2021-09-01" in PRIVATE_ACCESS_SCRIPT
+    assert "privateEndpointConnections?api-version=2021-09-01" in (
+        PRIVATE_ACCESS_SCRIPT
     )
-    for preserved_value in (
-        "workspaceLocation",
-        "workspaceTags",
-        "dataCollectionEndpointLocation",
-        "dataCollectionEndpointTags",
-        "privateLinkScopeTags",
-        "privateLinkScopeAccessModeExclusions",
-        "workspaceSkuName",
-        "workspaceRetentionDays",
-        "workspaceDailyQuotaGb",
-        "workspaceFeatures",
-    ):
-        assert f"param {preserved_value} " in PRIVATE_ACCESS
-        assert f"{preserved_value}: monitoringDataPlatform.outputs.{preserved_value}" in MAIN
-    for nullable_preserved_value in (
-        "dataCollectionEndpointDescription",
-        "dataCollectionEndpointKind",
-    ):
-        assert f"param {nullable_preserved_value} string?" in PRIVATE_ACCESS
-        assert (
-            f"{nullable_preserved_value}: "
-            f"monitoringDataPlatform.outputs.?{nullable_preserved_value}"
-            in MAIN
-        )
-    assert "location: location" not in PRIVATE_ACCESS
-    assert "location: workspaceLocation" in PRIVATE_ACCESS
-    assert "location: dataCollectionEndpointLocation" in PRIVATE_ACCESS
-    assert "tags: workspaceTags" in PRIVATE_ACCESS
-    assert "tags: dataCollectionEndpointTags" in PRIVATE_ACCESS
-    assert "tags: privateLinkScopeTags" in PRIVATE_ACCESS
-    assert "param dataCollectionEndpointDescription string?" in PRIVATE_ACCESS
-    assert "param dataCollectionEndpointKind string?" in PRIVATE_ACCESS
-    assert "dataCollectionEndpointDescription == null ? {}" in PRIVATE_ACCESS
-    assert (
-        "resource dataCollectionEndpointWithKind "
-        "'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' = "
-        "if (dataCollectionEndpointKind != null)" in PRIVATE_ACCESS
-    )
-    assert "kind: dataCollectionEndpointKind!" in PRIVATE_ACCESS
-    assert (
-        "resource dataCollectionEndpointWithoutKind "
-        "'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' = "
-        "if (dataCollectionEndpointKind == null)" in PRIVATE_ACCESS
-    )
-    without_kind_declaration = PRIVATE_ACCESS.split(
-        "resource dataCollectionEndpointWithoutKind", maxsplit=1
-    )[1].split("resource privateLinkScope", maxsplit=1)[0]
-    assert "kind:" not in without_kind_declaration
-    assert "var dataCollectionEndpointProperties = union(" in PRIVATE_ACCESS
-    assert "dailyQuotaGb: workspaceDailyQuotaGb" in PRIVATE_ACCESS
-    assert "features: workspaceFeatures" in PRIVATE_ACCESS
-    assert "exclusions: privateLinkScopeAccessModeExclusions" in PRIVATE_ACCESS
-    assert "resourceTags" not in PRIVATE_ACCESS
-    assert "enableLogAccessUsingOnlyResourcePermissions: true" not in PRIVATE_ACCESS
-    assert "disableLocalAuth: false" not in PRIVATE_ACCESS
-    assert "param workspaceSkuName" not in MAIN
-    for preserved_output in (
-        "workspaceLocation",
-        "workspaceTags",
-        "workspaceSkuName",
-        "workspaceRetentionDays",
-        "workspaceDailyQuotaGb",
-        "workspaceFeatures",
-        "dataCollectionEndpointLocation",
-        "dataCollectionEndpointTags",
-        "dataCollectionEndpointDescription",
-        "dataCollectionEndpointKind",
-        "privateLinkScopeTags",
-        "privateLinkScopeAccessModeExclusions",
-    ):
-        assert f"output {preserved_output} " in DATA_PLATFORM
-    assert "output dataCollectionEndpointDescription string?" in DATA_PLATFORM
-    assert "output dataCollectionEndpointKind string?" in DATA_PLATFORM
-    assert (
-        "output dataCollectionEndpointDescription string? = "
-        "dataCollectionEndpoint.properties.?description" in DATA_PLATFORM
+    assert "does not contain the exact reviewed LAW and DCE" in PRIVATE_ACCESS_SCRIPT
+    assert "does not contain the exact approved private endpoint" in (
+        PRIVATE_ACCESS_SCRIPT
     )
     assert (
-        "output dataCollectionEndpointKind string? = "
-        "dataCollectionEndpoint.?kind" in DATA_PLATFORM
+        "[ValidateSet('a6add389-9978-47ac-ab1e-a09212e321d4')]"
+        in PRIVATE_ACCESS_SCRIPT
     )
+    assert "athena-demo-monitoring-workload-ampls" in PRIVATE_ACCESS_SCRIPT
+    assert "athena-demo-monitoring-collector-ampls" in PRIVATE_ACCESS_SCRIPT
+    assert "Private access verification failed" in PRIVATE_ACCESS_SCRIPT
 
 
 def test_wc024_uses_adopted_monitoring_locations_not_deployment_location() -> None:
+    assert "@allowed([\n  'australiaeast'\n])\nparam location" in MAIN
     assert "var adoptedWorkspaceLocation = workspace.location" in DATA_PLATFORM
     assert (
         "var adoptedDataCollectionEndpointLocation = dataCollectionEndpoint.location"
@@ -430,23 +445,10 @@ def test_wc024_uses_adopted_monitoring_locations_not_deployment_location() -> No
         "output dataCollectionEndpointLocation string = "
         "validatedDataCollectionEndpointLocation" in DATA_PLATFORM
     )
-    private_access_declaration = MAIN.split(
-        "module monitoringPrivateAccess", maxsplit=1
-    )[1].split("module vnetFlowLog", maxsplit=1)[0]
     flow_log_declaration = MAIN.split("module vnetFlowLog", maxsplit=1)[1].split(
         "module legacyFlowLogMigration", maxsplit=1
     )[0]
 
-    assert "location: location" not in private_access_declaration
-    assert (
-        "workspaceLocation: monitoringDataPlatform.outputs.workspaceLocation"
-        in private_access_declaration
-    )
-    assert (
-        "dataCollectionEndpointLocation: "
-        "monitoringDataPlatform.outputs.dataCollectionEndpointLocation"
-        in private_access_declaration
-    )
     assert "workspaceLocation: location" not in flow_log_declaration
     assert (
         "workspaceLocation: monitoringDataPlatform.outputs.workspaceLocation"
@@ -458,86 +460,95 @@ def test_wc024_populates_private_dns_before_workload_vnet_links() -> None:
     assert (
         MAIN.index("module dcrAssociationValidation")
         < MAIN.index("module dcrAssociations")
-        < MAIN.index("module privateDnsZones")
+        < MAIN.index("module workloadPrivateDnsZones")
         < MAIN.index("module monitoringPrivateEndpoints")
-        < MAIN.index("module privateDnsVnetLinks")
-        < MAIN.index("module monitoringPrivateAccess")
+        < MAIN.index("module workloadPrivateDnsVnetLinks")
+        < MAIN.index("module collectorKeyVaultPrivateDnsLink")
     )
     private_endpoints_declaration = MAIN.split(
         "module monitoringPrivateEndpoints", maxsplit=1
-    )[1].split("module privateDnsVnetLinks", maxsplit=1)[0]
+    )[1].split("module workloadPrivateDnsVnetLinks", maxsplit=1)[0]
     private_dns_zones_declaration = MAIN.split(
-        "module privateDnsZones", maxsplit=1
+        "module workloadPrivateDnsZones", maxsplit=1
     )[1].split("module monitoringStorage", maxsplit=1)[0]
     vnet_links_declaration = MAIN.split(
-        "module privateDnsVnetLinks", maxsplit=1
+        "module workloadPrivateDnsVnetLinks", maxsplit=1
     )[1].split("module monitoringEvidenceReaderRole", maxsplit=1)[0]
-    private_access_declaration = MAIN.split(
-        "module monitoringPrivateAccess", maxsplit=1
-    )[1].split("module vnetFlowLog", maxsplit=1)[0]
-
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_endpoints_declaration
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_dns_zones_declaration
     assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
         vnet_links_declaration
     )
-    assert "privateDnsVnetLinks" in private_access_declaration
-    assert "dcrAssociations" in private_access_declaration
+    key_vault_link_declaration = MAIN.split(
+        "module collectorKeyVaultPrivateDnsLink",
+        maxsplit=1,
+    )[1].split("module monitoringEvidenceReaderRole", maxsplit=1)[0]
+    assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
+        key_vault_link_declaration
+    )
 
 
 def test_wc024_requires_private_collector_runtime_topology_and_dns_links() -> None:
     for parameter in (
-        "privateEndpointVirtualNetworkResourceId",
+        "workloadPrivateEndpointSubnetResourceId",
         "collectorRuntimeVirtualNetworkResourceId",
         "collectorRuntimeSubnetResourceId",
-        "workloadPrivateEndpointConnectivityConfirmed",
-        "collectorRuntimePrivateEndpointConnectivityConfirmed",
-        "workloadPrivateDnsResolutionConfirmed",
-        "collectorRuntimePrivateDnsResolutionConfirmed",
-        "privateMonitoringIngestionCutoverConfirmed",
+        "collectorPrivateEndpointSubnetResourceId",
     ):
         assert f"param {parameter} " in MAIN
         assert f"param {parameter} " in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
 
     assert "deploymentSubscriptionPrefix" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    assert "privateEndpointSubnetBelongsToDeclaredVnet" in (
+    assert "workloadPrivateEndpointSubnetBelongsToWorkloadVnet" in (
         PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     )
-    assert "collectorRuntimeSubnetBelongsToDeclaredVnet" in (
+    assert "collectorRuntimeSubnetBelongsToCollectorVnet" in (
         PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     )
-    assert "workloadCanReachPrivateEndpoints" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    assert "collectorCanReachPrivateEndpoints" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    assert "privateCutoverDnsResolutionConfirmed" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    assert "!privateMonitoringIngestionCutoverConfirmed ||" in (
+    assert "collectorPrivateEndpointSubnetBelongsToCollectorVnet" in (
         PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     )
-    assert "reviewed private DNS resolution for the phase-two private cutover" in (
-        PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    )
+    assert "collectorSubnetsAreDistinct" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
+    assert "networksRemainIsolated" in PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     assert "module privateRuntimeTopologyValidation" in MAIN
     assert (
-        "privateEndpointSubnetResourceId: "
-        "privateRuntimeTopologyValidation.outputs.privateEndpointSubnetResourceId"
+        "workloadPrivateEndpointSubnetResourceId: "
+        "privateRuntimeTopologyValidation.outputs.workloadPrivateEndpointSubnetResourceId"
         in MAIN
     )
+    assert "collectorRuntimeVirtualNetworkResourceId:" in MAIN
     assert (
-        "collectorRuntimeVirtualNetworkResourceId: "
-        "privateRuntimeTopologyValidation.outputs."
-        "collectorRuntimeVirtualNetworkResourceId"
+        "privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId"
         in MAIN
     )
-    assert "if (collectorRuntimeRequiresSeparateLinks)" in PRIVATE_DNS_VNET_LINKS
-    assert "collectorRuntimeVirtualNetworkResourceId" in PRIVATE_DNS_VNET_LINKS
-    assert "privateDnsVnetLinks" in MAIN
-    assert (
-        "privateMonitoringIngestionCutoverConfirmed: "
-        "privateMonitoringIngestionCutoverConfirmed" in MAIN
-    )
+    assert "module workloadPrivateDnsVnetLinks" in MAIN
+    assert "module collectorPrivateDnsVnetLinks" in MAIN
+
+
+def test_wc024_connectivity_is_a_separate_isolated_collector_deployment() -> None:
+    for exact_name in (
+        "rg-athena-demo-monitoring",
+        "rg-athena-demo-workload",
+        "athena-hackathon-vnet",
+        "athena-demo-monitoring-collector-vnet",
+    ):
+        assert exact_name in CONNECTIVITY_MAIN
+    assert "10.45.0.0/24" in CONNECTIVITY_HUB
+    assert "10.45.0.0/25" in CONNECTIVITY_HUB
+    assert "10.45.0.128/26" in CONNECTIVITY_HUB
+    assert "destinationPortRange: '443'" in CONNECTIVITY_HUB
+    assert "DenyUnreviewedPrivateEndpointInbound" in CONNECTIVITY_HUB
+    assert "privateEndpointNetworkPolicies: 'Enabled'" in CONNECTIVITY_HUB
+    assert "virtualNetworkPeerings@" not in CONNECTIVITY_MAIN
+    assert "virtualNetworkPeerings@" not in CONNECTIVITY_HUB
+    assert "workloadCollectorNetworkConnected" not in CONNECTIVITY_MAIN
+    assert "collectorRuntimeSubnetResourceId" in CONNECTIVITY_MAIN
+    assert "collectorPrivateEndpointSubnetResourceId" in CONNECTIVITY_MAIN
 
 
 def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "Athena WC024 Isolated Monitoring Evidence Reader" in READER_ROLE
+    assert "Microsoft.OperationalInsights/workspaces/query/read" in READER_ROLE
     for table in (
         "Heartbeat",
         "Perf",
@@ -555,7 +566,6 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     ):
         assert f"Microsoft.OperationalInsights/workspaces/query/{table}/read" in READER_ROLE
     assert "AzureNetworkAnalytics_CL" not in READER_ROLE
-    assert "'Microsoft.OperationalInsights/workspaces/query/read'" not in READER_ROLE
     assert "Microsoft.Insights/Metrics/Read" in READER_ROLE
     assert "Microsoft.Insights/dataCollectionRuleAssociations/read" in READER_ROLE
     assert "Microsoft.Network/networkWatchers/flowLogs/read" in READER_ROLE
@@ -599,6 +609,13 @@ def test_wc024_uses_deployment_subscription_for_all_custom_role_scopes() -> None
     ) in MAIN
     assert "scope: resourceGroup(workloadResourceGroupName)" in MAIN
     assert "scope: resourceGroup(networkWatcherResourceGroupName)" in MAIN
+    assert "@allowed([\n  'NetworkWatcherRG'\n])" in MAIN
+    assert "@allowed([\n  'NetworkWatcher_australiaeast'\n])" in MAIN
+    network_watcher_assignment = MAIN.split(
+        "module networkWatcherReaderAssignment",
+        maxsplit=1,
+    )[1].split("module vnetFlowLog", maxsplit=1)[0]
+    assert "dependsOn: [\n    vnetFlowLog\n  ]" in network_watcher_assignment
 
 
 def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> None:
@@ -606,6 +623,10 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "athena.wc024MonitoringEvidenceHandoff.v1" in COLLECTOR_CONTRACT
     assert "isolatedSignedCollector" in COLLECTOR_CONTRACT
     assert "capabilityOnly" in COLLECTOR_CONTRACT
+    assert "workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "approvedVmNames: approvedVmNames" in COLLECTOR_CONTRACT
     assert "signingKeyResourceId: signingKeyResourceId" in COLLECTOR_CONTRACT
     assert (
         "evidenceStorageAccountResourceId: evidenceStorageAccountResourceId"
@@ -647,17 +668,24 @@ def test_wc024_example_parameters_are_synthetic_and_keyless() -> None:
     assert "athenahackathonflowwhtco" not in PARAMETERS
     assert "legacyFlowLogNames = []" in PARAMETERS
     assert "canonicalVnetFlowLogCutoverConfirmed = false" in PARAMETERS
-    assert "privateMonitoringIngestionCutoverConfirmed = false" in PARAMETERS
-    assert "createPrivateLinkScope = true" in PARAMETERS
-    assert "privateEndpointVirtualNetworkResourceId" in PARAMETERS
+    assert "privateLinkScopeDeploymentPhase" not in PARAMETERS
+    assert "workloadPrivateEndpointSubnetResourceId" in PARAMETERS
     assert "collectorRuntimeVirtualNetworkResourceId" in PARAMETERS
     assert "collectorRuntimeSubnetResourceId" in PARAMETERS
-    assert "workloadPrivateEndpointConnectivityConfirmed = true" in PARAMETERS
-    assert "collectorRuntimePrivateEndpointConnectivityConfirmed = true" in PARAMETERS
-    assert "workloadPrivateDnsResolutionConfirmed = false" in PARAMETERS
-    assert "collectorRuntimePrivateDnsResolutionConfirmed = false" in PARAMETERS
-    for vm_number in range(1, 12):
-        assert f"'synthetic-vm-{vm_number:02d}'" in PARAMETERS
+    assert "collectorPrivateEndpointSubnetResourceId" in PARAMETERS
+    for vm_name in (
+        "athena-hackathon-client-01",
+        "athena-hackathon-ecp-01",
+        "athena-hackathon-ecp-03",
+        "athena-hackathon-iris-01",
+        "athena-hackathon-mid-01",
+        "athena-hackathon-mid-02",
+        "athena-hackathon-sqlvm-01",
+        "athena-hackathon-web-01",
+        "athena-hackathon-web-03",
+    ):
+        assert f"'{vm_name}'" in PARAMETERS
+    assert "virtualNetworks/athena-hackathon-vnet" in PARAMETERS
     assert "password" not in PARAMETERS.lower()
     assert "clientsecret" not in PARAMETERS.lower()
     assert "connectionstring" not in PARAMETERS.lower()
@@ -673,14 +701,15 @@ def test_wc024_records_and_preserves_the_live_telemetry_cutover_baseline() -> No
         "NTANetAnalytics",
     ):
         assert signal in ADR
-        assert signal in MAIN
+        assert signal in COLLECTOR_CONTRACT or signal in DATA_PLATFORM
     assert "All 11 workload VMs had successful" in ADR
     assert "configurationAccessEndpoint" in ADR
     assert "DCR association is read without being rewritten" in ADR
     assert "AzureMonitorLinuxAgent" in ADR
     assert "Shared Key disabled" in ADR
-    assert "private-ingestion cutover confirmation" in ADR
-    assert "AMPLS remains open" in ADR
+    assert "private-access cutover operation" in ADR
+    assert "AMPLS resources" in ADR
+    assert "remain open" in ADR
     assert "empty private zones" in ADR
     assert "storage account keeps public network access" in ADR
     assert "enabled solely to activate the storage firewall" in ADR
@@ -731,4 +760,23 @@ def test_wc024_checked_in_generated_artifacts_match_current_bicep(tmp_path: Path
     )
     assert json.loads((WC024_ROOT / "main.example.json").read_text(encoding="utf-8")) == (
         json.loads(generated_parameters.read_text(encoding="utf-8"))
+    )
+
+
+def test_wc024_connectivity_templates_build(tmp_path: Path) -> None:
+    _run_az_bicep(
+        ["build", "--file", str(WC024_CONNECTIVITY_ROOT / "main.bicep")],
+        tmp_path / "connectivity.json",
+    )
+    _run_az_bicep(
+        [
+            "build-params",
+            "--file",
+            str(WC024_CONNECTIVITY_ROOT / "main.example.bicepparam"),
+        ],
+        tmp_path / "connectivity.example.json",
+    )
+    _run_az_bicep(
+        ["build", "--file", str(WC024_ROOT / "bootstrap-ampls.bicep")],
+        tmp_path / "bootstrap-ampls.json",
     )

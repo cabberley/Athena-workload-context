@@ -16,21 +16,21 @@
     },
     "approvedVmNames": {
       "value": [
-        "synthetic-vm-01",
-        "synthetic-vm-02",
-        "synthetic-vm-03",
-        "synthetic-vm-04",
-        "synthetic-vm-05",
-        "synthetic-vm-06",
-        "synthetic-vm-07",
-        "synthetic-vm-08",
-        "synthetic-vm-09",
-        "synthetic-vm-10",
-        "synthetic-vm-11"
+        "athena-hackathon-client-01",
+        "athena-hackathon-ecp-01",
+        "athena-hackathon-ecp-02",
+        "athena-hackathon-ecp-03",
+        "athena-hackathon-iris-01",
+        "athena-hackathon-mid-01",
+        "athena-hackathon-mid-02",
+        "athena-hackathon-sqlvm-01",
+        "athena-hackathon-web-01",
+        "athena-hackathon-web-02",
+        "athena-hackathon-web-03"
       ]
     },
     "workloadVirtualNetworkResourceId": {
-      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network/virtualNetworks/synthetic-workload-vnet"
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet"
     },
     "networkWatcherResourceGroupName": {
       "value": "NetworkWatcherRG"
@@ -38,29 +38,17 @@
     "networkWatcherName": {
       "value": "NetworkWatcher_australiaeast"
     },
-    "privateEndpointSubnetResourceId": {
-      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/synthetic-monitoring-vnet/subnets/private-endpoints"
-    },
-    "privateEndpointVirtualNetworkResourceId": {
-      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/synthetic-monitoring-vnet"
+    "workloadPrivateEndpointSubnetResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet/subnets/snet-paas-private-endpoints"
     },
     "collectorRuntimeVirtualNetworkResourceId": {
-      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/synthetic-collector-vnet"
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet"
     },
     "collectorRuntimeSubnetResourceId": {
-      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/synthetic-collector-vnet/subnets/collector-runtime"
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet/subnets/collector-runtime"
     },
-    "workloadPrivateEndpointConnectivityConfirmed": {
-      "value": true
-    },
-    "collectorRuntimePrivateEndpointConnectivityConfirmed": {
-      "value": true
-    },
-    "workloadPrivateDnsResolutionConfirmed": {
-      "value": false
-    },
-    "collectorRuntimePrivateDnsResolutionConfirmed": {
-      "value": false
+    "collectorPrivateEndpointSubnetResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet/subnets/private-endpoints"
     },
     "monitoringStorageAccountName": {
       "value": "athenademomonstore"
@@ -88,12 +76,6 @@
     },
     "canonicalVnetFlowLogCutoverConfirmed": {
       "value": false
-    },
-    "privateMonitoringIngestionCutoverConfirmed": {
-      "value": false
-    },
-    "createPrivateLinkScope": {
-      "value": true
     },
     "tags": {
       "value": {

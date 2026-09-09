@@ -9,6 +9,9 @@ param namePrefix string
 @description('Existing monitoring-owned storage account name.')
 param storageAccountName string
 
+@description('Resource ID of the monitoring-evidence container created by monitoring-flow-log-storage.')
+param monitoringEvidenceContainerResourceId string
+
 @description('Globally unique Key Vault name for the monitoring collector signing key.')
 param keyVaultName string
 
@@ -83,8 +86,12 @@ resource monitoringEvidenceContainer 'Microsoft.Storage/storageAccounts/blobServ
   name: 'monitoring-evidence'
 }
 
+var validatedMonitoringEvidenceContainerResourceId = toLower(monitoringEvidenceContainer.id) == toLower(monitoringEvidenceContainerResourceId)
+  ? monitoringEvidenceContainer.id
+  : fail('WC-024 evidence writer RBAC must bind to the monitoring-evidence container created by monitoring-flow-log-storage.')
+
 resource collectorEvidenceWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(monitoringEvidenceContainer.id, collectorIdentity.id, storageBlobDataContributorRoleDefinitionId)
+  name: guid(validatedMonitoringEvidenceContainerResourceId, collectorIdentity.id, storageBlobDataContributorRoleDefinitionId)
   scope: monitoringEvidenceContainer
   properties: {
     principalId: collectorIdentity.properties.principalId
@@ -107,4 +114,4 @@ output collectorIdentityResourceId string = collectorIdentity.id
 output collectorIdentityClientId string = collectorIdentity.properties.clientId
 output collectorIdentityPrincipalId string = collectorIdentity.properties.principalId
 output keyVaultResourceId string = signingKeyVault.id
-output signingKeyResourceId string = signingKey.id
+output signingKeyResourceId string = signingKey.properties.keyUriWithVersion

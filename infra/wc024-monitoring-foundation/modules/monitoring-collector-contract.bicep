@@ -12,6 +12,14 @@ param monitoringResourceGroupId string
 @description('Resource ID of the approved workload resource group.')
 param workloadResourceGroupId string
 
+@description('Exact reviewed workload VNet resource ID.')
+param workloadVirtualNetworkResourceId string
+
+@description('Exact reviewed 11 VM names that are inside the WC-024 workload boundary.')
+@minLength(11)
+@maxLength(11)
+param approvedVmNames array
+
 @description('Resource ID of the private Log Analytics workspace.')
 param workspaceResourceId string
 
@@ -45,6 +53,8 @@ output collectorContract object = {
   collectorIdentityClientId: collectorIdentityClientId
   monitoringResourceGroupId: monitoringResourceGroupId
   workloadResourceGroupId: workloadResourceGroupId
+  workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId
+  approvedVmNames: approvedVmNames
   workspaceResourceId: workspaceResourceId
   dataCollectionRuleResourceId: dataCollectionRuleResourceId
   dataCollectionEndpointResourceId: dataCollectionEndpointResourceId
@@ -60,6 +70,7 @@ output collectorContract object = {
   ]
   allowedReadOperations: [
     'Microsoft.OperationalInsights/workspaces/read'
+    'Microsoft.OperationalInsights/workspaces/query/read'
     'Microsoft.OperationalInsights/workspaces/query/Heartbeat/read'
     'Microsoft.OperationalInsights/workspaces/query/Perf/read'
     'Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read'

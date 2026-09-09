@@ -3,8 +3,11 @@ targetScope = 'subscription'
 metadata name = 'Athena WC-024 generic monitoring foundation'
 metadata description = 'Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths.'
 
-@description('Azure region for monitoring-owned resources.')
-param location string = deployment().location
+@description('Reviewed Azure region for monitoring-owned resources and private endpoints.')
+@allowed([
+  'australiaeast'
+])
+param location string = 'australiaeast'
 
 @description('The dedicated resource group owned by the generic monitoring foundation.')
 @allowed([
@@ -13,13 +16,17 @@ param location string = deployment().location
 param monitoringResourceGroupName string = 'rg-athena-demo-monitoring'
 
 @description('Lowercase prefix for deterministic monitoring resource names.')
+@allowed([
+  'athena-demo-monitoring'
+])
 @minLength(3)
 @maxLength(32)
 param namePrefix string = 'athena-demo-monitoring'
 
 @description('Reviewed workload resource group whose VMs receive the generic DCR association.')
-@minLength(1)
-@maxLength(90)
+@allowed([
+  'rg-athena-demo-workload'
+])
 param workloadResourceGroupName string = 'rg-athena-demo-workload'
 
 @description('Exact names of the 11 reviewed workload VMs that already have successful Azure Monitor Agent deployment and the athena-linux-dcr association. Values must be distinct.')
@@ -31,25 +38,31 @@ param approvedVmNames array
 param workloadVirtualNetworkResourceId string
 
 @description('Resource group containing the existing regional Network Watcher.')
+@allowed([
+  'NetworkWatcherRG'
+])
 @minLength(1)
 @maxLength(90)
 param networkWatcherResourceGroupName string
 
 @description('Existing regional Network Watcher resource name.')
+@allowed([
+  'NetworkWatcher_australiaeast'
+])
 @minLength(1)
 @maxLength(80)
 param networkWatcherName string
 
 @description('Existing canonical VNet flow-log name. WC-024 updates this resource in place.')
+@allowed([
+  'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'
+])
 @minLength(1)
 @maxLength(80)
 param flowLogName string = 'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'
 
-@description('Existing subnet resource ID dedicated to private endpoints.')
-param privateEndpointSubnetResourceId string
-
-@description('VNet containing privateEndpointSubnetResourceId. It can differ from workload and collector runtime VNets only when reviewed routing or peering is confirmed.')
-param privateEndpointVirtualNetworkResourceId string
+@description('Exact workload-local private endpoint subnet resource ID.')
+param workloadPrivateEndpointSubnetResourceId string
 
 @description('VNet hosting the isolated Azure MCP or signed-evidence collector runtime.')
 param collectorRuntimeVirtualNetworkResourceId string
@@ -57,22 +70,8 @@ param collectorRuntimeVirtualNetworkResourceId string
 @description('Subnet hosting the isolated Azure MCP or signed-evidence collector runtime.')
 param collectorRuntimeSubnetResourceId string
 
-@description('Set true only after reviewed routing or peering validation confirms that workload agents can reach the private endpoint VNet when it differs from the workload VNet.')
-param workloadPrivateEndpointConnectivityConfirmed bool = false
-
-@description('Set true only after reviewed routing or peering validation confirms that the collector runtime can reach the private endpoint VNet when it differs from the collector runtime VNet.')
-param collectorRuntimePrivateEndpointConnectivityConfirmed bool = false
-
-@description('Set true only after reviewed DNS validation confirms that workload agents resolve private endpoint records through the managed zone links or approved forwarding.')
-param workloadPrivateDnsResolutionConfirmed bool = false
-
-@description('Set true only after reviewed DNS validation confirms that the collector runtime resolves private endpoint records through the managed zone links or approved forwarding.')
-param collectorRuntimePrivateDnsResolutionConfirmed bool = false
-
-@description('Resource group containing the private DNS zones and required workload-VNet links managed by WC-024.')
-@minLength(1)
-@maxLength(90)
-param privateDnsResourceGroupName string = monitoringResourceGroupName
+@description('Exact collector-local private endpoint subnet resource ID.')
+param collectorPrivateEndpointSubnetResourceId string
 
 @description('Globally unique lowercase storage account name for replacement flow-log and collector evidence storage.')
 @minLength(3)
@@ -93,21 +92,33 @@ param collectorRoleDefinitionGuid string
 param retentionDays int = 30
 
 @description('Existing Log Analytics workspace adopted by WC-024 rather than creating a parallel workspace.')
+@allowed([
+  'athena-hackathon-law'
+])
 @minLength(1)
 @maxLength(63)
 param workspaceName string = 'athena-hackathon-law'
 
 @description('Existing data collection endpoint adopted by WC-024 rather than creating a parallel endpoint.')
+@allowed([
+  'athena-hackathon-linux-dce'
+])
 @minLength(1)
 @maxLength(63)
 param dataCollectionEndpointName string = 'athena-hackathon-linux-dce'
 
 @description('Existing data collection rule adopted by WC-024 without overwriting custom data sources or tags.')
+@allowed([
+  'athena-hackathon-linux-dcr'
+])
 @minLength(1)
 @maxLength(63)
 param dataCollectionRuleName string = 'athena-hackathon-linux-dcr'
 
 @description('Existing DCR-only association name adopted on each approved AMA-enabled VM without a PUT.')
+@allowed([
+  'athena-linux-dcr'
+])
 @minLength(1)
 @maxLength(64)
 param dataCollectionRuleAssociationName string = 'athena-linux-dcr'
@@ -140,12 +151,6 @@ param legacyFlowLogTargetResourceIds array = []
 @description('Set true only after the existing canonical VNet flow log is confirmed enabled and writing to replacement storage.')
 param canonicalVnetFlowLogCutoverConfirmed bool = false
 
-@description('Set true only after reviewed private-ingestion evidence confirms all 11 approved VMs retain healthy Azure Monitor Agent and athena-linux-dcr associations, and Heartbeat, Perf, InsightsMetrics, Syslog, AthenaApp_CL, and NTANetAnalytics continue to ingest through the adopted monitoring platform.')
-param privateMonitoringIngestionCutoverConfirmed bool = false
-
-@description('Set true only for the reviewed first deployment that creates the Azure Monitor Private Link Scope in Open mode. Leave false for every later deployment so its existing mode is adopted and cannot be reopened.')
-param createPrivateLinkScope bool = false
-
 var resourceTags = union(tags, {
   component: 'wc024-monitoring-foundation'
   dataBoundary: 'customer'
@@ -155,10 +160,46 @@ var resourceTags = union(tags, {
 var legacyFlowLogStorageAccountName = 'athenahackathonflowwhtco'
 var workloadResourceGroupId = '${subscription().id}/resourceGroups/${workloadResourceGroupName}'
 var networkWatcherResourceGroupId = '${subscription().id}/resourceGroups/${networkWatcherResourceGroupName}'
-var validatedCreatePrivateLinkScope = createPrivateLinkScope && privateMonitoringIngestionCutoverConfirmed
-  ? fail('WC-024 cannot create an Open Azure Monitor Private Link Scope during the private-only cutover. Adopt the existing scope so its PrivateOnly mode is preserved.')
-  : createPrivateLinkScope
-
+var reviewedWorkloadVirtualNetworkResourceId = '${workloadResourceGroupId}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet'
+var reviewedWorkloadPrivateEndpointSubnetResourceId = '${reviewedWorkloadVirtualNetworkResourceId}/subnets/snet-paas-private-endpoints'
+var reviewedCollectorRuntimeVirtualNetworkResourceId = '${monitoringResourceGroup.id}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet'
+var reviewedCollectorRuntimeSubnetResourceId = '${reviewedCollectorRuntimeVirtualNetworkResourceId}/subnets/collector-runtime'
+var reviewedCollectorPrivateEndpointSubnetResourceId = '${reviewedCollectorRuntimeVirtualNetworkResourceId}/subnets/private-endpoints'
+var reviewedApprovedVmNames = [
+  'athena-hackathon-client-01'
+  'athena-hackathon-ecp-01'
+  'athena-hackathon-ecp-02'
+  'athena-hackathon-ecp-03'
+  'athena-hackathon-iris-01'
+  'athena-hackathon-mid-01'
+  'athena-hackathon-mid-02'
+  'athena-hackathon-sqlvm-01'
+  'athena-hackathon-web-01'
+  'athena-hackathon-web-02'
+  'athena-hackathon-web-03'
+]
+var normalizedApprovedVmNames = map(approvedVmNames, vmName => toLower(string(vmName)))
+var uniqueApprovedVmNames = union(normalizedApprovedVmNames, [])
+var unreviewedApprovedVmNames = filter(normalizedApprovedVmNames, vmName => !contains(reviewedApprovedVmNames, vmName))
+var missingReviewedVmNames = filter(reviewedApprovedVmNames, vmName => !contains(normalizedApprovedVmNames, vmName))
+var validatedApprovedVmNames = empty(unreviewedApprovedVmNames) && empty(missingReviewedVmNames) && length(uniqueApprovedVmNames) == length(reviewedApprovedVmNames)
+  ? reviewedApprovedVmNames
+  : fail('WC-024 approvedVmNames must match the exact reviewed 11-VM workload allowlist.')
+var validatedWorkloadVirtualNetworkResourceId = toLower(workloadVirtualNetworkResourceId) == toLower(reviewedWorkloadVirtualNetworkResourceId)
+  ? reviewedWorkloadVirtualNetworkResourceId
+  : fail('WC-024 workloadVirtualNetworkResourceId must match the reviewed rg-athena-demo-workload VNet in the deployment subscription.')
+var validatedWorkloadPrivateEndpointSubnetResourceId = toLower(workloadPrivateEndpointSubnetResourceId) == toLower(reviewedWorkloadPrivateEndpointSubnetResourceId)
+  ? reviewedWorkloadPrivateEndpointSubnetResourceId
+  : fail('WC-024 workloadPrivateEndpointSubnetResourceId must match the reviewed workload private-endpoint subnet.')
+var validatedCollectorRuntimeVirtualNetworkResourceId = toLower(collectorRuntimeVirtualNetworkResourceId) == toLower(reviewedCollectorRuntimeVirtualNetworkResourceId)
+  ? reviewedCollectorRuntimeVirtualNetworkResourceId
+  : fail('WC-024 collectorRuntimeVirtualNetworkResourceId must match the dedicated WC-024 collector VNet.')
+var validatedCollectorRuntimeSubnetResourceId = toLower(collectorRuntimeSubnetResourceId) == toLower(reviewedCollectorRuntimeSubnetResourceId)
+  ? reviewedCollectorRuntimeSubnetResourceId
+  : fail('WC-024 collectorRuntimeSubnetResourceId must match the dedicated WC-024 collector runtime subnet.')
+var validatedCollectorPrivateEndpointSubnetResourceId = toLower(collectorPrivateEndpointSubnetResourceId) == toLower(reviewedCollectorPrivateEndpointSubnetResourceId)
+  ? reviewedCollectorPrivateEndpointSubnetResourceId
+  : fail('WC-024 collectorPrivateEndpointSubnetResourceId must match the dedicated WC-024 collector private-endpoint subnet.')
 resource monitoringResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
   name: monitoringResourceGroupName
 }
@@ -171,8 +212,6 @@ module monitoringDataPlatform 'modules/monitoring-data-platform.bicep' = {
     workspaceName: workspaceName
     dataCollectionEndpointName: dataCollectionEndpointName
     dataCollectionRuleName: dataCollectionRuleName
-    tags: resourceTags
-    createPrivateLinkScope: validatedCreatePrivateLinkScope
   }
 }
 
@@ -180,16 +219,11 @@ module privateRuntimeTopologyValidation 'modules/private-runtime-topology-valida
   name: 'validate-private-runtime-topology'
   scope: monitoringResourceGroup
   params: {
-    workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId
-    privateEndpointVirtualNetworkResourceId: privateEndpointVirtualNetworkResourceId
-    privateEndpointSubnetResourceId: privateEndpointSubnetResourceId
-    collectorRuntimeVirtualNetworkResourceId: collectorRuntimeVirtualNetworkResourceId
-    collectorRuntimeSubnetResourceId: collectorRuntimeSubnetResourceId
-    workloadPrivateEndpointConnectivityConfirmed: workloadPrivateEndpointConnectivityConfirmed
-    collectorRuntimePrivateEndpointConnectivityConfirmed: collectorRuntimePrivateEndpointConnectivityConfirmed
-    workloadPrivateDnsResolutionConfirmed: workloadPrivateDnsResolutionConfirmed
-    collectorRuntimePrivateDnsResolutionConfirmed: collectorRuntimePrivateDnsResolutionConfirmed
-    privateMonitoringIngestionCutoverConfirmed: privateMonitoringIngestionCutoverConfirmed
+    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
+    workloadPrivateEndpointSubnetResourceId: validatedWorkloadPrivateEndpointSubnetResourceId
+    collectorRuntimeVirtualNetworkResourceId: validatedCollectorRuntimeVirtualNetworkResourceId
+    collectorRuntimeSubnetResourceId: validatedCollectorRuntimeSubnetResourceId
+    collectorPrivateEndpointSubnetResourceId: validatedCollectorPrivateEndpointSubnetResourceId
   }
 }
 
@@ -197,7 +231,7 @@ module dcrAssociationValidation 'modules/dcr-association-validation.bicep' = {
   name: 'validate-adopted-dcr-associations'
   scope: resourceGroup(workloadResourceGroupName)
   params: {
-    approvedVmNames: approvedVmNames
+    approvedVmNames: validatedApprovedVmNames
     dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
     dataCollectionRuleAssociationName: dataCollectionRuleAssociationName
   }
@@ -211,7 +245,7 @@ module dcrAssociations 'modules/dcr-associations.bicep' = {
     dcrAssociationValidation
   ]
   params: {
-    approvedVmNames: approvedVmNames
+    approvedVmNames: validatedApprovedVmNames
     dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
     dataCollectionEndpointLocation: monitoringDataPlatform.outputs.dataCollectionEndpointLocation
     dataCollectionEndpointAssociationName: dataCollectionEndpointAssociationName
@@ -219,9 +253,31 @@ module dcrAssociations 'modules/dcr-associations.bicep' = {
   }
 }
 
-module privateDnsZones 'modules/private-dns-zones.bicep' = {
-  name: 'monitoring-private-dns-zones'
-  scope: resourceGroup(privateDnsResourceGroupName)
+module workloadPrivateDnsZones 'modules/private-dns-zones.bicep' = {
+  name: 'workload-monitoring-private-dns-zones'
+  scope: resourceGroup(workloadResourceGroupName)
+  dependsOn: [
+    dcrAssociations
+  ]
+  params: {
+    tags: resourceTags
+  }
+}
+
+module collectorPrivateDnsZones 'modules/private-dns-zones.bicep' = {
+  name: 'collector-monitoring-private-dns-zones'
+  scope: monitoringResourceGroup
+  dependsOn: [
+    dcrAssociations
+  ]
+  params: {
+    tags: resourceTags
+  }
+}
+
+module collectorKeyVaultPrivateDns 'modules/collector-key-vault-private-dns.bicep' = {
+  name: 'collector-key-vault-private-dns'
+  scope: monitoringResourceGroup
   dependsOn: [
     dcrAssociations
   ]
@@ -244,10 +300,15 @@ module monitoringStorage 'modules/monitoring-flow-log-storage.bicep' = {
 module monitoringEvidenceSeams 'modules/monitoring-evidence-seams.bicep' = {
   name: 'monitoring-evidence-seams'
   scope: monitoringResourceGroup
+  dependsOn: [
+    #disable-next-line no-unnecessary-dependson // Preserve review-visible container creation before evidence writer RBAC.
+    monitoringStorage
+  ]
   params: {
     location: location
     namePrefix: namePrefix
     storageAccountName: monitoringStorageAccountName
+    monitoringEvidenceContainerResourceId: monitoringStorage.outputs.monitoringEvidenceContainerResourceId
     keyVaultName: monitoringCollectorKeyVaultName
     tags: resourceTags
   }
@@ -259,13 +320,17 @@ module monitoringPrivateEndpoints 'modules/monitoring-private-endpoints.bicep' =
   params: {
     location: location
     namePrefix: namePrefix
-    privateEndpointSubnetResourceId: privateRuntimeTopologyValidation.outputs.privateEndpointSubnetResourceId
-    azureMonitorPrivateLinkScopeResourceId: monitoringDataPlatform.outputs.privateLinkScopeResourceId
+    workloadPrivateEndpointSubnetResourceId: privateRuntimeTopologyValidation.outputs.workloadPrivateEndpointSubnetResourceId
+    collectorPrivateEndpointSubnetResourceId: privateRuntimeTopologyValidation.outputs.collectorPrivateEndpointSubnetResourceId
+    workloadAzureMonitorPrivateLinkScopeResourceId: monitoringDataPlatform.outputs.workloadPrivateLinkScopeResourceId
+    collectorAzureMonitorPrivateLinkScopeResourceId: monitoringDataPlatform.outputs.collectorPrivateLinkScopeResourceId
     storageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
     keyVaultResourceId: monitoringEvidenceSeams.outputs.keyVaultResourceId
-    storageBlobPrivateDnsZoneResourceId: privateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId
-    keyVaultPrivateDnsZoneResourceId: privateDnsZones.outputs.keyVaultPrivateDnsZoneResourceId
-    azureMonitorPrivateDnsZoneResourceIds: privateDnsZones.outputs.azureMonitorPrivateDnsZoneResourceIds
+    workloadStorageBlobPrivateDnsZoneResourceId: workloadPrivateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId
+    collectorStorageBlobPrivateDnsZoneResourceId: collectorPrivateDnsZones.outputs.storageBlobPrivateDnsZoneResourceId
+    collectorKeyVaultPrivateDnsZoneResourceId: collectorKeyVaultPrivateDns.outputs.keyVaultPrivateDnsZoneResourceId
+    workloadAzureMonitorPrivateDnsZoneResourceIds: workloadPrivateDnsZones.outputs.azureMonitorPrivateDnsZoneResourceIds
+    collectorAzureMonitorPrivateDnsZoneResourceIds: collectorPrivateDnsZones.outputs.azureMonitorPrivateDnsZoneResourceIds
     tags: resourceTags
   }
   dependsOn: [
@@ -273,16 +338,39 @@ module monitoringPrivateEndpoints 'modules/monitoring-private-endpoints.bicep' =
   ]
 }
 
-module privateDnsVnetLinks 'modules/private-dns-vnet-links.bicep' = {
-  name: 'monitoring-private-dns-vnet-links'
-  scope: resourceGroup(privateDnsResourceGroupName)
+module workloadPrivateDnsVnetLinks 'modules/private-dns-vnet-links.bicep' = {
+  name: 'workload-monitoring-private-dns-vnet-links'
+  scope: resourceGroup(workloadResourceGroupName)
   dependsOn: [
     monitoringPrivateEndpoints
   ]
   params: {
-    namePrefix: namePrefix
-    workloadVirtualNetworkResourceId: privateRuntimeTopologyValidation.outputs.workloadVirtualNetworkResourceId
-    collectorRuntimeVirtualNetworkResourceId: privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId
+    namePrefix: '${namePrefix}-workload'
+    virtualNetworkResourceId: privateRuntimeTopologyValidation.outputs.workloadVirtualNetworkResourceId
+  }
+}
+
+module collectorPrivateDnsVnetLinks 'modules/private-dns-vnet-links.bicep' = {
+  name: 'collector-monitoring-private-dns-vnet-links'
+  scope: monitoringResourceGroup
+  dependsOn: [
+    monitoringPrivateEndpoints
+  ]
+  params: {
+    namePrefix: '${namePrefix}-collector'
+    virtualNetworkResourceId: privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId
+  }
+}
+
+module collectorKeyVaultPrivateDnsLink 'modules/collector-key-vault-private-dns-link.bicep' = {
+  name: 'collector-key-vault-private-dns-link'
+  scope: monitoringResourceGroup
+  dependsOn: [
+    monitoringPrivateEndpoints
+  ]
+  params: {
+    namePrefix: '${namePrefix}-collector'
+    collectorVirtualNetworkResourceId: privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId
   }
 }
 
@@ -295,6 +383,16 @@ module monitoringEvidenceReaderRole 'modules/monitoring-evidence-reader-role.bic
       workloadResourceGroupId
       networkWatcherResourceGroupId
     ]
+  }
+}
+
+module canonicalFlowLogValidation 'modules/canonical-flow-log-validation.bicep' = {
+  name: 'validate-canonical-vnet-flow-log'
+  scope: resourceGroup(networkWatcherResourceGroupName)
+  params: {
+    networkWatcherName: networkWatcherName
+    flowLogName: flowLogName
+    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
   }
 }
 
@@ -319,38 +417,12 @@ module workloadAssociationReaderAssignment 'modules/monitoring-evidence-reader-r
 module networkWatcherReaderAssignment 'modules/monitoring-evidence-reader-rbac.bicep' = {
   name: 'network-watcher-reader-assignment'
   scope: resourceGroup(networkWatcherResourceGroupName)
+  dependsOn: [
+    vnetFlowLog
+  ]
   params: {
     collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
     roleDefinitionId: monitoringEvidenceReaderRole.outputs.roleDefinitionId
-  }
-}
-
-module monitoringPrivateAccess 'modules/monitoring-private-access.bicep' = if (privateMonitoringIngestionCutoverConfirmed) {
-  name: 'disable-adopted-monitoring-public-access'
-  scope: monitoringResourceGroup
-  dependsOn: [
-    monitoringPrivateEndpoints
-    privateDnsVnetLinks
-    dcrAssociations
-    dcrAssociationValidation
-    privateRuntimeTopologyValidation
-  ]
-  params: {
-    workspaceLocation: monitoringDataPlatform.outputs.workspaceLocation
-    workspaceName: workspaceName
-    workspaceTags: monitoringDataPlatform.outputs.workspaceTags
-    dataCollectionEndpointName: dataCollectionEndpointName
-    dataCollectionEndpointLocation: monitoringDataPlatform.outputs.dataCollectionEndpointLocation
-    dataCollectionEndpointTags: monitoringDataPlatform.outputs.dataCollectionEndpointTags
-    dataCollectionEndpointDescription: monitoringDataPlatform.outputs.?dataCollectionEndpointDescription
-    dataCollectionEndpointKind: monitoringDataPlatform.outputs.?dataCollectionEndpointKind
-    privateLinkScopeName: '${namePrefix}-ampls'
-    privateLinkScopeTags: monitoringDataPlatform.outputs.privateLinkScopeTags
-    privateLinkScopeAccessModeExclusions: monitoringDataPlatform.outputs.privateLinkScopeAccessModeExclusions
-    workspaceSkuName: monitoringDataPlatform.outputs.workspaceSkuName
-    workspaceRetentionDays: monitoringDataPlatform.outputs.workspaceRetentionDays
-    workspaceDailyQuotaGb: monitoringDataPlatform.outputs.workspaceDailyQuotaGb
-    workspaceFeatures: monitoringDataPlatform.outputs.workspaceFeatures
   }
 }
 
@@ -359,8 +431,8 @@ module vnetFlowLog 'modules/vnet-flow-log.bicep' = {
   scope: resourceGroup(networkWatcherResourceGroupName)
   params: {
     networkWatcherName: networkWatcherName
-    flowLogName: flowLogName
-    workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId
+    flowLogName: canonicalFlowLogValidation.outputs.validatedFlowLogName
+    workloadVirtualNetworkResourceId: canonicalFlowLogValidation.outputs.validatedTargetResourceId
     storageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
     workspaceCustomerId: monitoringDataPlatform.outputs.workspaceCustomerId
     workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
@@ -378,7 +450,7 @@ module legacyFlowLogMigration 'modules/legacy-flow-log-migration.bicep' = {
   params: {
     networkWatcherName: networkWatcherName
     canonicalVnetFlowLogName: flowLogName
-    workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId
+    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
     replacementStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
     legacyFlowLogNames: legacyFlowLogNames
     legacyFlowLogTargetResourceIds: legacyFlowLogTargetResourceIds
@@ -402,6 +474,8 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
     monitoringResourceGroupId: monitoringResourceGroup.id
     workloadResourceGroupId: workloadResourceGroupId
+    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
+    approvedVmNames: validatedApprovedVmNames
     workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
     dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
     dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId

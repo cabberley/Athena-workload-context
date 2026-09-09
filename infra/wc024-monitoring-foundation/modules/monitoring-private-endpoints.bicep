@@ -6,11 +6,17 @@ param location string = resourceGroup().location
 @description('Lowercase prefix for deterministic private endpoint names.')
 param namePrefix string
 
-@description('Resource ID of the dedicated private endpoint subnet.')
-param privateEndpointSubnetResourceId string
+@description('Resource ID of the workload-local private endpoint subnet.')
+param workloadPrivateEndpointSubnetResourceId string
 
-@description('Resource ID of the Azure Monitor private link scope.')
-param azureMonitorPrivateLinkScopeResourceId string
+@description('Resource ID of the collector-local private endpoint subnet.')
+param collectorPrivateEndpointSubnetResourceId string
+
+@description('Resource ID of the workload Azure Monitor private link scope.')
+param workloadAzureMonitorPrivateLinkScopeResourceId string
+
+@description('Resource ID of the collector Azure Monitor private link scope.')
+param collectorAzureMonitorPrivateLinkScopeResourceId string
 
 @description('Resource ID of monitoring-owned replacement storage.')
 param storageAccountResourceId string
@@ -18,16 +24,24 @@ param storageAccountResourceId string
 @description('Resource ID of the monitoring collector Key Vault.')
 param keyVaultResourceId string
 
-@description('Private DNS zone ID for Blob private endpoints.')
-param storageBlobPrivateDnsZoneResourceId string
+@description('Workload-bound private DNS zone ID for Azure Monitor Blob endpoints.')
+param workloadStorageBlobPrivateDnsZoneResourceId string
 
-@description('Private DNS zone ID for Key Vault private endpoints.')
-param keyVaultPrivateDnsZoneResourceId string
+@description('Collector-bound private DNS zone ID for Blob private endpoints.')
+param collectorStorageBlobPrivateDnsZoneResourceId string
 
-@description('The four non-Blob private DNS zone IDs required by Azure Monitor private link.')
+@description('Collector-bound private DNS zone ID for Key Vault private endpoints.')
+param collectorKeyVaultPrivateDnsZoneResourceId string
+
+@description('The four workload-bound non-Blob private DNS zone IDs required by Azure Monitor private link.')
 @minLength(4)
 @maxLength(4)
-param azureMonitorPrivateDnsZoneResourceIds array
+param workloadAzureMonitorPrivateDnsZoneResourceIds array
+
+@description('The four collector-bound non-Blob private DNS zone IDs required by Azure Monitor private link.')
+@minLength(4)
+@maxLength(4)
+param collectorAzureMonitorPrivateDnsZoneResourceIds array
 
 @description('Resource tags applied to private endpoints.')
 param tags object = {}
@@ -37,8 +51,16 @@ var resourceTags = union(tags, {
   dataBoundary: 'customer'
   managedBy: 'bicep'
 })
-var azureMonitorPrivateDnsZoneConfigs = [
-  for (zoneId, index) in azureMonitorPrivateDnsZoneResourceIds: {
+var workloadAzureMonitorPrivateDnsZoneConfigs = [
+  for (zoneId, index) in workloadAzureMonitorPrivateDnsZoneResourceIds: {
+    name: 'azure-monitor-${index}'
+    properties: {
+      privateDnsZoneId: zoneId
+    }
+  }
+]
+var collectorAzureMonitorPrivateDnsZoneConfigs = [
+  for (zoneId, index) in collectorAzureMonitorPrivateDnsZoneResourceIds: {
     name: 'azure-monitor-${index}'
     properties: {
       privateDnsZoneId: zoneId
@@ -46,19 +68,19 @@ var azureMonitorPrivateDnsZoneConfigs = [
   }
 ]
 
-resource azureMonitorPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: '${namePrefix}-ampls-pe'
+resource workloadAzureMonitorPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
+  name: '${namePrefix}-workload-ampls-pe'
   location: location
   tags: resourceTags
   properties: {
     subnet: {
-      id: privateEndpointSubnetResourceId
+      id: workloadPrivateEndpointSubnetResourceId
     }
     privateLinkServiceConnections: [
       {
-        name: 'azure-monitor'
+        name: 'workload-azure-monitor'
         properties: {
-          privateLinkServiceId: azureMonitorPrivateLinkScopeResourceId
+          privateLinkServiceId: workloadAzureMonitorPrivateLinkScopeResourceId
           groupIds: [
             'azuremonitor'
           ]
@@ -68,8 +90,8 @@ resource azureMonitorPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10
   }
 }
 
-resource azureMonitorPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: azureMonitorPrivateEndpoint
+resource workloadAzureMonitorPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
+  parent: workloadAzureMonitorPrivateEndpoint
   name: 'default'
   properties: {
     privateDnsZoneConfigs: concat(
@@ -77,11 +99,51 @@ resource azureMonitorPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/pri
         {
           name: 'azure-monitor-blob'
           properties: {
-            privateDnsZoneId: storageBlobPrivateDnsZoneResourceId
+            privateDnsZoneId: workloadStorageBlobPrivateDnsZoneResourceId
           }
         }
       ],
-      azureMonitorPrivateDnsZoneConfigs
+      workloadAzureMonitorPrivateDnsZoneConfigs
+    )
+  }
+}
+
+resource collectorAzureMonitorPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
+  name: '${namePrefix}-collector-ampls-pe'
+  location: location
+  tags: resourceTags
+  properties: {
+    subnet: {
+      id: collectorPrivateEndpointSubnetResourceId
+    }
+    privateLinkServiceConnections: [
+      {
+        name: 'collector-azure-monitor'
+        properties: {
+          privateLinkServiceId: collectorAzureMonitorPrivateLinkScopeResourceId
+          groupIds: [
+            'azuremonitor'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+resource collectorAzureMonitorPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
+  parent: collectorAzureMonitorPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: concat(
+      [
+        {
+          name: 'azure-monitor-blob'
+          properties: {
+            privateDnsZoneId: collectorStorageBlobPrivateDnsZoneResourceId
+          }
+        }
+      ],
+      collectorAzureMonitorPrivateDnsZoneConfigs
     )
   }
 }
@@ -92,7 +154,7 @@ resource storagePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' 
   tags: resourceTags
   properties: {
     subnet: {
-      id: privateEndpointSubnetResourceId
+      id: collectorPrivateEndpointSubnetResourceId
     }
     privateLinkServiceConnections: [
       {
@@ -116,7 +178,7 @@ resource storagePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateD
       {
         name: 'blob'
         properties: {
-          privateDnsZoneId: storageBlobPrivateDnsZoneResourceId
+          privateDnsZoneId: collectorStorageBlobPrivateDnsZoneResourceId
         }
       }
     ]
@@ -129,7 +191,7 @@ resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01'
   tags: resourceTags
   properties: {
     subnet: {
-      id: privateEndpointSubnetResourceId
+      id: collectorPrivateEndpointSubnetResourceId
     }
     privateLinkServiceConnections: [
       {
@@ -153,7 +215,7 @@ resource keyVaultPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/private
       {
         name: 'vault'
         properties: {
-          privateDnsZoneId: keyVaultPrivateDnsZoneResourceId
+          privateDnsZoneId: collectorKeyVaultPrivateDnsZoneResourceId
         }
       }
     ]

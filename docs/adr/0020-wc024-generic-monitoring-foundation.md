@@ -35,7 +35,12 @@ which preserves its `Custom-AthenaJson` to `Custom-AthenaApp_CL` data flow and a
 The existing `rg-athena-demo-monitoring` resource group is likewise a deployment scope rather than
 a resource PUT, so the foundation cannot replace its established tags.
 The existing `athena-linux-dcr` DCR association is read without being rewritten for the exact,
-case-insensitively distinct set of 11 named, already AMA-enabled VMs. A dedicated prerequisite
+case-insensitively distinct set of 11 named, already AMA-enabled VMs:
+`athena-hackathon-client-01`, `athena-hackathon-ecp-01` through
+`athena-hackathon-ecp-03`, `athena-hackathon-iris-01`,
+`athena-hackathon-mid-01` and `athena-hackathon-mid-02`,
+`athena-hackathon-sqlvm-01`, and `athena-hackathon-web-01` through
+`athena-hackathon-web-03`. A dedicated prerequisite
 validation deployment reads each association's `dataCollectionRuleId`, compares it to the adopted
 DCR resource ID, and must complete before any DCE association PUT can occur. WC-024 does not rewrite
 the existing DCR binding. Deployment fails closed if any association is missing or does not reference
@@ -43,54 +48,66 @@ the reviewed DCR. The template instead creates a
 distinct `configurationAccessEndpoint` association on each approved VM whose properties contain
 only the adopted private DCE ID. It neither installs AMA nor creates a duplicate DCR association.
 
-WC-024 adds an Azure Monitor Private Link Scope, monitoring-owned replacement storage, private
-endpoints, required private DNS zones and workload- and collector-runtime-VNet links, and one
-collector-only managed identity. The AMPLS is created in Open mode only when the explicit,
-reviewed `createPrivateLinkScope` phase-one input is true. Its default is false: later deployments
-declare the scope as existing, fail closed if it is absent, and do not PUT its access mode. Therefore
-the phase-two PrivateOnly update is persistent and an ordinary later deployment cannot reopen the
-scope. The template rejects a request to create an Open scope in the private-only cutover phase. It
-validates all 11 adopted DCR associations before deploying the AMPLS private endpoint
-and its private DNS zone group. Private DNS zone creation is separated from workload-VNet linking:
-the deployment creates or adopts unlinked zones, populates them through the private-endpoint zone
-groups, and only then links the zones to the workload VNet. This prevents empty private zones from
-overriding Azure Monitor DNS before the AMPLS records exist. Public access remains unchanged by
-default, and the new AMPLS remains open during the initial adoption deployment. LAW/DCE public
-access and AMPLS private-only access can be enabled only in a subsequent reviewed deployment after
-the private-ingestion cutover confirmation attests that the 11 agents, their adopted DCR associations, and
-their separate DCE associations
+WC-024 adds two isolated Azure Monitor Private Link Scopes, monitoring-owned replacement storage,
+private endpoints, separate workload and collector private DNS boundaries, and one collector-only
+managed identity. AMPLS creation is a separate one-time bootstrap deployment with explicit Open
+access modes. Its wrapper processes each scope independently: an exact existing Open scope with no
+exclusions is retained, a missing scope is created, and any other lookup failure or existing state
+fails closed. The steady-state foundation always declares both scopes as existing, links the same reviewed
+LAW and DCE to each, fails closed if either is absent, and never PUTs Open access modes. Therefore
+the phase-two PrivateOnly update is persistent and an ordinary later foundation deployment cannot
+reopen either scope. It validates all 11 adopted DCR associations before deploying either AMPLS
+private endpoint and private DNS zone group. Each DNS boundary is populated through its local
+private-endpoint zone group before being linked to its sole VNet. This prevents empty private zones
+from overriding Azure Monitor DNS and prevents collector Blob/Key Vault records from being exposed
+to the workload network. Public access remains unchanged by default, and both new AMPLS resources
+remain open during the initial adoption deployment. LAW/DCE public
+access and AMPLS private-only access can be enabled only by the separate reviewed
+`set-private-access.ps1` operation after its connectivity, DNS, and ingestion confirmations attest
+that the 11 agents, their adopted DCR associations, and their separate DCE associations
 remain healthy and Heartbeat, Perf, InsightsMetrics, Syslog, AthenaApp_CL, and NTANetAnalytics
 are actively ingesting. This two-phase ordering avoids a telemetry outage while AMA transitions to
-private connectivity. The phase-two PUT obtains the adopted LAW and DCE values from the
-adoption module rather than applying generic tags or replacement defaults: it preserves LAW tags,
-SKU, retention, daily quota, and the exact workspace feature object (including `disableLocalAuth`
-and `enableLogAccessUsingOnlyResourcePermissions`), and preserves DCE tags plus description and
-kind when those optional values exist on the adopted resource. It also
-replays the AMPLS's exact tags and any per-private-endpoint access-mode exclusions. Therefore the
-only intended phase-two changes are the LAW/DCE public-network settings and AMPLS default access
-modes. Private DNS resources are managed
-in one reviewed, deployment-subscription resource group; deployment fails if that resource group
-is unavailable instead of silently relying on unverified links.
+private connectivity. The cutover is a serialized operator action that reads each AMPLS, requires
+an empty per-private-endpoint exclusion set, performs the documented create-or-update operation
+while preserving exact tags, and immediately verifies that only the default query and ingestion
+modes changed. It
+then uses the supported narrow Azure CLI update surfaces for the DCE and LAW public-network
+settings. The script reads all four resources back and fails unless the intended private settings
+are effective. The AMPLS API exposes no supported ETag condition, so concurrent cutover execution
+is prohibited operationally.
+Collector private DNS resources are managed in `rg-athena-demo-monitoring`; the isolated workload
+Azure Monitor/Blob zones are managed in `rg-athena-demo-workload`. Both are fixed deployment
+scopes rather than caller-selected resource groups.
 
-The deployment explicitly declares the private-endpoint VNet and subnet and the isolated
-collector-runtime VNet and subnet. A prerequisite validation module requires all of these IDs to
-be in the deployment subscription and verifies that each subnet belongs to its declared VNet. When
-either the workload VNet or collector VNet differs from the private-endpoint VNet, a reviewed
-routing/peering confirmation is required. Separate non-registration links are created for all six
-private zones on the collector VNet when it differs from the workload VNet. Before the private-ingestion cutover, after private endpoints, private DNS zones, and VNet
-links exist, the operator must also attest that workload and collector runtimes resolve the
-managed private zones (or approved forwarding). The first adoption deployment can therefore
-create the DNS and endpoint prerequisites without pre-attesting records that cannot exist yet.
-This does not infer peering, routes, or custom DNS behavior from resource IDs: missing cutover
-topology or DNS evidence fails closed.
+The deployment pins the workload scope to `rg-athena-demo-workload`, the exact reviewed
+`athena-hackathon-vnet` resource ID in the deployment subscription, and the reviewed 11-VM list.
+It also pins the workload-local private-endpoint subnet and the dedicated collector VNet, runtime
+subnet, and private-endpoint subnet. A prerequisite validation module requires all IDs to be in the
+deployment subscription, verifies each subnet parent, requires distinct collector subnets, and
+rejects a shared workload/collector VNet. Non-registration links are created only between each
+private DNS boundary and its corresponding VNet. Before private cutover, the operator validates
+that both runtimes resolve their local managed zones. DNS and ingestion evidence is supplied only
+to the explicit cutover script after endpoint records and links exist.
+
+The reviewed demo workload and existing shared WC-013 MCP network have overlapping address spaces,
+and the shared MCP identity already has workload Reader authority. WC-024 therefore does not peer
+or DNS-link that runtime. Connectivity is a separate deployment under
+`infra/wc024-monitoring-connectivity`: it creates a dedicated `10.45.0.0/24` WC-024 collector VNet
+in `rg-athena-demo-monitoring`, with separate runtime and private-endpoint subnets and no peering to
+the workload. The workload uses its existing `snet-paas-private-endpoints` subnet for a
+workload-local AMPLS endpoint. The collector VNet receives a separate AMPLS endpoint plus the
+evidence Blob and Key Vault endpoints. Identically named Azure Monitor/Blob zones live in separate
+resource groups and link to only their corresponding VNet; the Key Vault zone exists only in the
+collector boundary. This avoids ambiguous routes, shared DNS records, and a network path from the
+workload to collector evidence or signing resources.
 
 The subscription deployment `location` applies only to WC-024-created monitoring resources. The
 adoption module reads the actual LAW and DCE locations and fails closed unless they are in the same
 Azure region, which is required for the DCE logs-ingestion endpoint. The DCE association module
 also fails closed unless every approved VM is in the adopted DCE region, which is required for its
-configuration-access endpoint. Traffic Analytics receives the adopted workspace location, while the
-gated phase-two PUTs use each adopted resource's own location. Consequently, a subscription
-deployment in a different region cannot relocate or misconfigure the adopted LAW or DCE.
+configuration-access endpoint. Traffic Analytics receives the adopted workspace location. The root deployment is pinned to
+`australiaeast`, matching the reviewed workload and monitoring VNets; a caller cannot select a
+different private-endpoint or flow-log-storage region.
 
 The custom **Athena WC024 Isolated Monitoring Evidence Reader** role is assigned only to that
 collector identity and only at the monitoring, approved workload, and Network Watcher resource
@@ -103,23 +120,27 @@ by the collector. Context API, Context MCP, presentation, and correlation identi
 parameters nor role-assignment principals in the foundation.
 
 The collector uses a dedicated non-exportable Key Vault RSA signing key and a versioned,
-retention-controlled `monitoring-evidence` Blob container. Its Pydantic contract follows the
-WC-013 pattern: a reviewed, canonical collector contract identifies the allowed generic signal
-kinds and read operations; each `athena.wc024MonitoringEvidenceHandoff.v1` references an exact
-Blob version and digest and binds it with a domain-separated RS256 attestation. Consumers must
-validate the reviewed contract digest, immutable reference, signature, scope, and freshness before
-using evidence.
+retention-controlled `monitoring-evidence` Blob container. The checked-in contract binds the
+versioned `signingKeyResourceId` Key Vault key URI, reviewed workload resource group, reviewed
+workload VNet, and exact 11 VM names. Its Pydantic contract follows the WC-013 pattern: a
+reviewed, canonical collector contract identifies the allowed generic signal kinds and read
+operations; each `athena.wc024MonitoringEvidenceHandoff.v1` references an exact Blob version and
+digest and binds it with a domain-separated RS256 attestation. Consumers must validate the reviewed
+contract digest, immutable reference, signing key URI, signature, scope, and freshness at trusted
+`as_of` before using evidence; keys retired or expired at `as_of` fail closed.
 
 The existing VNet-scope
 `athena-hackathon-vnet-rg-athena-demo-workload-flowlog` is adopted and updated in place to use
 the monitoring-owned storage with Traffic Analytics enabled. `athenahackathonflowwhtco` remains
 retained and its existing blobs are never deleted. An explicit, bounded migration surface can
 disable redundant subnet and NIC flow logs only after a reviewed canonical-VNet cutover
-confirmation. Each redundant flow-log name and target is supplied as a paired reviewed parameter;
-the module rejects unpaired values, the canonical VNet flow log, VNet targets, and an unconfirmed
-cutover. Disabled redundant logs are pointed at replacement storage and have Traffic Analytics
-disabled, so future writes do not continue to use the legacy account. No flow log is implicitly
-deleted.
+confirmation. Each redundant flow-log name and target must appear in a checked-in exact
+reviewed allowlist, and WC-024 currently ships with an empty allowlist. The module rejects
+unpaired values, unreviewed name/target pairs, the canonical VNet flow log, VNet targets, and an
+unconfirmed cutover; it also reads each existing flow log and refuses to disable it unless its
+current target matches the reviewed pair. Disabled redundant logs are pointed at replacement
+storage and have Traffic Analytics disabled, so future writes do not continue to use the legacy
+account. No flow log is implicitly deleted.
 
 Connection Monitor is a capability boundary only. WC-024 creates no monitor definitions and
 rejects attempts to enable them. A future published-intent reconciliation may introduce exact,
@@ -127,35 +148,28 @@ reviewed endpoint paths in a separate change.
 
 ## Operator runbook
 
-1. For the reviewed first phase-one deployment only, set `createPrivateLinkScope` to `true`; keep
-   `privateMonitoringIngestionCutoverConfirmed` false. All later deployments leave
-   `createPrivateLinkScope` false, which adopts the scope as an existing resource and preserves
-   its access mode.
-2. Provide the workload, private-endpoint, and collector runtime VNet/subnet IDs. Where a runtime
-   is not in the private-endpoint VNet, record reviewed routing or peering evidence and set the
-   corresponding connectivity confirmation. For the first adoption deployment, leave the DNS
-   resolution confirmations false until the private endpoints, zones, and VNet links exist. For
-   the private-ingestion cutover deployment, record private DNS resolution evidence for both
-   runtimes and set both confirmations true. The deployment deliberately rejects omitted or
-   inconsistent cutover assertions.
-3. Only after validating the populated DNS records, all DCE-only associations, connectivity, and
-   the stated ingestion baseline, set the private-ingestion confirmation for phase two. Review
-   validate and what-if output for deletes, public exposure, and role broadening. There is no
-   phase-two parameter that reopens an adopted PrivateOnly AMPLS.
+1. Run `bootstrap-ampls.ps1` once after reviewing its what-if. The wrapper refuses an already
+   existing scope and deploys explicit Open access modes. Every foundation deployment thereafter
+   adopts that scope as existing; there is no steady-state creation parameter or Open-mode PUT.
+2. Review, validate, and deploy the separate monitoring-connectivity template. Confirm the
+   dedicated collector VNet contains only the WC-024 runtime and private-endpoint subnets. Provide
+   its output IDs and the existing workload private-endpoint subnet ID to the foundation.
+3. Only after validating populated DNS records, all DCE-only associations, connectivity, and the
+   stated ingestion baseline, run `set-private-access.ps1` with all three explicit confirmations.
+   The steady-state template has no public-access mutation path and cannot reopen an adopted
+   PrivateOnly AMPLS.
 
 ## Consequences
 
 - Workspace query and ingestion, DCE, and Key Vault have public access disabled and use private
-  endpoints/private-link infrastructure once the explicit private-ingestion cutover confirmation
+  endpoints/private-link infrastructure once the explicit private-access cutover operation
   is supplied; the initial adoption deployment leaves LAW/DCE public settings unchanged. The
   Azure Monitor private endpoint uses all five
   required zones: `privatelink.monitor.azure.com`, `privatelink.oms.opinsights.azure.com`,
   `privatelink.ods.opinsights.azure.com`, `privatelink.agentsvc.azure-automation.net`, and the
-  same `privatelink.blob.core.windows.net` zone also attached to the storage endpoint. WC-024
-  explicitly manages non-registration workload-VNet links and, when distinct, collector-runtime
-  VNet links for these zones and `privatelink.vaultcore.azure.net`. Operators must validate
-  routing/peering and custom DNS forwarding before private cutover; resource IDs alone are not
-  evidence that these paths work.
+  corresponding isolated `privatelink.blob.core.windows.net` zones. The Key Vault zone and evidence
+  storage endpoint exist only in the collector DNS/network boundary. Operators must validate DNS
+  and endpoint connectivity in both runtimes before private cutover.
 - Storage uses Microsoft Entra authorization, TLS 1.2, versioning, soft-delete retention,
   cool-tier/deletion lifecycle, and an unlocked evidence-container immutability policy. Standard
   ZRS does not use archive tiering and Shared Key access remains disabled. The retained legacy
@@ -180,11 +194,13 @@ reviewed endpoint paths in a separate change.
 Deterministic contract tests reject incomplete allowlists, unexpected fields, nondeterministic Blob
 names, and attestation digests that do not bind the exact immutable reference. Static Bicep tests
 assert adoption of the existing LAW/DCE/DCR and association, custom-log preservation boundary,
-the exact distinct 11-VM preserved-association validation boundary, its completion before any
-DCE-only association PUT, the gated private-ingestion confirmation,
+the exact distinct 11-VM preserved-association validation boundary, reviewed workload RG/VNet
+pinning, its completion before any DCE-only association PUT, the gated private-ingestion
+confirmation,
 the DCR-association adoption and DCE-only `configurationAccessEndpoint` association boundary,
 private networking, collector runtime topology validation, and DNS links, populated-zone-before-VNet-link
-ordering, persistent private-access ordering and mutable-state preservation, lifecycle/retention, collector-only
-RBAC, canonical VNet Traffic Analytics, explicit legacy-flow-log migration, and the absence of
+ordering, persistent private-access ordering and mutable-state preservation, versioned signing
+key binding, lifecycle/retention, collector-only RBAC, canonical VNet Traffic Analytics, explicit
+allowlisted legacy-flow-log migration with existing-target verification, and the absence of
 Connection Monitor definitions or unpublished-intent configuration. Local Bicep build validates
 the root template and example parameters without contacting Azure.

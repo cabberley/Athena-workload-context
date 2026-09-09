@@ -23,19 +23,42 @@ param legacyFlowLogTargetResourceIds array = []
 @description('Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage.')
 param canonicalVnetFlowLogCutoverConfirmed bool = false
 
-var legacyFlowLogMigrationIsValid = length(legacyFlowLogNames) == length(legacyFlowLogTargetResourceIds) && !contains(map(legacyFlowLogNames, flowLogName => toLower(string(flowLogName))), toLower(canonicalVnetFlowLogName)) && !contains(map(legacyFlowLogTargetResourceIds, targetResourceId => toLower(string(targetResourceId))), toLower(workloadVirtualNetworkResourceId)) && (empty(legacyFlowLogNames) || canonicalVnetFlowLogCutoverConfirmed)
-var validatedLegacyFlowLogNames = legacyFlowLogMigrationIsValid ? legacyFlowLogNames : fail('legacy flow-log migration requires paired non-VNet targets and explicit canonical VNet cutover confirmation')
+var reviewedLegacyFlowLogMigrationAllowlist = []
+var requestedLegacyFlowLogMigrations = [
+  for (flowLogName, index) in legacyFlowLogNames: {
+    name: string(flowLogName)
+    targetResourceId: string(legacyFlowLogTargetResourceIds[index])
+  }
+]
+var reviewedLegacyFlowLogMigrationPairs = [
+  for reviewedMigration in reviewedLegacyFlowLogMigrationAllowlist: '${toLower(string(reviewedMigration.name))}|${toLower(string(reviewedMigration.targetResourceId))}'
+]
+var requestedLegacyFlowLogMigrationPairs = [
+  for requestedMigration in requestedLegacyFlowLogMigrations: '${toLower(requestedMigration.name)}|${toLower(requestedMigration.targetResourceId)}'
+]
+var unreviewedLegacyFlowLogMigrationPairs = filter(requestedLegacyFlowLogMigrationPairs, requestedPair => !contains(reviewedLegacyFlowLogMigrationPairs, requestedPair))
+var legacyFlowLogMigrationIsValid = length(legacyFlowLogNames) == length(legacyFlowLogTargetResourceIds) && empty(unreviewedLegacyFlowLogMigrationPairs) && !contains(map(legacyFlowLogNames, flowLogName => toLower(string(flowLogName))), toLower(canonicalVnetFlowLogName)) && !contains(map(legacyFlowLogTargetResourceIds, targetResourceId => toLower(string(targetResourceId))), toLower(workloadVirtualNetworkResourceId)) && (empty(legacyFlowLogNames) || canonicalVnetFlowLogCutoverConfirmed)
+var validatedLegacyFlowLogMigrations = legacyFlowLogMigrationIsValid ? requestedLegacyFlowLogMigrations : fail('legacy flow-log migration requires exact reviewed name/target allowlist entries, paired non-VNet targets, and explicit canonical VNet cutover confirmation')
 
 resource networkWatcher 'Microsoft.Network/networkWatchers@2024-10-01' existing = {
   name: networkWatcherName
 }
 
-resource legacyFlowLogs 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' = [
-  for (flowLogName, index) in validatedLegacyFlowLogNames: {
+resource existingLegacyFlowLogs 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' existing = [
+  for legacyFlowLogMigration in validatedLegacyFlowLogMigrations: {
     parent: networkWatcher
-    name: string(flowLogName)
+    name: legacyFlowLogMigration.name
+  }
+]
+
+resource legacyFlowLogs 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' = [
+  for (legacyFlowLogMigration, index) in validatedLegacyFlowLogMigrations: {
+    parent: networkWatcher
+    name: legacyFlowLogMigration.name
     properties: {
-      targetResourceId: string(legacyFlowLogTargetResourceIds[index])
+      targetResourceId: toLower(existingLegacyFlowLogs[index].properties.targetResourceId) == toLower(legacyFlowLogMigration.targetResourceId)
+        ? legacyFlowLogMigration.targetResourceId
+        : fail('WC-024 refuses to disable a legacy flow log unless its existing target matches the reviewed allowlist.')
       storageId: replacementStorageAccountResourceId
       enabled: false
       retentionPolicy: {
@@ -55,4 +78,4 @@ resource legacyFlowLogs 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' 
   }
 ]
 
-output disabledLegacyFlowLogNames array = validatedLegacyFlowLogNames
+output disabledLegacyFlowLogNames array = [for migration in validatedLegacyFlowLogMigrations: migration.name]

@@ -24,18 +24,6 @@ param preservedCustomLogStream string = 'Custom-AthenaJson'
 ])
 param preservedCustomLogTable string = 'Custom-AthenaApp_CL'
 
-@description('Resource tags applied to the new Azure Monitor Private Link Scope.')
-param tags object = {}
-
-@description('Set true only for the reviewed initial phase-one deployment that creates the Azure Monitor Private Link Scope in Open mode. Leave false thereafter to adopt and preserve its existing access mode.')
-param createPrivateLinkScope bool = false
-
-var resourceTags = union(tags, {
-  component: 'wc024-monitoring-data-platform'
-  dataBoundary: 'customer'
-  managedBy: 'bicep'
-})
-
 resource workspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
   name: workspaceName
 }
@@ -57,48 +45,40 @@ var validatedDataCollectionEndpointLocation = toLower(adoptedWorkspaceLocation) 
   ? adoptedDataCollectionEndpointLocation
   : fail('WC-024 requires the adopted Log Analytics workspace and data collection endpoint to use the same Azure region. Reconcile the regional topology before deployment.')
 
-resource createdPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-09-01' = if (createPrivateLinkScope) {
-  name: '${namePrefix}-ampls'
-  location: 'global'
-  tags: resourceTags
-  properties: {
-    accessModeSettings: {
-      queryAccessMode: 'Open'
-      ingestionAccessMode: 'Open'
-    }
-  }
+resource workloadPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-09-01' existing = {
+  name: '${namePrefix}-workload-ampls'
 }
 
-resource adoptedPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-09-01' existing = if (!createPrivateLinkScope) {
-  name: '${namePrefix}-ampls'
+resource collectorPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-09-01' existing = {
+  name: '${namePrefix}-collector-ampls'
 }
 
-resource createdWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = if (createPrivateLinkScope) {
-  parent: createdPrivateLinkScope
+resource workloadWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
+  parent: workloadPrivateLinkScope
   name: uniqueString(workspace.id)
   properties: {
     linkedResourceId: workspace.id
   }
 }
 
-resource adoptedWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = if (!createPrivateLinkScope) {
-  parent: adoptedPrivateLinkScope
-  name: uniqueString(workspace.id)
-  properties: {
-    linkedResourceId: workspace.id
-  }
-}
-
-resource createdDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = if (createPrivateLinkScope) {
-  parent: createdPrivateLinkScope
+resource workloadDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
+  parent: workloadPrivateLinkScope
   name: uniqueString(dataCollectionEndpoint.id)
   properties: {
     linkedResourceId: dataCollectionEndpoint.id
   }
 }
 
-resource adoptedDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = if (!createPrivateLinkScope) {
-  parent: adoptedPrivateLinkScope
+resource collectorWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
+  parent: collectorPrivateLinkScope
+  name: uniqueString(workspace.id)
+  properties: {
+    linkedResourceId: workspace.id
+  }
+}
+
+resource collectorDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
+  parent: collectorPrivateLinkScope
   name: uniqueString(dataCollectionEndpoint.id)
   properties: {
     linkedResourceId: dataCollectionEndpoint.id
@@ -119,8 +99,7 @@ output dataCollectionEndpointLocation string = validatedDataCollectionEndpointLo
 output dataCollectionEndpointTags object = dataCollectionEndpoint.tags
 output dataCollectionEndpointDescription string? = dataCollectionEndpoint.properties.?description
 output dataCollectionEndpointKind string? = dataCollectionEndpoint.?kind
-output privateLinkScopeResourceId string = createPrivateLinkScope ? createdPrivateLinkScope!.id : adoptedPrivateLinkScope!.id
-output privateLinkScopeTags object = createPrivateLinkScope ? resourceTags : adoptedPrivateLinkScope!.tags
-output privateLinkScopeAccessModeExclusions array = createPrivateLinkScope ? [] : adoptedPrivateLinkScope!.properties.accessModeSettings.exclusions ?? []
+output workloadPrivateLinkScopeResourceId string = workloadPrivateLinkScope.id
+output collectorPrivateLinkScopeResourceId string = collectorPrivateLinkScope.id
 output preservedCustomLogStream string = preservedCustomLogStream
 output preservedCustomLogTable string = preservedCustomLogTable

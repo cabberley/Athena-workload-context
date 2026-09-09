@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,74 @@ COLLECTOR_CONTRACT_MODULE = (
     / "modules"
     / "monitoring-collector-contract.bicep"
 )
+MONITORING_FOUNDATION_MAIN = (
+    Path(__file__).parents[1]
+    / "infra"
+    / "wc024-monitoring-foundation"
+    / "main.bicep"
+)
+
+
+REVIEWED_VM_NAMES = (
+    "athena-hackathon-client-01",
+    "athena-hackathon-ecp-01",
+    "athena-hackathon-ecp-02",
+    "athena-hackathon-ecp-03",
+    "athena-hackathon-iris-01",
+    "athena-hackathon-mid-01",
+    "athena-hackathon-mid-02",
+    "athena-hackathon-sqlvm-01",
+    "athena-hackathon-web-01",
+    "athena-hackathon-web-02",
+    "athena-hackathon-web-03",
+)
+REVIEWED_WORKLOAD_VNET_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
+    "rg-athena-demo-workload/providers/Microsoft.Network/virtualNetworks/"
+    "athena-hackathon-vnet"
+)
+REVIEWED_SIGNING_KEY_URI = (
+    "https://athenademomonkv.vault.azure.net/keys/monitoring-evidence-signing/"
+    "0123456789abcdef0123456789abcdef"
+)
+
+
+def test_bicep_and_python_share_one_canonical_vm_allowlist() -> None:
+    source = MONITORING_FOUNDATION_MAIN.read_text(encoding="utf-8")
+    block = source.split(
+        "var reviewedApprovedVmNames = [",
+        maxsplit=1,
+    )[1].split("]", maxsplit=1)[0]
+    bicep_names = tuple(
+        line.strip().strip("'")
+        for line in block.splitlines()
+        if line.strip()
+    )
+
+    assert bicep_names == REVIEWED_VM_NAMES
+    assert "? reviewedApprovedVmNames" in source
+
+
+def test_workload_vnet_id_is_canonicalized_before_digesting() -> None:
+    canonical = _collector_contract()
+    uppercase_payload = canonical.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    uppercase_payload["workloadVirtualNetworkResourceId"] = (
+        canonical.workload_virtual_network_resource_id.upper()
+    )
+
+    normalized = MonitoringCollectorContract.model_validate_json(
+        json.dumps(uppercase_payload)
+    )
+
+    assert normalized.workload_virtual_network_resource_id == (
+        canonical.workload_virtual_network_resource_id
+    )
+    assert normalized.compute_artifact_digest_value() == (
+        canonical.compute_artifact_digest_value()
+    )
 
 
 def _collector_contract() -> MonitoringCollectorContract:
@@ -52,6 +121,8 @@ def _collector_contract() -> MonitoringCollectorContract:
             "/subscriptions/00000000-0000-0000-0000-000000000000/"
             "resourceGroups/rg-athena-demo-workload"
         ),
+        workloadVirtualNetworkResourceId=REVIEWED_WORKLOAD_VNET_ID,
+        approvedVmNames=REVIEWED_VM_NAMES,
         workspaceResourceId=(
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
             "rg-athena-demo-monitoring/providers/Microsoft.OperationalInsights/"
@@ -67,11 +138,7 @@ def _collector_contract() -> MonitoringCollectorContract:
             "rg-athena-demo-monitoring/providers/Microsoft.Insights/"
             "dataCollectionEndpoints/athena-hackathon-linux-dce"
         ),
-        signingKeyResourceId=(
-            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
-            "rg-athena-demo-monitoring/providers/Microsoft.KeyVault/vaults/"
-            "athenademomonkv/keys/monitoring-evidence-signing"
-        ),
+        signingKeyResourceId=REVIEWED_SIGNING_KEY_URI,
         evidenceStorageAccountResourceId=(
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
             "rg-athena-demo-monitoring/providers/Microsoft.Storage/storageAccounts/"
@@ -90,6 +157,7 @@ def _collector_contract() -> MonitoringCollectorContract:
         ),
         allowedReadOperations=(
             "Microsoft.OperationalInsights/workspaces/read",
+            "Microsoft.OperationalInsights/workspaces/query/read",
             "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
             "Microsoft.OperationalInsights/workspaces/query/Perf/read",
             "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
@@ -140,10 +208,7 @@ def _signed_handoff() -> MonitoringEvidenceHandoff:
     assert isinstance(evidence, VersionPinnedBlobReference)
     attestation = MonitoringEvidenceAttestation(
         signatureAlgorithm="RS256",
-        trustAnchorRef=(
-            "https://athenademomonkv.vault.azure.net/keys/monitoring-evidence-signing/"
-            "0123456789abcdef0123456789abcdef"
-        ),
+        trustAnchorRef=REVIEWED_SIGNING_KEY_URI,
         signedPreimageDigest=compute_artifact_digest(
             {
                 "domain": MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
@@ -241,6 +306,14 @@ def test_signed_handoff_rejects_changed_reference_or_attestation_binding() -> No
             "rg-athena-demo-workload/providers/Microsoft.OperationalInsights/workspaces/"
             "athena-demo-monitoring-law",
         ),
+        (
+            "workloadVirtualNetworkResourceId",
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
+            "rg-athena-demo-workload/providers/Microsoft.Network/virtualNetworks/"
+            "other-vnet",
+        ),
+        ("approvedVmNames", ("athena-hackathon-web-01",) * 11),
+        ("signingKeyResourceId", "not-a-versioned-key-uri"),
         ("evidenceStorageAccountResourceId", "not-a-resource-id"),
     ],
 )
@@ -309,11 +382,12 @@ def test_signed_handoff_requires_the_exact_active_collector_key() -> None:
             as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
             expected_collector_contract_digest="sha256:" + "b" * 64,
             reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+            reviewed_signing_key_resource_id=contract.signing_key_resource_id,
             trusted_key_anchor=anchor,
             key_resolver=lambda _: record,
         )
 
-    with pytest.raises(ValueError, match="untrusted key"):
+    with pytest.raises(ValueError, match="trusted key"):
         verify_monitoring_evidence_handoff_attestation(
             signed_handoff,
             as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
@@ -353,6 +427,75 @@ def test_signed_handoff_requires_the_exact_active_collector_key() -> None:
         MonitoringEvidenceHandoff(**payload)
 
 
+def test_signed_handoff_binds_reviewed_signing_key_to_trusted_anchor() -> None:
+    signed_handoff, contract, anchor, record = _trusted_signed_handoff()
+    other_key_uri = (
+        "https://athenademomonkv.vault.azure.net/keys/other-monitoring-key/"
+        "0123456789abcdef0123456789abcdef"
+    )
+
+    with pytest.raises(ValueError, match="trusted key"):
+        verify_monitoring_evidence_handoff_attestation(
+            signed_handoff,
+            as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+            expected_collector_contract_digest=signed_handoff.collector_contract_digest,
+            reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+            reviewed_signing_key_resource_id=other_key_uri,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _: record,
+        )
+
+    with pytest.raises(ValueError, match="expected collector contract"):
+        verify_monitoring_evidence_handoff_attestation(
+            signed_handoff,
+            as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+            reviewed_collector_contract=contract.model_copy(
+                update={"signing_key_resource_id": other_key_uri}
+            ),
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _: record,
+        )
+
+    with pytest.raises(ValueError, match="reviewed signing key"):
+        verify_monitoring_evidence_handoff_attestation(
+            signed_handoff,
+            as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+            expected_collector_contract_digest=signed_handoff.collector_contract_digest,
+            reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _: record,
+        )
+
+
+def test_signed_handoff_rejects_key_retired_or_expired_at_trusted_as_of() -> None:
+    signed_handoff, contract, anchor, record = _trusted_signed_handoff()
+
+    for stale_record in (
+        TrustedKeyRecord(
+            anchor=anchor,
+            public_key=record.public_key,
+            enabled=True,
+            activated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            retired_at=datetime(2026, 9, 6, 6, 5, tzinfo=UTC),
+        ),
+        TrustedKeyRecord(
+            anchor=anchor,
+            public_key=record.public_key,
+            enabled=True,
+            activated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            expires_at=datetime(2026, 9, 6, 6, 5, tzinfo=UTC),
+        ),
+    ):
+        with pytest.raises(ValueError, match="key is not trusted"):
+            verify_monitoring_evidence_handoff_attestation(
+                signed_handoff,
+                as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+                reviewed_collector_contract=contract,
+                trusted_key_anchor=anchor,
+                key_resolver=lambda _, stale_record=stale_record: stale_record,
+            )
+
+
 def test_signed_handoff_requires_trusted_as_of_and_reviewed_freshness() -> None:
     signed_handoff, contract, anchor, record = _trusted_signed_handoff()
 
@@ -361,6 +504,7 @@ def test_signed_handoff_requires_trusted_as_of_and_reviewed_freshness() -> None:
         as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
         expected_collector_contract_digest=signed_handoff.collector_contract_digest,
         reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+        reviewed_signing_key_resource_id=contract.signing_key_resource_id,
         trusted_key_anchor=anchor,
         key_resolver=lambda _: record,
     )

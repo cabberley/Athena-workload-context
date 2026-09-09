@@ -18,6 +18,7 @@ resource monitoringEvidenceReaderRole 'Microsoft.Authorization/roleDefinitions@2
       {
         actions: [
           'Microsoft.OperationalInsights/workspaces/read'
+          'Microsoft.OperationalInsights/workspaces/query/read'
           'Microsoft.OperationalInsights/workspaces/query/Heartbeat/read'
           'Microsoft.OperationalInsights/workspaces/query/Perf/read'
           'Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read'
