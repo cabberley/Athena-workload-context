@@ -504,6 +504,7 @@ All quota-exposed resources are well within regional limits.
 | Recovery ARM validation | `az deployment sub validate` | Passed against live partial state, including exact existing signal-role validation |
 | Recovery what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 42 creates, 13 nested deployments, 104 ignores, 40 runtime-expression unsupported, zero custom-role creates, zero Connection Monitor creates, and zero deletes |
 | First recovery deployment | `az deployment sub create` deployment `wc024-foundation-recovery-20260910-0119` | Failed after safe partial progress because the adopted LAW returned `dailyQuotaGb` as a Float while a read-only output declared Integer; no private cutover occurred |
+| Second recovery deployment | `az deployment sub create` deployment `wc024-foundation-20260910-0152` | Failed after safe partial progress because ARM does not permit converting a Float to a string in a template output; the unused output was removed |
 
 **WC-024 validation timestamp:** 2026-09-10T00:22:53+10:00
 
