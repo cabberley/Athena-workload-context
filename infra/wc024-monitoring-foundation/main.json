@@ -1,0 +1,3094 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "11482343716248087509"
+    },
+    "name": "Athena WC-024 generic monitoring foundation",
+    "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "australiaeast",
+      "allowedValues": [
+        "australiaeast"
+      ],
+      "metadata": {
+        "description": "Reviewed Azure region for monitoring-owned resources and private endpoints."
+      }
+    },
+    "monitoringResourceGroupName": {
+      "type": "string",
+      "defaultValue": "rg-athena-demo-monitoring",
+      "allowedValues": [
+        "rg-athena-demo-monitoring"
+      ],
+      "metadata": {
+        "description": "The dedicated resource group owned by the generic monitoring foundation."
+      }
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "athena-demo-monitoring",
+      "allowedValues": [
+        "athena-demo-monitoring"
+      ],
+      "minLength": 3,
+      "maxLength": 32,
+      "metadata": {
+        "description": "Lowercase prefix for deterministic monitoring resource names."
+      }
+    },
+    "workloadResourceGroupName": {
+      "type": "string",
+      "defaultValue": "rg-athena-demo-workload",
+      "allowedValues": [
+        "rg-athena-demo-workload"
+      ],
+      "metadata": {
+        "description": "Reviewed workload resource group whose VMs receive the generic DCR association."
+      }
+    },
+    "approvedVmNames": {
+      "type": "array",
+      "minLength": 11,
+      "maxLength": 11,
+      "metadata": {
+        "description": "Exact names of the 11 reviewed workload VMs that already have successful Azure Monitor Agent deployment and the athena-linux-dcr association. Values must be distinct."
+      }
+    },
+    "workloadVirtualNetworkResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Reviewed workload VNet resource ID used only as the VNet flow-log target."
+      }
+    },
+    "networkWatcherResourceGroupName": {
+      "type": "string",
+      "allowedValues": [
+        "NetworkWatcherRG"
+      ],
+      "minLength": 1,
+      "maxLength": 90,
+      "metadata": {
+        "description": "Resource group containing the existing regional Network Watcher."
+      }
+    },
+    "networkWatcherName": {
+      "type": "string",
+      "allowedValues": [
+        "NetworkWatcher_australiaeast"
+      ],
+      "minLength": 1,
+      "maxLength": 80,
+      "metadata": {
+        "description": "Existing regional Network Watcher resource name."
+      }
+    },
+    "flowLogName": {
+      "type": "string",
+      "defaultValue": "athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
+      "allowedValues": [
+        "athena-hackathon-vnet-rg-athena-demo-workload-flowlog"
+      ],
+      "minLength": 1,
+      "maxLength": 80,
+      "metadata": {
+        "description": "Existing canonical VNet flow-log name. WC-024 updates this resource in place."
+      }
+    },
+    "workloadPrivateEndpointSubnetResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Exact workload-local private endpoint subnet resource ID."
+      }
+    },
+    "collectorRuntimeVirtualNetworkResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "VNet hosting the isolated Azure MCP or signed-evidence collector runtime."
+      }
+    },
+    "collectorRuntimeSubnetResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Subnet hosting the isolated Azure MCP or signed-evidence collector runtime."
+      }
+    },
+    "collectorPrivateEndpointSubnetResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Exact collector-local private endpoint subnet resource ID."
+      }
+    },
+    "monitoringStorageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique lowercase storage account name for replacement flow-log and collector evidence storage."
+      }
+    },
+    "monitoringCollectorKeyVaultName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique Key Vault name for the isolated monitoring collector signing key."
+      }
+    },
+    "collectorRoleDefinitionGuid": {
+      "type": "string",
+      "metadata": {
+        "description": "Unambiguous GUID used for the custom isolated monitoring evidence-reader role."
+      }
+    },
+    "retentionDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 30,
+      "maxValue": 365,
+      "metadata": {
+        "description": "Retention period for replacement flow-log and signed-evidence data."
+      }
+    },
+    "workspaceName": {
+      "type": "string",
+      "defaultValue": "athena-hackathon-law",
+      "allowedValues": [
+        "athena-hackathon-law"
+      ],
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Existing Log Analytics workspace adopted by WC-024 rather than creating a parallel workspace."
+      }
+    },
+    "dataCollectionEndpointName": {
+      "type": "string",
+      "defaultValue": "athena-hackathon-linux-dce",
+      "allowedValues": [
+        "athena-hackathon-linux-dce"
+      ],
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Existing data collection endpoint adopted by WC-024 rather than creating a parallel endpoint."
+      }
+    },
+    "dataCollectionRuleName": {
+      "type": "string",
+      "defaultValue": "athena-hackathon-linux-dcr",
+      "allowedValues": [
+        "athena-hackathon-linux-dcr"
+      ],
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Existing data collection rule adopted by WC-024 without overwriting custom data sources or tags."
+      }
+    },
+    "dataCollectionRuleAssociationName": {
+      "type": "string",
+      "defaultValue": "athena-linux-dcr",
+      "allowedValues": [
+        "athena-linux-dcr"
+      ],
+      "minLength": 1,
+      "maxLength": 64,
+      "metadata": {
+        "description": "Existing DCR-only association name adopted on each approved AMA-enabled VM without a PUT."
+      }
+    },
+    "dataCollectionEndpointAssociationName": {
+      "type": "string",
+      "defaultValue": "configurationAccessEndpoint",
+      "allowedValues": [
+        "configurationAccessEndpoint"
+      ],
+      "metadata": {
+        "description": "Separate DCE-only association created on each approved AMA-enabled VM."
+      }
+    },
+    "maximumEvidenceAgeSeconds": {
+      "type": "int",
+      "defaultValue": 600,
+      "minValue": 60,
+      "maxValue": 900,
+      "metadata": {
+        "description": "Maximum accepted age for a signed monitoring evidence handoff."
+      }
+    },
+    "connectionMonitorDeploymentEnabled": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Connection Monitor definitions remain disabled until an exact published intent is reconciled."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Resource tags applied to WC-024 resources."
+      }
+    },
+    "legacyFlowLogNames": {
+      "type": "array",
+      "defaultValue": [],
+      "maxLength": 32,
+      "metadata": {
+        "description": "Explicit reviewed redundant subnet or NIC flow-log names to disable after canonical VNet cutover. No target means no migration."
+      }
+    },
+    "legacyFlowLogTargetResourceIds": {
+      "type": "array",
+      "defaultValue": [],
+      "maxLength": 32,
+      "metadata": {
+        "description": "Explicit reviewed subnet or NIC IDs paired by index with legacyFlowLogNames. No target means no migration."
+      }
+    },
+    "canonicalVnetFlowLogCutoverConfirmed": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set true only after the existing canonical VNet flow log is confirmed enabled and writing to replacement storage."
+      }
+    }
+  },
+  "variables": {
+    "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-foundation', 'dataBoundary', 'customer', 'managedBy', 'bicep', 'autoRemediation', 'disabled'))]",
+    "legacyFlowLogStorageAccountName": "athenahackathonflowwhtco",
+    "workloadResourceGroupId": "[format('{0}/resourceGroups/{1}', subscription().id, parameters('workloadResourceGroupName'))]",
+    "networkWatcherResourceGroupId": "[format('{0}/resourceGroups/{1}', subscription().id, parameters('networkWatcherResourceGroupName'))]",
+    "reviewedWorkloadVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet', variables('workloadResourceGroupId'))]",
+    "reviewedWorkloadPrivateEndpointSubnetResourceId": "[format('{0}/subnets/snet-paas-private-endpoints', variables('reviewedWorkloadVirtualNetworkResourceId'))]",
+    "reviewedCollectorRuntimeVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet', subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName')))]",
+    "reviewedCollectorRuntimeSubnetResourceId": "[format('{0}/subnets/collector-runtime', variables('reviewedCollectorRuntimeVirtualNetworkResourceId'))]",
+    "reviewedCollectorPrivateEndpointSubnetResourceId": "[format('{0}/subnets/private-endpoints', variables('reviewedCollectorRuntimeVirtualNetworkResourceId'))]",
+    "reviewedApprovedVmNames": [
+      "athena-hackathon-client-01",
+      "athena-hackathon-ecp-01",
+      "athena-hackathon-ecp-02",
+      "athena-hackathon-ecp-03",
+      "athena-hackathon-iris-01",
+      "athena-hackathon-mid-01",
+      "athena-hackathon-mid-02",
+      "athena-hackathon-sqlvm-01",
+      "athena-hackathon-web-01",
+      "athena-hackathon-web-02",
+      "athena-hackathon-web-03"
+    ],
+    "normalizedApprovedVmNames": "[map(parameters('approvedVmNames'), lambda('vmName', toLower(string(lambdaVariables('vmName')))))]",
+    "uniqueApprovedVmNames": "[union(variables('normalizedApprovedVmNames'), createArray())]",
+    "unreviewedApprovedVmNames": "[filter(variables('normalizedApprovedVmNames'), lambda('vmName', not(contains(variables('reviewedApprovedVmNames'), lambdaVariables('vmName')))))]",
+    "missingReviewedVmNames": "[filter(variables('reviewedApprovedVmNames'), lambda('vmName', not(contains(variables('normalizedApprovedVmNames'), lambdaVariables('vmName')))))]",
+    "validatedApprovedVmNames": "[if(and(and(empty(variables('unreviewedApprovedVmNames')), empty(variables('missingReviewedVmNames'))), equals(length(variables('uniqueApprovedVmNames')), length(variables('reviewedApprovedVmNames')))), variables('reviewedApprovedVmNames'), fail('WC-024 approvedVmNames must match the exact reviewed 11-VM workload allowlist.'))]",
+    "validatedWorkloadVirtualNetworkResourceId": "[if(equals(toLower(parameters('workloadVirtualNetworkResourceId')), toLower(variables('reviewedWorkloadVirtualNetworkResourceId'))), variables('reviewedWorkloadVirtualNetworkResourceId'), fail('WC-024 workloadVirtualNetworkResourceId must match the reviewed rg-athena-demo-workload VNet in the deployment subscription.'))]",
+    "validatedWorkloadPrivateEndpointSubnetResourceId": "[if(equals(toLower(parameters('workloadPrivateEndpointSubnetResourceId')), toLower(variables('reviewedWorkloadPrivateEndpointSubnetResourceId'))), variables('reviewedWorkloadPrivateEndpointSubnetResourceId'), fail('WC-024 workloadPrivateEndpointSubnetResourceId must match the reviewed workload private-endpoint subnet.'))]",
+    "validatedCollectorRuntimeVirtualNetworkResourceId": "[if(equals(toLower(parameters('collectorRuntimeVirtualNetworkResourceId')), toLower(variables('reviewedCollectorRuntimeVirtualNetworkResourceId'))), variables('reviewedCollectorRuntimeVirtualNetworkResourceId'), fail('WC-024 collectorRuntimeVirtualNetworkResourceId must match the dedicated WC-024 collector VNet.'))]",
+    "validatedCollectorRuntimeSubnetResourceId": "[if(equals(toLower(parameters('collectorRuntimeSubnetResourceId')), toLower(variables('reviewedCollectorRuntimeSubnetResourceId'))), variables('reviewedCollectorRuntimeSubnetResourceId'), fail('WC-024 collectorRuntimeSubnetResourceId must match the dedicated WC-024 collector runtime subnet.'))]",
+    "validatedCollectorPrivateEndpointSubnetResourceId": "[if(equals(toLower(parameters('collectorPrivateEndpointSubnetResourceId')), toLower(variables('reviewedCollectorPrivateEndpointSubnetResourceId'))), variables('reviewedCollectorPrivateEndpointSubnetResourceId'), fail('WC-024 collectorPrivateEndpointSubnetResourceId must match the dedicated WC-024 collector private-endpoint subnet.'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "adopt-monitoring-data-platform",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "namePrefix": {
+            "value": "[parameters('namePrefix')]"
+          },
+          "workspaceName": {
+            "value": "[parameters('workspaceName')]"
+          },
+          "dataCollectionEndpointName": {
+            "value": "[parameters('dataCollectionEndpointName')]"
+          },
+          "dataCollectionRuleName": {
+            "value": "[parameters('dataCollectionRuleName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "7031636691322894280"
+            }
+          },
+          "parameters": {
+            "namePrefix": {
+              "type": "string",
+              "metadata": {
+                "description": "Lowercase prefix for the monitoring private link scope name."
+              }
+            },
+            "workspaceName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing Log Analytics workspace adopted by the monitoring foundation."
+              }
+            },
+            "dataCollectionEndpointName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing data collection endpoint adopted by the monitoring foundation."
+              }
+            },
+            "dataCollectionRuleName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing data collection rule adopted without a PUT so its custom log source, flow, and tags remain unchanged."
+              }
+            },
+            "preservedCustomLogStream": {
+              "type": "string",
+              "defaultValue": "Custom-AthenaJson",
+              "allowedValues": [
+                "Custom-AthenaJson"
+              ],
+              "metadata": {
+                "description": "Reviewed existing custom DCR input stream that WC-024 must preserve."
+              }
+            },
+            "preservedCustomLogTable": {
+              "type": "string",
+              "defaultValue": "Custom-AthenaApp_CL",
+              "allowedValues": [
+                "Custom-AthenaApp_CL"
+              ],
+              "metadata": {
+                "description": "Reviewed existing custom DCR output table that WC-024 must preserve."
+              }
+            }
+          },
+          "resources": {
+            "workspace": {
+              "existing": true,
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2025-02-01",
+              "name": "[parameters('workspaceName')]"
+            },
+            "dataCollectionEndpoint": {
+              "existing": true,
+              "type": "Microsoft.Insights/dataCollectionEndpoints",
+              "apiVersion": "2024-03-11",
+              "name": "[parameters('dataCollectionEndpointName')]"
+            },
+            "dataCollectionRule": {
+              "existing": true,
+              "type": "Microsoft.Insights/dataCollectionRules",
+              "apiVersion": "2024-03-11",
+              "name": "[parameters('dataCollectionRuleName')]"
+            },
+            "workloadPrivateLinkScope": {
+              "existing": true,
+              "type": "Microsoft.Insights/privateLinkScopes",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}-workload-ampls', parameters('namePrefix'))]"
+            },
+            "collectorPrivateLinkScope": {
+              "existing": true,
+              "type": "Microsoft.Insights/privateLinkScopes",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}-collector-ampls', parameters('namePrefix'))]"
+            },
+            "workloadWorkspacePrivateLinkScope": {
+              "type": "Microsoft.Insights/privateLinkScopes/scopedResources",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}/{1}', format('{0}-workload-ampls', parameters('namePrefix')), uniqueString(resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))))]",
+              "properties": {
+                "linkedResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]"
+              }
+            },
+            "workloadDcePrivateLinkScope": {
+              "type": "Microsoft.Insights/privateLinkScopes/scopedResources",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}/{1}', format('{0}-workload-ampls', parameters('namePrefix')), uniqueString(resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))))]",
+              "properties": {
+                "linkedResourceId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))]"
+              }
+            },
+            "collectorWorkspacePrivateLinkScope": {
+              "type": "Microsoft.Insights/privateLinkScopes/scopedResources",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}/{1}', format('{0}-collector-ampls', parameters('namePrefix')), uniqueString(resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))))]",
+              "properties": {
+                "linkedResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]"
+              }
+            },
+            "collectorDcePrivateLinkScope": {
+              "type": "Microsoft.Insights/privateLinkScopes/scopedResources",
+              "apiVersion": "2021-09-01",
+              "name": "[format('{0}/{1}', format('{0}-collector-ampls', parameters('namePrefix')), uniqueString(resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))))]",
+              "properties": {
+                "linkedResourceId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))]"
+              }
+            }
+          },
+          "outputs": {
+            "workspaceResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]"
+            },
+            "workspaceCustomerId": {
+              "type": "string",
+              "value": "[reference('workspace').customerId]"
+            },
+            "workspaceLocation": {
+              "type": "string",
+              "value": "[if(equals(toLower(reference('workspace', '2025-02-01', 'full').location), toLower(reference('dataCollectionEndpoint', '2024-03-11', 'full').location)), reference('workspace', '2025-02-01', 'full').location, fail('WC-024 requires the adopted Log Analytics workspace and data collection endpoint to use the same Azure region. Reconcile the regional topology before deployment.'))]"
+            },
+            "workspaceTags": {
+              "type": "object",
+              "value": "[reference('workspace', '2025-02-01', 'full').tags]"
+            },
+            "workspaceSkuName": {
+              "type": "string",
+              "value": "[reference('workspace').sku.name]"
+            },
+            "workspaceRetentionDays": {
+              "type": "int",
+              "value": "[reference('workspace').retentionInDays]"
+            },
+            "workspaceDailyQuotaGb": {
+              "type": "int",
+              "value": "[reference('workspace').workspaceCapping.dailyQuotaGb]"
+            },
+            "workspaceFeatures": {
+              "type": "object",
+              "value": "[reference('workspace').features]"
+            },
+            "dataCollectionRuleResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/dataCollectionRules', parameters('dataCollectionRuleName'))]"
+            },
+            "dataCollectionEndpointResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))]"
+            },
+            "dataCollectionEndpointLocation": {
+              "type": "string",
+              "value": "[if(equals(toLower(reference('workspace', '2025-02-01', 'full').location), toLower(reference('dataCollectionEndpoint', '2024-03-11', 'full').location)), reference('dataCollectionEndpoint', '2024-03-11', 'full').location, fail('WC-024 requires the adopted Log Analytics workspace and data collection endpoint to use the same Azure region. Reconcile the regional topology before deployment.'))]"
+            },
+            "dataCollectionEndpointTags": {
+              "type": "object",
+              "value": "[reference('dataCollectionEndpoint', '2024-03-11', 'full').tags]"
+            },
+            "dataCollectionEndpointDescription": {
+              "type": "string",
+              "nullable": true,
+              "value": "[tryGet(reference('dataCollectionEndpoint'), 'description')]"
+            },
+            "dataCollectionEndpointKind": {
+              "type": "string",
+              "nullable": true,
+              "value": "[tryGet(reference('dataCollectionEndpoint', '2024-03-11', 'full'), 'kind')]"
+            },
+            "workloadPrivateLinkScopeResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/privateLinkScopes', format('{0}-workload-ampls', parameters('namePrefix')))]"
+            },
+            "collectorPrivateLinkScopeResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Insights/privateLinkScopes', format('{0}-collector-ampls', parameters('namePrefix')))]"
+            },
+            "preservedCustomLogStream": {
+              "type": "string",
+              "value": "[parameters('preservedCustomLogStream')]"
+            },
+            "preservedCustomLogTable": {
+              "type": "string",
+              "value": "[parameters('preservedCustomLogTable')]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "validate-private-runtime-topology",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "workloadVirtualNetworkResourceId": {
+            "value": "[variables('validatedWorkloadVirtualNetworkResourceId')]"
+          },
+          "workloadPrivateEndpointSubnetResourceId": {
+            "value": "[variables('validatedWorkloadPrivateEndpointSubnetResourceId')]"
+          },
+          "collectorRuntimeVirtualNetworkResourceId": {
+            "value": "[variables('validatedCollectorRuntimeVirtualNetworkResourceId')]"
+          },
+          "collectorRuntimeSubnetResourceId": {
+            "value": "[variables('validatedCollectorRuntimeSubnetResourceId')]"
+          },
+          "collectorPrivateEndpointSubnetResourceId": {
+            "value": "[variables('validatedCollectorPrivateEndpointSubnetResourceId')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "6397905042430153369"
+            }
+          },
+          "parameters": {
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Workload VNet whose agents use the workload-local Azure Monitor private endpoint."
+              }
+            },
+            "workloadPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Workload-local private endpoint subnet resource ID."
+              }
+            },
+            "collectorRuntimeVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Dedicated WC-024 collector runtime VNet resource ID."
+              }
+            },
+            "collectorRuntimeSubnetResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Dedicated WC-024 collector runtime subnet resource ID."
+              }
+            },
+            "collectorPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Collector-local private endpoint subnet resource ID."
+              }
+            }
+          },
+          "variables": {
+            "deploymentSubscriptionPrefix": "[toLower(format('{0}/resourcegroups/', subscription().id))]",
+            "normalizedWorkloadVirtualNetworkResourceId": "[toLower(parameters('workloadVirtualNetworkResourceId'))]",
+            "normalizedWorkloadPrivateEndpointSubnetResourceId": "[toLower(parameters('workloadPrivateEndpointSubnetResourceId'))]",
+            "normalizedCollectorRuntimeVirtualNetworkResourceId": "[toLower(parameters('collectorRuntimeVirtualNetworkResourceId'))]",
+            "normalizedCollectorRuntimeSubnetResourceId": "[toLower(parameters('collectorRuntimeSubnetResourceId'))]",
+            "normalizedCollectorPrivateEndpointSubnetResourceId": "[toLower(parameters('collectorPrivateEndpointSubnetResourceId'))]",
+            "allVnetsAreDeploymentSubscriptionScoped": "[and(startsWith(variables('normalizedWorkloadVirtualNetworkResourceId'), variables('deploymentSubscriptionPrefix')), startsWith(variables('normalizedCollectorRuntimeVirtualNetworkResourceId'), variables('deploymentSubscriptionPrefix')))]",
+            "allSubnetsAreDeploymentSubscriptionScoped": "[and(and(startsWith(variables('normalizedWorkloadPrivateEndpointSubnetResourceId'), variables('deploymentSubscriptionPrefix')), startsWith(variables('normalizedCollectorRuntimeSubnetResourceId'), variables('deploymentSubscriptionPrefix'))), startsWith(variables('normalizedCollectorPrivateEndpointSubnetResourceId'), variables('deploymentSubscriptionPrefix')))]",
+            "workloadPrivateEndpointSubnetBelongsToWorkloadVnet": "[and(startsWith(variables('normalizedWorkloadPrivateEndpointSubnetResourceId'), format('{0}/subnets/', variables('normalizedWorkloadVirtualNetworkResourceId'))), equals(length(split(variables('normalizedWorkloadPrivateEndpointSubnetResourceId'), '/')), add(length(split(variables('normalizedWorkloadVirtualNetworkResourceId'), '/')), 2)))]",
+            "collectorRuntimeSubnetBelongsToCollectorVnet": "[and(startsWith(variables('normalizedCollectorRuntimeSubnetResourceId'), format('{0}/subnets/', variables('normalizedCollectorRuntimeVirtualNetworkResourceId'))), equals(length(split(variables('normalizedCollectorRuntimeSubnetResourceId'), '/')), add(length(split(variables('normalizedCollectorRuntimeVirtualNetworkResourceId'), '/')), 2)))]",
+            "collectorPrivateEndpointSubnetBelongsToCollectorVnet": "[and(startsWith(variables('normalizedCollectorPrivateEndpointSubnetResourceId'), format('{0}/subnets/', variables('normalizedCollectorRuntimeVirtualNetworkResourceId'))), equals(length(split(variables('normalizedCollectorPrivateEndpointSubnetResourceId'), '/')), add(length(split(variables('normalizedCollectorRuntimeVirtualNetworkResourceId'), '/')), 2)))]",
+            "collectorSubnetsAreDistinct": "[not(equals(variables('normalizedCollectorRuntimeSubnetResourceId'), variables('normalizedCollectorPrivateEndpointSubnetResourceId')))]",
+            "networksRemainIsolated": "[not(equals(variables('normalizedWorkloadVirtualNetworkResourceId'), variables('normalizedCollectorRuntimeVirtualNetworkResourceId')))]",
+            "topologyValidated": "[if(and(and(and(and(and(and(variables('allVnetsAreDeploymentSubscriptionScoped'), variables('allSubnetsAreDeploymentSubscriptionScoped')), variables('workloadPrivateEndpointSubnetBelongsToWorkloadVnet')), variables('collectorRuntimeSubnetBelongsToCollectorVnet')), variables('collectorPrivateEndpointSubnetBelongsToCollectorVnet')), variables('collectorSubnetsAreDistinct')), variables('networksRemainIsolated')), true(), fail('WC-024 requires exact deployment-subscription workload and dedicated collector network IDs, local private-endpoint subnets, distinct collector runtime/private-endpoint subnets, and no shared workload/collector VNet.'))]"
+          },
+          "resources": [],
+          "outputs": {
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "value": "[if(variables('topologyValidated'), parameters('workloadVirtualNetworkResourceId'), fail('Unreachable topology validation failure.'))]"
+            },
+            "workloadPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "value": "[if(variables('topologyValidated'), parameters('workloadPrivateEndpointSubnetResourceId'), fail('Unreachable topology validation failure.'))]"
+            },
+            "collectorRuntimeVirtualNetworkResourceId": {
+              "type": "string",
+              "value": "[if(variables('topologyValidated'), parameters('collectorRuntimeVirtualNetworkResourceId'), fail('Unreachable topology validation failure.'))]"
+            },
+            "collectorRuntimeSubnetResourceId": {
+              "type": "string",
+              "value": "[if(variables('topologyValidated'), parameters('collectorRuntimeSubnetResourceId'), fail('Unreachable topology validation failure.'))]"
+            },
+            "collectorPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "value": "[if(variables('topologyValidated'), parameters('collectorPrivateEndpointSubnetResourceId'), fail('Unreachable topology validation failure.'))]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "validate-adopted-dcr-associations",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "approvedVmNames": {
+            "value": "[variables('validatedApprovedVmNames')]"
+          },
+          "dataCollectionRuleResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionRuleResourceId.value]"
+          },
+          "dataCollectionRuleAssociationName": {
+            "value": "[parameters('dataCollectionRuleAssociationName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "6383098833510535370"
+            }
+          },
+          "parameters": {
+            "approvedVmNames": {
+              "type": "array",
+              "minLength": 11,
+              "maxLength": 11,
+              "metadata": {
+                "description": "Exactly 11 distinct VM names that have already been approved and have successful Azure Monitor Agent deployment and the adopted DCR association."
+              }
+            },
+            "dataCollectionRuleResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing DCR resource ID that every adopted DCR-only association must already reference."
+              }
+            },
+            "dataCollectionRuleAssociationName": {
+              "type": "string",
+              "defaultValue": "athena-linux-dcr",
+              "minLength": 1,
+              "maxLength": 64,
+              "metadata": {
+                "description": "Existing DCR-only association name on every approved VM. WC-024 validates it without rewriting it."
+              }
+            }
+          },
+          "variables": {
+            "normalizedApprovedVmNames": "[map(parameters('approvedVmNames'), lambda('vmName', toLower(string(lambdaVariables('vmName')))))]",
+            "uniqueApprovedVmNames": "[union(variables('normalizedApprovedVmNames'), createArray())]",
+            "validatedApprovedVmNames": "[if(equals(length(parameters('approvedVmNames')), length(variables('uniqueApprovedVmNames'))), parameters('approvedVmNames'), fail('WC-024 requires exactly 11 distinct approved VM names to validate adopted DCR associations.'))]"
+          },
+          "resources": [],
+          "outputs": {
+            "validatedAdoptedDataCollectionRuleAssociationResourceIds": {
+              "type": "array",
+              "metadata": {
+                "description": "Verified existing DCR association IDs. Reading this output requires every association to exist and reference the adopted DCR."
+              },
+              "copy": {
+                "count": "[length(variables('validatedApprovedVmNames'))]",
+                "input": "[if(equals(toLower(reference(extensionResourceId(resourceId('Microsoft.Compute/virtualMachines', variables('validatedApprovedVmNames')[copyIndex()]), 'Microsoft.Insights/dataCollectionRuleAssociations', parameters('dataCollectionRuleAssociationName')), '2024-03-11').dataCollectionRuleId), toLower(parameters('dataCollectionRuleResourceId'))), extensionResourceId(resourceId('Microsoft.Compute/virtualMachines', variables('validatedApprovedVmNames')[copyIndex()]), 'Microsoft.Insights/dataCollectionRuleAssociations', parameters('dataCollectionRuleAssociationName')), fail('WC-024 requires every approved VM to retain the existing reviewed DCR association; the association is missing or does not reference the adopted data collection rule.'))]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "create-dce-associations-after-dcr-validation",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "approvedVmNames": {
+            "value": "[variables('validatedApprovedVmNames')]"
+          },
+          "dataCollectionEndpointResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionEndpointResourceId.value]"
+          },
+          "dataCollectionEndpointLocation": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionEndpointLocation.value]"
+          },
+          "dataCollectionEndpointAssociationName": {
+            "value": "[parameters('dataCollectionEndpointAssociationName')]"
+          },
+          "validatedDataCollectionRuleAssociationResourceIds": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-adopted-dcr-associations'), '2025-04-01').outputs.validatedAdoptedDataCollectionRuleAssociationResourceIds.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "17320524381455678"
+            }
+          },
+          "parameters": {
+            "approvedVmNames": {
+              "type": "array",
+              "minLength": 11,
+              "maxLength": 11,
+              "metadata": {
+                "description": "Exactly 11 distinct VM names that have already been approved and have successful Azure Monitor Agent deployment and the adopted DCR association."
+              }
+            },
+            "dataCollectionEndpointResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing private DCE resource ID used by AMA for monitoring ingestion."
+              }
+            },
+            "dataCollectionEndpointLocation": {
+              "type": "string",
+              "metadata": {
+                "description": "Actual region of the adopted DCE. Every approved VM must be in this region for configuration access."
+              }
+            },
+            "dataCollectionEndpointAssociationName": {
+              "type": "string",
+              "defaultValue": "configurationAccessEndpoint",
+              "allowedValues": [
+                "configurationAccessEndpoint"
+              ],
+              "metadata": {
+                "description": "Separate DCE-only association created on every approved VM."
+              }
+            },
+            "validatedDataCollectionRuleAssociationResourceIds": {
+              "type": "array",
+              "minLength": 11,
+              "maxLength": 11,
+              "metadata": {
+                "description": "Read-only validation results for the existing DCR-only association on every approved VM. This module will not create a DCE association unless every result is present."
+              }
+            }
+          },
+          "variables": {
+            "normalizedApprovedVmNames": "[map(parameters('approvedVmNames'), lambda('vmName', toLower(string(lambdaVariables('vmName')))))]",
+            "uniqueApprovedVmNames": "[union(variables('normalizedApprovedVmNames'), createArray())]",
+            "validatedApprovedVmNames": "[if(equals(length(parameters('approvedVmNames')), length(variables('uniqueApprovedVmNames'))), parameters('approvedVmNames'), fail('WC-024 requires exactly 11 distinct approved VM names to avoid duplicate DCR associations.'))]",
+            "validatedDcrAssociationIds": "[if(equals(length(parameters('validatedDataCollectionRuleAssociationResourceIds')), length(variables('validatedApprovedVmNames'))), parameters('validatedDataCollectionRuleAssociationResourceIds'), fail('WC-024 requires successful validation of every adopted DCR association before creating any DCE association.'))]"
+          },
+          "resources": [
+            {
+              "copy": {
+                "name": "configurationAccessEndpointAssociation",
+                "count": "[length(variables('validatedApprovedVmNames'))]"
+              },
+              "type": "Microsoft.Insights/dataCollectionRuleAssociations",
+              "apiVersion": "2024-03-11",
+              "scope": "[resourceId('Microsoft.Compute/virtualMachines', variables('validatedApprovedVmNames')[copyIndex()])]",
+              "name": "[parameters('dataCollectionEndpointAssociationName')]",
+              "properties": {
+                "dataCollectionEndpointId": "[if(and(not(empty(variables('validatedDcrAssociationIds')[copyIndex()])), equals(toLower(reference(resourceId('Microsoft.Compute/virtualMachines', variables('validatedApprovedVmNames')[copyIndex()]), '2025-04-01', 'full').location), toLower(parameters('dataCollectionEndpointLocation')))), parameters('dataCollectionEndpointResourceId'), fail('Every approved VM must pass the prerequisite adopted DCR association validation and use the adopted DCE region before any DCE association is created.'))]"
+              }
+            }
+          ],
+          "outputs": {
+            "dataCollectionEndpointAssociationResourceIds": {
+              "type": "array",
+              "copy": {
+                "count": "[length(variables('validatedApprovedVmNames'))]",
+                "input": "[extensionResourceId(resourceId('Microsoft.Compute/virtualMachines', variables('validatedApprovedVmNames')[copyIndex()]), 'Microsoft.Insights/dataCollectionRuleAssociations', parameters('dataCollectionEndpointAssociationName'))]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-adopted-dcr-associations')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workload-monitoring-private-dns-zones",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "6567595471956446979"
+            }
+          },
+          "parameters": {
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied when a required private DNS zone is created or adopted."
+              }
+            }
+          },
+          "variables": {
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-private-dns', 'dataBoundary', 'customer', 'managedBy', 'bicep'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.monitor.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.oms.opinsights.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.ods.opinsights.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.agentsvc.azure-automation.net",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.blob.core.windows.net",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            }
+          ],
+          "outputs": {
+            "azureMonitorPrivateDnsZoneResourceIds": {
+              "type": "array",
+              "value": [
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.monitor.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.oms.opinsights.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.ods.opinsights.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.agentsvc.azure-automation.net')]"
+              ]
+            },
+            "storageBlobPrivateDnsZoneResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.blob.core.windows.net')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'create-dce-associations-after-dcr-validation')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "collector-monitoring-private-dns-zones",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "6567595471956446979"
+            }
+          },
+          "parameters": {
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied when a required private DNS zone is created or adopted."
+              }
+            }
+          },
+          "variables": {
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-private-dns', 'dataBoundary', 'customer', 'managedBy', 'bicep'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.monitor.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.oms.opinsights.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.ods.opinsights.azure.com",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.agentsvc.azure-automation.net",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.blob.core.windows.net",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            }
+          ],
+          "outputs": {
+            "azureMonitorPrivateDnsZoneResourceIds": {
+              "type": "array",
+              "value": [
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.monitor.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.oms.opinsights.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.ods.opinsights.azure.com')]",
+                "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.agentsvc.azure-automation.net')]"
+              ]
+            },
+            "storageBlobPrivateDnsZoneResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.blob.core.windows.net')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'create-dce-associations-after-dcr-validation')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "collector-key-vault-private-dns",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "2404189933027721780"
+            }
+          },
+          "parameters": {
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied to the collector-only Key Vault DNS zone."
+              }
+            }
+          },
+          "variables": {
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-private-dns', 'dataBoundary', 'customer', 'managedBy', 'bicep', 'accessBoundary', 'collector-only'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "privatelink.vaultcore.azure.net",
+              "location": "global",
+              "tags": "[variables('resourceTags')]"
+            }
+          ],
+          "outputs": {
+            "keyVaultPrivateDnsZoneResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateDnsZones', 'privatelink.vaultcore.azure.net')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'create-dce-associations-after-dcr-validation')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-flow-log-storage",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "storageAccountName": {
+            "value": "[parameters('monitoringStorageAccountName')]"
+          },
+          "retentionDays": {
+            "value": "[parameters('retentionDays')]"
+          },
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "16200640404122625272"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Azure region for monitoring storage."
+              }
+            },
+            "storageAccountName": {
+              "type": "string",
+              "metadata": {
+                "description": "Globally unique lowercase monitoring storage account name."
+              }
+            },
+            "retentionDays": {
+              "type": "int",
+              "minValue": 30,
+              "maxValue": 365,
+              "metadata": {
+                "description": "Retention period for flow-log and collector-evidence data."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied to monitoring storage."
+              }
+            }
+          },
+          "variables": {
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-storage', 'dataBoundary', 'customer', 'managedBy', 'bicep'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2025-06-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard_ZRS"
+              },
+              "kind": "StorageV2",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "accessTier": "Hot",
+                "allowBlobPublicAccess": false,
+                "allowCrossTenantReplication": false,
+                "allowSharedKeyAccess": false,
+                "defaultToOAuthAuthentication": true,
+                "minimumTlsVersion": "TLS1_2",
+                "publicNetworkAccess": "Enabled",
+                "supportsHttpsTrafficOnly": true,
+                "networkAcls": {
+                  "bypass": "AzureServices",
+                  "defaultAction": "Deny",
+                  "ipRules": [],
+                  "virtualNetworkRules": []
+                },
+                "encryption": {
+                  "keySource": "Microsoft.Storage",
+                  "services": {
+                    "blob": {
+                      "enabled": true
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "properties": {
+                "isVersioningEnabled": true,
+                "deleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": "[parameters('retentionDays')]"
+                },
+                "containerDeleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": "[parameters('retentionDays')]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', 'monitoring-evidence')]",
+              "properties": {
+                "publicAccess": "None"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}/{2}/{3}', parameters('storageAccountName'), 'default', 'monitoring-evidence', 'default')]",
+              "properties": {
+                "immutabilityPeriodSinceCreationInDays": "[parameters('retentionDays')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'monitoring-evidence')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "properties": {
+                "policy": {
+                  "rules": [
+                    {
+                      "enabled": true,
+                      "name": "flow-log-evidence-retention",
+                      "type": "Lifecycle",
+                      "definition": {
+                        "actions": {
+                          "baseBlob": {
+                            "tierToCool": {
+                              "daysAfterModificationGreaterThan": 30
+                            },
+                            "delete": {
+                              "daysAfterModificationGreaterThan": "[parameters('retentionDays')]"
+                            }
+                          },
+                          "version": {
+                            "delete": {
+                              "daysAfterCreationGreaterThan": "[parameters('retentionDays')]"
+                            }
+                          }
+                        },
+                        "filters": {
+                          "blobTypes": [
+                            "blockBlob"
+                          ],
+                          "prefixMatch": [
+                            "insights-logs-flowlogflowevent/",
+                            "monitoring-evidence/"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "storageAccountResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+            },
+            "monitoringEvidenceContainerResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'monitoring-evidence')]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-evidence-seams",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "namePrefix": {
+            "value": "[parameters('namePrefix')]"
+          },
+          "storageAccountName": {
+            "value": "[parameters('monitoringStorageAccountName')]"
+          },
+          "monitoringEvidenceContainerResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.monitoringEvidenceContainerResourceId.value]"
+          },
+          "keyVaultName": {
+            "value": "[parameters('monitoringCollectorKeyVaultName')]"
+          },
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "449272939311603736"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Azure region for the isolated evidence collector identity and signing key."
+              }
+            },
+            "namePrefix": {
+              "type": "string",
+              "metadata": {
+                "description": "Lowercase prefix for deterministic evidence resources."
+              }
+            },
+            "storageAccountName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing monitoring-owned storage account name."
+              }
+            },
+            "monitoringEvidenceContainerResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the monitoring-evidence container created by monitoring-flow-log-storage."
+              }
+            },
+            "keyVaultName": {
+              "type": "string",
+              "metadata": {
+                "description": "Globally unique Key Vault name for the monitoring collector signing key."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied to evidence resources."
+              }
+            }
+          },
+          "variables": {
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-evidence', 'dataBoundary', 'customer', 'managedBy', 'bicep'))]",
+            "storageBlobDataContributorRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+            "keyVaultCryptoUserRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12338af0-0e69-4776-bea7-57ae8d297424')]",
+            "validatedMonitoringEvidenceContainerResourceId": "[if(equals(toLower(resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'monitoring-evidence')), toLower(parameters('monitoringEvidenceContainerResourceId'))), resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'monitoring-evidence'), fail('WC-024 evidence writer RBAC must bind to the monitoring-evidence container created by monitoring-flow-log-storage.'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+              "apiVersion": "2024-11-30",
+              "name": "[format('{0}-monitoring-collector-id', parameters('namePrefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[union(variables('resourceTags'), createObject('identityPurpose', 'isolated-signed-monitoring-evidence-collector'))]"
+            },
+            {
+              "type": "Microsoft.KeyVault/vaults",
+              "apiVersion": "2024-11-01",
+              "name": "[parameters('keyVaultName')]",
+              "location": "[parameters('location')]",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "tenantId": "[tenant().tenantId]",
+                "sku": {
+                  "family": "A",
+                  "name": "standard"
+                },
+                "enablePurgeProtection": true,
+                "enableRbacAuthorization": true,
+                "enableSoftDelete": true,
+                "publicNetworkAccess": "Disabled",
+                "softDeleteRetentionInDays": 90,
+                "networkAcls": {
+                  "bypass": "AzureServices",
+                  "defaultAction": "Deny"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.KeyVault/vaults/keys",
+              "apiVersion": "2024-11-01",
+              "name": "[format('{0}/{1}', parameters('keyVaultName'), 'monitoring-evidence-signing')]",
+              "properties": {
+                "kty": "RSA",
+                "keySize": 3072,
+                "keyOps": [
+                  "sign",
+                  "verify"
+                ],
+                "attributes": {
+                  "enabled": true
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'monitoring-evidence')]",
+              "name": "[guid(variables('validatedMonitoringEvidenceContainerResourceId'), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), variables('storageBlobDataContributorRoleDefinitionId'))]",
+              "properties": {
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').principalId]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[variables('storageBlobDataContributorRoleDefinitionId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing')]",
+              "name": "[guid(resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing'), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), variables('keyVaultCryptoUserRoleDefinitionId'))]",
+              "properties": {
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').principalId]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[variables('keyVaultCryptoUserRoleDefinitionId')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix')))]",
+                "[resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing')]"
+              ]
+            }
+          ],
+          "outputs": {
+            "collectorIdentityResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix')))]"
+            },
+            "collectorIdentityClientId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').clientId]"
+            },
+            "collectorIdentityPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').principalId]"
+            },
+            "keyVaultResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
+            },
+            "signingKeyResourceId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing'), '2024-11-01').keyUriWithVersion]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-private-endpoints",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "namePrefix": {
+            "value": "[parameters('namePrefix')]"
+          },
+          "workloadPrivateEndpointSubnetResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology'), '2025-04-01').outputs.workloadPrivateEndpointSubnetResourceId.value]"
+          },
+          "collectorPrivateEndpointSubnetResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology'), '2025-04-01').outputs.collectorPrivateEndpointSubnetResourceId.value]"
+          },
+          "workloadAzureMonitorPrivateLinkScopeResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workloadPrivateLinkScopeResourceId.value]"
+          },
+          "collectorAzureMonitorPrivateLinkScopeResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.collectorPrivateLinkScopeResourceId.value]"
+          },
+          "storageAccountResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
+          },
+          "keyVaultResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.keyVaultResourceId.value]"
+          },
+          "workloadStorageBlobPrivateDnsZoneResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-private-dns-zones'), '2025-04-01').outputs.storageBlobPrivateDnsZoneResourceId.value]"
+          },
+          "collectorStorageBlobPrivateDnsZoneResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'collector-monitoring-private-dns-zones'), '2025-04-01').outputs.storageBlobPrivateDnsZoneResourceId.value]"
+          },
+          "collectorKeyVaultPrivateDnsZoneResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'collector-key-vault-private-dns'), '2025-04-01').outputs.keyVaultPrivateDnsZoneResourceId.value]"
+          },
+          "workloadAzureMonitorPrivateDnsZoneResourceIds": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-private-dns-zones'), '2025-04-01').outputs.azureMonitorPrivateDnsZoneResourceIds.value]"
+          },
+          "collectorAzureMonitorPrivateDnsZoneResourceIds": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'collector-monitoring-private-dns-zones'), '2025-04-01').outputs.azureMonitorPrivateDnsZoneResourceIds.value]"
+          },
+          "tags": {
+            "value": "[variables('resourceTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "4041444995268874517"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Azure region for private endpoints."
+              }
+            },
+            "namePrefix": {
+              "type": "string",
+              "metadata": {
+                "description": "Lowercase prefix for deterministic private endpoint names."
+              }
+            },
+            "workloadPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the workload-local private endpoint subnet."
+              }
+            },
+            "collectorPrivateEndpointSubnetResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the collector-local private endpoint subnet."
+              }
+            },
+            "workloadAzureMonitorPrivateLinkScopeResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the workload Azure Monitor private link scope."
+              }
+            },
+            "collectorAzureMonitorPrivateLinkScopeResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the collector Azure Monitor private link scope."
+              }
+            },
+            "storageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of monitoring-owned replacement storage."
+              }
+            },
+            "keyVaultResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the monitoring collector Key Vault."
+              }
+            },
+            "workloadStorageBlobPrivateDnsZoneResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Workload-bound private DNS zone ID for Azure Monitor Blob endpoints."
+              }
+            },
+            "collectorStorageBlobPrivateDnsZoneResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Collector-bound private DNS zone ID for Blob private endpoints."
+              }
+            },
+            "collectorKeyVaultPrivateDnsZoneResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Collector-bound private DNS zone ID for Key Vault private endpoints."
+              }
+            },
+            "workloadAzureMonitorPrivateDnsZoneResourceIds": {
+              "type": "array",
+              "minLength": 4,
+              "maxLength": 4,
+              "metadata": {
+                "description": "The four workload-bound non-Blob private DNS zone IDs required by Azure Monitor private link."
+              }
+            },
+            "collectorAzureMonitorPrivateDnsZoneResourceIds": {
+              "type": "array",
+              "minLength": 4,
+              "maxLength": 4,
+              "metadata": {
+                "description": "The four collector-bound non-Blob private DNS zone IDs required by Azure Monitor private link."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {},
+              "metadata": {
+                "description": "Resource tags applied to private endpoints."
+              }
+            }
+          },
+          "variables": {
+            "copy": [
+              {
+                "name": "workloadAzureMonitorPrivateDnsZoneConfigs",
+                "count": "[length(parameters('workloadAzureMonitorPrivateDnsZoneResourceIds'))]",
+                "input": {
+                  "name": "[format('azure-monitor-{0}', copyIndex('workloadAzureMonitorPrivateDnsZoneConfigs'))]",
+                  "properties": {
+                    "privateDnsZoneId": "[parameters('workloadAzureMonitorPrivateDnsZoneResourceIds')[copyIndex('workloadAzureMonitorPrivateDnsZoneConfigs')]]"
+                  }
+                }
+              },
+              {
+                "name": "collectorAzureMonitorPrivateDnsZoneConfigs",
+                "count": "[length(parameters('collectorAzureMonitorPrivateDnsZoneResourceIds'))]",
+                "input": {
+                  "name": "[format('azure-monitor-{0}', copyIndex('collectorAzureMonitorPrivateDnsZoneConfigs'))]",
+                  "properties": {
+                    "privateDnsZoneId": "[parameters('collectorAzureMonitorPrivateDnsZoneResourceIds')[copyIndex('collectorAzureMonitorPrivateDnsZoneConfigs')]]"
+                  }
+                }
+              }
+            ],
+            "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-private-network', 'dataBoundary', 'customer', 'managedBy', 'bicep'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}-workload-ampls-pe', parameters('namePrefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('workloadPrivateEndpointSubnetResourceId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "workload-azure-monitor",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('workloadAzureMonitorPrivateLinkScopeResourceId')]",
+                      "groupIds": [
+                        "azuremonitor"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', format('{0}-workload-ampls-pe', parameters('namePrefix')), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": "[concat(createArray(createObject('name', 'azure-monitor-blob', 'properties', createObject('privateDnsZoneId', parameters('workloadStorageBlobPrivateDnsZoneResourceId')))), variables('workloadAzureMonitorPrivateDnsZoneConfigs'))]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', format('{0}-workload-ampls-pe', parameters('namePrefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}-collector-ampls-pe', parameters('namePrefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('collectorPrivateEndpointSubnetResourceId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "collector-azure-monitor",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('collectorAzureMonitorPrivateLinkScopeResourceId')]",
+                      "groupIds": [
+                        "azuremonitor"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', format('{0}-collector-ampls-pe', parameters('namePrefix')), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": "[concat(createArray(createObject('name', 'azure-monitor-blob', 'properties', createObject('privateDnsZoneId', parameters('collectorStorageBlobPrivateDnsZoneResourceId')))), variables('collectorAzureMonitorPrivateDnsZoneConfigs'))]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', format('{0}-collector-ampls-pe', parameters('namePrefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}-monitoring-storage-pe', parameters('namePrefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('collectorPrivateEndpointSubnetResourceId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "monitoring-storage-blob",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('storageAccountResourceId')]",
+                      "groupIds": [
+                        "blob"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', format('{0}-monitoring-storage-pe', parameters('namePrefix')), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": [
+                  {
+                    "name": "blob",
+                    "properties": {
+                      "privateDnsZoneId": "[parameters('collectorStorageBlobPrivateDnsZoneResourceId')]"
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', format('{0}-monitoring-storage-pe', parameters('namePrefix')))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}-monitoring-kv-pe', parameters('namePrefix'))]",
+              "location": "[parameters('location')]",
+              "tags": "[variables('resourceTags')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('collectorPrivateEndpointSubnetResourceId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "monitoring-collector-key",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('keyVaultResourceId')]",
+                      "groupIds": [
+                        "vault"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', format('{0}-monitoring-kv-pe', parameters('namePrefix')), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": [
+                  {
+                    "name": "vault",
+                    "properties": {
+                      "privateDnsZoneId": "[parameters('collectorKeyVaultPrivateDnsZoneResourceId')]"
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', format('{0}-monitoring-kv-pe', parameters('namePrefix')))]"
+              ]
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'collector-key-vault-private-dns')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'collector-monitoring-private-dns-zones')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'create-dce-associations-after-dcr-validation')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-private-dns-zones')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workload-monitoring-private-dns-vnet-links",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "namePrefix": {
+            "value": "[format('{0}-workload', parameters('namePrefix'))]"
+          },
+          "virtualNetworkResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology'), '2025-04-01').outputs.workloadVirtualNetworkResourceId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13200925371298447078"
+            }
+          },
+          "parameters": {
+            "namePrefix": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 48,
+              "metadata": {
+                "description": "Prefix used in deterministic private DNS virtual-network-link names."
+              }
+            },
+            "virtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "The sole VNet linked to this isolated private DNS boundary."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.monitor.azure.com', format('{0}-ampls-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.oms.opinsights.azure.com', format('{0}-oms-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.ods.opinsights.azure.com', format('{0}-ods-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.agentsvc.azure-automation.net', format('{0}-agentsvc-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.blob.core.windows.net', format('{0}-blob-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-private-endpoints')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "collector-monitoring-private-dns-vnet-links",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "namePrefix": {
+            "value": "[format('{0}-collector', parameters('namePrefix'))]"
+          },
+          "virtualNetworkResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology'), '2025-04-01').outputs.collectorRuntimeVirtualNetworkResourceId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13200925371298447078"
+            }
+          },
+          "parameters": {
+            "namePrefix": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 48,
+              "metadata": {
+                "description": "Prefix used in deterministic private DNS virtual-network-link names."
+              }
+            },
+            "virtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "The sole VNet linked to this isolated private DNS boundary."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.monitor.azure.com', format('{0}-ampls-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.oms.opinsights.azure.com', format('{0}-oms-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.ods.opinsights.azure.com', format('{0}-ods-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.agentsvc.azure-automation.net', format('{0}-agentsvc-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.blob.core.windows.net', format('{0}-blob-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('virtualNetworkResourceId')]"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-private-endpoints')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "collector-key-vault-private-dns-link",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "namePrefix": {
+            "value": "[format('{0}-collector', parameters('namePrefix'))]"
+          },
+          "collectorVirtualNetworkResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology'), '2025-04-01').outputs.collectorRuntimeVirtualNetworkResourceId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "1599032489780171083"
+            }
+          },
+          "parameters": {
+            "namePrefix": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 48,
+              "metadata": {
+                "description": "Prefix used in the collector Key Vault private DNS VNet link."
+              }
+            },
+            "collectorVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Dedicated WC-024 collector VNet resource ID."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', 'privatelink.vaultcore.azure.net', format('{0}-kv-vnet', parameters('namePrefix')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[parameters('collectorVirtualNetworkResourceId')]"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-private-endpoints')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-private-runtime-topology')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-evidence-reader-role",
+      "location": "[deployment().location]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "roleDefinitionGuid": {
+            "value": "[parameters('collectorRoleDefinitionGuid')]"
+          },
+          "assignableScopes": {
+            "value": [
+              "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName'))]",
+              "[variables('workloadResourceGroupId')]",
+              "[variables('networkWatcherResourceGroupId')]"
+            ]
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "17901574769192215524"
+            }
+          },
+          "parameters": {
+            "roleDefinitionGuid": {
+              "type": "string",
+              "metadata": {
+                "description": "Deterministic custom-role definition GUID."
+              }
+            },
+            "assignableScopes": {
+              "type": "array",
+              "minLength": 3,
+              "maxLength": 3,
+              "metadata": {
+                "description": "Only the monitoring, approved workload, and regional Network Watcher resource groups are assignable."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[parameters('roleDefinitionGuid')]",
+              "properties": {
+                "roleName": "Athena WC024 Isolated Monitoring Evidence Reader",
+                "description": "Read only the generic monitoring data plane, DCR associations, VNet flow logs, and Connection Monitor results. Assignment is reserved for the isolated signed collector.",
+                "type": "CustomRole",
+                "permissions": [
+                  {
+                    "actions": [
+                      "Microsoft.OperationalInsights/workspaces/read",
+                      "Microsoft.OperationalInsights/workspaces/query/read",
+                      "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
+                      "Microsoft.OperationalInsights/workspaces/query/Perf/read",
+                      "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
+                      "Microsoft.OperationalInsights/workspaces/query/Syslog/read",
+                      "Microsoft.OperationalInsights/workspaces/query/VMComputer/read",
+                      "Microsoft.OperationalInsights/workspaces/query/VMConnection/read",
+                      "Microsoft.OperationalInsights/workspaces/query/VMBoundPort/read",
+                      "Microsoft.OperationalInsights/workspaces/query/VMProcess/read",
+                      "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read",
+                      "Microsoft.Insights/Metrics/Read",
+                      "Microsoft.Insights/dataCollectionRules/read",
+                      "Microsoft.Insights/dataCollectionEndpoints/read",
+                      "Microsoft.Insights/dataCollectionRuleAssociations/read",
+                      "Microsoft.Insights/privateLinkScopes/read",
+                      "Microsoft.Network/networkWatchers/flowLogs/read",
+                      "Microsoft.Network/networkWatchers/connectionMonitors/read",
+                      "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDestinationListenerResult/read",
+                      "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
+                      "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
+                      "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read"
+                    ],
+                    "notActions": [],
+                    "dataActions": [],
+                    "notDataActions": []
+                  }
+                ],
+                "assignableScopes": "[parameters('assignableScopes')]"
+              }
+            }
+          ],
+          "outputs": {
+            "roleDefinitionId": {
+              "type": "string",
+              "value": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', parameters('roleDefinitionGuid'))]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "validate-canonical-vnet-flow-log",
+      "resourceGroup": "[parameters('networkWatcherResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "networkWatcherName": {
+            "value": "[parameters('networkWatcherName')]"
+          },
+          "flowLogName": {
+            "value": "[parameters('flowLogName')]"
+          },
+          "workloadVirtualNetworkResourceId": {
+            "value": "[variables('validatedWorkloadVirtualNetworkResourceId')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "15149657605643478802"
+            }
+          },
+          "parameters": {
+            "networkWatcherName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact regional Network Watcher resource name."
+              }
+            },
+            "flowLogName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact reviewed canonical VNet flow-log name."
+              }
+            },
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact reviewed workload VNet resource ID."
+              }
+            }
+          },
+          "resources": [],
+          "outputs": {
+            "validatedFlowLogName": {
+              "type": "string",
+              "value": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName')), '2024-10-01').targetResourceId), toLower(parameters('workloadVirtualNetworkResourceId'))), parameters('flowLogName'), fail('WC-024 refuses to update the canonical flow log unless its current target is the reviewed workload VNet.'))]"
+            },
+            "validatedTargetResourceId": {
+              "type": "string",
+              "value": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName')), '2024-10-01').targetResourceId), toLower(parameters('workloadVirtualNetworkResourceId'))), parameters('workloadVirtualNetworkResourceId'), fail('Unreachable canonical flow-log validation failure.'))]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-resource-reader-assignment",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "collectorPrincipalId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
+          },
+          "roleDefinitionId": {
+            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role'), '2025-04-01').outputs.roleDefinitionId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13328023498060196963"
+            }
+          },
+          "parameters": {
+            "collectorPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the only identity permitted to read generic monitoring evidence."
+              }
+            },
+            "roleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the custom isolated monitoring evidence-reader role."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(resourceGroup().id, parameters('collectorPrincipalId'), parameters('roleDefinitionId'))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[parameters('roleDefinitionId')]"
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workload-association-reader-assignment",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "collectorPrincipalId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
+          },
+          "roleDefinitionId": {
+            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role'), '2025-04-01').outputs.roleDefinitionId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13328023498060196963"
+            }
+          },
+          "parameters": {
+            "collectorPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the only identity permitted to read generic monitoring evidence."
+              }
+            },
+            "roleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the custom isolated monitoring evidence-reader role."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(resourceGroup().id, parameters('collectorPrincipalId'), parameters('roleDefinitionId'))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[parameters('roleDefinitionId')]"
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "network-watcher-reader-assignment",
+      "resourceGroup": "[parameters('networkWatcherResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "collectorPrincipalId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
+          },
+          "roleDefinitionId": {
+            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role'), '2025-04-01').outputs.roleDefinitionId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13328023498060196963"
+            }
+          },
+          "parameters": {
+            "collectorPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the only identity permitted to read generic monitoring evidence."
+              }
+            },
+            "roleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the custom isolated monitoring evidence-reader role."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(resourceGroup().id, parameters('collectorPrincipalId'), parameters('roleDefinitionId'))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[parameters('roleDefinitionId')]"
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-evidence-reader-role')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-vnet-flow-log-with-traffic-analytics')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "adopt-vnet-flow-log-with-traffic-analytics",
+      "resourceGroup": "[parameters('networkWatcherResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "networkWatcherName": {
+            "value": "[parameters('networkWatcherName')]"
+          },
+          "flowLogName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-canonical-vnet-flow-log'), '2025-04-01').outputs.validatedFlowLogName.value]"
+          },
+          "workloadVirtualNetworkResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-canonical-vnet-flow-log'), '2025-04-01').outputs.validatedTargetResourceId.value]"
+          },
+          "storageAccountResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
+          },
+          "workspaceCustomerId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceCustomerId.value]"
+          },
+          "workspaceResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value]"
+          },
+          "workspaceLocation": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceLocation.value]"
+          },
+          "retentionDays": {
+            "value": "[parameters('retentionDays')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "4905709821098539897"
+            }
+          },
+          "parameters": {
+            "networkWatcherName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing regional Network Watcher resource name."
+              }
+            },
+            "flowLogName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deterministic VNet flow-log name."
+              }
+            },
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Reviewed workload VNet resource ID."
+              }
+            },
+            "storageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Monitoring-owned replacement storage account resource ID."
+              }
+            },
+            "workspaceCustomerId": {
+              "type": "string",
+              "metadata": {
+                "description": "Log Analytics workspace customer ID used by Traffic Analytics."
+              }
+            },
+            "workspaceResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Log Analytics workspace resource ID used by Traffic Analytics."
+              }
+            },
+            "workspaceLocation": {
+              "type": "string",
+              "metadata": {
+                "description": "Region of the Log Analytics workspace."
+              }
+            },
+            "retentionDays": {
+              "type": "int",
+              "minValue": 30,
+              "maxValue": 365,
+              "metadata": {
+                "description": "Retention period for VNet flow-log records."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/networkWatchers/flowLogs",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', parameters('networkWatcherName'), parameters('flowLogName'))]",
+              "properties": {
+                "targetResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
+                "storageId": "[parameters('storageAccountResourceId')]",
+                "enabled": true,
+                "retentionPolicy": {
+                  "days": "[parameters('retentionDays')]",
+                  "enabled": true
+                },
+                "format": {
+                  "type": "JSON",
+                  "version": 2
+                },
+                "flowAnalyticsConfiguration": {
+                  "networkWatcherFlowAnalyticsConfiguration": {
+                    "enabled": true,
+                    "workspaceId": "[parameters('workspaceCustomerId')]",
+                    "workspaceRegion": "[parameters('workspaceLocation')]",
+                    "workspaceResourceId": "[parameters('workspaceResourceId')]",
+                    "trafficAnalyticsInterval": 10
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-canonical-vnet-flow-log')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "disable-redundant-legacy-flow-logs",
+      "resourceGroup": "[parameters('networkWatcherResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "networkWatcherName": {
+            "value": "[parameters('networkWatcherName')]"
+          },
+          "canonicalVnetFlowLogName": {
+            "value": "[parameters('flowLogName')]"
+          },
+          "workloadVirtualNetworkResourceId": {
+            "value": "[variables('validatedWorkloadVirtualNetworkResourceId')]"
+          },
+          "replacementStorageAccountResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
+          },
+          "legacyFlowLogNames": {
+            "value": "[parameters('legacyFlowLogNames')]"
+          },
+          "legacyFlowLogTargetResourceIds": {
+            "value": "[parameters('legacyFlowLogTargetResourceIds')]"
+          },
+          "canonicalVnetFlowLogCutoverConfirmed": {
+            "value": "[parameters('canonicalVnetFlowLogCutoverConfirmed')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "13925719048038281809"
+            }
+          },
+          "parameters": {
+            "networkWatcherName": {
+              "type": "string",
+              "metadata": {
+                "description": "Existing regional Network Watcher containing the canonical and redundant flow logs."
+              }
+            },
+            "canonicalVnetFlowLogName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the enabled canonical VNet flow log that must complete cutover first."
+              }
+            },
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "VNet resource ID owned by the enabled canonical VNet flow log."
+              }
+            },
+            "replacementStorageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Replacement monitoring storage account configured on disabled redundant flow logs."
+              }
+            },
+            "legacyFlowLogNames": {
+              "type": "array",
+              "defaultValue": [],
+              "maxLength": 32,
+              "metadata": {
+                "description": "Explicit reviewed names of redundant subnet or NIC flow logs to disable."
+              }
+            },
+            "legacyFlowLogTargetResourceIds": {
+              "type": "array",
+              "defaultValue": [],
+              "maxLength": 32,
+              "metadata": {
+                "description": "Explicit reviewed target resource IDs paired by index with legacyFlowLogNames."
+              }
+            },
+            "canonicalVnetFlowLogCutoverConfirmed": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage."
+              }
+            }
+          },
+          "variables": {
+            "copy": [
+              {
+                "name": "requestedLegacyFlowLogMigrations",
+                "count": "[length(parameters('legacyFlowLogNames'))]",
+                "input": {
+                  "name": "[string(parameters('legacyFlowLogNames')[copyIndex('requestedLegacyFlowLogMigrations')])]",
+                  "targetResourceId": "[string(parameters('legacyFlowLogTargetResourceIds')[copyIndex('requestedLegacyFlowLogMigrations')])]"
+                }
+              },
+              {
+                "name": "reviewedLegacyFlowLogMigrationPairs",
+                "count": "[length(variables('reviewedLegacyFlowLogMigrationAllowlist'))]",
+                "input": "[format('{0}|{1}', toLower(string(variables('reviewedLegacyFlowLogMigrationAllowlist')[copyIndex('reviewedLegacyFlowLogMigrationPairs')].name)), toLower(string(variables('reviewedLegacyFlowLogMigrationAllowlist')[copyIndex('reviewedLegacyFlowLogMigrationPairs')].targetResourceId)))]"
+              },
+              {
+                "name": "requestedLegacyFlowLogMigrationPairs",
+                "count": "[length(variables('requestedLegacyFlowLogMigrations'))]",
+                "input": "[format('{0}|{1}', toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].name), toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].targetResourceId))]"
+              }
+            ],
+            "reviewedLegacyFlowLogMigrationAllowlist": [],
+            "unreviewedLegacyFlowLogMigrationPairs": "[filter(variables('requestedLegacyFlowLogMigrationPairs'), lambda('requestedPair', not(contains(variables('reviewedLegacyFlowLogMigrationPairs'), lambdaVariables('requestedPair')))))]",
+            "legacyFlowLogMigrationIsValid": "[and(and(and(and(equals(length(parameters('legacyFlowLogNames')), length(parameters('legacyFlowLogTargetResourceIds'))), empty(variables('unreviewedLegacyFlowLogMigrationPairs'))), not(contains(map(parameters('legacyFlowLogNames'), lambda('flowLogName', toLower(string(lambdaVariables('flowLogName'))))), toLower(parameters('canonicalVnetFlowLogName'))))), not(contains(map(parameters('legacyFlowLogTargetResourceIds'), lambda('targetResourceId', toLower(string(lambdaVariables('targetResourceId'))))), toLower(parameters('workloadVirtualNetworkResourceId'))))), or(empty(parameters('legacyFlowLogNames')), parameters('canonicalVnetFlowLogCutoverConfirmed')))]",
+            "validatedLegacyFlowLogMigrations": "[if(variables('legacyFlowLogMigrationIsValid'), variables('requestedLegacyFlowLogMigrations'), fail('legacy flow-log migration requires exact reviewed name/target allowlist entries, paired non-VNet targets, and explicit canonical VNet cutover confirmation'))]"
+          },
+          "resources": [
+            {
+              "copy": {
+                "name": "legacyFlowLogs",
+                "count": "[length(variables('validatedLegacyFlowLogMigrations'))]"
+              },
+              "type": "Microsoft.Network/networkWatchers/flowLogs",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name)]",
+              "properties": {
+                "targetResourceId": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').targetResourceId), toLower(variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId)), variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId, fail('WC-024 refuses to disable a legacy flow log unless its existing target matches the reviewed allowlist.'))]",
+                "storageId": "[parameters('replacementStorageAccountResourceId')]",
+                "enabled": false,
+                "retentionPolicy": {
+                  "days": 0,
+                  "enabled": false
+                },
+                "format": {
+                  "type": "JSON",
+                  "version": 2
+                },
+                "flowAnalyticsConfiguration": {
+                  "networkWatcherFlowAnalyticsConfiguration": {
+                    "enabled": false
+                  }
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "disabledLegacyFlowLogNames": {
+              "type": "array",
+              "copy": {
+                "count": "[length(variables('validatedLegacyFlowLogMigrations'))]",
+                "input": "[variables('validatedLegacyFlowLogMigrations')[copyIndex()].name]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-vnet-flow-log-with-traffic-analytics')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "connection-monitor-capability",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "connectionMonitorDeploymentEnabled": {
+            "value": "[parameters('connectionMonitorDeploymentEnabled')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "4823651825761740486"
+            }
+          },
+          "parameters": {
+            "connectionMonitorDeploymentEnabled": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "Must remain false until a separately reviewed published-intent reconciliation introduces exact endpoint paths."
+              }
+            }
+          },
+          "variables": {
+            "validatedConnectionMonitorDeploymentEnabled": "[if(parameters('connectionMonitorDeploymentEnabled'), fail('WC-024 provides Connection Monitor capability only; endpoint definitions require a separately reviewed published-intent reconciliation.'), false())]"
+          },
+          "resources": [],
+          "outputs": {
+            "deploymentMode": {
+              "type": "string",
+              "value": "[if(variables('validatedConnectionMonitorDeploymentEnabled'), 'not-supported', 'capability-only')]"
+            },
+            "supportedEvidence": {
+              "type": "array",
+              "value": [
+                "connectionMonitorResults",
+                "effectiveNsgRules",
+                "effectiveRoutes",
+                "nextHop",
+                "ipFlowVerification"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-collector-contract",
+      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "collectorIdentityResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value]"
+          },
+          "collectorIdentityClientId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityClientId.value]"
+          },
+          "monitoringResourceGroupId": {
+            "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName'))]"
+          },
+          "workloadResourceGroupId": {
+            "value": "[variables('workloadResourceGroupId')]"
+          },
+          "workloadVirtualNetworkResourceId": {
+            "value": "[variables('validatedWorkloadVirtualNetworkResourceId')]"
+          },
+          "approvedVmNames": {
+            "value": "[variables('validatedApprovedVmNames')]"
+          },
+          "workspaceResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value]"
+          },
+          "dataCollectionRuleResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionRuleResourceId.value]"
+          },
+          "dataCollectionEndpointResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionEndpointResourceId.value]"
+          },
+          "signingKeyResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyResourceId.value]"
+          },
+          "evidenceStorageAccountResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
+          },
+          "maximumEvidenceAgeSeconds": {
+            "value": "[parameters('maximumEvidenceAgeSeconds')]"
+          },
+          "connectionMonitorDeploymentMode": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability'), '2025-04-01').outputs.deploymentMode.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "3679548579900281051"
+            }
+          },
+          "parameters": {
+            "collectorIdentityResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the isolated monitoring evidence collector identity."
+              }
+            },
+            "collectorIdentityClientId": {
+              "type": "string",
+              "metadata": {
+                "description": "Client ID of the isolated monitoring evidence collector identity."
+              }
+            },
+            "monitoringResourceGroupId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the monitoring-owned resource group."
+              }
+            },
+            "workloadResourceGroupId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the approved workload resource group."
+              }
+            },
+            "workloadVirtualNetworkResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact reviewed workload VNet resource ID."
+              }
+            },
+            "approvedVmNames": {
+              "type": "array",
+              "minLength": 11,
+              "maxLength": 11,
+              "metadata": {
+                "description": "Exact reviewed 11 VM names that are inside the WC-024 workload boundary."
+              }
+            },
+            "workspaceResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the private Log Analytics workspace."
+              }
+            },
+            "dataCollectionRuleResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the generic AMA and VM Insights DCR."
+              }
+            },
+            "dataCollectionEndpointResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the private data collection endpoint."
+              }
+            },
+            "signingKeyResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the non-exportable collector signing key."
+              }
+            },
+            "evidenceStorageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the monitoring-owned immutable evidence storage account."
+              }
+            },
+            "maximumEvidenceAgeSeconds": {
+              "type": "int",
+              "minValue": 60,
+              "maxValue": 900,
+              "metadata": {
+                "description": "Maximum accepted age for a signed evidence handoff."
+              }
+            },
+            "connectionMonitorDeploymentMode": {
+              "type": "string",
+              "metadata": {
+                "description": "The generic Connection Monitor capability state."
+              }
+            }
+          },
+          "variables": {
+            "validatedConnectionMonitorDeploymentMode": "[if(equals(parameters('connectionMonitorDeploymentMode'), 'capability-only'), parameters('connectionMonitorDeploymentMode'), fail('collector contracts require the generic Connection Monitor capability-only mode'))]"
+          },
+          "resources": [],
+          "outputs": {
+            "collectorContract": {
+              "type": "object",
+              "value": {
+                "schemaVersion": "athena.wc024MonitoringCollectorContract.v1",
+                "collectorIdentityResourceId": "[parameters('collectorIdentityResourceId')]",
+                "collectorIdentityClientId": "[parameters('collectorIdentityClientId')]",
+                "monitoringResourceGroupId": "[parameters('monitoringResourceGroupId')]",
+                "workloadResourceGroupId": "[parameters('workloadResourceGroupId')]",
+                "workloadVirtualNetworkResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
+                "approvedVmNames": "[parameters('approvedVmNames')]",
+                "workspaceResourceId": "[parameters('workspaceResourceId')]",
+                "dataCollectionRuleResourceId": "[parameters('dataCollectionRuleResourceId')]",
+                "dataCollectionEndpointResourceId": "[parameters('dataCollectionEndpointResourceId')]",
+                "signalKinds": [
+                  "heartbeat",
+                  "perf",
+                  "insightsMetrics",
+                  "syslog",
+                  "disk",
+                  "guest",
+                  "vnetFlow",
+                  "trafficAnalytics"
+                ],
+                "allowedReadOperations": [
+                  "Microsoft.OperationalInsights/workspaces/read",
+                  "Microsoft.OperationalInsights/workspaces/query/read",
+                  "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
+                  "Microsoft.OperationalInsights/workspaces/query/Perf/read",
+                  "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
+                  "Microsoft.OperationalInsights/workspaces/query/Syslog/read",
+                  "Microsoft.OperationalInsights/workspaces/query/VMComputer/read",
+                  "Microsoft.OperationalInsights/workspaces/query/VMConnection/read",
+                  "Microsoft.OperationalInsights/workspaces/query/VMBoundPort/read",
+                  "Microsoft.OperationalInsights/workspaces/query/VMProcess/read",
+                  "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read",
+                  "Microsoft.Insights/Metrics/Read",
+                  "Microsoft.Insights/dataCollectionRules/read",
+                  "Microsoft.Insights/dataCollectionEndpoints/read",
+                  "Microsoft.Insights/dataCollectionRuleAssociations/read",
+                  "Microsoft.Insights/privateLinkScopes/read",
+                  "Microsoft.Network/networkWatchers/flowLogs/read",
+                  "Microsoft.Network/networkWatchers/connectionMonitors/read",
+                  "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDestinationListenerResult/read",
+                  "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
+                  "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
+                  "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read"
+                ],
+                "collectionMode": "isolatedSignedCollector",
+                "handoffSchemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
+                "maximumEvidenceAgeSeconds": "[parameters('maximumEvidenceAgeSeconds')]",
+                "connectionMonitorMode": "capabilityOnly",
+                "signingKeyResourceId": "[parameters('signingKeyResourceId')]",
+                "evidenceStorageAccountResourceId": "[parameters('evidenceStorageAccountResourceId')]",
+                "evidenceContainerName": "monitoring-evidence",
+                "connectionMonitorDeploymentMode": "[variables('validatedConnectionMonitorDeploymentMode')]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "monitoringCollectorContract": {
+      "type": "object",
+      "metadata": {
+        "description": "Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.collectorContract.value]"
+    },
+    "replacementMonitoringStorageAccountResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Monitoring-owned replacement storage. It is separate from the retained legacy flow-log destination."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
+    },
+    "retainedLegacyFlowLogStorageAccountName": {
+      "type": "string",
+      "metadata": {
+        "description": "Legacy flow-log storage blobs are retained. Redundant configured writers are disabled only through the reviewed migration inputs."
+      },
+      "value": "[variables('legacyFlowLogStorageAccountName')]"
+    },
+    "connectionMonitorDeploymentMode": {
+      "type": "string",
+      "metadata": {
+        "description": "Generic-only Connection Monitor state. No endpoint path definitions are created by WC-024."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability'), '2025-04-01').outputs.deploymentMode.value]"
+    },
+    "preservedCustomLogFlow": {
+      "type": "object",
+      "metadata": {
+        "description": "Existing custom DCR data flow retained because WC-024 adopts the DCR without replacing it."
+      },
+      "value": {
+        "stream": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.preservedCustomLogStream.value]",
+        "table": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.preservedCustomLogTable.value]"
+      }
+    },
+    "adoptedDataCollectionRuleAssociationResourceIds": {
+      "type": "array",
+      "metadata": {
+        "description": "Existing DCR associations adopted without modification on the approved VMs."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-adopted-dcr-associations'), '2025-04-01').outputs.validatedAdoptedDataCollectionRuleAssociationResourceIds.value]"
+    },
+    "dataCollectionEndpointAssociationResourceIds": {
+      "type": "array",
+      "metadata": {
+        "description": "Separate DCE-only associations created on the approved VMs."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'create-dce-associations-after-dcr-validation'), '2025-04-01').outputs.dataCollectionEndpointAssociationResourceIds.value]"
+    },
+    "disabledLegacyFlowLogNames": {
+      "type": "array",
+      "metadata": {
+        "description": "Redundant subnet or NIC flow logs disabled only after the approved canonical VNet flow-log cutover."
+      },
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'disable-redundant-legacy-flow-logs'), '2025-04-01').outputs.disabledLegacyFlowLogNames.value]"
+    }
+  }
+}

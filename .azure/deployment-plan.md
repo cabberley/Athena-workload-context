@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Deployed — hardened WC-016 operationally verified
+> **Status:** Validated — WC-024 phase-one foundation; bootstrap/connectivity deployed
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -395,3 +395,119 @@ signing, and a private static presentation container.
 
 1. Preserve the approved enterprise-claim workaround for collector execution until the repository
    is hosted in an allowed GitHub enterprise or an Azure-hosted managed-identity runner is adopted.
+
+---
+
+## 11. WC-024 Monitoring Foundation Deployment
+
+### Scope
+
+Deploy WC-024 into the previously approved Azure scope:
+
+- Subscription: `AG-CI-CE-chabberl`
+  (`a6add389-9978-47ac-ab1e-a09212e321d4`)
+- Region: `australiaeast`
+- Workload resource group: `rg-athena-demo-workload`
+- Monitoring resource group: `rg-athena-demo-monitoring`
+
+The user approved autonomous continuation in the same subscription and resource
+groups used by prior Athena deployments.
+
+### Architecture and rollout
+
+WC-024 adopts the existing Log Analytics workspace, DCE, DCR, eleven canonical
+VMs, workload VNet, Network Watcher, and canonical VNet flow log. It adds:
+
+- one isolated, unpeered `10.45.0.0/24` collector VNet with separate runtime and
+  private-endpoint subnets;
+- separate workload and collector AMPLS scopes;
+- separate same-named Azure Monitor private DNS zones in each network boundary;
+- collector-only Blob and Key Vault private endpoints and DNS;
+- immutable evidence storage, a signing Key Vault/key, and a managed identity;
+- exact, narrow monitoring-reader and evidence-writer permissions.
+
+Deployment is phased:
+
+1. Bootstrap both AMPLS scopes independently in `Open` mode.
+2. Deploy the isolated collector VNet.
+3. Validate and deploy the phase-one monitoring foundation.
+4. Defer `set-private-access.ps1` until exact AMPLS membership, approved private
+   endpoints, empty exclusions, DNS, connectivity, AMA/DCR health, ingestion,
+   collector query/sign/write, and negative-access checks all pass.
+
+The private cutover performs a complete two-scope preflight before any mutation
+and is serialized because AMPLS has no supported ETag concurrency contract.
+
+### Provisioning limits
+
+Azure Quota CLI results for `australiaeast`:
+
+| Resource type | New | Total after | Limit | Evidence |
+|---------------|----:|------------:|------:|----------|
+| Virtual networks | 1 | 8 | 1000 | Usage 7; available 993 |
+| Network security groups | 1 | 43 | 5000 | Usage 42; available 4958 |
+| Private endpoints | 4 | 8 | 65536 | Usage 4; available 65532 |
+| Storage accounts | 1 | 8 | 250 | Usage 7; available 243 |
+| Network Watchers | 0 | 1 | 1 | Existing watcher is adopted |
+| AMPLS scopes | 2 | 2 | Not exposed by Quota CLI | Azure validate/what-if required |
+| Private DNS zones | 11 | 18 | Not exposed by Quota CLI | Current count 7 from Resource Graph |
+| User-assigned identities | 1 | 16 | Not exposed by Quota CLI | Current count 15 from Resource Graph |
+| Key Vaults | 1 | 6 | Not exposed by Quota CLI | Current count 5 from Resource Graph |
+
+All quota-exposed resources are well within regional limits.
+
+### WC-024 validation checklist
+
+- [x] Bicep roots and parameter files compile.
+- [x] Focused WC-024 tests pass: 40.
+- [x] Full Python suite passes with two intentional skips.
+- [x] Ruff, MyPy, repository validation, PowerShell parsing, and
+  `git diff --check` pass.
+- [x] Independent code review approved.
+- [x] Independent security review approved.
+- [x] Independent Azure architecture review approved.
+- [x] Static RBAC review confirms exact resource scopes and no generic
+  Contributor assignment.
+- [x] Complete authoritative azure-validate workflow for the stage-one
+  bootstrap and collector-connectivity deployment.
+- [x] Re-run Azure validation and ResourceIdOnly what-if for each AMPLS
+  bootstrap and the collector VNet.
+- [x] Deploy and verify AMPLS bootstrap scopes and collector VNet.
+- [x] Run Azure validation and what-if for the complete foundation.
+- [ ] Deploy the phase-one foundation.
+- [ ] Keep private-only cutover deferred pending runtime acceptance.
+
+### WC-024 validation proof
+
+| Check | Command | Result |
+|-------|---------|--------|
+| Bicep | `az bicep build` and `az bicep build-params` for WC-024 roots | Passed |
+| Focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 40 passed |
+| Full tests | `python -m pytest -q` | Passed; 2 skipped |
+| Static quality | Ruff, MyPy, repository validator, PowerShell parser, `git diff --check` | Passed |
+| Reviews | Code, security, and Azure architecture agents | Approved |
+| AMPLS bootstrap validation | `az deployment group validate` for both reviewed AMPLS names | Passed |
+| AMPLS bootstrap what-if | `az deployment group what-if --result-format ResourceIdOnly` for both reviewed AMPLS names | Passed: one AMPLS create per invocation and no deletes |
+| Collector-network validation | `az deployment sub validate` for `infra/wc024-monitoring-connectivity/main.bicep` | Passed |
+| Collector-network what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: one VNet and one NSG create; no deletes |
+| Static RBAC | Reviewed custom monitoring reader, container-scoped Blob contributor, and key-scoped Crypto User assignments | Passed: exact scopes and no generic Contributor |
+| AMPLS bootstrap deployment | `bootstrap-ampls.ps1` | Passed: both scopes provisioned `Succeeded`, Open/Open, zero exclusions, zero scoped resources, and zero private endpoint connections |
+| Collector-network deployment | `az deployment sub create` deployment `wc024-connectivity-20260909-2213` | Passed: correlation `56e32d88-f27e-4a88-9c51-24673732014b`; exact VNet/subnet outputs and zero peerings |
+| Complete-foundation validation | `az deployment sub validate` for `infra/wc024-monitoring-foundation/main.bicep` | Passed |
+| Complete-foundation what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 56 creates, 104 ignores, 4 runtime-expression unsupported, and zero deletes or explicit modifies |
+
+**WC-024 validation timestamp:** 2026-09-09T22:15:49+10:00
+
+### WC-024 files
+
+| File | Purpose |
+|------|---------|
+| `infra/wc024-monitoring-connectivity/main.bicep` | Isolated collector network |
+| `infra/wc024-monitoring-foundation/bootstrap-ampls.bicep` | Serialized AMPLS bootstrap |
+| `infra/wc024-monitoring-foundation/main.bicep` | Monitoring foundation |
+| `infra/wc024-monitoring-foundation/set-private-access.ps1` | Deferred private-only cutover |
+| `src/athena_context/contracts/monitoring.py` | Signed monitoring contracts |
+
+> Current: WC-024 bootstrap and collector connectivity are deployed and
+> verified. The complete phase-one foundation is validated and will be deployed
+> from the merged revision; private-only cutover remains deferred.
