@@ -1730,6 +1730,120 @@ def test_direct_selector_control_and_applicability_weakening_fail_closed() -> No
         )
 
 
+@pytest.mark.parametrize(
+    "replacement_selector",
+    [
+        {
+            "selectorType": "namePredicate",
+            "selectorId": "replacement-broad",
+            "prefix": "athena-worker",
+            "maxMatches": 1000,
+        },
+        {
+            "selectorType": "resourceIdList",
+            "selectorId": "replacement-explicit",
+            "resourceIds": [f"{RESOURCE_PREFIX}athena-worker-001"],
+            "maxMatches": 1,
+        },
+        {
+            "selectorType": "compositeAll",
+            "selectorId": "replacement-guarded",
+            "children": [
+                {
+                    "selectorType": "namePredicate",
+                    "selectorId": "replacement-guard",
+                    "prefix": "athena-worker-",
+                    "maxMatches": 20,
+                },
+                {
+                    "selectorType": "resourceIdList",
+                    "selectorId": "replacement-exact",
+                    "resourceIds": [
+                        f"{RESOURCE_PREFIX}athena-worker-001"
+                    ],
+                    "maxMatches": 1,
+                },
+            ],
+            "maxMatches": 1,
+        },
+    ],
+    ids=[
+        "broadening",
+        "unguarded-new-identity",
+        "guarded-new-identity",
+    ],
+)
+def test_generic_disjoint_selector_replacement_fails_closed(
+    replacement_selector: dict[str, object],
+) -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    worker = next(role for role in payload["roles"] if role["roleId"] == "worker")
+    worker["selectors"][0]["maxMatches"] = 20
+    replacement = deepcopy(worker)
+    replacement["selectors"] = [replacement_selector]
+    payload["profiles"]["production"]["roles"] = [replacement]
+
+    with pytest.raises(
+        AthenaValidationError,
+        match="selector identities are immutable",
+    ):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
+def test_partial_inherited_selector_override_retains_unmentioned_selectors() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    worker = next(role for role in payload["roles"] if role["roleId"] == "worker")
+    worker["selectors"].append(
+        {
+            "selectorType": "namePredicate",
+            "selectorId": "worker-special-name",
+            "prefix": "athena-worker-special-",
+            "maxMatches": 20,
+        }
+    )
+    override = deepcopy(worker)
+    override["selectors"] = [
+        {
+            **deepcopy(worker["selectors"][0]),
+            "maxMatches": 10,
+        }
+    ]
+    payload["profiles"]["production"]["roles"] = [override]
+
+    resolved = resolve_manifest_profile(
+        CanonicalWorkloadManifest.model_validate(payload),
+        "production",
+        as_of=AS_OF,
+    )
+    resolved_worker = next(
+        role for role in resolved.roles if role.role_id == "worker"
+    )
+
+    assert {selector.selector_id for selector in resolved_worker.selectors} == {
+        "worker-name",
+        "worker-special-name",
+    }
+
+
+def test_case_only_selector_overlap_fails_closed() -> None:
+    payload = build_manifest().model_dump(mode="json", by_alias=True)
+    web = next(role for role in payload["roles"] if role["roleId"] == "web")
+    worker = next(role for role in payload["roles"] if role["roleId"] == "worker")
+    web["selectors"][0]["prefix"] = "ATHENA-WORKER-"
+    worker["selectors"][0]["prefix"] = "athena-worker-"
+
+    with pytest.raises(AthenaValidationError, match="ambiguous selectors"):
+        resolve_manifest_profile(
+            CanonicalWorkloadManifest.model_validate(payload),
+            "production",
+            as_of=AS_OF,
+        )
+
+
 def test_inherited_control_fields_require_exact_governance_and_keep_provenance() -> None:
     def development_backup() -> dict[str, object]:
         control = _control_payload("backup")

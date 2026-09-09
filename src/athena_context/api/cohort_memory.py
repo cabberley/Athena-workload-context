@@ -99,6 +99,7 @@ class InMemoryCohortPersistence:
         self._lock = RLock()
         self._batches: dict[str, CohortProposalBatchResponse] = {}
         self._receipts: dict[tuple[str, str], CohortPreviewReceipt] = {}
+        self._candidates: dict[tuple[str, str], CohortPreviewReceipt] = {}
 
     def get_batch(
         self,
@@ -135,12 +136,34 @@ class InMemoryCohortPersistence:
         receipt: CohortPreviewReceipt,
     ) -> CohortPreviewReceipt:
         key = (receipt.actor_id, receipt.idempotency_key)
+        candidate_key = (
+            receipt.actor_id,
+            receipt.candidate.candidate_id,
+        )
         with self._lock:
             existing = self._receipts.get(key)
             if existing is None:
+                candidate = self._candidates.get(candidate_key)
+                if candidate is not None and (
+                    candidate.candidate != receipt.candidate
+                    or candidate.evidence_binding != receipt.evidence_binding
+                ):
+                    raise PersistenceConflictError(
+                        "an immutable cohort candidate identifier already exists"
+                    )
                 existing = receipt.model_copy(deep=True)
                 self._receipts[key] = existing
+                self._candidates.setdefault(candidate_key, existing)
             return existing.model_copy(deep=True)
+
+    def get_candidate(
+        self,
+        actor_id: str,
+        candidate_id: str,
+    ) -> CohortPreviewReceipt | None:
+        with self._lock:
+            receipt = self._candidates.get((actor_id, candidate_id))
+            return None if receipt is None else receipt.model_copy(deep=True)
 
 
 __all__ = [

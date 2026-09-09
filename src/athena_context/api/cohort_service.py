@@ -49,6 +49,9 @@ from athena_context.api.errors import (
     VersionMismatchError,
 )
 from athena_context.api.ports import ClockPort, ContextStorePort
+from athena_context.api.selector_authority import (
+    persisted_selector_authority_for_draft,
+)
 from athena_context.binding import (
     VerifiedCohortSnapshot,
     evaluate_selector,
@@ -59,18 +62,25 @@ from athena_context.binding import (
 from athena_context.binding.domain import (
     CohortProposal,
     CohortProposalBatch,
+    ProposalScope,
     SelectorPreview,
 )
 from athena_context.contracts.common import AthenaValidationError, compute_artifact_digest
 from athena_context.contracts.manifest import (
+    AtomicSelector,
+    CompositeAllSelector,
+    CompositeAnySelector,
     ManifestRole,
     ManifestSelector,
     ResolvedManifestProfile,
     ResourceIdListSelector,
+    _resolve_manifest_profile_for_cohort_decision,
+    is_guarded_selector_replacement_narrower,
     resolve_manifest_profile,
 )
 from athena_context.contracts.models import EvidenceSnapshot, ResourceEvidenceRecord
 
+_ATOMIC_SELECTOR_ADAPTER: TypeAdapter[AtomicSelector] = TypeAdapter(AtomicSelector)
 _SELECTOR_ADAPTER: TypeAdapter[ManifestSelector] = TypeAdapter(ManifestSelector)
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_PROPOSALS = 200
@@ -96,6 +106,14 @@ class _ResolvedCohortContext:
             evidence_binding=self.evidence_binding,
             snapshot_artifact_digest=self.snapshot.compatibility.artifact_digest,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCohortReview:
+    evidence_binding: CohortEvidenceBinding
+    snapshot: EvidenceSnapshot
+    batch: CohortProposalBatchResponse
+    as_of: datetime
 
 
 def _authority_projection(role: ManifestRole) -> dict[str, Any]:
@@ -142,6 +160,18 @@ class CohortProposalService:
         self._proposal_cache = proposal_cache
         self._preview_receipts = preview_receipts
 
+    @property
+    def context_store(self) -> ContextStorePort:
+        return self._context_store
+
+    @property
+    def candidate_repository(self) -> CohortPreviewReceiptPort:
+        return self._preview_receipts
+
+    @property
+    def authorization(self) -> ExplicitWorkloadAuthorizationPort:
+        return self._authorization
+
     def get_proposals(
         self,
         actor: Actor,
@@ -175,6 +205,10 @@ class CohortProposalService:
                 **batch.model_dump(mode="python", by_alias=True, exclude_none=True),
             }
         )
+        response = self._bind_direct_review_selector_ids(
+            response,
+            _resource_records(resolved.snapshot),
+        )
         self._validate_batch_binding(response, resolved)
         self._enforce_batch_bounds(response)
         self._ensure_current_draft(query)
@@ -182,6 +216,86 @@ class CohortProposalService:
         self._validate_batch_binding(stored, resolved)
         self._enforce_batch_bounds(stored)
         return stored
+
+    @classmethod
+    def _bind_direct_review_selector_ids(
+        cls,
+        batch: CohortProposalBatchResponse,
+        resources: list[ResourceEvidenceRecord],
+    ) -> CohortProposalBatchResponse:
+        """Make safe direct-review selectors final before the human sees them."""
+
+        proposals: list[CohortProposal] = []
+        changed = False
+        for proposal in batch.proposals:
+            preview = proposal.selector_preview
+            if preview is None:
+                proposals.append(proposal)
+                continue
+            expected_members = {
+                normalize_resource_id(member)
+                for member in preview.matched_resource_ids
+            }
+            matches: list[ManifestSelector] = []
+            for selector in proposal.role.selectors:
+                if selector.selector_type != preview.selector.selector_type:
+                    continue
+                try:
+                    result = evaluate_selector(selector, resources)
+                except AthenaValidationError:
+                    continue
+                members = {
+                    normalize_resource_id(member)
+                    for member in result.matched_resource_ids
+                }
+                if members == expected_members:
+                    matches.append(selector)
+            if len(matches) != 1:
+                proposals.append(proposal)
+                continue
+            selector_payload = preview.selector.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+            selector_payload["selectorId"] = matches[0].selector_id
+            try:
+                selector = _SELECTOR_ADAPTER.validate_python(selector_payload)
+                final_preview = cls._evaluate_exact_preview(selector, resources)
+            except (AthenaValidationError, ValidationError) as exc:
+                raise CohortContractError(
+                    "direct review selector cannot be finalized before approval"
+                ) from exc
+            if final_preview.matched_resource_ids != preview.matched_resource_ids:
+                raise CohortContractError(
+                    "final direct review selector changed the proposed cohort"
+                )
+            proposals.append(
+                proposal.model_copy(
+                    update={"selector_preview": final_preview},
+                    deep=True,
+                )
+            )
+            changed = changed or final_preview != preview
+        if not changed:
+            return batch
+        payload = batch.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_none=True,
+        )
+        payload["proposals"] = proposals
+        payload["proposalSetDigest"] = compute_artifact_digest(
+            [
+                proposal.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for proposal in proposals
+            ]
+        )
+        return CohortProposalBatchResponse.model_validate(payload)
 
     def preview(
         self,
@@ -234,6 +348,7 @@ class CohortProposalService:
 
         proposals = self._select_proposals(batch, request)
         candidate = self._build_candidate(
+            actor,
             request,
             batch,
             proposals,
@@ -259,60 +374,86 @@ class CohortProposalService:
         self._enforce_candidate_bounds(stored.candidate)
         return stored.candidate
 
-    def _resolve_context(
+    def resolve_for_decision(
         self,
         actor: Actor,
         query: CohortProposalQuery,
-    ) -> _ResolvedCohortContext:
+        *,
+        scope: ProposalScope,
+        as_of: datetime | None = None,
+    ) -> ResolvedCohortReview:
+        """Revalidate the exact immutable batch and trusted snapshot for a decision."""
+
         if actor.kind is not ActorKind.HUMAN:
-            raise AuthorizationError("cohort proposal APIs require a verified human actor")
-        self._authorization.require_explicit(actor, Permission.READ, query.manifest_id)
-        as_of = ensure_timestamp(self._clock.now())
-        with self._context_store.transaction() as tx:
-            draft = tx.get_draft(query.draft_id)
-        if draft is None:
-            raise ResourceNotFoundError(f"draft {query.draft_id!r} was not found")
-        self._ensure_query_matches_draft(query, draft)
-        if draft.state is not DraftState.DRAFT:
-            raise InvalidTransitionError("cohort proposals require an active draft state")
-        if (
-            draft.manifest.compatibility.artifact_digest
-            != draft.manifest.compute_artifact_digest_value()
-            or draft.manifest_digest != draft.manifest.compatibility.artifact_digest
-        ):
-            raise DigestMismatchError("draft manifest digest is not canonical")
-        try:
-            profile = resolve_manifest_profile(
-                draft.manifest,
-                query.profile_id,
-                as_of=as_of,
+            raise AuthorizationError(
+                "cohort proposal APIs require a verified human actor"
             )
-        except AthenaValidationError as exc:
-            raise CohortProfileMismatchError(
-                "the requested profile does not resolve from the exact draft"
-            ) from exc
+        self._authorization.require_explicit(
+            actor,
+            Permission.READ,
+            query.manifest_id,
+        )
         if (
-            profile.profile_id != query.profile_id
-            or profile.manifest_id != query.manifest_id
-            or profile.manifest_version != query.manifest_version
+            scope.manifest_id != query.manifest_id
+            or scope.manifest_version != query.manifest_version
+            or scope.profile_id != query.profile_id
         ):
             raise CohortProfileMismatchError(
-                "the resolved profile does not exactly match the request binding"
+                "the immutable decision scope does not match its source draft binding"
             )
+        decision_time = ensure_timestamp(
+            self._clock.now() if as_of is None else as_of
+        )
         binding = CohortEvidenceBinding(
             manifest_id=query.manifest_id,
             manifest_version=query.manifest_version,
             profile_id=query.profile_id,
-            profile_type=profile.profile_type,
-            resolved_profile_digest=profile.resolved_profile_digest,
+            profile_type=scope.profile_type,
+            resolved_profile_digest=scope.resolved_profile_digest,
             draft_id=query.draft_id,
             draft_revision=query.expected_revision,
             draft_digest=query.expected_digest,
         )
+        snapshot = self._resolve_verified_snapshot(
+            binding,
+            as_of=decision_time,
+        ).snapshot
+        batch = self._proposal_cache.get_batch(
+            CohortBatchCacheKey(
+                evidence_binding=binding,
+                snapshot_artifact_digest=(
+                    snapshot.compatibility.artifact_digest
+                ),
+            )
+        )
+        if batch is None:
+            raise CohortContractError(
+                "the exact proposal batch must be loaded before recording a decision"
+            )
+        self._validate_decision_batch_binding(
+            batch,
+            binding=binding,
+            snapshot=snapshot,
+        )
+        self._enforce_batch_bounds(batch)
+        return ResolvedCohortReview(
+            evidence_binding=binding,
+            snapshot=snapshot,
+            batch=batch,
+            as_of=decision_time,
+        )
+
+    def _resolve_verified_snapshot(
+        self,
+        binding: CohortEvidenceBinding,
+        *,
+        as_of: datetime,
+    ) -> VerifiedCohortSnapshot:
         stored = self._snapshot_repository.get_snapshot(binding)
         if stored is None:
             raise ResourceNotFoundError(
-                "no trusted evidence snapshot exists for the exact draft and profile binding"
+                "no trusted evidence snapshot exists for the exact draft "
+                "and profile binding"
             )
         if stored.binding != binding:
             raise EvidenceSnapshotMismatchError(
@@ -343,6 +484,77 @@ class CohortProposalService:
         snapshot = verified.snapshot
         if as_of < snapshot.collected_at or as_of >= snapshot.expires_at:
             raise StaleEvidenceSnapshotError("the trusted evidence snapshot is stale")
+        return verified
+
+    def _resolve_context(
+        self,
+        actor: Actor,
+        query: CohortProposalQuery,
+    ) -> _ResolvedCohortContext:
+        if actor.kind is not ActorKind.HUMAN:
+            raise AuthorizationError("cohort proposal APIs require a verified human actor")
+        self._authorization.require_explicit(actor, Permission.READ, query.manifest_id)
+        as_of = ensure_timestamp(self._clock.now())
+        with self._context_store.transaction() as tx:
+            draft = tx.get_draft(query.draft_id)
+            selector_authority = (
+                None
+                if draft is None
+                else persisted_selector_authority_for_draft(
+                    tx,
+                    current=draft,
+                )
+            )
+        if draft is None:
+            raise ResourceNotFoundError(f"draft {query.draft_id!r} was not found")
+        self._ensure_query_matches_draft(query, draft)
+        if draft.state is not DraftState.DRAFT:
+            raise InvalidTransitionError("cohort proposals require an active draft state")
+        if (
+            draft.manifest.compatibility.artifact_digest
+            != draft.manifest.compute_artifact_digest_value()
+            or draft.manifest_digest != draft.manifest.compatibility.artifact_digest
+        ):
+            raise DigestMismatchError("draft manifest digest is not canonical")
+        try:
+            profile = (
+                resolve_manifest_profile(
+                    draft.manifest,
+                    query.profile_id,
+                    as_of=as_of,
+                )
+                if selector_authority is None
+                else _resolve_manifest_profile_for_cohort_decision(
+                    draft.manifest,
+                    query.profile_id,
+                    as_of=as_of,
+                    selector_capability=selector_authority,
+                )
+            )
+        except AthenaValidationError as exc:
+            raise CohortProfileMismatchError(
+                "the requested profile does not resolve from the exact draft"
+            ) from exc
+        if (
+            profile.profile_id != query.profile_id
+            or profile.manifest_id != query.manifest_id
+            or profile.manifest_version != query.manifest_version
+        ):
+            raise CohortProfileMismatchError(
+                "the resolved profile does not exactly match the request binding"
+            )
+        binding = CohortEvidenceBinding(
+            manifest_id=query.manifest_id,
+            manifest_version=query.manifest_version,
+            profile_id=query.profile_id,
+            profile_type=profile.profile_type,
+            resolved_profile_digest=profile.resolved_profile_digest,
+            draft_id=query.draft_id,
+            draft_revision=query.expected_revision,
+            draft_digest=query.expected_digest,
+        )
+        verified = self._resolve_verified_snapshot(binding, as_of=as_of)
+        snapshot = verified.snapshot
         profile_scopes = {
             scope.canonical_json() for scope in profile.allowed_evidence_scopes
         }
@@ -422,6 +634,67 @@ class CohortProposalService:
         ):
             raise CohortContractError(
                 "cohort proposal batch contains a cross-profile or cross-snapshot result"
+            )
+        CohortProposalService._validate_proposal_set_digest(batch)
+
+    @staticmethod
+    def _validate_decision_batch_binding(
+        batch: CohortProposalBatchResponse,
+        *,
+        binding: CohortEvidenceBinding,
+        snapshot: EvidenceSnapshot,
+    ) -> None:
+        """Validate an immutable source batch without requiring the mutable draft head."""
+
+        scope = batch.scope
+        batch_snapshot = batch.snapshot
+        source = batch.source_draft
+        if (
+            source.draft_id != binding.draft_id
+            or source.revision != binding.draft_revision
+            or source.manifest_digest != binding.draft_digest
+            or scope.manifest_id != binding.manifest_id
+            or scope.manifest_version != binding.manifest_version
+            or scope.profile_id != binding.profile_id
+            or scope.profile_type != binding.profile_type
+            or scope.resolved_profile_digest != binding.resolved_profile_digest
+            or batch_snapshot.snapshot_id != snapshot.snapshot_id
+            or batch_snapshot.artifact_digest
+            != snapshot.compatibility.artifact_digest
+            or batch_snapshot.semantic_digest
+            != snapshot.compatibility.semantic_digest
+            or batch_snapshot.collected_at != snapshot.collected_at
+            or batch_snapshot.expires_at != snapshot.expires_at
+        ):
+            raise EvidenceSnapshotMismatchError(
+                "cohort proposal batch escaped its immutable decision binding"
+            )
+        if any(
+            proposal.scope != scope or proposal.snapshot != batch_snapshot
+            for proposal in batch.proposals
+        ):
+            raise CohortContractError(
+                "cohort proposal batch contains a cross-profile or cross-snapshot result"
+            )
+        CohortProposalService._validate_proposal_set_digest(batch)
+
+    @staticmethod
+    def _validate_proposal_set_digest(
+        batch: CohortProposalBatchResponse,
+    ) -> None:
+        expected = compute_artifact_digest(
+            [
+                proposal.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for proposal in batch.proposals
+            ]
+        )
+        if batch.proposal_set_digest != expected:
+            raise CohortContractError(
+                "cohort proposal batch digest does not match its proposals"
             )
 
     @staticmethod
@@ -508,6 +781,7 @@ class CohortProposalService:
 
     def _build_candidate(
         self,
+        actor: Actor,
         request: CohortReviewPreviewRequest,
         batch: CohortProposalBatchResponse,
         proposals: list[CohortProposal],
@@ -517,6 +791,7 @@ class CohortProposalService:
         if len(source_members) > 1000:
             raise CohortBoundaryError("preview source union exceeds 1,000 members")
         resources = _resource_records(resolved.snapshot)
+        baseline = proposals[0].role
         if request.action == "split":
             previews = self._split_previews(
                 source_members,
@@ -529,7 +804,11 @@ class CohortProposalService:
                 request=request,
                 resources=resources,
             )
-        baseline = proposals[0].role
+        previews = self._guard_selector_replacements(
+            previews,
+            baseline=baseline,
+            resources=resources,
+        )
         role_payload = baseline.model_dump(
             mode="python",
             by_alias=True,
@@ -549,6 +828,7 @@ class CohortProposalService:
         )
         candidate_seed = compute_artifact_digest(
             {
+                "actorId": actor.actor_id,
                 "action": request.action,
                 "draftId": request.draft_id,
                 "draftRevision": request.expected_revision,
@@ -676,6 +956,142 @@ class CohortProposalService:
         return previews
 
     @staticmethod
+    def _guard_selector_replacements(
+        previews: list[SelectorPreview],
+        *,
+        baseline: ManifestRole,
+        resources: list[ResourceEvidenceRecord],
+    ) -> list[SelectorPreview]:
+        """Bind every exact selector to one inherited atomic selector."""
+
+        inherited_results: list[tuple[ManifestSelector, set[str]]] = []
+        for selector in baseline.selectors:
+            try:
+                result = evaluate_selector(selector, resources)
+            except AthenaValidationError:
+                continue
+            if result.status == "matched" and not result.max_match_violations:
+                inherited_results.append(
+                    (
+                        selector,
+                        {
+                            normalize_resource_id(resource_id)
+                            for resource_id in result.matched_resource_ids
+                        },
+                    )
+                )
+
+        guarded: list[SelectorPreview] = []
+        for preview in previews:
+            if isinstance(
+                preview.selector,
+                (CompositeAllSelector, CompositeAnySelector),
+            ):
+                raise CohortContractError(
+                    "cohort replacement requires an exact atomic selector"
+                )
+            members = {
+                normalize_resource_id(resource_id)
+                for resource_id in preview.matched_resource_ids
+            }
+            guards = [
+                selector
+                for selector, inherited_members in inherited_results
+                if members.issubset(inherited_members)
+            ]
+            if len(guards) != 1:
+                raise CohortContractError(
+                    "cohort replacement is not bound to exactly one inherited selector"
+                )
+            guard = guards[0]
+            guard_atoms: list[AtomicSelector]
+            if isinstance(guard, CompositeAllSelector):
+                guard_atoms = list(guard.children)
+            elif isinstance(guard, CompositeAnySelector):
+                matching_atoms: list[AtomicSelector] = []
+                for child in guard.children:
+                    try:
+                        child_result = evaluate_selector(child, resources)
+                    except AthenaValidationError:
+                        continue
+                    child_members = {
+                        normalize_resource_id(resource_id)
+                        for resource_id in child_result.matched_resource_ids
+                    }
+                    if (
+                        not child_result.max_match_violations
+                        and members.issubset(child_members)
+                    ):
+                        matching_atoms.append(child)
+                if len(matching_atoms) != 1:
+                    raise CohortContractError(
+                        "cohort replacement is not bound to exactly one "
+                        "inherited composite alternative"
+                    )
+                guard_atoms = matching_atoms
+            else:
+                guard_atoms = [guard]
+            if len(guard_atoms) >= 10:
+                raise CohortContractError(
+                    "cohort replacement exceeds the guarded selector child bound"
+                )
+            seed = compute_artifact_digest(
+                {
+                    "replacementSelectorId": preview.selector.selector_id,
+                    "guardSelectorId": guard.selector_id,
+                    "members": sorted(members),
+                }
+            )[7:31]
+            guard_children: list[AtomicSelector] = []
+            for index, guard_atom in enumerate(guard_atoms, start=1):
+                guard_payload = guard_atom.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                guard_payload["selectorId"] = (
+                    f"cohort-guard-{index:02d}-{seed}"
+                )
+                guard_children.append(
+                    _ATOMIC_SELECTOR_ADAPTER.validate_python(guard_payload)
+                )
+            exact_payload = preview.selector.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+            exact_payload["selectorId"] = f"cohort-exact-{seed}"
+            exact_child = _ATOMIC_SELECTOR_ADAPTER.validate_python(
+                exact_payload
+            )
+            guarded_selector = CompositeAllSelector(
+                selectorType="compositeAll",
+                selectorId=preview.selector.selector_id,
+                children=sorted(
+                    [exact_child, *guard_children],
+                    key=lambda child: child.selector_id.casefold(),
+                ),
+                maxMatches=preview.max_matches,
+            )
+            guarded_preview = CohortProposalService._evaluate_exact_preview(
+                guarded_selector,
+                resources,
+            )
+            if guarded_preview.matched_resource_ids != preview.matched_resource_ids:
+                raise CohortContractError(
+                    "guarded cohort selector changed the exact reviewed membership"
+                )
+            guarded.append(guarded_preview)
+        if not is_guarded_selector_replacement_narrower(
+            baseline.selectors,
+            [preview.selector for preview in guarded],
+        ):
+            raise CohortContractError(
+                "cohort replacement is not a provably narrower guarded selector set"
+            )
+        return guarded
+
+    @staticmethod
     def _evaluate_exact_preview(
         selector: ManifestSelector,
         resources: list[ResourceEvidenceRecord],
@@ -715,6 +1131,13 @@ class CohortProposalService:
             if _authority_projection(update.role) != _authority_projection(baseline):
                 raise CohortContractError(
                     "preview attempted to alter role kind, cardinality, owner, or status"
+                )
+            if not is_guarded_selector_replacement_narrower(
+                baseline.selectors,
+                update.role.selectors,
+            ):
+                raise CohortContractError(
+                    "preview selector replacement is not canonically guarded"
                 )
             update_union: set[str] = set()
             for preview in update.selector_previews:
@@ -786,4 +1209,4 @@ class CohortProposalService:
             )
 
 
-__all__ = ["CohortProposalService"]
+__all__ = ["CohortProposalService", "ResolvedCohortReview"]

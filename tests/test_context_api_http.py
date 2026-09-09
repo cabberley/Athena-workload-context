@@ -1,36 +1,62 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
 
 import athena_context.api.http as http_module
-from athena_context.api.authorization import StaticTestAuthenticator
+from athena_context.api.authorization import (
+    RoleBasedAuthorization,
+    StaticTestAuthenticator,
+)
+from athena_context.api.cohort_decision_service import CohortDecisionService
+from athena_context.api.cohort_memory import (
+    CallableTrustedEvidenceSnapshotVerifier,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
+    ApproveCommand,
     AuthenticationMethod,
     CreateDraftCommand,
+    DraftState,
     PublishCommand,
+    ReplaceDraftCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
     TransitionCommand,
+    ValidationRecord,
     VerifiedAuthentication,
 )
 from athena_context.api.http import SystemClock, create_app
+from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
+from athena_context.contracts.manifest import (
+    CanonicalWorkloadManifest,
+    canonicalize_manifest_payload,
+)
 from context_api_support import (
     AGENT,
     APPROVER,
     AUDITOR,
     AUTHOR,
+    OPERATIONAL_CONTEXT_SERVICE,
     OUTSIDER,
     PUBLISHER,
+    REVIEWER,
     approve_draft,
     build_service,
     canonical_manifest,
     create_draft,
+    issue_operational_context_receipt,
+    operational_context_command,
     publish_draft,
     transition,
 )
+from test_context_api_cohorts import _build_harness
 
 BAD_DIGEST = "sha256:" + ("0" * 64)
 _TOKENS = {
@@ -40,7 +66,100 @@ _TOKENS = {
     PUBLISHER.actor_id: "synthetic-publisher-token",
     AUDITOR.actor_id: "synthetic-auditor-token",
     OUTSIDER.actor_id: "synthetic-outsider-token",
+    OPERATIONAL_CONTEXT_SERVICE.actor_id: "synthetic-operational-token",
 }
+
+
+def test_context_api_rejects_partial_cohort_composition() -> None:
+    with pytest.raises(ValueError, match="supplied together"):
+        create_app(
+            service=build_service(),
+            cohort_service=cast(CohortProposalService, object()),
+        )
+
+
+def test_operational_receipt_route_requires_service_authority() -> None:
+    service, client = _client()
+    draft = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="http-operational-receipt",
+    )
+    command = operational_context_command(service, draft)
+
+    denied = client.post(
+        "/v1/operational-context-receipts",
+        headers=_headers(
+            APPROVER.actor_id,
+            "http-operational-human-denied",
+        ),
+        json=command.model_dump(mode="json", by_alias=True),
+    )
+    issued = client.post(
+        "/v1/operational-context-receipts",
+        headers=_headers(
+            OPERATIONAL_CONTEXT_SERVICE.actor_id,
+            "http-operational-service-issued",
+        ),
+        json=command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "authorization_denied"
+    assert issued.status_code == 201, issued.text
+    assert issued.json()["draft_id"] == draft.draft_id
+    assert issued.json()["draft_revision"] == draft.revision
+
+
+def test_context_api_rejects_disconnected_cohort_composition() -> None:
+    cohort = _build_harness()
+
+    with pytest.raises(ValueError, match="share the app-owned"):
+        create_app(
+            service=build_service(),
+            cohort_service=cohort.cohorts,
+            cohort_decision_service=cohort.decisions,
+        )
+
+
+def test_context_api_rejects_mismatched_cohort_authorization() -> None:
+    cohort = _build_harness()
+    foreign_authorization = RoleBasedAuthorization()
+    proposals = CohortProposalService(
+        context_store=cohort.store,
+        authorization=foreign_authorization,
+        clock=cohort.clock,
+        snapshot_repository=cohort.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            cohort.verifier
+        ),
+        proposal_cache=cohort.persistence,
+        preview_receipts=cohort.persistence,
+    )
+    decisions = CohortDecisionService(
+        store=cohort.store,
+        authorization=foreign_authorization,
+        clock=cohort.clock,
+        context_service=cohort.lifecycle,
+        proposal_service=proposals,
+        candidate_repository=cohort.persistence,
+    )
+
+    with pytest.raises(ValueError, match="share the app-owned"):
+        create_app(
+            service=cohort.lifecycle,
+            cohort_service=proposals,
+            cohort_decision_service=decisions,
+        )
+
+
+def test_unconfigured_context_api_does_not_advertise_cohort_routes() -> None:
+    schema = TestClient(create_app()).get("/openapi.json").json()
+
+    assert not any(
+        path.startswith("/v1/cohort-proposals")
+        for path in schema["paths"]
+    )
 
 
 def _verified(actor: Actor) -> VerifiedAuthentication:
@@ -53,16 +172,60 @@ def _verified(actor: Actor) -> VerifiedAuthentication:
     )
 
 
-def _client() -> tuple[ContextService, TestClient]:
-    service = build_service()
+def _client(
+    *,
+    store: InMemoryContextStore | None = None,
+) -> tuple[ContextService, TestClient]:
+    service = build_service(store=store)
     authenticator = StaticTestAuthenticator(
         {
             _TOKENS[actor.actor_id]: _verified(actor)
-            for actor in [AGENT, AUTHOR, APPROVER, PUBLISHER, AUDITOR, OUTSIDER]
+            for actor in [
+                AGENT,
+                AUTHOR,
+                APPROVER,
+                PUBLISHER,
+                AUDITOR,
+                OUTSIDER,
+                OPERATIONAL_CONTEXT_SERVICE,
+            ]
         }
     )
     return service, TestClient(
         create_app(service=service, authentication=authenticator)
+    )
+
+
+def _invalid_inherited_selector_manifest(
+    base: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = base.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    worker = next(
+        role for role in payload["roles"] if role["roleId"] == "worker"
+    )
+    replacement = deepcopy(worker)
+    replacement["selectors"][0]["selectorId"] = "arbitrary-inherited-selector"
+    payload["profiles"]["production"]["roles"] = [replacement]
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
+    )
+
+
+def _unresolved_profile_manifest(
+    base: CanonicalWorkloadManifest,
+) -> CanonicalWorkloadManifest:
+    payload = base.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["roles"][0]["ownerRef"] = "missing-synthetic-owner"
+    return CanonicalWorkloadManifest.model_validate(
+        canonicalize_manifest_payload(payload)
     )
 
 
@@ -78,6 +241,29 @@ def _headers(
     if spoofed_actor is not None:
         headers["X-Athena-Actor"] = spoofed_actor
     return headers
+
+
+def test_profile_authority_route_returns_the_exact_resolved_digest() -> None:
+    service, client = _client()
+    draft = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="profile-authority-draft",
+    )
+
+    response = client.get(
+        f"/v1/drafts/{draft.draft_id}/profiles/production/authority",
+        headers=_headers(AGENT.actor_id),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "manifest_id": draft.manifest_id,
+        "manifest_version": draft.manifest.manifest_version,
+        "profile_id": "production",
+        "resolved_profile_digest": response.json()["resolved_profile_digest"],
+    }
+    assert response.json()["resolved_profile_digest"].startswith("sha256:")
 
 
 def test_system_clock_preserves_supported_subsecond_expiry_boundary(
@@ -122,6 +308,7 @@ def test_openapi_exposes_typed_lifecycle_contracts() -> None:
     schema = client.get("/openapi.json").json()
 
     assert schema["info"]["title"] == "Athena Context API"
+    assert "/v1/drafts/{draft_id}/review" in schema["paths"]
     assert "/v1/drafts/{draft_id}/approve" in schema["paths"]
     assert "/v1/drafts/{draft_id}/publish" in schema["paths"]
     assert "/v1/manifests/{manifest_id}/compare" in schema["paths"]
@@ -299,6 +486,218 @@ def test_http_digest_failure_is_typed() -> None:
     assert digest_response.json()["error"]["code"] == "digest_mismatch"
 
 
+def test_http_create_resolves_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    _, client = _client(store=store)
+    manifest = _invalid_inherited_selector_manifest(canonical_manifest())
+    create = CreateDraftCommand(
+        draft_id="invalid-inheritance-workflow",
+        manifest=manifest,
+        manifest_digest=manifest.compatibility.artifact_digest,
+        reason="Create a structurally valid but unresolved synthetic draft",
+    )
+    created = client.post(
+        "/v1/drafts",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-create"),
+        json=create.model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
+
+    assert created.status_code == 422, created.text
+    assert created.json()["error"]["code"] == "manifest_validation_failed"
+    with store.transaction() as tx:
+        assert tx.get_draft(create.draft_id) is None
+        assert tx.get_draft_selector_baseline(create.draft_id) is None
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == []
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-create",
+        ) is None
+
+
+def test_http_put_resolves_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-profile-put",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    command = ReplaceDraftCommand(
+        expected_revision=initial.revision,
+        expected_manifest_version=initial.manifest.manifest_version,
+        expected_digest=initial.manifest_digest,
+        replacement_manifest=manifest,
+        replacement_digest=manifest.compatibility.artifact_digest,
+        reason="Reject an unresolved profile before ordinary replacement",
+    )
+    with store.transaction() as tx:
+        audit_before = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    response = client.put(
+        f"/v1/drafts/{initial.draft_id}",
+        headers=_headers(AGENT.actor_id, "invalid-profile-put"),
+        json=command.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == initial
+    with store.transaction() as tx:
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
+        assert tx.get_receipt(AGENT.actor_id, "invalid-profile-put") is None
+
+
+def test_http_validate_and_submit_resolve_every_profile_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    initial = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="invalid-inheritance-workflow",
+    )
+    manifest = _unresolved_profile_manifest(initial.manifest)
+    tampered = initial.model_copy(
+        update={
+            "manifest": manifest,
+            "manifest_digest": manifest.compatibility.artifact_digest,
+        }
+    )
+    with store.transaction() as tx:
+        tx.put_draft(tampered, expected_revision=initial.revision)
+        audit_before_validate = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    validate = client.post(
+        f"/v1/drafts/{initial.draft_id}/validate",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-validate"),
+        json=transition(
+            tampered,
+            "Reject unresolved selector inheritance during validation",
+        ).model_dump(mode="json"),
+    )
+
+    assert validate.status_code == 422, validate.text
+    assert validate.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == tampered
+    with store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=manifest.manifest_id
+        ) == audit_before_validate
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-validate",
+        ) is None
+        current = tx.get_draft(initial.draft_id)
+        assert current is not None
+        previously_validated = current.model_copy(
+            update={
+                "state": DraftState.VALIDATED,
+                "revision": 2,
+                "validation": ValidationRecord(
+                    validated_by=AGENT,
+                    validated_at=current.updated_at,
+                    validated_revision=2,
+                    manifest_digest=current.manifest_digest,
+                ),
+            }
+        )
+        tx.put_draft(previously_validated, expected_revision=current.revision)
+    with store.transaction() as tx:
+        audit_before_submit = tx.list_audit(manifest_id=manifest.manifest_id)
+
+    submit = client.post(
+        f"/v1/drafts/{initial.draft_id}/submit",
+        headers=_headers(AGENT.actor_id, "invalid-inheritance-submit"),
+        json=transition(
+            previously_validated,
+            "Reject unresolved selector inheritance during submission",
+        ).model_dump(mode="json"),
+    )
+
+    assert submit.status_code == 422, submit.text
+    assert submit.json()["error"]["code"] == "manifest_validation_failed"
+    assert service.get_draft(AGENT, initial.draft_id) == previously_validated
+    with store.transaction() as tx:
+        assert tx.list_audit(
+            manifest_id=manifest.manifest_id
+        ) == audit_before_submit
+        assert tx.get_receipt(
+            AGENT.actor_id,
+            "invalid-inheritance-submit",
+        ) is None
+
+
+def test_http_publish_rechecks_profile_resolution_without_side_effects() -> None:
+    store = InMemoryContextStore()
+    service, client = _client(store=store)
+    approved = approve_draft(
+        service,
+        create_draft(
+            service,
+            canonical_manifest(),
+            draft_id="invalid-inheritance-publish",
+        ),
+        key_prefix="invalid-inheritance-publish",
+    )
+    assert approved.review is not None
+    assert approved.publication_candidate is not None
+    assert approved.approval is not None
+    manifest = _unresolved_profile_manifest(approved.manifest)
+    digest = manifest.compatibility.artifact_digest
+    tampered = approved.model_copy(
+        update={
+            "manifest": manifest,
+            "manifest_digest": digest,
+            "review": approved.review.model_copy(
+                update={"publication_candidate_digest": digest}
+            ),
+            "publication_candidate": approved.publication_candidate.model_copy(
+                update={
+                    "manifest_digest": digest,
+                    "semantic_digest": manifest.compatibility.semantic_digest,
+                }
+            ),
+            "approval": approved.approval.model_copy(
+                update={"manifest_digest": digest}
+            ),
+        }
+    )
+    with store.transaction() as tx:
+        tx.put_draft(tampered, expected_revision=approved.revision)
+        audit_before = tx.list_audit(manifest_id=manifest.manifest_id)
+    command = PublishCommand(
+        **transition(
+            tampered,
+            "Reject unresolved selector inheritance before publication",
+        ).model_dump(),
+        approval_id=tampered.approval.decision_id,
+        operational_context_receipt_id=(
+            tampered.approval.operational_context_receipt_id
+        ),
+    )
+
+    response = client.post(
+        f"/v1/drafts/{tampered.draft_id}/publish",
+        headers=_headers(PUBLISHER.actor_id, "invalid-inheritance-publish-final"),
+        json=command.model_dump(mode="json"),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "stale_approval"
+    assert service.get_draft(PUBLISHER, tampered.draft_id) == tampered
+    with store.transaction() as tx:
+        assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
+        assert tx.get_receipt(
+            PUBLISHER.actor_id,
+            "invalid-inheritance-publish-final",
+        ) is None
+        assert tx.list_published(manifest_id=manifest.manifest_id) == []
+
+
 def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None:
     service, client = _client()
     manifest = canonical_manifest()
@@ -322,7 +721,10 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
             "http-agent-approve",
             spoofed_actor=APPROVER.actor_id,
         ),
-        json=transition(draft, "Agent must not approve").model_dump(mode="json"),
+        json=ApproveCommand(
+            **transition(draft, "Agent must not approve").model_dump(),
+            operational_context_receipt_id="operational-placeholder",
+        ).model_dump(mode="json"),
     )
     publisher_spoof_approval_response = client.post(
         f"/v1/drafts/{draft.draft_id}/approve",
@@ -331,15 +733,43 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
             "http-agent-publisher-spoof-approve",
             spoofed_actor=PUBLISHER.actor_id,
         ),
-        json=transition(draft, "Publisher header must not replace agent").model_dump(
-            mode="json"
+        json=ApproveCommand(
+            **transition(
+                draft,
+                "Publisher header must not replace agent",
+            ).model_dump(),
+            operational_context_receipt_id="operational-placeholder",
+        ).model_dump(mode="json"),
+    )
+    reviewed = service.review_draft(
+        REVIEWER,
+        draft.draft_id,
+        "http-human-review",
+        ReviewCommand(
+            **transition(
+                draft,
+                "Human reviews exact candidate",
+            ).model_dump(),
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact HTTP candidate.",
         ),
+    )
+    approval_receipt = issue_operational_context_receipt(
+        service,
+        reviewed,
+        key_prefix="http-human-approve",
     )
     approved = service.approve_draft(
         APPROVER,
         draft.draft_id,
         "http-human-approve",
-        transition(draft, "Human approves exact candidate"),
+        ApproveCommand(
+            **transition(
+                reviewed,
+                "Human approves exact candidate",
+            ).model_dump(),
+            operational_context_receipt_id=approval_receipt.receipt_id,
+        ),
     )
     assert approved.approval is not None
     publication_response = client.post(
@@ -352,6 +782,7 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
         json=PublishCommand(
             **transition(approved, "Agent must not publish").model_dump(),
             approval_id=approved.approval.decision_id,
+            operational_context_receipt_id="operational-placeholder",
         ).model_dump(mode="json"),
     )
     unverified_response = client.get(

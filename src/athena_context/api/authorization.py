@@ -53,7 +53,14 @@ _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.SUBMIT,
         }
     ),
-    Role.REVIEWER: frozenset({Permission.READ, Permission.LIST, Permission.AUDIT}),
+    Role.REVIEWER: frozenset(
+        {
+            Permission.READ,
+            Permission.LIST,
+            Permission.AUDIT,
+            Permission.REVIEW,
+        }
+    ),
     Role.APPROVER: frozenset(
         {Permission.READ, Permission.LIST, Permission.AUDIT, Permission.APPROVE}
     ),
@@ -68,9 +75,20 @@ _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     ),
     Role.READER: frozenset({Permission.READ, Permission.LIST}),
     Role.AUDITOR: frozenset({Permission.READ, Permission.LIST, Permission.AUDIT}),
+    Role.OPERATIONAL_CONTEXT_ISSUER: frozenset(
+        {
+            Permission.READ,
+            Permission.ISSUE_OPERATIONAL_CONTEXT,
+        }
+    ),
 }
 _HUMAN_ONLY = frozenset(
-    {Permission.APPROVE, Permission.PUBLISH, Permission.SUPERSEDE}
+    {
+        Permission.REVIEW,
+        Permission.APPROVE,
+        Permission.PUBLISH,
+        Permission.SUPERSEDE,
+    }
 )
 
 

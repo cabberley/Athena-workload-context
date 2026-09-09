@@ -350,7 +350,7 @@ def test_one_shot_composition_uses_existing_services_without_context_api(
     )
     prepared = prepare_wc013_live_acceptance(rendered.plan_path)
     collected = _collected_evidence(prepared)
-    clock = StepClock(CURRENT_NOW + timedelta(seconds=10))
+    clock = StepClock(CURRENT_NOW + timedelta(seconds=20))
     resolver = key_resolver(CANONICAL_PRIVATE_KEY.public_key())
 
     runtime_environment = {

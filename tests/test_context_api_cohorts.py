@@ -14,6 +14,7 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortBatchCacheKey,
     CohortEvidenceBinding,
@@ -39,6 +40,7 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadGrantScope,
 )
+from athena_context.api.errors import CohortContractError
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
@@ -60,12 +62,17 @@ from test_cohort_binding import _build_attested_snapshot
 
 AS_OF = datetime(2025, 6, 1, 12, tzinfo=UTC)
 HUMAN = Actor(actor_id="human-cohort-reviewer", kind=ActorKind.HUMAN)
+SECOND_REVIEWER = Actor(
+    actor_id="human-cohort-reviewer-two",
+    kind=ActorKind.HUMAN,
+)
 OUTSIDER = Actor(actor_id="human-cohort-outsider", kind=ActorKind.HUMAN)
 WILDCARD = Actor(actor_id="human-wildcard-reader", kind=ActorKind.HUMAN)
 AGENT = Actor(actor_id="cohort-agent", kind=ActorKind.AGENT)
 PUBLICATION_SERVICE = Actor(actor_id="context-api-service", kind=ActorKind.SERVICE)
 TOKENS = {
     HUMAN.actor_id: "cohort-human-token",
+    SECOND_REVIEWER.actor_id: "cohort-human-two-token",
     OUTSIDER.actor_id: "cohort-outsider-token",
     WILDCARD.actor_id: "cohort-wildcard-token",
     AGENT.actor_id: "cohort-agent-token",
@@ -88,6 +95,7 @@ class Harness:
     store: InMemoryContextStore
     lifecycle: ContextService
     cohorts: CohortProposalService
+    decisions: CohortDecisionService
     snapshots: InMemoryEvidenceSnapshotRepository
     persistence: InMemoryCohortPersistence
     authorization: RoleBasedAuthorization
@@ -160,6 +168,11 @@ def _build_harness(
             scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
         ),
         RoleGrant(
+            actor_id=SECOND_REVIEWER.actor_id,
+            role=Role.PROPOSER,
+            scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
+        ),
+        RoleGrant(
             actor_id=AGENT.actor_id,
             role=Role.READER,
             scope=WorkloadGrantScope(workload_id=selected_manifest.manifest_id),
@@ -208,15 +221,24 @@ def _build_harness(
         proposal_cache=persistence,
         preview_receipts=persistence,
     )
+    decisions = CohortDecisionService(
+        store=store,
+        authorization=authorization,
+        clock=clock,
+        context_service=lifecycle,
+        proposal_service=cohorts,
+        candidate_repository=persistence,
+    )
     identities = {
         TOKENS[actor.actor_id]: _verified(actor)
-        for actor in (HUMAN, OUTSIDER, WILDCARD, AGENT)
+        for actor in (HUMAN, SECOND_REVIEWER, OUTSIDER, WILDCARD, AGENT)
     }
     client = TestClient(
         create_app(
             service=lifecycle,
             authentication=StaticTestAuthenticator(identities),
             cohort_service=cohorts,
+            cohort_decision_service=decisions,
         )
     )
     harness = Harness(
@@ -226,6 +248,7 @@ def _build_harness(
         store=store,
         lifecycle=lifecycle,
         cohorts=cohorts,
+        decisions=decisions,
         snapshots=snapshots,
         persistence=persistence,
         authorization=authorization,
@@ -440,7 +463,6 @@ def test_snapshot_is_cryptographically_verified_on_cache_hits_and_staleness_fail
     second = _load(harness)
     assert first == second
     assert len(harness.verifier_calls) == 2
-
     harness.clock.value = harness.snapshot.expires_at
     stale = harness.client.get(
         "/v1/cohort-proposals",
@@ -449,6 +471,23 @@ def test_snapshot_is_cryptographically_verified_on_cache_hits_and_staleness_fail
     )
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "stale_evidence_snapshot"
+
+
+def test_cached_proposal_content_is_rehashed_before_reuse() -> None:
+    harness = _build_harness()
+    _load(harness)
+    cached = next(iter(harness.persistence._batches.values()))
+    cached.proposals[0].members.append(
+        "/subscriptions/11111111-1111-1111-1111-111111111111/"
+        "resourcegroups/rg-synthetic/providers/microsoft.compute/"
+        "virtualmachines/injected-member"
+    )
+
+    with pytest.raises(CohortContractError, match="digest"):
+        harness.cohorts.get_proposals(
+            HUMAN,
+            CohortProposalQuery(**_params(harness)),
+        )
 
 
 def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
@@ -497,6 +536,14 @@ def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
         proposal_cache=oversized.persistence,
         preview_receipts=oversized.persistence,
     )
+    oversized.decisions = CohortDecisionService(
+        store=oversized.store,
+        authorization=oversized.authorization,
+        clock=oversized.clock,
+        context_service=oversized.lifecycle,
+        proposal_service=oversized.cohorts,
+        candidate_repository=oversized.persistence,
+    )
     oversized.client = TestClient(
         create_app(
             service=oversized.lifecycle,
@@ -504,6 +551,7 @@ def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
                 {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
             ),
             cohort_service=oversized.cohorts,
+            cohort_decision_service=oversized.decisions,
         )
     )
     boundary = oversized.client.get(
@@ -771,6 +819,14 @@ def _synthetic_merge_batch(
         proposal_cache=fresh_persistence,
         preview_receipts=fresh_persistence,
     )
+    harness.decisions = CohortDecisionService(
+        store=harness.store,
+        authorization=harness.authorization,
+        clock=harness.clock,
+        context_service=harness.lifecycle,
+        proposal_service=harness.cohorts,
+        candidate_repository=fresh_persistence,
+    )
     harness.client = TestClient(
         create_app(
             service=harness.lifecycle,
@@ -778,6 +834,7 @@ def _synthetic_merge_batch(
                 {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
             ),
             cohort_service=harness.cohorts,
+            cohort_decision_service=harness.decisions,
         )
     )
     return merged
