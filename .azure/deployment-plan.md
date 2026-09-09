@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated — WC-024 deployment recovery
+> **Status:** Deployed — WC-024 phase-one monitoring foundation
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -475,8 +475,8 @@ All quota-exposed resources are well within regional limits.
 - [x] Deploy and verify AMPLS bootstrap scopes and collector VNet.
 - [x] Complete authoritative validation and what-if for the recovered
   foundation.
-- [ ] Deploy the phase-one foundation.
-- [ ] Keep private-only cutover deferred pending runtime acceptance.
+- [x] Deploy the phase-one foundation.
+- [x] Keep private-only cutover deferred pending runtime acceptance.
 
 ### WC-024 validation proof
 
@@ -506,6 +506,14 @@ All quota-exposed resources are well within regional limits.
 | First recovery deployment | `az deployment sub create` deployment `wc024-foundation-recovery-20260910-0119` | Failed after safe partial progress because the adopted LAW returned `dailyQuotaGb` as a Float while a read-only output declared Integer; no private cutover occurred |
 | Second recovery deployment | `az deployment sub create` deployment `wc024-foundation-20260910-0152` | Failed after safe partial progress because ARM does not permit converting a Float to a string in a template output; the unused output was removed |
 | Third recovery deployment | `az deployment sub create` deployment `wc024-foundation-20260910-0218` | Failed after safe partial progress because extension-resource IDs were emitted through runtime references without API versions and the canonical flow-log PUT omitted its existing location; no private cutover occurred |
+| Final foundation deployment | `az deployment sub create` deployment `wc024-foundation-20260910-0233` | Succeeded; correlation `5472b5ce-e2f7-42c3-b36c-d8837abe6d25` |
+| AMPLS verification | Live ARM reads for both scopes | Each remains Open/Open with zero exclusions, exact LAW+DCE membership, and one approved local private endpoint |
+| VM association verification | `az monitor data-collection rule association list` for all 11 VMs | Each VM has exactly one `athena-linux-dcr` and one `configurationAccessEndpoint` association |
+| Private endpoint/DNS verification | Azure CLI reads for all four endpoints, zone groups, zones, and VNet links | All endpoints and links succeeded; workload and collector DNS boundaries remain separate |
+| Flow-log verification | `az network watcher flow-log show` | Enabled on the reviewed VNet, writing to `athenademomonchab01`, Traffic Analytics enabled against `athena-hackathon-law` |
+| Data-boundary verification | Storage, container immutability, Key Vault, and public-access reads | Storage shared keys disabled with default deny/AzureServices bypass; evidence container has 30-day unlocked immutability; Key Vault is RBAC-only, purge-protected, and public access disabled |
+| Live RBAC verification | Role assignments for collector principal `ee4f8f59-adb1-46fa-9613-4ca5547d3553` | 41 exact assignments; conditioned 13-table LAW access, 11 exact VM signal scopes, 27 exact Reader scopes, container writer, and key Crypto User |
+| Deployed collector contract | Deployment output `monitoringCollectorContract` | Schema v2; conditioned workspace plus exact resource context; 13 tables, 27 Reader scopes, 11 signal scopes; Connection Monitor remains capability-only |
 
 **WC-024 validation timestamp:** 2026-09-10T00:22:53+10:00
 
@@ -519,6 +527,7 @@ All quota-exposed resources are well within regional limits.
 | `infra/wc024-monitoring-foundation/set-private-access.ps1` | Deferred private-only cutover |
 | `src/athena_context/contracts/monitoring.py` | Signed monitoring contracts |
 
-> Current: WC-024 bootstrap and collector connectivity are deployed and
-> verified. The recovered foundation is validated and ready for a serialized
-> retry; private-only cutover remains deferred.
+> Current: WC-024 phase-one monitoring foundation is deployed and verified.
+> Private-only cutover remains deferred until collector runtime connectivity,
+> allowed/denied query behavior, signing/writing, ingestion, and negative-access
+> checks pass.
