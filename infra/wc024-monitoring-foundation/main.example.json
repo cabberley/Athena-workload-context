@@ -56,9 +56,6 @@
     "monitoringCollectorKeyVaultName": {
       "value": "athenademomonkv"
     },
-    "collectorRoleDefinitionGuid": {
-      "value": "14d3d0d4-28bd-45b3-b0e0-18c581d57b5e"
-    },
     "retentionDays": {
       "value": 30
     },

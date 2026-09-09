@@ -21,7 +21,7 @@ from athena_context.contracts.models import (
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
 MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
-    "athena.wc024MonitoringCollectorContract.v1"
+    "athena.wc024MonitoringCollectorContract.v2"
 )
 MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = (
     "athena.wc024MonitoringEvidenceHandoff.v1"
@@ -40,26 +40,29 @@ type MonitoringSignalKind = Literal[
 type MonitoringReadOperation = Literal[
     "Microsoft.OperationalInsights/workspaces/read",
     "Microsoft.OperationalInsights/workspaces/query/read",
-    "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
-    "Microsoft.OperationalInsights/workspaces/query/Perf/read",
-    "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
-    "Microsoft.OperationalInsights/workspaces/query/Syslog/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMComputer/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMConnection/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMBoundPort/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMProcess/read",
-    "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read",
+    "Microsoft.OperationalInsights/workspaces/tables/data/read",
+    "Microsoft.Compute/virtualMachines/instanceView/read",
     "Microsoft.Insights/Metrics/Read",
     "Microsoft.Insights/dataCollectionRules/read",
     "Microsoft.Insights/dataCollectionEndpoints/read",
     "Microsoft.Insights/dataCollectionRuleAssociations/read",
     "Microsoft.Insights/privateLinkScopes/read",
     "Microsoft.Network/networkWatchers/flowLogs/read",
-    "Microsoft.Network/networkWatchers/connectionMonitors/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDestinationListenerResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read",
+]
+type MonitoringLogTable = Literal[
+    "Heartbeat",
+    "Perf",
+    "InsightsMetrics",
+    "Syslog",
+    "VMComputer",
+    "VMConnection",
+    "VMBoundPort",
+    "VMProcess",
+    "NTANetAnalytics",
+    "NWConnectionMonitorDestinationListenerResult",
+    "NWConnectionMonitorDNSResult",
+    "NWConnectionMonitorPathResult",
+    "NWConnectionMonitorTestResult",
 ]
 
 _DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
@@ -72,8 +75,50 @@ _KEY_VAULT_KEY_ID_PATTERN = re.compile(
     r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/"
     r"[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
 )
+_READER_ROLE_DEFINITION_GUID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+_SIGNAL_READER_ROLE_DEFINITION_GUID = "2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
+_LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = (
+    "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
+)
 _REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
 _REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
+_REVIEWED_MONITORING_RESOURCE_GROUP = "rg-athena-demo-monitoring"
+_REVIEWED_NETWORK_WATCHER_RESOURCE_GROUP = "NetworkWatcherRG"
+_REVIEWED_NETWORK_WATCHER_NAME = "NetworkWatcher_australiaeast"
+_REVIEWED_FLOW_LOG_NAME = "athena-hackathon-vnet-rg-athena-demo-workload-flowlog"
+_REVIEWED_WORKSPACE_NAME = "athena-hackathon-law"
+_REVIEWED_DCE_NAME = "athena-hackathon-linux-dce"
+_REVIEWED_DCR_NAME = "athena-hackathon-linux-dcr"
+_REVIEWED_AMPLS_NAMES = (
+    "athena-demo-monitoring-workload-ampls",
+    "athena-demo-monitoring-collector-ampls",
+)
+_EXPECTED_LOG_TABLES: tuple[MonitoringLogTable, ...] = (
+    "Heartbeat",
+    "Perf",
+    "InsightsMetrics",
+    "Syslog",
+    "VMComputer",
+    "VMConnection",
+    "VMBoundPort",
+    "VMProcess",
+    "NTANetAnalytics",
+    "NWConnectionMonitorDestinationListenerResult",
+    "NWConnectionMonitorDNSResult",
+    "NWConnectionMonitorPathResult",
+    "NWConnectionMonitorTestResult",
+)
+_EXPECTED_LOG_ANALYTICS_ACCESS_CONDITION = (
+    "((!(ActionMatches"
+    "{'Microsoft.OperationalInsights/workspaces/tables/data/read'}"
+    ")) OR ("
+    + " OR ".join(
+        "@Resource[Microsoft.OperationalInsights/workspaces/tables:name] "
+        f"StringEquals '{table_name}'"
+        for table_name in _EXPECTED_LOG_TABLES
+    )
+    + "))"
+)
 _EXPECTED_APPROVED_VM_NAMES: tuple[str, ...] = (
     "athena-hackathon-client-01",
     "athena-hackathon-ecp-01",
@@ -100,26 +145,14 @@ _EXPECTED_SIGNALS: tuple[MonitoringSignalKind, ...] = (
 _EXPECTED_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     "Microsoft.OperationalInsights/workspaces/read",
     "Microsoft.OperationalInsights/workspaces/query/read",
-    "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
-    "Microsoft.OperationalInsights/workspaces/query/Perf/read",
-    "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
-    "Microsoft.OperationalInsights/workspaces/query/Syslog/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMComputer/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMConnection/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMBoundPort/read",
-    "Microsoft.OperationalInsights/workspaces/query/VMProcess/read",
-    "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read",
+    "Microsoft.OperationalInsights/workspaces/tables/data/read",
+    "Microsoft.Compute/virtualMachines/instanceView/read",
     "Microsoft.Insights/Metrics/Read",
     "Microsoft.Insights/dataCollectionRules/read",
     "Microsoft.Insights/dataCollectionEndpoints/read",
     "Microsoft.Insights/dataCollectionRuleAssociations/read",
     "Microsoft.Insights/privateLinkScopes/read",
     "Microsoft.Network/networkWatchers/flowLogs/read",
-    "Microsoft.Network/networkWatchers/connectionMonitors/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDestinationListenerResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
-    "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read",
 )
 
 
@@ -172,7 +205,7 @@ def _parse_arm_resource_id(
 class MonitoringCollectorContract(_StrictMonitoringContract):
     """Reviewed generic boundary for one identity-isolated monitoring collector."""
 
-    schema_version: Literal["athena.wc024MonitoringCollectorContract.v1"] = Field(
+    schema_version: Literal["athena.wc024MonitoringCollectorContract.v2"] = Field(
         alias="schemaVersion"
     )
     collector_identity_resource_id: str = Field(
@@ -219,6 +252,50 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         alias="dataCollectionEndpointResourceId",
         min_length=1,
         max_length=2048,
+    )
+    authorization_mode: Literal[
+        "conditionedWorkspacePlusExactResourceContext"
+    ] = Field(
+        alias="authorizationMode"
+    )
+    workspace_access_control_mode: Literal[
+        "workspaceAndResourceContext",
+        "workspaceOnly",
+    ] = Field(alias="workspaceAccessControlMode")
+    reader_role_definition_id: str = Field(
+        alias="readerRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    signal_reader_role_definition_id: str = Field(
+        alias="signalReaderRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    log_analytics_data_reader_role_definition_id: str = Field(
+        alias="logAnalyticsDataReaderRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    log_analytics_allowed_tables: tuple[MonitoringLogTable, ...] = Field(
+        alias="logAnalyticsAllowedTables",
+        min_length=len(_EXPECTED_LOG_TABLES),
+        max_length=len(_EXPECTED_LOG_TABLES),
+    )
+    log_analytics_access_condition: str = Field(
+        alias="logAnalyticsAccessCondition",
+        min_length=1,
+        max_length=8192,
+    )
+    resource_read_scope_ids: tuple[str, ...] = Field(
+        alias="resourceReadScopeIds",
+        min_length=27,
+        max_length=27,
+    )
+    signal_read_scope_ids: tuple[str, ...] = Field(
+        alias="signalReadScopeIds",
+        min_length=len(_EXPECTED_APPROVED_VM_NAMES),
+        max_length=len(_EXPECTED_APPROVED_VM_NAMES),
     )
     signing_key_resource_id: str = Field(
         alias="signingKeyResourceId",
@@ -288,6 +365,17 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError(
                 "monitoring read operations must use the complete reviewed allowlist"
             )
+        if self.log_analytics_allowed_tables != _EXPECTED_LOG_TABLES:
+            raise ValueError(
+                "Log Analytics tables must use the complete reviewed allowlist"
+            )
+        normalized_condition = "".join(self.log_analytics_access_condition.split())
+        expected_condition = "".join(_EXPECTED_LOG_ANALYTICS_ACCESS_CONDITION.split())
+        if normalized_condition != expected_condition:
+            raise ValueError(
+                "Log Analytics access condition must restrict data reads to the "
+                "reviewed table allowlist"
+            )
         try:
             UUID(self.collector_identity_client_id)
         except ValueError as exc:
@@ -329,6 +417,100 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("workload VNet must match the exact reviewed WC-024 boundary")
         if _KEY_VAULT_KEY_ID_PATTERN.fullmatch(self.signing_key_resource_id) is None:
             raise ValueError("signing key must be an exact versioned Key Vault key URI")
+
+        expected_role_definition_ids = (
+            (
+                self.reader_role_definition_id,
+                _READER_ROLE_DEFINITION_GUID,
+                "Reader",
+            ),
+            (
+                self.signal_reader_role_definition_id,
+                _SIGNAL_READER_ROLE_DEFINITION_GUID,
+                "signal reader",
+            ),
+            (
+                self.log_analytics_data_reader_role_definition_id,
+                _LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID,
+                "Log Analytics Data Reader",
+            ),
+        )
+        for role_definition_id, role_guid, role_name in expected_role_definition_ids:
+            expected_role_definition_id = (
+                f"/subscriptions/{monitoring_subscription}/providers/"
+                f"Microsoft.Authorization/roleDefinitions/{role_guid}"
+            )
+            if role_definition_id.casefold() != expected_role_definition_id.casefold():
+                raise ValueError(
+                    f"{role_name} role definition must match the reviewed built-in "
+                    "or existing narrow role"
+                )
+
+        monitoring_resource_group_root = (
+            f"/subscriptions/{monitoring_subscription}/resourceGroups/"
+            f"{_REVIEWED_MONITORING_RESOURCE_GROUP}"
+        )
+        workload_resource_group_root = (
+            f"/subscriptions/{monitoring_subscription}/resourceGroups/"
+            f"{_REVIEWED_WORKLOAD_RESOURCE_GROUP}"
+        )
+        expected_signal_read_scope_ids = tuple(
+            (
+                f"{workload_resource_group_root}/providers/Microsoft.Compute/"
+                f"virtualMachines/{vm_name}"
+            )
+            for vm_name in _EXPECTED_APPROVED_VM_NAMES
+        )
+        if tuple(scope.casefold() for scope in self.signal_read_scope_ids) != tuple(
+            scope.casefold() for scope in expected_signal_read_scope_ids
+        ):
+            raise ValueError("signal-reader scopes must match the exact reviewed VMs")
+
+        expected_resource_read_scope_ids = (
+            (
+                f"{monitoring_resource_group_root}/providers/Microsoft.Insights/"
+                f"dataCollectionEndpoints/{_REVIEWED_DCE_NAME}"
+            ),
+            (
+                f"{monitoring_resource_group_root}/providers/Microsoft.Insights/"
+                f"dataCollectionRules/{_REVIEWED_DCR_NAME}"
+            ),
+            *(
+                (
+                    f"{monitoring_resource_group_root}/providers/Microsoft.Insights/"
+                    f"privateLinkScopes/{scope_name}"
+                )
+                for scope_name in _REVIEWED_AMPLS_NAMES
+            ),
+            *(
+                (
+                    f"{workload_resource_group_root}/providers/Microsoft.Compute/"
+                    f"virtualMachines/{vm_name}/providers/Microsoft.Insights/"
+                    "dataCollectionRuleAssociations/athena-linux-dcr"
+                )
+                for vm_name in _EXPECTED_APPROVED_VM_NAMES
+            ),
+            *(
+                (
+                    f"{workload_resource_group_root}/providers/Microsoft.Compute/"
+                    f"virtualMachines/{vm_name}/providers/Microsoft.Insights/"
+                    "dataCollectionRuleAssociations/configurationAccessEndpoint"
+                )
+                for vm_name in _EXPECTED_APPROVED_VM_NAMES
+            ),
+            (
+                f"/subscriptions/{monitoring_subscription}/resourceGroups/"
+                f"{_REVIEWED_NETWORK_WATCHER_RESOURCE_GROUP}/providers/"
+                f"Microsoft.Network/networkWatchers/{_REVIEWED_NETWORK_WATCHER_NAME}/"
+                f"flowLogs/{_REVIEWED_FLOW_LOG_NAME}"
+            ),
+        )
+        if tuple(scope.casefold() for scope in self.resource_read_scope_ids) != tuple(
+            scope.casefold() for scope in expected_resource_read_scope_ids
+        ):
+            raise ValueError(
+                "Reader scopes must match the exact reviewed monitoring resources"
+            )
 
         resource_bindings = (
             (

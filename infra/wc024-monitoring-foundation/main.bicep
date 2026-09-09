@@ -83,9 +83,6 @@ param monitoringStorageAccountName string
 @maxLength(24)
 param monitoringCollectorKeyVaultName string
 
-@description('Unambiguous GUID used for the custom isolated monitoring evidence-reader role.')
-param collectorRoleDefinitionGuid string
-
 @description('Retention period for replacement flow-log and signed-evidence data.')
 @minValue(30)
 @maxValue(365)
@@ -159,7 +156,6 @@ var resourceTags = union(tags, {
 })
 var legacyFlowLogStorageAccountName = 'athenahackathonflowwhtco'
 var workloadResourceGroupId = '${subscription().id}/resourceGroups/${workloadResourceGroupName}'
-var networkWatcherResourceGroupId = '${subscription().id}/resourceGroups/${networkWatcherResourceGroupName}'
 var reviewedWorkloadVirtualNetworkResourceId = '${workloadResourceGroupId}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet'
 var reviewedWorkloadPrivateEndpointSubnetResourceId = '${reviewedWorkloadVirtualNetworkResourceId}/subnets/snet-paas-private-endpoints'
 var reviewedCollectorRuntimeVirtualNetworkResourceId = '${monitoringResourceGroup.id}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet'
@@ -374,15 +370,32 @@ module collectorKeyVaultPrivateDnsLink 'modules/collector-key-vault-private-dns-
   }
 }
 
-module monitoringEvidenceReaderRole 'modules/monitoring-evidence-reader-role.bicep' = {
-  name: 'monitoring-evidence-reader-role'
+module monitoringEvidenceReaderAssignments 'modules/monitoring-evidence-reader-rbac.bicep' = {
+  name: 'monitoring-evidence-reader-assignments'
+  scope: monitoringResourceGroup
   params: {
-    roleDefinitionGuid: collectorRoleDefinitionGuid
-    assignableScopes: [
-      monitoringResourceGroup.id
-      workloadResourceGroupId
-      networkWatcherResourceGroupId
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+    workspaceName: workspaceName
+    dataCollectionEndpointName: dataCollectionEndpointName
+    dataCollectionRuleName: dataCollectionRuleName
+    privateLinkScopeNames: [
+      '${namePrefix}-workload-ampls'
+      '${namePrefix}-collector-ampls'
     ]
+  }
+}
+
+module workloadEvidenceReaderAssignments 'modules/workload-monitoring-evidence-reader-rbac.bicep' = {
+  name: 'workload-monitoring-evidence-reader-assignments'
+  scope: resourceGroup(workloadResourceGroupName)
+  dependsOn: [
+    dcrAssociations
+  ]
+  params: {
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+    approvedVmNames: validatedApprovedVmNames
+    dataCollectionRuleAssociationName: dataCollectionRuleAssociationName
+    dataCollectionEndpointAssociationName: dataCollectionEndpointAssociationName
   }
 }
 
@@ -393,36 +406,6 @@ module canonicalFlowLogValidation 'modules/canonical-flow-log-validation.bicep' 
     networkWatcherName: networkWatcherName
     flowLogName: flowLogName
     workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
-  }
-}
-
-module monitoringResourceReaderAssignment 'modules/monitoring-evidence-reader-rbac.bicep' = {
-  name: 'monitoring-resource-reader-assignment'
-  scope: monitoringResourceGroup
-  params: {
-    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-    roleDefinitionId: monitoringEvidenceReaderRole.outputs.roleDefinitionId
-  }
-}
-
-module workloadAssociationReaderAssignment 'modules/monitoring-evidence-reader-rbac.bicep' = {
-  name: 'workload-association-reader-assignment'
-  scope: resourceGroup(workloadResourceGroupName)
-  params: {
-    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-    roleDefinitionId: monitoringEvidenceReaderRole.outputs.roleDefinitionId
-  }
-}
-
-module networkWatcherReaderAssignment 'modules/monitoring-evidence-reader-rbac.bicep' = {
-  name: 'network-watcher-reader-assignment'
-  scope: resourceGroup(networkWatcherResourceGroupName)
-  dependsOn: [
-    vnetFlowLog
-  ]
-  params: {
-    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-    roleDefinitionId: monitoringEvidenceReaderRole.outputs.roleDefinitionId
   }
 }
 
@@ -438,6 +421,19 @@ module vnetFlowLog 'modules/vnet-flow-log.bicep' = {
     workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
     workspaceLocation: monitoringDataPlatform.outputs.workspaceLocation
     retentionDays: retentionDays
+  }
+}
+
+module networkWatcherEvidenceReaderAssignment 'modules/network-watcher-monitoring-evidence-reader-rbac.bicep' = {
+  name: 'network-watcher-monitoring-evidence-reader-assignment'
+  scope: resourceGroup(networkWatcherResourceGroupName)
+  dependsOn: [
+    vnetFlowLog
+  ]
+  params: {
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+    networkWatcherName: networkWatcherName
+    flowLogName: canonicalFlowLogValidation.outputs.validatedFlowLogName
   }
 }
 
@@ -479,6 +475,21 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
     dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
     dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
+    authorizationMode: 'conditionedWorkspacePlusExactResourceContext'
+    workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+      ? 'workspaceAndResourceContext'
+      : 'workspaceOnly'
+    readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
+    signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
+    logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
+    logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
+    logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
+    resourceReadScopeIds: concat(
+      monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+      workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+      networkWatcherEvidenceReaderAssignment.outputs.resourceReadScopeIds
+    )
+    signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
     signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
     evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
     maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds

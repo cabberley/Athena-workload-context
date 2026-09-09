@@ -64,6 +64,95 @@ REVIEWED_SIGNING_KEY_URI = (
     "https://athenademomonkv.vault.azure.net/keys/monitoring-evidence-signing/"
     "0123456789abcdef0123456789abcdef"
 )
+SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
+MONITORING_RESOURCE_GROUP_ROOT = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring"
+)
+WORKLOAD_RESOURCE_GROUP_ROOT = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload"
+)
+READER_ROLE_DEFINITION_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7"
+)
+SIGNAL_READER_ROLE_DEFINITION_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleDefinitions/2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
+)
+LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleDefinitions/3b03c2da-16b3-4a49-8834-0f8130efdd3b"
+)
+REVIEWED_LOG_TABLES = (
+    "Heartbeat",
+    "Perf",
+    "InsightsMetrics",
+    "Syslog",
+    "VMComputer",
+    "VMConnection",
+    "VMBoundPort",
+    "VMProcess",
+    "NTANetAnalytics",
+    "NWConnectionMonitorDestinationListenerResult",
+    "NWConnectionMonitorDNSResult",
+    "NWConnectionMonitorPathResult",
+    "NWConnectionMonitorTestResult",
+)
+LOG_ANALYTICS_ACCESS_CONDITION = (
+    "((!(ActionMatches"
+    "{'Microsoft.OperationalInsights/workspaces/tables/data/read'}"
+    ")) OR ("
+    + " OR ".join(
+        "@Resource[Microsoft.OperationalInsights/workspaces/tables:name] "
+        f"StringEquals '{table_name}'"
+        for table_name in REVIEWED_LOG_TABLES
+    )
+    + "))"
+)
+SIGNAL_READ_SCOPE_IDS = tuple(
+    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Compute/"
+    f"virtualMachines/{vm_name}"
+    for vm_name in REVIEWED_VM_NAMES
+)
+RESOURCE_READ_SCOPE_IDS = (
+    (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Insights/"
+        "dataCollectionEndpoints/athena-hackathon-linux-dce"
+    ),
+    (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Insights/"
+        "dataCollectionRules/athena-hackathon-linux-dcr"
+    ),
+    (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Insights/"
+        "privateLinkScopes/athena-demo-monitoring-workload-ampls"
+    ),
+    (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Insights/"
+        "privateLinkScopes/athena-demo-monitoring-collector-ampls"
+    ),
+    *(
+        (
+            f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Compute/"
+            f"virtualMachines/{vm_name}/providers/Microsoft.Insights/"
+            "dataCollectionRuleAssociations/athena-linux-dcr"
+        )
+        for vm_name in REVIEWED_VM_NAMES
+    ),
+    *(
+        (
+            f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Compute/"
+            f"virtualMachines/{vm_name}/providers/Microsoft.Insights/"
+            "dataCollectionRuleAssociations/configurationAccessEndpoint"
+        )
+        for vm_name in REVIEWED_VM_NAMES
+    ),
+    (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/"
+        "providers/Microsoft.Network/networkWatchers/NetworkWatcher_australiaeast/"
+        "flowLogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog"
+    ),
+)
 
 
 def test_bicep_and_python_share_one_canonical_vm_allowlist() -> None:
@@ -138,6 +227,17 @@ def _collector_contract() -> MonitoringCollectorContract:
             "rg-athena-demo-monitoring/providers/Microsoft.Insights/"
             "dataCollectionEndpoints/athena-hackathon-linux-dce"
         ),
+        authorizationMode="conditionedWorkspacePlusExactResourceContext",
+        workspaceAccessControlMode="workspaceAndResourceContext",
+        readerRoleDefinitionId=READER_ROLE_DEFINITION_ID,
+        signalReaderRoleDefinitionId=SIGNAL_READER_ROLE_DEFINITION_ID,
+        logAnalyticsDataReaderRoleDefinitionId=(
+            LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_ID
+        ),
+        logAnalyticsAllowedTables=REVIEWED_LOG_TABLES,
+        logAnalyticsAccessCondition=LOG_ANALYTICS_ACCESS_CONDITION,
+        resourceReadScopeIds=RESOURCE_READ_SCOPE_IDS,
+        signalReadScopeIds=SIGNAL_READ_SCOPE_IDS,
         signingKeyResourceId=REVIEWED_SIGNING_KEY_URI,
         evidenceStorageAccountResourceId=(
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/"
@@ -158,26 +258,14 @@ def _collector_contract() -> MonitoringCollectorContract:
         allowedReadOperations=(
             "Microsoft.OperationalInsights/workspaces/read",
             "Microsoft.OperationalInsights/workspaces/query/read",
-            "Microsoft.OperationalInsights/workspaces/query/Heartbeat/read",
-            "Microsoft.OperationalInsights/workspaces/query/Perf/read",
-            "Microsoft.OperationalInsights/workspaces/query/InsightsMetrics/read",
-            "Microsoft.OperationalInsights/workspaces/query/Syslog/read",
-            "Microsoft.OperationalInsights/workspaces/query/VMComputer/read",
-            "Microsoft.OperationalInsights/workspaces/query/VMConnection/read",
-            "Microsoft.OperationalInsights/workspaces/query/VMBoundPort/read",
-            "Microsoft.OperationalInsights/workspaces/query/VMProcess/read",
-            "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read",
+            "Microsoft.OperationalInsights/workspaces/tables/data/read",
+            "Microsoft.Compute/virtualMachines/instanceView/read",
             "Microsoft.Insights/Metrics/Read",
             "Microsoft.Insights/dataCollectionRules/read",
             "Microsoft.Insights/dataCollectionEndpoints/read",
             "Microsoft.Insights/dataCollectionRuleAssociations/read",
             "Microsoft.Insights/privateLinkScopes/read",
             "Microsoft.Network/networkWatchers/flowLogs/read",
-            "Microsoft.Network/networkWatchers/connectionMonitors/read",
-            "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDestinationListenerResult/read",
-            "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
-            "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
-            "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read",
         ),
         collectionMode="isolatedSignedCollector",
         handoffSchemaVersion=MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
@@ -259,7 +347,13 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     "change",
     [
         {"signalKinds": ("heartbeat",) * 8},
-        {"allowedReadOperations": ("Microsoft.Insights/Metrics/Read",) * 21},
+        {"allowedReadOperations": ("Microsoft.Insights/Metrics/Read",) * 10},
+        {"authorizationMode": "customRole"},
+        {"workspaceAccessControlMode": "unknown"},
+        {"logAnalyticsAllowedTables": ("Heartbeat",) * 13},
+        {"logAnalyticsAccessCondition": "allow everything"},
+        {"resourceReadScopeIds": RESOURCE_READ_SCOPE_IDS[:-1]},
+        {"signalReadScopeIds": SIGNAL_READ_SCOPE_IDS[:-1]},
         {"maximumEvidenceAgeSeconds": 901},
         {"connectionMonitorMode": "configured"},
         {"unpublishedEndpointPath": "synthetic"},

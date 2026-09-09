@@ -64,6 +64,9 @@ resource workloadWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes
 resource workloadDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
   parent: workloadPrivateLinkScope
   name: uniqueString(dataCollectionEndpoint.id)
+  dependsOn: [
+    workloadWorkspacePrivateLinkScope
+  ]
   properties: {
     linkedResourceId: dataCollectionEndpoint.id
   }
@@ -72,6 +75,9 @@ resource workloadDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scope
 resource collectorWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
   parent: collectorPrivateLinkScope
   name: uniqueString(workspace.id)
+  dependsOn: [
+    workloadDcePrivateLinkScope
+  ]
   properties: {
     linkedResourceId: workspace.id
   }
@@ -80,6 +86,9 @@ resource collectorWorkspacePrivateLinkScope 'Microsoft.Insights/privateLinkScope
 resource collectorDcePrivateLinkScope 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
   parent: collectorPrivateLinkScope
   name: uniqueString(dataCollectionEndpoint.id)
+  dependsOn: [
+    collectorWorkspacePrivateLinkScope
+  ]
   properties: {
     linkedResourceId: dataCollectionEndpoint.id
   }
@@ -93,6 +102,7 @@ output workspaceSkuName string = workspace.properties.sku.name
 output workspaceRetentionDays int = workspace.properties.retentionInDays
 output workspaceDailyQuotaGb int = workspace.properties.workspaceCapping.dailyQuotaGb
 output workspaceFeatures object = workspace.properties.features
+output workspaceResourceContextAccessEnabled bool = workspace.properties.features.enableLogAccessUsingOnlyResourcePermissions
 output dataCollectionRuleResourceId string = dataCollectionRule.id
 output dataCollectionEndpointResourceId string = dataCollectionEndpoint.id
 output dataCollectionEndpointLocation string = validatedDataCollectionEndpointLocation

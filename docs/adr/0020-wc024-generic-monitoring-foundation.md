@@ -109,15 +109,28 @@ configuration-access endpoint. Traffic Analytics receives the adopted workspace 
 `australiaeast`, matching the reviewed workload and monitoring VNets; a caller cannot select a
 different private-endpoint or flow-log-storage region.
 
-The custom **Athena WC024 Isolated Monitoring Evidence Reader** role is assigned only to that
-collector identity and only at the monitoring, approved workload, and Network Watcher resource
-groups, all in the deployment subscription. Its workspace permissions name only Heartbeat, Perf,
-InsightsMetrics, Syslog, VMComputer, VMConnection, VMBoundPort, VMProcess, NTANetAnalytics,
-NWConnectionMonitorDestinationListenerResult, NWConnectionMonitorDNSResult,
-NWConnectionMonitorPathResult, and NWConnectionMonitorTestResult query tables; it also has the
-exact DCR, DCE, flow-log, Connection Monitor, and Azure Monitor metrics read operations required
-by the collector. Context API, Context MCP, presentation, and correlation identities are neither
-parameters nor role-assignment principals in the foundation.
+The collector receives no subscription- or resource-group-level Reader role. The existing narrow
+WC-016 signal-reader role is assigned at each exact reviewed VM and is validated to contain only
+VM instance-view and Azure Monitor metrics reads. Built-in Reader is assigned only at the exact
+DCR and DCE, both AMPLS resources, both exact DCR-association children on each approved VM, and
+the canonical VNet flow-log child. No current or future Connection Monitor is preauthorized. The
+built-in Log Analytics Data Reader role is assigned only at the adopted workspace with an Azure
+RBAC condition that permits workspace-context data reads solely from
+Heartbeat, Perf, InsightsMetrics, Syslog, VMComputer, VMConnection, VMBoundPort, VMProcess,
+NTANetAnalytics, NWConnectionMonitorDestinationListenerResult, NWConnectionMonitorDNSResult,
+NWConnectionMonitorPathResult, and NWConnectionMonitorTestResult. This avoids consuming another
+tenant-wide custom-role slot while preserving a bounded monitoring-data contract. Context API,
+Context MCP, presentation, and correlation identities are neither parameters nor role-assignment
+principals in the foundation.
+
+The adopted workspace currently retains
+`features.enableLogAccessUsingOnlyResourcePermissions=true` for compatibility with existing
+consumers. The collector contract therefore records `workspaceAndResourceContext` rather than
+claiming that the table condition governs every query path. Resource-context authority is bounded
+to the exact DCR, DCE, AMPLS, DCR-association, and canonical flow-log resource IDs carried by the
+signed contract. No Reader assignment is made at a VM, Network Watcher, resource-group, or
+subscription scope, so the collector cannot use resource-context authorization to query workload
+VM logs or unrelated Network Watcher children.
 
 The collector uses a dedicated non-exportable Key Vault RSA signing key and a versioned,
 retention-controlled `monitoring-evidence` Blob container. The checked-in contract binds the
