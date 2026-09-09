@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "11698054907267800929"
+      "templateHash": "9619163693346661893"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -2339,13 +2339,12 @@
         },
         "template": {
           "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-          "languageVersion": "2.0",
           "contentVersion": "1.0.0.0",
           "metadata": {
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "16808286688309635138"
+              "templateHash": "5041225840290691506"
             }
           },
           "parameters": {
@@ -2390,47 +2389,8 @@
               "microsoft.insights/metrics/read"
             ]
           },
-          "resources": {
-            "signalReaderRoleDefinition": {
-              "existing": true,
-              "type": "Microsoft.Authorization/roleDefinitions",
-              "apiVersion": "2022-04-01",
-              "subscriptionId": "[subscription().subscriptionId]",
-              "name": "[variables('signalReaderRoleDefinitionGuid')]"
-            },
-            "approvedVms": {
-              "copy": {
-                "name": "approvedVms",
-                "count": "[length(parameters('approvedVmNames'))]"
-              },
-              "existing": true,
-              "type": "Microsoft.Compute/virtualMachines",
-              "apiVersion": "2025-04-01",
-              "name": "[parameters('approvedVmNames')[copyIndex()]]"
-            },
-            "adoptedDcrAssociations": {
-              "copy": {
-                "name": "adoptedDcrAssociations",
-                "count": "[length(parameters('approvedVmNames'))]"
-              },
-              "existing": true,
-              "type": "Microsoft.Insights/dataCollectionRuleAssociations",
-              "apiVersion": "2024-03-11",
-              "scope": "[resourceId('Microsoft.Compute/virtualMachines', parameters('approvedVmNames')[copyIndex()])]",
-              "name": "[parameters('dataCollectionRuleAssociationName')]"
-            },
-            "dceAssociations": {
-              "copy": {
-                "name": "dceAssociations",
-                "count": "[length(parameters('approvedVmNames'))]"
-              },
-              "existing": true,
-              "type": "Microsoft.Insights/dataCollectionRuleAssociations",
-              "apiVersion": "2024-03-11",
-              "scope": "[resourceId('Microsoft.Compute/virtualMachines', parameters('approvedVmNames')[copyIndex()])]",
-              "name": "[parameters('dataCollectionEndpointAssociationName')]"
-            },
-            "collectorVmSignalReaders": {
+          "resources": [
+            {
               "copy": {
                 "name": "collectorVmSignalReaders",
                 "count": "[length(parameters('approvedVmNames'))]"
@@ -2442,13 +2402,10 @@
               "properties": {
                 "principalId": "[parameters('collectorPrincipalId')]",
                 "principalType": "ServicePrincipal",
-                "roleDefinitionId": "[if(and(and(and(and(and(and(equals(length(reference('signalReaderRoleDefinition').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference('signalReaderRoleDefinition').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference('signalReaderRoleDefinition').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference('signalReaderRoleDefinition').permissions[0].notActions)), empty(reference('signalReaderRoleDefinition').permissions[0].dataActions)), empty(reference('signalReaderRoleDefinition').permissions[0].notDataActions)), contains(map(reference('signalReaderRoleDefinition').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
-              },
-              "dependsOn": [
-                "signalReaderRoleDefinition"
-              ]
+                "roleDefinitionId": "[if(and(and(and(and(and(and(equals(length(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].dataActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notDataActions)), contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
+              }
             },
-            "collectorDcrAssociationReaders": {
+            {
               "copy": {
                 "name": "collectorDcrAssociationReaders",
                 "count": "[length(parameters('approvedVmNames'))]"
@@ -2463,7 +2420,7 @@
                 "roleDefinitionId": "[variables('readerRoleDefinitionId')]"
               }
             },
-            "collectorDceAssociationReaders": {
+            {
               "copy": {
                 "name": "collectorDceAssociationReaders",
                 "count": "[length(parameters('approvedVmNames'))]"
@@ -2478,7 +2435,7 @@
                 "roleDefinitionId": "[variables('readerRoleDefinitionId')]"
               }
             }
-          },
+          ],
           "outputs": {
             "readerRoleDefinitionId": {
               "type": "string",
@@ -2486,15 +2443,15 @@
             },
             "signalReaderRoleDefinitionId": {
               "type": "string",
-              "value": "[if(and(and(and(and(and(and(equals(length(reference('signalReaderRoleDefinition').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference('signalReaderRoleDefinition').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference('signalReaderRoleDefinition').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference('signalReaderRoleDefinition').permissions[0].notActions)), empty(reference('signalReaderRoleDefinition').permissions[0].dataActions)), empty(reference('signalReaderRoleDefinition').permissions[0].notDataActions)), contains(map(reference('signalReaderRoleDefinition').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
+              "value": "[if(and(and(and(and(and(and(equals(length(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].dataActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notDataActions)), contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
             },
             "signalReadScopeIds": {
               "type": "array",
-              "value": "[map(references('approvedVms', 'full'), lambda('vm', lambdaVariables('vm').id))]"
+              "value": "[map(parameters('approvedVmNames'), lambda('vmName', resourceId('Microsoft.Compute/virtualMachines', lambdaVariables('vmName'))))]"
             },
             "resourceReadScopeIds": {
               "type": "array",
-              "value": "[concat(map(references('adoptedDcrAssociations', 'full'), lambda('association', lambdaVariables('association').id)), map(references('dceAssociations', 'full'), lambda('association', lambdaVariables('association').id)))]"
+              "value": "[concat(map(parameters('approvedVmNames'), lambda('vmName', format('{0}/providers/Microsoft.Insights/dataCollectionRuleAssociations/{1}', resourceId('Microsoft.Compute/virtualMachines', lambdaVariables('vmName')), parameters('dataCollectionRuleAssociationName')))), map(parameters('approvedVmNames'), lambda('vmName', format('{0}/providers/Microsoft.Insights/dataCollectionRuleAssociations/{1}', resourceId('Microsoft.Compute/virtualMachines', lambdaVariables('vmName')), parameters('dataCollectionEndpointAssociationName')))))]"
             }
           }
         }
@@ -2532,7 +2489,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "15149657605643478802"
+              "templateHash": "14580665417408480955"
             }
           },
           "parameters": {
@@ -2564,6 +2521,10 @@
             "validatedTargetResourceId": {
               "type": "string",
               "value": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName')), '2024-10-01').targetResourceId), toLower(parameters('workloadVirtualNetworkResourceId'))), parameters('workloadVirtualNetworkResourceId'), fail('Unreachable canonical flow-log validation failure.'))]"
+            },
+            "validatedFlowLogLocation": {
+              "type": "string",
+              "value": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName')), '2024-10-01', 'full').location), 'australiaeast'), reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName')), '2024-10-01', 'full').location, fail('WC-024 refuses to update the canonical flow log outside australiaeast.'))]"
             }
           }
         }
@@ -2585,6 +2546,9 @@
           },
           "flowLogName": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-canonical-vnet-flow-log'), '2025-04-01').outputs.validatedFlowLogName.value]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
           },
           "workloadVirtualNetworkResourceId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'validate-canonical-vnet-flow-log'), '2025-04-01').outputs.validatedTargetResourceId.value]"
@@ -2612,7 +2576,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "4905709821098539897"
+              "templateHash": "13232665487552878237"
             }
           },
           "parameters": {
@@ -2626,6 +2590,15 @@
               "type": "string",
               "metadata": {
                 "description": "Deterministic VNet flow-log name."
+              }
+            },
+            "location": {
+              "type": "string",
+              "allowedValues": [
+                "australiaeast"
+              ],
+              "metadata": {
+                "description": "Existing canonical VNet flow-log location."
               }
             },
             "workloadVirtualNetworkResourceId": {
@@ -2672,6 +2645,7 @@
               "type": "Microsoft.Network/networkWatchers/flowLogs",
               "apiVersion": "2024-10-01",
               "name": "[format('{0}/{1}', parameters('networkWatcherName'), parameters('flowLogName'))]",
+              "location": "[parameters('location')]",
               "properties": {
                 "targetResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
                 "storageId": "[parameters('storageAccountResourceId')]",
@@ -2732,7 +2706,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "5495406005296288509"
+              "templateHash": "15752322013193089179"
             }
           },
           "parameters": {
@@ -2779,7 +2753,7 @@
             "resourceReadScopeIds": {
               "type": "array",
               "value": [
-                "[resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), parameters('flowLogName'))]"
+                "[format('{0}/flowLogs/{1}', resourceId('Microsoft.Network/networkWatchers', parameters('networkWatcherName')), parameters('flowLogName'))]"
               ]
             }
           }

@@ -115,8 +115,17 @@ resource collectorDceAssociationReaders 'Microsoft.Authorization/roleAssignments
 
 output readerRoleDefinitionId string = readerRoleDefinitionId
 output signalReaderRoleDefinitionId string = validatedSignalReaderRoleDefinitionId
-output signalReadScopeIds array = map(approvedVms, vm => vm.id)
+output signalReadScopeIds array = map(
+  approvedVmNames,
+  vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)
+)
 output resourceReadScopeIds array = concat(
-  map(adoptedDcrAssociations, association => association.id),
-  map(dceAssociations, association => association.id)
+  map(
+    approvedVmNames,
+    vmName => '${resourceId('Microsoft.Compute/virtualMachines', vmName)}/providers/Microsoft.Insights/dataCollectionRuleAssociations/${dataCollectionRuleAssociationName}'
+  ),
+  map(
+    approvedVmNames,
+    vmName => '${resourceId('Microsoft.Compute/virtualMachines', vmName)}/providers/Microsoft.Insights/dataCollectionRuleAssociations/${dataCollectionEndpointAssociationName}'
+  )
 )

@@ -415,6 +415,7 @@ module vnetFlowLog 'modules/vnet-flow-log.bicep' = {
   params: {
     networkWatcherName: networkWatcherName
     flowLogName: canonicalFlowLogValidation.outputs.validatedFlowLogName
+    location: location
     workloadVirtualNetworkResourceId: canonicalFlowLogValidation.outputs.validatedTargetResourceId
     storageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
     workspaceCustomerId: monitoringDataPlatform.outputs.workspaceCustomerId
