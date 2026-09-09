@@ -160,6 +160,18 @@ class CohortProposalService:
         self._proposal_cache = proposal_cache
         self._preview_receipts = preview_receipts
 
+    @property
+    def context_store(self) -> ContextStorePort:
+        return self._context_store
+
+    @property
+    def candidate_repository(self) -> CohortPreviewReceiptPort:
+        return self._preview_receipts
+
+    @property
+    def authorization(self) -> ExplicitWorkloadAuthorizationPort:
+        return self._authorization
+
     def get_proposals(
         self,
         actor: Actor,
@@ -623,6 +635,7 @@ class CohortProposalService:
             raise CohortContractError(
                 "cohort proposal batch contains a cross-profile or cross-snapshot result"
             )
+        CohortProposalService._validate_proposal_set_digest(batch)
 
     @staticmethod
     def _validate_decision_batch_binding(
@@ -662,6 +675,26 @@ class CohortProposalService:
         ):
             raise CohortContractError(
                 "cohort proposal batch contains a cross-profile or cross-snapshot result"
+            )
+        CohortProposalService._validate_proposal_set_digest(batch)
+
+    @staticmethod
+    def _validate_proposal_set_digest(
+        batch: CohortProposalBatchResponse,
+    ) -> None:
+        expected = compute_artifact_digest(
+            [
+                proposal.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for proposal in batch.proposals
+            ]
+        )
+        if batch.proposal_set_digest != expected:
+            raise CohortContractError(
+                "cohort proposal batch digest does not match its proposals"
             )
 
     @staticmethod

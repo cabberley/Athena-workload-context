@@ -151,6 +151,8 @@ def _selector_binding_permits(
             CohortDecisionKind.SPLIT,
             CohortDecisionKind.MERGE,
         }
+        and normalized_identifier(profile_id)
+        == normalized_identifier(binding.profile_id)
         and normalized_identifier(inherited_role.role_id)
         == normalized_identifier(binding.target_role_id)
         and normalized_identifier(replacement_role.role_id)
@@ -173,8 +175,6 @@ def _selector_binding_permits(
         and normalized_identifier(manifest_id)
         == normalized_identifier(binding.manifest_id)
         and manifest_version == binding.manifest_version
-        and normalized_identifier(profile_id)
-        == normalized_identifier(binding.profile_id)
         and (exact_candidate or retained_from_current_draft)
         and is_guarded_selector_replacement_narrower(
             inherited_role.selectors,
@@ -325,7 +325,7 @@ class CohortProposalSetVersion(ApiModel):
     )
     source_rejection_authorities: list[CohortRejectionAuthority] = Field(
         alias="sourceRejectionAuthorities",
-        min_length=1,
+        min_length=0,
         max_length=200,
     )
 
@@ -469,7 +469,7 @@ class CohortDecisionRecord(ApiModel):
     )
     source_rejection_authorities: list[CohortRejectionAuthority] = Field(
         alias="sourceRejectionAuthorities",
-        min_length=1,
+        min_length=0,
         max_length=200,
     )
     snapshot: ProposalSnapshot
@@ -607,7 +607,9 @@ class CohortDecisionReceipt(ApiModel):
     actor_id: str = Field(pattern=_ID_PATTERN)
     idempotency_key: str = Field(pattern=_ID_PATTERN)
     request_digest: str = Field(pattern=_DIGEST_PATTERN)
-    response_json: str = Field(min_length=2)
+    manifest_id: WorkloadIdentifier
+    decision_id: str = Field(pattern=_ID_PATTERN)
+    decision_digest: str = Field(pattern=_DIGEST_PATTERN)
 
 
 class CohortDecisionDraftResult(ApiModel):

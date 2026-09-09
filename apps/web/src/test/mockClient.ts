@@ -43,14 +43,37 @@ const makeContext = (
   session: AuthSession,
   currentDraft: DraftRecord | null,
   published: PublishedManifest | null,
+  publishedHistory: PublishedManifest[],
 ): WorkloadContext => {
   const selectedManifest = currentDraft?.manifest ?? published?.manifest ?? manifest
   const activeDraft = currentDraft && !['published', 'superseded'].includes(currentDraft.state) ? currentDraft : null
   const owner = selectedManifest.ownership[0]?.ownerRef ?? null
+  const productionProfile = Object.values(
+    selectedManifest.profiles,
+  ).find(
+    (profile) =>
+      profile.profileId.toLowerCase() === 'production' &&
+      profile.profileType === 'production',
+  )!
+  const profileId = productionProfile.profileId
+  const operationalAuthority = activeDraft
+    ? {
+        draftId: activeDraft.draftId,
+        draftRevision: activeDraft.revision,
+        manifestDigest: activeDraft.manifestDigest,
+      }
+    : published
+      ? {
+          draftId: published.sourceDraftId,
+          draftRevision: published.sourceDraftRevision,
+          manifestDigest: published.manifestDigest,
+        }
+      : null
   return {
     workloadId: selectedManifest.manifestId,
     auth: session,
-    environment: selectedManifest.workload.environments[0]!,
+    environment: productionProfile.profileType,
+    profileId,
     evidenceSource: 'Explicit synthetic test adapter; not a production evidence source.',
     confidence: null,
     manifestVersion: selectedManifest.manifestVersion,
@@ -74,7 +97,7 @@ const makeContext = (
         relationshipKind: 'declared' as const,
       }
     }),
-    relationships: selectedManifest.relationships.map((relationship) => {
+    relationships: [...selectedManifest.relationships.map((relationship) => {
       if (relationship.relationshipClass === 'exception') {
         const targetRef = relationship.appliesToRelationshipRef ?? relationship.appliesToClauseRef!
         return {
@@ -102,7 +125,25 @@ const makeContext = (
         clause: relationship.sourceClause,
         profileId: null,
       }
-    }),
+    }), {
+      id: 'observed-web-to-worker',
+      kind: 'observed' as const,
+      source: 'web',
+      target: 'worker',
+      evidenceRefs: ['evidence-synthetic-flow'],
+      observedAt: timestamp,
+      confidence: 0.98,
+      profileId: 'production',
+    }, {
+      id: 'inferred-worker-to-database',
+      kind: 'inferred' as const,
+      source: 'worker',
+      target: 'database',
+      hypothesis: 'Synthetic dependency inferred from bounded communication evidence.',
+      evidenceRefs: ['evidence-synthetic-flow'],
+      confidence: 0.72,
+      profileId: 'production',
+    }],
     manifest: structuredClone(selectedManifest),
     controls: Object.values(selectedManifest.profiles).flatMap((profile) =>
       profile.controls.map((control) => ({
@@ -130,9 +171,87 @@ const makeContext = (
       manifestVersion: selectedManifest.manifestVersion,
       confidence: null,
     }],
+    findings: [{
+      id: 'finding-synthetic-context-gap',
+      verdict: 'humanReviewRequired',
+      summary: 'Synthetic evidence does not prove the declared recovery control.',
+      manifestVersion: selectedManifest.manifestVersion,
+      profileId: 'production',
+      clause: '/profiles/production/controls/0',
+      evidenceRefs: ['evidence-synthetic-control'],
+      residualRisk: 'Recovery evidence remains incomplete.',
+      controlState: 'unknown',
+      confidence: 0.61,
+    }],
+    publishedVersions: publishedHistory.map((item) => ({
+      manifestVersion: item.manifestVersion,
+      manifestDigest: item.manifestDigest,
+      publishedAt: item.publishedAt,
+      publishedBy: item.publishedBy.actorId,
+      supersededBy: null,
+      active: item === published,
+    })),
     validationMessages: activeDraft?.validation ? [] : ['No WC-007 validation record exists for the active draft.'],
     draft: activeDraft,
     published,
+    pendingSupersessionRecovery: null,
+    operationalContext: operationalAuthority
+      ? {
+          schemaVersion: 'athena.contextStudio.operationalContext.v1',
+          workloadId: selectedManifest.manifestId,
+          manifestVersion: selectedManifest.manifestVersion,
+          profileId,
+          ...operationalAuthority,
+          profileDigest: `sha256:${'1'.repeat(64)}`,
+          receiptId:
+            `operational-${operationalAuthority.draftId}-` +
+            `r${operationalAuthority.draftRevision}`,
+          receipt: {
+            schemaVersion:
+              'athena.context-api.operational-context-receipt.v1',
+            receiptId:
+              `operational-${operationalAuthority.draftId}-` +
+              `r${operationalAuthority.draftRevision}`,
+            issuedBy: {
+              actorId: 'synthetic-operational-context',
+              kind: 'service',
+            },
+            issuedAt: '2025-01-01T00:01:00.000Z',
+            manifestId: selectedManifest.manifestId,
+            manifestVersion: selectedManifest.manifestVersion,
+            profileId,
+            ...operationalAuthority,
+            profileDigest: `sha256:${'1'.repeat(64)}`,
+            snapshotId:
+              `snapshot-${operationalAuthority.draftId}-` +
+              `r${operationalAuthority.draftRevision}`,
+            collectedAt: '2025-01-01T00:00:00.000Z',
+            expiresAt: '2100-01-01T00:00:00.000Z',
+            evidenceCount: 1,
+            evidenceInventoryDigest: `sha256:${'3'.repeat(64)}`,
+            contentDigest: `sha256:${'6'.repeat(64)}`,
+            bindingDigest: `sha256:${'4'.repeat(64)}`,
+            receiptDigest: `sha256:${'5'.repeat(64)}`,
+          },
+          snapshotId:
+            `snapshot-${operationalAuthority.draftId}-` +
+            `r${operationalAuthority.draftRevision}`,
+          collectedAt: '2025-01-01T00:00:00.000Z',
+          expiresAt: '2100-01-01T00:00:00.000Z',
+          evidenceSource: 'Synthetic operational context receipt.',
+          confidence: 0.9,
+          evidenceInventory: [{
+            evidenceRef: 'synthetic-operational-evidence',
+            evidenceDigest: `sha256:${'2'.repeat(64)}`,
+          }],
+          evidenceInventoryDigest: `sha256:${'3'.repeat(64)}`,
+          contentDigest: `sha256:${'6'.repeat(64)}`,
+          bindingDigest: `sha256:${'4'.repeat(64)}`,
+          relationships: [],
+          findings: [],
+        }
+      : null,
+    operationalContextRequired: true,
   }
 }
 
@@ -162,6 +281,7 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
         validation: null,
         review: null,
         publicationCandidate: null,
+        reviewDecisions: [],
         approval: null,
       }
   let published: PublishedManifest | null = options.publishedOnly
@@ -180,17 +300,21 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
           approvedRevision: 4,
           manifestVersion: manifest.manifestVersion,
           manifestDigest: manifest.compatibility.artifactDigest,
+          reviewDecisionId: 'review-synthetic-published',
+          operationalContextReceiptId: 'operational-approval-published',
           reason: 'Explicit synthetic approval.',
         },
         publishedBy: actor(session),
         publishedAt: timestamp,
         publicationAuthorizedBy: { actorId: 'athena-context-api', kind: 'service' },
         publicationAuthorizedAt: timestamp,
+        operationalContextReceiptId: 'operational-publication-published',
         reason: 'Explicit synthetic publication.',
       }
     : null
 
-  const context = () => makeContext(session, draft, published)
+  const publishedHistory = published ? [published] : []
+  const context = () => makeContext(session, draft, published, publishedHistory)
 
   const transition = (
     request: ConcurrencyRequest,
@@ -215,6 +339,12 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
       if (!session.authorizedWorkloadIds.includes(workloadId)) throw new Error('Synthetic authorization denied.')
       return context()
     },
+    loadResolvedProfileDigest: async (value) => {
+      if (!session.authorizedWorkloadIds.includes(value.workloadId)) {
+        throw new Error('Synthetic authorization denied.')
+      }
+      return `sha256:${'7'.repeat(64)}`
+    },
     createSuccessorDraft: async (workloadId, reason) => {
       if (!published || draft) throw new Error('A unique published predecessor without an active draft is required.')
       const [major, minor, patch] = published.manifestVersion.split('.').map(Number)
@@ -237,10 +367,59 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
         validation: null,
         review: null,
         publicationCandidate: null,
+        reviewDecisions: [],
         approval: null,
       }
       return draft
     },
+    createRollbackDraft: async (workloadId, sourceVersion, reason) => {
+      if (draft || !published) {
+        throw new Error('A unique published predecessor without an active draft is required.')
+      }
+      const source = publishedHistory.find(
+        (item) => item.manifestVersion === sourceVersion,
+      )
+      if (!source || source === published) {
+        throw new Error('Synthetic rollback requires an older published version.')
+      }
+      const [major, minor, patch] = published.manifestVersion.split('.').map(Number)
+      const candidate = structuredClone(source.manifest)
+      candidate.manifestVersion = `${major}.${minor}.${patch + 1}`
+      const canonical = await refreshCanonicalManifestDigests(candidate)
+      draft = {
+        draftId: 'draft-synthetic-rollback',
+        manifestId: workloadId,
+        state: 'draft',
+        revision: 1,
+        manifest: canonical,
+        manifestDigest: canonical.compatibility.artifactDigest,
+        previousVersion: published.manifestVersion,
+        createdBy: actor(session),
+        createdAt: timestamp,
+        updatedBy: actor(session),
+        updatedAt: timestamp,
+        reason,
+        validation: null,
+        review: null,
+        publicationCandidate: null,
+        reviewDecisions: [],
+        approval: null,
+      }
+      return draft
+    },
+    comparePublishedVersions: async (workloadId, fromVersion, toVersion) => ({
+      manifestId: workloadId,
+      fromVersion,
+      toVersion,
+      fromDigest: publishedHistory.find(
+        (item) => item.manifestVersion === fromVersion,
+      )?.manifestDigest ?? manifest.compatibility.artifactDigest,
+      toDigest: publishedHistory.find(
+        (item) => item.manifestVersion === toVersion,
+      )?.manifestDigest ?? manifest.compatibility.artifactDigest,
+      equivalent: false,
+      changedPaths: ['/manifestVersion', '/workload/displayName'],
+    }),
     updateDraft: async (request) => {
       const current = assertConcurrency(draft, request)
       const replacement = await refreshCanonicalManifestDigests(request.replacementManifest)
@@ -284,7 +463,55 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
       }
       return draft
     },
+    reviewDraft: async (request) => {
+      const current = assertConcurrency(draft, request)
+      const reviewed = {
+        ...current,
+        state:
+          request.decision === 'approved'
+            ? 'in_review' as const
+            : 'draft' as const,
+        revision: current.revision + 1,
+        updatedBy: actor(session),
+        updatedAt: timestamp,
+        reason: request.reason,
+        reviewDecisions: [
+          ...current.reviewDecisions,
+          {
+            decisionId: `review-${current.draftId}-${current.revision + 1}`,
+            decision: request.decision,
+            reviewedBy: actor(session),
+            reviewedAt: timestamp,
+            reviewedRevision: current.revision + 1,
+            manifestVersion: current.manifest.manifestVersion,
+            manifestDigest: current.manifestDigest,
+            comments: request.comments,
+            rejectedFields: [...request.rejectedFields],
+            requiredCorrections: [...request.requiredCorrections],
+          },
+        ],
+      }
+      draft =
+        request.decision === 'approved'
+          ? reviewed
+          : {
+              ...reviewed,
+              validation: null,
+              review: null,
+              publicationCandidate: null,
+              approval: null,
+            }
+      return draft
+    },
     approveDraft: async (request) => {
+      const current = assertConcurrency(draft, request)
+      const review = current.reviewDecisions.at(-1)
+      if (
+        review?.decision !== 'approved' ||
+        review.reviewedRevision !== current.revision
+      ) {
+        throw new Error('Synthetic authoritative review is missing.')
+      }
       const updated = transition(request, 'approved')
       const approval: ApprovalDecision = {
         decisionId: 'approval-synthetic-candidate',
@@ -293,6 +520,8 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
         approvedRevision: updated.revision,
         manifestVersion: updated.manifest.manifestVersion,
         manifestDigest: updated.manifestDigest,
+        reviewDecisionId: review.decisionId,
+        operationalContextReceiptId: request.operationalContextReceiptId,
         reason: request.reason,
       }
       draft = {
@@ -327,8 +556,10 @@ export const createMockContextApiClient = (options: MockClientOptions = {}): Con
         publishedAt: timestamp,
         publicationAuthorizedBy: { actorId: 'athena-context-api', kind: 'service' },
         publicationAuthorizedAt: timestamp,
+        operationalContextReceiptId: request.operationalContextReceiptId,
         reason: request.reason,
       }
+      publishedHistory.push(published)
       draft = { ...current, state: 'published', revision: current.revision + 1 }
       return published
     },

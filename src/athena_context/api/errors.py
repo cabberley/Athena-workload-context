@@ -103,6 +103,10 @@ class StaleEvidenceSnapshotError(ContextApiError):
     code = "stale_evidence_snapshot"
 
 
+class OperationalContextReceiptError(ContextApiError):
+    code = "operational_context_receipt_invalid"
+
+
 class CohortBoundaryError(ContextApiError):
     code = "cohort_boundary_exceeded"
 

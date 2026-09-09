@@ -48,6 +48,68 @@ const renderCohorts = async (
 }
 
 describe('cohort proposal review', () => {
+  it('reloads a valid rebased decision applied at a later draft revision', async () => {
+    const decisionStore = createMockCohortDecisionStore()
+    const proposal = syntheticCohortBatch.proposals[0]!
+    decisionStore.records.push({
+      decisionId: 'decision-wc012-rebased',
+      action: 'approve',
+      sourceDraft: structuredClone(syntheticCohortBatch.sourceDraft),
+      scope: structuredClone(syntheticCohortBatch.scope),
+      proposalIds: [proposal.proposalId],
+      proposalSetDigest: syntheticCohortBatch.proposalSetDigest,
+      snapshotArtifactDigest: syntheticCohortBatch.snapshot.artifactDigest,
+      candidateId: `review-${proposal.proposalId}`,
+      rationale: 'Synthetic disjoint decision rebased after another apply.',
+      state: 'applied',
+      decidedBy: proposerSession.actorId,
+      decidedAt: '2026-08-17T08:10:00.000Z',
+      draftResult: {
+        draftId: syntheticCohortBatch.sourceDraft.draftId,
+        revision: syntheticCohortBatch.sourceDraft.revision + 2,
+        manifestDigest: `sha256:${'8'.repeat(64)}`,
+      },
+      publicationAllowed: false,
+    })
+
+    await renderCohorts(undefined, decisionStore)
+
+    expect(screen.getByText('decision-wc012-rebased')).toBeInTheDocument()
+    expect(screen.queryByText(/outside the exact proposal batch/i)).not.toBeInTheDocument()
+  })
+
+  it('renders an empty proposal batch without issuing an invalid decision query', async () => {
+    const contextClient = createMockContextApiClient({ session: proposerSession })
+    const cohortClient = createMockCohortProposalApiClient({
+      session: proposerSession,
+      batch: {
+        ...syntheticCohortBatch,
+        proposals: [],
+        conflicts: [],
+      },
+    })
+    const decisionClient = createMockCohortDecisionApiClient({
+      session: proposerSession,
+      store: createMockCohortDecisionStore(),
+    })
+    const loadDecisions = vi.spyOn(decisionClient, 'loadDecisions')
+    const initialContexts = await contextClient.loadAuthorizedWorkloads()
+    const user = userEvent.setup()
+    render(
+      <App
+        client={contextClient}
+        cohortClient={cohortClient}
+        decisionClient={decisionClient}
+        initialContexts={initialContexts}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Cohorts' }))
+
+    expect(await screen.findByText(/returned no proposals/i)).toBeInTheDocument()
+    expect(loadDecisions).not.toHaveBeenCalled()
+  })
+
   it('shows proposal provenance, confidence, support, conflict detail, and paginates 1,000 members', async () => {
     const { user } = await renderCohorts()
 
@@ -235,6 +297,9 @@ describe('cohort proposal review', () => {
       name: /include web proposal in merge/i,
     })
     await user.click(webMergeChoices[0]!)
+    expect(screen.queryByRole('button', {
+      name: /apply preview as draft selector proposal/i,
+    })).not.toBeInTheDocument()
     await user.click(webMergeChoices[1]!)
     await user.click(screen.getByRole('button', { name: /preview merge of selected/i }))
     await user.click(

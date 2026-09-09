@@ -25,7 +25,7 @@ export type DeclaredRelationshipType =
   | 'protectedBy'
   | 'prohibited'
 export type DraftState = 'draft' | 'validated' | 'in_review' | 'approved' | 'published' | 'superseded'
-export type AppRoute = 'overview' | 'cohorts' | 'catalogue' | 'manifest' | 'controls'
+export type AppRoute = 'overview' | 'cohorts' | 'catalogue' | 'manifest' | 'versions' | 'controls'
 export type ActorKind = 'human' | 'agent' | 'service'
 export type RoleName = 'proposer' | 'reviewer' | 'approver' | 'publisher' | 'reader' | 'auditor'
 
@@ -54,8 +54,9 @@ export interface AuthPort {
 
 export interface ContextStudioRuntime {
   apiBaseUrl: string
-  cohortApiBaseUrl?: string
+  cohortApiBaseUrl: string
   authPort: AuthPort
+  operationalContextPort?: OperationalContextPort
   fetchImpl?: typeof fetch
   createId?: () => string
 }
@@ -102,8 +103,32 @@ export interface ExceptionTopologyRelationship {
   profileId: string | null
 }
 
+export interface ObservedTopologyRelationship {
+  id: string
+  kind: 'observed'
+  source: string
+  target: string
+  evidenceRefs: string[]
+  observedAt: string
+  confidence: number
+  profileId: string | null
+}
+
+export interface InferredTopologyRelationship {
+  id: string
+  kind: 'inferred'
+  source: string
+  target: string
+  hypothesis: string
+  evidenceRefs: string[]
+  confidence: number
+  profileId: string | null
+}
+
 export type TopologyRelationship =
   | DeclaredTopologyRelationship
+  | ObservedTopologyRelationship
+  | InferredTopologyRelationship
   | ExceptionTopologyRelationship
 
 export interface ControlRecord {
@@ -129,6 +154,104 @@ export interface EvidenceItem {
   clause: string
   manifestVersion: string
   confidence: number | null
+}
+
+export interface ContextFinding {
+  id: string
+  verdict: string
+  summary: string
+  manifestVersion: string
+  profileId: string
+  clause: string
+  evidenceRefs: string[]
+  residualRisk: string | null
+  controlState: string | null
+  confidence: number | null
+}
+
+export interface PublishedVersionSummary {
+  manifestVersion: string
+  manifestDigest: string
+  publishedAt: string
+  publishedBy: string
+  supersededBy: string | null
+  active: boolean
+}
+
+export interface ExactVersionComparison {
+  manifestId: string
+  fromVersion: string
+  toVersion: string
+  fromDigest: string
+  toDigest: string
+  equivalent: boolean
+  changedPaths: string[]
+}
+
+export interface OperationalContextRequest {
+  workloadId: string
+  manifestVersion: string
+  profileId: string
+  draftId: string
+  draftRevision: number
+  manifestDigest: string
+  profileDigest: string
+  asOf: string
+}
+
+export interface OperationalContextReceipt {
+  schemaVersion: 'athena.context-api.operational-context-receipt.v1'
+  receiptId: string
+  issuedBy: Actor
+  issuedAt: string
+  manifestId: string
+  manifestVersion: string
+  profileId: string
+  draftId: string
+  draftRevision: number
+  manifestDigest: string
+  profileDigest: string
+  snapshotId: string
+  collectedAt: string
+  expiresAt: string
+  evidenceCount: number
+  evidenceInventoryDigest: string
+  contentDigest: string
+  bindingDigest: string
+  receiptDigest: string
+}
+
+export interface OperationalContextSnapshot {
+  schemaVersion: 'athena.contextStudio.operationalContext.v1'
+  workloadId: string
+  manifestVersion: string
+  profileId: string
+  draftId: string
+  draftRevision: number
+  manifestDigest: string
+  profileDigest: string
+  receiptId: string
+  receipt: OperationalContextReceipt
+  snapshotId: string
+  collectedAt: string
+  expiresAt: string
+  evidenceSource: string
+  confidence: number | null
+  evidenceInventory: Array<{
+    evidenceRef: string
+    evidenceDigest: string
+  }>
+  evidenceInventoryDigest: string
+  contentDigest: string
+  bindingDigest: string
+  relationships: Array<ObservedTopologyRelationship | InferredTopologyRelationship>
+  findings: ContextFinding[]
+}
+
+export interface OperationalContextPort {
+  loadOperationalContext: (
+    request: OperationalContextRequest,
+  ) => Promise<unknown>
 }
 
 export interface CapabilityRequirement {
@@ -410,6 +533,21 @@ export interface ReviewSubmission {
   reason: string
 }
 
+export type ReviewDecisionKind = 'approved' | 'changes_requested'
+
+export interface ReviewDecision {
+  decisionId: string
+  decision: ReviewDecisionKind
+  reviewedBy: Actor
+  reviewedAt: string
+  reviewedRevision: number
+  manifestVersion: string
+  manifestDigest: string
+  comments: string
+  rejectedFields: string[]
+  requiredCorrections: string[]
+}
+
 export interface PublicationCandidate {
   finalizedBy: Actor
   finalizedAt: string
@@ -426,6 +564,8 @@ export interface ApprovalDecision {
   approvedRevision: number
   manifestVersion: string
   manifestDigest: string
+  reviewDecisionId: string | null
+  operationalContextReceiptId: string | null
   reason: string
 }
 
@@ -437,6 +577,7 @@ export interface DraftRecord {
   manifest: CanonicalWorkloadManifest
   manifestDigest: string
   previousVersion: string | null
+  rollbackSourceVersion?: string | null
   createdBy: Actor
   createdAt: string
   updatedBy: Actor
@@ -445,6 +586,7 @@ export interface DraftRecord {
   validation: ValidationRecord | null
   review: ReviewSubmission | null
   publicationCandidate: PublicationCandidate | null
+  reviewDecisions: ReviewDecision[]
   approval: ApprovalDecision | null
 }
 
@@ -461,6 +603,7 @@ export interface PublishedManifest {
   publishedAt: string
   publicationAuthorizedBy: Actor
   publicationAuthorizedAt: string
+  operationalContextReceiptId: string | null
   reason: string
 }
 
@@ -477,6 +620,7 @@ export interface WorkloadContext {
   workloadId: string
   auth: AuthSession
   environment: EnvironmentName
+  profileId: string
   evidenceSource: string
   confidence: number | null
   manifestVersion: string
@@ -488,9 +632,14 @@ export interface WorkloadContext {
   controls: ControlRecord[]
   riskAcceptances: RiskAcceptance[]
   provenance: EvidenceItem[]
+  findings: ContextFinding[]
+  publishedVersions: PublishedVersionSummary[]
   validationMessages: string[]
   draft: DraftRecord | null
   published: PublishedManifest | null
+  pendingSupersessionRecovery: SupersessionRecovery | null
+  operationalContext: OperationalContextSnapshot | null
+  operationalContextRequired: boolean
 }
 
 export interface ConcurrencyRequest {
@@ -505,6 +654,18 @@ export interface ConcurrencyRequest {
 
 export interface PublishRequest extends ConcurrencyRequest {
   approvalId: string
+  operationalContextReceiptId: string
+}
+
+export interface ApproveRequest extends ConcurrencyRequest {
+  operationalContextReceiptId: string
+}
+
+export interface ReviewRequest extends ConcurrencyRequest {
+  decision: ReviewDecisionKind
+  comments: string
+  rejectedFields: string[]
+  requiredCorrections: string[]
 }
 
 export interface SupersessionRecovery {
@@ -538,6 +699,8 @@ export interface WireApprovalDecision {
   approved_revision: number
   manifest_version: string
   manifest_digest: string
+  review_decision_id?: string | null
+  operational_context_receipt_id?: string | null
   reason: string
 }
 
@@ -549,6 +712,7 @@ export interface WireDraftRecord {
   manifest: CanonicalWorkloadManifest
   manifest_digest: string
   previous_version?: string | null
+  rollback_source_version?: string | null
   created_by: WireActor
   created_at: string
   updated_by: WireActor
@@ -567,6 +731,18 @@ export interface WireDraftRecord {
     publication_candidate_digest: string
     reason: string
   }
+  review_decisions?: Array<{
+    decision_id: string
+    decision: ReviewDecisionKind
+    reviewed_by: WireActor
+    reviewed_at: string
+    reviewed_revision: number
+    manifest_version: string
+    manifest_digest: string
+    comments: string
+    rejected_fields: string[]
+    required_corrections: string[]
+  }>
   publication_candidate?: {
     finalized_by: WireActor
     finalized_at: string
@@ -591,6 +767,7 @@ export interface WirePublishedManifest {
   published_at: string
   publication_authorized_by: WireActor
   publication_authorized_at: string
+  operational_context_receipt_id?: string | null
   reason: string
 }
 
@@ -612,13 +789,25 @@ export interface ContextApiClientPort {
   auth: AuthSession
   loadAuthorizedWorkloads: () => Promise<WorkloadContext[]>
   loadWorkloadContext: (workloadId: string) => Promise<WorkloadContext>
+  loadResolvedProfileDigest: (context: WorkloadContext) => Promise<string>
   createSuccessorDraft: (workloadId: string, reason: string) => Promise<DraftRecord>
+  createRollbackDraft: (
+    workloadId: string,
+    sourceVersion: string,
+    reason: string,
+  ) => Promise<DraftRecord>
+  comparePublishedVersions: (
+    workloadId: string,
+    fromVersion: string,
+    toVersion: string,
+  ) => Promise<ExactVersionComparison>
   updateDraft: (
     request: ConcurrencyRequest & { replacementManifest: CanonicalWorkloadManifest },
   ) => Promise<DraftRecord>
   validateDraft: (request: ConcurrencyRequest) => Promise<DraftRecord>
   submitForReview: (request: ConcurrencyRequest) => Promise<DraftRecord>
-  approveDraft: (request: ConcurrencyRequest) => Promise<DraftRecord>
+  reviewDraft: (request: ReviewRequest) => Promise<DraftRecord>
+  approveDraft: (request: ApproveRequest) => Promise<DraftRecord>
   publishDraft: (request: PublishRequest) => Promise<PublishedManifest>
   completeSupersession: (recovery: SupersessionRecovery) => Promise<Supersession>
 }

@@ -134,7 +134,7 @@ const indexDecisionRecords = (
         record.candidateId.length > 128 ||
         !record.draftResult ||
         record.draftResult.draftId !== record.sourceDraft.draftId ||
-        record.draftResult.revision !== record.sourceDraft.revision + 1 ||
+        record.draftResult.revision <= record.sourceDraft.revision ||
         !/^sha256:[a-f0-9]{64}$/.test(record.draftResult.manifestDigest)
       ))
     ) {
@@ -192,12 +192,20 @@ export default function CohortReview({
   const confirmationButtonRef = useRef<HTMLButtonElement>(null)
   const confirmationDialogRef = useRef<HTMLDivElement>(null)
   const confirmationReturnFocusRef = useRef<HTMLElement | null>(null)
+  const selectionGenerationRef = useRef(0)
 
   const activeManifest = context.draft?.manifest ?? context.manifest
-  const profile = Object.values(activeManifest.profiles).find(
-    (item) => item.profileType === context.environment,
-  )
+  const profile = activeManifest.profiles[context.profileId]
   const binding = useMemo(() => draftBinding(context), [context])
+  const authorityKey = [
+    context.workloadId,
+    context.profileId,
+    binding?.draftId ?? '',
+    binding?.revision ?? 0,
+    binding?.manifestDigest ?? '',
+  ].join('|')
+  const authorityKeyRef = useRef(authorityKey)
+  authorityKeyRef.current = authorityKey
 
   useEffect(() => {
     if (!confirmation) return
@@ -254,6 +262,13 @@ export default function CohortReview({
         setBatch(loaded)
         setSelectedProposalId(loaded.proposals[0]?.proposalId ?? null)
         setLoadState('ready')
+        if (loaded.proposals.length === 0) {
+          setDecisionLoadState('ready')
+          setStatusMessage(
+            'The cohort API returned no proposals for this exact draft and profile.',
+          )
+          return
+        }
         if (!decisionClient) {
           setDecisionLoadState('unavailable')
           setStatusMessage(
@@ -314,6 +329,7 @@ export default function CohortReview({
     context.workloadId,
     context.draft,
     context.environment,
+    context.profileId,
     contextClient.auth.actorId,
     profile,
   ])
@@ -387,6 +403,7 @@ export default function CohortReview({
   }, [rejectedProposalIds])
 
   const selectProposal = (proposalId: string): void => {
+    selectionGenerationRef.current += 1
     setSelectedProposalId(proposalId)
     setMemberFilter('')
     setMemberPage(0)
@@ -401,6 +418,8 @@ export default function CohortReview({
       setStatusMessage('Rejected or unverified proposals cannot be selected for merge.')
       return
     }
+    selectionGenerationRef.current += 1
+    setCandidate(null)
     setMergeSelection((current) => {
       const next = new Set(current)
       if (checked) next.add(proposalId)
@@ -452,6 +471,8 @@ export default function CohortReview({
       setStatusMessage('Split and merge require an acknowledged resolution rationale.')
       return
     }
+    const requestAuthorityKey = authorityKey
+    const requestSelectionGeneration = selectionGenerationRef.current
     setBusy(true)
     try {
       const preview = await cohortClient.previewReview({
@@ -475,11 +496,19 @@ export default function CohortReview({
         snapshotArtifactDigest: batch.snapshot.artifactDigest,
         resolution: resolution.trim(),
       })
+      if (
+        authorityKeyRef.current !== requestAuthorityKey ||
+        selectionGenerationRef.current !== requestSelectionGeneration
+      ) return
       setCandidate(preview)
       setStatusMessage(
         `${displayToken(action)} preview loaded from the cohort API. It has not changed WC-007 state.`,
       )
     } catch (error) {
+      if (
+        authorityKeyRef.current !== requestAuthorityKey ||
+        selectionGenerationRef.current !== requestSelectionGeneration
+      ) return
       setCandidate(null)
       setStatusMessage(errorMessage(error, `Unable to preview the ${action}.`))
     } finally {
@@ -508,6 +537,7 @@ export default function CohortReview({
       setStatusMessage('A final cohort decision already blocks this proposal or candidate.')
       return
     }
+    const requestAuthorityKey = authorityKey
     const rationale = reviewCandidate?.resolution.trim() ?? resolution.trim()
     if (rationale.length < 1 || rationale.length > 2000) {
       setStatusMessage('A durable cohort decision requires a rationale of 1 to 2,000 characters.')
@@ -536,6 +566,7 @@ export default function CohortReview({
         candidate: reviewCandidate,
         rationale,
       })
+      if (authorityKeyRef.current !== requestAuthorityKey) return
       const indexed = indexDecisionRecords([decision], batch)
       if (
         decision.action !== action ||
@@ -549,12 +580,25 @@ export default function CohortReview({
         indexed.forEach((record, proposalId) => next.set(proposalId, record))
         return next
       })
+      if (authorityKeyRef.current !== requestAuthorityKey) return
       setCandidate(null)
       setMergeSelection((current) =>
         new Set([...current].filter((proposalId) => !proposalIds.includes(proposalId))),
       )
       if (decision.state === 'applied') {
         const refreshed = await contextClient.loadWorkloadContext(context.workloadId)
+        if (authorityKeyRef.current !== requestAuthorityKey) return
+        if (
+          !decision.draftResult ||
+          !refreshed.draft ||
+          refreshed.draft.draftId !== decision.draftResult.draftId ||
+          refreshed.draft.revision !== decision.draftResult.revision ||
+          refreshed.draft.manifestDigest !== decision.draftResult.manifestDigest
+        ) {
+          throw new Error(
+            'Reloaded draft does not match the exact durable decision result.',
+          )
+        }
         onContextChange(refreshed)
         setStatusMessage(
           `Durable decision ${decision.decisionId} atomically applied bounded selectors to draft ` +
@@ -567,6 +611,7 @@ export default function CohortReview({
         )
       }
     } catch (error) {
+      if (authorityKeyRef.current !== requestAuthorityKey) return
       setStatusMessage(errorMessage(error, 'The durable cohort decision failed closed.'))
     } finally {
       setBusy(false)
@@ -649,7 +694,12 @@ export default function CohortReview({
       </div>
 
       <dl className="cohort-metadata">
-        <div><dt>Environment</dt><dd>{displayEnvironment(batch.scope.profileType)}</dd></div>
+        <div>
+          <dt>Environment</dt>
+          <dd>
+            {displayEnvironment(batch.scope.profileType)} ({batch.scope.profileId})
+          </dd>
+        </div>
         <div><dt>Manifest version</dt><dd>{batch.scope.manifestVersion}</dd></div>
         <div><dt>Approval state</dt><dd>{context.draft?.state ?? context.approvalState}</dd></div>
         <div>
@@ -1077,7 +1127,8 @@ export default function CohortReview({
             </h3>
             <p id="cohort-confirmation-description">
               Confirm this action for {confirmation.proposalIds.length} exact proposal(s) in
-              {' '}{displayEnvironment(batch.scope.profileType)}, manifest {batch.scope.manifestVersion},
+              {' '}{displayEnvironment(batch.scope.profileType)} profile {batch.scope.profileId},
+              {' '}manifest {batch.scope.manifestVersion},
               snapshot <span className="digest-value">{batch.snapshot.artifactDigest}</span>.
               {confirmation.action === 'reject'
                 ? ' This persists a durable rejection and permanently blocks later actions for this proposal set.'

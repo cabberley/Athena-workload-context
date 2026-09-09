@@ -1,11 +1,19 @@
-import { act, screen } from '@testing-library/react'
+import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { bootstrapContextStudio } from './bootstrap'
 import { refreshCanonicalManifestDigests } from './canonical'
+import {
+  computeOperationalBindingDigest,
+  computeOperationalContentDigest,
+  computeOperationalEvidenceInventoryDigest,
+  computeOperationalReceiptId,
+  computeOperationalReceiptDigest,
+} from './operationalContext'
 import { canonicalManifestFixture, mockAuthSession } from './test/mockClient'
 import type {
   AuthPort,
   CanonicalWorkloadManifest,
+  OperationalContextRequest,
   WireDraftRecord,
   WirePublishedManifest,
 } from './types'
@@ -25,12 +33,14 @@ const wirePublished: WirePublishedManifest = {
     approved_revision: 4,
     manifest_version: canonicalManifestFixture.manifestVersion,
     manifest_digest: canonicalManifestFixture.compatibility.artifactDigest,
+    operational_context_receipt_id: 'operational-approval-startup',
     reason: 'Synthetic startup approval.',
   },
   published_by: actor,
   published_at: '2026-08-17T00:00:00.000Z',
   publication_authorized_by: { actor_id: 'athena-context-api', kind: 'service' },
   publication_authorized_at: '2026-08-17T00:00:00.000Z',
+  operational_context_receipt_id: 'operational-publication-startup',
   reason: 'Synthetic startup publication.',
 }
 const wireDraft: WireDraftRecord = {
@@ -137,9 +147,19 @@ describe('production startup', () => {
       acquireSession: vi.fn(async () => mockAuthSession),
       acquireAccessToken: vi.fn(async () => 'per-user-runtime-token'),
     }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) =>
-      String(input).includes('/v1/drafts?') ? response([]) : response([{ published: wirePublished }]),
-    )
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/v1/drafts?')) return response([])
+      if (url.includes('/profiles/production/authority')) {
+        return response({
+          manifest_id: canonicalManifestFixture.manifestId,
+          manifest_version: canonicalManifestFixture.manifestVersion,
+          profile_id: 'production',
+          resolved_profile_digest: `sha256:${'7'.repeat(64)}`,
+        })
+      }
+      return response([{ published: wirePublished }])
+    })
     const rootElement = document.createElement('div')
     document.body.append(rootElement)
 
@@ -148,6 +168,7 @@ describe('production startup', () => {
       root = await bootstrapContextStudio(
         {
           apiBaseUrl: 'https://context.invalid',
+          cohortApiBaseUrl: 'https://cohorts.invalid',
           authPort,
           fetchImpl: fetchMock as typeof fetch,
         },
@@ -178,6 +199,7 @@ describe('production startup', () => {
         await bootstrapContextStudio(
           {
             apiBaseUrl: 'https://context.invalid',
+            cohortApiBaseUrl: 'https://cohorts.invalid',
             authPort,
             fetchImpl: fetchMock as unknown as typeof fetch,
           },
@@ -186,6 +208,249 @@ describe('production startup', () => {
       }),
     ).rejects.toThrow(/authenticated session/i)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('binds operational relationships and findings to the exact active context', async () => {
+    const authPort: AuthPort = {
+      acquireSession: vi.fn(async () => mockAuthSession),
+      acquireAccessToken: vi.fn(async () => 'per-user-runtime-token'),
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/v1/drafts?')) return response([])
+      if (url.includes('/profiles/production/authority')) {
+        return response({
+          manifest_id: canonicalManifestFixture.manifestId,
+          manifest_version: canonicalManifestFixture.manifestVersion,
+          profile_id: 'production',
+          resolved_profile_digest: `sha256:${'7'.repeat(64)}`,
+        })
+      }
+      return response([{ published: wirePublished }])
+    })
+    const operationalContextPort = {
+      loadOperationalContext: vi.fn(async (request: OperationalContextRequest) => {
+        const evidenceInventory = [{
+          evidenceRef: 'flow-evidence-001',
+          evidenceDigest: `sha256:${'2'.repeat(64)}`,
+        }]
+        const evidenceInventoryDigest =
+          await computeOperationalEvidenceInventoryDigest(evidenceInventory)
+        const asOf = Date.parse(request.asOf)
+        const collectedAt = new Date(asOf - 60_000).toISOString()
+        const expiresAt = new Date(asOf + 3_600_000).toISOString()
+        const snapshotId = 'snapshot-operational-001'
+        const evidenceSource = 'Signed WC-026 correlation snapshot'
+        const snapshotConfidence = 0.88
+        const relationships = [{
+          id: 'observed-production-web-worker',
+          kind: 'observed' as const,
+          source: 'web',
+          target: 'worker',
+          evidenceRefs: ['flow-evidence-001'],
+          observedAt: '2026-09-08T00:00:00.000Z',
+          confidence: 0.96,
+          profileId: 'production',
+        }]
+        const findings = [{
+          id: 'finding-production-connectivity',
+          verdict: 'humanReviewRequired',
+          summary: 'Synthetic connectivity evidence requires operator review.',
+          manifestVersion: canonicalManifestFixture.manifestVersion,
+          profileId: 'production',
+          clause: '/profiles/production/relationships/0',
+          evidenceRefs: ['flow-evidence-001'],
+          residualRisk: 'Connectivity intent is not yet confirmed.',
+          controlState: 'unknown',
+          confidence: 0.72,
+        }]
+        const contentDigest = await computeOperationalContentDigest({
+          evidenceSource,
+          confidence: snapshotConfidence,
+          relationships,
+          findings,
+        })
+        const bindingDigest = await computeOperationalBindingDigest({
+          workloadId: request.workloadId,
+          manifestVersion: request.manifestVersion,
+          profileId: request.profileId,
+          draftId: request.draftId,
+          draftRevision: request.draftRevision,
+          manifestDigest: request.manifestDigest,
+          profileDigest: request.profileDigest,
+          snapshotId,
+          collectedAt,
+          expiresAt,
+          evidenceInventoryDigest,
+          contentDigest,
+        })
+        const receiptBase = {
+          schemaVersion:
+            'athena.context-api.operational-context-receipt.v1' as const,
+          receiptId: 'operational-placeholder',
+          issuedBy: {
+            actorId: 'operational-context-service',
+            kind: 'service' as const,
+          },
+          issuedAt: new Date(asOf - 30_000).toISOString(),
+          manifestId: request.workloadId,
+          manifestVersion: request.manifestVersion,
+          profileId: request.profileId,
+          draftId: request.draftId,
+          draftRevision: request.draftRevision,
+          manifestDigest: request.manifestDigest,
+          profileDigest: request.profileDigest,
+          snapshotId,
+          collectedAt,
+          expiresAt,
+          evidenceCount: evidenceInventory.length,
+          evidenceInventoryDigest,
+          contentDigest,
+          bindingDigest,
+          receiptDigest: `sha256:${'0'.repeat(64)}`,
+        }
+        const receipt = {
+          ...receiptBase,
+          receiptId: await computeOperationalReceiptId(receiptBase),
+        }
+        receipt.receiptDigest =
+          await computeOperationalReceiptDigest(receipt)
+        return {
+        schemaVersion: 'athena.contextStudio.operationalContext.v1',
+        workloadId: request.workloadId,
+        manifestVersion: request.manifestVersion,
+        profileId: request.profileId,
+        draftId: request.draftId,
+        draftRevision: request.draftRevision,
+        manifestDigest: request.manifestDigest,
+        profileDigest: request.profileDigest,
+        receiptId: receipt.receiptId,
+        snapshotId,
+        collectedAt,
+        expiresAt,
+        evidenceSource,
+        confidence: snapshotConfidence,
+        evidenceInventory,
+        evidenceInventoryDigest,
+        contentDigest,
+        bindingDigest,
+        receipt: {
+          schema_version: receipt.schemaVersion,
+          receipt_id: receipt.receiptId,
+          issued_by: {
+            actor_id: receipt.issuedBy.actorId,
+            kind: receipt.issuedBy.kind,
+          },
+          issued_at: receipt.issuedAt,
+          manifest_id: receipt.manifestId,
+          manifest_version: receipt.manifestVersion,
+          profile_id: receipt.profileId,
+          draft_id: receipt.draftId,
+          draft_revision: receipt.draftRevision,
+          manifest_digest: receipt.manifestDigest,
+          profile_digest: receipt.profileDigest,
+          snapshot_id: receipt.snapshotId,
+          collected_at: receipt.collectedAt,
+          expires_at: receipt.expiresAt,
+          evidence_count: receipt.evidenceCount,
+          evidence_inventory_digest: receipt.evidenceInventoryDigest,
+          content_digest: receipt.contentDigest,
+          binding_digest: receipt.bindingDigest,
+          receipt_digest: receipt.receiptDigest,
+        },
+        relationships,
+        findings,
+        }
+      }),
+    }
+    const rootElement = document.createElement('div')
+    document.body.append(rootElement)
+
+    let root: Awaited<ReturnType<typeof bootstrapContextStudio>>
+    await act(async () => {
+      root = await bootstrapContextStudio(
+        {
+          apiBaseUrl: 'https://context.invalid',
+          cohortApiBaseUrl: 'https://cohorts.invalid',
+          authPort,
+          operationalContextPort,
+          fetchImpl: fetchMock as typeof fetch,
+        },
+        rootElement,
+      )
+    })
+
+    expect(operationalContextPort.loadOperationalContext).toHaveBeenCalledWith({
+      workloadId: canonicalManifestFixture.manifestId,
+      manifestVersion: canonicalManifestFixture.manifestVersion,
+      profileId: 'production',
+      draftId: wirePublished.source_draft_id,
+      draftRevision: wirePublished.source_draft_revision,
+      manifestDigest: wirePublished.manifest_digest,
+      profileDigest: expect.stringMatching(/^sha256:/),
+      asOf: expect.any(String),
+    })
+    expect(screen.getByText('observed')).toBeInTheDocument()
+    expect(screen.getByText(/synthetic connectivity evidence/i)).toBeInTheDocument()
+    expect(screen.getByText(/signed wc-026 correlation snapshot/i)).toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Manifest' }))
+    await user.click(screen.getByRole('button', { name: /reload scoped context/i }))
+    await waitFor(() =>
+      expect(operationalContextPort.loadOperationalContext).toHaveBeenCalledTimes(2),
+    )
+    expect(screen.getByText(/signed wc-026 correlation snapshot/i)).toBeInTheDocument()
+    await act(async () => root.unmount())
+  })
+
+  it('sanitizes operational adapter failures without exposing raw evidence', async () => {
+    const authPort: AuthPort = {
+      acquireSession: vi.fn(async () => mockAuthSession),
+      acquireAccessToken: vi.fn(async () => 'per-user-runtime-token'),
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/v1/drafts?')) return response([])
+      if (url.includes('/profiles/production/authority')) {
+        return response({
+          manifest_id: canonicalManifestFixture.manifestId,
+          manifest_version: canonicalManifestFixture.manifestVersion,
+          profile_id: 'production',
+          resolved_profile_digest: `sha256:${'7'.repeat(64)}`,
+        })
+      }
+      return response([{ published: wirePublished }])
+    })
+    const rootElement = document.createElement('div')
+    document.body.append(rootElement)
+
+    let caught: unknown
+    await act(async () => {
+      try {
+        await bootstrapContextStudio(
+          {
+            apiBaseUrl: 'https://context.invalid',
+            cohortApiBaseUrl: 'https://cohorts.invalid',
+            authPort,
+            operationalContextPort: {
+              loadOperationalContext: async () => {
+                throw new Error('synthetic raw monitoring payload')
+              },
+            },
+            fetchImpl: fetchMock as typeof fetch,
+          },
+          rootElement,
+        )
+      } catch (error) {
+        caught = error
+      }
+    })
+
+    expect(caught).toEqual(expect.objectContaining({
+      message:
+        'Trusted operational context could not be loaded for the exact lifecycle binding.',
+    }))
+    expect(String(caught)).not.toMatch(/raw monitoring payload/i)
   })
 
   it('loads the merged cohort route through the production HTTP adapter', async () => {
@@ -265,6 +530,10 @@ describe('production startup', () => {
       ...wirePublished,
       manifest: canonicalExceptionManifest,
       manifest_digest: canonicalExceptionManifest.compatibility.artifactDigest,
+      approval: {
+        ...wirePublished.approval,
+        manifest_digest: canonicalExceptionManifest.compatibility.artifactDigest,
+      },
     }
     const authPort: AuthPort = {
       acquireSession: vi.fn(async () => mockAuthSession),
@@ -283,6 +552,7 @@ describe('production startup', () => {
       root = await bootstrapContextStudio(
         {
           apiBaseUrl: 'https://context.invalid',
+          cohortApiBaseUrl: 'https://cohorts.invalid',
           authPort,
           fetchImpl: fetchMock as typeof fetch,
         },

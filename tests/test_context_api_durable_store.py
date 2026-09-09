@@ -32,14 +32,21 @@ from athena_context.api.errors import (
 )
 from athena_context.api.evaluation_adapters import ContextServicePublishedContextReader
 from athena_context.api.memory import InMemoryContextStore
+from athena_context.api.selector_provenance import (
+    DraftSelectorBaseline,
+    SelectorProvenanceEntry,
+    selector_provenance_digest,
+)
 from athena_context.api.service import ContextService
 from athena_context.contracts import compute_artifact_digest
 from context_api_support import (
     AGENT,
     APPROVER,
     AUDITOR,
+    OPERATIONAL_CONTEXT_SERVICE,
     PUBLICATION_SERVICE,
     PUBLISHER,
+    REVIEWER,
     StepClock,
     approve_draft,
     canonical_manifest,
@@ -47,6 +54,8 @@ from context_api_support import (
     publish_draft,
     transition,
 )
+from test_context_api_cohort_decisions import _decision_body, _post_decision
+from test_context_api_cohorts import HUMAN, _build_harness, _load
 
 _DURABLE_WORKLOAD_ID = "wl-athena-wc002-canonical"
 _PRODUCTION_TENANT_ID = "11111111-1111-1111-1111-111111111111"
@@ -231,8 +240,13 @@ def durable_role_authorization(
         [
             RoleGrant(actor_id=AGENT.actor_id, role=Role.PROPOSER),
             RoleGrant(actor_id=APPROVER.actor_id, role=Role.APPROVER),
+            RoleGrant(actor_id=REVIEWER.actor_id, role=Role.REVIEWER),
             RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
             RoleGrant(actor_id=AUDITOR.actor_id, role=Role.AUDITOR),
+            RoleGrant(
+                actor_id=OPERATIONAL_CONTEXT_SERVICE.actor_id,
+                role=Role.OPERATIONAL_CONTEXT_ISSUER,
+            ),
             *(additional_grants or []),
         ]
     )
@@ -303,6 +317,125 @@ def test_durable_store_reloads_immutable_versions_and_exact_supersession(
         DuplicateVersionError
     ):
         transaction.put_published(published_v1)
+
+
+def test_durable_store_round_trips_cohort_authority_records(
+    durable_store_factory: tuple[_FakeTable, type[AzureTableContextStore]],
+) -> None:
+    _table, store_type = durable_store_factory
+    cohort = _build_harness()
+    batch = _load(cohort)
+    idempotency_key = "durable-cohort-authority"
+    response = _post_decision(
+        cohort,
+        _decision_body(cohort, batch),
+        idempotency_key,
+    )
+    assert response.status_code == 201
+    decision_id = response.json()["decisionId"]
+    with cohort.store.transaction() as transaction:
+        baseline = transaction.get_draft_selector_baseline(cohort.draft_id)
+        decision = transaction.get_cohort_decision(
+            cohort.manifest.manifest_id,
+            decision_id,
+        )
+        receipt = transaction.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            idempotency_key,
+        )
+    assert baseline is not None
+    assert decision is not None
+    assert receipt is not None
+    assert len(decision.source_rejection_authorities) == 1
+    authority = decision.source_rejection_authorities[0].model_copy(
+        update={
+            "member_fingerprints": [
+                f"sha256:{index:064x}" for index in range(1000)
+            ]
+        }
+    )
+    decision = type(decision).model_validate(
+        {
+            **decision.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "sourceRejectionAuthorities": [
+                authority.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            ],
+        }
+    )
+    assert not durable._record_json_fits_table_property_bound(
+        decision.model_dump_json(by_alias=True, exclude_none=True)
+    )
+
+    store = _initialized_store(store_type)
+    with store.transaction() as transaction:
+        transaction.put_draft_selector_baseline(baseline)
+        transaction.put_cohort_decision(decision)
+        transaction.put_cohort_decision_receipt(receipt)
+
+    with _store(store_type).transaction() as transaction:
+        assert transaction.get_draft_selector_baseline(cohort.draft_id) == baseline
+        assert transaction.get_cohort_decision(
+            cohort.manifest.manifest_id,
+            decision_id,
+        ) == decision
+        assert transaction.get_cohort_decision_receipt(
+            HUMAN.actor_id,
+            idempotency_key,
+        ) == receipt
+
+
+def test_durable_store_chunks_large_selector_baselines(
+    durable_store_factory: tuple[_FakeTable, type[AzureTableContextStore]],
+) -> None:
+    table, store_type = durable_store_factory
+    entries = tuple(
+        SelectorProvenanceEntry(
+            location="global",
+            role_id=f"role-{index:04d}",
+            selector_path=(
+                "roles",
+                f"role-{index:04d}",
+                "selectors",
+                f"selector-{index:04d}",
+            ),
+            selector_id=f"selector-{index:04d}",
+            selector_variant="namePredicate",
+            semantic_digest=f"sha256:{index:064x}",
+        )
+        for index in range(500)
+    )
+    baseline = DraftSelectorBaseline(
+        draft_id="large-selector-baseline",
+        manifest_id=_DURABLE_WORKLOAD_ID,
+        manifest_version="1.0.0",
+        source_manifest_digest="sha256:" + ("a" * 64),
+        selector_provenance_digest=selector_provenance_digest(entries),
+        entries=entries,
+        captured_by=AGENT,
+        captured_at=StepClock().now(),
+    )
+    assert not durable._record_json_fits_table_property_bound(
+        baseline.model_dump_json(by_alias=True, exclude_none=True)
+    )
+
+    with _initialized_store(store_type).transaction() as transaction:
+        transaction.put_draft_selector_baseline(baseline)
+
+    kinds = [row["kind"] for row in table._rows.values()]
+    assert kinds.count("draft-selector-baseline") == 1
+    assert kinds.count("draft-selector-baseline-chunk") > 1
+    with _store(store_type).transaction() as transaction:
+        assert transaction.get_draft_selector_baseline(
+            baseline.draft_id
+        ) == baseline
 
 
 def test_durable_store_row_keys_hash_untrusted_components_with_domain_separation() -> None:
@@ -725,7 +858,7 @@ def test_durable_store_rejects_partition_overflow_without_writing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     table, store_type = durable_store_factory
-    monkeypatch.setattr(durable, "_MAX_PARTITION_ENTITIES", 5)
+    monkeypatch.setattr(durable, "_MAX_PARTITION_ENTITIES", 6)
     service = _service(_initialized_store(store_type))
     draft = create_draft(
         service,

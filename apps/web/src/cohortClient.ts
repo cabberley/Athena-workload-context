@@ -892,6 +892,7 @@ const parseCohortDecisionRecord = (value: unknown): CohortDecisionRecord => {
 const assertDecisionBinding = (
   decision: CohortDecisionRecord,
   request: CohortDecisionLoadRequest,
+  exactProposalSet: boolean,
 ): void => {
   if (
     decision.sourceDraft.draftId !== request.sourceDraft.draftId ||
@@ -904,7 +905,11 @@ const assertDecisionBinding = (
     decision.scope.resolvedProfileDigest !== request.scope.resolvedProfileDigest ||
     decision.proposalSetDigest !== request.proposalSetDigest ||
     decision.snapshotArtifactDigest !== request.snapshotArtifactDigest ||
-    decision.proposalIds.some((proposalId) => !request.proposalIds.includes(proposalId))
+    (exactProposalSet
+      ? !sameNormalizedMembers(decision.proposalIds, request.proposalIds)
+      : decision.proposalIds.some(
+          (proposalId) => !request.proposalIds.includes(proposalId)
+        ))
   ) {
     throw new Error('Cohort API returned a decision outside the exact requested authority.')
   }
@@ -1103,7 +1108,9 @@ export const createCohortProposalApiClient = (
       const decisions = asArray(response, 'cohort decision list', 200).map(
         parseCohortDecisionRecord,
       )
-      decisions.forEach((decision) => assertDecisionBinding(decision, request))
+      decisions.forEach((decision) =>
+        assertDecisionBinding(decision, request, false)
+      )
       return decisions
     },
     submitDecision: async (request: CohortDecisionSubmitRequest) => {
@@ -1130,7 +1137,7 @@ export const createCohortProposalApiClient = (
           `cohort-decision-${(await idempotencyDigest(JSON.stringify(payload))).slice(0, 32)}`,
         ),
       )
-      assertDecisionBinding(decision, request)
+      assertDecisionBinding(decision, request, true)
       if (
         decision.action !== request.action ||
         decision.rationale !== request.rationale ||

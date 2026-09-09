@@ -77,6 +77,7 @@ from athena_context.api.evaluation_verification import (
     validate_evaluation_collection_binding,
     verify_and_evaluate_snapshot_for_publication,
 )
+from athena_context.api.operational_context import OperationalContextReceipt
 from athena_context.api.ports import (
     AuthoritativeCommitClockPort,
     ContextTransactionPort,
@@ -575,6 +576,10 @@ class InMemoryContextStore:
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._operational_context_receipts: dict[
+            str,
+            OperationalContextReceipt,
+        ] = {}
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
@@ -613,6 +618,10 @@ class InMemoryContextStore:
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
+
+    @property
+    def persistence_identity(self) -> object:
+        return self
 
     def _bind_context_service_evaluation_publication(
         self,
@@ -694,6 +703,10 @@ class _MemoryTransaction(ContextTransactionPort):
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._operational_context_receipts: dict[
+            str,
+            OperationalContextReceipt,
+        ] = {}
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
@@ -738,6 +751,9 @@ class _MemoryTransaction(ContextTransactionPort):
         self._supersessions = dict(self._store._supersessions)
         self._audit = list(self._store._audit)
         self._receipts = dict(self._store._receipts)
+        self._operational_context_receipts = dict(
+            self._store._operational_context_receipts
+        )
         self._demo_evaluation_approvals = dict(
             self._store._demo_evaluation_approvals
         )
@@ -780,6 +796,9 @@ class _MemoryTransaction(ContextTransactionPort):
                     self._store._supersessions = self._supersessions
                     self._store._audit = self._audit
                     self._store._receipts = self._receipts
+                    self._store._operational_context_receipts = (
+                        self._operational_context_receipts
+                    )
                     self._store._demo_evaluation_approvals = (
                         self._demo_evaluation_approvals
                     )
@@ -972,6 +991,26 @@ class _MemoryTransaction(ContextTransactionPort):
         if key in self._receipts:
             raise IdempotencyConflictError("idempotency key has already been recorded")
         self._receipts[key] = receipt.model_copy(deep=True)
+        self._dirty = True
+
+    def get_operational_context_receipt(
+        self,
+        receipt_id: str,
+    ) -> OperationalContextReceipt | None:
+        receipt = self._operational_context_receipts.get(receipt_id)
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_operational_context_receipt(
+        self,
+        receipt: OperationalContextReceipt,
+    ) -> None:
+        if receipt.receipt_id in self._operational_context_receipts:
+            raise PersistenceConflictError(
+                "operational context receipt identifier already exists"
+            )
+        self._operational_context_receipts[receipt.receipt_id] = (
+            receipt.model_copy(deep=True)
+        )
         self._dirty = True
 
     def get_demo_evaluation_approval(

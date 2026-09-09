@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         CohortDecisionRecord,
         CohortProposalSetVersion,
     )
+    from athena_context.api.operational_context import OperationalContextReceipt
 
 
 class ClockPort(Protocol):
@@ -111,6 +112,16 @@ class ContextTransactionPort(Protocol):
     def get_receipt(self, actor_id: str, idempotency_key: str) -> MutationReceipt | None: ...
 
     def put_receipt(self, receipt: MutationReceipt) -> None: ...
+
+    def get_operational_context_receipt(
+        self,
+        receipt_id: str,
+    ) -> OperationalContextReceipt | None: ...
+
+    def put_operational_context_receipt(
+        self,
+        receipt: OperationalContextReceipt,
+    ) -> None: ...
 
     def get_cohort_decision(
         self,

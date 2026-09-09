@@ -1684,11 +1684,11 @@ def _selectors_may_overlap(
         right, TagPredicateSelector
     ):
         left_predicates = {
-            _normalized_id(item.key): normalize_nfc_text(item.value)
+            _normalized_id(item.key): _normalized_id(item.value)
             for item in left.predicates
         }
         right_predicates = {
-            _normalized_id(item.key): normalize_nfc_text(item.value)
+            _normalized_id(item.key): _normalized_id(item.value)
             for item in right.predicates
         }
         return not any(
@@ -1701,14 +1701,14 @@ def _selectors_may_overlap(
         prefixes_overlap = (
             left.prefix is None
             or right.prefix is None
-            or normalize_nfc_text(left.prefix).startswith(normalize_nfc_text(right.prefix))
-            or normalize_nfc_text(right.prefix).startswith(normalize_nfc_text(left.prefix))
+            or _normalized_id(left.prefix).startswith(_normalized_id(right.prefix))
+            or _normalized_id(right.prefix).startswith(_normalized_id(left.prefix))
         )
         suffixes_overlap = (
             left.suffix is None
             or right.suffix is None
-            or normalize_nfc_text(left.suffix).endswith(normalize_nfc_text(right.suffix))
-            or normalize_nfc_text(right.suffix).endswith(normalize_nfc_text(left.suffix))
+            or _normalized_id(left.suffix).endswith(_normalized_id(right.suffix))
+            or _normalized_id(right.suffix).endswith(_normalized_id(left.suffix))
         )
         return prefixes_overlap and suffixes_overlap
     if isinstance(left, ResourceTypeSelector) and isinstance(
@@ -1755,7 +1755,8 @@ def _selectors_may_overlap(
         return (
             _normalized_id(left.collector_tool_name)
             == _normalized_id(right.collector_tool_name)
-            and left.collector_tool_version == right.collector_tool_version
+            and _normalized_id(left.collector_tool_version)
+            == _normalized_id(right.collector_tool_version)
             and _normalized_id(left.identity_evidence_ref)
             == _normalized_id(right.identity_evidence_ref)
         )
@@ -1857,7 +1858,7 @@ def _validate_inherited_semantics(
         current_selectors = {
             _normalized_id(item.selector_id): item for item in current.selectors
         }
-        if current_selectors.keys() != previous_selectors.keys():
+        if not current_selectors.keys() <= previous_selectors.keys():
             if selector_capability is not None and (
                 previous_selectors.keys().isdisjoint(current_selectors.keys())
                 and selector_capability.permits_selector_identity_replacement(
@@ -1873,8 +1874,8 @@ def _validate_inherited_semantics(
                 "inherited selector identities are immutable outside an exact "
                 f"cohort decision for role {current.role_id}"
             )
-        for selector_id, previous_selector in previous_selectors.items():
-            current_selector = current_selectors[selector_id]
+        for selector_id, current_selector in current_selectors.items():
+            previous_selector = previous_selectors[selector_id]
             if (
                 previous_selector.model_dump(
                     mode="json", by_alias=True, exclude_none=True
@@ -3146,13 +3147,13 @@ def validate_manifest_selector_identity_inheritance(
                 _normalized_id(selector.selector_id): selector
                 for selector in role.selectors
             }
-            if current_selectors.keys() != previous_selectors.keys():
+            if not current_selectors.keys() <= previous_selectors.keys():
                 raise AthenaValidationError(
                     "inherited selector identities are immutable outside an "
                     f"exact cohort decision for role {role.role_id}"
                 )
-            for selector_id, previous_selector in previous_selectors.items():
-                current_selector = current_selectors[selector_id]
+            for selector_id, current_selector in current_selectors.items():
+                previous_selector = previous_selectors[selector_id]
                 if (
                     current_selector != previous_selector
                     and not _selector_override_is_narrower(

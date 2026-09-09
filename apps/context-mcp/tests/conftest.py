@@ -21,9 +21,13 @@ from athena_context.api.authorization import RoleBasedAuthorization
 from athena_context.api.domain import (
     Actor,
     ActorKind,
+    ApproveCommand,
     AuthenticationMethod,
     CreateDraftCommand,
+    DraftRecord,
     PublishCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
     Role,
     RoleGrant,
     TransitionCommand,
@@ -31,6 +35,14 @@ from athena_context.api.domain import (
     WorkloadGrantScope,
 )
 from athena_context.api.memory import InMemoryContextStore
+from athena_context.api.operational_context import (
+    IssueOperationalContextReceiptCommand,
+    OperationalContextReceipt,
+    OperationalEvidenceInventoryItem,
+    compute_operational_binding_digest,
+    compute_operational_content_digest,
+    compute_operational_evidence_inventory_digest,
+)
 from athena_context.api.service import ContextService
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
@@ -44,9 +56,14 @@ from athena_context.policy import evaluate_manifest_profile
 WORKLOAD_ID = golden.WC002_MANIFEST_ID
 AGENT = Actor(actor_id="synthetic-context-mcp", kind=ActorKind.AGENT)
 APPROVER = Actor(actor_id="synthetic-human-approver", kind=ActorKind.HUMAN)
+REVIEWER = Actor(actor_id="synthetic-human-reviewer", kind=ActorKind.HUMAN)
 PUBLISHER = Actor(actor_id="synthetic-human-publisher", kind=ActorKind.HUMAN)
 PUBLICATION_SERVICE = Actor(
     actor_id="synthetic-context-api",
+    kind=ActorKind.SERVICE,
+)
+OPERATIONAL_CONTEXT_SERVICE = Actor(
+    actor_id="synthetic-operational-context",
     kind=ActorKind.SERVICE,
 )
 BYPASS_PHRASE = (
@@ -216,6 +233,71 @@ def _transition(
     )
 
 
+def _operational_receipt(
+    service: ContextService,
+    draft: DraftRecord,
+    *,
+    key: str,
+) -> OperationalContextReceipt:
+    profile_id = draft.manifest.workload.environments[0]
+    authority = service.resolve_draft_profile_authority(
+        OPERATIONAL_CONTEXT_SERVICE,
+        draft.draft_id,
+        profile_id,
+    )
+    inventory = [
+        OperationalEvidenceInventoryItem(
+            evidenceRef=f"synthetic://context-mcp/{draft.draft_id}/{draft.revision}",
+            evidenceDigest="sha256:" + "a" * 64,
+        )
+    ]
+    inventory_digest = compute_operational_evidence_inventory_digest(
+        inventory
+    )
+    content_digest = compute_operational_content_digest(
+        evidence_source="Synthetic Context MCP operational context.",
+        confidence=0.9,
+        relationships=[],
+        findings=[],
+    )
+    collected_at = datetime(2000, 1, 1, tzinfo=UTC)
+    expires_at = datetime(2100, 1, 1, tzinfo=UTC)
+    snapshot_id = f"context-mcp-{draft.draft_id}-r{draft.revision}"
+    return service.issue_operational_context_receipt(
+        OPERATIONAL_CONTEXT_SERVICE,
+        key,
+        IssueOperationalContextReceiptCommand(
+            manifest_id=draft.manifest_id,
+            manifest_version=draft.manifest.manifest_version,
+            profile_id=profile_id,
+            draft_id=draft.draft_id,
+            draft_revision=draft.revision,
+            manifest_digest=draft.manifest_digest,
+            profile_digest=authority.resolved_profile_digest,
+            snapshot_id=snapshot_id,
+            collected_at=collected_at,
+            expires_at=expires_at,
+            evidence_inventory=inventory,
+            evidence_inventory_digest=inventory_digest,
+            content_digest=content_digest,
+            binding_digest=compute_operational_binding_digest(
+                workload_id=draft.manifest_id,
+                manifest_version=draft.manifest.manifest_version,
+                profile_id=profile_id,
+                draft_id=draft.draft_id,
+                draft_revision=draft.revision,
+                manifest_digest=draft.manifest_digest,
+                profile_digest=authority.resolved_profile_digest,
+                snapshot_id=snapshot_id,
+                collected_at=collected_at,
+                expires_at=expires_at,
+                evidence_inventory_digest=inventory_digest,
+                content_digest=content_digest,
+            ),
+        ),
+    )
+
+
 @pytest.fixture
 def harness() -> Harness:
     service = ContextService(
@@ -238,8 +320,18 @@ def harness() -> Harness:
                     scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
                 RoleGrant(
+                    actor_id=REVIEWER.actor_id,
+                    role=Role.REVIEWER,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
+                ),
+                RoleGrant(
                     actor_id=PUBLISHER.actor_id,
                     role=Role.PUBLISHER,
+                    scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
+                ),
+                RoleGrant(
+                    actor_id=OPERATIONAL_CONTEXT_SERVICE.actor_id,
+                    role=Role.OPERATIONAL_CONTEXT_ISSUER,
                     scope=WorkloadGrantScope(workload_id=WORKLOAD_ID),
                 ),
             ]
@@ -289,18 +381,46 @@ def harness() -> Harness:
             "Submit the synthetic seed for review",
         ),
     )
+    draft = service.review_draft(
+        REVIEWER,
+        draft.draft_id,
+        "seed-review",
+        ReviewCommand(
+            **_transition(
+                draft.revision,
+                draft.manifest.manifest_version,
+                draft.manifest_digest,
+                "Review the exact synthetic candidate",
+            ).model_dump(),
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact synthetic publication candidate.",
+        ),
+    )
+    approval_receipt = _operational_receipt(
+        service,
+        draft,
+        key="seed-operational-approval",
+    )
     draft = service.approve_draft(
         APPROVER,
         draft.draft_id,
         "seed-approve",
-        _transition(
-            draft.revision,
-            draft.manifest.manifest_version,
-            draft.manifest_digest,
-            "Approve the exact synthetic candidate",
+        ApproveCommand(
+            **_transition(
+                draft.revision,
+                draft.manifest.manifest_version,
+                draft.manifest_digest,
+                "Approve the exact synthetic candidate",
+            ).model_dump(),
+            operational_context_receipt_id=approval_receipt.receipt_id,
         ),
     )
     assert draft.approval is not None
+    publication_receipt = _operational_receipt(
+        service,
+        draft,
+        key="seed-operational-publication",
+    )
     published = service.publish_draft(
         PUBLISHER,
         draft.draft_id,
@@ -313,6 +433,7 @@ def harness() -> Harness:
                 "Publish the human-approved synthetic candidate",
             ).model_dump(),
             approval_id=draft.approval.decision_id,
+            operational_context_receipt_id=publication_receipt.receipt_id,
         ),
     )
 

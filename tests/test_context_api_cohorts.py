@@ -40,6 +40,7 @@ from athena_context.api.domain import (
     VerifiedAuthentication,
     WorkloadGrantScope,
 )
+from athena_context.api.errors import CohortContractError
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
@@ -462,7 +463,6 @@ def test_snapshot_is_cryptographically_verified_on_cache_hits_and_staleness_fail
     second = _load(harness)
     assert first == second
     assert len(harness.verifier_calls) == 2
-
     harness.clock.value = harness.snapshot.expires_at
     stale = harness.client.get(
         "/v1/cohort-proposals",
@@ -471,6 +471,23 @@ def test_snapshot_is_cryptographically_verified_on_cache_hits_and_staleness_fail
     )
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "stale_evidence_snapshot"
+
+
+def test_cached_proposal_content_is_rehashed_before_reuse() -> None:
+    harness = _build_harness()
+    _load(harness)
+    cached = next(iter(harness.persistence._batches.values()))
+    cached.proposals[0].members.append(
+        "/subscriptions/11111111-1111-1111-1111-111111111111/"
+        "resourcegroups/rg-synthetic/providers/microsoft.compute/"
+        "virtualmachines/injected-member"
+    )
+
+    with pytest.raises(CohortContractError, match="digest"):
+        harness.cohorts.get_proposals(
+            HUMAN,
+            CohortProposalQuery(**_params(harness)),
+        )
 
 
 def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
@@ -519,6 +536,14 @@ def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
         proposal_cache=oversized.persistence,
         preview_receipts=oversized.persistence,
     )
+    oversized.decisions = CohortDecisionService(
+        store=oversized.store,
+        authorization=oversized.authorization,
+        clock=oversized.clock,
+        context_service=oversized.lifecycle,
+        proposal_service=oversized.cohorts,
+        candidate_repository=oversized.persistence,
+    )
     oversized.client = TestClient(
         create_app(
             service=oversized.lifecycle,
@@ -526,6 +551,7 @@ def test_snapshot_signature_failure_and_evidence_bounds_fail_closed() -> None:
                 {TOKENS[HUMAN.actor_id]: _verified(HUMAN)}
             ),
             cohort_service=oversized.cohorts,
+            cohort_decision_service=oversized.decisions,
         )
     )
     boundary = oversized.client.get(

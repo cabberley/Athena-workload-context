@@ -220,6 +220,26 @@ class CohortDecisionService:
         self._proposal_service = proposal_service
         self._candidate_repository = candidate_repository
 
+    @property
+    def persistence_store(self) -> CohortDecisionStorePort:
+        return self._store
+
+    @property
+    def context_service(self) -> ContextService:
+        return self._context_service
+
+    @property
+    def proposal_service(self) -> CohortProposalService:
+        return self._proposal_service
+
+    @property
+    def candidate_repository(self) -> CohortCandidateRepositoryPort:
+        return self._candidate_repository
+
+    @property
+    def authorization(self) -> ExplicitWorkloadAuthorizationPort:
+        return self._authorization
+
     def decide(
         self,
         actor: Actor,
@@ -253,14 +273,27 @@ class CohortDecisionService:
         if replay is not None:
             return replay
 
+        self._context_service.ensure_selector_baseline_for_decision(
+            actor,
+            draft_id=request.draft_id,
+            expected_revision=request.expected_revision,
+            expected_manifest_version=request.manifest_version,
+            expected_digest=request.expected_digest,
+        )
+
         with self._store.transaction() as tx:
             receipt = tx.get_cohort_decision_receipt(
                 actor.actor_id,
                 idempotency_key,
             )
             if receipt is not None:
+                decision = tx.get_cohort_decision(
+                    receipt.manifest_id,
+                    receipt.decision_id,
+                )
                 return self._replay_from_receipt(
                     receipt,
+                    decision=decision,
                     request_digest=request_digest,
                     manifest_id=request.manifest_id,
                 )
@@ -274,8 +307,13 @@ class CohortDecisionService:
                 idempotency_key,
             )
             if receipt is not None:
+                decision = tx.get_cohort_decision(
+                    receipt.manifest_id,
+                    receipt.decision_id,
+                )
                 return self._replay_from_receipt(
                     receipt,
+                    decision=decision,
                     request_digest=request_digest,
                     manifest_id=request.manifest_id,
                 )
@@ -445,9 +483,14 @@ class CohortDecisionService:
                     actor_id=actor.actor_id,
                     idempotency_key=idempotency_key,
                     request_digest=request_digest,
-                    response_json=record.model_dump_json(
-                        by_alias=True,
-                        exclude_none=True,
+                    manifest_id=record.manifest_id,
+                    decision_id=record.decision_id,
+                    decision_digest=compute_artifact_digest(
+                        record.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
                     ),
                 )
             )
@@ -526,18 +569,24 @@ class CohortDecisionService:
                 actor.actor_id,
                 idempotency_key,
             )
-        if receipt is None:
-            return None
-        return self._replay_from_receipt(
-            receipt,
-            request_digest=request_digest,
-            manifest_id=manifest_id,
-        )
+            if receipt is None:
+                return None
+            decision = tx.get_cohort_decision(
+                receipt.manifest_id,
+                receipt.decision_id,
+            )
+            return self._replay_from_receipt(
+                receipt,
+                decision=decision,
+                request_digest=request_digest,
+                manifest_id=manifest_id,
+            )
 
     @staticmethod
     def _replay_from_receipt(
         receipt: CohortDecisionReceipt,
         *,
+        decision: CohortDecisionRecord | None,
         request_digest: str,
         manifest_id: str,
     ) -> CohortDecisionRecord:
@@ -545,17 +594,24 @@ class CohortDecisionService:
             raise IdempotencyConflictError(
                 "idempotency key was used for a different cohort decision"
             )
-        try:
-            record = CohortDecisionRecord.model_validate_json(receipt.response_json)
-        except ValidationError as exc:
-            raise PersistenceConflictError(
-                "stored cohort decision receipt is invalid"
-            ) from exc
-        if record.manifest_id != manifest_id:
-            raise IdempotencyConflictError(
-                "idempotency receipt escaped its workload scope"
+        if (
+            receipt.manifest_id != manifest_id
+            or decision is None
+            or decision.manifest_id != receipt.manifest_id
+            or decision.decision_id != receipt.decision_id
+            or compute_artifact_digest(
+                decision.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
             )
-        return record
+            != receipt.decision_digest
+        ):
+            raise PersistenceConflictError(
+                "stored cohort decision receipt does not resolve exactly"
+            )
+        return decision
 
     @staticmethod
     def _proposal_set_version(
@@ -585,7 +641,10 @@ class CohortDecisionService:
         request: CohortDecisionRequest,
         proposals: list[CohortProposal],
     ) -> list[CohortRejectionAuthority]:
-        cls._source_union(proposals)
+        cls._source_union(
+            proposals,
+            allow_empty=request.action is CohortDecisionKind.REJECT,
+        )
         grouped: dict[str, set[str]] = {}
         for proposal in proposals:
             selector_role_fingerprint = (
@@ -611,6 +670,7 @@ class CohortDecisionService:
             for selector_role_fingerprint, member_fingerprints in sorted(
                 grouped.items()
             )
+            if member_fingerprints
         ]
 
     @staticmethod
@@ -740,7 +800,11 @@ class CohortDecisionService:
         return candidate
 
     @staticmethod
-    def _source_union(proposals: list[CohortProposal]) -> set[str]:
+    def _source_union(
+        proposals: list[CohortProposal],
+        *,
+        allow_empty: bool = False,
+    ) -> set[str]:
         members: set[str] = set()
         for proposal in proposals:
             for member in proposal.members:
@@ -755,7 +819,7 @@ class CohortDecisionService:
                         "source proposals contain overlapping normalized members"
                     )
                 members.add(normalized)
-        if not members or len(members) > 1000:
+        if (not members and not allow_empty) or len(members) > 1000:
             raise CohortBoundaryError(
                 "decision source union must contain between 1 and 1,000 members"
             )
@@ -771,7 +835,10 @@ class CohortDecisionService:
         *,
         decided_at: datetime,
     ) -> None:
-        source_union = cls._source_union(proposals)
+        source_union = cls._source_union(
+            proposals,
+            allow_empty=request.action is CohortDecisionKind.REJECT,
+        )
         if candidate is None:
             if request.action is not CohortDecisionKind.REJECT:
                 raise CohortContractError("apply decision has no exact candidate")
@@ -1013,11 +1080,50 @@ class CohortDecisionService:
         update = candidate.role_updates[0]
         target = normalized_identifier(update.role.role_id)
         source_role = proposals[0].role
-        applied_role = CohortDecisionService._materialize_local_role_override(
+        current_local_role = next(
+            (
+                role
+                for role in _profile.roles
+                if normalized_identifier(role.role_id) == target
+            ),
+            None,
+        )
+        current_role = current_local_role or source_role
+        candidate_role = CohortDecisionService._materialize_local_role_override(
             update.role,
             baseline=source_role,
             candidate=candidate,
         )
+        if _authority_projection(current_role) != _authority_projection(source_role):
+            raise CohortContractError(
+                "requested role authority changed outside the verified apply chain"
+            )
+        if current_role == source_role:
+            applied_role = candidate_role
+        else:
+            existing_selectors = {
+                normalized_identifier(selector.selector_id): selector
+                for selector in current_role.selectors
+            }
+            for selector in candidate_role.selectors:
+                selector_id = normalized_identifier(selector.selector_id)
+                existing = existing_selectors.get(selector_id)
+                if existing is not None and existing != selector:
+                    raise CohortContractError(
+                        "same-role disjoint apply attempted to replace an "
+                        "existing selector identity"
+                    )
+                existing_selectors[selector_id] = selector
+            applied_role = ManifestRole.model_validate(
+                {
+                    **current_role.model_dump(
+                        mode="python",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                    "selectors": list(existing_selectors.values()),
+                }
+            )
         profile_payload = payload["profiles"].get(profile_key)
         if not isinstance(profile_payload, dict):
             raise CohortContractError("requested profile payload is invalid")
@@ -1139,7 +1245,7 @@ class CohortDecisionService:
                 ),
                 None,
             )
-            if target_before_role != source_role:
+            if target_before_role != current_role:
                 raise CohortContractError(
                     "requested role changed outside this disjoint decision apply chain"
                 )
@@ -1198,9 +1304,9 @@ class CohortDecisionService:
             raise CohortContractError(
                 "candidate attempted an update outside the exact role selectors"
             )
-        if after_roles[target].selectors != update.role.selectors:
+        if after_roles[target].selectors != applied_role.selectors:
             raise CohortContractError(
-                "local override does not contain the exact approved candidate selectors"
+                "local override does not contain the exact authorized selector set"
             )
         before = target_before.model_dump(
             mode="json",

@@ -2,19 +2,31 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
 
 import athena_context.api.http as http_module
-from athena_context.api.authorization import StaticTestAuthenticator
+from athena_context.api.authorization import (
+    RoleBasedAuthorization,
+    StaticTestAuthenticator,
+)
+from athena_context.api.cohort_decision_service import CohortDecisionService
+from athena_context.api.cohort_memory import (
+    CallableTrustedEvidenceSnapshotVerifier,
+)
+from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
+    ApproveCommand,
     AuthenticationMethod,
     CreateDraftCommand,
     DraftState,
     PublishCommand,
     ReplaceDraftCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
     TransitionCommand,
     ValidationRecord,
     VerifiedAuthentication,
@@ -31,15 +43,20 @@ from context_api_support import (
     APPROVER,
     AUDITOR,
     AUTHOR,
+    OPERATIONAL_CONTEXT_SERVICE,
     OUTSIDER,
     PUBLISHER,
+    REVIEWER,
     approve_draft,
     build_service,
     canonical_manifest,
     create_draft,
+    issue_operational_context_receipt,
+    operational_context_command,
     publish_draft,
     transition,
 )
+from test_context_api_cohorts import _build_harness
 
 BAD_DIGEST = "sha256:" + ("0" * 64)
 _TOKENS = {
@@ -49,7 +66,100 @@ _TOKENS = {
     PUBLISHER.actor_id: "synthetic-publisher-token",
     AUDITOR.actor_id: "synthetic-auditor-token",
     OUTSIDER.actor_id: "synthetic-outsider-token",
+    OPERATIONAL_CONTEXT_SERVICE.actor_id: "synthetic-operational-token",
 }
+
+
+def test_context_api_rejects_partial_cohort_composition() -> None:
+    with pytest.raises(ValueError, match="supplied together"):
+        create_app(
+            service=build_service(),
+            cohort_service=cast(CohortProposalService, object()),
+        )
+
+
+def test_operational_receipt_route_requires_service_authority() -> None:
+    service, client = _client()
+    draft = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="http-operational-receipt",
+    )
+    command = operational_context_command(service, draft)
+
+    denied = client.post(
+        "/v1/operational-context-receipts",
+        headers=_headers(
+            APPROVER.actor_id,
+            "http-operational-human-denied",
+        ),
+        json=command.model_dump(mode="json", by_alias=True),
+    )
+    issued = client.post(
+        "/v1/operational-context-receipts",
+        headers=_headers(
+            OPERATIONAL_CONTEXT_SERVICE.actor_id,
+            "http-operational-service-issued",
+        ),
+        json=command.model_dump(mode="json", by_alias=True),
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "authorization_denied"
+    assert issued.status_code == 201, issued.text
+    assert issued.json()["draft_id"] == draft.draft_id
+    assert issued.json()["draft_revision"] == draft.revision
+
+
+def test_context_api_rejects_disconnected_cohort_composition() -> None:
+    cohort = _build_harness()
+
+    with pytest.raises(ValueError, match="share the app-owned"):
+        create_app(
+            service=build_service(),
+            cohort_service=cohort.cohorts,
+            cohort_decision_service=cohort.decisions,
+        )
+
+
+def test_context_api_rejects_mismatched_cohort_authorization() -> None:
+    cohort = _build_harness()
+    foreign_authorization = RoleBasedAuthorization()
+    proposals = CohortProposalService(
+        context_store=cohort.store,
+        authorization=foreign_authorization,
+        clock=cohort.clock,
+        snapshot_repository=cohort.snapshots,
+        snapshot_verifier=CallableTrustedEvidenceSnapshotVerifier(
+            cohort.verifier
+        ),
+        proposal_cache=cohort.persistence,
+        preview_receipts=cohort.persistence,
+    )
+    decisions = CohortDecisionService(
+        store=cohort.store,
+        authorization=foreign_authorization,
+        clock=cohort.clock,
+        context_service=cohort.lifecycle,
+        proposal_service=proposals,
+        candidate_repository=cohort.persistence,
+    )
+
+    with pytest.raises(ValueError, match="share the app-owned"):
+        create_app(
+            service=cohort.lifecycle,
+            cohort_service=proposals,
+            cohort_decision_service=decisions,
+        )
+
+
+def test_unconfigured_context_api_does_not_advertise_cohort_routes() -> None:
+    schema = TestClient(create_app()).get("/openapi.json").json()
+
+    assert not any(
+        path.startswith("/v1/cohort-proposals")
+        for path in schema["paths"]
+    )
 
 
 def _verified(actor: Actor) -> VerifiedAuthentication:
@@ -70,7 +180,15 @@ def _client(
     authenticator = StaticTestAuthenticator(
         {
             _TOKENS[actor.actor_id]: _verified(actor)
-            for actor in [AGENT, AUTHOR, APPROVER, PUBLISHER, AUDITOR, OUTSIDER]
+            for actor in [
+                AGENT,
+                AUTHOR,
+                APPROVER,
+                PUBLISHER,
+                AUDITOR,
+                OUTSIDER,
+                OPERATIONAL_CONTEXT_SERVICE,
+            ]
         }
     )
     return service, TestClient(
@@ -125,6 +243,29 @@ def _headers(
     return headers
 
 
+def test_profile_authority_route_returns_the_exact_resolved_digest() -> None:
+    service, client = _client()
+    draft = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="profile-authority-draft",
+    )
+
+    response = client.get(
+        f"/v1/drafts/{draft.draft_id}/profiles/production/authority",
+        headers=_headers(AGENT.actor_id),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "manifest_id": draft.manifest_id,
+        "manifest_version": draft.manifest.manifest_version,
+        "profile_id": "production",
+        "resolved_profile_digest": response.json()["resolved_profile_digest"],
+    }
+    assert response.json()["resolved_profile_digest"].startswith("sha256:")
+
+
 def test_system_clock_preserves_supported_subsecond_expiry_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,6 +308,7 @@ def test_openapi_exposes_typed_lifecycle_contracts() -> None:
     schema = client.get("/openapi.json").json()
 
     assert schema["info"]["title"] == "Athena Context API"
+    assert "/v1/drafts/{draft_id}/review" in schema["paths"]
     assert "/v1/drafts/{draft_id}/approve" in schema["paths"]
     assert "/v1/drafts/{draft_id}/publish" in schema["paths"]
     assert "/v1/manifests/{manifest_id}/compare" in schema["paths"]
@@ -533,6 +675,9 @@ def test_http_publish_rechecks_profile_resolution_without_side_effects() -> None
             "Reject unresolved selector inheritance before publication",
         ).model_dump(),
         approval_id=tampered.approval.decision_id,
+        operational_context_receipt_id=(
+            tampered.approval.operational_context_receipt_id
+        ),
     )
 
     response = client.post(
@@ -541,8 +686,8 @@ def test_http_publish_rechecks_profile_resolution_without_side_effects() -> None
         json=command.model_dump(mode="json"),
     )
 
-    assert response.status_code == 422, response.text
-    assert response.json()["error"]["code"] == "manifest_validation_failed"
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "stale_approval"
     assert service.get_draft(PUBLISHER, tampered.draft_id) == tampered
     with store.transaction() as tx:
         assert tx.list_audit(manifest_id=manifest.manifest_id) == audit_before
@@ -576,7 +721,10 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
             "http-agent-approve",
             spoofed_actor=APPROVER.actor_id,
         ),
-        json=transition(draft, "Agent must not approve").model_dump(mode="json"),
+        json=ApproveCommand(
+            **transition(draft, "Agent must not approve").model_dump(),
+            operational_context_receipt_id="operational-placeholder",
+        ).model_dump(mode="json"),
     )
     publisher_spoof_approval_response = client.post(
         f"/v1/drafts/{draft.draft_id}/approve",
@@ -585,15 +733,43 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
             "http-agent-publisher-spoof-approve",
             spoofed_actor=PUBLISHER.actor_id,
         ),
-        json=transition(draft, "Publisher header must not replace agent").model_dump(
-            mode="json"
+        json=ApproveCommand(
+            **transition(
+                draft,
+                "Publisher header must not replace agent",
+            ).model_dump(),
+            operational_context_receipt_id="operational-placeholder",
+        ).model_dump(mode="json"),
+    )
+    reviewed = service.review_draft(
+        REVIEWER,
+        draft.draft_id,
+        "http-human-review",
+        ReviewCommand(
+            **transition(
+                draft,
+                "Human reviews exact candidate",
+            ).model_dump(),
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact HTTP candidate.",
         ),
+    )
+    approval_receipt = issue_operational_context_receipt(
+        service,
+        reviewed,
+        key_prefix="http-human-approve",
     )
     approved = service.approve_draft(
         APPROVER,
         draft.draft_id,
         "http-human-approve",
-        transition(draft, "Human approves exact candidate"),
+        ApproveCommand(
+            **transition(
+                reviewed,
+                "Human approves exact candidate",
+            ).model_dump(),
+            operational_context_receipt_id=approval_receipt.receipt_id,
+        ),
     )
     assert approved.approval is not None
     publication_response = client.post(
@@ -606,6 +782,7 @@ def test_verified_agent_cannot_escalate_with_spoofed_authority_headers() -> None
         json=PublishCommand(
             **transition(approved, "Agent must not publish").model_dump(),
             approval_id=approved.approval.decision_id,
+            operational_context_receipt_id="operational-placeholder",
         ).model_dump(mode="json"),
     )
     unverified_response = client.get(

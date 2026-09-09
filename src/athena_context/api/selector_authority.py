@@ -116,7 +116,7 @@ def _deduplicate_bindings(
 def _validate_published_lineage_entry(
     tx: ContextTransactionPort,
     published: PublishedManifest,
-) -> None:
+) -> DraftRecord:
     stored = tx.get_published(
         published.manifest_id,
         published.manifest_version,
@@ -143,6 +143,7 @@ def _validate_published_lineage_entry(
         raise PersistenceConflictError(
             "published selector authority lineage is inconsistent"
         )
+    return source
 
 
 def _published_lineage_bindings(
@@ -156,18 +157,21 @@ def _published_lineage_bindings(
         raise PersistenceConflictError(
             "published selector authority lineage contains a cycle"
         )
-    _validate_published_lineage_entry(tx, published)
+    source = _validate_published_lineage_entry(tx, published)
 
     inherited: tuple[CohortDecisionApplyBinding, ...] = ()
-    if published.previous_version is not None:
+    selector_source_version = (
+        source.rollback_source_version or published.previous_version
+    )
+    if selector_source_version is not None:
         previous = tx.get_published(
             published.manifest_id,
-            published.previous_version,
+            selector_source_version,
         )
         if (
             previous is None
             or previous.manifest_id != published.manifest_id
-            or previous.manifest_version != published.previous_version
+            or previous.manifest_version != selector_source_version
             or _version_key(previous.manifest_version)
             >= _version_key(published.manifest_version)
         ):
@@ -225,15 +229,18 @@ def persisted_selector_authority_for_draft(
             maximum_revision=current.revision,
         )
     )
-    if current.previous_version is not None:
+    selector_source_version = (
+        current.rollback_source_version or current.previous_version
+    )
+    if selector_source_version is not None:
         previous = tx.get_published(
             current.manifest_id,
-            current.previous_version,
+            selector_source_version,
         )
         if (
             previous is None
             or previous.manifest_id != current.manifest_id
-            or previous.manifest_version != current.previous_version
+            or previous.manifest_version != selector_source_version
             or _version_key(previous.manifest_version)
             >= _version_key(current.manifest.manifest_version)
         ):

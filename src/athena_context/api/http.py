@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from time import time_ns
 from typing import Annotated, Protocol, cast
 
-from fastapi import Depends, FastAPI, Header, Path, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, Path, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from athena_context.api.authorization import (
@@ -16,7 +16,6 @@ from athena_context.api.cohort_decision_domain import (
     CohortDecisionResponse,
     decision_response,
 )
-from athena_context.api.cohort_decision_ports import CohortDecisionStorePort
 from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortDraftBinding,
@@ -26,17 +25,13 @@ from athena_context.api.cohort_domain import (
     CohortReviewPreviewRequest,
     ProfileType,
 )
-from athena_context.api.cohort_memory import (
-    EmptyEvidenceSnapshotRepository,
-    InMemoryCohortPersistence,
-    RejectingTrustedEvidenceSnapshotVerifier,
-)
 from athena_context.api.cohort_ports import ExplicitWorkloadAuthorizationPort
 from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
     Actor,
     ActorKind,
     ApiModel,
+    ApproveCommand,
     AuditEvent,
     CreateDraftCommand,
     DraftRecord,
@@ -45,6 +40,8 @@ from athena_context.api.domain import (
     PublishedManifest,
     PublishedManifestView,
     ReplaceDraftCommand,
+    ResolvedProfileAuthority,
+    ReviewCommand,
     SupersedeCommand,
     Supersession,
     TransitionCommand,
@@ -78,6 +75,10 @@ from athena_context.api.evaluation_service import (
     DemoEvaluationService,
 )
 from athena_context.api.memory import InMemoryContextStore
+from athena_context.api.operational_context import (
+    IssueOperationalContextReceiptCommand,
+    OperationalContextReceipt,
+)
 from athena_context.api.ports import (
     AuthenticationPort,
     AuthorizationPort,
@@ -150,6 +151,10 @@ def _current_actor(
 ActorDependency = Annotated[Actor, Depends(_current_actor)]
 
 
+def _dependency_identity(value: object) -> object:
+    return getattr(value, "persistence_identity", value)
+
+
 def create_app(
     *,
     service: ContextService | None = None,
@@ -207,29 +212,32 @@ def create_app(
             ),
             demo_evaluation_trust=demo_trust,
         )
-    cohort_persistence = InMemoryCohortPersistence()
-    decision_store = cast(
-        CohortDecisionStorePort,
-        default_store or InMemoryContextStore(),
-    )
-    if cohort_service is None:
-        cohort_service = CohortProposalService(
-            context_store=decision_store,
-            authorization=effective_authorization,
-            clock=SystemClock(),
-            snapshot_repository=EmptyEvidenceSnapshotRepository(),
-            snapshot_verifier=RejectingTrustedEvidenceSnapshotVerifier(),
-            proposal_cache=cohort_persistence,
-            preview_receipts=cohort_persistence,
+    if (cohort_service is None) != (cohort_decision_service is None):
+        raise ValueError(
+            "cohort proposal and decision services must be supplied together "
+            "from one shared dependency set"
         )
-    if cohort_decision_service is None:
-        cohort_decision_service = CohortDecisionService(
-            store=decision_store,
-            authorization=effective_authorization,
-            clock=SystemClock(),
-            context_service=service,
-            proposal_service=cohort_service,
-            candidate_repository=cohort_persistence,
+    if (
+        cohort_service is not None
+        and cohort_decision_service is not None
+        and (
+            _dependency_identity(cohort_service.context_store)
+            is not _dependency_identity(service.persistence_store)
+            or _dependency_identity(cohort_decision_service.persistence_store)
+            is not _dependency_identity(service.persistence_store)
+            or cohort_decision_service.context_service is not service
+            or cohort_decision_service.proposal_service is not cohort_service
+            or _dependency_identity(cohort_decision_service.candidate_repository)
+            is not _dependency_identity(cohort_service.candidate_repository)
+            or _dependency_identity(cohort_service.authorization)
+            is not _dependency_identity(service.authorization)
+            or _dependency_identity(cohort_decision_service.authorization)
+            is not _dependency_identity(service.authorization)
+        )
+    ):
+        raise ValueError(
+            "cohort services must share the app-owned ContextService, store, "
+            "proposal service, and candidate repository"
         )
     authenticator = authentication or RejectUnverifiedAuthentication()
     bound_demo_evaluation = (
@@ -247,6 +255,23 @@ def create_app(
         separate_input_output_schemas=False,
     )
     application.state.authenticator = authenticator
+    cohort_router = APIRouter()
+
+    def configured_cohort_service() -> CohortProposalService:
+        if cohort_service is None:
+            raise DemoEvaluationConfigurationError(
+                "cohort APIs require an explicitly configured trusted snapshot "
+                "repository, verifier, cache, and shared Context store"
+            )
+        return cohort_service
+
+    def configured_cohort_decision_service() -> CohortDecisionService:
+        if cohort_decision_service is None:
+            raise DemoEvaluationConfigurationError(
+                "cohort decision APIs require the same explicitly configured "
+                "proposal and Context persistence dependencies"
+            )
+        return cohort_decision_service
 
     @application.exception_handler(ContextApiError)
     async def context_error_handler(
@@ -277,7 +302,7 @@ def create_app(
         body = ErrorResponse(error=ErrorDetail(code=exc.code, message=exc.message))
         return JSONResponse(status_code=http_status, content=body.model_dump(mode="json"))
 
-    @application.get(
+    @cohort_router.get(
         "/v1/cohort-proposals",
         response_model=CohortProposalBatchResponse,
         response_model_exclude_none=True,
@@ -304,7 +329,7 @@ def create_app(
             Query(pattern=r"^sha256:[a-f0-9]{64}$"),
         ],
     ) -> CohortProposalBatchResponse:
-        return cohort_service.get_proposals(
+        return configured_cohort_service().get_proposals(
             actor,
             CohortProposalQuery(
                 manifest_id=manifest_id,
@@ -316,7 +341,7 @@ def create_app(
             ),
         )
 
-    @application.post(
+    @cohort_router.post(
         "/v1/cohort-proposals/preview",
         response_model=CohortReviewCandidate,
         response_model_exclude_none=True,
@@ -334,9 +359,13 @@ def create_app(
         idempotency_key: IdempotencyHeader,
         actor: ActorDependency,
     ) -> CohortReviewCandidate:
-        return cohort_service.preview(actor, idempotency_key, command)
+        return configured_cohort_service().preview(
+            actor,
+            idempotency_key,
+            command,
+        )
 
-    @application.post(
+    @cohort_router.post(
         "/v1/cohort-proposals/decisions",
         response_model=CohortDecisionResponse,
         response_model_exclude_none=False,
@@ -356,14 +385,14 @@ def create_app(
         actor: ActorDependency,
     ) -> CohortDecisionResponse:
         return decision_response(
-            cohort_decision_service.decide(
+            configured_cohort_decision_service().decide(
                 actor,
                 idempotency_key,
                 command,
             )
         )
 
-    @application.get(
+    @cohort_router.get(
         "/v1/cohort-proposals/decisions/{decision_id}",
         response_model=CohortDecisionResponse,
         response_model_exclude_none=False,
@@ -379,14 +408,14 @@ def create_app(
         actor: ActorDependency,
     ) -> CohortDecisionResponse:
         return decision_response(
-            cohort_decision_service.get(
+            configured_cohort_decision_service().get(
                 actor,
                 manifest_id=manifest_id,
                 decision_id=decision_id,
             )
         )
 
-    @application.get(
+    @cohort_router.get(
         "/v1/cohort-proposals/decisions",
         response_model=list[CohortDecisionResponse],
         response_model_exclude_none=False,
@@ -450,17 +479,20 @@ def create_app(
         )
         return [
             decision_response(decision)
-            for decision in cohort_decision_service.list_decisions(
-            actor,
-            manifest_id=manifest_id,
-            scope=scope,
-            source_draft=source_draft,
-            proposal_ids=proposal_ids,
-            proposal_set_digest=proposal_set_digest,
-            snapshot_artifact_digest=snapshot_artifact_digest,
-            limit=limit,
+            for decision in configured_cohort_decision_service().list_decisions(
+                actor,
+                manifest_id=manifest_id,
+                scope=scope,
+                source_draft=source_draft,
+                proposal_ids=proposal_ids,
+                proposal_set_digest=proposal_set_digest,
+                snapshot_artifact_digest=snapshot_artifact_digest,
+                limit=limit,
             )
         ]
+
+    if cohort_service is not None and cohort_decision_service is not None:
+        application.include_router(cohort_router)
 
     @application.post(
         "/v1/drafts",
@@ -513,6 +545,23 @@ def create_app(
         return service.replace_draft(actor, draft_id, idempotency_key, command)
 
     @application.post(
+        "/v1/operational-context-receipts",
+        response_model=OperationalContextReceipt,
+        response_model_exclude_none=True,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def issue_operational_context_receipt(
+        command: IssueOperationalContextReceiptCommand,
+        idempotency_key: IdempotencyHeader,
+        actor: ActorDependency,
+    ) -> OperationalContextReceipt:
+        return service.issue_operational_context_receipt(
+            actor,
+            idempotency_key,
+            command,
+        )
+
+    @application.post(
         "/v1/drafts/{draft_id}/validate",
         response_model=DraftRecord,
         response_model_exclude_none=True,
@@ -539,13 +588,31 @@ def create_app(
         return service.submit_for_review(actor, draft_id, idempotency_key, command)
 
     @application.post(
+        "/v1/drafts/{draft_id}/review",
+        response_model=DraftRecord,
+        response_model_exclude_none=True,
+    )
+    def review_draft(
+        draft_id: str,
+        command: ReviewCommand,
+        idempotency_key: IdempotencyHeader,
+        actor: ActorDependency,
+    ) -> DraftRecord:
+        return service.review_draft(
+            actor,
+            draft_id,
+            idempotency_key,
+            command,
+        )
+
+    @application.post(
         "/v1/drafts/{draft_id}/approve",
         response_model=DraftRecord,
         response_model_exclude_none=True,
     )
     def approve_draft(
         draft_id: str,
-        command: TransitionCommand,
+        command: ApproveCommand,
         idempotency_key: IdempotencyHeader,
         actor: ActorDependency,
     ) -> DraftRecord:
@@ -638,6 +705,39 @@ def create_app(
         actor: ActorDependency,
     ) -> VersionComparison:
         return service.compare_versions(actor, manifest_id, from_version, to_version)
+
+    @application.get(
+        "/v1/drafts/{draft_id}/profiles/{profile_id}/authority",
+        response_model=ResolvedProfileAuthority,
+    )
+    def resolve_draft_profile_authority(
+        draft_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+        profile_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+        actor: ActorDependency,
+    ) -> ResolvedProfileAuthority:
+        return service.resolve_draft_profile_authority(
+            actor,
+            draft_id,
+            profile_id,
+        )
+
+    @application.get(
+        "/v1/manifests/{manifest_id}/versions/{manifest_version}/profiles/"
+        "{profile_id}/authority",
+        response_model=ResolvedProfileAuthority,
+    )
+    def resolve_published_profile_authority(
+        manifest_id: WorkloadPath,
+        manifest_version: Annotated[str, Path(pattern=_VERSION_PATTERN)],
+        profile_id: Annotated[str, Path(pattern=_ID_PATTERN)],
+        actor: ActorDependency,
+    ) -> ResolvedProfileAuthority:
+        return service.resolve_published_profile_authority(
+            actor,
+            manifest_id,
+            manifest_version,
+            profile_id,
+        )
 
     @application.get(
         "/v1/manifests/{manifest_id}/audit",

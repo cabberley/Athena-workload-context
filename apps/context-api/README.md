@@ -14,7 +14,36 @@ privileged role.
 Published manifest values are immutable. Supersession is stored as a separate append-only relation.
 Submission replaces untrusted draft audit values with a server-finalized publication candidate and
 recomputes canonical digests. Human approval binds that exact candidate; publication does not
-mutate it.
+mutate it. Approval and publication also require a current server-verifiable operational-context
+receipt for the exact draft revision and canonical production profile.
+
+`POST /v1/drafts/{draft_id}/review` is a distinct human-only reviewer operation between submission
+and approval. It stores the exact revision/digest, decision, comments, rejected JSON-pointer
+fields, and required corrections. An approved review advances the in-review revision and is linked
+from the later approval. A changes-requested review returns the candidate to draft state while
+retaining the immutable review history. Browser confirmation is never review authority.
+
+## Operational-context receipts
+
+`POST /v1/operational-context-receipts` is the sole receipt-issuance route. It accepts only a
+verified service actor with the exact-workload `operational_context_issuer` role. The trusted
+WC-026/WC-028 integration submits the complete bounded evidence inventory plus its canonical
+digest and the operational binding digest. Context API independently verifies:
+
+- the current draft ID, revision, manifest version, and manifest digest;
+- the server-resolved active profile ID and resolved-profile digest;
+- collection/expiry time and current freshness;
+- unique bounded evidence references and their inventory digest; and
+- the canonical rendered-content digest covering evidence source, confidence,
+  relationships, and findings; and
+- the exact snapshot and binding digest used by Context Studio.
+
+The durable receipt stores the exact authority binding, evidence count, inventory digest, and
+rendered-content digest and expiry, but not raw operational evidence. Approve and publish commands
+require its receipt ID and revalidate it inside the same persistence transaction as the lifecycle
+mutation. Because approval increments the draft revision, publication requires a newly issued
+receipt for the approved revision. Pre-existing published records without these optional
+provenance fields remain readable; all new approval and publication mutations require receipts.
 
 ## Durable production persistence
 
@@ -49,7 +78,9 @@ deployment configuration, never request input. Every grant must explicitly use
 `all_workloads` scopes, duplicates, empty arrays, invalid JSON, and foreign workload grants fail
 startup. The configured workload ID also bounds the durable adapter: it rejects any lifecycle
 record or read for another workload. Workload identifiers use the same route-safe ASCII contract
-as the HTTP API.
+as the HTTP API. The operational evidence service must receive only the
+`operational_context_issuer` role for the configured workload; that role can read exact lifecycle
+authority and issue receipts, but cannot approve, publish, supersede, or edit manifests.
 
 An empty partition is never a normal store state. On the controlled first deployment only, an
 operator runs `python apps/context-api/bootstrap.py` as a one-shot deployment step under the

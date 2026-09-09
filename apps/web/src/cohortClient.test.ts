@@ -400,6 +400,27 @@ describe('typed cohort proposal HTTP adapter', () => {
     expect(new Headers(init?.headers).has('Idempotency-Key')).toBe(false)
   })
 
+  it('loads durable decisions covering an intersecting subset of the batch', async () => {
+    const fetchMock = vi.fn(async (...request: Parameters<typeof fetch>) => {
+      void request
+      return response([wireDecision])
+    })
+    const client = createCohortProposalApiClient({
+      baseUrl: 'https://cohorts.invalid',
+      authPort,
+      session: mockAuthSession,
+      fetchImpl: fetchMock as typeof fetch,
+    })
+
+    await expect(client.loadDecisions({
+      ...decisionLoadRequest,
+      proposalIds: [
+        proposal.proposalId,
+        'proposal-2222222222222222',
+      ],
+    })).resolves.toEqual([wireDecision])
+  })
+
   it('submits an exact durable decision without a WC-007 draft write', async () => {
     const parsedBatch = parseCohortProposalBatch(wireBatch)
     const candidate = proposalReviewCandidate(

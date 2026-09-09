@@ -18,13 +18,32 @@ window.athenaContextStudioRuntime = {
     acquireAccessToken: async (session) =>
       enterpriseSessionAdapter.acquirePerUserAccessToken(session),
   },
+  operationalContextPort: {
+    loadOperationalContext: async ({ workloadId, manifestVersion, profileId }) =>
+      trustedCorrelationAdapter.loadExactSnapshot({
+        workloadId,
+        manifestVersion,
+        profileId,
+      }),
+  },
 }
 ```
 
-`cohortApiBaseUrl` may be omitted when the cohort routes are hosted with the Context API.
+`cohortApiBaseUrl` is always required. A deployment may deliberately set it to the same origin as
+`apiBaseUrl`, but Studio never infers that routing decision.
 `acquireSession` must return verified actor metadata and explicit `authorizedWorkloadIds`.
 `acquireAccessToken` obtains a per-user token just in time for each request. A missing session,
 workload scope, or token fails closed before workload data is rendered.
+The optional operational port is the production WC-026/WC-028 boundary for observed/inferred
+relationships and findings. Its response is rejected unless every record matches the exact
+workload, manifest version, profile, snapshot, evidence-reference, and confidence contract. When
+the port is absent, Studio shows an explicit evidence gap and does not fabricate operational data;
+approval and publication remain disabled. The trusted adapter must return a non-empty evidence
+inventory plus the complete receipt metadata and digest issued by Context API's service-only
+operational receipt route for that exact draft revision and canonical production profile. Studio
+canonicalizes the rendered evidence source, confidence, relationships, and findings, then verifies
+that content digest, the evidence inventory, full receipt digest, and deterministic receipt ID
+before enabling lifecycle authority.
 
 Startup reads each authorized workload only through:
 
@@ -41,6 +60,9 @@ The client never uses unrestricted `GET /v1/drafts`.
 - Structured edits are mapped onto a clone of the full manifest. Artifact and semantic digests use
   Python-compatible default materialization and sorting, RFC 8785 canonical JSON, Unicode NFC and
   case folding, Web Crypto SHA-256, and Python fixture reference digests.
+- The full canonical manifest can be edited through a bounded JSON section editor. Manifest
+  identity and candidate version are immutable in the browser, and every save still passes through
+  WC-007 canonical validation and optimistic concurrency.
 - `manifestDigest` is never added to a canonical manifest. WC-007's required top-level
   `manifest_digest` and `replacement_digest` command members carry the computed artifact digest.
 - Published list responses are unwrapped from `{ published, supersession }`. A successor requires
@@ -51,13 +73,20 @@ The client never uses unrestricted `GET /v1/drafts`.
   revision/version/digest and successor version/digest. Reload must confirm one active version.
   If publication succeeds but supersession fails or cannot be verified, the UI enters a blocking
   recovery state and retries the same command with its original idempotency key.
-- Canonical relationships are a discriminated `declared | exception` union. Exceptions render
-  their target, risk acceptance, governance scope, rationale, owner, and expiry; they never receive
-  fabricated endpoint or relationship-kind fields.
-- Authority, provenance, observed relationships, and confidence are never invented. Missing
-  WC-007 evidence or confidence is displayed as not provided.
+- Exact version comparison uses `GET /v1/manifests/{manifest_id}/compare`; rollback clones a selected
+  older immutable version into a new higher-version draft whose predecessor is the current active
+  publication. The command records `rollback_source_version`; existing versions are never mutated
+  or reactivated.
+- Relationship rendering distinguishes `declared`, `observed`, `inferred`, and `exception` records.
+  Exceptions render their governance fields; observed and inferred records require cited evidence
+  and confidence. Missing runtime findings or confidence are displayed as evidence gaps, never pass.
+- Controls expose explicit unknowns, missing declarations, and field provenance for the exact draft
+  revision or published version being reviewed.
 - Agent sessions cannot approve or publish. Human users must explicitly confirm review of the exact
-  candidate digest before approval and publication.
+  candidate digest, then record a durable human Review decision with comments and any rejected
+  fields/corrections. Approval requires that exact current approved Review. Each approval and
+  publication also sends the current operational receipt ID; both Review and approval increment
+  the draft revision, so fresh operational receipts are required.
 - Error rendering is bounded and never displays unrestricted non-JSON response or log bodies.
 
 The mock adapter is under `src/test/` and is imported only by tests.
@@ -92,11 +121,15 @@ acknowledgement. Direct approval requires an existing bounded selector preview; 
 proposals without one may still request a server-generated split preview. A rejection is accepted
 only as a visible durable decision; local session-only rejection is not treated as authority.
 
-Final decision persistence and atomic draft apply are tracked by
-[issue #34](https://github.com/cabberley/Athena-workload-context/issues/34). Until that authenticated
-contract merges, production composition has no decision adapter and fails closed: reject, approve,
-split, merge, and apply controls are disabled rather than fabricating durable state. A narrow typed
-decision port and explicit in-memory adapter exist only for UI tests.
+The production adapter uses the authenticated durable-decision routes:
+
+- `GET /v1/cohort-proposals/decisions` with the exact draft, profile, proposal-set, proposal IDs,
+  and evidence snapshot binding.
+- `POST /v1/cohort-proposals/decisions` with the complete bounded rationale and exact candidate.
+
+Decisions and selector-only draft mutation commit atomically in the Context API store. Rejections
+are durable and block later actions for the same proposal authority. No browser path performs a
+direct WC-007 replacement for cohort apply.
 
 The decision flow sends the complete bounded 1–2,000 character rationale to the durable decision
 record. Context Studio never concatenates that rationale or a proposal list into a WC-007

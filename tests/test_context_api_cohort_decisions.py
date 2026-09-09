@@ -13,12 +13,15 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_decision_domain import CohortDecisionRequest
 from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortBatchCacheKey,
     CohortEvidenceBinding,
+    CohortPreviewReceipt,
     CohortProposalBatchResponse,
     CohortProposalQuery,
+    CohortReviewCandidate,
 )
 from athena_context.api.cohort_memory import (
     CallableTrustedEvidenceSnapshotVerifier,
@@ -26,9 +29,12 @@ from athena_context.api.cohort_memory import (
 )
 from athena_context.api.cohort_service import CohortProposalService
 from athena_context.api.domain import (
+    ApproveCommand,
     CreateDraftCommand,
     PublishCommand,
     ReplaceDraftCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
     Role,
     RoleGrant,
     SupersedeCommand,
@@ -56,8 +62,14 @@ from athena_context.contracts import (
     resolve_manifest_profile,
 )
 from athena_context.contracts.manifest import (
+    CompositeAllSelector,
+    CompositeAnySelector,
     ResourceIdListSelector,
     _resolve_manifest_profile_for_cohort_decision,
+)
+from context_api_support import (
+    OPERATIONAL_CONTEXT_SERVICE,
+    issue_operational_context_receipt,
 )
 from test_cohort_binding import _build_attested_snapshot
 from test_context_api_cohorts import (
@@ -227,6 +239,7 @@ def _install_partitioned_role_batch(
     *,
     role_id: str,
     partitions: list[list[str]],
+    guarded: bool = False,
 ) -> dict[str, Any]:
     """Install a valid typed batch with one role's members repartitioned."""
 
@@ -241,6 +254,7 @@ def _install_partitioned_role_batch(
         if proposal.role.role_id == role_id
     )
     source_members = set(source.members)
+    source_selector = source.role.selectors[0]
     if (
         not partitions
         or any(not partition for partition in partitions)
@@ -259,12 +273,32 @@ def _install_partitioned_role_batch(
     proposals: list[CohortProposal] = []
     for index, partition in enumerate(partitions, start=1):
         members = sorted(partition)
-        selector = ResourceIdListSelector(
+        member_selector = ResourceIdListSelector(
             selectorType="resourceIdList",
-            selectorId=f"repartition-source-{index}",
+            selectorId=f"repartition-members-{index}",
             resourceIds=members,
             maxMatches=len(members),
         )
+        if guarded:
+            if isinstance(
+                source_selector,
+                (CompositeAllSelector, CompositeAnySelector),
+            ):
+                raise AssertionError("guarded test source selector must be atomic")
+            inherited_guard = source_selector.model_copy(
+                update={"selector_id": f"repartition-inherited-{index}"}
+            )
+            selector = CompositeAllSelector(
+                selectorType="compositeAll",
+                selectorId=f"repartition-source-{index}",
+                children=sorted(
+                    [inherited_guard, member_selector],
+                    key=lambda child: child.selector_id.casefold(),
+                ),
+                maxMatches=len(members),
+            )
+        else:
+            selector = member_selector
         result = evaluate_selector(selector, resources)
         preview = SelectorPreview(
             selector=selector,
@@ -507,16 +541,26 @@ def _enable_full_lifecycle(harness: Harness) -> None:
         workload_id=harness.manifest.manifest_id,
     )
     authorization = RoleBasedAuthorization(
-        RoleGrant(
-            actor_id=HUMAN.actor_id,
-            role=role,
-            scope=scope,
-        )
-        for role in (
-            Role.PROPOSER,
-            Role.APPROVER,
-            Role.PUBLISHER,
-        )
+        [
+            *(
+                RoleGrant(
+                    actor_id=HUMAN.actor_id,
+                    role=role,
+                    scope=scope,
+                )
+                for role in (
+                    Role.PROPOSER,
+                    Role.REVIEWER,
+                    Role.APPROVER,
+                    Role.PUBLISHER,
+                )
+            ),
+            RoleGrant(
+                actor_id=OPERATIONAL_CONTEXT_SERVICE.actor_id,
+                role=Role.OPERATIONAL_CONTEXT_ISSUER,
+                scope=scope,
+            ),
+        ]
     )
     lifecycle = ContextService(
         store=harness.store,
@@ -604,15 +648,32 @@ def _post_lifecycle_transition(
     idempotency_key: str,
 ):
     current = harness.lifecycle.get_draft(HUMAN, draft_id)
+    command = TransitionCommand(
+        expected_revision=current.revision,
+        expected_manifest_version=current.manifest.manifest_version,
+        expected_digest=current.manifest_digest,
+        reason=f"{action.title()} exact selector provenance",
+    )
+    if action == "review":
+        command = ReviewCommand(
+            **command.model_dump(),
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact selector provenance candidate.",
+        )
+    if action == "approve":
+        receipt = issue_operational_context_receipt(
+            harness.lifecycle,
+            current,
+            key_prefix=idempotency_key,
+        )
+        command = ApproveCommand(
+            **command.model_dump(),
+            operational_context_receipt_id=receipt.receipt_id,
+        )
     return harness.client.post(
         f"/v1/drafts/{draft_id}/{action}",
         headers=_headers(HUMAN, idempotency_key=idempotency_key),
-        json=TransitionCommand(
-            expected_revision=current.revision,
-            expected_manifest_version=current.manifest.manifest_version,
-            expected_digest=current.manifest_digest,
-            reason=f"{action.title()} exact selector provenance",
-        ).model_dump(mode="json"),
+        json=command.model_dump(mode="json"),
     )
 
 
@@ -623,7 +684,7 @@ def _publish_draft_through_http(
     key_prefix: str,
 ):
     _enable_full_lifecycle(harness)
-    for action in ("validate", "submit", "approve"):
+    for action in ("validate", "submit", "review", "approve"):
         response = _post_lifecycle_transition(
             harness,
             draft_id=draft_id,
@@ -633,6 +694,11 @@ def _publish_draft_through_http(
         assert response.status_code == 200, response.text
     approved = harness.lifecycle.get_draft(HUMAN, draft_id)
     assert approved.approval is not None
+    receipt = issue_operational_context_receipt(
+        harness.lifecycle,
+        approved,
+        key_prefix=f"{key_prefix}-publish",
+    )
     return harness.client.post(
         f"/v1/drafts/{draft_id}/publish",
         headers=_headers(
@@ -644,6 +710,7 @@ def _publish_draft_through_http(
             expected_manifest_version=approved.manifest.manifest_version,
             expected_digest=approved.manifest_digest,
             approval_id=approved.approval.decision_id,
+            operational_context_receipt_id=receipt.receipt_id,
             reason="Publish exact durable selector provenance",
         ).model_dump(mode="json"),
     )
@@ -2642,7 +2709,8 @@ def test_four_proposal_batch_rebases_disjoint_applies_and_preserves_both() -> No
         "wc-034-four-apply-first",
     )
 
-    assert first.status_code == second.status_code == 201
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
     assert replay_after_rebase.status_code == 201
     assert replay_after_rebase.json() == first.json()
     assert first.json()["sourceDraft"] == second.json()["sourceDraft"]
@@ -2682,6 +2750,167 @@ def test_four_proposal_batch_rebases_disjoint_applies_and_preserves_both() -> No
         proposals[0]["proposalId"]: 2,
         proposals[1]["proposalId"]: 3,
     }
+
+
+def test_same_role_disjoint_decisions_rebase_and_preserve_both_selectors() -> None:
+    harness = _build_harness()
+    original = _load(harness)
+    web = next(
+        proposal
+        for proposal in original["proposals"]
+        if proposal["role"]["roleId"] == "web"
+    )
+    members = web["members"]
+    batch = _install_partitioned_role_batch(
+        harness,
+        role_id="web",
+        partitions=[members[:1], members[1:]],
+        guarded=True,
+    )
+    proposals = batch["proposals"]
+    evidence_binding = CohortEvidenceBinding(
+        manifest_id=harness.manifest.manifest_id,
+        manifest_version=harness.manifest.manifest_version,
+        profile_id=batch["scope"]["profileId"],
+        profile_type=batch["scope"]["profileType"],
+        resolved_profile_digest=batch["scope"]["resolvedProfileDigest"],
+        draft_id=batch["sourceDraft"]["draftId"],
+        draft_revision=batch["sourceDraft"]["revision"],
+        draft_digest=batch["sourceDraft"]["manifestDigest"],
+    )
+
+    candidates: list[CohortReviewCandidate] = []
+    rationales = [
+        "Apply the first disjoint web selector.",
+        "Apply the second disjoint web selector.",
+    ]
+    for index, (proposal, rationale) in enumerate(
+        zip(proposals, rationales, strict=True),
+        start=1,
+    ):
+        preview = proposal["selectorPreview"]
+        candidate = CohortReviewCandidate.model_validate(
+            {
+                "candidateId": f"candidate-same-role-{index}",
+                "action": "split",
+                "sourceDraft": batch["sourceDraft"],
+                "scope": batch["scope"],
+                "sourceProposalIds": [proposal["proposalId"]],
+                "proposalSetDigest": batch["proposalSetDigest"],
+                "snapshot": batch["snapshot"],
+                "roleUpdates": [
+                    {
+                        "role": {
+                            **proposal["role"],
+                            "selectors": [preview["selector"]],
+                        },
+                        "selectorPreviews": [preview],
+                        "memberCount": len(proposal["members"]),
+                    }
+                ],
+                "replaceRoleRefs": [proposal["role"]["roleId"]],
+                "resolution": rationale,
+                "generatedAt": batch["evaluatedAt"],
+                "expiresAt": batch["snapshot"]["expiresAt"],
+                "requiresHumanReview": True,
+                "publicationAllowed": False,
+                "manifestMutated": False,
+            }
+        )
+        harness.persistence.put_preview_receipt_if_absent(
+            CohortPreviewReceipt(
+                actor_id=HUMAN.actor_id,
+                idempotency_key=f"same-role-preview-{index}",
+                request_digest=compute_artifact_digest(
+                    candidate.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                ),
+                evidence_binding=evidence_binding,
+                candidate=candidate,
+            )
+        )
+        candidates.append(candidate)
+
+    first = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposals[0]["proposalId"]],
+            candidate=candidates[0].model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            rationale=rationales[0],
+        ),
+        "wc-034-same-role-first",
+    )
+    second = _post_decision(
+        harness,
+        _decision_body(
+            harness,
+            batch,
+            decision="split",
+            proposal_ids=[proposals[1]["proposalId"]],
+            candidate=candidates[1].model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            rationale=rationales[1],
+        ),
+        "wc-034-same-role-second",
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["draftResult"]["revision"] == 2
+    assert second.json()["draftResult"]["revision"] == 3
+    draft = harness.lifecycle.get_draft(HUMAN, harness.draft_id)
+    with harness.store.transaction() as tx:
+        authority = persisted_selector_authority_for_draft(
+            tx,
+            current=draft,
+        )
+    assert authority is not None
+    profile = _resolve_manifest_profile_for_cohort_decision(
+        draft.manifest,
+        "production",
+        as_of=harness.clock.now(),
+        selector_capability=authority,
+    )
+    web_role = next(role for role in profile.roles if role.role_id == "web")
+    assert len(web_role.selectors) == 2
+    assert {
+        selector.selector_id for selector in web_role.selectors
+    } == {
+        proposal["selectorPreview"]["selector"]["selectorId"]
+        for proposal in proposals
+    }
+    resources = [
+        record
+        for record in harness.snapshot.evidence_records
+        if isinstance(record, ResourceEvidenceRecord)
+    ]
+    matched_sets = [
+        set(evaluate_selector(selector, resources).matched_resource_ids)
+        for selector in web_role.selectors
+    ]
+    assert matched_sets[0].isdisjoint(matched_sets[1])
+    assert matched_sets[0] | matched_sets[1] == set(members)
+    assert all(
+        selector.max_matches == len(matched)
+        for selector, matched in zip(
+            web_role.selectors,
+            matched_sets,
+            strict=True,
+        )
+    )
 
 
 def test_apply_then_new_key_overlap_conflicts_before_draft_freshness() -> None:
@@ -3258,7 +3487,7 @@ def test_unpublished_approval_manifest_cannot_launder_authority() -> None:
     create_key = "wc-034-unpublished-approval-create"
     action_keys = tuple(
         f"wc-034-unpublished-approval-{action}"
-        for action in ("validate", "submit", "approve", "publish")
+        for action in ("validate", "submit", "review", "approve", "publish")
     )
     _enable_full_lifecycle(harness)
     state_before = _selector_lineage_failure_state(
@@ -3286,14 +3515,31 @@ def test_unpublished_approval_manifest_cannot_launder_authority() -> None:
         reason="A rejected draft cannot enter the lifecycle",
     ).model_dump(mode="json")
     for action, key in zip(
-        ("validate", "submit", "approve"),
-        action_keys[:3],
+        ("validate", "submit", "review", "approve"),
+        action_keys[:4],
         strict=True,
     ):
+        body = (
+            {
+                **transition,
+                "decision": "approved",
+                "comments": "Review a rejected draft",
+                "rejected_fields": [],
+                "required_corrections": [],
+            }
+            if action == "review"
+            else
+            {
+                **transition,
+                "operational_context_receipt_id": "operational-missing",
+            }
+            if action == "approve"
+            else transition
+        )
         blocked = harness.client.post(
             f"/v1/drafts/{successor_id}/{action}",
             headers=_headers(HUMAN, idempotency_key=key),
-            json=transition,
+            json=body,
         )
         assert blocked.status_code == 404, blocked.text
         assert blocked.json()["error"]["code"] == "resource_not_found"
@@ -3305,6 +3551,7 @@ def test_unpublished_approval_manifest_cannot_launder_authority() -> None:
             expected_manifest_version="1.0.1",
             expected_digest=successor.compatibility.artifact_digest,
             approval_id="missing-approval",
+            operational_context_receipt_id="operational-missing",
             reason="A rejected draft cannot publish",
         ).model_dump(mode="json"),
     )
@@ -3519,21 +3766,56 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
         ).model_dump(mode="json"),
     )
     assert submitted.status_code == 200, submitted.text
+    reviewed = harness.client.post(
+        f"/v1/drafts/{harness.draft_id}/review",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-lifecycle-review",
+        ),
+        json=ReviewCommand(
+            expected_revision=submitted.json()["revision"],
+            expected_manifest_version=harness.manifest.manifest_version,
+            expected_digest=submitted.json()["manifest_digest"],
+            reason="Record exact selector provenance review",
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact persisted selector provenance.",
+        ).model_dump(mode="json"),
+    )
+    assert reviewed.status_code == 200, reviewed.text
+    reviewed_record = harness.lifecycle.get_draft(
+        HUMAN,
+        harness.draft_id,
+    )
+    approval_receipt = issue_operational_context_receipt(
+        harness.lifecycle,
+        reviewed_record,
+        key_prefix="wc-034-provenance-lifecycle-approve",
+    )
     approved = harness.client.post(
         f"/v1/drafts/{harness.draft_id}/approve",
         headers=_headers(
             HUMAN,
             idempotency_key="wc-034-provenance-lifecycle-approve",
         ),
-        json=TransitionCommand(
-            expected_revision=submitted.json()["revision"],
+        json=ApproveCommand(
+            expected_revision=reviewed.json()["revision"],
             expected_manifest_version=harness.manifest.manifest_version,
-            expected_digest=submitted.json()["manifest_digest"],
+            expected_digest=reviewed.json()["manifest_digest"],
+            operational_context_receipt_id=approval_receipt.receipt_id,
             reason="Approve the persisted cohort selector provenance",
         ).model_dump(mode="json"),
     )
     assert approved.status_code == 200, approved.text
     approval_id = approved.json()["approval"]["decision_id"]
+    approved_record = harness.lifecycle.get_draft(
+        HUMAN,
+        harness.draft_id,
+    )
+    publication_receipt = issue_operational_context_receipt(
+        harness.lifecycle,
+        approved_record,
+        key_prefix="wc-034-provenance-lifecycle-publish",
+    )
     published = harness.client.post(
         f"/v1/drafts/{harness.draft_id}/publish",
         headers=_headers(
@@ -3545,6 +3827,7 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
             expected_manifest_version=harness.manifest.manifest_version,
             expected_digest=approved.json()["manifest_digest"],
             approval_id=approval_id,
+            operational_context_receipt_id=publication_receipt.receipt_id,
             reason="Publish exact approved cohort selector provenance",
         ).model_dump(mode="json"),
     )
@@ -3616,20 +3899,55 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
         ).model_dump(mode="json"),
     )
     assert next_submitted.status_code == 200, next_submitted.text
+    next_reviewed = harness.client.post(
+        f"/v1/drafts/{next_draft_id}/review",
+        headers=_headers(
+            HUMAN,
+            idempotency_key="wc-034-provenance-next-review",
+        ),
+        json=ReviewCommand(
+            expected_revision=next_submitted.json()["revision"],
+            expected_manifest_version="1.0.1",
+            expected_digest=next_submitted.json()["manifest_digest"],
+            reason="Record carried selector provenance review",
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the carried selector provenance successor.",
+        ).model_dump(mode="json"),
+    )
+    assert next_reviewed.status_code == 200, next_reviewed.text
+    next_reviewed_record = harness.lifecycle.get_draft(
+        HUMAN,
+        next_draft_id,
+    )
+    next_approval_receipt = issue_operational_context_receipt(
+        harness.lifecycle,
+        next_reviewed_record,
+        key_prefix="wc-034-provenance-next-approve",
+    )
     next_approved = harness.client.post(
         f"/v1/drafts/{next_draft_id}/approve",
         headers=_headers(
             HUMAN,
             idempotency_key="wc-034-provenance-next-approve",
         ),
-        json=TransitionCommand(
-            expected_revision=next_submitted.json()["revision"],
+        json=ApproveCommand(
+            expected_revision=next_reviewed.json()["revision"],
             expected_manifest_version="1.0.1",
-            expected_digest=next_submitted.json()["manifest_digest"],
+            expected_digest=next_reviewed.json()["manifest_digest"],
+            operational_context_receipt_id=next_approval_receipt.receipt_id,
             reason="Approve the first carried selector provenance successor",
         ).model_dump(mode="json"),
     )
     assert next_approved.status_code == 200, next_approved.text
+    next_approved_record = harness.lifecycle.get_draft(
+        HUMAN,
+        next_draft_id,
+    )
+    next_publication_receipt = issue_operational_context_receipt(
+        harness.lifecycle,
+        next_approved_record,
+        key_prefix="wc-034-provenance-next-publish",
+    )
     next_published = harness.client.post(
         f"/v1/drafts/{next_draft_id}/publish",
         headers=_headers(
@@ -3641,6 +3959,9 @@ def test_approved_split_supports_proposals_publish_and_next_version() -> None:
             expected_manifest_version="1.0.1",
             expected_digest=next_approved.json()["manifest_digest"],
             approval_id=next_approved.json()["approval"]["decision_id"],
+            operational_context_receipt_id=(
+                next_publication_receipt.receipt_id
+            ),
             reason="Publish the first carried selector provenance successor",
         ).model_dump(mode="json"),
     )
@@ -4288,6 +4609,10 @@ class _FailAfterDraftStore:
     def transaction(self) -> _FailAfterDraftTransaction:
         return _FailAfterDraftTransaction(self._store.transaction())
 
+    @property
+    def persistence_identity(self) -> object:
+        return self._store.persistence_identity
+
 
 class _AdvanceClockTransaction:
     def __init__(
@@ -4333,6 +4658,10 @@ class _AdvanceClockOnFinalDecisionStore:
     @property
     def transactions(self) -> int:
         return self._transactions
+
+    @property
+    def persistence_identity(self) -> object:
+        return self._harness.store.persistence_identity
 
     def transaction(self) -> _AdvanceClockTransaction:
         self._transactions += 1
@@ -4577,3 +4906,63 @@ def test_approve_applies_exact_1000_member_selector_without_publication() -> Non
     assert updated.selectors[0].max_matches == 1000
     with harness.store.transaction() as tx:
         assert tx.list_published(manifest_id=harness.manifest.manifest_id) == []
+
+
+def test_mixed_rejection_skips_zero_member_authority_groups() -> None:
+    harness = _build_harness()
+    batch = _load(harness)
+    populated_payload = _proposal(batch)
+    populated = CohortProposal.model_validate(populated_payload)
+    zero_member_payload = next(
+        proposal
+        for proposal in batch["proposals"]
+        if proposal["role"]["roleId"]
+        != populated_payload["role"]["roleId"]
+    )
+    zero_member = CohortProposal.model_validate(zero_member_payload).model_copy(
+        update={
+            "members": [],
+            "supporting_evidence": [],
+            "dissent": [],
+            "selector_preview": None,
+        }
+    )
+    request = CohortDecisionRequest.model_validate(
+        _decision_body(
+            harness,
+            batch,
+            decision="reject",
+            proposal_ids=[
+                populated.proposal_id,
+                zero_member.proposal_id,
+            ],
+            candidate=None,
+        )
+    )
+
+    authorities = CohortDecisionService._rejection_authorities(
+        request,
+        [populated, zero_member],
+    )
+
+    assert authorities
+    assert all(authority.member_fingerprints for authority in authorities)
+
+
+def test_first_cohort_apply_backfills_a_legacy_draft_baseline() -> None:
+    harness = _build_harness()
+    harness.store._draft_selector_baselines.clear()
+    batch = _load(harness)
+    generation_before = harness.store._transaction_generation
+
+    response = _post_decision(
+        harness,
+        _decision_body(harness, batch),
+        "legacy-first-cohort-apply",
+    )
+
+    assert response.status_code == 201, response.text
+    with harness.store.transaction() as transaction:
+        baseline = transaction.get_draft_selector_baseline(harness.draft_id)
+    assert baseline is not None
+    assert harness.store._transaction_generation == generation_before + 2

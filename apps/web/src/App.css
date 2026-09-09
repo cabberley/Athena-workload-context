@@ -287,6 +287,23 @@
   gap: 1rem;
 }
 
+.full-manifest-editor {
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 0.85rem;
+}
+
+.full-manifest-editor summary {
+  cursor: pointer;
+  color: #7dd3fc;
+  font-weight: 700;
+}
+
+.full-manifest-editor textarea {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  min-height: 24rem;
+}
+
 .editor-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(220px, 1fr));

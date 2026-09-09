@@ -1,6 +1,7 @@
 import { refreshCanonicalManifestDigests } from './canonical'
 import type {
   ApprovalDecision,
+  ApproveRequest,
   AuthSession,
   CanonicalControl,
   CanonicalDeclaredRelationship,
@@ -18,8 +19,11 @@ import type {
   DraftRecord,
   DraftState,
   EvidenceItem,
+  ExactVersionComparison,
   PublishRequest,
   PublishedManifest,
+  ReviewDecision,
+  ReviewRequest,
   RiskAcceptance,
   Supersession,
   SupersessionRecovery,
@@ -218,7 +222,7 @@ const parseCanonicalRelationship = (value: unknown, label: string): CanonicalRel
   throw new Error(`Context API returned unsupported ${label}.relationshipClass.`)
 }
 
-const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
+export const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
   const record = asRecord(value, 'canonical manifest')
   if ('manifestDigest' in record) {
     throw new Error('Context API returned a forbidden manifestDigest member inside the canonical manifest.')
@@ -272,14 +276,86 @@ const parseCanonicalManifest = (value: unknown): CanonicalWorkloadManifest => {
 
 const parseApproval = (value: unknown, label: string): WireApprovalDecision => {
   const record = asRecord(value, label)
-  return {
+  const approval = {
     decision_id: requiredString(record, 'decision_id', label),
     approved_by: parseActor(record.approved_by, `${label}.approved_by`),
     approved_at: requiredString(record, 'approved_at', label),
     approved_revision: requiredNumber(record, 'approved_revision', label),
     manifest_version: requiredString(record, 'manifest_version', label),
     manifest_digest: requiredString(record, 'manifest_digest', label),
+    review_decision_id: optionalNullableString(
+      record,
+      'review_decision_id',
+    ),
+    operational_context_receipt_id: optionalNullableString(
+      record,
+      'operational_context_receipt_id',
+    ),
     reason: requiredString(record, 'reason', label),
+  }
+  if (
+    !IDENTIFIER.test(approval.decision_id) ||
+    (
+      approval.operational_context_receipt_id !== undefined &&
+      approval.operational_context_receipt_id !== null &&
+      !IDENTIFIER.test(approval.operational_context_receipt_id)
+    )
+  ) {
+    throw new Error(`Context API returned an invalid ${label}.`)
+  }
+  return approval
+}
+
+const parseReviewDecision = (
+  value: unknown,
+  label: string,
+): NonNullable<WireDraftRecord['review_decisions']>[number] => {
+  const item = asRecord(value, label)
+  const decision = requiredString(item, 'decision', label)
+  if (!['approved', 'changes_requested'].includes(decision)) {
+    throw new Error(`Context API returned an invalid ${label}.decision.`)
+  }
+  const rejectedFields = asArray(
+    item.rejected_fields,
+    `${label}.rejected_fields`,
+  ).map((field, index) => {
+    if (
+      typeof field !== 'string' ||
+      !field.startsWith('/') ||
+      field.length > 512
+    ) {
+      throw new Error(
+        `Context API returned an invalid ${label}.rejected_fields[${index}].`,
+      )
+    }
+    return field
+  })
+  const requiredCorrections = asArray(
+    item.required_corrections,
+    `${label}.required_corrections`,
+  ).map((correction, index) => {
+    if (
+      typeof correction !== 'string' ||
+      correction.length === 0 ||
+      correction.length > 500
+    ) {
+      throw new Error(
+        `Context API returned an invalid ${label}.required_corrections[${index}].`,
+      )
+    }
+    return correction
+  })
+  return {
+    decision_id: requiredString(item, 'decision_id', label),
+    decision: decision as 'approved' | 'changes_requested',
+    reviewed_by: parseActor(item.reviewed_by, `${label}.reviewed_by`),
+    reviewed_at: requiredString(item, 'reviewed_at', label),
+    reviewed_revision: requiredNumber(item, 'reviewed_revision', label),
+    manifest_version: requiredString(item, 'manifest_version', label),
+    manifest_digest: requiredString(item, 'manifest_digest', label),
+    comments: requiredString(item, 'comments', label),
+    rejected_fields: rejectedFields,
+    required_corrections: requiredCorrections,
   }
 }
 
@@ -305,6 +381,10 @@ const parseDraft = (value: unknown): WireDraftRecord => {
     manifest: parseCanonicalManifest(record.manifest),
     manifest_digest: requiredString(record, 'manifest_digest', 'draft record'),
     previous_version: optionalNullableString(record, 'previous_version'),
+    rollback_source_version: optionalNullableString(
+      record,
+      'rollback_source_version',
+    ),
     created_by: parseActor(record.created_by, 'draft record.created_by'),
     created_at: requiredString(record, 'created_at', 'draft record'),
     updated_by: parseActor(record.updated_by, 'draft record.updated_by'),
@@ -344,15 +424,73 @@ const parseDraft = (value: unknown): WireDraftRecord => {
       approval_status: 'approved',
     }
   }
+  wire.review_decisions = asArray(
+    record.review_decisions ?? [],
+    'draft record.review_decisions',
+  ).map((decision, index) =>
+    parseReviewDecision(
+      decision,
+      `draft record.review_decisions[${index}]`,
+    )
+  )
   if (record.approval !== undefined && record.approval !== null) {
     wire.approval = parseApproval(record.approval, 'draft approval')
+  }
+  const approvalReview =
+    wire.approval?.review_decision_id == null
+      ? undefined
+      : wire.review_decisions?.find(
+          (decision) =>
+            decision.decision_id === wire.approval?.review_decision_id,
+        )
+  if (
+    wire.manifest.manifestId !== wire.manifest_id ||
+    wire.manifest.compatibility.artifactDigest !== wire.manifest_digest ||
+    wire.validation?.manifest_digest !== undefined &&
+      wire.validation.manifest_digest !== wire.manifest_digest ||
+    wire.review?.publication_candidate_digest !== undefined &&
+      wire.review.publication_candidate_digest !== wire.manifest_digest ||
+    wire.publication_candidate !== undefined &&
+      (
+        wire.publication_candidate.manifest_version !==
+          wire.manifest.manifestVersion ||
+        wire.publication_candidate.manifest_digest !== wire.manifest_digest ||
+        wire.publication_candidate.semantic_digest !==
+          wire.manifest.compatibility.semanticDigest
+      ) ||
+    wire.approval !== undefined &&
+      (
+        wire.approval.manifest_version !== wire.manifest.manifestVersion ||
+        wire.approval.manifest_digest !== wire.manifest_digest
+      ) ||
+    wire.review_decisions?.some(
+      (decision) =>
+        decision.reviewed_revision > wire.revision ||
+        (
+          decision.reviewed_revision === wire.revision &&
+          (
+            decision.manifest_version !== wire.manifest.manifestVersion ||
+            decision.manifest_digest !== wire.manifest_digest
+          )
+        ),
+    ) ||
+    (
+      wire.approval?.review_decision_id != null &&
+      (
+        approvalReview?.decision !== 'approved' ||
+        approvalReview.reviewed_revision !== wire.approval.approved_revision - 1 ||
+        approvalReview.manifest_digest !== wire.manifest_digest
+      )
+    )
+  ) {
+    throw new Error('Context API returned an internally inconsistent draft.')
   }
   return wire
 }
 
 const parsePublished = (value: unknown): WirePublishedManifest => {
   const record = asRecord(value, 'published manifest')
-  return {
+  const published = {
     manifest_id: requiredString(record, 'manifest_id', 'published manifest'),
     manifest_version: requiredString(record, 'manifest_version', 'published manifest'),
     manifest_digest: requiredString(record, 'manifest_digest', 'published manifest'),
@@ -368,8 +506,34 @@ const parsePublished = (value: unknown): WirePublishedManifest => {
       'published manifest.publication_authorized_by',
     ),
     publication_authorized_at: requiredString(record, 'publication_authorized_at', 'published manifest'),
+    operational_context_receipt_id: optionalNullableString(
+      record,
+      'operational_context_receipt_id',
+    ),
     reason: requiredString(record, 'reason', 'published manifest'),
   }
+  if (
+    !IDENTIFIER.test(published.manifest_id) ||
+    !VERSION.test(published.manifest_version) ||
+    !DIGEST.test(published.manifest_digest) ||
+    !IDENTIFIER.test(published.source_draft_id) ||
+    published.manifest.manifestId !== published.manifest_id ||
+    published.manifest.manifestVersion !== published.manifest_version ||
+    published.manifest.compatibility.artifactDigest !== published.manifest_digest ||
+    published.approval.manifest_version !== published.manifest_version ||
+    published.approval.manifest_digest !== published.manifest_digest ||
+    (
+      published.operational_context_receipt_id !== undefined &&
+      published.operational_context_receipt_id !== null &&
+      !IDENTIFIER.test(published.operational_context_receipt_id)
+    ) ||
+    (published.previous_version !== undefined &&
+      published.previous_version !== null &&
+      !VERSION.test(published.previous_version))
+  ) {
+    throw new Error('Context API returned an internally inconsistent published manifest.')
+  }
+  return published
 }
 
 const parseSupersession = (value: unknown): WireSupersession => {
@@ -386,12 +550,59 @@ const parseSupersession = (value: unknown): WireSupersession => {
 
 const parsePublishedView = (value: unknown): WirePublishedManifestView => {
   const record = asRecord(value, 'published manifest view')
+  const published = parsePublished(record.published)
+  const supersession =
+    record.supersession === undefined || record.supersession === null
+      ? undefined
+      : parseSupersession(record.supersession)
+  if (
+    supersession !== undefined &&
+    (
+      supersession.manifest_id !== published.manifest_id ||
+      supersession.superseded_version !== published.manifest_version ||
+      supersession.replacement_version === published.manifest_version ||
+      !VERSION.test(supersession.replacement_version)
+    )
+  ) {
+    throw new Error('Context API returned an inconsistent supersession binding.')
+  }
+  return { published, supersession }
+}
+
+const parseVersionComparison = (value: unknown): ExactVersionComparison => {
+  const record = asRecord(value, 'version comparison')
+  const changedPaths = asArray(record.changed_paths, 'version comparison.changed_paths')
+    .map((item) => {
+      if (typeof item !== 'string' || !item.startsWith('/')) {
+        throw new Error('Context API returned an invalid version comparison path.')
+      }
+      return item
+    })
+  const fromVersion = requiredString(record, 'from_version', 'version comparison')
+  const toVersion = requiredString(record, 'to_version', 'version comparison')
+  const fromDigest = requiredString(record, 'from_digest', 'version comparison')
+  const toDigest = requiredString(record, 'to_digest', 'version comparison')
+  if (
+    !VERSION.test(fromVersion) ||
+    !VERSION.test(toVersion) ||
+    !DIGEST.test(fromDigest) ||
+    !DIGEST.test(toDigest) ||
+    typeof record.equivalent !== 'boolean' ||
+    new Set(changedPaths).size !== changedPaths.length ||
+    record.equivalent !== (fromDigest === toDigest) ||
+    (record.equivalent && changedPaths.length !== 0) ||
+    (!record.equivalent && changedPaths.length === 0)
+  ) {
+    throw new Error('Context API returned an invalid version comparison.')
+  }
   return {
-    published: parsePublished(record.published),
-    supersession:
-      record.supersession === undefined || record.supersession === null
-        ? undefined
-        : parseSupersession(record.supersession),
+    manifestId: requiredString(record, 'manifest_id', 'version comparison'),
+    fromVersion,
+    toVersion,
+    fromDigest,
+    toDigest,
+    equivalent: record.equivalent,
+    changedPaths,
   }
 }
 
@@ -407,7 +618,25 @@ const toViewApproval = (approval: WireApprovalDecision): ApprovalDecision => ({
   approvedRevision: approval.approved_revision,
   manifestVersion: approval.manifest_version,
   manifestDigest: approval.manifest_digest,
+  reviewDecisionId: approval.review_decision_id ?? null,
+  operationalContextReceiptId:
+    approval.operational_context_receipt_id ?? null,
   reason: approval.reason,
+})
+
+const toViewReviewDecision = (
+  decision: NonNullable<WireDraftRecord['review_decisions']>[number],
+): ReviewDecision => ({
+  decisionId: decision.decision_id,
+  decision: decision.decision,
+  reviewedBy: toViewActor(decision.reviewed_by),
+  reviewedAt: decision.reviewed_at,
+  reviewedRevision: decision.reviewed_revision,
+  manifestVersion: decision.manifest_version,
+  manifestDigest: decision.manifest_digest,
+  comments: decision.comments,
+  rejectedFields: [...decision.rejected_fields],
+  requiredCorrections: [...decision.required_corrections],
 })
 
 const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
@@ -418,6 +647,7 @@ const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
   manifest: structuredClone(wire.manifest),
   manifestDigest: wire.manifest_digest,
   previousVersion: wire.previous_version ?? null,
+  rollbackSourceVersion: wire.rollback_source_version ?? null,
   createdBy: toViewActor(wire.created_by),
   createdAt: wire.created_at,
   updatedBy: toViewActor(wire.updated_by),
@@ -450,6 +680,9 @@ const toViewDraft = (wire: WireDraftRecord): DraftRecord => ({
         approvalStatus: wire.publication_candidate.approval_status,
       }
     : null,
+  reviewDecisions: (wire.review_decisions ?? []).map(
+    toViewReviewDecision,
+  ),
   approval: wire.approval ? toViewApproval(wire.approval) : null,
 })
 
@@ -466,6 +699,8 @@ const toViewPublished = (wire: WirePublishedManifest): PublishedManifest => ({
   publishedAt: wire.published_at,
   publicationAuthorizedBy: toViewActor(wire.publication_authorized_by),
   publicationAuthorizedAt: wire.publication_authorized_at,
+  operationalContextReceiptId:
+    wire.operational_context_receipt_id ?? null,
   reason: wire.reason,
 })
 
@@ -588,6 +823,22 @@ interface LifecycleState {
   publishedViews: WirePublishedManifestView[]
 }
 
+const verifyCanonicalManifestDigests = async (
+  manifest: CanonicalWorkloadManifest,
+  expectedArtifactDigest: string,
+): Promise<void> => {
+  const recomputed = await refreshCanonicalManifestDigests(manifest)
+  if (
+    recomputed.compatibility.artifactDigest !== expectedArtifactDigest ||
+    recomputed.compatibility.artifactDigest !==
+      manifest.compatibility.artifactDigest ||
+    recomputed.compatibility.semanticDigest !==
+      manifest.compatibility.semanticDigest
+  ) {
+    throw new Error('Context API returned a manifest with invalid canonical digests.')
+  }
+}
+
 const buildContext = (
   session: AuthSession,
   workloadId: string,
@@ -597,10 +848,56 @@ const buildContext = (
     lifecycle.drafts.filter((draft) => EDITABLE_STATES.has(draft.state)),
     `active drafts for ${workloadId}`,
   )
-  const activePublishedWire = selectUnique(
-    lifecycle.publishedViews.filter((view) => !view.supersession).map((view) => view.published),
-    `unsuperseded published versions for ${workloadId}`,
-  )
+  const unsuperseded = lifecycle.publishedViews.filter((view) => !view.supersession)
+  let activePublishedWire: WirePublishedManifest | null = null
+  let pendingSupersessionRecovery: SupersessionRecovery | null = null
+  if (unsuperseded.length === 1) {
+    activePublishedWire = unsuperseded[0]!.published
+  } else if (unsuperseded.length === 2) {
+    const candidates = unsuperseded.filter((candidate) =>
+      unsuperseded.some(
+        (predecessor) =>
+          predecessor !== candidate &&
+          candidate.published.previous_version ===
+            predecessor.published.manifest_version,
+      ),
+    )
+    const successor = selectUnique(
+      candidates,
+      `pending supersession successors for ${workloadId}`,
+    )
+    const predecessor = successor
+      ? unsuperseded.find(
+          (candidate) =>
+            candidate.published.manifest_version ===
+            successor.published.previous_version,
+        )
+      : undefined
+    if (!successor || !predecessor) {
+      throw new Error(
+        `Context API returned ambiguous unsuperseded versions for ${workloadId}.`,
+      )
+    }
+    activePublishedWire = successor.published
+    pendingSupersessionRecovery = {
+      workloadId,
+      predecessorVersion: predecessor.published.manifest_version,
+      predecessorRevision: predecessor.published.source_draft_revision,
+      predecessorDigest: predecessor.published.manifest_digest,
+      successorVersion: successor.published.manifest_version,
+      successorDigest: successor.published.manifest_digest,
+      reason:
+        `Supersede ${predecessor.published.manifest_version} with published successor ` +
+        `${successor.published.manifest_version}.`,
+      idempotencyKey:
+        `supersede-${predecessor.published.manifest_version}-` +
+        `${successor.published.manifest_version}`,
+    }
+  } else if (unsuperseded.length > 2) {
+    throw new Error(
+      `Context API returned ambiguous unsuperseded versions for ${workloadId}.`,
+    )
+  }
   const draft = activeDraftWire ? toViewDraft(activeDraftWire) : null
   const published = activePublishedWire ? toViewPublished(activePublishedWire) : null
   if (draft && published) {
@@ -621,10 +918,20 @@ const buildContext = (
     throw new Error(`Context API returned a manifest identity mismatch for ${workloadId}.`)
   }
 
-  const environment = manifest.workload.environments[0]
-  if (!environment) {
-    throw new Error(`Context API returned no declared environment for ${workloadId}.`)
+  const activeProfile = selectUnique(
+    Object.values(manifest.profiles).filter(
+      (profile) =>
+        profile.profileId.toLowerCase() === 'production' &&
+        profile.profileType === 'production',
+    ),
+    `canonical production profiles in ${workloadId}`,
+  )
+  if (!activeProfile) {
+    throw new Error(
+      `Context API returned no canonical production profile for ${workloadId}.`,
+    )
   }
+  const environment = activeProfile.profileType
   const relationships = [
     ...manifest.relationships.map((relationship) => toRelationship(relationship, null)),
     ...Object.values(manifest.profiles).flatMap((profile) =>
@@ -646,6 +953,7 @@ const buildContext = (
     workloadId,
     auth: session,
     environment,
+    profileId: activeProfile.profileId,
     evidenceSource: 'WC-007 Context API lifecycle response; observed Azure evidence is not provided by this route.',
     confidence: null,
     manifestVersion: manifest.manifestVersion,
@@ -660,9 +968,28 @@ const buildContext = (
     controls: profileControls(manifest).map(toControl),
     riskAcceptances: profileRisks(manifest).map(toRisk),
     provenance: provenanceFrom(manifest, published),
+    findings: [],
+    publishedVersions: lifecycle.publishedViews.map((view) => ({
+      manifestVersion: view.published.manifest_version,
+      manifestDigest: view.published.manifest_digest,
+      publishedAt: view.published.published_at,
+      publishedBy: view.published.published_by.actor_id,
+      supersededBy:
+        view.supersession?.replacement_version ??
+        (pendingSupersessionRecovery?.predecessorVersion ===
+        view.published.manifest_version
+          ? pendingSupersessionRecovery.successorVersion
+          : null),
+      active:
+        view.published.manifest_version ===
+        activePublishedWire?.manifest_version,
+    })),
     validationMessages: draft?.validation ? [] : ['No WC-007 validation record exists for the active draft.'],
     draft,
     published,
+    pendingSupersessionRecovery,
+    operationalContext: null,
+    operationalContextRequired: false,
   }
 }
 
@@ -781,15 +1108,28 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
     const encoded = encodeURIComponent(workloadId)
     const draftPayload = await requestJson(`/v1/drafts?manifest_id=${encoded}`, { method: 'GET' })
     const publishedPayload = await requestJson(`/v1/manifests/${encoded}/versions`, { method: 'GET' })
-    return {
-      drafts: asArray(draftPayload, 'draft list').map(parseDraft),
-      publishedViews: asArray(publishedPayload, 'published manifest view list').map(parsePublishedView),
-    }
+    const drafts = asArray(draftPayload, 'draft list').map(parseDraft)
+    const publishedViews = asArray(
+      publishedPayload,
+      'published manifest view list',
+    ).map(parsePublishedView)
+    await Promise.all([
+      ...drafts.map((draft) =>
+        verifyCanonicalManifestDigests(draft.manifest, draft.manifest_digest)
+      ),
+      ...publishedViews.map((view) =>
+        verifyCanonicalManifestDigests(
+          view.published.manifest,
+          view.published.manifest_digest,
+        )
+      ),
+    ])
+    return { drafts, publishedViews }
   }
 
   const transition = async (
     request: ConcurrencyRequest,
-    operation: 'validate' | 'submit' | 'approve',
+    operation: 'validate' | 'submit',
   ): Promise<DraftRecord> => {
     assertAuthorized(request.workloadId)
     const response = await requestJson(
@@ -803,6 +1143,7 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
           reason: request.reason,
         }),
       },
+      request.idempotencyKey,
     )
     const draft = toViewDraft(parseDraft(response))
     if (draft.manifestId !== request.workloadId) {
@@ -864,6 +1205,69 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
     }
   }
 
+  const createDerivedDraft = async (
+    workloadId: string,
+    lifecycle: LifecycleState,
+    source: WirePublishedManifest,
+    predecessor: WirePublishedManifest,
+    reason: string,
+    idPrefix: string,
+    rollbackSourceVersion?: string,
+  ): Promise<DraftRecord> => {
+    const existingVersions = new Set([
+      ...lifecycle.drafts.map((draft) => draft.manifest.manifestVersion),
+      ...lifecycle.publishedViews.map((view) => view.published.manifest_version),
+    ])
+    const candidate = structuredClone(source.manifest)
+    candidate.manifestVersion = nextUniqueVersion(
+      predecessor.manifest_version,
+      existingVersions,
+    )
+    const canonicalCandidate = await refreshCanonicalManifestDigests(candidate)
+    let draftId = ''
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const candidateId = safeId(`${idPrefix}-${workloadId.slice(0, 36)}`)
+      if (!lifecycle.drafts.some((draft) => draft.draft_id === candidateId)) {
+        draftId = candidateId
+        break
+      }
+    }
+    if (!draftId) throw new Error('Unable to allocate a unique derived draft identifier.')
+    const response = await requestJson('/v1/drafts', {
+      method: 'POST',
+      body: JSON.stringify({
+        draft_id: draftId,
+        manifest: canonicalCandidate,
+        manifest_digest: canonicalCandidate.compatibility.artifactDigest,
+        previous_version: predecessor.manifest_version,
+        ...(rollbackSourceVersion === undefined
+          ? {}
+          : { rollback_source_version: rollbackSourceVersion }),
+        reason,
+      }),
+    })
+    const draft = toViewDraft(parseDraft(response))
+    await verifyCanonicalManifestDigests(
+      draft.manifest,
+      draft.manifestDigest,
+    )
+    if (
+      draft.manifestId !== workloadId ||
+      draft.draftId !== draftId ||
+      draft.previousVersion !== predecessor.manifest_version ||
+      draft.manifest.manifestVersion !== canonicalCandidate.manifestVersion ||
+      draft.manifestDigest !== canonicalCandidate.compatibility.artifactDigest ||
+      draft.manifest.compatibility.semanticDigest
+        !== canonicalCandidate.compatibility.semanticDigest ||
+      (rollbackSourceVersion !== undefined &&
+        draft.rollbackSourceVersion !== rollbackSourceVersion) ||
+      JSON.stringify(draft.manifest) !== JSON.stringify(canonicalCandidate)
+    ) {
+      throw new Error('Context API returned a derived draft outside the exact version lineage.')
+    }
+    return draft
+  }
+
   return {
     auth: config.session,
     loadAuthorizedWorkloads: async () =>
@@ -874,6 +1278,40 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
       ),
     loadWorkloadContext: async (workloadId) =>
       buildContext(config.session, workloadId, await loadLifecycle(workloadId)),
+    loadResolvedProfileDigest: async (context) => {
+      assertAuthorized(context.workloadId)
+      const path = context.draft
+        ? `/v1/drafts/${encodeURIComponent(context.draft.draftId)}/profiles/` +
+          `${encodeURIComponent(context.profileId)}/authority`
+        : context.published
+          ? `/v1/manifests/${encodeURIComponent(context.workloadId)}/versions/` +
+            `${encodeURIComponent(context.published.manifestVersion)}/profiles/` +
+            `${encodeURIComponent(context.profileId)}/authority`
+          : null
+      if (path === null) {
+        throw new Error('Resolved profile authority requires an exact lifecycle record.')
+      }
+      const response = asRecord(
+        await requestJson(path, { method: 'GET' }),
+        'resolved profile authority',
+      )
+      const digest = requiredString(
+        response,
+        'resolved_profile_digest',
+        'resolved profile authority',
+      )
+      if (
+        response.manifest_id !== context.workloadId ||
+        response.manifest_version !== context.manifestVersion ||
+        response.profile_id !== context.profileId ||
+        !DIGEST.test(digest)
+      ) {
+        throw new Error(
+          'Context API returned resolved profile authority outside the exact lifecycle binding.',
+        )
+      }
+      return digest
+    },
     createSuccessorDraft: async (workloadId, reason) => {
       const lifecycle = await loadLifecycle(workloadId)
       const activeDrafts = lifecycle.drafts.filter((draft) => EDITABLE_STATES.has(draft.state))
@@ -887,39 +1325,103 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
       if (!activePublished) {
         throw new Error('A unique unsuperseded published predecessor is required to create a successor draft.')
       }
-      const predecessor = activePublished.published
-      if (predecessor.manifest_id !== workloadId) {
+      if (activePublished.published.manifest_id !== workloadId) {
         throw new Error('Published predecessor identity does not match the authorized workload.')
       }
-      const existingVersions = new Set([
-        ...lifecycle.drafts.map((draft) => draft.manifest.manifestVersion),
-        ...lifecycle.publishedViews.map((view) => view.published.manifest_version),
-      ])
-      const candidate = structuredClone(predecessor.manifest)
-      candidate.manifestVersion = nextUniqueVersion(predecessor.manifest_version, existingVersions)
-      const canonicalCandidate = await refreshCanonicalManifestDigests(candidate)
-
-      let draftId = ''
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const candidateId = safeId(`draft-${workloadId.slice(0, 36)}`)
-        if (!lifecycle.drafts.some((draft) => draft.draft_id === candidateId)) {
-          draftId = candidateId
-          break
-        }
+      return createDerivedDraft(
+        workloadId,
+        lifecycle,
+        activePublished.published,
+        activePublished.published,
+        reason,
+        'draft',
+      )
+    },
+    createRollbackDraft: async (workloadId, sourceVersion, reason) => {
+      const lifecycle = await loadLifecycle(workloadId)
+      if (lifecycle.drafts.some((draft) => EDITABLE_STATES.has(draft.state))) {
+        throw new Error('Rollback-by-new-version requires no active draft.')
       }
-      if (!draftId) throw new Error('Unable to allocate a unique successor draft identifier.')
-
-      const response = await requestJson('/v1/drafts', {
-        method: 'POST',
-        body: JSON.stringify({
-          draft_id: draftId,
-          manifest: canonicalCandidate,
-          manifest_digest: canonicalCandidate.compatibility.artifactDigest,
-          previous_version: predecessor.manifest_version,
-          reason,
-        }),
+      const active = selectUnique(
+        lifecycle.publishedViews.filter((view) => !view.supersession),
+        `unsuperseded published versions for ${workloadId}`,
+      )
+      const source = selectUnique(
+        lifecycle.publishedViews.filter(
+          (view) => view.published.manifest_version === sourceVersion,
+        ),
+        `rollback source versions for ${workloadId}`,
+      )
+      if (!active || !source) {
+        throw new Error('Rollback requires an exact source and active published version.')
+      }
+      if (
+        compareVersions(
+          source.published.manifest_version,
+          active.published.manifest_version,
+        ) >= 0
+      ) {
+        throw new Error('Rollback source must be an older published version.')
+      }
+      return createDerivedDraft(
+        workloadId,
+        lifecycle,
+        source.published,
+        active.published,
+        reason,
+        'rollback',
+        source.published.manifest_version,
+      )
+    },
+    comparePublishedVersions: async (workloadId, fromVersion, toVersion) => {
+      assertAuthorized(workloadId)
+      if (
+        !VERSION.test(fromVersion) ||
+        !VERSION.test(toVersion) ||
+        compareVersions(fromVersion, toVersion) >= 0
+      ) {
+        throw new Error(
+          'Version comparison requires an earlier source and later target version.',
+        )
+      }
+      const query = new URLSearchParams({
+        from_version: fromVersion,
+        to_version: toVersion,
       })
-      return toViewDraft(parseDraft(response))
+      const lifecycle = await loadLifecycle(workloadId)
+      const from = selectUnique(
+        lifecycle.publishedViews.filter(
+          (view) => view.published.manifest_version === fromVersion,
+        ),
+        `comparison source versions for ${workloadId}`,
+      )
+      const to = selectUnique(
+        lifecycle.publishedViews.filter(
+          (view) => view.published.manifest_version === toVersion,
+        ),
+        `comparison target versions for ${workloadId}`,
+      )
+      if (!from || !to) {
+        throw new Error('Version comparison requires two exact published versions.')
+      }
+      const comparison = parseVersionComparison(
+        await requestJson(
+          `/v1/manifests/${encodeURIComponent(workloadId)}/compare?${query.toString()}`,
+          { method: 'GET' },
+        ),
+      )
+      if (comparison.manifestId !== workloadId) {
+        throw new Error('Context API returned a comparison outside the authorized workload.')
+      }
+      if (
+        comparison.fromVersion !== fromVersion ||
+        comparison.toVersion !== toVersion ||
+        comparison.fromDigest !== from.published.manifest_digest ||
+        comparison.toDigest !== to.published.manifest_digest
+      ) {
+        throw new Error('Context API returned a comparison for different versions.')
+      }
+      return comparison
     },
     updateDraft: async (request) => {
       assertAuthorized(request.workloadId)
@@ -942,7 +1444,70 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
     },
     validateDraft: async (request) => transition(request, 'validate'),
     submitForReview: async (request) => transition(request, 'submit'),
-    approveDraft: async (request) => transition(request, 'approve'),
+    reviewDraft: async (request: ReviewRequest) => {
+      assertAuthorized(request.workloadId)
+      const response = await requestJson(
+        `/v1/drafts/${encodeURIComponent(request.draftId)}/review`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expected_revision: request.expectedRevision,
+            expected_manifest_version: request.expectedManifestVersion,
+            expected_digest: request.expectedDigest,
+            reason: request.reason,
+            decision: request.decision,
+            comments: request.comments,
+            rejected_fields: request.rejectedFields,
+            required_corrections: request.requiredCorrections,
+          }),
+        },
+        request.idempotencyKey,
+      )
+      const draft = toViewDraft(parseDraft(response))
+      const decision = draft.reviewDecisions.at(-1)
+      if (
+        draft.manifestId !== request.workloadId ||
+        decision?.decision !== request.decision ||
+        decision.comments !== request.comments
+      ) {
+        throw new Error(
+          'Context API returned a review outside the exact requested decision.',
+        )
+      }
+      return draft
+    },
+    approveDraft: async (request: ApproveRequest) => {
+      assertAuthorized(request.workloadId)
+      if (!IDENTIFIER.test(request.operationalContextReceiptId)) {
+        throw new Error('Approval requires a valid operational context receipt.')
+      }
+      const response = await requestJson(
+        `/v1/drafts/${encodeURIComponent(request.draftId)}/approve`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            expected_revision: request.expectedRevision,
+            expected_manifest_version: request.expectedManifestVersion,
+            expected_digest: request.expectedDigest,
+            operational_context_receipt_id:
+              request.operationalContextReceiptId,
+            reason: request.reason,
+          }),
+        },
+        request.idempotencyKey,
+      )
+      const draft = toViewDraft(parseDraft(response))
+      if (
+        draft.manifestId !== request.workloadId ||
+        draft.approval?.operationalContextReceiptId !==
+          request.operationalContextReceiptId
+      ) {
+        throw new Error(
+          'Context API returned an approval outside the exact operational binding.',
+        )
+      }
+      return draft
+    },
     publishDraft: async (request: PublishRequest) => {
       assertAuthorized(request.workloadId)
       const beforePublication = await loadLifecycle(request.workloadId)
@@ -984,11 +1549,31 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
           expected_digest: request.expectedDigest,
           reason: request.reason,
           approval_id: request.approvalId,
+          operational_context_receipt_id:
+            request.operationalContextReceiptId,
         }),
-      })
+      }, request.idempotencyKey)
       const published = toViewPublished(parsePublished(response))
-      if (published.manifestId !== request.workloadId) {
-        throw new Error('Context API returned a publication outside the authorized workload scope.')
+      await verifyCanonicalManifestDigests(
+        published.manifest,
+        published.manifestDigest,
+      )
+      if (
+        published.manifestId !== request.workloadId ||
+        published.manifestVersion !== request.expectedManifestVersion ||
+        published.manifestDigest !== request.expectedDigest ||
+        published.sourceDraftId !== request.draftId ||
+        published.sourceDraftRevision !== request.expectedRevision + 1 ||
+        published.approval.decisionId !== request.approvalId ||
+        published.operationalContextReceiptId !==
+          request.operationalContextReceiptId ||
+        published.approval.manifestVersion !== request.expectedManifestVersion ||
+        published.approval.manifestDigest !== request.expectedDigest ||
+        published.manifest.compatibility.artifactDigest !== request.expectedDigest
+      ) {
+        throw new Error(
+          'Context API returned a publication outside the exact authorized draft.',
+        )
       }
       if (published.previousVersion !== (predecessor?.published.manifest_version ?? null)) {
         throw new Error('Published successor did not retain the exact predecessor version.')
@@ -1015,7 +1600,8 @@ export const createContextApiClient = (options: ContextApiClientOptions): Contex
         const activeAfter = afterPublication.publishedViews.filter((view) => !view.supersession)
         if (
           activeAfter.length !== 1 ||
-          activeAfter[0]!.published.manifest_version !== published.manifestVersion
+          activeAfter[0]!.published.manifest_version !== published.manifestVersion ||
+          activeAfter[0]!.published.manifest_digest !== published.manifestDigest
         ) {
           throw new Error('Initial publication reload did not yield exactly one active version.')
         }
