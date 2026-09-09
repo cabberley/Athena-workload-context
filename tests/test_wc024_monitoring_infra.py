@@ -581,7 +581,8 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         "NWConnectionMonitorPathResult",
         "NWConnectionMonitorTestResult",
     ):
-        assert f"StringEquals '{table}'" in READER_RBAC
+        assert f"  '{table}'" in READER_RBAC
+    assert "StringEquals \\'${tableName}\\'" in READER_RBAC
     assert "AzureNetworkAnalytics_CL" not in READER_RBAC
     assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in (
         COLLECTOR_CONTRACT

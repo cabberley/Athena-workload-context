@@ -40,29 +40,11 @@ var allowedLogTableNames = [
   'NWConnectionMonitorPathResult'
   'NWConnectionMonitorTestResult'
 ]
-var allowedLogTableCondition = '''
-(
-  (
-    !(ActionMatches{'Microsoft.OperationalInsights/workspaces/tables/data/read'})
-  )
-  OR
-  (
-    @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Heartbeat'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Perf'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'InsightsMetrics'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Syslog'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMComputer'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMConnection'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMBoundPort'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMProcess'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NTANetAnalytics'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorDestinationListenerResult'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorDNSResult'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorPathResult'
-    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorTestResult'
-  )
+var allowedLogTableExpressions = map(
+  allowedLogTableNames,
+  tableName => '@Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals \'${tableName}\''
 )
-'''
+var allowedLogTableCondition = '((!(ActionMatches{\'Microsoft.OperationalInsights/workspaces/tables/data/read\'})) OR (${join(allowedLogTableExpressions, ' OR ')}))'
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
   name: workspaceName

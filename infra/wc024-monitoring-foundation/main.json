@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "1245993929019666639"
+      "templateHash": "17430854186111338340"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -2151,7 +2151,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "240924520166947123"
+              "templateHash": "577769006377817568"
             }
           },
           "parameters": {
@@ -2206,7 +2206,8 @@
               "NWConnectionMonitorPathResult",
               "NWConnectionMonitorTestResult"
             ],
-            "allowedLogTableCondition": "(\r\n  (\r\n    !(ActionMatches{'Microsoft.OperationalInsights/workspaces/tables/data/read'})\r\n  )\r\n  OR\r\n  (\r\n    @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Heartbeat'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Perf'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'InsightsMetrics'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'Syslog'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMComputer'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMConnection'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMBoundPort'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'VMProcess'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NTANetAnalytics'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorDestinationListenerResult'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorDNSResult'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorPathResult'\r\n    OR @Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals 'NWConnectionMonitorTestResult'\r\n  )\r\n)\r\n"
+            "allowedLogTableExpressions": "[map(variables('allowedLogTableNames'), lambda('tableName', format('@Resource[Microsoft.OperationalInsights/workspaces/tables:name] StringEquals ''{0}''', lambdaVariables('tableName'))))]",
+            "allowedLogTableCondition": "[format('((!(ActionMatches{{''Microsoft.OperationalInsights/workspaces/tables/data/read''}})) OR ({0}))', join(variables('allowedLogTableExpressions'), ' OR '))]"
           },
           "resources": {
             "workspace": {
