@@ -100,7 +100,6 @@ output workspaceLocation string = validatedWorkspaceLocation
 output workspaceTags object = workspace.tags
 output workspaceSkuName string = workspace.properties.sku.name
 output workspaceRetentionDays int = workspace.properties.retentionInDays
-output workspaceDailyQuotaGb string = string(workspace.properties.workspaceCapping.dailyQuotaGb)
 output workspaceFeatures object = workspace.properties.features
 output workspaceResourceContextAccessEnabled bool = workspace.properties.features.enableLogAccessUsingOnlyResourcePermissions
 output dataCollectionRuleResourceId string = dataCollectionRule.id

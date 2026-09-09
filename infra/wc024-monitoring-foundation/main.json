@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "5134248014550740923"
+      "templateHash": "11698054907267800929"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -321,7 +321,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "8872574231448794557"
+              "templateHash": "4369675104337263051"
             }
           },
           "parameters": {
@@ -467,10 +467,6 @@
             "workspaceRetentionDays": {
               "type": "int",
               "value": "[reference('workspace').retentionInDays]"
-            },
-            "workspaceDailyQuotaGb": {
-              "type": "string",
-              "value": "[string(reference('workspace').workspaceCapping.dailyQuotaGb)]"
             },
             "workspaceFeatures": {
               "type": "object",

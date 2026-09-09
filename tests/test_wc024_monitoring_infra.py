@@ -455,11 +455,7 @@ def test_wc024_uses_adopted_monitoring_locations_not_deployment_location() -> No
         "endpoint to use the same Azure region." in DATA_PLATFORM
     )
     assert "output workspaceLocation string = validatedWorkspaceLocation" in DATA_PLATFORM
-    assert (
-        "output workspaceDailyQuotaGb string = "
-        "string(workspace.properties.workspaceCapping.dailyQuotaGb)"
-        in DATA_PLATFORM
-    )
+    assert "output workspaceDailyQuotaGb" not in DATA_PLATFORM
     assert (
         "output dataCollectionEndpointLocation string = "
         "validatedDataCollectionEndpointLocation" in DATA_PLATFORM
