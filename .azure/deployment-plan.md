@@ -459,7 +459,7 @@ All quota-exposed resources are well within regional limits.
 ### WC-024 validation checklist
 
 - [x] Bicep roots and parameter files compile.
-- [x] Focused WC-024 tests pass: 46.
+- [x] Focused WC-024 tests pass: 47.
 - [x] Full Python suite passes with two intentional skips.
 - [x] Ruff, MyPy, repository validation, PowerShell parsing, and
   `git diff --check` pass.
@@ -497,14 +497,14 @@ All quota-exposed resources are well within regional limits.
 | Complete-foundation validation | `az deployment sub validate` for `infra/wc024-monitoring-foundation/main.bicep` | Passed |
 | Complete-foundation what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 56 creates, 104 ignores, 4 runtime-expression unsupported, and zero deletes or explicit modifies |
 | Initial merged foundation deployment | `az deployment sub create` deployment `wc024-foundation-20260909-2255` | Failed safely: tenant custom-role limit and concurrent LAW link update; no private cutover occurred |
-| Recovery design | Remove new custom-role creation; use conditioned table access, the exact existing signal role, exact child/resource scopes, and serialized AMPLS links | Implemented |
-| Recovery focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 46 passed |
+| Recovery design | Remove new custom-role creation; use conditioned workspace access, explicitly bound resource-context mode, the exact existing signal role, exact child/resource scopes, and serialized AMPLS links | Implemented and independently approved |
+| Recovery focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 47 passed |
 | Recovery full tests | `python -m pytest -q` | Passed; 2 skipped |
 | Recovery static gate | Bicep build, Ruff, MyPy, repository validation, PowerShell parsing, and `git diff --check` | Passed |
 | Recovery ARM validation | `az deployment sub validate` | Passed against live partial state, including exact existing signal-role validation |
 | Recovery what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 42 creates, 13 nested deployments, 104 ignores, 40 runtime-expression unsupported, zero custom-role creates, zero Connection Monitor creates, and zero deletes |
 
-**WC-024 validation timestamp:** 2026-09-10T00:10:35+10:00
+**WC-024 validation timestamp:** 2026-09-10T00:22:53+10:00
 
 ### WC-024 files
 
