@@ -35,5 +35,5 @@ resource collectorFlowLogReader 'Microsoft.Authorization/roleAssignments@2022-04
 
 output readerRoleDefinitionId string = readerRoleDefinitionId
 output resourceReadScopeIds array = [
-  flowLog.id
+  '${networkWatcher.id}/flowLogs/${flowLogName}'
 ]

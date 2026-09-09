@@ -6,6 +6,12 @@ param networkWatcherName string
 @description('Deterministic VNet flow-log name.')
 param flowLogName string
 
+@description('Existing canonical VNet flow-log location.')
+@allowed([
+  'australiaeast'
+])
+param location string
+
 @description('Reviewed workload VNet resource ID.')
 param workloadVirtualNetworkResourceId string
 
@@ -33,6 +39,7 @@ resource networkWatcher 'Microsoft.Network/networkWatchers@2024-10-01' existing 
 resource vnetFlowLog 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' = {
   parent: networkWatcher
   name: flowLogName
+  location: location
   properties: {
     targetResourceId: workloadVirtualNetworkResourceId
     storageId: storageAccountResourceId

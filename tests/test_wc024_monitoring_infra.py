@@ -469,6 +469,9 @@ def test_wc024_uses_adopted_monitoring_locations_not_deployment_location() -> No
         "workspaceLocation: monitoringDataPlatform.outputs.workspaceLocation"
         in flow_log_declaration
     )
+    assert "location: location" in flow_log_declaration
+    assert "location: location" in FLOW_LOG
+    assert "output validatedFlowLogLocation string" in FLOW_LOG_VALIDATION
 
 
 def test_wc024_populates_private_dns_before_workload_vnet_links() -> None:
@@ -604,6 +607,13 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "scope: approvedVms[index]" in WORKLOAD_READER_RBAC
     assert "scope: adoptedDcrAssociations[index]" in WORKLOAD_READER_RBAC
     assert "scope: dceAssociations[index]" in WORKLOAD_READER_RBAC
+    assert "map(approvedVms, vm => vm.id)" not in WORKLOAD_READER_RBAC
+    assert "dataCollectionRuleAssociations/${dataCollectionRuleAssociationName}" in (
+        WORKLOAD_READER_RBAC
+    )
+    assert "dataCollectionRuleAssociations/${dataCollectionEndpointAssociationName}" in (
+        WORKLOAD_READER_RBAC
+    )
     vm_signal_assignment = WORKLOAD_READER_RBAC.split(
         "resource collectorVmSignalReaders",
         maxsplit=1,
