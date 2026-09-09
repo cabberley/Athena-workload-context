@@ -26,12 +26,15 @@ EVIDENCE_SEAMS = (WC024_ROOT / "modules" / "monitoring-evidence-seams.bicep").re
 PRIVATE_ENDPOINTS = (WC024_ROOT / "modules" / "monitoring-private-endpoints.bicep").read_text(
     encoding="utf-8"
 )
-READER_ROLE = (WC024_ROOT / "modules" / "monitoring-evidence-reader-role.bicep").read_text(
-    encoding="utf-8"
-)
 READER_RBAC = (WC024_ROOT / "modules" / "monitoring-evidence-reader-rbac.bicep").read_text(
     encoding="utf-8"
 )
+WORKLOAD_READER_RBAC = (
+    WC024_ROOT / "modules" / "workload-monitoring-evidence-reader-rbac.bicep"
+).read_text(encoding="utf-8")
+NETWORK_WATCHER_READER_RBAC = (
+    WC024_ROOT / "modules" / "network-watcher-monitoring-evidence-reader-rbac.bicep"
+).read_text(encoding="utf-8")
 DCR_ASSOCIATIONS = (WC024_ROOT / "modules" / "dcr-associations.bicep").read_text(
     encoding="utf-8"
 )
@@ -425,6 +428,17 @@ def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> 
     assert "Private access verification failed" in PRIVATE_ACCESS_SCRIPT
 
 
+def test_wc024_serializes_ampls_links_to_shared_law_and_dce() -> None:
+    assert (
+        "resource workloadDcePrivateLinkScope "
+        "'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {"
+        in DATA_PLATFORM
+    )
+    assert "dependsOn: [\n    workloadWorkspacePrivateLinkScope\n  ]" in DATA_PLATFORM
+    assert "dependsOn: [\n    workloadDcePrivateLinkScope\n  ]" in DATA_PLATFORM
+    assert "dependsOn: [\n    collectorWorkspacePrivateLinkScope\n  ]" in DATA_PLATFORM
+
+
 def test_wc024_uses_adopted_monitoring_locations_not_deployment_location() -> None:
     assert "@allowed([\n  'australiaeast'\n])\nparam location" in MAIN
     assert "var adoptedWorkspaceLocation = workspace.location" in DATA_PLATFORM
@@ -473,7 +487,7 @@ def test_wc024_populates_private_dns_before_workload_vnet_links() -> None:
     )[1].split("module monitoringStorage", maxsplit=1)[0]
     vnet_links_declaration = MAIN.split(
         "module workloadPrivateDnsVnetLinks", maxsplit=1
-    )[1].split("module monitoringEvidenceReaderRole", maxsplit=1)[0]
+    )[1].split("module monitoringEvidenceReaderAssignments", maxsplit=1)[0]
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_endpoints_declaration
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_dns_zones_declaration
     assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
@@ -482,7 +496,7 @@ def test_wc024_populates_private_dns_before_workload_vnet_links() -> None:
     key_vault_link_declaration = MAIN.split(
         "module collectorKeyVaultPrivateDnsLink",
         maxsplit=1,
-    )[1].split("module monitoringEvidenceReaderRole", maxsplit=1)[0]
+    )[1].split("module monitoringEvidenceReaderAssignments", maxsplit=1)[0]
     assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
         key_vault_link_declaration
     )
@@ -547,8 +561,11 @@ def test_wc024_connectivity_is_a_separate_isolated_collector_deployment() -> Non
 
 
 def test_wc024_rbac_is_collector_only_and_narrow() -> None:
-    assert "Athena WC024 Isolated Monitoring Evidence Reader" in READER_ROLE
-    assert "Microsoft.OperationalInsights/workspaces/query/read" in READER_ROLE
+    assert not (WC024_ROOT / "modules" / "monitoring-evidence-reader-role.bicep").exists()
+    assert "3b03c2da-16b3-4a49-8834-0f8130efdd3b" in READER_RBAC
+    assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" in READER_RBAC
+    assert "conditionVersion: '2.0'" in READER_RBAC
+    assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in READER_RBAC
     for table in (
         "Heartbeat",
         "Perf",
@@ -564,65 +581,110 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         "NWConnectionMonitorPathResult",
         "NWConnectionMonitorTestResult",
     ):
-        assert f"Microsoft.OperationalInsights/workspaces/query/{table}/read" in READER_ROLE
-    assert "AzureNetworkAnalytics_CL" not in READER_ROLE
-    assert "Microsoft.Insights/Metrics/Read" in READER_ROLE
-    assert "Microsoft.Insights/dataCollectionRuleAssociations/read" in READER_ROLE
-    assert "Microsoft.Network/networkWatchers/flowLogs/read" in READER_ROLE
-    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" in READER_ROLE
-    for operation in (
-        "Microsoft.OperationalInsights/workspaces/query/"
-        "NWConnectionMonitorDestinationListenerResult/read",
-        "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorDNSResult/read",
-        "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorPathResult/read",
-        "Microsoft.OperationalInsights/workspaces/query/NWConnectionMonitorTestResult/read",
-    ):
-        assert operation in READER_ROLE
-        assert operation in COLLECTOR_CONTRACT
-    assert (
-        "Microsoft.OperationalInsights/workspaces/query/NTANetAnalytics/read"
-        in COLLECTOR_CONTRACT
+        assert f"StringEquals '{table}'" in READER_RBAC
+    assert "AzureNetworkAnalytics_CL" not in READER_RBAC
+    assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "Microsoft.Compute/virtualMachines/instanceView/read" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (
+        COLLECTOR_CONTRACT
     )
     assert "AzureNetworkAnalytics_CL" not in COLLECTOR_CONTRACT
-    assert "*/read" not in READER_ROLE
-    assert "Owner" not in READER_ROLE
-    assert "Contributor" not in READER_ROLE
-    assert "collectorPrincipalId" in READER_RBAC
+    assert "scope: workspace" in READER_RBAC
+    assert "scope: dataCollectionEndpoint" in READER_RBAC
+    assert "scope: dataCollectionRule" in READER_RBAC
+    assert "scope: privateLinkScopes[index]" in READER_RBAC
+    assert "2fda1d90-37da-55d9-8ac3-132fb7bdca5d" in WORKLOAD_READER_RBAC
+    assert "scope: collectorVmSignalReaders" not in WORKLOAD_READER_RBAC
+    assert "scope: approvedVms[index]" in WORKLOAD_READER_RBAC
+    assert "scope: adoptedDcrAssociations[index]" in WORKLOAD_READER_RBAC
+    assert "scope: dceAssociations[index]" in WORKLOAD_READER_RBAC
+    vm_signal_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorVmSignalReaders",
+        maxsplit=1,
+    )[1].split("resource collectorDcrAssociationReaders", maxsplit=1)[0]
+    assert "roleDefinitionId: validatedSignalReaderRoleDefinitionId" in (
+        vm_signal_assignment
+    )
+    assert "roleDefinitionId: readerRoleDefinitionId" not in vm_signal_assignment
+    assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
+    assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
+    assert "signalReaderAssignableScopes" in WORKLOAD_READER_RBAC
+    assert "length(signalReaderRoleDefinition.properties.permissions) == 1" in (
+        WORKLOAD_READER_RBAC
+    )
+    assert "scope: flowLog" in NETWORK_WATCHER_READER_RBAC
+    assert "scope: networkWatcher" not in NETWORK_WATCHER_READER_RBAC
+    combined_rbac = READER_RBAC + WORKLOAD_READER_RBAC + NETWORK_WATCHER_READER_RBAC
+    assert "Owner" not in combined_rbac
+    assert "Contributor" not in combined_rbac
+    assert "collectorPrincipalId" in combined_rbac
     for forbidden_identity in ("context", "presentation", "correlation", "mcp"):
-        assert forbidden_identity not in READER_RBAC.lower()
+        assert forbidden_identity not in combined_rbac.lower()
     assert "collectorIdentity.properties.principalId" in EVIDENCE_SEAMS
     assert "scope: monitoringEvidenceContainer" in EVIDENCE_SEAMS
     assert "scope: signingKey" in EVIDENCE_SEAMS
     assert "listKeys" not in EVIDENCE_SEAMS
 
 
-def test_wc024_uses_deployment_subscription_for_all_custom_role_scopes() -> None:
+def test_wc024_uses_exact_resource_scopes_without_creating_a_custom_role() -> None:
     assert "workloadSubscriptionId" not in MAIN
     assert "networkWatcherSubscriptionId" not in MAIN
+    assert "collectorRoleDefinitionGuid" not in MAIN
+    assert "monitoring-evidence-reader-role.bicep" not in MAIN
     assert (
         "var workloadResourceGroupId = '${subscription().id}/resourceGroups/"
         "${workloadResourceGroupName}'"
     ) in MAIN
-    assert (
-        "var networkWatcherResourceGroupId = '${subscription().id}/resourceGroups/"
-        "${networkWatcherResourceGroupName}'"
-    ) in MAIN
-    assert "scope: resourceGroup(workloadResourceGroupName)" in MAIN
-    assert "scope: resourceGroup(networkWatcherResourceGroupName)" in MAIN
     assert "@allowed([\n  'NetworkWatcherRG'\n])" in MAIN
     assert "@allowed([\n  'NetworkWatcher_australiaeast'\n])" in MAIN
-    network_watcher_assignment = MAIN.split(
-        "module networkWatcherReaderAssignment",
+    assert "module monitoringEvidenceReaderAssignments" in MAIN
+    assert "module workloadEvidenceReaderAssignments" in MAIN
+    assert "module networkWatcherEvidenceReaderAssignment" in MAIN
+    assert "targetScope = 'resourceGroup'" in READER_RBAC
+    assert "targetScope = 'resourceGroup'" in WORKLOAD_READER_RBAC
+    assert "targetScope = 'resourceGroup'" in NETWORK_WATCHER_READER_RBAC
+    assert "scope: resourceGroup(workloadResourceGroupName)" in MAIN
+    assert "scope: resourceGroup(networkWatcherResourceGroupName)" in MAIN
+    workload_assignment = MAIN.split(
+        "module workloadEvidenceReaderAssignments",
         maxsplit=1,
-    )[1].split("module vnetFlowLog", maxsplit=1)[0]
-    assert "dependsOn: [\n    vnetFlowLog\n  ]" in network_watcher_assignment
+    )[1].split("module canonicalFlowLogValidation", maxsplit=1)[0]
+    assert "dependsOn: [\n    dcrAssociations\n  ]" in workload_assignment
 
 
 def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> None:
-    assert "athena.wc024MonitoringCollectorContract.v1" in COLLECTOR_CONTRACT
+    assert "athena.wc024MonitoringCollectorContract.v2" in COLLECTOR_CONTRACT
     assert "athena.wc024MonitoringEvidenceHandoff.v1" in COLLECTOR_CONTRACT
     assert "isolatedSignedCollector" in COLLECTOR_CONTRACT
     assert "capabilityOnly" in COLLECTOR_CONTRACT
+    assert "authorizationMode: authorizationMode" in COLLECTOR_CONTRACT
+    assert "workspaceAccessControlMode: workspaceAccessControlMode" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "readerRoleDefinitionId: readerRoleDefinitionId" in COLLECTOR_CONTRACT
+    assert "signalReaderRoleDefinitionId: signalReaderRoleDefinitionId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert (
+        "logAnalyticsDataReaderRoleDefinitionId: "
+        "logAnalyticsDataReaderRoleDefinitionId"
+    ) in COLLECTOR_CONTRACT
+    assert "logAnalyticsAllowedTables: logAnalyticsAllowedTables" in COLLECTOR_CONTRACT
+    assert "logAnalyticsAccessCondition: logAnalyticsAccessCondition" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
+    assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
+    assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
+    assert "'workspaceAndResourceContext'" in MAIN
+    assert "'workspaceOnly'" in MAIN
+    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (
+        COLLECTOR_CONTRACT
+    )
     assert "workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId" in (
         COLLECTOR_CONTRACT
     )
@@ -701,7 +763,11 @@ def test_wc024_records_and_preserves_the_live_telemetry_cutover_baseline() -> No
         "NTANetAnalytics",
     ):
         assert signal in ADR
-        assert signal in COLLECTOR_CONTRACT or signal in DATA_PLATFORM
+        assert (
+            signal in COLLECTOR_CONTRACT
+            or signal in DATA_PLATFORM
+            or signal in READER_RBAC
+        )
     assert "All 11 workload VMs had successful" in ADR
     assert "configurationAccessEndpoint" in ADR
     assert "DCR association is read without being rewritten" in ADR

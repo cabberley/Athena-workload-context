@@ -1,6 +1,6 @@
 # Azure Deployment Plan
 
-> **Status:** Validated — WC-024 phase-one foundation; bootstrap/connectivity deployed
+> **Status:** Validated — WC-024 deployment recovery
 
 Generated: 2026-08-31T12:28:07+10:00
 
@@ -459,13 +459,13 @@ All quota-exposed resources are well within regional limits.
 ### WC-024 validation checklist
 
 - [x] Bicep roots and parameter files compile.
-- [x] Focused WC-024 tests pass: 40.
+- [x] Focused WC-024 tests pass: 46.
 - [x] Full Python suite passes with two intentional skips.
 - [x] Ruff, MyPy, repository validation, PowerShell parsing, and
   `git diff --check` pass.
-- [x] Independent code review approved.
-- [x] Independent security review approved.
-- [x] Independent Azure architecture review approved.
+- [x] Independent code review approves the deployment recovery.
+- [x] Independent security review approves the deployment recovery.
+- [x] Independent Azure architecture review approves the deployment recovery.
 - [x] Static RBAC review confirms exact resource scopes and no generic
   Contributor assignment.
 - [x] Complete authoritative azure-validate workflow for the stage-one
@@ -473,7 +473,8 @@ All quota-exposed resources are well within regional limits.
 - [x] Re-run Azure validation and ResourceIdOnly what-if for each AMPLS
   bootstrap and the collector VNet.
 - [x] Deploy and verify AMPLS bootstrap scopes and collector VNet.
-- [x] Run Azure validation and what-if for the complete foundation.
+- [x] Complete authoritative validation and what-if for the recovered
+  foundation.
 - [ ] Deploy the phase-one foundation.
 - [ ] Keep private-only cutover deferred pending runtime acceptance.
 
@@ -482,7 +483,7 @@ All quota-exposed resources are well within regional limits.
 | Check | Command | Result |
 |-------|---------|--------|
 | Bicep | `az bicep build` and `az bicep build-params` for WC-024 roots | Passed |
-| Focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 40 passed |
+| Focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 46 passed |
 | Full tests | `python -m pytest -q` | Passed; 2 skipped |
 | Static quality | Ruff, MyPy, repository validator, PowerShell parser, `git diff --check` | Passed |
 | Reviews | Code, security, and Azure architecture agents | Approved |
@@ -490,13 +491,20 @@ All quota-exposed resources are well within regional limits.
 | AMPLS bootstrap what-if | `az deployment group what-if --result-format ResourceIdOnly` for both reviewed AMPLS names | Passed: one AMPLS create per invocation and no deletes |
 | Collector-network validation | `az deployment sub validate` for `infra/wc024-monitoring-connectivity/main.bicep` | Passed |
 | Collector-network what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: one VNet and one NSG create; no deletes |
-| Static RBAC | Reviewed custom monitoring reader, container-scoped Blob contributor, and key-scoped Crypto User assignments | Passed: exact scopes and no generic Contributor |
+| Static RBAC | Reviewed conditioned Log Analytics Data Reader, exact-resource Reader, existing narrow signal-reader, container-scoped Blob contributor, and key-scoped Crypto User assignments | Passed: no subscription/resource-group Reader and no generic Contributor |
 | AMPLS bootstrap deployment | `bootstrap-ampls.ps1` | Passed: both scopes provisioned `Succeeded`, Open/Open, zero exclusions, zero scoped resources, and zero private endpoint connections |
 | Collector-network deployment | `az deployment sub create` deployment `wc024-connectivity-20260909-2213` | Passed: correlation `56e32d88-f27e-4a88-9c51-24673732014b`; exact VNet/subnet outputs and zero peerings |
 | Complete-foundation validation | `az deployment sub validate` for `infra/wc024-monitoring-foundation/main.bicep` | Passed |
 | Complete-foundation what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 56 creates, 104 ignores, 4 runtime-expression unsupported, and zero deletes or explicit modifies |
+| Initial merged foundation deployment | `az deployment sub create` deployment `wc024-foundation-20260909-2255` | Failed safely: tenant custom-role limit and concurrent LAW link update; no private cutover occurred |
+| Recovery design | Remove new custom-role creation; use conditioned table access, the exact existing signal role, exact child/resource scopes, and serialized AMPLS links | Implemented |
+| Recovery focused tests | `python -m pytest tests/test_wc024_monitoring_contract.py tests/test_wc024_monitoring_infra.py -q` | 46 passed |
+| Recovery full tests | `python -m pytest -q` | Passed; 2 skipped |
+| Recovery static gate | Bicep build, Ruff, MyPy, repository validation, PowerShell parsing, and `git diff --check` | Passed |
+| Recovery ARM validation | `az deployment sub validate` | Passed against live partial state, including exact existing signal-role validation |
+| Recovery what-if | `az deployment sub what-if --result-format ResourceIdOnly` | Passed: 42 creates, 13 nested deployments, 104 ignores, 40 runtime-expression unsupported, zero custom-role creates, zero Connection Monitor creates, and zero deletes |
 
-**WC-024 validation timestamp:** 2026-09-09T22:15:49+10:00
+**WC-024 validation timestamp:** 2026-09-10T00:10:35+10:00
 
 ### WC-024 files
 
@@ -509,5 +517,5 @@ All quota-exposed resources are well within regional limits.
 | `src/athena_context/contracts/monitoring.py` | Signed monitoring contracts |
 
 > Current: WC-024 bootstrap and collector connectivity are deployed and
-> verified. The complete phase-one foundation is validated and will be deployed
-> from the merged revision; private-only cutover remains deferred.
+> verified. The recovered foundation is validated and ready for a serialized
+> retry; private-only cutover remains deferred.
