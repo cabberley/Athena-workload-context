@@ -14,6 +14,12 @@ from azure.data.tables import TableServiceClient, UpdateMode
 from pydantic import BaseModel, ValidationError
 
 from athena_context.api.audit import audit_event_digest, verify_audit_chain
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionReceipt,
+    CohortDecisionRecord,
+    CohortProposalSetVersion,
+    rejection_authorities_overlap,
+)
 from athena_context.api.domain import (
     AuditEvent,
     DraftRecord,
@@ -34,7 +40,9 @@ from athena_context.api.errors import (
     ResourceNotFoundError,
     StaleRevisionError,
 )
+from athena_context.api.operational_context import OperationalContextReceipt
 from athena_context.api.ports import ContextTransactionPort
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.azure_adapters import production_managed_identity_credential
 from athena_context.contracts import compute_artifact_digest
@@ -45,6 +53,11 @@ _CONTEXT_STATE_ROW_KEY = "meta:state"
 _MAX_RECORD_BYTES = 60 * 1024
 _MAX_PARTITION_ENTITIES = 4_096
 _CAPACITY_WARNING_ENTITY_COUNT = 3_584
+_AZURE_TABLE_TRANSACTION_LIMIT = 100
+_ATOMIC_RECORD_RESERVED_OPERATIONS = 6
+_MAX_ATOMIC_RECORD_CHUNKS = (
+    _AZURE_TABLE_TRANSACTION_LIMIT - _ATOMIC_RECORD_RESERVED_OPERATIONS
+)
 _PARTITION_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TABLE_ACCOUNT_PATTERN = re.compile(r"^[a-z0-9]{3,24}\.table\.core\.windows\.net$")
 _LOGGER = logging.getLogger(__name__)
@@ -104,6 +117,26 @@ def _row_key_for_draft(draft: DraftRecord) -> str:
     return _row_key_for_components("draft", draft.draft_id)
 
 
+def _row_key_for_draft_selector_baseline(
+    baseline: DraftSelectorBaseline,
+) -> str:
+    return _row_key_for_components(
+        "draft-selector-baseline",
+        baseline.draft_id,
+    )
+
+
+def _row_key_for_draft_selector_baseline_chunk(
+    baseline_row_key: str,
+    chunk_index: int,
+) -> str:
+    return _row_key_for_components(
+        "draft-selector-baseline-chunk",
+        baseline_row_key,
+        f"{chunk_index:04d}",
+    )
+
+
 def _row_key_for_published(published: PublishedManifest) -> str:
     return _row_key_for_components(
         "published",
@@ -128,6 +161,45 @@ def _row_key_for_receipt(receipt: MutationReceipt) -> str:
     )
 
 
+def _row_key_for_operational_context_receipt(
+    receipt: OperationalContextReceipt,
+) -> str:
+    return _row_key_for_components(
+        "operational-context-receipt",
+        receipt.manifest_id,
+        receipt.receipt_id,
+    )
+
+
+def _row_key_for_cohort_decision(decision: CohortDecisionRecord) -> str:
+    return _row_key_for_components(
+        "cohort-decision",
+        decision.manifest_id,
+        decision.decision_id,
+    )
+
+
+def _row_key_for_cohort_decision_receipt(
+    receipt: CohortDecisionReceipt,
+) -> str:
+    return _row_key_for_components(
+        "cohort-decision-receipt",
+        receipt.actor_id,
+        receipt.idempotency_key,
+    )
+
+
+def _row_key_for_cohort_decision_chunk(
+    decision_row_key: str,
+    chunk_index: int,
+) -> str:
+    return _row_key_for_components(
+        "cohort-decision-chunk",
+        decision_row_key,
+        f"{chunk_index:04d}",
+    )
+
+
 def _row_key_for_audit(event: AuditEvent) -> str:
     return f"audit:{event.sequence:08d}"
 
@@ -145,11 +217,44 @@ def _row_key_for_components(kind: str, *components: str) -> str:
     return f"{kind}:{digest.removeprefix('sha256:')}"
 
 
+def _cohort_overlap_binding_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, str]:
+    return version.authority_overlap_identity()
+
+
+def _cohort_selected_version_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, ...]:
+    return version.authority_selected_identity()
+
+
 def _record_json_fits_table_property_bound(record_json: str) -> bool:
     try:
         return len(record_json.encode("utf-16-le")) <= _MAX_RECORD_BYTES
     except UnicodeEncodeError:
         return False
+
+
+def _split_record_json(record_json: str) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for character in record_json:
+        character_size = len(character.encode("utf-16-le"))
+        if character_size > _MAX_RECORD_BYTES:
+            raise ValueError("context store record contains an oversized character")
+        if current and current_size + character_size > _MAX_RECORD_BYTES:
+            chunks.append("".join(current))
+            current = []
+            current_size = 0
+        current.append(character)
+        current_size += character_size
+    if current:
+        chunks.append("".join(current))
+    if not chunks:
+        raise ValueError("context store chunked record is empty")
+    return chunks
 
 
 def _partition_anchor(
@@ -243,6 +348,10 @@ class AzureTableContextStore:
     def transaction(self) -> _AzureTableTransaction:
         return _AzureTableTransaction(self)
 
+    @property
+    def persistence_identity(self) -> object:
+        return self
+
     def initialize_empty_partition(self) -> None:
         """Create the one-time continuity root for an empty configured partition."""
 
@@ -331,10 +440,27 @@ class _AzureTableTransaction(ContextTransactionPort):
         self._state_entity: Mapping[str, Any] | None = None
         self._generation = 0
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._operational_context_receipts: dict[
+            str,
+            OperationalContextReceipt,
+        ] = {}
+        self._cohort_decisions: dict[
+            tuple[str, str],
+            CohortDecisionRecord,
+        ] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
         self._creates: dict[str, dict[str, object]] = {}
         self._updates: dict[str, dict[str, object]] = {}
         self._dirty = False
@@ -373,6 +499,10 @@ class _AzureTableTransaction(ContextTransactionPort):
             raise RuntimeError(
                 "context store continuity root is absent; explicit initialization is required"
             )
+        chunked_baselines: dict[str, Mapping[str, Any]] = {}
+        baseline_chunks: dict[str, list[Mapping[str, Any]]] = {}
+        chunked_decisions: dict[str, Mapping[str, Any]] = {}
+        decision_chunks: dict[str, list[Mapping[str, Any]]] = {}
         for row_key, entity in self._persisted.items():
             kind = entity.get("kind")
             if row_key == _CONTEXT_STATE_ROW_KEY:
@@ -383,6 +513,21 @@ class _AzureTableTransaction(ContextTransactionPort):
                 if _row_key_for_draft(draft) != row_key or draft.draft_id in self._drafts:
                     raise RuntimeError("context store draft key is invalid")
                 self._drafts[draft.draft_id] = draft
+            elif kind == "draft-selector-baseline":
+                if "recordJson" in entity:
+                    self._register_loaded_draft_selector_baseline(
+                        row_key,
+                        self._decode_model(entity, DraftSelectorBaseline),
+                    )
+                else:
+                    chunked_baselines[row_key] = entity
+            elif kind == "draft-selector-baseline-chunk":
+                parent_row_key = entity.get("parentRowKey")
+                if not isinstance(parent_row_key, str):
+                    raise RuntimeError(
+                        "context store selector baseline chunk parent is invalid"
+                    )
+                baseline_chunks.setdefault(parent_row_key, []).append(entity)
             elif kind == "published":
                 published = self._decode_model(entity, PublishedManifest)
                 self._require_persisted_workload(published.manifest_id)
@@ -409,16 +554,270 @@ class _AzureTableTransaction(ContextTransactionPort):
                 if _row_key_for_receipt(receipt) != row_key or key in self._receipts:
                     raise RuntimeError("context store receipt key is invalid")
                 self._receipts[key] = receipt
+            elif kind == "operational-context-receipt":
+                receipt = self._decode_model(
+                    entity,
+                    OperationalContextReceipt,
+                )
+                if (
+                    _row_key_for_operational_context_receipt(receipt)
+                    != row_key
+                    or receipt.receipt_id
+                    in self._operational_context_receipts
+                ):
+                    raise RuntimeError(
+                        "context store operational receipt key is invalid"
+                    )
+                self._require_operational_receipt_workload(
+                    receipt,
+                    persisted=True,
+                )
+                self._operational_context_receipts[
+                    receipt.receipt_id
+                ] = receipt
+            elif kind == "cohort-decision":
+                if "recordJson" in entity:
+                    self._register_loaded_cohort_decision(
+                        row_key,
+                        self._decode_model(entity, CohortDecisionRecord),
+                    )
+                else:
+                    chunked_decisions[row_key] = entity
+            elif kind == "cohort-decision-chunk":
+                parent_row_key = entity.get("parentRowKey")
+                if not isinstance(parent_row_key, str):
+                    raise RuntimeError(
+                        "context store cohort decision chunk parent is invalid"
+                    )
+                decision_chunks.setdefault(parent_row_key, []).append(entity)
+            elif kind == "cohort-decision-receipt":
+                receipt = self._decode_model(entity, CohortDecisionReceipt)
+                key = (receipt.actor_id, receipt.idempotency_key)
+                if (
+                    _row_key_for_cohort_decision_receipt(receipt) != row_key
+                    or key in self._cohort_decision_receipts
+                ):
+                    raise RuntimeError(
+                        "context store cohort decision receipt key is invalid"
+                    )
+                self._require_cohort_receipt_workload(
+                    receipt,
+                    persisted=True,
+                )
+                self._cohort_decision_receipts[key] = receipt
             else:
                 raise RuntimeError("context store contains an unknown entity kind")
+        for row_key, entity in sorted(chunked_baselines.items()):
+            self._register_loaded_draft_selector_baseline(
+                row_key,
+                self._decode_chunked_draft_selector_baseline(
+                    row_key,
+                    entity,
+                    baseline_chunks.pop(row_key, []),
+                ),
+            )
+        if baseline_chunks:
+            raise RuntimeError("context store contains orphan selector baseline chunks")
+        for row_key, entity in sorted(chunked_decisions.items()):
+            self._register_loaded_cohort_decision(
+                row_key,
+                self._decode_chunked_cohort_decision(
+                    row_key,
+                    entity,
+                    decision_chunks.pop(row_key, []),
+                ),
+            )
+        if decision_chunks:
+            raise RuntimeError("context store contains orphan cohort decision chunks")
         if self._state_entity is None and self._persisted:
             raise RuntimeError("context store has state without a commit generation")
         self._audit.sort(key=lambda event: event.sequence)
         verify_audit_chain(self._audit)
         for receipt in self._receipts.values():
             self._require_receipt_workload(receipt, persisted=True)
+        for receipt in self._operational_context_receipts.values():
+            self._require_operational_receipt_workload(
+                receipt,
+                persisted=True,
+            )
         if self._state_entity is not None:
             self._verify_state_anchor()
+
+    def _register_loaded_draft_selector_baseline(
+        self,
+        row_key: str,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        self._require_persisted_workload(baseline.manifest_id)
+        if (
+            _row_key_for_draft_selector_baseline(baseline) != row_key
+            or baseline.draft_id in self._draft_selector_baselines
+        ):
+            raise RuntimeError(
+                "context store draft selector baseline key is invalid"
+            )
+        self._draft_selector_baselines[baseline.draft_id] = baseline
+
+    def _register_loaded_cohort_decision(
+        self,
+        row_key: str,
+        decision: CohortDecisionRecord,
+    ) -> None:
+        self._require_persisted_workload(decision.manifest_id)
+        key = (decision.manifest_id, decision.decision_id)
+        version = decision.proposal_set_version()
+        version_key = _cohort_selected_version_key(version)
+        if (
+            _row_key_for_cohort_decision(decision) != row_key
+            or key in self._cohort_decisions
+            or version_key in self._cohort_decision_versions
+            or self._overlapping_cohort_decisions(version)
+        ):
+            raise RuntimeError(
+                "context store cohort decision key or authority is invalid"
+            )
+        self._cohort_decisions[key] = decision
+        self._cohort_decision_versions[version_key] = key
+
+    def _decode_chunked_cohort_decision(
+        self,
+        row_key: str,
+        entity: Mapping[str, Any],
+        chunks: list[Mapping[str, Any]],
+    ) -> CohortDecisionRecord:
+        if entity.get("schemaVersion") != _CONTEXT_STORE_SCHEMA:
+            raise RuntimeError("context store schema version is invalid")
+        chunk_count = entity.get("chunkCount")
+        record_digest = entity.get("recordDigest")
+        if (
+            type(chunk_count) is not int
+            or not 1 <= chunk_count <= _MAX_ATOMIC_RECORD_CHUNKS
+            or not isinstance(record_digest, str)
+            or len(chunks) != chunk_count
+        ):
+            raise RuntimeError("context store cohort decision chunk metadata is invalid")
+        self._entity_etag(entity)
+        indexed: dict[int, str] = {}
+        for chunk in chunks:
+            if chunk.get("schemaVersion") != _CONTEXT_STORE_SCHEMA:
+                raise RuntimeError("context store schema version is invalid")
+            index = chunk.get("chunkIndex")
+            value = chunk.get("recordJsonChunk")
+            digest = chunk.get("recordDigest")
+            if (
+                type(index) is not int
+                or not 0 <= index < chunk_count
+                or index in indexed
+                or not isinstance(value, str)
+                or not _record_json_fits_table_property_bound(value)
+                or chunk.get("parentRowKey") != row_key
+                or chunk.get("RowKey")
+                != _row_key_for_cohort_decision_chunk(row_key, index)
+                or digest
+                != compute_artifact_digest(
+                    {
+                        "parentRowKey": row_key,
+                        "chunkIndex": index,
+                        "recordJsonChunk": value,
+                    }
+                )
+            ):
+                raise RuntimeError("context store cohort decision chunk is invalid")
+            self._entity_etag(chunk)
+            indexed[index] = value
+        record_json = "".join(indexed[index] for index in range(chunk_count))
+        try:
+            decision = CohortDecisionRecord.model_validate_json(record_json)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "context store chunked cohort decision does not match its schema"
+            ) from exc
+        if (
+            compute_artifact_digest(
+                decision.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+            != record_digest
+        ):
+            raise RuntimeError(
+                "context store chunked cohort decision integrity digest is invalid"
+            )
+        return decision
+
+    def _decode_chunked_draft_selector_baseline(
+        self,
+        row_key: str,
+        entity: Mapping[str, Any],
+        chunks: list[Mapping[str, Any]],
+    ) -> DraftSelectorBaseline:
+        if entity.get("schemaVersion") != _CONTEXT_STORE_SCHEMA:
+            raise RuntimeError("context store schema version is invalid")
+        chunk_count = entity.get("chunkCount")
+        record_digest = entity.get("recordDigest")
+        if (
+            type(chunk_count) is not int
+            or not 1 <= chunk_count <= _MAX_ATOMIC_RECORD_CHUNKS
+            or not isinstance(record_digest, str)
+            or len(chunks) != chunk_count
+        ):
+            raise RuntimeError(
+                "context store selector baseline chunk metadata is invalid"
+            )
+        self._entity_etag(entity)
+        indexed: dict[int, str] = {}
+        for chunk in chunks:
+            if chunk.get("schemaVersion") != _CONTEXT_STORE_SCHEMA:
+                raise RuntimeError("context store schema version is invalid")
+            index = chunk.get("chunkIndex")
+            value = chunk.get("recordJsonChunk")
+            digest = chunk.get("recordDigest")
+            if (
+                type(index) is not int
+                or not 0 <= index < chunk_count
+                or index in indexed
+                or not isinstance(value, str)
+                or not _record_json_fits_table_property_bound(value)
+                or chunk.get("parentRowKey") != row_key
+                or chunk.get("RowKey")
+                != _row_key_for_draft_selector_baseline_chunk(row_key, index)
+                or digest
+                != compute_artifact_digest(
+                    {
+                        "parentRowKey": row_key,
+                        "chunkIndex": index,
+                        "recordJsonChunk": value,
+                    }
+                )
+            ):
+                raise RuntimeError(
+                    "context store selector baseline chunk is invalid"
+                )
+            self._entity_etag(chunk)
+            indexed[index] = value
+        record_json = "".join(indexed[index] for index in range(chunk_count))
+        try:
+            baseline = DraftSelectorBaseline.model_validate_json(record_json)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "context store chunked selector baseline does not match its schema"
+            ) from exc
+        if (
+            compute_artifact_digest(
+                baseline.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+            )
+            != record_digest
+        ):
+            raise RuntimeError(
+                "context store chunked selector baseline integrity digest is invalid"
+            )
+        return baseline
 
     def _require_persisted_workload(self, manifest_id: str) -> None:
         if manifest_id != self._store._workload_id:
@@ -460,6 +859,59 @@ class _AzureTableTransaction(ContextTransactionPort):
             self._require_persisted_workload(draft.manifest_id)
         else:
             self._require_workload(draft.manifest_id)
+
+    def _require_cohort_receipt_workload(
+        self,
+        receipt: CohortDecisionReceipt,
+        *,
+        persisted: bool,
+    ) -> None:
+        if persisted:
+            self._require_persisted_workload(receipt.manifest_id)
+        else:
+            self._require_workload(receipt.manifest_id)
+
+    def _require_operational_receipt_workload(
+        self,
+        receipt: OperationalContextReceipt,
+        *,
+        persisted: bool,
+    ) -> None:
+        if persisted:
+            self._require_persisted_workload(receipt.manifest_id)
+        else:
+            self._require_workload(receipt.manifest_id)
+
+    def _overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]:
+        binding_key = _cohort_overlap_binding_key(version)
+        batch_key = version.batch_overlap_identity()
+        selected_proposal_ids = set(version.source_proposal_ids)
+        return [
+            decision
+            for decision in self._cohort_decisions.values()
+            if (
+                (
+                    _cohort_overlap_binding_key(
+                        decision.proposal_set_version()
+                    )
+                    == binding_key
+                    and rejection_authorities_overlap(
+                        version.source_rejection_authorities,
+                        decision.source_rejection_authorities,
+                    )
+                )
+                or (
+                    decision.proposal_set_version().batch_overlap_identity()
+                    == batch_key
+                    and selected_proposal_ids.intersection(
+                        decision.source_proposal_ids
+                    )
+                )
+            )
+        ]
 
     def _load_state(self, entity: Mapping[str, Any]) -> None:
         if self._state_entity is not None or entity.get("kind") != "state":
@@ -545,6 +997,120 @@ class _AzureTableTransaction(ContextTransactionPort):
             ),
         }
 
+    def _stage_chunked_cohort_decision(
+        self,
+        decision: CohortDecisionRecord,
+    ) -> None:
+        row_key = _row_key_for_cohort_decision(decision)
+        record_json = decision.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
+        chunks = _split_record_json(record_json)
+        if len(chunks) > _MAX_ATOMIC_RECORD_CHUNKS:
+            raise ValueError(
+                "context store cohort decision exceeds its chunk bound"
+            )
+        record_digest = compute_artifact_digest(
+            decision.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        self._stage_create(
+            row_key,
+            {
+                "PartitionKey": self._store._partition_key,
+                "RowKey": row_key,
+                "schemaVersion": _CONTEXT_STORE_SCHEMA,
+                "kind": "cohort-decision",
+                "chunkCount": len(chunks),
+                "recordDigest": record_digest,
+            },
+        )
+        for index, value in enumerate(chunks):
+            chunk_row_key = _row_key_for_cohort_decision_chunk(
+                row_key,
+                index,
+            )
+            self._stage_create(
+                chunk_row_key,
+                {
+                    "PartitionKey": self._store._partition_key,
+                    "RowKey": chunk_row_key,
+                    "schemaVersion": _CONTEXT_STORE_SCHEMA,
+                    "kind": "cohort-decision-chunk",
+                    "parentRowKey": row_key,
+                    "chunkIndex": index,
+                    "recordJsonChunk": value,
+                    "recordDigest": compute_artifact_digest(
+                        {
+                            "parentRowKey": row_key,
+                            "chunkIndex": index,
+                            "recordJsonChunk": value,
+                        }
+                    ),
+                },
+            )
+
+    def _stage_chunked_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        row_key = _row_key_for_draft_selector_baseline(baseline)
+        record_json = baseline.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        )
+        chunks = _split_record_json(record_json)
+        if len(chunks) > _MAX_ATOMIC_RECORD_CHUNKS:
+            raise ValueError(
+                "context store selector baseline exceeds its chunk bound"
+            )
+        record_digest = compute_artifact_digest(
+            baseline.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        )
+        self._stage_create(
+            row_key,
+            {
+                "PartitionKey": self._store._partition_key,
+                "RowKey": row_key,
+                "schemaVersion": _CONTEXT_STORE_SCHEMA,
+                "kind": "draft-selector-baseline",
+                "chunkCount": len(chunks),
+                "recordDigest": record_digest,
+            },
+        )
+        for index, value in enumerate(chunks):
+            chunk_row_key = _row_key_for_draft_selector_baseline_chunk(
+                row_key,
+                index,
+            )
+            self._stage_create(
+                chunk_row_key,
+                {
+                    "PartitionKey": self._store._partition_key,
+                    "RowKey": chunk_row_key,
+                    "schemaVersion": _CONTEXT_STORE_SCHEMA,
+                    "kind": "draft-selector-baseline-chunk",
+                    "parentRowKey": row_key,
+                    "chunkIndex": index,
+                    "recordJsonChunk": value,
+                    "recordDigest": compute_artifact_digest(
+                        {
+                            "parentRowKey": row_key,
+                            "chunkIndex": index,
+                            "recordJsonChunk": value,
+                        }
+                    ),
+                },
+            )
+
     def _stage_create(self, row_key: str, entity: dict[str, object]) -> None:
         if row_key in self._persisted or row_key in self._creates:
             raise RuntimeError("context store attempted to recreate an existing entity")
@@ -614,7 +1180,7 @@ class _AzureTableTransaction(ContextTransactionPort):
                     },
                 )
             )
-        if len(operations) > 100:
+        if len(operations) > _AZURE_TABLE_TRANSACTION_LIMIT:
             raise RuntimeError("context store transaction exceeds Azure Table batch limit")
         try:
             self._store._table.submit_transaction(operations)
@@ -677,6 +1243,47 @@ class _AzureTableTransaction(ContextTransactionPort):
         else:
             self._stage_update(row_key, entity)
         self._drafts[draft.draft_id] = normalized
+
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None:
+        baseline = self._draft_selector_baselines.get(draft_id)
+        return None if baseline is None else baseline.model_copy(deep=True)
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]:
+        self._require_workload(manifest_id)
+        matches = sorted(
+            (
+                baseline
+                for baseline in self._draft_selector_baselines.values()
+                if baseline.manifest_id == manifest_id
+                and (
+                    manifest_version is None
+                    or baseline.manifest_version == manifest_version
+                )
+            ),
+            key=lambda baseline: (baseline.captured_at, baseline.draft_id),
+        )
+        return [baseline.model_copy(deep=True) for baseline in matches]
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        self._require_workload(baseline.manifest_id)
+        if baseline.draft_id in self._draft_selector_baselines:
+            raise PersistenceConflictError(
+                "draft selector baseline is immutable"
+            )
+        normalized = baseline.model_copy(deep=True)
+        self._stage_chunked_draft_selector_baseline(normalized)
+        self._draft_selector_baselines[baseline.draft_id] = normalized
 
     def get_published(
         self,
@@ -809,3 +1416,148 @@ class _AzureTableTransaction(ContextTransactionPort):
             ),
         )
         self._receipts[key] = normalized
+
+    def get_operational_context_receipt(
+        self,
+        receipt_id: str,
+    ) -> OperationalContextReceipt | None:
+        receipt = self._operational_context_receipts.get(receipt_id)
+        if receipt is not None:
+            self._require_operational_receipt_workload(
+                receipt,
+                persisted=False,
+            )
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_operational_context_receipt(
+        self,
+        receipt: OperationalContextReceipt,
+    ) -> None:
+        self._require_operational_receipt_workload(
+            receipt,
+            persisted=False,
+        )
+        if receipt.receipt_id in self._operational_context_receipts:
+            raise PersistenceConflictError(
+                "operational context receipt identifier already exists"
+            )
+        normalized = receipt.model_copy(deep=True)
+        row_key = _row_key_for_operational_context_receipt(normalized)
+        self._stage_create(
+            row_key,
+            self._record_entity(
+                row_key=row_key,
+                kind="operational-context-receipt",
+                record=normalized,
+            ),
+        )
+        self._operational_context_receipts[normalized.receipt_id] = normalized
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None:
+        self._require_workload(manifest_id)
+        decision = self._cohort_decisions.get((manifest_id, decision_id))
+        return None if decision is None else decision.model_copy(deep=True)
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]:
+        self._require_workload(manifest_id)
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if decision.manifest_id == manifest_id
+                and (profile_id is None or decision.profile_id == profile_id)
+                and (
+                    draft_id is None
+                    or decision.source_draft.draft_id == draft_id
+                )
+                and (
+                    proposal_set_digest is None
+                    or decision.proposal_set_digest == proposal_set_digest
+                )
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
+        )
+        return [decision.model_copy(deep=True) for decision in matches]
+
+    def list_overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]:
+        self._require_workload(version.manifest_id)
+        return [
+            decision.model_copy(deep=True)
+            for decision in sorted(
+                self._overlapping_cohort_decisions(version),
+                key=lambda item: (item.decided_at, item.decision_id),
+            )
+        ]
+
+    def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
+        self._require_workload(decision.manifest_id)
+        decision_key = (decision.manifest_id, decision.decision_id)
+        version = decision.proposal_set_version()
+        version_key = _cohort_selected_version_key(version)
+        if decision_key in self._cohort_decisions:
+            raise PersistenceConflictError(
+                "cohort decision identifier already exists"
+            )
+        if version_key in self._cohort_decision_versions:
+            raise PersistenceConflictError(
+                "the proposal-set version already has an authoritative decision"
+            )
+        if self._overlapping_cohort_decisions(version):
+            raise PersistenceConflictError(
+                "an overlapping selected proposal already has an authoritative decision"
+            )
+        normalized = decision.model_copy(deep=True)
+        self._stage_chunked_cohort_decision(normalized)
+        self._cohort_decisions[decision_key] = normalized
+        self._cohort_decision_versions[version_key] = decision_key
+
+    def get_cohort_decision_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> CohortDecisionReceipt | None:
+        receipt = self._cohort_decision_receipts.get(
+            (actor_id, idempotency_key)
+        )
+        if receipt is not None:
+            self._require_cohort_receipt_workload(
+                receipt,
+                persisted=False,
+            )
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_cohort_decision_receipt(
+        self,
+        receipt: CohortDecisionReceipt,
+    ) -> None:
+        self._require_cohort_receipt_workload(receipt, persisted=False)
+        key = (receipt.actor_id, receipt.idempotency_key)
+        if key in self._cohort_decision_receipts:
+            raise IdempotencyConflictError(
+                "cohort decision idempotency key has already been recorded"
+            )
+        normalized = receipt.model_copy(deep=True)
+        row_key = _row_key_for_cohort_decision_receipt(normalized)
+        self._stage_create(
+            row_key,
+            self._record_entity(
+                row_key=row_key,
+                kind="cohort-decision-receipt",
+                record=normalized,
+            ),
+        )
+        self._cohort_decision_receipts[key] = normalized

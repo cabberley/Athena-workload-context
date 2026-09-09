@@ -82,6 +82,7 @@ class Role(StrEnum):
     PUBLISHER = "publisher"
     READER = "reader"
     AUDITOR = "auditor"
+    OPERATIONAL_CONTEXT_ISSUER = "operational_context_issuer"
 
 
 class Permission(StrEnum):
@@ -91,10 +92,12 @@ class Permission(StrEnum):
     UPDATE_DRAFT = "update_draft"
     VALIDATE = "validate"
     SUBMIT = "submit"
+    REVIEW = "review"
     APPROVE = "approve"
     PUBLISH = "publish"
     SUPERSEDE = "supersede"
     AUDIT = "audit"
+    ISSUE_OPERATIONAL_CONTEXT = "issue_operational_context"
 
 
 class AllWorkloadsGrantScope(ApiModel):
@@ -132,11 +135,13 @@ class AuditAction(StrEnum):
     DRAFT_REPLACED = "draft_replaced"
     DRAFT_VALIDATED = "draft_validated"
     REVIEW_SUBMITTED = "review_submitted"
+    REVIEW_RECORDED = "review_recorded"
     DRAFT_APPROVED = "draft_approved"
     VERSION_PUBLISHED = "version_published"
     VERSION_SUPERSEDED = "version_superseded"
     DEMO_EVALUATION_APPROVAL_CREATED = "demo_evaluation_approval_created"
     DEMO_EVALUATION_APPROVAL_REVOKED = "demo_evaluation_approval_revoked"
+    COHORT_DECISION_RECORDED = "cohort_decision_recorded"
 
 
 class ValidationRecord(ApiModel):
@@ -163,6 +168,27 @@ class PublicationCandidate(ApiModel):
     approval_status: Literal["approved"]
 
 
+class ReviewDecisionKind(StrEnum):
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+
+
+class ReviewDecision(ApiModel):
+    decision_id: str = Field(pattern=_ID_PATTERN)
+    decision: ReviewDecisionKind
+    reviewed_by: Actor
+    reviewed_at: AwareDatetime
+    reviewed_revision: int = Field(ge=1)
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    comments: str = Field(min_length=3, max_length=2000)
+    rejected_fields: list[str] = Field(default_factory=list, max_length=100)
+    required_corrections: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+
+
 class ApprovalDecision(ApiModel):
     decision_id: str = Field(pattern=_ID_PATTERN)
     approved_by: Actor
@@ -170,6 +196,14 @@ class ApprovalDecision(ApiModel):
     approved_revision: int = Field(ge=1)
     manifest_version: str = Field(pattern=_VERSION_PATTERN)
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
+    review_decision_id: str | None = Field(
+        default=None,
+        pattern=_ID_PATTERN,
+    )
+    operational_context_receipt_id: str | None = Field(
+        default=None,
+        pattern=_ID_PATTERN,
+    )
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -181,6 +215,10 @@ class DraftRecord(ApiModel):
     manifest: CanonicalWorkloadManifest
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     previous_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    rollback_source_version: str | None = Field(
+        default=None,
+        pattern=_VERSION_PATTERN,
+    )
     created_by: Actor
     created_at: AwareDatetime
     updated_by: Actor
@@ -189,6 +227,10 @@ class DraftRecord(ApiModel):
     validation: ValidationRecord | None = None
     review: ReviewSubmission | None = None
     publication_candidate: PublicationCandidate | None = None
+    review_decisions: list[ReviewDecision] = Field(
+        default_factory=list,
+        max_length=100,
+    )
     approval: ApprovalDecision | None = None
 
 
@@ -205,6 +247,10 @@ class PublishedManifest(ApiModel):
     published_at: AwareDatetime
     publication_authorized_by: Actor
     publication_authorized_at: AwareDatetime
+    operational_context_receipt_id: str | None = Field(
+        default=None,
+        pattern=_ID_PATTERN,
+    )
     reason: str = Field(min_length=3, max_length=500)
 
 
@@ -278,11 +324,24 @@ class CreateDraftCommand(ApiModel):
     manifest: CanonicalWorkloadManifest
     manifest_digest: str = Field(pattern=_DIGEST_PATTERN)
     previous_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    rollback_source_version: str | None = Field(
+        default=None,
+        pattern=_VERSION_PATTERN,
+    )
     reason: str = Field(min_length=3, max_length=500)
 
     @model_validator(mode="after")
     def validate_manifest_id(self) -> CreateDraftCommand:
         ensure_concrete_workload_id(self.manifest.manifest_id)
+        if self.rollback_source_version is not None:
+            if self.previous_version is None:
+                raise ValueError(
+                    "rollback_source_version requires the active previous_version"
+                )
+            if self.rollback_source_version == self.previous_version:
+                raise ValueError(
+                    "rollback_source_version must identify an older version"
+                )
         return self
 
 
@@ -307,8 +366,63 @@ class TransitionCommand(ApiModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class ReviewCommand(TransitionCommand):
+    decision: ReviewDecisionKind = Field(strict=False)
+    comments: str = Field(min_length=3, max_length=2000)
+    rejected_fields: list[str] = Field(default_factory=list, max_length=100)
+    required_corrections: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+
+    @model_validator(mode="after")
+    def validate_review_details(self) -> ReviewCommand:
+        if len(self.rejected_fields) != len(set(self.rejected_fields)):
+            raise ValueError("rejected_fields must be unique")
+        if len(self.required_corrections) != len(
+            set(self.required_corrections)
+        ):
+            raise ValueError("required_corrections must be unique")
+        if any(
+            not field.startswith("/") or len(field) > 512
+            for field in self.rejected_fields
+        ):
+            raise ValueError(
+                "rejected_fields must be bounded JSON pointer paths"
+            )
+        if any(
+            not correction.strip()
+            or correction != correction.strip()
+            or len(correction) > 500
+            for correction in self.required_corrections
+        ):
+            raise ValueError(
+                "required_corrections must be bounded trimmed text"
+            )
+        if (
+            self.decision is ReviewDecisionKind.APPROVED
+            and (self.rejected_fields or self.required_corrections)
+        ):
+            raise ValueError(
+                "approved reviews cannot declare rejected fields or corrections"
+            )
+        if (
+            self.decision is ReviewDecisionKind.CHANGES_REQUESTED
+            and not self.required_corrections
+        ):
+            raise ValueError(
+                "changes_requested reviews require explicit corrections"
+            )
+        return self
+
+
+class ApproveCommand(TransitionCommand):
+    operational_context_receipt_id: str = Field(pattern=_ID_PATTERN)
+
+
 class PublishCommand(TransitionCommand):
     approval_id: str = Field(pattern=_ID_PATTERN)
+    operational_context_receipt_id: str = Field(pattern=_ID_PATTERN)
 
 
 class SupersedeCommand(ApiModel):
@@ -328,6 +442,13 @@ class VersionComparison(ApiModel):
     to_digest: str = Field(pattern=_DIGEST_PATTERN)
     equivalent: bool
     changed_paths: list[str]
+
+
+class ResolvedProfileAuthority(ApiModel):
+    manifest_id: WorkloadIdentifier
+    manifest_version: str = Field(pattern=_VERSION_PATTERN)
+    profile_id: str = Field(pattern=_ID_PATTERN)
+    resolved_profile_digest: str = Field(pattern=_DIGEST_PATTERN)
 
 
 def ensure_timestamp(value: datetime) -> datetime:

@@ -9,6 +9,12 @@ from typing import Literal
 from pydantic import TypeAdapter
 
 from athena_context.api.audit import audit_event_digest, verify_audit_chain
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionReceipt,
+    CohortDecisionRecord,
+    CohortProposalSetVersion,
+    rejection_authorities_overlap,
+)
 from athena_context.api.domain import (
     Actor,
     AuditEvent,
@@ -29,6 +35,7 @@ from athena_context.api.errors import (
     DuplicateVersionError,
     EvaluationFailedClosedError,
     IdempotencyConflictError,
+    PersistenceConflictError,
     ResourceNotFoundError,
     StaleRevisionError,
 )
@@ -70,10 +77,12 @@ from athena_context.api.evaluation_verification import (
     validate_evaluation_collection_binding,
     verify_and_evaluate_snapshot_for_publication,
 )
+from athena_context.api.operational_context import OperationalContextReceipt
 from athena_context.api.ports import (
     AuthoritativeCommitClockPort,
     ContextTransactionPort,
 )
+from athena_context.api.selector_provenance import DraftSelectorBaseline
 from athena_context.api.transaction_lock import InMemoryTransactionLock
 from athena_context.contracts import (
     AthenaValidationError,
@@ -533,8 +542,22 @@ def _seal_trusted_key_for_finalization(
     return seal_evaluation_trusted_key_authority(trusted_key)
 
 
+def _cohort_overlap_binding_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, str]:
+    """Stable workload/profile scope without mutable generation coordinates."""
+
+    return version.authority_overlap_identity()
+
+
+def _cohort_selected_version_key(
+    version: CohortProposalSetVersion,
+) -> tuple[str, ...]:
+    return version.authority_selected_identity()
+
+
 class InMemoryContextStore:
-    """Transactional, deterministic in-memory implementation of the storage port."""
+    """Transactional in-memory adapter for WC-007 and cohort decision ports."""
 
     def __init__(
         self,
@@ -548,10 +571,15 @@ class InMemoryContextStore:
         self._lock = self._transaction_lock.lock
         self._authoritative_clock = authoritative_clock
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._operational_context_receipts: dict[
+            str,
+            OperationalContextReceipt,
+        ] = {}
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
@@ -578,9 +606,22 @@ class InMemoryContextStore:
             ]
             | None
         ) = None
+        self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
 
     def transaction(self) -> _MemoryTransaction:
         return _MemoryTransaction(self)
+
+    @property
+    def persistence_identity(self) -> object:
+        return self
 
     def _bind_context_service_evaluation_publication(
         self,
@@ -657,10 +698,15 @@ class _MemoryTransaction(ContextTransactionPort):
     def __init__(self, store: InMemoryContextStore) -> None:
         self._store = store
         self._drafts: dict[str, DraftRecord] = {}
+        self._draft_selector_baselines: dict[str, DraftSelectorBaseline] = {}
         self._published: dict[tuple[str, str], PublishedManifest] = {}
         self._supersessions: dict[tuple[str, str], Supersession] = {}
         self._audit: list[AuditEvent] = []
         self._receipts: dict[tuple[str, str], MutationReceipt] = {}
+        self._operational_context_receipts: dict[
+            str,
+            OperationalContextReceipt,
+        ] = {}
         self._demo_evaluation_approvals: dict[str, DemoEvaluationApproval] = {}
         self._evaluation_grants: tuple[RoleGrant, ...] = ()
         self._evaluation_grant_revision = 0
@@ -679,6 +725,15 @@ class _MemoryTransaction(ContextTransactionPort):
         self.__evaluation_publication_epoch: object | None = None
         self.__evaluation_publication_capability: object | None = None
         self.__evaluation_publication_consumed = False
+        self._cohort_decisions: dict[tuple[str, str], CohortDecisionRecord] = {}
+        self._cohort_decision_versions: dict[
+            tuple[str, ...],
+            tuple[str, str],
+        ] = {}
+        self._cohort_decision_receipts: dict[
+            tuple[str, str],
+            CohortDecisionReceipt,
+        ] = {}
 
     def __enter__(self) -> _MemoryTransaction:
         if self.__active_entry_epoch is not None:
@@ -689,10 +744,16 @@ class _MemoryTransaction(ContextTransactionPort):
         self.__evaluation_publication_capability = None
         self.__evaluation_publication_consumed = False
         self._drafts = dict(self._store._drafts)
+        self._draft_selector_baselines = dict(
+            self._store._draft_selector_baselines
+        )
         self._published = dict(self._store._published)
         self._supersessions = dict(self._store._supersessions)
         self._audit = list(self._store._audit)
         self._receipts = dict(self._store._receipts)
+        self._operational_context_receipts = dict(
+            self._store._operational_context_receipts
+        )
         self._demo_evaluation_approvals = dict(
             self._store._demo_evaluation_approvals
         )
@@ -705,6 +766,13 @@ class _MemoryTransaction(ContextTransactionPort):
         )
         self._base_generation = self._store._transaction_generation
         self._dirty = False
+        self._cohort_decisions = dict(self._store._cohort_decisions)
+        self._cohort_decision_versions = dict(
+            self._store._cohort_decision_versions
+        )
+        self._cohort_decision_receipts = dict(
+            self._store._cohort_decision_receipts
+        )
         return self
 
     def __exit__(
@@ -721,10 +789,16 @@ class _MemoryTransaction(ContextTransactionPort):
                     )
                 if self._dirty:
                     self._store._drafts = self._drafts
+                    self._store._draft_selector_baselines = (
+                        self._draft_selector_baselines
+                    )
                     self._store._published = self._published
                     self._store._supersessions = self._supersessions
                     self._store._audit = self._audit
                     self._store._receipts = self._receipts
+                    self._store._operational_context_receipts = (
+                        self._operational_context_receipts
+                    )
                     self._store._demo_evaluation_approvals = (
                         self._demo_evaluation_approvals
                     )
@@ -736,6 +810,13 @@ class _MemoryTransaction(ContextTransactionPort):
                     self._store._evaluation_artifacts = self._evaluation_artifacts
                     self._store._demo_evaluation_trusted_keys = (
                         self._demo_evaluation_trusted_keys
+                    )
+                    self._store._cohort_decisions = self._cohort_decisions
+                    self._store._cohort_decision_versions = (
+                        self._cohort_decision_versions
+                    )
+                    self._store._cohort_decision_receipts = (
+                        self._cohort_decision_receipts
                     )
                     self._store._transaction_generation += 1
         finally:
@@ -784,6 +865,46 @@ class _MemoryTransaction(ContextTransactionPort):
                 f"expected draft revision {expected_revision}, found {current.revision}"
             )
         self._drafts[draft.draft_id] = draft.model_copy(deep=True)
+        self._dirty = True
+
+    def get_draft_selector_baseline(
+        self,
+        draft_id: str,
+    ) -> DraftSelectorBaseline | None:
+        baseline = self._draft_selector_baselines.get(draft_id)
+        return None if baseline is None else baseline.model_copy(deep=True)
+
+    def list_draft_selector_baselines(
+        self,
+        *,
+        manifest_id: str,
+        manifest_version: str | None = None,
+    ) -> list[DraftSelectorBaseline]:
+        matches = sorted(
+            (
+                baseline
+                for baseline in self._draft_selector_baselines.values()
+                if baseline.manifest_id == manifest_id
+                and (
+                    manifest_version is None
+                    or baseline.manifest_version == manifest_version
+                )
+            ),
+            key=lambda baseline: (baseline.captured_at, baseline.draft_id),
+        )
+        return [baseline.model_copy(deep=True) for baseline in matches]
+
+    def put_draft_selector_baseline(
+        self,
+        baseline: DraftSelectorBaseline,
+    ) -> None:
+        if baseline.draft_id in self._draft_selector_baselines:
+            raise PersistenceConflictError(
+                "draft selector baseline is immutable"
+            )
+        self._draft_selector_baselines[baseline.draft_id] = (
+            baseline.model_copy(deep=True)
+        )
         self._dirty = True
 
     def get_published(
@@ -870,6 +991,26 @@ class _MemoryTransaction(ContextTransactionPort):
         if key in self._receipts:
             raise IdempotencyConflictError("idempotency key has already been recorded")
         self._receipts[key] = receipt.model_copy(deep=True)
+        self._dirty = True
+
+    def get_operational_context_receipt(
+        self,
+        receipt_id: str,
+    ) -> OperationalContextReceipt | None:
+        receipt = self._operational_context_receipts.get(receipt_id)
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_operational_context_receipt(
+        self,
+        receipt: OperationalContextReceipt,
+    ) -> None:
+        if receipt.receipt_id in self._operational_context_receipts:
+            raise PersistenceConflictError(
+                "operational context receipt identifier already exists"
+            )
+        self._operational_context_receipts[receipt.receipt_id] = (
+            receipt.model_copy(deep=True)
+        )
         self._dirty = True
 
     def get_demo_evaluation_approval(
@@ -1345,3 +1486,115 @@ class _MemoryTransaction(ContextTransactionPort):
             deepcopy(self._evaluation_artifacts[snapshot_id])
             for snapshot_id in sorted(self._evaluation_artifacts)
         )
+
+    def get_cohort_decision(
+        self,
+        manifest_id: str,
+        decision_id: str,
+    ) -> CohortDecisionRecord | None:
+        decision = self._cohort_decisions.get((manifest_id, decision_id))
+        return None if decision is None else decision.model_copy(deep=True)
+
+    def list_cohort_decisions(
+        self,
+        *,
+        manifest_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        proposal_set_digest: str | None = None,
+    ) -> list[CohortDecisionRecord]:
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if decision.manifest_id == manifest_id
+                and (profile_id is None or decision.profile_id == profile_id)
+                and (
+                    draft_id is None
+                    or decision.source_draft.draft_id == draft_id
+                )
+                and (
+                    proposal_set_digest is None
+                    or decision.proposal_set_digest == proposal_set_digest
+                )
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
+        )
+        return [decision.model_copy(deep=True) for decision in matches]
+
+    def list_overlapping_cohort_decisions(
+        self,
+        version: CohortProposalSetVersion,
+    ) -> list[CohortDecisionRecord]:
+        binding_key = _cohort_overlap_binding_key(version)
+        batch_key = version.batch_overlap_identity()
+        selected_proposal_ids = set(version.source_proposal_ids)
+        matches = sorted(
+            (
+                decision
+                for decision in self._cohort_decisions.values()
+                if (
+                    (
+                        _cohort_overlap_binding_key(
+                            decision.proposal_set_version()
+                        )
+                        == binding_key
+                        and rejection_authorities_overlap(
+                            version.source_rejection_authorities,
+                            decision.source_rejection_authorities,
+                        )
+                    )
+                    or (
+                        decision.proposal_set_version().batch_overlap_identity()
+                        == batch_key
+                        and selected_proposal_ids.intersection(
+                            decision.source_proposal_ids
+                        )
+                    )
+                )
+            ),
+            key=lambda decision: (decision.decided_at, decision.decision_id),
+        )
+        return [decision.model_copy(deep=True) for decision in matches]
+
+    def put_cohort_decision(self, decision: CohortDecisionRecord) -> None:
+        decision_key = (decision.manifest_id, decision.decision_id)
+        version = decision.proposal_set_version()
+        version_key = _cohort_selected_version_key(version)
+        if decision_key in self._cohort_decisions:
+            raise PersistenceConflictError(
+                "cohort decision identifier already exists"
+            )
+        if version_key in self._cohort_decision_versions:
+            raise PersistenceConflictError(
+                "the proposal-set version already has an authoritative decision"
+            )
+        if self.list_overlapping_cohort_decisions(version):
+            raise PersistenceConflictError(
+                "an overlapping selected proposal already has an authoritative decision"
+            )
+        self._cohort_decisions[decision_key] = decision.model_copy(deep=True)
+        self._cohort_decision_versions[version_key] = decision_key
+        self._dirty = True
+
+    def get_cohort_decision_receipt(
+        self,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> CohortDecisionReceipt | None:
+        receipt = self._cohort_decision_receipts.get(
+            (actor_id, idempotency_key)
+        )
+        return None if receipt is None else receipt.model_copy(deep=True)
+
+    def put_cohort_decision_receipt(
+        self,
+        receipt: CohortDecisionReceipt,
+    ) -> None:
+        key = (receipt.actor_id, receipt.idempotency_key)
+        if key in self._cohort_decision_receipts:
+            raise IdempotencyConflictError(
+                "cohort decision idempotency key has already been recorded"
+            )
+        self._cohort_decision_receipts[key] = receipt.model_copy(deep=True)
+        self._dirty = True

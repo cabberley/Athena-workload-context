@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from athena_context.api import (
     Actor,
     ActorKind,
+    ApproveCommand,
     ContextService,
     ContextServicePublishedContextResolver,
     CreateDemoEvaluationApprovalCommand,
@@ -35,6 +36,8 @@ from athena_context.api import (
     PublishCommand,
     PublishedContextSelection,
     ResolvedPublishedContext,
+    ReviewCommand,
+    ReviewDecisionKind,
     Role,
     RoleBasedAuthorization,
     RoleGrant,
@@ -53,6 +56,14 @@ from athena_context.api.evaluation_ports import (
     EvaluationTrustedKeyAuthority,
     SnapshotSigningRequest,
     seal_timestamp_epoch_milliseconds,
+)
+from athena_context.api.operational_context import (
+    IssueOperationalContextReceiptCommand,
+    OperationalContextReceipt,
+    OperationalEvidenceInventoryItem,
+    compute_operational_binding_digest,
+    compute_operational_content_digest,
+    compute_operational_evidence_inventory_digest,
 )
 from athena_context.contracts import (
     CanonicalWorkloadManifest,
@@ -106,8 +117,13 @@ PRIVATE_ENDPOINT = (
 
 PUBLISHER = Actor(actor_id="wc013-human-publisher", kind=ActorKind.HUMAN)
 APPROVER = Actor(actor_id="wc013-human-approver", kind=ActorKind.HUMAN)
+REVIEWER = Actor(actor_id="wc013-human-reviewer", kind=ActorKind.HUMAN)
 PUBLICATION_SERVICE = Actor(actor_id="athena-context-api", kind=ActorKind.SERVICE)
 MCP_SERVICE_ACTOR = Actor(actor_id="wc013-mcp-service", kind=ActorKind.SERVICE)
+OPERATIONAL_CONTEXT_SERVICE = Actor(
+    actor_id="wc013-operational-context",
+    kind=ActorKind.SERVICE,
+)
 PROPOSER = Actor(actor_id="wc013-proposal-agent", kind=ActorKind.AGENT)
 
 
@@ -489,7 +505,12 @@ class LifecycleContextResolver:
             [
                 RoleGrant(actor_id=PROPOSER.actor_id, role=Role.PROPOSER),
                 RoleGrant(actor_id=APPROVER.actor_id, role=Role.APPROVER),
+                RoleGrant(actor_id=REVIEWER.actor_id, role=Role.REVIEWER),
                 RoleGrant(actor_id=PUBLISHER.actor_id, role=Role.PUBLISHER),
+                RoleGrant(
+                    actor_id=OPERATIONAL_CONTEXT_SERVICE.actor_id,
+                    role=Role.OPERATIONAL_CONTEXT_ISSUER,
+                ),
                 # Deliberate grant proves actor-kind checks still reject MCP writes.
                 RoleGrant(actor_id=MCP_SERVICE_ACTOR.actor_id, role=Role.PUBLISHER),
             ]
@@ -510,6 +531,70 @@ class LifecycleContextResolver:
             reader_actor=PUBLISHER,
         )
         self.calls = 0
+
+    def _operational_receipt(
+        self,
+        draft: DraftRecord,
+        *,
+        key: str,
+    ) -> OperationalContextReceipt:
+        profile_id = draft.manifest.workload.environments[0]
+        authority = self.service.resolve_draft_profile_authority(
+            OPERATIONAL_CONTEXT_SERVICE,
+            draft.draft_id,
+            profile_id,
+        )
+        inventory = [
+            OperationalEvidenceInventoryItem(
+                evidenceRef=f"synthetic://wc013/{draft.draft_id}/{draft.revision}",
+                evidenceDigest="sha256:" + "a" * 64,
+            )
+        ]
+        inventory_digest = compute_operational_evidence_inventory_digest(
+            inventory
+        )
+        content_digest = compute_operational_content_digest(
+            evidence_source="Synthetic WC-013 operational context.",
+            confidence=0.9,
+            relationships=[],
+            findings=[],
+        )
+        collected_at = datetime(2000, 1, 1, tzinfo=UTC)
+        expires_at = datetime(2100, 1, 1, tzinfo=UTC)
+        snapshot_id = f"wc013-{draft.draft_id}-r{draft.revision}"
+        return self.service.issue_operational_context_receipt(
+            OPERATIONAL_CONTEXT_SERVICE,
+            key,
+            IssueOperationalContextReceiptCommand(
+                manifest_id=draft.manifest_id,
+                manifest_version=draft.manifest.manifest_version,
+                profile_id=profile_id,
+                draft_id=draft.draft_id,
+                draft_revision=draft.revision,
+                manifest_digest=draft.manifest_digest,
+                profile_digest=authority.resolved_profile_digest,
+                snapshot_id=snapshot_id,
+                collected_at=collected_at,
+                expires_at=expires_at,
+                evidence_inventory=inventory,
+                evidence_inventory_digest=inventory_digest,
+                content_digest=content_digest,
+                binding_digest=compute_operational_binding_digest(
+                    workload_id=draft.manifest_id,
+                    manifest_version=draft.manifest.manifest_version,
+                    profile_id=profile_id,
+                    draft_id=draft.draft_id,
+                    draft_revision=draft.revision,
+                    manifest_digest=draft.manifest_digest,
+                    profile_digest=authority.resolved_profile_digest,
+                    snapshot_id=snapshot_id,
+                    collected_at=collected_at,
+                    expires_at=expires_at,
+                    evidence_inventory_digest=inventory_digest,
+                    content_digest=content_digest,
+                ),
+            ),
+        )
 
     def _publish(
         self,
@@ -541,13 +626,40 @@ class LifecycleContextResolver:
             f"wc013-{version_key}-submit",
             _transition(draft, "Submit the synthetic manifest for human review"),
         )
+        draft = self.service.review_draft(
+            REVIEWER,
+            draft.draft_id,
+            f"wc013-{version_key}-review",
+            ReviewCommand(
+                **_transition(
+                    draft,
+                    "Review the exact publication candidate",
+                ).model_dump(),
+                decision=ReviewDecisionKind.APPROVED,
+                comments="Reviewed the exact synthetic publication candidate.",
+            ),
+        )
+        approval_receipt = self._operational_receipt(
+            draft,
+            key=f"wc013-{version_key}-operational-approval",
+        )
         draft = self.service.approve_draft(
             APPROVER,
             draft.draft_id,
             f"wc013-{version_key}-approve",
-            _transition(draft, "Human-approve the exact publication candidate"),
+            ApproveCommand(
+                **_transition(
+                    draft,
+                    "Human-approve the exact publication candidate",
+                ).model_dump(),
+                operational_context_receipt_id=approval_receipt.receipt_id,
+            ),
         )
         assert draft.approval is not None
+        publication_receipt = self._operational_receipt(
+            draft,
+            key=f"wc013-{version_key}-operational-publication",
+        )
         self.service.publish_draft(
             PUBLISHER,
             draft.draft_id,
@@ -558,6 +670,7 @@ class LifecycleContextResolver:
                     "Human-authorize Context API publication",
                 ).model_dump(),
                 approval_id=draft.approval.decision_id,
+                operational_context_receipt_id=publication_receipt.receipt_id,
             ),
         )
         self._manifest_id = manifest.manifest_id

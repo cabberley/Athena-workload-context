@@ -3,6 +3,14 @@ from athena_context.api.authorization import (
     RoleBasedAuthorization,
     StaticTestAuthenticator,
 )
+from athena_context.api.cohort_decision_domain import (
+    CohortDecisionAudit,
+    CohortDecisionKind,
+    CohortDecisionRecord,
+    CohortDecisionRequest,
+    CohortDecisionResponse,
+)
+from athena_context.api.cohort_decision_service import CohortDecisionService
 from athena_context.api.cohort_domain import (
     CohortDraftBinding,
     CohortEvidenceBinding,
@@ -21,12 +29,16 @@ from athena_context.api.domain import (
     Actor,
     ActorKind,
     AllWorkloadsGrantScope,
+    ApproveCommand,
     CreateDraftCommand,
     DraftRecord,
     DraftState,
     PublishCommand,
     PublishedManifest,
     ReplaceDraftCommand,
+    ReviewCommand,
+    ReviewDecision,
+    ReviewDecisionKind,
     Role,
     RoleGrant,
     SupersedeCommand,
@@ -93,6 +105,11 @@ from athena_context.api.evaluation_service import (
 )
 from athena_context.api.http import create_app
 from athena_context.api.memory import InMemoryContextStore
+from athena_context.api.operational_context import (
+    IssueOperationalContextReceiptCommand,
+    OperationalContextReceipt,
+    OperationalEvidenceInventoryItem,
+)
 from athena_context.api.service import ContextService
 
 __all__ = [
@@ -104,6 +121,7 @@ __all__ = [
     "AZURE_MCP_2_0_5_CATALOG_HASH",
     "AZURE_MCP_2_0_5_IMAGE_DIGEST",
     "ApprovalAuthorityToken",
+    "ApproveCommand",
     "AuthorizedSnapshotPublication",
     "AuthorizationGrantToken",
     "ContextApiPublishedContextResolver",
@@ -113,6 +131,12 @@ __all__ = [
     "AllWorkloadsGrantScope",
     "AzureTableContextStore",
     "CallableTrustedEvidenceSnapshotVerifier",
+    "CohortDecisionAudit",
+    "CohortDecisionKind",
+    "CohortDecisionRecord",
+    "CohortDecisionRequest",
+    "CohortDecisionResponse",
+    "CohortDecisionService",
     "CohortDraftBinding",
     "CohortEvidenceBinding",
     "CohortProposalBatchResponse",
@@ -152,9 +176,15 @@ __all__ = [
     "PrivateMcpInvokerPort",
     "InMemoryCohortPersistence",
     "InMemoryEvidenceSnapshotRepository",
+    "IssueOperationalContextReceiptCommand",
+    "OperationalContextReceipt",
+    "OperationalEvidenceInventoryItem",
     "PublishedManifest",
     "PublishCommand",
     "ReplaceDraftCommand",
+    "ReviewCommand",
+    "ReviewDecision",
+    "ReviewDecisionKind",
     "Role",
     "RoleBasedAuthorization",
     "RejectUnverifiedAuthentication",

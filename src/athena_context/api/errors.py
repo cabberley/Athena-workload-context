@@ -103,9 +103,21 @@ class StaleEvidenceSnapshotError(ContextApiError):
     code = "stale_evidence_snapshot"
 
 
+class OperationalContextReceiptError(ContextApiError):
+    code = "operational_context_receipt_invalid"
+
+
 class CohortBoundaryError(ContextApiError):
     code = "cohort_boundary_exceeded"
 
 
 class CohortContractError(ContextApiError):
     code = "cohort_contract_invalid"
+
+
+class CohortDecisionConflictError(ContextApiError):
+    code = "cohort_decision_conflict"
+
+
+class RejectedProposalSetError(ContextApiError):
+    code = "cohort_proposal_set_rejected"

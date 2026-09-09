@@ -1,10 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
-import { SupersessionRecoveryRequiredError } from './client'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import CohortReview from './CohortReview'
+import {
+  parseCanonicalManifest,
+  SupersessionRecoveryRequiredError,
+} from './client'
+import type { CohortDecisionApiPort, CohortProposalApiPort } from './cohortTypes'
 import type {
   AppRoute,
   CanonicalWorkloadManifest,
   ConcurrencyRequest,
   ContextApiClientPort,
+  ExactVersionComparison,
   SupersessionRecovery,
   WorkloadContext,
 } from './types'
@@ -19,6 +25,12 @@ const displayEnvironment = (value: string): string =>
 const errorMessage = (error: unknown, fallback: string): string =>
   error instanceof Error ? error.message : fallback
 
+const boundedLines = (value: string): string[] =>
+  value
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+
 const concurrencyRequest = (context: WorkloadContext, reason: string): ConcurrencyRequest => {
   if (!context.draft) throw new Error('The active draft is unavailable.')
   return {
@@ -31,55 +43,283 @@ const concurrencyRequest = (context: WorkloadContext, reason: string): Concurren
   }
 }
 
+const withoutOperationalContext = (
+  context: WorkloadContext,
+): WorkloadContext => ({
+  ...context,
+  evidenceSource: 'Operational context is unavailable for the exact lifecycle binding.',
+  confidence: null,
+  relationships: context.relationships.filter(
+    (relationship) =>
+      relationship.kind === 'declared' || relationship.kind === 'exception',
+  ),
+  findings: [],
+  provenance: context.provenance.filter(
+    (item) => !item.id.startsWith('operational-'),
+  ),
+  validationMessages: [
+    ...context.validationMessages.filter(
+      (message) => !message.startsWith('Operational context expired'),
+    ),
+    'Operational context expired; approval and publication remain blocked until refresh.',
+  ],
+  operationalContext: null,
+})
+
+const workloadAuthorityKey = (context: WorkloadContext): string => [
+  context.workloadId,
+  context.profileId,
+  context.draft?.draftId ?? '',
+  context.draft?.revision ?? 0,
+  context.draft?.manifestDigest ?? '',
+  context.published?.manifestVersion ?? '',
+  context.published?.manifestDigest ?? '',
+].join('|')
+
+interface FullManifestEditorProps {
+  manifest: CanonicalWorkloadManifest
+  disabled: boolean
+  onApply: (manifest: CanonicalWorkloadManifest) => void
+}
+
+function FullManifestEditor({
+  manifest,
+  disabled,
+  onApply,
+}: FullManifestEditorProps) {
+  const [value, setValue] = useState(() => JSON.stringify(manifest, null, 2))
+  const [message, setMessage] = useState(
+    'Edit the complete canonical manifest without changing its identity or candidate version.',
+  )
+
+  useEffect(() => {
+    setValue(JSON.stringify(manifest, null, 2))
+  }, [manifest])
+
+  const apply = (): void => {
+    try {
+      const parsed = parseCanonicalManifest(JSON.parse(value))
+      if (
+        parsed.manifestId !== manifest.manifestId ||
+        parsed.manifestVersion !== manifest.manifestVersion
+      ) {
+        throw new Error('Manifest identity and candidate version are immutable in this editor.')
+      }
+      onApply(parsed)
+      setMessage('Full manifest structure accepted locally; server validation remains required.')
+    } catch (error) {
+      setMessage(errorMessage(error, 'Manifest JSON is invalid.'))
+    }
+  }
+
+  return (
+    <details className="full-manifest-editor">
+      <summary>Full canonical manifest sections</summary>
+      <p>
+        This bounded editor preserves the complete roles, relationships, constraints, controls,
+        objectives, ownership, unknowns, and exception structures. Publication metadata remains
+        server-governed.
+      </p>
+      <label htmlFor="full-manifest-json">
+        Canonical manifest JSON
+        <textarea
+          id="full-manifest-json"
+          rows={20}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          disabled={disabled}
+          spellCheck={false}
+        />
+      </label>
+      <button type="button" className="secondary-action" onClick={apply} disabled={disabled}>
+        Apply structured JSON
+      </button>
+      <small role="status">{message}</small>
+    </details>
+  )
+}
+
 interface AppProps {
   client: ContextApiClientPort
+  cohortClient: CohortProposalApiPort
+  decisionClient?: CohortDecisionApiPort
   initialContexts: WorkloadContext[]
 }
 
-function App({ client, initialContexts }: AppProps) {
+function App({ client, cohortClient, decisionClient, initialContexts }: AppProps) {
   const initial = initialContexts[0]!
   const [route, setRoute] = useState<AppRoute>('overview')
   const [contexts, setContexts] = useState(() => new Map(initialContexts.map((context) => [context.workloadId, context])))
   const [selectedWorkloadId, setSelectedWorkloadId] = useState(initial.workloadId)
   const [workloadContext, setWorkloadContext] = useState(initial)
   const [draftForm, setDraftForm] = useState(() => cloneManifest(initial.manifest))
-  const [selectedProfileId, setSelectedProfileId] = useState(
-    initial.manifest.profiles.production ? 'production' : Object.keys(initial.manifest.profiles)[0]!,
+  const [selectedProfileId, setSelectedProfileId] = useState(initial.profileId)
+  const initialActiveVersion = initial.publishedVersions.find((version) => version.active)
+  const initialEarlierVersion = initial.publishedVersions.find((version) => !version.active)
+  const [comparisonFromVersion, setComparisonFromVersion] = useState(
+    initialEarlierVersion?.manifestVersion ?? initial.publishedVersions[0]?.manifestVersion ?? '',
   )
+  const [comparisonToVersion, setComparisonToVersion] = useState(
+    initialActiveVersion?.manifestVersion ?? initial.publishedVersions.at(-1)?.manifestVersion ?? '',
+  )
+  const [versionComparison, setVersionComparison] =
+    useState<ExactVersionComparison | null>(null)
   const [reviewedDigest, setReviewedDigest] = useState<string | null>(null)
-  const [supersessionRecovery, setSupersessionRecovery] = useState<SupersessionRecovery | null>(null)
+  const [reviewComments, setReviewComments] = useState(
+    'Reviewed the exact canonical publication candidate.',
+  )
+  const [rejectedFields, setRejectedFields] = useState('')
+  const [requiredCorrections, setRequiredCorrections] = useState('')
+  const [supersessionRecovery, setSupersessionRecovery] = useState<SupersessionRecovery | null>(
+    initial.pendingSupersessionRecovery,
+  )
+  const [authorityDrift, setAuthorityDrift] = useState(false)
   const [statusMessage, setStatusMessage] = useState('Authenticated workload context loaded from scoped WC-007 routes.')
   const [busy, setBusy] = useState(false)
   const routeHeadingRef = useRef<HTMLHeadingElement>(null)
+  const workloadAuthorityRef = useRef(workloadAuthorityKey(initial))
+  const workloadRequestGenerationRef = useRef(0)
+  workloadAuthorityRef.current = workloadAuthorityKey(workloadContext)
 
   useEffect(() => {
     routeHeadingRef.current?.focus()
   }, [route])
 
-  const applyContext = (next: WorkloadContext): void => {
+  const applyContext = useCallback((next: WorkloadContext): void => {
     setContexts((current) => new Map(current).set(next.workloadId, next))
     setSelectedWorkloadId(next.workloadId)
     setWorkloadContext(next)
     setDraftForm(cloneManifest(next.manifest))
-    setSelectedProfileId(next.manifest.profiles.production ? 'production' : Object.keys(next.manifest.profiles)[0]!)
-    if (reviewedDigest !== next.draft?.manifestDigest) setReviewedDigest(null)
-  }
+    setSelectedProfileId(next.profileId)
+    const activeVersion = next.publishedVersions.find((version) => version.active)
+    const earlierVersion = next.publishedVersions.find((version) => !version.active)
+    setComparisonFromVersion(
+      earlierVersion?.manifestVersion ?? next.publishedVersions[0]?.manifestVersion ?? '',
+    )
+    setComparisonToVersion(
+      activeVersion?.manifestVersion ?? next.publishedVersions.at(-1)?.manifestVersion ?? '',
+    )
+    setVersionComparison(null)
+    setSupersessionRecovery(next.pendingSupersessionRecovery)
+    setAuthorityDrift(false)
+    setReviewedDigest((current) =>
+      current === next.draft?.manifestDigest ? current : null
+    )
+  }, [])
 
-  const refreshCurrentWorkload = async (): Promise<WorkloadContext> => {
-    const next = await client.loadWorkloadContext(selectedWorkloadId)
+  const applyExternalContext = useCallback((next: WorkloadContext): void => {
+    workloadRequestGenerationRef.current += 1
     applyContext(next)
+  }, [applyContext])
+
+  const applyOperationalRefresh = useCallback(
+    (next: WorkloadContext): void => {
+      setContexts((current) => new Map(current).set(next.workloadId, next))
+      setWorkloadContext(next)
+      setReviewedDigest((current) =>
+        current === next.draft?.manifestDigest ? current : null
+      )
+    },
+    [],
+  )
+
+  const refreshCurrentWorkload = useCallback(async (): Promise<WorkloadContext> => {
+    const requestGeneration = ++workloadRequestGenerationRef.current
+    const requestAuthority = workloadAuthorityRef.current
+    const requestWorkloadId = selectedWorkloadId
+    const next = await client.loadWorkloadContext(selectedWorkloadId)
+    if (
+      workloadRequestGenerationRef.current === requestGeneration &&
+      workloadAuthorityRef.current === requestAuthority &&
+      next.workloadId === requestWorkloadId
+    ) {
+      applyContext(next)
+    }
     return next
-  }
+  }, [applyContext, client, selectedWorkloadId])
+
+  useEffect(() => {
+    const expiresAt = workloadContext.operationalContext?.expiresAt
+    if (!expiresAt) return
+    const delay = Date.parse(expiresAt) - Date.now()
+    const expireAndRefresh = (): void => {
+      const requestGeneration = ++workloadRequestGenerationRef.current
+      const requestAuthority = workloadAuthorityRef.current
+      const requestWorkloadId = selectedWorkloadId
+      const expired = withoutOperationalContext(workloadContext)
+      setContexts((current) =>
+        new Map(current).set(expired.workloadId, expired)
+      )
+      setWorkloadContext(expired)
+      setReviewedDigest((current) =>
+        current === expired.draft?.manifestDigest ? current : null
+      )
+      setStatusMessage(
+        'Operational context expired; approval and publication are blocked pending refresh.',
+      )
+      void client.loadWorkloadContext(selectedWorkloadId)
+        .then((next) => {
+          if (
+            workloadRequestGenerationRef.current === requestGeneration &&
+            workloadAuthorityRef.current === requestAuthority &&
+            next.workloadId === requestWorkloadId
+          ) {
+            if (workloadAuthorityKey(next) === requestAuthority) {
+              applyOperationalRefresh(next)
+            } else {
+              setAuthorityDrift(true)
+              setStatusMessage(
+                'The authoritative lifecycle changed during operational refresh. Unsaved edits are preserved but all mutations are blocked until explicit reload.',
+              )
+            }
+          }
+        })
+        .catch(() => {
+          if (workloadRequestGenerationRef.current === requestGeneration) {
+            setStatusMessage(
+              'Operational context expired and could not be refreshed for the exact lifecycle binding.',
+            )
+          }
+        })
+    }
+    if (delay <= 0) {
+      expireAndRefresh()
+      return
+    }
+    const timer = window.setTimeout(expireAndRefresh, Math.min(delay, 2_147_483_647))
+    return () => window.clearTimeout(timer)
+  }, [
+    applyOperationalRefresh,
+    client,
+    selectedWorkloadId,
+    workloadContext,
+    workloadContext.operationalContext?.expiresAt,
+  ])
 
   const handleSelectWorkload = async (workloadId: string): Promise<void> => {
+    if (authorityDrift) {
+      setStatusMessage(
+        'Reload the authoritative lifecycle before changing workload context.',
+      )
+      return
+    }
+    const requestGeneration = ++workloadRequestGenerationRef.current
     setBusy(true)
     try {
       const cached = contexts.get(workloadId)
-      if (cached) {
+      if (
+        cached &&
+        (
+          cached.operationalContext === null ||
+          Date.parse(cached.operationalContext.expiresAt) > Date.now()
+        )
+      ) {
+        if (workloadRequestGenerationRef.current !== requestGeneration) return
         applyContext(cached)
         setStatusMessage(`Selected authorized workload ${cached.manifest.workload.displayName}.`)
       } else {
         const next = await client.loadWorkloadContext(workloadId)
+        if (workloadRequestGenerationRef.current !== requestGeneration) return
         applyContext(next)
         setStatusMessage(`Loaded authorized workload ${next.manifest.workload.displayName}.`)
       }
@@ -130,6 +370,56 @@ function App({ client, initialContexts }: AppProps) {
     }
   }
 
+  const comparePublishedVersions = async (): Promise<void> => {
+    if (!comparisonFromVersion || !comparisonToVersion) {
+      setStatusMessage('Select two exact published versions to compare.')
+      return
+    }
+    setBusy(true)
+    try {
+      const comparison = await client.comparePublishedVersions(
+        selectedWorkloadId,
+        comparisonFromVersion,
+        comparisonToVersion,
+      )
+      setVersionComparison(comparison)
+      setStatusMessage(
+        comparison.equivalent
+          ? `Versions ${comparison.fromVersion} and ${comparison.toVersion} are equivalent.`
+          : `Compared exact versions ${comparison.fromVersion} and ${comparison.toVersion}.`,
+      )
+    } catch (error) {
+      setVersionComparison(null)
+      setStatusMessage(errorMessage(error, 'Unable to compare exact published versions.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const createRollbackDraft = async (): Promise<void> => {
+    if (!comparisonFromVersion) {
+      setStatusMessage('Select an older exact version as the rollback source.')
+      return
+    }
+    setBusy(true)
+    try {
+      const created = await client.createRollbackDraft(
+        selectedWorkloadId,
+        comparisonFromVersion,
+        `Create rollback-by-new-version draft from ${comparisonFromVersion}.`,
+      )
+      await refreshCurrentWorkload()
+      setRoute('manifest')
+      setStatusMessage(
+        `Rollback draft ${created.draftId} created as new version ${created.manifest.manifestVersion}; no published version was mutated.`,
+      )
+    } catch (error) {
+      setStatusMessage(errorMessage(error, 'Unable to create rollback-by-new-version draft.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const validateDraft = async (): Promise<void> => {
     setBusy(true)
     try {
@@ -161,16 +451,77 @@ function App({ client, initialContexts }: AppProps) {
     }
   }
 
-  const approveDraft = async (): Promise<void> => {
+  const recordReview = async (
+    decision: 'approved' | 'changes_requested',
+  ): Promise<void> => {
     const draft = workloadContext.draft
-    if (!draft || reviewedDigest !== draft.manifestDigest || client.auth.kind !== 'human') {
-      setStatusMessage('A human must explicitly review this exact candidate digest before approval.')
+    if (
+      !draft ||
+      reviewedDigest !== draft.manifestDigest ||
+      client.auth.kind !== 'human'
+    ) {
+      setStatusMessage(
+        'A human must explicitly review this exact candidate digest.',
+      )
       return
     }
     setBusy(true)
     try {
+      const reviewed = await client.reviewDraft({
+        ...concurrencyRequest(
+          workloadContext,
+          decision === 'approved'
+            ? 'Record authoritative review approval.'
+            : 'Record authoritative requested corrections.',
+        ),
+        decision,
+        comments: reviewComments,
+        rejectedFields:
+          decision === 'approved' ? [] : boundedLines(rejectedFields),
+        requiredCorrections:
+          decision === 'approved'
+            ? []
+            : boundedLines(requiredCorrections),
+      })
+      if (decision === 'changes_requested') {
+        setReviewedDigest(null)
+      }
+      await refreshCurrentWorkload()
+      setStatusMessage(
+        decision === 'approved'
+          ? `Review ${reviewed.reviewDecisions.at(-1)?.decisionId ?? 'decision'} authorizes approval review.`
+          : 'Required corrections were recorded and the draft returned to editing.',
+      )
+    } catch (error) {
+      setStatusMessage(
+        errorMessage(error, 'Authoritative review failed closed.'),
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const approveDraft = async (): Promise<void> => {
+    const draft = workloadContext.draft
+    const operationalReceiptId =
+      workloadContext.operationalContext?.receiptId
+    if (
+      !draft ||
+      !operationalReceiptId ||
+      reviewedDigest !== draft.manifestDigest ||
+      client.auth.kind !== 'human'
+    ) {
+      setStatusMessage('A human must explicitly review this exact candidate digest before approval.')
+      return
+    }
+
+    setBusy(true)
+    try {
       const approved = await client.approveDraft(
-        concurrencyRequest(workloadContext, 'Human reviewed and approved the exact candidate digest.'),
+        {
+          ...concurrencyRequest(workloadContext, 'Human reviewed and approved the exact candidate digest.'),
+          operationalContextReceiptId: operationalReceiptId,
+        },
       )
       await refreshCurrentWorkload()
       setReviewedDigest(approved.manifestDigest)
@@ -184,7 +535,14 @@ function App({ client, initialContexts }: AppProps) {
 
   const publishDraft = async (): Promise<void> => {
     const draft = workloadContext.draft
-    if (!draft?.approval || reviewedDigest !== draft.manifestDigest || client.auth.kind !== 'human') {
+    const operationalReceiptId =
+      workloadContext.operationalContext?.receiptId
+    if (
+      !draft?.approval ||
+      !operationalReceiptId ||
+      reviewedDigest !== draft.manifestDigest ||
+      client.auth.kind !== 'human'
+    ) {
       setStatusMessage('Publication requires an explicit human review of the exact server-approved candidate.')
       return
     }
@@ -193,6 +551,7 @@ function App({ client, initialContexts }: AppProps) {
       const published = await client.publishDraft({
         ...concurrencyRequest(workloadContext, 'Publish the explicitly reviewed, server-approved candidate.'),
         approvalId: draft.approval.decisionId,
+        operationalContextReceiptId: operationalReceiptId,
       })
       setReviewedDigest(null)
       setSupersessionRecovery(null)
@@ -235,23 +594,88 @@ function App({ client, initialContexts }: AppProps) {
     }
   }
 
+  const reloadAfterAuthorityDrift = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      await refreshCurrentWorkload()
+      setStatusMessage(
+        'Reloaded the current authoritative lifecycle after concurrent change.',
+      )
+    } catch (error) {
+      setStatusMessage(
+        errorMessage(
+          error,
+          'The authoritative lifecycle could not be reloaded.',
+        ),
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const currentDraft = workloadContext.draft
+  const currentReview = currentDraft?.reviewDecisions.at(-1)
   const selectedProfile = draftForm.profiles[selectedProfileId]
   const reviewConfirmed = Boolean(currentDraft && reviewedDigest === currentDraft.manifestDigest)
   const isHuman = client.auth.kind === 'human'
-  const lifecycleBlocked = supersessionRecovery !== null
+  const lifecycleBlocked =
+    supersessionRecovery !== null || authorityDrift
   const canEdit = !lifecycleBlocked && currentDraft?.state === 'draft'
   const canCreateSuccessor = !lifecycleBlocked && !currentDraft && Boolean(workloadContext.published)
   const canValidate = !lifecycleBlocked && currentDraft?.state === 'draft'
   const canSubmit = !lifecycleBlocked && currentDraft?.state === 'validated'
-  const canApprove = !lifecycleBlocked && currentDraft?.state === 'in_review' && reviewConfirmed && isHuman
+  const canReview =
+    !lifecycleBlocked &&
+    currentDraft?.state === 'in_review' &&
+    reviewConfirmed &&
+    isHuman
+  const canRequestCorrections =
+    canReview && boundedLines(requiredCorrections).length > 0
+  const operationalContextReady =
+    workloadContext.operationalContext !== null &&
+    Date.parse(workloadContext.operationalContext.expiresAt) > Date.now()
+  const canApprove =
+    !lifecycleBlocked &&
+    currentDraft?.state === 'in_review' &&
+    currentReview?.decision === 'approved' &&
+    currentReview.reviewedRevision === currentDraft.revision &&
+    currentReview.manifestDigest === currentDraft.manifestDigest &&
+    reviewConfirmed &&
+    isHuman &&
+    operationalContextReady
   const canPublish =
     !lifecycleBlocked &&
     currentDraft?.state === 'approved' &&
     Boolean(currentDraft.approval) &&
     reviewConfirmed &&
-    isHuman
+    isHuman &&
+    operationalContextReady
   const catalogue = [...contexts.values()].map((context) => context.catalogueItem)
+  const activePublishedVersion = workloadContext.publishedVersions.find(
+    (version) => version.active,
+  )
+  const canRollback =
+    !lifecycleBlocked &&
+    !currentDraft &&
+    comparisonFromVersion.length > 0 &&
+    activePublishedVersion !== undefined &&
+    comparisonFromVersion !== activePublishedVersion.manifestVersion
+  const reviewGaps = [
+    ...workloadContext.validationMessages,
+    ...(workloadContext.catalogueItem.owner ? [] : ['Workload owner is not declared.']),
+    ...(workloadContext.catalogueItem.criticality ? [] : ['Workload criticality is not declared.']),
+    ...(workloadContext.confidence === null
+      ? ['No runtime confidence value is available from the lifecycle route.']
+      : []),
+    ...workloadContext.controls
+      .filter((control) => control.runbookRef === null)
+      .map((control) => `Control ${control.id} has no declared runbook.`),
+  ]
+  const provenanceSource = currentDraft
+    ? `Draft ${currentDraft.draftId} revision ${currentDraft.revision}`
+    : workloadContext.published
+      ? `Published version ${workloadContext.published.manifestVersion}`
+      : 'No authoritative lifecycle record'
 
   const setDisplayName = (displayName: string): void => {
     setDraftForm((current) => ({
@@ -306,7 +730,7 @@ function App({ client, initialContexts }: AppProps) {
       </header>
 
       <nav className="primary-nav" aria-label="Primary navigation">
-        {(['overview', 'catalogue', 'manifest', 'controls'] as AppRoute[]).map((item) => (
+        {(['overview', 'cohorts', 'catalogue', 'manifest', 'versions', 'controls'] as AppRoute[]).map((item) => (
           <button
             key={item}
             type="button"
@@ -333,7 +757,7 @@ function App({ client, initialContexts }: AppProps) {
                   className={workload.id === selectedWorkloadId ? 'catalogue-button is-selected' : 'catalogue-button'}
                   onClick={() => void handleSelectWorkload(workload.id)}
                   aria-pressed={workload.id === selectedWorkloadId}
-                  disabled={busy}
+                  disabled={busy || authorityDrift}
                 >
                   <span className="catalogue-name">{workload.name}</span>
                   <span className="catalogue-owner">Owner: {workload.owner ?? 'Not declared'}</span>
@@ -427,7 +851,7 @@ function App({ client, initialContexts }: AppProps) {
                             {relationship.ownerRef}
                           </small>
                         </>
-                      ) : (
+                      ) : relationship.kind === 'declared' ? (
                         <>
                           <p>{relationship.source} {relationship.relationshipType} {relationship.target}</p>
                           <small>
@@ -435,10 +859,62 @@ function App({ client, initialContexts }: AppProps) {
                             {relationship.clause}
                           </small>
                         </>
+                      ) : relationship.kind === 'observed' ? (
+                        <>
+                          <p>{relationship.source} observed communicating with {relationship.target}</p>
+                          <small>
+                            Profile: {relationship.profileId ?? 'runtime'} • Observed:{' '}
+                            {relationship.observedAt} • Confidence:{' '}
+                            {Math.round(relationship.confidence * 100)}% • Evidence:{' '}
+                            {relationship.evidenceRefs.join(', ')}
+                          </small>
+                        </>
+                      ) : (
+                        <>
+                          <p>{relationship.source} may depend on {relationship.target}</p>
+                          <p>{relationship.hypothesis}</p>
+                          <small>
+                            Profile: {relationship.profileId ?? 'runtime'} • Confidence:{' '}
+                            {Math.round(relationship.confidence * 100)}% • Evidence:{' '}
+                            {relationship.evidenceRefs.join(', ')}
+                          </small>
+                        </>
                       )}
                     </li>
                   ))}
                 </ul>
+              </section>
+
+              <section className="panel evidence-panel" aria-labelledby="finding-heading">
+                <div className="panel-heading">
+                  <h2 id="finding-heading">Contextual findings and evidence</h2>
+                </div>
+                {workloadContext.findings.length === 0 ? (
+                  <p role="alert">
+                    No evaluated findings were supplied for this exact manifest version. The
+                    absence is treated as an evidence gap, not a passing health state.
+                  </p>
+                ) : (
+                  <ul className="stack-list">
+                    {workloadContext.findings.map((finding) => (
+                      <li key={finding.id} className="stack-item">
+                        <span className="stack-name">{finding.verdict}: {finding.summary}</span>
+                        <span className="stack-meta">
+                          Manifest {finding.manifestVersion} • Profile {finding.profileId} • Clause{' '}
+                          {finding.clause} • Confidence{' '}
+                          {finding.confidence === null
+                            ? 'not provided'
+                            : `${Math.round(finding.confidence * 100)}%`}
+                        </span>
+                        <p>Evidence: {finding.evidenceRefs.join(', ') || 'Missing'}</p>
+                        <p>
+                          Residual risk: {finding.residualRisk ?? 'Not declared'} • Control:{' '}
+                          {finding.controlState ?? 'Unknown'}
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </section>
             </>
           )}
@@ -455,6 +931,35 @@ function App({ client, initialContexts }: AppProps) {
                 <div><dt>Zone count</dt><dd>{workloadContext.catalogueItem.zoneCount ?? 'Not provided by WC-007'}</dd></div>
               </dl>
             </section>
+          )}
+
+          {route === 'cohorts' && authorityDrift && (
+            <section className="panel recovery-state" role="alert">
+              <h2>Concurrent lifecycle change detected</h2>
+              <p>
+                Cohort decisions and all lifecycle mutations are blocked until
+                the authoritative lifecycle is reloaded.
+              </p>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => void reloadAfterAuthorityDrift()}
+                disabled={busy}
+              >
+                Reload authoritative lifecycle
+              </button>
+            </section>
+          )}
+
+          {route === 'cohorts' && !authorityDrift && (
+            <CohortReview
+              context={workloadContext}
+              contextClient={client}
+              cohortClient={cohortClient}
+              decisionClient={decisionClient}
+              onContextChange={applyExternalContext}
+              headingRef={routeHeadingRef}
+            />
           )}
 
           {route === 'manifest' && (
@@ -509,7 +1014,123 @@ function App({ client, initialContexts }: AppProps) {
                   ))}
                   {!selectedProfile?.riskAcceptances.length && <p>No residual-risk acceptance is declared for this profile.</p>}
                 </fieldset>
+                <FullManifestEditor
+                  manifest={draftForm}
+                  disabled={!canEdit || busy}
+                  onApply={(manifest) => {
+                    setDraftForm(cloneManifest(manifest))
+                    setReviewedDigest(null)
+                  }}
+                />
               </form>
+            </section>
+          )}
+
+          {route === 'versions' && (
+            <section className="panel comparison-panel" aria-labelledby="versions-heading">
+              <div className="panel-heading">
+                <h2 id="versions-heading" tabIndex={-1} ref={routeHeadingRef}>
+                  Exact version comparison and rollback
+                </h2>
+              </div>
+              <p className="source-note">
+                Published versions are immutable. Rollback always creates a new draft whose
+                predecessor is the current active version.
+              </p>
+              <div className="editor-grid">
+                <label htmlFor="comparison-from-version">
+                  Source version
+                  <select
+                    id="comparison-from-version"
+                    value={comparisonFromVersion}
+                    onChange={(event) => {
+                      setComparisonFromVersion(event.target.value)
+                      setVersionComparison(null)
+                    }}
+                  >
+                    {workloadContext.publishedVersions.map((version) => (
+                      <option key={version.manifestVersion} value={version.manifestVersion}>
+                        {version.manifestVersion}{version.active ? ' (active)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label htmlFor="comparison-to-version">
+                  Target version
+                  <select
+                    id="comparison-to-version"
+                    value={comparisonToVersion}
+                    onChange={(event) => {
+                      setComparisonToVersion(event.target.value)
+                      setVersionComparison(null)
+                    }}
+                  >
+                    {workloadContext.publishedVersions.map((version) => (
+                      <option key={version.manifestVersion} value={version.manifestVersion}>
+                        {version.manifestVersion}{version.active ? ' (active)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="action-stack">
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => void comparePublishedVersions()}
+                  disabled={
+                    busy ||
+                    !comparisonFromVersion ||
+                    !comparisonToVersion ||
+                    comparisonFromVersion === comparisonToVersion
+                  }
+                >
+                  Compare exact versions
+                </button>
+                <button
+                  type="button"
+                  className="primary-action"
+                  onClick={() => void createRollbackDraft()}
+                  disabled={busy || !canRollback}
+                >
+                  Create rollback draft from source
+                </button>
+              </div>
+              <ul className="stack-list" aria-label="Published version history">
+                {workloadContext.publishedVersions.map((version) => (
+                  <li key={version.manifestVersion} className="stack-item">
+                    <span className="stack-name">
+                      {version.manifestVersion} {version.active ? 'active' : 'superseded'}
+                    </span>
+                    <span className="stack-meta">
+                      {version.manifestDigest} • Published by {version.publishedBy} at{' '}
+                      {version.publishedAt}
+                    </span>
+                    <p>
+                      {version.supersededBy
+                        ? `Superseded by ${version.supersededBy}.`
+                        : 'No supersession record.'}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              {versionComparison && (
+                <div className="approval-record" aria-live="polite">
+                  <h3>
+                    {versionComparison.fromVersion} → {versionComparison.toVersion}
+                  </h3>
+                  <p>
+                    {versionComparison.equivalent
+                      ? 'No canonical changes.'
+                      : `${versionComparison.changedPaths.length} canonical path changes.`}
+                  </p>
+                  <ul>
+                    {versionComparison.changedPaths.map((path) => (
+                      <li key={path}>{path}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </section>
           )}
 
@@ -555,11 +1176,71 @@ function App({ client, initialContexts }: AppProps) {
                     ))}
                   </ul>
                 </div>
+                <div>
+                  <h3>Explicit unknowns and review gaps</h3>
+                  {reviewGaps.length === 0 ? (
+                    <p>No unresolved declaration gaps were detected in this view.</p>
+                  ) : (
+                    <ul className="stack-list">
+                      {reviewGaps.map((gap) => (
+                        <li key={gap} className="stack-item">{gap}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div>
+                  <h3>Field provenance</h3>
+                  <dl className="summary-list">
+                    <div>
+                      <dt>/workload</dt>
+                      <dd>{provenanceSource}</dd>
+                    </div>
+                    <div>
+                      <dt>/profiles/{selectedProfileId}</dt>
+                      <dd>
+                        {provenanceSource}; owner{' '}
+                        {selectedProfile?.ownership[0]?.ownerRef ??
+                          workloadContext.catalogueItem.owner ??
+                          'not declared'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>/relationships</dt>
+                      <dd>
+                        Declared and exception relationships come from {provenanceSource};
+                        observed and inferred relationships require separately cited evidence.
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
               </div>
             </section>
           )}
         </div>
 
+        {route === 'cohorts' && (
+          <aside className="panel review-panel" aria-label="Cohort review guardrails">
+            <div className="panel-kicker">Draft-only boundary</div>
+            <h2>Cohort review guardrails</h2>
+            <p>
+              Cohort proposals are inferred from observed evidence. They never become declared
+              authority until a human explicitly writes bounded selectors to a WC-007 draft.
+            </p>
+            <dl className="summary-list">
+              <div><dt>Actor</dt><dd>{client.auth.userLabel}</dd></div>
+              <div><dt>Role</dt><dd>{client.auth.role}</dd></div>
+              <div><dt>Environment</dt><dd>{displayEnvironment(workloadContext.environment)}</dd></div>
+              <div><dt>Manifest</dt><dd>{workloadContext.manifestVersion}</dd></div>
+              <div><dt>Approval</dt><dd>{currentDraft?.state ?? workloadContext.approvalState}</dd></div>
+            </dl>
+            <p className="source-note">
+              This flow can update a draft with exact revision, digest, and idempotency. It cannot
+              validate, approve, or publish a manifest.
+            </p>
+          </aside>
+        )}
+
+        {route !== 'cohorts' && (
         <aside className="panel review-panel" aria-label="Draft review and publication">
           <div className="panel-kicker">Lifecycle state</div>
           <h2>Explicit human review</h2>
@@ -584,6 +1265,24 @@ function App({ client, initialContexts }: AppProps) {
             </div>
           )}
 
+          {authorityDrift && (
+            <div className="recovery-state" role="alert">
+              <h3>Concurrent lifecycle change detected</h3>
+              <p>
+                Unsaved edits remain in the editor, but cannot be saved against
+                a newer authoritative revision. Reload before continuing.
+              </p>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => void reloadAfterAuthorityDrift()}
+                disabled={busy}
+              >
+                Reload authoritative lifecycle
+              </button>
+            </div>
+          )}
+
           <label className="review-confirmation">
             <input
               type="checkbox"
@@ -600,17 +1299,54 @@ function App({ client, initialContexts }: AppProps) {
             I reviewed this exact candidate digest for publication.
           </label>
 
+          <label htmlFor="review-comments">
+            Review comments
+            <textarea
+              id="review-comments"
+              value={reviewComments}
+              onChange={(event) => setReviewComments(event.target.value)}
+              disabled={busy || !currentDraft || currentDraft.state !== 'in_review'}
+            />
+          </label>
+          <label htmlFor="rejected-fields">
+            Rejected JSON pointer fields, one per line
+            <textarea
+              id="rejected-fields"
+              value={rejectedFields}
+              onChange={(event) => setRejectedFields(event.target.value)}
+              disabled={busy || !currentDraft || currentDraft.state !== 'in_review'}
+            />
+          </label>
+          <label htmlFor="required-corrections">
+            Required corrections, one per line
+            <textarea
+              id="required-corrections"
+              value={requiredCorrections}
+              onChange={(event) => setRequiredCorrections(event.target.value)}
+              disabled={busy || !currentDraft || currentDraft.state !== 'in_review'}
+            />
+          </label>
+
           <div className="action-stack">
             <button type="button" className="primary-action" onClick={() => void saveDraft()} disabled={busy || !canEdit}>Save structured edits</button>
             <button type="button" className="secondary-action" onClick={() => void createSuccessorDraft()} disabled={busy || !canCreateSuccessor}>Create successor draft</button>
             <button type="button" className="secondary-action" onClick={() => void validateDraft()} disabled={busy || !canValidate}>Validate draft</button>
             <button type="button" className="secondary-action" onClick={() => void submitForReview()} disabled={busy || !canSubmit}>Submit for review</button>
+            <button type="button" className="secondary-action" onClick={() => void recordReview('approved')} disabled={busy || !canReview}>Record review approval</button>
+            <button type="button" className="secondary-action" onClick={() => void recordReview('changes_requested')} disabled={busy || !canRequestCorrections}>Request corrections</button>
             <button type="button" className="secondary-action" onClick={() => void approveDraft()} disabled={busy || !canApprove}>Approve reviewed candidate</button>
             <button type="button" className="primary-action" onClick={() => void publishDraft()} disabled={busy || !canPublish}>Publish reviewed candidate</button>
           </div>
 
           <div className="status-message" aria-live="polite">{statusMessage}</div>
           <div className="approval-record">
+            <h3>Review record</h3>
+            <p>{currentReview?.decisionId ?? 'Awaiting authoritative reviewer decision.'}</p>
+            <small>
+              {currentReview
+                ? `${currentReview.decision} • ${currentReview.comments}`
+                : 'Browser confirmation alone is not review authority.'}
+            </small>
             <h3>Approval record</h3>
             <p>{currentDraft?.approval?.decisionId ?? 'Awaiting WC-007 approval decision.'}</p>
             <small>
@@ -620,6 +1356,7 @@ function App({ client, initialContexts }: AppProps) {
             </small>
           </div>
         </aside>
+        )}
       </main>
     </div>
   )

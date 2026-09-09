@@ -8,6 +8,8 @@ from athena_context.api.domain import (
     AllWorkloadsGrantScope,
     Permission,
     PublishCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
     Role,
     RoleGrant,
     WorkloadGrantScope,
@@ -21,6 +23,7 @@ from context_api_support import (
     build_service,
     canonical_manifest,
     create_draft,
+    issue_operational_context_receipt,
     transition,
 )
 
@@ -50,6 +53,42 @@ def test_agent_cannot_approve_even_with_accidental_approver_grant() -> None:
         )
 
 
+def test_agent_cannot_record_review_even_with_reviewer_grant() -> None:
+    service = build_service()
+    draft = create_draft(
+        service,
+        canonical_manifest(),
+        draft_id="agent-review",
+    )
+    draft = service.validate_draft(
+        AGENT,
+        draft.draft_id,
+        "agent-review-validate",
+        transition(draft, "Validate before review"),
+    )
+    draft = service.submit_for_review(
+        AGENT,
+        draft.draft_id,
+        "agent-review-submit",
+        transition(draft, "Submit for review"),
+    )
+
+    with pytest.raises(AuthorizationError, match="requires a human actor"):
+        service.review_draft(
+            AGENT,
+            draft.draft_id,
+            "agent-review-denied",
+            ReviewCommand(
+                **transition(
+                    draft,
+                    "Agent attempts review",
+                ).model_dump(),
+                decision=ReviewDecisionKind.APPROVED,
+                comments="Agent review must remain non-authoritative.",
+            ),
+        )
+
+
 def test_agent_cannot_publish_even_with_accidental_publisher_grant() -> None:
     service = build_service()
     approved = approve_draft(
@@ -58,6 +97,11 @@ def test_agent_cannot_publish_even_with_accidental_publisher_grant() -> None:
         key_prefix="agent-publish",
     )
     assert approved.approval is not None
+    receipt = issue_operational_context_receipt(
+        service,
+        approved,
+        key_prefix="agent-publish-denied",
+    )
 
     with pytest.raises(AuthorizationError, match="requires a human actor"):
         service.publish_draft(
@@ -67,6 +111,7 @@ def test_agent_cannot_publish_even_with_accidental_publisher_grant() -> None:
             PublishCommand(
                 **transition(approved, "Agent attempts publication").model_dump(),
                 approval_id=approved.approval.decision_id,
+                operational_context_receipt_id=receipt.receipt_id,
             ),
         )
 
@@ -79,6 +124,11 @@ def test_human_approval_does_not_implicitly_authorize_publication() -> None:
         key_prefix="separate-publisher",
     )
     assert approved.approval is not None
+    receipt = issue_operational_context_receipt(
+        service,
+        approved,
+        key_prefix="approver-publish-denied",
+    )
 
     with pytest.raises(AuthorizationError):
         service.publish_draft(
@@ -88,6 +138,7 @@ def test_human_approval_does_not_implicitly_authorize_publication() -> None:
             PublishCommand(
                 **transition(approved, "Approver lacks publisher role").model_dump(),
                 approval_id=approved.approval.decision_id,
+                operational_context_receipt_id=receipt.receipt_id,
             ),
         )
 

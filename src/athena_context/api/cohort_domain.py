@@ -28,10 +28,28 @@ type ProfileType = Literal[
     "sandbox",
 ]
 type CohortPreviewAction = Literal["split", "merge"]
+type CohortReviewAction = Literal["approve", "split", "merge"]
 
 
 def normalized_identifier(value: str) -> str:
     return normalize_nfc_text(value).casefold()
+
+
+def canonical_proposal_ids(values: list[str]) -> list[str]:
+    """Validate and canonicalize an unordered WC-010 proposal selection."""
+
+    for value in values:
+        if len(value) != 25 or not value.startswith("proposal-"):
+            raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
+        suffix = value.removeprefix("proposal-")
+        if len(suffix) != 16 or any(
+            character not in "0123456789abcdef" for character in suffix
+        ):
+            raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
+    canonical = sorted(normalized_identifier(value) for value in values)
+    if len(canonical) != len(set(canonical)):
+        raise ValueError("proposal_ids must be unique after normalization")
+    return canonical
 
 
 class CohortDraftBinding(ApiModel):
@@ -91,18 +109,7 @@ class CohortReviewPreviewRequest(ApiModel):
     @field_validator("proposal_ids")
     @classmethod
     def validate_proposal_ids(cls, values: list[str]) -> list[str]:
-        for value in values:
-            if len(value) != 25 or not value.startswith("proposal-"):
-                raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
-            suffix = value.removeprefix("proposal-")
-            if len(suffix) != 16 or any(
-                character not in "0123456789abcdef" for character in suffix
-            ):
-                raise ValueError("proposal_ids must contain WC-010 proposal identifiers")
-        normalized = [normalized_identifier(value) for value in values]
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("proposal_ids must be unique after normalization")
-        return values
+        return canonical_proposal_ids(values)
 
     @field_validator("source_role_refs")
     @classmethod
@@ -170,7 +177,7 @@ class CohortRoleUpdate(ApiModel):
 
 class CohortReviewCandidate(ApiModel):
     candidate_id: str = Field(alias="candidateId", pattern=_ID_PATTERN)
-    action: CohortPreviewAction
+    action: CohortReviewAction
     source_draft: CohortDraftBinding = Field(alias="sourceDraft")
     scope: ProposalScope
     source_proposal_ids: list[str] = Field(
@@ -190,12 +197,17 @@ class CohortReviewCandidate(ApiModel):
         min_length=1,
         max_length=200,
     )
-    resolution: str = Field(min_length=12, max_length=2000)
-    generated_at: AwareDatetime = Field(alias="generatedAt")
-    expires_at: AwareDatetime = Field(alias="expiresAt")
+    resolution: str = Field(min_length=1, max_length=2000)
+    generated_at: AwareDatetime = Field(alias="generatedAt", strict=False)
+    expires_at: AwareDatetime = Field(alias="expiresAt", strict=False)
     requires_human_review: Literal[True] = Field(True, alias="requiresHumanReview")
     publication_allowed: Literal[False] = Field(False, alias="publicationAllowed")
     manifest_mutated: Literal[False] = Field(False, alias="manifestMutated")
+
+    @field_validator("source_proposal_ids")
+    @classmethod
+    def validate_source_proposal_ids(cls, values: list[str]) -> list[str]:
+        return canonical_proposal_ids(values)
 
 
 class CohortPreviewReceipt(ApiModel):
@@ -214,9 +226,11 @@ __all__ = [
     "CohortProposalBatchResponse",
     "CohortProposalQuery",
     "CohortReviewCandidate",
+    "CohortReviewAction",
     "CohortReviewPreviewRequest",
     "CohortRoleUpdate",
     "ProfileType",
     "StoredEvidenceSnapshot",
+    "canonical_proposal_ids",
     "normalized_identifier",
 ]

@@ -5,7 +5,14 @@ from datetime import UTC, datetime
 import pytest
 
 from athena_context.api.authorization import RoleBasedAuthorization
-from athena_context.api.domain import PublishCommand, Role, RoleGrant
+from athena_context.api.domain import (
+    ApproveCommand,
+    PublishCommand,
+    ReviewCommand,
+    ReviewDecisionKind,
+    Role,
+    RoleGrant,
+)
 from athena_context.api.memory import InMemoryContextStore
 from athena_context.api.service import ContextService
 from context_api_support import (
@@ -13,9 +20,11 @@ from context_api_support import (
     APPROVER,
     PUBLICATION_SERVICE,
     PUBLISHER,
+    REVIEWER,
     build_service,
     canonical_manifest,
     create_draft,
+    issue_operational_context_receipt,
     transition,
 )
 
@@ -68,7 +77,7 @@ def test_submission_finalizes_exact_publication_candidate_before_approval() -> N
     assert submitted.manifest.audit != untrusted_audit
     assert submitted.manifest.audit.published_by == PUBLICATION_SERVICE.actor_id
     assert submitted.manifest.audit.published_at == datetime(
-        2026, 8, 17, 0, 0, 2, tzinfo=UTC
+        2025, 6, 1, 0, 0, 2, tzinfo=UTC
     )
     assert submitted.manifest.audit.approval_status == "approved"
     assert submitted.manifest.compute_artifact_digest_value() == submitted.manifest_digest
@@ -93,15 +102,44 @@ def test_approval_and_publication_preserve_candidate_and_record_human_authority(
         "bound-submit",
         transition(validated, "Finalize candidate"),
     )
+    reviewed = service.review_draft(
+        REVIEWER,
+        submitted.draft_id,
+        "bound-review",
+        ReviewCommand(
+            **transition(
+                submitted,
+                "Record exact reviewer decision",
+            ).model_dump(),
+            decision=ReviewDecisionKind.APPROVED,
+            comments="Reviewed the exact finalized artifact.",
+        ),
+    )
+    approval_receipt = issue_operational_context_receipt(
+        service,
+        reviewed,
+        key_prefix="bound-approve",
+    )
     approved = service.approve_draft(
         APPROVER,
         draft.draft_id,
         "bound-approve",
-        transition(submitted, "Approve exact finalized artifact"),
+        ApproveCommand(
+            **transition(
+                reviewed,
+                "Approve exact finalized artifact",
+            ).model_dump(),
+            operational_context_receipt_id=approval_receipt.receipt_id,
+        ),
     )
     assert approved.approval is not None
     approved_artifact = approved.manifest.canonical_json()
 
+    publication_receipt = issue_operational_context_receipt(
+        service,
+        approved,
+        key_prefix="bound-publish",
+    )
     published = service.publish_draft(
         PUBLISHER,
         approved.draft_id,
@@ -109,18 +147,27 @@ def test_approval_and_publication_preserve_candidate_and_record_human_authority(
         PublishCommand(
             **transition(approved, "Authorize immutable publication").model_dump(),
             approval_id=approved.approval.decision_id,
+            operational_context_receipt_id=publication_receipt.receipt_id,
         ),
     )
 
     assert approved.approval.manifest_digest == approved.manifest_digest
+    assert (
+        approved.approval.operational_context_receipt_id
+        == approval_receipt.receipt_id
+    )
+    assert approved.approval.review_decision_id == (
+        approved.review_decisions[-1].decision_id
+    )
     assert published.manifest.canonical_json() == approved_artifact
     assert published.manifest_digest == approved.approval.manifest_digest
     assert published.manifest.audit.published_by == published.published_by.actor_id
     assert published.manifest.audit.published_at == published.published_at
     assert published.published_by == PUBLICATION_SERVICE
     assert published.publication_authorized_by == PUBLISHER
-    assert published.publication_authorized_at == datetime(
-        2026, 8, 17, 0, 0, 4, tzinfo=UTC
+    assert (
+        published.operational_context_receipt_id
+        == publication_receipt.receipt_id
     )
     publication_event = service.audit_history(PUBLISHER, published.manifest_id)[-1]
     assert publication_event.actor == PUBLISHER
