@@ -2237,13 +2237,28 @@ def test_report_is_bound_to_exact_request_and_transition() -> None:
 def test_runtime_report_validator_rejects_draft_preview() -> None:
     runtime_request = _request()
     runtime_report = _report()
-    validate_runtime_correlation_report(runtime_report, runtime_request)
+    validate_runtime_correlation_report(
+        runtime_report,
+        runtime_request,
+        evaluated_at=runtime_request.trusted_as_of,
+    )
 
     preview_request = _request(binding_mode="draftPreview")
     preview_report = _report(binding_mode="draftPreview")
     validate_correlation_report_binding(preview_report, preview_request)
     with pytest.raises(ValueError, match="published context"):
-        validate_runtime_correlation_report(preview_report, preview_request)
+        validate_runtime_correlation_report(
+            preview_report,
+            preview_request,
+            evaluated_at=preview_request.trusted_as_of,
+        )
+
+    with pytest.raises(ValueError, match="validity window"):
+        validate_runtime_correlation_report(
+            runtime_report,
+            runtime_request,
+            evaluated_at=runtime_request.expires_at + timedelta(milliseconds=1),
+        )
 
 
 def test_report_rejects_non_contiguous_ranks_and_digest_changes() -> None:

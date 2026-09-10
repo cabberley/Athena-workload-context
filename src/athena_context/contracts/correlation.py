@@ -2746,8 +2746,12 @@ def validate_correlation_report_binding(
 def validate_runtime_correlation_report(
     report: CorrelationReport,
     request: CorrelationRequest,
+    *,
+    evaluated_at: UtcDateTime,
 ) -> None:
     validate_correlation_report_binding(report, request)
+    if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
+        raise ValueError("runtime correlation request is outside its validity window")
     if (
         not isinstance(request.context_binding, PublishedRuntimeContextBinding)
         or report.binding_mode != "publishedRuntime"
