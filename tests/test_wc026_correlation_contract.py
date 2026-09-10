@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
+    CORRELATION_CONFIDENCE_THRESHOLDS,
     CORRELATION_REPORT_SCHEMA_VERSION,
     CORRELATION_REQUEST_SCHEMA_VERSION,
+    CORRELATION_REQUIRED_CAPS,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ApprovedChangeScope,
     ChangeEvidenceArtifact,
@@ -637,6 +639,7 @@ def _context_binding(
         ),
     }
     if binding_mode == "publishedRuntime":
+        context_payload_digest = compute_artifact_digest(_json_value(common))
         authority_payload: dict[str, object] = {
             "workloadId": common["workloadId"],
             "manifestId": common["manifestId"],
@@ -645,6 +648,7 @@ def _context_binding(
             "profileId": common["profileId"],
             "resolvedProfileDigest": common["resolvedProfileDigest"],
             "dependencyGraphDigest": common["dependencyGraphDigest"],
+            "contextBindingPayloadDigest": context_payload_digest,
             "publicationRecordDigest": DIGEST_A,
             "auditHeadDigest": DIGEST_B,
             "publishedAt": NOW - timedelta(hours=1),
@@ -662,6 +666,14 @@ def _context_binding(
             **common,
             "bindingMode": "publishedRuntime",
             "publicationAuthority": authority,
+            "publicationAuthorityReference": VersionPinnedBlobReference(
+                name=(
+                    "context-authority/"
+                    f"{authority.authority_id}/authority.json"
+                ),
+                version="2026-09-10T01:00:00.0000000Z",
+                contentDigest=sha256_hex(authority.canonical_bytes()),
+            ),
             "previewOnly": False,
         }
         digest = compute_artifact_digest(_json_value(payload))
@@ -736,6 +748,14 @@ def _inventory(
         sorted(
             (
                 handoff.evidence,
+                *(
+                    (context_binding.publication_authority_reference,)
+                    if isinstance(
+                        context_binding,
+                        PublishedRuntimeContextBinding,
+                    )
+                    else ()
+                ),
                 *(item.artifact for item in change_handoffs),
             ),
             key=lambda item: (item.name, item.version, item.content_digest),
@@ -1238,9 +1258,27 @@ def test_context_binding_separates_published_runtime_and_draft_preview() -> None
         )
 
 
+def test_publication_authority_binds_paths_and_required_coverage() -> None:
+    runtime = _context_binding()
+    payload = runtime.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"binding_digest"},
+    )
+    payload["requiredCoverageScopeDigests"] = (DIGEST_A,)
+    digest = compute_artifact_digest(_json_value(payload))
+
+    with pytest.raises(ValidationError, match="runtime context"):
+        PublishedRuntimeContextBinding(
+            **payload,
+            bindingDigest=digest,
+        )
+
+
 def test_request_binds_exact_handoff_bundle_inventory_and_as_of() -> None:
     request = _request()
 
+    assert request.schema_version == "athena.wc026CorrelationRequest.v2"
     assert CorrelationRequest.model_validate_json(request.model_dump_json()) == request
     assert request.request_digest == compute_artifact_digest(
         request.model_dump(
@@ -1260,6 +1298,20 @@ def test_request_binds_exact_handoff_bundle_inventory_and_as_of() -> None:
     payload["trustedAsOf"] = NOW - timedelta(minutes=3)
     with pytest.raises(ValidationError, match="trustedAsOf"):
         CorrelationRequest(**payload)
+
+    payload = request.model_dump(mode="python", by_alias=True)
+    payload["schemaVersion"] = "athena.wc026CorrelationRequest.v1"
+    with pytest.raises(ValidationError):
+        CorrelationRequest(**payload)
+
+
+def test_correlation_policy_constants_are_immutable() -> None:
+    with pytest.raises(TypeError):
+        cast(dict[str, int], CORRELATION_CONFIDENCE_THRESHOLDS)["Confirmed"] = 0
+    with pytest.raises(TypeError):
+        cast(dict[str, str], CORRELATION_REQUIRED_CAPS)["missingAffectedPath"] = (
+            "Confirmed"
+        )
 
 
 def test_request_rejects_monitoring_blob_substitution() -> None:
