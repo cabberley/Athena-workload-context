@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from datetime import timedelta
 from ipaddress import ip_address
+from types import MappingProxyType
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -20,9 +22,26 @@ from athena_context.contracts.operational_phase import VersionPinnedBlobReferenc
 MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION = (
     "athena.wc026MonitoringEvidenceBundle.v1"
 )
-CORRELATION_REQUEST_SCHEMA_VERSION = "athena.wc026CorrelationRequest.v1"
+CORRELATION_REQUEST_SCHEMA_VERSION = "athena.wc026CorrelationRequest.v2"
 CORRELATION_REPORT_SCHEMA_VERSION = "athena.wc026CorrelationReport.v1"
 CORRELATION_ALGORITHM_ID = "athena.wc026.correlation.v1"
+CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
+    {
+        "Unknown": 0,
+        "Low": 30,
+        "Medium": 55,
+        "High": 75,
+        "Confirmed": 90,
+    }
+)
+CORRELATION_MAX_HYPOTHESES = 64
+CORRELATION_MAX_SUPPORTING_EVIDENCE = 128
+CORRELATION_MAX_CONTRADICTIONS = 64
+CORRELATION_MAX_MISSING_EVIDENCE = 64
+CORRELATION_MAX_GATES = 32
+CORRELATION_MAX_CAPS = 16
+CORRELATION_MAX_GATE_EVIDENCE_IDS = 64
+CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS = 64
 
 type BindingMode = Literal["publishedRuntime", "draftPreview"]
 type ConfidenceLevel = Literal["Confirmed", "High", "Medium", "Low", "Unknown"]
@@ -74,6 +93,17 @@ type ConfidenceCapCode = Literal[
     "missingDirectAttribution",
     "ambiguousObservationWindow",
 ]
+CORRELATION_REQUIRED_CAPS: Mapping[ConfidenceCapCode, ConfidenceLevel] = (
+    MappingProxyType(
+        {
+            "recentChangeOnly": "Low",
+            "missingAffectedPath": "Low",
+            "missingIndependentSupport": "Medium",
+            "missingDirectAttribution": "High",
+            "ambiguousObservationWindow": "Medium",
+        }
+    )
+)
 type ContradictionCode = Literal[
     "changeFailed",
     "changeAfterDegradation",
@@ -1019,6 +1049,9 @@ class PublishedContextAuthority(_StrictCorrelationModel):
     profile_id: str = Field(alias="profileId", min_length=1, max_length=128)
     resolved_profile_digest: Sha256Digest = Field(alias="resolvedProfileDigest")
     dependency_graph_digest: Sha256Digest = Field(alias="dependencyGraphDigest")
+    context_binding_payload_digest: Sha256Digest = Field(
+        alias="contextBindingPayloadDigest"
+    )
     publication_record_digest: Sha256Digest = Field(alias="publicationRecordDigest")
     audit_head_digest: Sha256Digest = Field(alias="auditHeadDigest")
     published_at: UtcDateTime = Field(alias="publishedAt")
@@ -1089,11 +1122,35 @@ class PublishedRuntimeContextBinding(_CorrelationContextBindingBase):
     publication_authority: PublishedContextAuthority = Field(
         alias="publicationAuthority"
     )
+    publication_authority_reference: VersionPinnedBlobReference = Field(
+        alias="publicationAuthorityReference"
+    )
     preview_only: Literal[False] = Field(default=False, alias="previewOnly")
 
     @model_validator(mode="after")
     def validate_publication_authority(self) -> PublishedRuntimeContextBinding:
         authority = self.publication_authority
+        context_payload_digest = compute_artifact_digest(
+            {
+                "workloadId": self.workload_id,
+                "manifestId": self.manifest_id,
+                "manifestVersion": self.manifest_version,
+                "manifestDigest": self.manifest_digest,
+                "profileId": self.profile_id,
+                "resolvedProfileDigest": self.resolved_profile_digest,
+                "dependencyGraphDigest": self.dependency_graph_digest,
+                "dependencyPaths": [
+                    item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for item in self.dependency_paths
+                ],
+                "requiredCoverageScopeDigests": list(
+                    self.required_coverage_scope_digests
+                ),
+            }
+        )
+        expected_authority_name = (
+            f"context-authority/{authority.authority_id}/authority.json"
+        )
         if (
             authority.workload_id != self.workload_id
             or authority.manifest_id != self.manifest_id
@@ -1102,6 +1159,10 @@ class PublishedRuntimeContextBinding(_CorrelationContextBindingBase):
             or authority.profile_id != self.profile_id
             or authority.resolved_profile_digest != self.resolved_profile_digest
             or authority.dependency_graph_digest != self.dependency_graph_digest
+            or authority.context_binding_payload_digest != context_payload_digest
+            or self.publication_authority_reference.name != expected_authority_name
+            or self.publication_authority_reference.content_digest
+            != sha256_hex(authority.canonical_bytes())
         ):
             raise ValueError(
                 "publication authority does not bind the exact runtime context"
@@ -1254,7 +1315,7 @@ class CorrelationEvidenceInventory(_StrictCorrelationModel):
 class CorrelationRequest(_StrictCorrelationModel):
     """Untrusted wire envelope that must pass the later verification adapter."""
 
-    schema_version: Literal["athena.wc026CorrelationRequest.v1"] = Field(
+    schema_version: Literal["athena.wc026CorrelationRequest.v2"] = Field(
         alias="schemaVersion"
     )
     request_id: str = Field(alias="requestId")
@@ -1410,6 +1471,14 @@ class CorrelationRequest(_StrictCorrelationModel):
             sorted(
                 (
                     self.monitoring_handoff.evidence,
+                    *(
+                        (self.context_binding.publication_authority_reference,)
+                        if isinstance(
+                            self.context_binding,
+                            PublishedRuntimeContextBinding,
+                        )
+                        else ()
+                    ),
                     *(handoff.artifact for handoff in self.change_handoffs),
                 ),
                 key=lambda item: (item.name, item.version, item.content_digest),
@@ -2134,21 +2203,37 @@ def validate_correlation_report_binding(
             item.family for item in substantive_support
         }
         if support_families == {"resourceChange"}:
-            require_cap(hypothesis, "recentChangeOnly", "Low")
+            require_cap(
+                hypothesis,
+                "recentChangeOnly",
+                CORRELATION_REQUIRED_CAPS["recentChangeOnly"],
+            )
         affected_path_gate = gate_map.get("affectedPath")
         if (
             hypothesis.affected_path_id is None
             or affected_path_gate is None
             or not affected_path_gate.satisfied
         ):
-            require_cap(hypothesis, "missingAffectedPath", "Low")
+            require_cap(
+                hypothesis,
+                "missingAffectedPath",
+                CORRELATION_REQUIRED_CAPS["missingAffectedPath"],
+            )
         corroboration_gate = gate_map.get("independentCorroboration")
         if corroboration_gate is None or not corroboration_gate.satisfied:
-            require_cap(hypothesis, "missingIndependentSupport", "Medium")
+            require_cap(
+                hypothesis,
+                "missingIndependentSupport",
+                CORRELATION_REQUIRED_CAPS["missingIndependentSupport"],
+            )
         if hypothesis.category == "networkSecurityChange":
             attribution_gate = gate_map.get("effectiveRuleAttribution")
             if attribution_gate is None or not attribution_gate.satisfied:
-                require_cap(hypothesis, "missingDirectAttribution", "High")
+                require_cap(
+                    hypothesis,
+                    "missingDirectAttribution",
+                    CORRELATION_REQUIRED_CAPS["missingDirectAttribution"],
+                )
             if _CONFIDENCE_RANK[hypothesis.confidence] >= _CONFIDENCE_RANK["High"]:
                 for required_gate in (
                     "affectedPath",
@@ -2261,7 +2346,7 @@ def validate_correlation_report_binding(
                 require_cap(
                     hypothesis,
                     "ambiguousObservationWindow",
-                    "Medium",
+                    CORRELATION_REQUIRED_CAPS["ambiguousObservationWindow"],
                 )
 
         claimed_flow_ids: set[str] = set()
@@ -2787,7 +2872,7 @@ class CorrelationGate(_StrictCorrelationModel):
     evidence_ids: tuple[str, ...] = Field(
         default=(),
         alias="evidenceIds",
-        max_length=64,
+        max_length=CORRELATION_MAX_GATE_EVIDENCE_IDS,
     )
 
     @field_validator("evidence_ids")
@@ -2807,7 +2892,7 @@ class CorrelationContradiction(_StrictCorrelationModel):
     evidence_ids: tuple[str, ...] = Field(
         alias="evidenceIds",
         min_length=1,
-        max_length=64,
+        max_length=CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS,
     )
     hard_conflict: bool = Field(alias="hardConflict")
 
@@ -2833,7 +2918,7 @@ class MissingCorrelationEvidence(_StrictCorrelationModel):
 
 class RootCauseHypothesis(_StrictCorrelationModel):
     hypothesis_id: str = Field(alias="hypothesisId")
-    rank: int = Field(ge=1, le=64)
+    rank: int = Field(ge=1, le=CORRELATION_MAX_HYPOTHESES)
     category: RootCauseCategory
     cause_resource_id: str | None = Field(
         default=None,
@@ -2855,15 +2940,17 @@ class RootCauseHypothesis(_StrictCorrelationModel):
     confidence: ConfidenceLevel
     supporting_evidence: tuple[CorrelationEvidenceCitation, ...] = Field(
         alias="supportingEvidence",
-        max_length=128,
+        max_length=CORRELATION_MAX_SUPPORTING_EVIDENCE,
     )
-    contradictions: tuple[CorrelationContradiction, ...] = Field(max_length=64)
+    contradictions: tuple[CorrelationContradiction, ...] = Field(
+        max_length=CORRELATION_MAX_CONTRADICTIONS
+    )
     missing_evidence: tuple[MissingCorrelationEvidence, ...] = Field(
         alias="missingEvidence",
-        max_length=64,
+        max_length=CORRELATION_MAX_MISSING_EVIDENCE,
     )
-    gates: tuple[CorrelationGate, ...] = Field(max_length=32)
-    caps: tuple[ConfidenceCap, ...] = Field(max_length=16)
+    gates: tuple[CorrelationGate, ...] = Field(max_length=CORRELATION_MAX_GATES)
+    caps: tuple[ConfidenceCap, ...] = Field(max_length=CORRELATION_MAX_CAPS)
     hypothesis_digest: Sha256Digest = Field(alias="hypothesisDigest")
 
     @field_validator("cause_resource_id")
@@ -2914,11 +3001,11 @@ class RootCauseHypothesis(_StrictCorrelationModel):
         ):
             raise ValueError("hard conflicts require Unknown confidence")
         minimum_scores: dict[ConfidenceLevel, int] = {
-            "Unknown": 0,
-            "Low": 30,
-            "Medium": 55,
-            "High": 75,
-            "Confirmed": 90,
+            "Unknown": CORRELATION_CONFIDENCE_THRESHOLDS["Unknown"],
+            "Low": CORRELATION_CONFIDENCE_THRESHOLDS["Low"],
+            "Medium": CORRELATION_CONFIDENCE_THRESHOLDS["Medium"],
+            "High": CORRELATION_CONFIDENCE_THRESHOLDS["High"],
+            "Confirmed": CORRELATION_CONFIDENCE_THRESHOLDS["Confirmed"],
         }
         if self.score.raw_score < minimum_scores[self.confidence]:
             raise ValueError("rawScore is below the declared confidence threshold")
@@ -2977,7 +3064,10 @@ class CorrelationReport(_StrictCorrelationModel):
     incident_anchor_observed_end: UtcDateTime = Field(
         alias="incidentAnchorObservedEnd"
     )
-    hypotheses: tuple[RootCauseHypothesis, ...] = Field(min_length=1, max_length=64)
+    hypotheses: tuple[RootCauseHypothesis, ...] = Field(
+        min_length=1,
+        max_length=CORRELATION_MAX_HYPOTHESES,
+    )
     preview_only: bool = Field(alias="previewOnly")
     no_auto_remediation: Literal[True] = Field(alias="noAutoRemediation")
     report_digest: Sha256Digest = Field(alias="reportDigest")
@@ -3020,7 +3110,17 @@ class CorrelationReport(_StrictCorrelationModel):
 
 __all__ = [
     "CORRELATION_ALGORITHM_ID",
+    "CORRELATION_CONFIDENCE_THRESHOLDS",
+    "CORRELATION_MAX_CAPS",
+    "CORRELATION_MAX_CONTRADICTIONS",
+    "CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS",
+    "CORRELATION_MAX_GATES",
+    "CORRELATION_MAX_GATE_EVIDENCE_IDS",
+    "CORRELATION_MAX_HYPOTHESES",
+    "CORRELATION_MAX_MISSING_EVIDENCE",
+    "CORRELATION_MAX_SUPPORTING_EVIDENCE",
     "CORRELATION_REPORT_SCHEMA_VERSION",
+    "CORRELATION_REQUIRED_CAPS",
     "CORRELATION_REQUEST_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "BindingMode",
