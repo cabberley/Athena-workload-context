@@ -11,6 +11,8 @@ from athena_context.contracts.common import (
     compute_semantic_digest,
     sha256_hex,
 )
+from athena_context.contracts.correlation import *  # noqa: F403
+from athena_context.contracts.correlation import __all__ as _correlation_all
 from athena_context.contracts.eventing import *  # noqa: F403
 from athena_context.contracts.eventing import __all__ as _eventing_all
 from athena_context.contracts.manifest import *  # noqa: F403
@@ -40,6 +42,7 @@ WorkloadManifest = CanonicalWorkloadManifest  # type: ignore[misc,assignment]  #
 __all__ = [
     *list(_model_all),
     *list(_change_ingestion_all),
+    *list(_correlation_all),
     *list(_eventing_all),
     *list(_manifest_all),
     *list(_monitoring_all),
