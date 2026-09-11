@@ -293,21 +293,34 @@ def _endpoint_health_observation(
     observed_start: datetime | None = None,
     observed_end: datetime | None = None,
     status: str = "unhealthy",
+    subject_resource_id: str = WEB_ID,
+    backend_resource_ids: tuple[str, ...] | None = None,
+    source_root_reference: str | None = None,
+    source_record_reference: str | None = None,
 ) -> EndpointHealthObservation:
-    source_root_reference = "endpoint-health-source:sha256:" + "4" * 64
-    source_record_reference = "endpoint-health:sha256:" + "4" * 64
+    selected_source_root = (
+        source_root_reference
+        or "endpoint-health-source:sha256:" + "4" * 64
+    )
+    selected_source_record = (
+        source_record_reference or "endpoint-health:sha256:" + "4" * 64
+    )
     payload: dict[str, object] = {
         "observationKind": "endpointHealth",
-        "subjectResourceId": WEB_ID.lower(),
+        "subjectResourceId": subject_resource_id.lower(),
         "observedStart": observed_start or NOW - timedelta(minutes=4),
         "observedEnd": observed_end or NOW,
-        "provenanceRootDigest": sha256_hex(source_root_reference),
-        "sourceRootReference": source_root_reference,
-        "sourceRecordReference": source_record_reference,
+        "provenanceRootDigest": sha256_hex(selected_source_root),
+        "sourceRootReference": selected_source_root,
+        "sourceRecordReference": selected_source_record,
         "summaryCode": f"endpoint.{status}",
         "pathId": path.path_id,
         "status": status,
-        "backendResourceIds": (DB_ID.lower(),),
+        "backendResourceIds": (
+            (DB_ID.lower(),)
+            if backend_resource_ids is None
+            else backend_resource_ids
+        ),
     }
     digest = compute_artifact_digest(_json_value(payload))
     return EndpointHealthObservation(
