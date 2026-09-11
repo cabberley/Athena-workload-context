@@ -3,6 +3,9 @@
 - **Status:** Proposed
 - **Date:** 2026-09-11
 
+ADR 0029 advances the pre-runtime guidance authority wire contracts to v2 so runbook references
+carry immutable versions and content digests.
+
 ## Context
 
 WC-027 guidance may cite manual options and runbooks only when they are part of exact published
