@@ -15,6 +15,7 @@ from athena_context.contracts.change_ingestion import (
     ChangeEvidencePersistenceHandoff,
 )
 from athena_context.contracts.common import compute_artifact_digest, sha256_hex
+from athena_context.contracts.eventing import IncidentState, IncidentStateAttestation
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.monitoring import MonitoringEvidenceHandoff
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
@@ -1204,6 +1205,138 @@ type CorrelationContextBinding = Annotated[
 ]
 
 
+class IncidentCorrelationSubjectAttestation(_StrictCorrelationModel):
+    schema_version: Literal[
+        "athena.wc027IncidentCorrelationSubjectAttestation.v1"
+    ] = Field(alias="schemaVersion")
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
+class IncidentBoundCorrelationRequestAttestation(_StrictCorrelationModel):
+    schema_version: Literal[
+        "athena.wc027IncidentBoundCorrelationRequestAttestation.v1"
+    ] = Field(alias="schemaVersion")
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
+class IncidentCorrelationSubject(_StrictCorrelationModel):
+    schema_version: Literal["athena.wc027IncidentCorrelationSubject.v1"] = Field(
+        alias="schemaVersion"
+    )
+    subject_id: str = Field(
+        alias="subjectId",
+        pattern=r"^incident-subject-[a-f0-9]{32}$",
+    )
+    incident_id: str = Field(alias="incidentId", pattern=r"^inc-[a-f0-9]{12}$")
+    incident_transition_id: str = Field(
+        alias="incidentTransitionId",
+        pattern=r"^wc016-[a-f0-9]{64}$",
+    )
+    incident_revision: int = Field(alias="incidentRevision", ge=1)
+    affected_resource_id: str = Field(
+        alias="affectedResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    incident_state: IncidentState = Field(alias="incidentState")
+    incident_state_attestation: IncidentStateAttestation = Field(
+        alias="incidentStateAttestation"
+    )
+    incident_state_digest: Sha256Digest = Field(alias="incidentStateDigest")
+    state_reference: VersionPinnedBlobReference = Field(alias="stateReference")
+    attestation_reference: VersionPinnedBlobReference = Field(
+        alias="attestationReference"
+    )
+    subject_attestation: IncidentCorrelationSubjectAttestation = Field(
+        alias="subjectAttestation"
+    )
+    subject_digest: Sha256Digest = Field(alias="subjectDigest")
+
+    @field_validator("affected_resource_id")
+    @classmethod
+    def normalize_resource_id(cls, value: str) -> str:
+        return _canonical_resource_id(value)
+
+    @model_validator(mode="after")
+    def validate_subject(self) -> IncidentCorrelationSubject:
+        state = self.incident_state
+        attestation = self.incident_state_attestation
+        expected_incident_id = (
+            "inc-"
+            + sha256_hex(self.affected_resource_id.encode("utf-8"))
+            .removeprefix("sha256:")[:12]
+        )
+        digest_suffix = state.result_digest.removeprefix("sha256:")
+        prefix = f"incidents/{state.incident_id}/versions/{digest_suffix}"
+        signed_preimage = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "subject_id",
+                "subject_digest",
+                "subject_attestation",
+            },
+        )
+        if (
+            self.incident_id != expected_incident_id
+            or state.incident_id != self.incident_id
+            or state.transition_id != self.incident_transition_id
+            or self.incident_state_digest != state.result_digest
+            or attestation.result_digest != state.result_digest
+            or state.lifecycle not in {"active", "resolved"}
+            or self.state_reference.name != f"{prefix}/state.json"
+            or self.attestation_reference.name != f"{prefix}/attestation.json"
+            or self.state_reference.content_digest
+            != sha256_hex(state.canonical_bytes())
+            or self.attestation_reference.content_digest
+            != sha256_hex(attestation.canonical_bytes())
+            or self.subject_attestation.key_vault_key_id
+            != attestation.key_vault_key_id
+            or self.subject_attestation.signed_preimage_digest
+            != compute_artifact_digest(signed_preimage)
+        ):
+            raise ValueError(
+                "incident subject does not bind the exact signed incident state"
+            )
+        expected = _expected_digest(
+            self,
+            excluded_fields={"subject_id", "subject_digest"},
+        )
+        if self.subject_digest != expected:
+            raise ValueError("subjectDigest does not bind the incident subject")
+        if (
+            self.subject_id
+            != f"incident-subject-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("subjectId is not digest-bound")
+        return self
+
+
 class IncidentHealthTransition(_StrictCorrelationModel):
     transition_id: str = Field(alias="transitionId")
     affected_resource_id: str = Field(
@@ -1713,6 +1846,78 @@ class CorrelationRequest(_StrictCorrelationModel):
             identifier_kind="request",
             digest=expected,
         )
+        return self
+
+
+class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
+    schema_version: Literal["athena.wc027IncidentBoundCorrelationRequest.v1"] = (
+        Field(alias="schemaVersion")
+    )
+    request_id: str = Field(
+        alias="requestId",
+        pattern=r"^incident-bound-request-[a-f0-9]{32}$",
+    )
+    incident_subject: IncidentCorrelationSubject = Field(alias="incidentSubject")
+    correlation_request: CorrelationRequest = Field(alias="correlationRequest")
+    correlation_transition_digest: Sha256Digest = Field(
+        alias="correlationTransitionDigest"
+    )
+    binding_attestation: IncidentBoundCorrelationRequestAttestation = Field(
+        alias="bindingAttestation"
+    )
+    binding_digest: Sha256Digest = Field(alias="bindingDigest")
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> IncidentBoundCorrelationRequest:
+        subject = self.incident_subject
+        request = self.correlation_request
+        state = subject.incident_state
+        signed_preimage = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "request_id",
+                "binding_digest",
+                "binding_attestation",
+            },
+        )
+        if (
+            subject.affected_resource_id
+            != request.incident_anchor.affected_resource_id
+            or subject.incident_revision != request.incident_revision
+            or self.correlation_transition_digest
+            != request.incident_anchor.transition_digest
+            or state.detected_at > request.trusted_as_of
+            or state.updated_at > request.trusted_as_of
+            or state.updated_at < request.incident_anchor.observed_start
+            or (
+                state.lifecycle == "active"
+                and request.incident_anchor.current_state
+                not in {"degraded", "unhealthy", "unavailable", "unknown"}
+            )
+            or (
+                state.lifecycle == "resolved"
+                and request.incident_anchor.current_state
+                not in {"healthy", "recovered"}
+            )
+            or self.binding_attestation.signed_preimage_digest
+            != compute_artifact_digest(signed_preimage)
+        ):
+            raise ValueError(
+                "incident subject does not bind the exact correlation request"
+            )
+        expected = _expected_digest(
+            self,
+            excluded_fields={"request_id", "binding_digest"},
+        )
+        if self.binding_digest != expected:
+            raise ValueError("bindingDigest does not bind the incident request")
+        if (
+            self.request_id
+            != f"incident-bound-request-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("requestId is not digest-bound")
         return self
 
 
@@ -3169,6 +3374,10 @@ __all__ = [
     "GuestSignal",
     "GuestSignalObservation",
     "HealthState",
+    "IncidentBoundCorrelationRequest",
+    "IncidentBoundCorrelationRequestAttestation",
+    "IncidentCorrelationSubject",
+    "IncidentCorrelationSubjectAttestation",
     "IncidentHealthTransition",
     "MissingCorrelationEvidence",
     "MissingEvidenceCode",
