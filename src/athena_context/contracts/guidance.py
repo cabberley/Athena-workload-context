@@ -783,7 +783,8 @@ class GuidanceAffectedRoleImpact(_StrictGuidanceModel):
     )
     profile_id: str = Field(
         alias="profileId",
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        min_length=1,
+        max_length=128,
     )
     impact_severity: GuidanceImpactSeverity = Field(alias="impactSeverity")
     impact_code: GuidanceImpactCode = Field(alias="impactCode")
@@ -1433,7 +1434,7 @@ def build_guidance_legality(
     )
 
 
-def _timeline_kind_for_evidence(
+def guidance_timeline_kind_for_evidence(
     evidence_id: str,
     binding: PublishedGuidanceAuthorityBinding,
 ) -> GuidanceTimelineKind:
@@ -1471,7 +1472,7 @@ def _timeline_kind_for_evidence(
     raise ValueError("timeline evidence is not present in the exact request")
 
 
-def _expected_role_impact(
+def build_guidance_affected_role_impact(
     binding: PublishedGuidanceAuthorityBinding,
 ) -> GuidanceAffectedRoleImpact:
     state = binding.incident_bound_request.incident_subject.incident_state
@@ -1554,7 +1555,7 @@ def validate_incident_guidance_binding(
         raise ValueError("incident guidance generation time is invalid")
     if guidance.hypotheses != project_guidance_hypotheses(binding.correlation_report):
         raise ValueError("incident guidance hypotheses do not match the report")
-    if guidance.affected_role_impact != _expected_role_impact(binding):
+    if guidance.affected_role_impact != build_guidance_affected_role_impact(binding):
         raise ValueError("incident guidance role impact is invalid")
     if guidance.legality != build_guidance_legality(binding):
         raise ValueError("incident guidance legality is invalid")
@@ -1569,7 +1570,8 @@ def validate_incident_guidance_binding(
             or entry.observed_start != citation.observed_start
             or entry.observed_end != citation.observed_end
             or entry.summary_code != citation.summary_code
-            or entry.timeline_kind != _timeline_kind_for_evidence(entry.evidence_ids[0], binding)
+            or entry.timeline_kind
+            != guidance_timeline_kind_for_evidence(entry.evidence_ids[0], binding)
         ):
             raise ValueError("incident guidance timeline claim is invalid")
     allowed_evidence_ids = {
@@ -1772,7 +1774,9 @@ __all__ = [
     "PublishedGuidanceAuthorityBindingAttestation",
     "PublishedRunbookGuidanceOption",
     "SelectedRunbookGuidanceSelection",
+    "build_guidance_affected_role_impact",
     "build_incident_guidance_source_binding",
+    "guidance_timeline_kind_for_evidence",
     "build_guidance_legality",
     "project_guidance_hypotheses",
     "validate_incident_guidance_assets",
