@@ -835,12 +835,17 @@ class KeyVaultChangeEvidenceSigner:
 
         if _KEY_VAULT_KEY_ID_PATTERN.fullmatch(key_vault_key_id) is None:
             raise ValueError("key_vault_key_id must be one exact versioned Key Vault key")
+        self._key_vault_key_id = key_vault_key_id
         self._client = CryptographyClient(
             key_vault_key_id,
             production_managed_identity_credential(
                 managed_identity_client_id=managed_identity_client_id
             ),
         )
+
+    @property
+    def key_vault_key_id(self) -> str:
+        return self._key_vault_key_id
 
     def sign_preimage(self, canonical_preimage: bytes) -> str:
         from azure.keyvault.keys.crypto import SignatureAlgorithm
