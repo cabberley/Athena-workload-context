@@ -1139,8 +1139,22 @@ class AzureBlobVersionPinnedArtifactReader:
             max_chunk_get_size=max_payload_bytes + 1,
         )
         self._container = service.get_container_client(container_name)
+        self._blob_endpoint = blob_endpoint
         self._container_name = container_name
+        self._managed_identity_client_id = managed_identity_client_id
         self._max_payload_bytes = max_payload_bytes
+
+    @property
+    def blob_endpoint(self) -> str:
+        return self._blob_endpoint
+
+    @property
+    def container_name(self) -> str:
+        return self._container_name
+
+    @property
+    def managed_identity_client_id(self) -> str:
+        return self._managed_identity_client_id
 
     @staticmethod
     def _raise_if_blob_not_found(exc: ResourceNotFoundError) -> NoReturn:

@@ -54,6 +54,7 @@ from athena_context.contracts import (
     validate_correlation_report_binding,
     validate_runtime_correlation_report,
 )
+from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
 from athena_context.eventing.change_ingestion import normalize_resource_graph_change
 
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
@@ -153,8 +154,9 @@ def _network_flow_observation(
     observed_end: datetime | None = None,
     source_seed: str = "1",
     effective_rule_attribution: bool = True,
-    enforcement_resource_id: str = NSG_ID,
+    include_rule_resource_id: bool = True,
     rule_resource_id: str = NSG_RULE_ID,
+    enforcement_resource_id: str = NSG_ID,
 ) -> NetworkFlowObservation:
     source_root_reference = "network-flow-source:sha256:" + "1" * 64
     source_record_reference = "network-flow:sha256:" + source_seed * 64
@@ -188,7 +190,11 @@ def _network_flow_observation(
         "sourcePort": 443,
         "destinationPort": 1433,
         "enforcementResourceId": enforcement_resource_id.lower(),
-        "ruleResourceId": rule_resource_id.lower(),
+        "ruleResourceId": (
+            rule_resource_id.lower()
+            if include_rule_resource_id
+            else None
+        ),
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "effectiveRuleAttribution": effective_rule_attribution,
         "attributionMethod": (
@@ -385,7 +391,33 @@ def _monitoring_handoff(
     )
 
 
-def _change_pair() -> tuple[ChangeEvidenceArtifact, ChangeEvidencePersistenceHandoff]:
+def _change_pair(
+    *,
+    changed_property_path: str = "properties.access",
+    previous_value: str = "Allow",
+    new_value: str = "Deny",
+    change_suffix: str = "001",
+    correlation_id: str = "11111111-1111-1111-1111-111111111111",
+    occurred_at: datetime | None = None,
+    changed_properties: dict[str, tuple[str, str]] | None = None,
+) -> tuple[ChangeEvidenceArtifact, ChangeEvidencePersistenceHandoff]:
+    change_time = occurred_at or NOW - timedelta(minutes=6)
+    selected_changes = (
+        {
+            changed_property_path: {
+                "previousValue": previous_value,
+                "newValue": new_value,
+            }
+        }
+        if changed_properties is None
+        else {
+            path: {
+                "previousValue": values[0],
+                "newValue": values[1],
+            }
+            for path, values in changed_properties.items()
+        }
+    )
     scope = ApprovedChangeScope(
         schemaVersion="athena.approvedChangeScope.v1",
         subscriptionId=SUBSCRIPTION_ID,
@@ -395,7 +427,7 @@ def _change_pair() -> tuple[ChangeEvidenceArtifact, ChangeEvidencePersistenceHan
     change = {
         "id": (
             f"{NSG_RULE_ID}/providers/Microsoft.Resources/changes/"
-            "synthetic-wc026-change-001"
+            f"synthetic-wc026-change-{change_suffix}"
         ),
         "properties": {
             "targetResourceId": NSG_RULE_ID,
@@ -406,30 +438,23 @@ def _change_pair() -> tuple[ChangeEvidenceArtifact, ChangeEvidencePersistenceHan
             "changeAttributes": {
                 "previousResourceSnapshotId": "synthetic-before",
                 "newResourceSnapshotId": "synthetic-after",
-                "changesCount": 1,
+                "changesCount": len(selected_changes),
                 "changedByType": "Application",
                 "changedBy": "synthetic-wc026-deployer",
                 "clientType": "Automation",
                 "operation": (
                     "Microsoft.Network/networkSecurityGroups/securityRules/write"
                 ),
-                "timestamp": (
-                    NOW - timedelta(minutes=6)
-                ).isoformat().replace("+00:00", "Z"),
-                "correlationId": "11111111-1111-1111-1111-111111111111",
+                "timestamp": change_time.isoformat().replace("+00:00", "Z"),
+                "correlationId": correlation_id,
             },
-            "changes": {
-                "properties.access": {
-                    "previousValue": "Allow",
-                    "newValue": "Deny",
-                }
-            },
+            "changes": selected_changes,
         },
     }
     evidence = normalize_resource_graph_change(
         change,
         scope=scope,
-        received_at=NOW - timedelta(minutes=5),
+        received_at=max(change_time, NOW - timedelta(minutes=5)),
     )
     attestation_digest = sha256_hex(
         canonicalize_json(change_evidence_attestation_preimage(evidence)).encode(
@@ -518,13 +543,17 @@ def _nsg_bundle(
     matched_change_artifact_digest: str,
     flow_decision: str = "denied",
     effective_rule_attribution: bool = True,
+    include_rule_resource_id: bool = True,
+    rule_resource_id: str = NSG_RULE_ID,
+    enforcement_resource_id: str = NSG_ID,
+    path_override: DependencyPath | None = None,
 ) -> tuple[
     MonitoringEvidenceBundle,
     NetworkFlowObservation,
     ConnectionMonitorObservation,
     EndpointHealthObservation,
 ]:
-    path = _dependency_path()
+    path = path_override or _dependency_path()
     flow = _network_flow_observation(
         path=path,
         matched_change_key=matched_change_key,
@@ -532,6 +561,9 @@ def _nsg_bundle(
         matched_change_artifact_digest=matched_change_artifact_digest,
         decision=flow_decision,
         effective_rule_attribution=effective_rule_attribution,
+        include_rule_resource_id=include_rule_resource_id,
+        rule_resource_id=rule_resource_id,
+        enforcement_resource_id=enforcement_resource_id,
     )
     monitor = _connection_monitor_observation(
         path=path,
@@ -605,15 +637,22 @@ def _nsg_bundle(
     return bundle, flow, monitor, endpoint
 
 
-def _dependency_path() -> DependencyPath:
+def _dependency_path(
+    *,
+    source_role_ref: str = "web",
+    target_role_ref: str = "database",
+    relationship_id: str = "relationship-web-db",
+    resource_ids: tuple[str, ...] | None = None,
+) -> DependencyPath:
     payload: dict[str, object] = {
         "pathClass": "declared",
-        "sourceRoleRef": "web",
-        "targetRoleRef": "database",
-        "relationshipIds": ("relationship-web-db",),
+        "sourceRoleRef": source_role_ref,
+        "targetRoleRef": target_role_ref,
+        "relationshipIds": (relationship_id,),
         "resourceIds": tuple(
             sorted(
-                (
+                resource_ids
+                or (
                     DB_ID.lower(),
                     NSG_ID.lower(),
                     NSG_RULE_ID.lower(),
@@ -634,7 +673,14 @@ def _context_binding(
     *,
     binding_mode: str = "publishedRuntime",
     required_coverage_scope_digests: tuple[str, ...] | None = None,
+    dependency_paths: tuple[DependencyPath, ...] | None = None,
 ) -> PublishedRuntimeContextBinding | DraftPreviewContextBinding:
+    selected_paths = tuple(
+        sorted(
+            dependency_paths or (_dependency_path(),),
+            key=lambda item: item.path_id,
+        )
+    )
     common: dict[str, object] = {
         "workloadId": "synthetic-wc026",
         "manifestId": "manifest-synthetic",
@@ -643,7 +689,7 @@ def _context_binding(
         "profileId": "production",
         "resolvedProfileDigest": DIGEST_B,
         "dependencyGraphDigest": DIGEST_C,
-        "dependencyPaths": (_dependency_path(),),
+        "dependencyPaths": selected_paths,
         "requiredCoverageScopeDigests": (
             (_coverage().scope.scope_digest,)
             if required_coverage_scope_digests is None
@@ -724,16 +770,27 @@ def _citation(
 def _transition(
     *,
     previous_citation: CorrelationEvidenceCitation,
-    current_citation: CorrelationEvidenceCitation,
+    current_citation: CorrelationEvidenceCitation | None = None,
+    current_citations: tuple[CorrelationEvidenceCitation, ...] | None = None,
 ) -> IncidentHealthTransition:
+    if (current_citation is None) == (current_citations is None):
+        raise ValueError("provide one current citation form")
+    selected_current = (
+        (current_citation,)
+        if current_citation is not None
+        else current_citations
+    )
+    assert selected_current is not None
     payload: dict[str, object] = {
         "affectedResourceId": WEB_ID.lower(),
         "previousState": "healthy",
         "currentState": "unhealthy",
-        "observedStart": current_citation.observed_start,
-        "observedEnd": current_citation.observed_end,
+        "observedStart": min(item.observed_start for item in selected_current),
+        "observedEnd": max(item.observed_end for item in selected_current),
         "previousStateEvidence": (previous_citation,),
-        "currentStateEvidence": (current_citation,),
+        "currentStateEvidence": tuple(
+            sorted(selected_current, key=lambda item: item.evidence_id)
+        ),
     }
     digest = compute_artifact_digest(_json_value(payload))
     return IncidentHealthTransition(
@@ -752,6 +809,7 @@ def _inventory(
     evidence_index: tuple[CorrelationEvidenceCitation, ...],
     change_artifacts: tuple[ChangeEvidenceArtifact, ...] = (),
     change_handoffs: tuple[ChangeEvidencePersistenceHandoff, ...] = (),
+    rule_catalog_digest: str = CORRELATION_RULE_CATALOG_DIGEST,
 ) -> CorrelationEvidenceInventory:
     change_digests = tuple(
         sorted(sha256_hex(artifact.canonical_bytes()) for artifact in change_artifacts)
@@ -774,7 +832,7 @@ def _inventory(
         )
     )
     payload: dict[str, object] = {
-        "ruleCatalogDigest": DIGEST_C,
+        "ruleCatalogDigest": rule_catalog_digest,
         "contextBindingDigest": context_binding.binding_digest,
         "incidentTransitionDigest": transition.transition_digest,
         "monitoringHandoffDigest": handoff.compute_artifact_digest_value(),
@@ -800,14 +858,30 @@ def _request(
         ChangeEvidencePersistenceHandoff,
     ]
     | None = None,
+    change_pairs: tuple[
+        tuple[
+            ChangeEvidenceArtifact,
+            ChangeEvidencePersistenceHandoff,
+        ],
+        ...,
+    ]
+    | None = None,
     bundle_override: MonitoringEvidenceBundle | None = None,
     incident_evidence_id: str | None = None,
+    incident_evidence_ids: tuple[str, ...] | None = None,
+    rule_catalog_digest: str = CORRELATION_RULE_CATALOG_DIGEST,
+    dependency_paths: tuple[DependencyPath, ...] | None = None,
 ) -> CorrelationRequest:
+    if change_pair is not None and change_pairs is not None:
+        raise ValueError("provide change_pair or change_pairs, not both")
+    if incident_evidence_id is not None and incident_evidence_ids is not None:
+        raise ValueError("provide incident_evidence_id or incident_evidence_ids")
     bundle = bundle_override or _bundle()
     handoff = _monitoring_handoff(bundle=bundle)
     context_binding = _context_binding(
         binding_mode=binding_mode,
         required_coverage_scope_digests=bundle.expected_coverage_scope_digests,
+        dependency_paths=dependency_paths,
     )
     observation_citations = tuple(
         CorrelationEvidenceCitation(
@@ -884,8 +958,22 @@ def _request(
         )
         for coverage in bundle.coverage
     )
-    change_artifacts = () if change_pair is None else (change_pair[0],)
-    change_handoffs = () if change_pair is None else (change_pair[1],)
+    selected_change_pairs = (
+        ()
+        if change_pair is None and change_pairs is None
+        else (change_pair,)
+        if change_pair is not None
+        else change_pairs
+    )
+    assert selected_change_pairs is not None
+    selected_change_pairs = tuple(
+        sorted(
+            selected_change_pairs,
+            key=lambda item: sha256_hex(item[0].canonical_bytes()),
+        )
+    )
+    change_artifacts = tuple(item[0] for item in selected_change_pairs)
+    change_handoffs = tuple(item[1] for item in selected_change_pairs)
     change_citations = tuple(
         CorrelationEvidenceCitation(
             evidenceId=artifact.evidence.evidence_id,
@@ -915,27 +1003,37 @@ def _request(
             key=lambda item: item.evidence_id,
         )
     )
-    selected_incident_id = incident_evidence_id or next(
-        observation.observation_id
-        for observation in bundle.observations
-        if isinstance(
-            observation,
-            (GuestSignalObservation, EndpointHealthObservation),
-        )
-        and observation.subject_resource_id == WEB_ID.lower()
-        and (
-            (
-                isinstance(observation, GuestSignalObservation)
-                and observation.state == "unhealthy"
-            )
-            or (
-                isinstance(observation, EndpointHealthObservation)
-                and observation.status == "unhealthy"
-            )
+    selected_incident_ids = (
+        incident_evidence_ids
+        if incident_evidence_ids is not None
+        else (
+            incident_evidence_id
+            or next(
+                observation.observation_id
+                for observation in bundle.observations
+                if isinstance(
+                    observation,
+                    (GuestSignalObservation, EndpointHealthObservation),
+                )
+                and observation.subject_resource_id == WEB_ID.lower()
+                and (
+                    (
+                        isinstance(observation, GuestSignalObservation)
+                        and observation.state == "unhealthy"
+                    )
+                    or (
+                        isinstance(observation, EndpointHealthObservation)
+                        and observation.status == "unhealthy"
+                    )
+                )
+            ),
         )
     )
-    current_citation = next(
-        item for item in evidence_index if item.evidence_id == selected_incident_id
+    selected_incident_id_set = set(selected_incident_ids)
+    current_citations = tuple(
+        item
+        for item in evidence_index
+        if item.evidence_id in selected_incident_id_set
     )
     previous_health_id = next(
         observation.observation_id
@@ -956,12 +1054,12 @@ def _request(
     )
     transition = _transition(
         previous_citation=previous_citation,
-        current_citation=current_citation,
+        current_citations=current_citations,
     )
     payload: dict[str, object] = {
         "schemaVersion": CORRELATION_REQUEST_SCHEMA_VERSION,
         "algorithmId": CORRELATION_ALGORITHM_ID,
-        "ruleCatalogDigest": DIGEST_C,
+        "ruleCatalogDigest": rule_catalog_digest,
         "incidentRevision": 1,
         "issuedAt": NOW,
         "trustedAsOf": NOW + timedelta(minutes=1),
@@ -981,6 +1079,7 @@ def _request(
             evidence_index=evidence_index,
             change_artifacts=change_artifacts,
             change_handoffs=change_handoffs,
+            rule_catalog_digest=rule_catalog_digest,
         ),
     }
     digest = compute_artifact_digest(_json_value(payload))
