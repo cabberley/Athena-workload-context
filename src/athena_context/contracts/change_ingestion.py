@@ -316,6 +316,11 @@ class NormalizedChangeEvidence(_StrictChangeModel):
         paths = [item.path for item in self.changed_properties]
         if paths != sorted(paths) or len(paths) != len(set(paths)):
             raise ValueError("changedProperties must have uniquely sorted paths")
+        normalized_paths = [path.casefold() for path in paths]
+        if len(normalized_paths) != len(set(normalized_paths)):
+            raise ValueError(
+                "changedProperties must be unique case-insensitive paths"
+            )
         expected_deduplication_key = _delivery_key(
             self.source_system,
             self.source_record_reference,

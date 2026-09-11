@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel, ValidationError
 
+import athena_context.contracts.correlation as correlation_contract
 from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_CONFIDENCE_THRESHOLDS,
@@ -40,6 +41,7 @@ from athena_context.contracts import (
     MonitoringEvidenceHandoff,
     MonitoringObservation,
     NetworkFlowObservation,
+    NormalizedChangeEvidence,
     PublishedContextAuthority,
     PublishedRuntimeContextBinding,
     RootCauseHypothesis,
@@ -68,11 +70,11 @@ NOW = datetime(2026, 9, 10, 2, 0, tzinfo=UTC)
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
-NSG_RULE_ID = (
+NSG_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/"
-    "providers/Microsoft.Network/networkSecurityGroups/synthetic-nsg/"
-    "securityRules/deny-web"
+    "providers/Microsoft.Network/networkSecurityGroups/synthetic-nsg"
 )
+NSG_RULE_ID = f"{NSG_ID}/securityRules/deny-web"
 
 
 def _json_value(value: Any) -> Any:
@@ -151,6 +153,8 @@ def _network_flow_observation(
     observed_end: datetime | None = None,
     source_seed: str = "1",
     effective_rule_attribution: bool = True,
+    enforcement_resource_id: str = NSG_ID,
+    rule_resource_id: str = NSG_RULE_ID,
 ) -> NetworkFlowObservation:
     source_root_reference = "network-flow-source:sha256:" + "1" * 64
     source_record_reference = "network-flow:sha256:" + source_seed * 64
@@ -183,8 +187,8 @@ def _network_flow_observation(
         "destinationAddress": "192.0.2.20",
         "sourcePort": 443,
         "destinationPort": 1433,
-        "enforcementResourceId": NSG_RULE_ID.lower(),
-        "ruleResourceId": NSG_RULE_ID.lower(),
+        "enforcementResourceId": enforcement_resource_id.lower(),
+        "ruleResourceId": rule_resource_id.lower(),
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "effectiveRuleAttribution": effective_rule_attribution,
         "attributionMethod": (
@@ -546,6 +550,7 @@ def _nsg_bundle(
                 (
                     WEB_ID.lower(),
                     DB_ID.lower(),
+                    NSG_ID.lower(),
                     NSG_RULE_ID.lower(),
                 )
             )
@@ -607,7 +612,14 @@ def _dependency_path() -> DependencyPath:
         "targetRoleRef": "database",
         "relationshipIds": ("relationship-web-db",),
         "resourceIds": tuple(
-            sorted((DB_ID.lower(), NSG_RULE_ID.lower(), WEB_ID.lower()))
+            sorted(
+                (
+                    DB_ID.lower(),
+                    NSG_ID.lower(),
+                    NSG_RULE_ID.lower(),
+                    WEB_ID.lower(),
+                )
+            )
         ),
     }
     digest = compute_artifact_digest(_json_value(payload))
@@ -1467,6 +1479,61 @@ def test_network_tuple_and_nsg_property_bindings_are_exact() -> None:
             ),
             observationDigest=unrelated_digest,
         )
+
+    other_nsg_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/"
+        "providers/Microsoft.Network/networkSecurityGroups/synthetic-other-nsg"
+    )
+    with pytest.raises(ValidationError, match="belong to enforcement"):
+        _network_flow_observation(
+            path=path,
+            matched_change_key=change_pair[0].evidence.change_key,
+            enforcement_resource_id=other_nsg_id,
+        )
+    with pytest.raises(ValidationError, match="belong to enforcement"):
+        _network_flow_observation(
+            path=path,
+            matched_change_key=change_pair[0].evidence.change_key,
+            rule_resource_id=(
+                f"{NSG_RULE_ID}/providers/Microsoft.Insights/"
+                "diagnosticSettings/synthetic"
+            ),
+        )
+    vm_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/"
+        "providers/Microsoft.Compute/virtualMachines/synthetic-web-01"
+    )
+    with pytest.raises(ValidationError, match="belong to enforcement"):
+        _network_flow_observation(
+            path=path,
+            matched_change_key=change_pair[0].evidence.change_key,
+            enforcement_resource_id=vm_id,
+            rule_resource_id=f"{vm_id}/securityRules/synthetic",
+        )
+
+    sibling_flow = _network_flow_observation(
+        path=path,
+        matched_change_key=change_pair[0].evidence.change_key,
+        effective_rule_attribution=False,
+        rule_resource_id=f"{NSG_ID}/securityRules/allow-other",
+    )
+    assert not correlation_contract._same_flow(flow, sibling_flow)
+
+
+def test_change_properties_reject_case_insensitive_duplicates() -> None:
+    artifact, _ = _change_pair()
+    payload = artifact.evidence.model_dump(mode="python", by_alias=True)
+    original = payload["changedProperties"][0]
+    payload["changedProperties"] = (
+        {
+            **original,
+            "path": "properties.Access",
+        },
+        original,
+    )
+
+    with pytest.raises(ValidationError, match="case-insensitive"):
+        NormalizedChangeEvidence(**payload)
 
 
 @pytest.mark.parametrize(
