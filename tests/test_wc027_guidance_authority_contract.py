@@ -69,7 +69,7 @@ def _option(
     runbook_reference=None,
 ) -> PublishedRunbookGuidanceOption:
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc027PublishedRunbookGuidanceOption.v1",
+        "schemaVersion": "athena.wc027PublishedRunbookGuidanceOption.v2",
         "controlId": "synthetic-guidance-control",
         "provenance": GuidanceControlProvenance(
             manifestId="manifest-synthetic",
@@ -83,6 +83,8 @@ def _option(
         or HttpsGuidanceRunbookReference(
             referenceKind="https",
             uri="https://runbooks.invalid/synthetic/network-check",
+            version="2026.09.11.1",
+            contentDigest="sha256:" + "4" * 64,
         ),
         "controlHealth": health,
         "lastReviewedAt": last_reviewed_at or NOW - timedelta(days=1),
@@ -113,7 +115,7 @@ def _authority(
         else no_runbook_reasons
     )
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc027PublishedGuidanceAuthority.v1",
+        "schemaVersion": "athena.wc027PublishedGuidanceAuthority.v2",
         "workloadId": context.workload_id,
         "manifestId": context.manifest_id,
         "manifestVersion": context.manifest_version,
@@ -153,7 +155,7 @@ def _no_runbook_selection(
     )
     hypothesis = selected_report.hypotheses[0]
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc027GuidanceSelection.v1",
+        "schemaVersion": "athena.wc027GuidanceSelection.v2",
         "selectionKind": "noRunbook",
         "reason": reason,
         "affectedRoleRef": "web",
@@ -184,7 +186,7 @@ def _selected_runbook(
     )
     hypothesis = selected_report.hypotheses[0]
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc027GuidanceSelection.v1",
+        "schemaVersion": "athena.wc027GuidanceSelection.v2",
         "selectionKind": "selectedRunbook",
         "optionId": option.option_id,
         "optionDigest": option.option_digest,
@@ -228,7 +230,7 @@ def _binding(
         contentDigest=sha256_hex(selected_authority.canonical_bytes()),
     )
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc027PublishedGuidanceAuthorityBinding.v1",
+        "schemaVersion": "athena.wc027PublishedGuidanceAuthorityBinding.v2",
         "incidentBoundRequest": _bound_request(correlation_request=selected_request),
         "correlationReport": selected_report,
         "guidanceAuthority": selected_authority,
@@ -238,7 +240,7 @@ def _binding(
         "selection": selected_selection,
     }
     attestation = PublishedGuidanceAuthorityBindingAttestation(
-        schemaVersion=("athena.wc027PublishedGuidanceAuthorityBindingAttestation.v1"),
+        schemaVersion=("athena.wc027PublishedGuidanceAuthorityBindingAttestation.v2"),
         signatureAlgorithm="RS256",
         keyVaultKeyId=(
             "https://synthetic-wc027.vault.azure.net/keys/"
@@ -270,23 +272,34 @@ def _binding(
 )
 def test_https_runbook_reference_rejects_unsafe_uri(uri: str) -> None:
     with pytest.raises(ValidationError, match="safe HTTPS"):
-        HttpsGuidanceRunbookReference(referenceKind="https", uri=uri)
+        HttpsGuidanceRunbookReference(
+            referenceKind="https",
+            uri=uri,
+            version="2026.09.11.1",
+            contentDigest="sha256:" + "4" * 64,
+        )
 
 
 def test_opaque_runbook_reference_requires_approved_scheme() -> None:
     assert OpaqueGuidanceRunbookReference(
         referenceKind="opaque",
         opaqueRef="urn:synthetic:runbook:network-check",
+        version="2026.09.11.1",
+        contentDigest="sha256:" + "5" * 64,
     )
     with pytest.raises(ValidationError, match="approved opaque"):
         OpaqueGuidanceRunbookReference(
             referenceKind="opaque",
             opaqueRef="https://runbooks.invalid/hidden",
+            version="2026.09.11.1",
+            contentDigest="sha256:" + "5" * 64,
         )
     with pytest.raises(ValidationError, match="approved opaque"):
         OpaqueGuidanceRunbookReference(
             referenceKind="opaque",
             opaqueRef="urn:",
+            version="2026.09.11.1",
+            contentDigest="sha256:" + "5" * 64,
         )
 
 
