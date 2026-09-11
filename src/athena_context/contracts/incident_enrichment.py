@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from athena_context.contracts.common import compute_artifact_digest, sha256_hex
 from athena_context.contracts.correlation import (
+    CORRELATION_MAX_CANONICAL_BYTES,
     CorrelationReport,
     IncidentBoundCorrelationRequest,
     PublishedRuntimeContextBinding,
@@ -20,7 +21,7 @@ from athena_context.contracts.guidance import (
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
-MAX_PUBLISHED_CORRELATION_REPORT_BYTES = 8 * 1024 * 1024
+MAX_PUBLISHED_CORRELATION_REPORT_BYTES = CORRELATION_MAX_CANONICAL_BYTES
 MAX_PUBLISHED_CORRELATION_REPORT_STATEMENT_BYTES = 8 * 1024
 MAX_INCIDENT_ENRICHMENT_MANIFEST_BYTES = 64 * 1024
 MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES = 16 * 1024
