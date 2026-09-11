@@ -25,6 +25,7 @@ from athena_context.contracts.common import (
     sha256_hex,
 )
 from athena_context.contracts.correlation import (
+    CORRELATION_MAX_CANONICAL_BYTES,
     CORRELATION_REPORT_SCHEMA_VERSION,
     CorrelationReport,
     CorrelationRequest,
@@ -49,6 +50,7 @@ from athena_context.contracts.monitoring import (
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 from athena_context.correlation.rules import (
+    CORRELATION_RULE_CATALOG,
     CORRELATION_RULE_CATALOG_DIGEST,
     assert_catalog_digest,
     assert_contract_compatibility,
@@ -398,6 +400,24 @@ def _build_verified_report(
 ) -> CorrelationReport:
     assert_catalog_digest()
     assert_contract_compatibility()
+    bounded_hypotheses = _bound_report_hypotheses(request, hypotheses)
+    document = _report_document(request, bounded_hypotheses)
+    report = CorrelationReport.model_validate(document)
+    if len(report.canonical_bytes()) > CORRELATION_MAX_CANONICAL_BYTES:
+        raise ValueError("correlation report exceeds its canonical byte budget")
+    if report.rule_catalog_digest != CORRELATION_RULE_CATALOG_DIGEST:
+        raise ValueError("correlation report does not match the engine rule catalog")
+    validate_correlation_report_binding(report, request)
+    return report
+
+
+def _report_document(
+    request: CorrelationRequest,
+    hypotheses: tuple[RootCauseHypothesis, ...],
+) -> dict[str, object]:
+    hypothesis_payloads = tuple(
+        item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in hypotheses
+    )
     values = {
         "schemaVersion": CORRELATION_REPORT_SCHEMA_VERSION,
         "algorithmId": request.algorithm_id,
@@ -414,24 +434,93 @@ def _build_verified_report(
         "previewOnly": False,
         "noAutoRemediation": True,
     }
-    digest_payload = {
-        **values,
-        "hypotheses": [
-            item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in hypotheses
-        ],
-    }
-    digest = compute_artifact_digest(digest_payload)
-    report = CorrelationReport.model_validate(
+    digest = compute_artifact_digest(
         {
             **values,
-            "reportId": f"report-{digest.removeprefix('sha256:')[:32]}",
-            "reportDigest": digest,
+            "hypotheses": list(hypothesis_payloads),
         }
     )
-    if report.rule_catalog_digest != CORRELATION_RULE_CATALOG_DIGEST:
-        raise ValueError("correlation report does not match the engine rule catalog")
-    validate_correlation_report_binding(report, request)
-    return report
+    return {
+        **values,
+        "reportId": f"report-{digest.removeprefix('sha256:')[:32]}",
+        "reportDigest": digest,
+    }
+
+
+def _rank_hypotheses(
+    hypotheses: tuple[RootCauseHypothesis, ...],
+) -> tuple[RootCauseHypothesis, ...]:
+    return tuple(
+        RootCauseHypothesis.model_validate(
+            {
+                **item.model_dump(mode="python", by_alias=True),
+                "rank": index,
+            }
+        )
+        for index, item in enumerate(hypotheses, start=1)
+    )
+
+
+def _report_document_size(
+    request: CorrelationRequest,
+    hypotheses: tuple[RootCauseHypothesis, ...],
+) -> int:
+    document = _report_document(request, hypotheses)
+    return len(
+        (
+            canonicalize_json(
+                {
+                    **document,
+                    "hypotheses": [
+                        item.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
+                        for item in hypotheses
+                    ],
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+
+
+def _bound_report_hypotheses(
+    request: CorrelationRequest,
+    hypotheses: tuple[RootCauseHypothesis, ...],
+) -> tuple[RootCauseHypothesis, ...]:
+    from athena_context.correlation.engine import _overflow_hypothesis
+
+    maximum = CORRELATION_RULE_CATALOG.maximum_hypotheses
+    if len(hypotheses) <= maximum:
+        complete = _rank_hypotheses(hypotheses)
+        if _report_document_size(request, complete) <= CORRELATION_MAX_CANONICAL_BYTES:
+            return complete
+        maximum_retained = len(hypotheses) - 1
+    else:
+        maximum_retained = maximum - 1
+
+    best: tuple[RootCauseHypothesis, ...] | None = None
+    minimum_retained = 1
+    while minimum_retained <= maximum_retained:
+        retained_count = (minimum_retained + maximum_retained) // 2
+        omitted = list(hypotheses[retained_count:])
+        candidate = (
+            *hypotheses[:retained_count],
+            _overflow_hypothesis(request, omitted),
+        )
+        ranked = _rank_hypotheses(tuple(candidate))
+        if _report_document_size(request, ranked) <= CORRELATION_MAX_CANONICAL_BYTES:
+            best = ranked
+            minimum_retained = retained_count + 1
+        else:
+            maximum_retained = retained_count - 1
+    if best is not None:
+        return best
+    raise ValueError(
+        "top correlation hypothesis and omission record exceed the canonical report byte budget"
+    )
 
 
 def _report_receipt(

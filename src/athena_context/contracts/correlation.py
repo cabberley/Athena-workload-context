@@ -35,6 +35,7 @@ CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
         "Confirmed": 90,
     }
 )
+CORRELATION_MAX_CANDIDATE_HYPOTHESES = 4096
 CORRELATION_MAX_HYPOTHESES = 64
 CORRELATION_MAX_SUPPORTING_EVIDENCE = 128
 CORRELATION_MAX_CONTRADICTIONS = 64
@@ -43,6 +44,7 @@ CORRELATION_MAX_GATES = 32
 CORRELATION_MAX_CAPS = 16
 CORRELATION_MAX_GATE_EVIDENCE_IDS = 64
 CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS = 64
+CORRELATION_MAX_CANONICAL_BYTES = 8 * 1024 * 1024
 
 type BindingMode = Literal["publishedRuntime", "draftPreview"]
 type ConfidenceLevel = Literal["Confirmed", "High", "Medium", "Low", "Unknown"]
@@ -122,6 +124,7 @@ type MissingEvidenceCode = Literal[
     "completeObservationWindow",
     "recoveryObservation",
     "changeDetails",
+    "omittedCandidates",
 ]
 type GuestSignal = Literal[
     "heartbeatLoss",
@@ -3058,6 +3061,10 @@ def validate_runtime_correlation_report(
     evaluated_at: UtcDateTime,
 ) -> None:
     validate_correlation_report_binding(report, request)
+    if len(report.canonical_bytes()) > CORRELATION_MAX_CANONICAL_BYTES:
+        raise ValueError(
+            "correlation report exceeds its canonical byte budget"
+        )
     if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
         raise ValueError("runtime correlation request is outside its validity window")
     if (
@@ -3172,6 +3179,16 @@ class RootCauseHypothesis(_StrictCorrelationModel):
         alias="missingEvidence",
         max_length=CORRELATION_MAX_MISSING_EVIDENCE,
     )
+    omitted_candidate_count: int | None = Field(
+        default=None,
+        alias="omittedCandidateCount",
+        ge=1,
+        le=CORRELATION_MAX_CANDIDATE_HYPOTHESES,
+    )
+    omitted_candidate_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="omittedCandidateDigest",
+    )
     gates: tuple[CorrelationGate, ...] = Field(max_length=CORRELATION_MAX_GATES)
     caps: tuple[ConfidenceCap, ...] = Field(max_length=CORRELATION_MAX_CAPS)
     hypothesis_digest: Sha256Digest = Field(alias="hypothesisDigest")
@@ -3183,6 +3200,32 @@ class RootCauseHypothesis(_StrictCorrelationModel):
 
     @model_validator(mode="after")
     def validate_hypothesis(self) -> RootCauseHypothesis:
+        has_omission = self.omitted_candidate_count is not None
+        if has_omission != (self.omitted_candidate_digest is not None):
+            raise ValueError(
+                "omitted candidate count and digest must be supplied together"
+            )
+        omitted_codes = {
+            item.code
+            for item in self.missing_evidence
+            if item.code == "omittedCandidates"
+        }
+        if has_omission and (
+            self.category != "unknown"
+            or self.confidence != "Unknown"
+            or self.cause_resource_id is not None
+            or self.affected_path_id is not None
+            or self.candidate_causal_at is not None
+            or self.supporting_evidence
+            or omitted_codes != {"omittedCandidates"}
+        ):
+            raise ValueError(
+                "omitted candidates require one bounded unknown hypothesis"
+            )
+        if not has_omission and omitted_codes:
+            raise ValueError(
+                "omittedCandidates requires structural count and digest"
+            )
         evidence_ids = tuple(item.evidence_id for item in self.supporting_evidence)
         if evidence_ids != tuple(sorted(evidence_ids)) or len(evidence_ids) != len(
             set(evidence_ids)
@@ -3309,6 +3352,19 @@ class CorrelationReport(_StrictCorrelationModel):
         hypothesis_ids = tuple(item.hypothesis_id for item in self.hypotheses)
         if len(hypothesis_ids) != len(set(hypothesis_ids)):
             raise ValueError("duplicate hypothesis IDs are not permitted")
+        omission_ranks = tuple(
+            item.rank
+            for item in self.hypotheses
+            if item.omitted_candidate_count is not None
+        )
+        if omission_ranks and (
+            len(omission_ranks) != 1
+            or len(self.hypotheses) < 2
+            or omission_ranks[0] != len(self.hypotheses)
+        ):
+            raise ValueError(
+                "one omission hypothesis is permitted only at the final rank"
+            )
         if any(
             item.candidate_causal_at is not None
             and item.candidate_causal_at > self.incident_anchor_observed_start
@@ -3328,6 +3384,10 @@ class CorrelationReport(_StrictCorrelationModel):
             identifier_kind="report",
             digest=expected,
         )
+        if len(self.canonical_bytes()) > CORRELATION_MAX_CANONICAL_BYTES:
+            raise ValueError(
+                "correlation report exceeds its canonical byte budget"
+            )
         return self
 
 
@@ -3335,6 +3395,8 @@ __all__ = [
     "CORRELATION_ALGORITHM_ID",
     "CORRELATION_CONFIDENCE_THRESHOLDS",
     "CORRELATION_MAX_CAPS",
+    "CORRELATION_MAX_CANDIDATE_HYPOTHESES",
+    "CORRELATION_MAX_CANONICAL_BYTES",
     "CORRELATION_MAX_CONTRADICTIONS",
     "CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS",
     "CORRELATION_MAX_GATES",

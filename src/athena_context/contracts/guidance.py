@@ -13,6 +13,7 @@ from athena_context.contracts.common import (
     sha256_hex,
 )
 from athena_context.contracts.correlation import (
+    CORRELATION_MAX_CANDIDATE_HYPOTHESES,
     ConfidenceLevel,
     ContradictionCode,
     CorrelationReport,
@@ -858,6 +859,16 @@ class GuidanceHypothesisSummary(_StrictGuidanceModel):
         le=128,
     )
     supporting_evidence_digest: Sha256Digest = Field(alias="supportingEvidenceDigest")
+    omitted_candidate_count: int | None = Field(
+        default=None,
+        alias="omittedCandidateCount",
+        ge=1,
+        le=CORRELATION_MAX_CANDIDATE_HYPOTHESES,
+    )
+    omitted_candidate_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="omittedCandidateDigest",
+    )
     contradiction_codes: tuple[ContradictionCode, ...] = Field(
         alias="contradictionCodes",
         max_length=64,
@@ -878,6 +889,12 @@ class GuidanceHypothesisSummary(_StrictGuidanceModel):
         if any(len(value) > 128 or not _is_visible_ascii(value) for value in normalized):
             raise ValueError("hypothesis projection values are invalid")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_omission(self) -> GuidanceHypothesisSummary:
+        if (self.omitted_candidate_count is None) != (self.omitted_candidate_digest is None):
+            raise ValueError("omitted candidate count and digest must be supplied together")
+        return self
 
 
 class GuidanceTemplateParameter(_StrictGuidanceModel):
@@ -1377,6 +1394,8 @@ def project_guidance_hypotheses(
                 supportingEvidenceIds=evidence_ids[:4],
                 supportingEvidenceCount=len(evidence_ids),
                 supportingEvidenceDigest=compute_artifact_digest(list(evidence_ids)),
+                omittedCandidateCount=item.omitted_candidate_count,
+                omittedCandidateDigest=item.omitted_candidate_digest,
                 contradictionCodes=tuple(
                     sorted({contradiction.code for contradiction in item.contradictions})
                 ),

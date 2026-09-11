@@ -10,10 +10,18 @@ from typing import Any, cast
 
 import pytest
 
+import athena_context.contracts.correlation as correlation_contract
 import athena_context.correlation as correlation_package
 import athena_context.correlation.engine as correlation_engine
+import athena_context.correlation.verification as correlation_verification
 from athena_context.azure_adapters import AzureBlobVersionPinnedArtifactReader
-from athena_context.contracts import compute_artifact_digest, sha256_hex
+from athena_context.contracts import (
+    CORRELATION_MAX_CANONICAL_BYTES,
+    CorrelationReport,
+    compute_artifact_digest,
+    project_guidance_hypotheses,
+    sha256_hex,
+)
 from athena_context.correlation import (
     CORRELATION_RULE_CATALOG,
     CORRELATION_RULE_CATALOG_DIGEST,
@@ -1798,6 +1806,200 @@ def test_report_capacity_is_bounded_and_omissions_are_disclosed() -> None:
     assert len(report.hypotheses) == 64
     assert report.hypotheses[-1].category == "unknown"
     assert "omitted" in report.hypotheses[-1].missing_evidence[0].detail
+
+
+def test_report_byte_budget_preserves_top_causes_and_discloses_omissions() -> None:
+    base_bundle = _bundle()
+    backend_resource_ids = tuple(
+        (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourcegroups/rg-synthetic-wc026/providers/microsoft.compute/"
+            f"virtualmachines/backend-{index:03d}-{'x' * 1800}"
+        )
+        for index in range(127)
+    )
+    path = _dependency_path(
+        target_role_ref="database-primary",
+        relationship_id="relationship-wide-endpoint",
+        resource_ids=tuple(sorted((WEB_ID.lower(), *backend_resource_ids))),
+    )
+    endpoints = tuple(
+        _endpoint_health_observation(
+            path=path,
+            subject_resource_id=backend_resource_ids[index],
+            backend_resource_ids=backend_resource_ids,
+            observed_start=base_bundle.observed_start,
+            observed_end=base_bundle.observed_end,
+            source_root_reference=(f"endpoint-root:sha256:{index:064x}"),
+            source_record_reference=(f"endpoint-record:sha256:{index:064x}"),
+        )
+        for index in range(10)
+    )
+    bundle = _bundle(
+        observations=tuple(
+            sorted(
+                (*base_bundle.observations, *endpoints),
+                key=lambda item: item.observation_id,
+            )
+        ),
+        coverage=base_bundle.coverage,
+    )
+    request = _request(
+        bundle_override=bundle,
+        dependency_paths=(path,),
+    )
+    unbounded = correlation_engine._compute_hypotheses(request)
+    unbounded_ranked = correlation_verification._rank_hypotheses(unbounded)
+
+    assert (
+        correlation_verification._report_document_size(
+            request,
+            unbounded_ranked,
+        )
+        > CORRELATION_MAX_CANONICAL_BYTES
+    )
+
+    first = correlate_incident(request)
+    second = correlation_verification._build_verified_report(
+        request,
+        unbounded,
+    )
+
+    assert first == second
+    assert len(first.canonical_bytes()) <= CORRELATION_MAX_CANONICAL_BYTES
+    assert first.hypotheses[0].hypothesis_id == unbounded[0].hypothesis_id
+    assert len(first.hypotheses) < len(unbounded)
+    omission = first.hypotheses[-1]
+    retained_count = len(first.hypotheses) - 1
+    omitted = unbounded[retained_count:]
+    omitted_digest = compute_artifact_digest([item.hypothesis_digest for item in omitted])
+    assert omission.category == "unknown"
+    assert omission.omitted_candidate_count == len(omitted)
+    assert omission.omitted_candidate_digest == omitted_digest
+    assert omission.missing_evidence[0].code == "omittedCandidates"
+    assert "omitted" in omission.missing_evidence[0].detail
+    projected_omission = project_guidance_hypotheses(first)[-1]
+    assert projected_omission.omitted_candidate_count == len(omitted)
+    assert projected_omission.omitted_candidate_digest == omitted_digest
+
+    oversized_document = correlation_verification._report_document(
+        request,
+        unbounded_ranked,
+    )
+    with pytest.raises(
+        ValueError,
+        match="canonical byte budget",
+    ):
+        CorrelationReport.model_validate(oversized_document)
+
+
+def test_report_engine_budget_is_inclusive_and_preserves_top_hypothesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    hypotheses = correlation_engine._compute_hypotheses(request)
+    ranked = correlation_verification._rank_hypotheses(hypotheses)
+    exact_size = correlation_verification._report_document_size(
+        request,
+        ranked,
+    )
+
+    monkeypatch.setattr(
+        correlation_verification,
+        "CORRELATION_MAX_CANONICAL_BYTES",
+        exact_size,
+    )
+    assert (
+        correlation_verification._bound_report_hypotheses(
+            request,
+            hypotheses,
+        )
+        == ranked
+    )
+
+    monkeypatch.setattr(
+        correlation_verification,
+        "CORRELATION_MAX_CANONICAL_BYTES",
+        exact_size - 1,
+    )
+    with pytest.raises(
+        ValueError,
+        match="top correlation hypothesis",
+    ):
+        correlation_verification._bound_report_hypotheses(
+            request,
+            hypotheses,
+        )
+
+
+def test_report_contract_requires_one_final_omission_hypothesis() -> None:
+    request = _request(change_pair=_change_pair())
+    hypotheses = correlation_engine._compute_hypotheses(request)
+    assert len(hypotheses) >= 2
+    first_omission = correlation_engine._overflow_hypothesis(
+        request,
+        list(hypotheses[1:]),
+    )
+    second_omission = correlation_engine._overflow_hypothesis(
+        request,
+        [hypotheses[0]],
+    )
+
+    misplaced = correlation_verification._rank_hypotheses(
+        (first_omission, hypotheses[0])
+    )
+    with pytest.raises(ValueError, match="final rank"):
+        CorrelationReport.model_validate(
+            correlation_verification._report_document(
+                request,
+                misplaced,
+            )
+        )
+
+    duplicated = correlation_verification._rank_hypotheses(
+        (hypotheses[0], first_omission, second_omission)
+    )
+    with pytest.raises(ValueError, match="one omission hypothesis"):
+        CorrelationReport.model_validate(
+            correlation_verification._report_document(
+                request,
+                duplicated,
+            )
+        )
+
+    omission_only = correlation_verification._rank_hypotheses(
+        (first_omission,)
+    )
+    with pytest.raises(ValueError, match="one omission hypothesis"):
+        CorrelationReport.model_validate(
+            correlation_verification._report_document(
+                request,
+                omission_only,
+            )
+        )
+
+
+def test_report_byte_budget_accepts_limit_and_rejects_limit_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = correlate_incident(_request())
+    report_size = len(report.canonical_bytes())
+    payload = report.model_dump(mode="python", by_alias=True)
+
+    monkeypatch.setattr(
+        correlation_contract,
+        "CORRELATION_MAX_CANONICAL_BYTES",
+        report_size,
+    )
+    assert CorrelationReport.model_validate(payload) == report
+
+    monkeypatch.setattr(
+        correlation_contract,
+        "CORRELATION_MAX_CANONICAL_BYTES",
+        report_size - 1,
+    )
+    with pytest.raises(ValueError, match="canonical byte budget"):
+        CorrelationReport.model_validate(payload)
 
 
 def test_rank_order_is_stable_for_multiple_candidates() -> None:

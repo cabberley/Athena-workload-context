@@ -43,6 +43,7 @@ class CorrelationRuleCatalog:
     maximum_caps: int
     maximum_gate_evidence_ids: int
     maximum_contradiction_evidence_ids: int
+    maximum_report_canonical_bytes: int
 
     def canonical_payload(self) -> dict[str, object]:
         return {
@@ -77,6 +78,7 @@ class CorrelationRuleCatalog:
             "maximumCaps": self.maximum_caps,
             "maximumGateEvidenceIds": self.maximum_gate_evidence_ids,
             "maximumContradictionEvidenceIds": (self.maximum_contradiction_evidence_ids),
+            "maximumReportCanonicalBytes": self.maximum_report_canonical_bytes,
         }
 
 
@@ -172,6 +174,7 @@ CORRELATION_RULE_CATALOG = CorrelationRuleCatalog(
     maximum_caps=16,
     maximum_gate_evidence_ids=64,
     maximum_contradiction_evidence_ids=64,
+    maximum_report_canonical_bytes=8 * 1024 * 1024,
 )
 
 CORRELATION_RULE_CATALOG_DIGEST = compute_artifact_digest(
@@ -213,6 +216,8 @@ def assert_contract_compatibility() -> None:
         and contract.CORRELATION_REQUIRED_CAPS["missingDirectAttribution"]
         == CORRELATION_RULE_CATALOG.unattributed_nsg_max_confidence
         and CORRELATION_RULE_CATALOG.maximum_hypotheses == contract.CORRELATION_MAX_HYPOTHESES
+        and CORRELATION_RULE_CATALOG.maximum_candidate_hypotheses
+        == contract.CORRELATION_MAX_CANDIDATE_HYPOTHESES
         and CORRELATION_RULE_CATALOG.maximum_supporting_evidence
         == contract.CORRELATION_MAX_SUPPORTING_EVIDENCE
         and CORRELATION_RULE_CATALOG.maximum_contradictions
@@ -225,6 +230,8 @@ def assert_contract_compatibility() -> None:
         == contract.CORRELATION_MAX_GATE_EVIDENCE_IDS
         and CORRELATION_RULE_CATALOG.maximum_contradiction_evidence_ids
         == contract.CORRELATION_MAX_CONTRADICTION_EVIDENCE_IDS
+        and CORRELATION_RULE_CATALOG.maximum_report_canonical_bytes
+        == contract.CORRELATION_MAX_CANONICAL_BYTES
     )
     if not compatible:
         raise RuntimeError("WC-026 correlation contracts do not match the engine rule catalog")

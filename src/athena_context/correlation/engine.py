@@ -242,25 +242,9 @@ def _compute_hypotheses(
         hypotheses.append(_unknown_hypothesis(request))
 
     ordered = sorted(hypotheses, key=_hypothesis_sort_key)
-    if len(ordered) > CORRELATION_RULE_CATALOG.maximum_hypotheses:
-        retained_count = CORRELATION_RULE_CATALOG.maximum_hypotheses - 1
-        omitted = ordered[retained_count:]
-        ordered = [
-            *ordered[:retained_count],
-            _overflow_hypothesis(request, omitted),
-        ]
-    ranked = tuple(
-        RootCauseHypothesis.model_validate(
-            {
-                **item.model_dump(mode="python", by_alias=True),
-                "rank": index,
-            }
-        )
-        for index, item in enumerate(ordered, start=1)
-    )
     assert_catalog_digest()
     assert_contract_compatibility()
-    return ranked
+    return tuple(ordered)
 
 
 def _adverse_observation_ids(
@@ -1555,11 +1539,11 @@ def _overflow_hypothesis(
         candidate_causal_at=None,
         score=_score(0, 0, 0, 0, 0),
         confidence="Unknown",
-        support=request.incident_anchor.current_state_evidence,
+        support=[],
         contradictions=[],
         missing=[
             _missing(
-                "changeDetails",
+                "omittedCandidates",
                 "resourceChange",
                 (
                     f"{len(omitted)} lower-ranked candidates were omitted from the "
@@ -1573,6 +1557,8 @@ def _overflow_hypothesis(
             _cap("missingAffectedPath"),
             _cap("missingIndependentSupport"),
         ],
+        omitted_candidate_count=len(omitted),
+        omitted_candidate_digest=omitted_digest,
     )
 
 
@@ -2379,6 +2365,8 @@ def _make_hypothesis(
     missing: Iterable[MissingCorrelationEvidence],
     gates: Iterable[CorrelationGate],
     caps: Iterable[ConfidenceCap],
+    omitted_candidate_count: int | None = None,
+    omitted_candidate_digest: str | None = None,
 ) -> RootCauseHypothesis:
     sorted_support = tuple(
         sorted(
@@ -2433,6 +2421,8 @@ def _make_hypothesis(
         "supportingEvidence": sorted_support,
         "contradictions": sorted_contradictions,
         "missingEvidence": sorted_missing,
+        "omittedCandidateCount": omitted_candidate_count,
+        "omittedCandidateDigest": omitted_candidate_digest,
         "gates": sorted_gates,
         "caps": sorted_caps,
     }
@@ -2455,6 +2445,8 @@ def _make_hypothesis(
             item.model_dump(mode="json", by_alias=True, exclude_none=True)
             for item in sorted_missing
         ],
+        "omittedCandidateCount": omitted_candidate_count,
+        "omittedCandidateDigest": omitted_candidate_digest,
         "gates": [
             item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in sorted_gates
         ],
