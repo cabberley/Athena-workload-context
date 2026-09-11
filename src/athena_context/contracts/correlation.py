@@ -540,6 +540,23 @@ class NetworkFlowObservation(_MonitoringObservation):
         }
         if self.five_tuple_digest != compute_artifact_digest(tuple_payload):
             raise ValueError("fiveTupleDigest does not bind the exact flow tuple")
+        if self.rule_resource_id is not None:
+            enforcement_segments = self.enforcement_resource_id.split("/")
+            rule_segments = self.rule_resource_id.split("/")
+            if (
+                len(enforcement_segments) != 9
+                or enforcement_segments[1] != "subscriptions"
+                or enforcement_segments[3] != "resourcegroups"
+                or enforcement_segments[5] != "providers"
+                or enforcement_segments[6] != "microsoft.network"
+                or enforcement_segments[7] != "networksecuritygroups"
+                or len(rule_segments) != 11
+                or rule_segments[:9] != enforcement_segments
+                or rule_segments[9] != "securityrules"
+            ):
+                raise ValueError(
+                    "ruleResourceId must belong to enforcementResourceId"
+                )
         if self.effective_rule_attribution and (
             self.rule_resource_id is None
             or self.attribution_method is None
@@ -1782,6 +1799,7 @@ def _same_flow(
         and first.source_port == second.source_port
         and first.destination_port == second.destination_port
         and first.enforcement_resource_id == second.enforcement_resource_id
+        and first.rule_resource_id == second.rule_resource_id
     )
 
 
