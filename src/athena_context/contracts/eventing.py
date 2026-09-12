@@ -6,7 +6,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from athena_context.contracts.common import canonicalize_json
+from athena_context.contracts.common import (
+    canonicalize_json,
+    compute_artifact_digest,
+    sha256_hex,
+)
+from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
 EventLifecycle = Literal["activated", "resolved", "changed", "unknown"]
 EventSource = Literal["azureEventGrid", "azureMonitorCommonAlert"]
@@ -265,6 +270,18 @@ class IncidentStateAttestation(_StrictEventModel):
     )
 
 
+def incident_state_signature_preimage(state: IncidentState) -> bytes:
+    state = IncidentState.model_validate_json(
+        state.model_dump_json(by_alias=True)
+    )
+    unsigned = state.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"result_digest"},
+    )
+    return canonicalize_json(unsigned).encode("utf-8")
+
+
 class IncidentNotification(_StrictEventModel):
     schema_version: Literal["athena.incidentNotification.v1"] = Field(
         alias="schemaVersion"
@@ -361,6 +378,190 @@ class IncidentFeedAttestation(_StrictEventModel):
     )
 
 
+def incident_pointer_signature_preimage(
+    pointer: IncidentFeedPointer,
+) -> bytes:
+    pointer = IncidentFeedPointer.model_validate_json(
+        pointer.model_dump_json(by_alias=True)
+    )
+    return pointer.canonical_bytes()
+
+
+class IncidentOccurrenceReceipt(_StrictEventModel):
+    schema_version: Literal["athena.incidentOccurrenceReceipt.v1"] = Field(
+        alias="schemaVersion"
+    )
+    occurrence_id: str = Field(
+        alias="occurrenceId",
+        pattern=r"^incident-occurrence-[a-f0-9]{32}$",
+    )
+    incident_id: str = Field(
+        alias="incidentId",
+        pattern=r"^inc-[a-f0-9]{12}$",
+    )
+    transition_id: str = Field(
+        alias="transitionId",
+        pattern=r"^wc016-[a-f0-9]{64}$",
+    )
+    state_result_digest: str = Field(
+        alias="stateResultDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    state_reference: VersionPinnedBlobReference = Field(
+        alias="stateReference"
+    )
+    state_attestation_reference: VersionPinnedBlobReference = Field(
+        alias="stateAttestationReference"
+    )
+    pointer_reference: VersionPinnedBlobReference = Field(
+        alias="pointerReference"
+    )
+    pointer_attestation_reference: VersionPinnedBlobReference = Field(
+        alias="pointerAttestationReference"
+    )
+    published_at: datetime = Field(alias="publishedAt")
+    occurrence_digest: str = Field(
+        alias="occurrenceDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @field_validator("published_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        return _require_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> IncidentOccurrenceReceipt:
+        suffix = self.state_result_digest.removeprefix("sha256:")
+        prefix = f"incidents/{self.incident_id}/versions/{suffix}"
+        if (
+            self.state_reference.name != f"{prefix}/state.json"
+            or self.state_attestation_reference.name
+            != f"{prefix}/attestation.json"
+            or self.pointer_reference.name != f"{prefix}/pointer.json"
+            or self.pointer_attestation_reference.name
+            != f"{prefix}/pointer-attestation.json"
+        ):
+            raise ValueError(
+                "incident occurrence references do not bind one state version"
+            )
+        payload = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"occurrence_id", "occurrence_digest"},
+        )
+        expected = compute_artifact_digest(payload)
+        if self.occurrence_digest != expected:
+            raise ValueError(
+                "occurrenceDigest does not bind incident occurrence receipt"
+            )
+        if (
+            self.occurrence_id
+            != f"incident-occurrence-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("occurrenceId is not digest-bound")
+        if len(self.canonical_bytes()) > 16 * 1024:
+            raise ValueError(
+                "incident occurrence receipt exceeds its byte budget"
+            )
+        return self
+
+
+def build_incident_occurrence_receipt(
+    state: IncidentState,
+    state_attestation: IncidentStateAttestation,
+    pointer: IncidentFeedPointer,
+    pointer_attestation: IncidentFeedAttestation,
+    *,
+    state_reference: VersionPinnedBlobReference,
+    state_attestation_reference: VersionPinnedBlobReference,
+    pointer_reference: VersionPinnedBlobReference,
+    pointer_attestation_reference: VersionPinnedBlobReference,
+) -> IncidentOccurrenceReceipt:
+    state = IncidentState.model_validate_json(
+        state.model_dump_json(by_alias=True)
+    )
+    state_attestation = IncidentStateAttestation.model_validate_json(
+        state_attestation.model_dump_json(by_alias=True)
+    )
+    pointer = IncidentFeedPointer.model_validate_json(
+        pointer.model_dump_json(by_alias=True)
+    )
+    pointer_attestation = IncidentFeedAttestation.model_validate_json(
+        pointer_attestation.model_dump_json(by_alias=True)
+    )
+    state_bytes = state.canonical_bytes()
+    state_attestation_bytes = state_attestation.canonical_bytes()
+    pointer_bytes = pointer.canonical_bytes()
+    pointer_attestation_bytes = pointer_attestation.canonical_bytes()
+    if (
+        state.result_digest != sha256_hex(
+            incident_state_signature_preimage(state)
+        )
+        or state_attestation.result_digest != state.result_digest
+        or state_attestation.key_vault_key_id != pointer.key_id
+        or pointer_attestation.key_vault_key_id != pointer.key_id
+        or pointer.incident_id != state.incident_id
+        or pointer.state_sha256 != sha256_hex(state_bytes)
+        or pointer.state_path.removeprefix("./")
+        != state_reference.name
+        or pointer.attestation_sha256
+        != sha256_hex(state_attestation_bytes)
+        or pointer.attestation_path.removeprefix("./")
+        != state_attestation_reference.name
+        or pointer.state_path.removesuffix("/state.json").removeprefix("./")
+        + "/pointer.json"
+        != pointer_reference.name
+        or pointer.pointer_attestation_path.removeprefix("./")
+        != pointer_attestation_reference.name
+        or pointer_attestation.pointer_digest != sha256_hex(pointer_bytes)
+        or state_reference.content_digest != sha256_hex(state_bytes)
+        or state_attestation_reference.content_digest
+        != sha256_hex(state_attestation_bytes)
+        or pointer_reference.content_digest != sha256_hex(pointer_bytes)
+        or pointer_attestation_reference.content_digest
+        != sha256_hex(pointer_attestation_bytes)
+        or pointer.published_at < state.updated_at
+    ):
+        raise ValueError(
+            "incident occurrence receipt inputs do not match exact artifacts"
+        )
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.incidentOccurrenceReceipt.v1",
+        "incidentId": state.incident_id,
+        "transitionId": state.transition_id,
+        "stateResultDigest": state.result_digest,
+        "stateReference": state_reference,
+        "stateAttestationReference": state_attestation_reference,
+        "pointerReference": pointer_reference,
+        "pointerAttestationReference": pointer_attestation_reference,
+        "publishedAt": pointer.published_at,
+    }
+    digest_payload = {
+        key: (
+            value.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            if isinstance(value, BaseModel)
+            else value
+        )
+        for key, value in payload.items()
+    }
+    digest = compute_artifact_digest(digest_payload)
+    return IncidentOccurrenceReceipt.model_validate(
+        {
+            **payload,
+            "occurrenceId": (
+                f"incident-occurrence-{digest.removeprefix('sha256:')[:32]}"
+            ),
+            "occurrenceDigest": digest,
+        }
+    )
+
+
 class ActiveIncidentEntry(_StrictEventModel):
     incident_id: str = Field(alias="incidentId", pattern=r"^inc-[a-f0-9]{12}$")
     scenario: IncidentScenario
@@ -450,12 +651,16 @@ __all__ = [
     "IncidentFinding",
     "IncidentLifecycle",
     "IncidentNotification",
+    "IncidentOccurrenceReceipt",
     "IncidentScenario",
     "IncidentState",
     "IncidentStateAttestation",
     "NormalizedMonitorEvent",
     "ReassessmentRequest",
     "SignalKind",
-    "WorkloadRole",
     "VerifiedReassessmentResult",
+    "WorkloadRole",
+    "build_incident_occurrence_receipt",
+    "incident_pointer_signature_preimage",
+    "incident_state_signature_preimage",
 ]
