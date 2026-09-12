@@ -87,6 +87,17 @@ A later atomic publication service must reject all inputs before writing unless 
 Attestation fields bind claimed preimages but do not establish that a key is trusted. Trusted key
 roles remain service configuration, never data supplied by the artifact.
 
+This is an explicit **trust-transcoding** boundary. The six published assets do not persist the full
+incident subject, incident-bound request, or guidance-authority binding. Consumers trust the
+separate report, guidance, and enrichment publication signatures as assertions that the publisher
+verified those upstream signatures and immutable bytes. End-to-end replay of every upstream
+attestation would require additional version-pinned artifacts and is outside this slice.
+
+The process-local `VerifiedCorrelationReport` HMAC receipt is not transportable. Publication must
+run synchronously with the same `CorrelationService` instance that created the receipt, or
+recompute correlation inside that boundary. It must never persist or queue the current HMAC as
+durable authority.
+
 ### Create-only order
 
 The publication service writes or recovers exact existing bytes in this order:
@@ -98,9 +109,20 @@ The publication service writes or recovers exact existing bytes in this order:
 5. enrichment manifest; and
 6. enrichment attestation.
 
-The manifest is published only after all referenced assets exist. Conflicting existing bytes fail
-closed. This slice creates no mutable discovery pointer; consumer-first v1/v2 feed work will add
-discovery separately.
+The operation is an idempotent staged saga, not an atomic storage transaction. The manifest is
+published only after all referenced assets exist, and the final enrichment attestation is the
+commit marker consumers require. Conflicting existing bytes fail closed. This slice creates no
+mutable discovery pointer; consumer-first v1/v2 feed work will add discovery separately.
+
+Production composition must also:
+
+- enforce separate pinned report, guidance, and enrichment key versions and identities;
+- normalize signer output to the unpadded Base64URL form required by the contracts and immediately
+  self-verify every signature;
+- use path/prefix-constrained create-only storage adapters with Blob versioning and reviewed
+  retention controls; and
+- reject selected-runbook publication until the exact immutable runbook bytes can be verified by a
+  scheme-specific reader. A verified `noRunbook` outcome remains publishable.
 
 ## Consequences
 
