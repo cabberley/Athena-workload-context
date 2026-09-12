@@ -183,9 +183,7 @@ class IncidentEnrichmentPublicationService:
         )
         occurrence = incident_publication.occurrence
         if occurrence is None:
-            raise ValueError(
-                "incident enrichment requires a coherent occurrence receipt"
-            )
+            raise ValueError("incident enrichment requires a coherent occurrence receipt")
         occurrence = IncidentOccurrenceReceipt.model_validate_json(
             occurrence.model_dump_json(by_alias=True)
         )
