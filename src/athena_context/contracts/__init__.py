@@ -27,6 +27,10 @@ from athena_context.contracts.models import *  # noqa: F403
 from athena_context.contracts.models import __all__ as _model_all
 from athena_context.contracts.monitoring import *  # noqa: F403
 from athena_context.contracts.monitoring import __all__ as _monitoring_all
+from athena_context.contracts.monitoring_intent import *  # noqa: F403
+from athena_context.contracts.monitoring_intent import (
+    __all__ as _monitoring_intent_all,
+)
 from athena_context.contracts.operational_demo import *  # noqa: F403
 from athena_context.contracts.operational_demo import (
     __all__ as _operational_demo_all,
@@ -53,6 +57,7 @@ __all__ = [
     *list(_guidance_all),
     *list(_incident_enrichment_all),
     *list(_manifest_all),
+    *list(_monitoring_intent_all),
     *list(_monitoring_all),
     *list(_operational_demo_all),
     *list(_operational_phase_all),
