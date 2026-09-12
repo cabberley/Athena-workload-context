@@ -185,6 +185,7 @@ def build_incident_publication(
     signer: PresentationSigner,
     active_index_snapshot: ActiveIncidentIndexSnapshot | None = None,
 ) -> IncidentPublicationRequest:
+    published_at = max(published_at, state.updated_at)
     digest_suffix = state.result_digest.removeprefix("sha256:")
     prefix = f"incidents/{state.incident_id}/versions/{digest_suffix}"
     state_bytes = state.canonical_bytes()

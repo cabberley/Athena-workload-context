@@ -165,6 +165,30 @@ def run_incident_reassessment(
             and latest.state.scenario == request.scenario
             and latest.state.workload_role == request.workload_role
         ):
+            if expected_lifecycle == "active":
+                if (
+                    active_entry is None
+                    or active_entry.pointer_sha256
+                    != latest.pointer_sha256
+                    or active_entry.pointer_path
+                    != (
+                        "./"
+                        + latest.pointer.state_path.removesuffix(
+                            "/state.json"
+                        ).removeprefix("./")
+                        + "/pointer.json"
+                    )
+                    or active_entry.detected_at
+                    != latest.state.detected_at
+                    or active_entry.updated_at != latest.state.updated_at
+                ):
+                    raise RuntimeError(
+                        "active incident index is not coherent with current occurrence"
+                    )
+            elif active_entry is not None:
+                raise RuntimeError(
+                    "resolved occurrence remains in the active incident index"
+                )
             message = notification_message(
                 latest.state,
                 presentation_url=presentation_url,
@@ -175,6 +199,18 @@ def run_incident_reassessment(
                     lifecycle=latest.state.lifecycle,
                     transition_id=latest.state.transition_id,
                     message=message,
+                )
+            if (
+                latest.occurrence is not None
+                and active_index_snapshot is not None
+            ):
+                return latest.state, IncidentPublicationReceipt(
+                    incident_id=latest.state.incident_id,
+                    pointer_sha256=latest.pointer_sha256,
+                    active_index_sha256=(
+                        active_index_snapshot.payload_sha256
+                    ),
+                    occurrence=latest.occurrence,
                 )
         return None
     incident_detected_at = (

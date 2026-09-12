@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -13,11 +14,19 @@ import athena_context.eventing.detector as detector_module
 import athena_context.eventing.runtime as runtime_module
 from athena_context.azure_adapters import AzureBlobIncidentAssetPublisher
 from athena_context.cli import build_parser
-from athena_context.contracts import sha256_hex
+from athena_context.contracts import (
+    VersionPinnedBlobReference,
+    build_incident_occurrence_receipt,
+    sha256_hex,
+)
 from athena_context.contracts.eventing import (
+    ActiveIncidentIndex,
+    IncidentFeedAttestation,
+    IncidentFeedPointer,
     IncidentFinding,
     IncidentNotification,
     IncidentState,
+    IncidentStateAttestation,
 )
 from athena_context.eventing import (
     ApprovedLiveReassessmentAdapter,
@@ -671,6 +680,42 @@ def test_concurrent_publication_cas_loss_cannot_replace_indexed_pointer() -> Non
     )
 
 
+def test_incident_publication_rejects_index_occurrence_mismatch() -> None:
+    _, state, attestation = _state_and_attestation(
+        DB_ID,
+        "deallocate",
+        False,
+    )
+    publication = build_incident_publication(
+        state,
+        attestation,
+        published_at=NOW,
+        key_id=INCIDENT_KEY_ID,
+        key_fingerprint=INCIDENT_KEY_FINGERPRINT,
+        signer=_Signer(),
+    )
+    empty_index = build_active_incident_index_heartbeat(
+        published_at=NOW,
+        key_id=INCIDENT_KEY_ID,
+        key_fingerprint=INCIDENT_KEY_FINGERPRINT,
+        signer=_Signer(),
+        active_index_snapshot=None,
+    )
+
+    with pytest.raises(ValueError, match="does not match the occurrence"):
+        replace(
+            publication,
+            active_index=empty_index.active_index,
+            active_index_attestation=(
+                empty_index.active_index_attestation
+            ),
+            active_index_asset=empty_index.active_index_asset,
+            active_index_attestation_asset=(
+                empty_index.active_index_attestation_asset
+            ),
+        )
+
+
 def test_blob_publisher_translates_conditional_write_conflicts() -> None:
     asset = PresentationAsset(
         blob_name="incidents/active.json",
@@ -712,6 +757,111 @@ def test_blob_publisher_translates_conditional_write_conflicts() -> None:
         )
 
 
+def test_incident_publisher_returns_version_pinned_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, state, attestation = _state_and_attestation(
+        DB_ID,
+        "deallocate",
+        False,
+    )
+    publication = build_incident_publication(
+        state,
+        attestation,
+        published_at=NOW,
+        key_id=INCIDENT_KEY_ID,
+        key_fingerprint=INCIDENT_KEY_FINGERPRINT,
+        signer=_Signer(),
+    )
+    publisher = object.__new__(AzureBlobIncidentAssetPublisher)
+    publisher._signing_key_id = INCIDENT_KEY_ID
+    publisher._signing_key_fingerprint = INCIDENT_KEY_FINGERPRINT
+
+    def upload(
+        _self: object,
+        asset: PresentationAsset,
+    ) -> VersionPinnedBlobReference:
+        return VersionPinnedBlobReference(
+            name=asset.blob_name,
+            version=f"version-{sha256_hex(asset.blob_name)[:16]}",
+            contentDigest=asset.payload_sha256,
+        )
+
+    monkeypatch.setattr(
+        AzureBlobIncidentAssetPublisher,
+        "_upload_immutable",
+        upload,
+    )
+    monkeypatch.setattr(
+        AzureBlobIncidentAssetPublisher,
+        "_publish_current_pointer",
+        lambda _self, _request: None,
+    )
+    monkeypatch.setattr(
+        AzureBlobIncidentAssetPublisher,
+        "_publish_active_index",
+        lambda _self, _request: None,
+    )
+
+    receipt = publisher.publish_incident(publication)
+
+    assert receipt.occurrence is not None
+    assert receipt.occurrence.incident_id == state.incident_id
+    assert (
+        receipt.occurrence.pointer_reference.content_digest
+        == receipt.pointer_sha256
+    )
+
+
+def test_immutable_upload_requires_version_id() -> None:
+    asset = PresentationAsset(
+        blob_name=(
+            "incidents/inc-000000000000/versions/"
+            + "0" * 64
+            + "/state.json"
+        ),
+        payload=b"{}",
+        payload_sha256=sha256_hex(b"{}"),
+        maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+    )
+
+    class _Downloader:
+        properties = SimpleNamespace(
+            content_settings=SimpleNamespace(
+                content_type="application/json"
+            ),
+            metadata={"payload_sha256": asset.payload_sha256},
+            version_id=None,
+        )
+
+        @staticmethod
+        def readall() -> bytes:
+            return asset.payload
+
+    class _Blob:
+        @staticmethod
+        def upload_blob(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {}
+
+        @staticmethod
+        def download_blob(**_kwargs: object) -> _Downloader:
+            return _Downloader()
+
+    class _Container:
+        @staticmethod
+        def get_blob_client(_name: str) -> _Blob:
+            return _Blob()
+
+    publisher = object.__new__(AzureBlobIncidentAssetPublisher)
+    publisher._container = _Container()
+
+    with pytest.raises(
+        PresentationAssetAlreadyExistsError,
+        match="unversioned",
+    ):
+        publisher._upload_immutable(asset)
+
+
 def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
     _, state, attestation = _state_and_attestation(DB_ID, "deallocate", False)
     publication = build_incident_publication(
@@ -726,6 +876,10 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
         publication.current_pointer_asset.blob_name: (
             publication.current_pointer_asset.payload,
             publication.current_pointer_asset.payload_sha256,
+        ),
+        publication.pointer_asset.blob_name: (
+            publication.pointer_asset.payload,
+            publication.pointer_asset.payload_sha256,
         ),
         publication.pointer_attestation_asset.blob_name: (
             publication.pointer_attestation_asset.payload,
@@ -761,6 +915,7 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
                 properties=SimpleNamespace(
                     content_settings=SimpleNamespace(content_type="application/json"),
                     metadata={"payload_sha256": digest},
+                    version_id=f"version-{self.name}",
                 ),
                 readall=lambda: payload,
             )
@@ -781,8 +936,12 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
     assert snapshot is not None
     assert snapshot.state == state
     assert snapshot.pointer == publication.pointer
+    assert snapshot.occurrence is not None
     assert requested_lengths == {
         publication.current_pointer_asset.blob_name: (
+            MAX_INCIDENT_FEED_POINTER_BYTES + 1
+        ),
+        publication.pointer_asset.blob_name: (
             MAX_INCIDENT_FEED_POINTER_BYTES + 1
         ),
         publication.pointer_attestation_asset.blob_name: (
@@ -791,6 +950,40 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
         publication.state.blob_name: MAX_INCIDENT_STATE_BYTES + 1,
         publication.attestation.blob_name: MAX_PRESENTATION_ATTESTATION_BYTES + 1,
     }
+
+    stale_payload = publication.pointer.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    stale_payload["publishedAt"] = state.updated_at - timedelta(seconds=1)
+    stale_pointer = IncidentFeedPointer(**stale_payload)
+    stale_pointer_bytes = stale_pointer.canonical_bytes()
+    stale_pointer_digest = sha256_hex(stale_pointer_bytes)
+    stale_attestation = IncidentFeedAttestation(
+        schemaVersion="athena.incidentFeedAttestation.v1",
+        pointerDigest=stale_pointer_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=INCIDENT_KEY_ID,
+        detachedSignature="c3ludGhldGlj",
+    )
+    assets[publication.current_pointer_asset.blob_name] = (
+        stale_pointer_bytes,
+        stale_pointer_digest,
+    )
+    assets[publication.pointer_asset.blob_name] = (
+        stale_pointer_bytes,
+        stale_pointer_digest,
+    )
+    assets[publication.pointer_attestation_asset.blob_name] = (
+        stale_attestation.canonical_bytes(),
+        sha256_hex(stale_attestation.canonical_bytes()),
+    )
+    legacy_snapshot = publisher.read_current_incident_state(
+        incident_id=state.incident_id
+    )
+    assert legacy_snapshot is not None
+    assert legacy_snapshot.state == state
+    assert legacy_snapshot.occurrence is None
 
     assets[publication.state.blob_name] = (
         publication.state.payload,
@@ -1602,10 +1795,45 @@ class _Publisher:
             self.events.append("publish")
         self.requests.append(request)
         state = IncidentState.model_validate_json(request.state.payload)
+        state_attestation = IncidentStateAttestation.model_validate_json(
+            request.attestation.payload
+        )
+        pointer_attestation = IncidentFeedAttestation.model_validate_json(
+            request.pointer_attestation_asset.payload
+        )
+        occurrence = build_incident_occurrence_receipt(
+            state,
+            state_attestation,
+            request.pointer,
+            pointer_attestation,
+            state_reference=VersionPinnedBlobReference(
+                name=request.state.blob_name,
+                version="synthetic-state-version",
+                contentDigest=request.state.payload_sha256,
+            ),
+            state_attestation_reference=VersionPinnedBlobReference(
+                name=request.attestation.blob_name,
+                version="synthetic-state-attestation-version",
+                contentDigest=request.attestation.payload_sha256,
+            ),
+            pointer_reference=VersionPinnedBlobReference(
+                name=request.pointer_asset.blob_name,
+                version="synthetic-pointer-version",
+                contentDigest=request.pointer_asset.payload_sha256,
+            ),
+            pointer_attestation_reference=VersionPinnedBlobReference(
+                name=request.pointer_attestation_asset.blob_name,
+                version="synthetic-pointer-attestation-version",
+                contentDigest=(
+                    request.pointer_attestation_asset.payload_sha256
+                ),
+            ),
+        )
         self.current = CurrentIncidentStateSnapshot(
             state=state,
             pointer=request.pointer,
             pointer_sha256=request.pointer_asset.payload_sha256,
+            occurrence=occurrence,
         )
         self.snapshot = ActiveIncidentIndexSnapshot(
             index=request.active_index,
@@ -1615,6 +1843,7 @@ class _Publisher:
             incident_id=request.pointer.incident_id,
             pointer_sha256=request.pointer_asset.payload_sha256,
             active_index_sha256=request.active_index_asset.payload_sha256,
+            occurrence=occurrence,
         )
 
     def publish_active_incident_index(
@@ -1812,9 +2041,52 @@ def test_retry_after_publication_reenqueues_the_same_notification() -> None:
     assert publisher.current is not None
     assert publisher.current.state.transition_id == request.idempotency_key
 
-    assert run_incident_reassessment(request, **arguments) is None
+    recovered = run_incident_reassessment(request, **arguments)
+    assert recovered is not None
+    assert recovered[1].occurrence == publisher.current.occurrence
     assert len(publisher.requests) == 1
     assert notifications.transitions == [request.idempotency_key]
+
+
+def test_retry_with_incoherent_active_index_does_not_return_receipt() -> None:
+    request = _request(DB_ID, "deallocate")
+    publisher = _Publisher()
+    arguments = {
+        "detected_at": NOW,
+        "updated_at": NOW,
+        "published_at": NOW,
+        "presentation_url": "https://athena.invalid",
+        "signing_key_id": INCIDENT_KEY_ID,
+        "signing_key_fingerprint": INCIDENT_KEY_FINGERPRINT,
+        "reassessment": _Reassessment(False),
+        "signer": _Signer(),
+        "publisher": publisher,
+        "notifications": _Notifications(),
+    }
+    first = run_incident_reassessment(request, **arguments)
+    assert first is not None
+    assert publisher.snapshot is not None
+    entry = publisher.snapshot.index.incidents[0]
+    stale_entry = entry.model_copy(
+        update={"pointer_sha256": "sha256:" + "0" * 64}
+    )
+    stale_payload = publisher.snapshot.index.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    stale_payload["incidents"] = (stale_entry,)
+    stale_index = ActiveIncidentIndex(**stale_payload)
+    publisher.snapshot = ActiveIncidentIndexSnapshot(
+        index=stale_index,
+        payload_sha256=sha256_hex(stale_index.canonical_bytes()),
+    )
+    notifications = _Notifications()
+    arguments["notifications"] = notifications
+
+    with pytest.raises(RuntimeError, match="not coherent"):
+        run_incident_reassessment(request, **arguments)
+
+    assert notifications.transitions == []
 
 
 def test_resolution_retry_reenqueues_from_published_current_state() -> None:
@@ -1884,7 +2156,9 @@ def test_resolution_retry_reenqueues_from_published_current_state() -> None:
     assert publisher.current is not None
     assert publisher.current.state.lifecycle == "resolved"
 
-    assert run_incident_reassessment(request, **arguments) is None
+    recovered = run_incident_reassessment(request, **arguments)
+    assert recovered is not None
+    assert recovered[1].occurrence == publisher.current.occurrence
     assert len(publisher.requests) == 1
     assert notifications.transitions == [request.idempotency_key]
 
