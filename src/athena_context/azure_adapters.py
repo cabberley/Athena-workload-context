@@ -16,6 +16,8 @@ from azure.core.exceptions import (
     ResourceExistsError,
     ResourceModifiedError,
     ResourceNotFoundError,
+    ServiceRequestError,
+    ServiceResponseError,
 )
 from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
@@ -48,6 +50,8 @@ from athena_context.contracts import (
     IncidentStateAttestation,
     TrustedKeyAnchor,
     TrustedKeyRecord,
+    VersionPinnedBlobReference,
+    build_incident_occurrence_receipt,
     canonicalize_json,
     compute_artifact_digest,
     sha256_hex,
@@ -747,26 +751,36 @@ class AzureBlobIncidentAssetPublisher:
             raise PresentationAssetUnavailableError(
                 "current incident pointer trust binding is invalid"
             )
-        pointer_attestation_payload = self._read_incident_json_blob(
+        pointer_blob_name = (
+            pointer.state_path.removesuffix("/state.json").removeprefix("./")
+            + "/pointer.json"
+        )
+        immutable_pointer_payload, pointer_version = (
+            self._read_immutable_incident_json_blob(
+                pointer_blob_name,
+                maximum_bytes=MAX_INCIDENT_FEED_POINTER_BYTES,
+            )
+        )
+        (
+            pointer_attestation_payload,
+            pointer_attestation_version,
+        ) = self._read_immutable_incident_json_blob(
             pointer.pointer_attestation_path.removeprefix("./"),
             maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
         )
-        state_payload = self._read_incident_json_blob(
-            pointer.state_path.removeprefix("./"),
-            maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+        state_payload, state_version_id = (
+            self._read_immutable_incident_json_blob(
+                pointer.state_path.removeprefix("./"),
+                maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+            )
         )
-        state_attestation_payload = self._read_incident_json_blob(
+        (
+            state_attestation_payload,
+            state_attestation_version,
+        ) = self._read_immutable_incident_json_blob(
             pointer.attestation_path.removeprefix("./"),
             maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
         )
-        if (
-            pointer_attestation_payload is None
-            or state_payload is None
-            or state_attestation_payload is None
-        ):
-            raise PresentationAssetUnavailableError(
-                "current incident state is unavailable"
-            )
         try:
             pointer_attestation = IncidentFeedAttestation.model_validate_json(
                 pointer_attestation_payload
@@ -789,6 +803,8 @@ class AzureBlobIncidentAssetPublisher:
             f"./incidents/{incident_id}/versions/"
         ).removesuffix("/state.json")
         if (
+            immutable_pointer_payload != pointer_payload
+            or
             pointer_attestation_payload != pointer_attestation.canonical_bytes()
             or pointer_attestation.pointer_digest != sha256_hex(pointer_payload)
             or pointer_attestation.key_vault_key_id != self._signing_key_id
@@ -809,15 +825,45 @@ class AzureBlobIncidentAssetPublisher:
                 state_preimage,
                 state_attestation.detached_signature,
             )
-            or pointer.published_at < state.updated_at
         ):
             raise PresentationAssetUnavailableError(
                 "current incident state trust binding is invalid"
             )
+        occurrence = (
+            build_incident_occurrence_receipt(
+                state,
+                state_attestation,
+                pointer,
+                pointer_attestation,
+                state_reference=VersionPinnedBlobReference(
+                    name=pointer.state_path.removeprefix("./"),
+                    version=state_version_id,
+                    contentDigest=pointer.state_sha256,
+                ),
+                state_attestation_reference=VersionPinnedBlobReference(
+                    name=pointer.attestation_path.removeprefix("./"),
+                    version=state_attestation_version,
+                    contentDigest=pointer.attestation_sha256,
+                ),
+                pointer_reference=VersionPinnedBlobReference(
+                    name=pointer_blob_name,
+                    version=pointer_version,
+                    contentDigest=sha256_hex(pointer_payload),
+                ),
+                pointer_attestation_reference=VersionPinnedBlobReference(
+                    name=pointer.pointer_attestation_path.removeprefix("./"),
+                    version=pointer_attestation_version,
+                    contentDigest=sha256_hex(pointer_attestation_payload),
+                ),
+            )
+            if pointer.published_at >= state.updated_at
+            else None
+        )
         return CurrentIncidentStateSnapshot(
             state=state,
             pointer=pointer,
             pointer_sha256=sha256_hex(pointer_payload),
+            occurrence=occurrence,
         )
 
     def publish_incident(
@@ -834,20 +880,66 @@ class AzureBlobIncidentAssetPublisher:
             != self._signing_key_fingerprint
         ):
             raise ValueError("incident publication trust anchor is invalid")
-        for asset in (
-            request.state,
-            request.attestation,
-            request.pointer_asset,
-            request.pointer_attestation_asset,
-            request.active_index_attestation_asset,
-        ):
-            self._upload_immutable(asset)
+        build_incident_occurrence_receipt(
+            IncidentState.model_validate_json(request.state.payload),
+            IncidentStateAttestation.model_validate_json(
+                request.attestation.payload
+            ),
+            request.pointer,
+            request.pointer_attestation,
+            state_reference=VersionPinnedBlobReference(
+                name=request.state.blob_name,
+                version="preflight",
+                contentDigest=request.state.payload_sha256,
+            ),
+            state_attestation_reference=VersionPinnedBlobReference(
+                name=request.attestation.blob_name,
+                version="preflight",
+                contentDigest=request.attestation.payload_sha256,
+            ),
+            pointer_reference=VersionPinnedBlobReference(
+                name=request.pointer_asset.blob_name,
+                version="preflight",
+                contentDigest=request.pointer_asset.payload_sha256,
+            ),
+            pointer_attestation_reference=VersionPinnedBlobReference(
+                name=request.pointer_attestation_asset.blob_name,
+                version="preflight",
+                contentDigest=(
+                    request.pointer_attestation_asset.payload_sha256
+                ),
+            ),
+        )
+        state_reference = self._upload_immutable(request.state)
+        state_attestation_reference = self._upload_immutable(
+            request.attestation
+        )
+        pointer_reference = self._upload_immutable(
+            request.pointer_asset
+        )
+        pointer_attestation_reference = self._upload_immutable(
+            request.pointer_attestation_asset
+        )
+        self._upload_immutable(request.active_index_attestation_asset)
         self._publish_current_pointer(request)
         self._publish_active_index(request)
+        occurrence = build_incident_occurrence_receipt(
+            IncidentState.model_validate_json(request.state.payload),
+            IncidentStateAttestation.model_validate_json(
+                request.attestation.payload
+            ),
+            request.pointer,
+            request.pointer_attestation,
+            state_reference=state_reference,
+            state_attestation_reference=state_attestation_reference,
+            pointer_reference=pointer_reference,
+            pointer_attestation_reference=pointer_attestation_reference,
+        )
         return IncidentPublicationReceipt(
             incident_id=request.pointer.incident_id,
             pointer_sha256=request.pointer_asset.payload_sha256,
             active_index_sha256=request.active_index_asset.payload_sha256,
+            occurrence=occurrence,
         )
 
     def publish_active_incident_index(
@@ -871,10 +963,66 @@ class AzureBlobIncidentAssetPublisher:
             payload_sha256=request.active_index_asset.payload_sha256,
         )
 
-    def _upload_immutable(self, asset: Any) -> None:
+    @staticmethod
+    def _version_id(value: object) -> str | None:
+        candidate = (
+            (value.get("version_id") or value.get("versionId"))
+            if isinstance(value, dict)
+            else getattr(value, "version_id", None)
+        )
+        return (
+            candidate
+            if isinstance(candidate, str) and candidate
+            else None
+        )
+
+    def _recover_immutable_reference(
+        self,
+        blob: Any,
+        asset: Any,
+        *,
+        cause: BaseException,
+    ) -> VersionPinnedBlobReference:
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=asset.maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            existing_payload = downloader.readall()
+        except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
+            raise PresentationAssetAlreadyExistsError(
+                "an immutable incident asset could not be verified"
+            ) from read_exc
+        content_settings = getattr(properties, "content_settings", None)
+        metadata = getattr(properties, "metadata", None)
+        version_id = self._version_id(properties)
+        if (
+            existing_payload != asset.payload
+            or getattr(content_settings, "content_type", None)
+            != "application/json"
+            or type(metadata) is not dict
+            or metadata.get("payload_sha256") != asset.payload_sha256
+            or version_id is None
+        ):
+            raise PresentationAssetAlreadyExistsError(
+                "an immutable incident asset already exists with different "
+                "or unversioned content"
+            ) from cause
+        return VersionPinnedBlobReference(
+            name=asset.blob_name,
+            version=version_id,
+            contentDigest=asset.payload_sha256,
+        )
+
+    def _upload_immutable(
+        self,
+        asset: Any,
+    ) -> VersionPinnedBlobReference:
         blob = self._container.get_blob_client(asset.blob_name)
         try:
-            blob.upload_blob(
+            response = blob.upload_blob(
                 asset.payload,
                 blob_type=BlobType.BLOCKBLOB,
                 length=len(asset.payload),
@@ -888,30 +1036,31 @@ class AzureBlobIncidentAssetPublisher:
             normalized_code = getattr(error_code, "value", error_code)
             if normalized_code != "BlobAlreadyExists":
                 raise
-            try:
-                downloader = blob.download_blob(
-                    offset=0,
-                    length=asset.maximum_bytes + 1,
-                    max_concurrency=1,
-                )
-                properties = downloader.properties
-                existing_payload = downloader.readall()
-            except Exception as read_exc:  # noqa: BLE001 - Blob is a trust boundary.
-                raise PresentationAssetAlreadyExistsError(
-                    "an immutable incident asset could not be verified"
-                ) from read_exc
-            content_settings = getattr(properties, "content_settings", None)
-            metadata = getattr(properties, "metadata", None)
-            if (
-                existing_payload != asset.payload
-                or getattr(content_settings, "content_type", None)
-                != "application/json"
-                or type(metadata) is not dict
-                or metadata.get("payload_sha256") != asset.payload_sha256
-            ):
-                raise PresentationAssetAlreadyExistsError(
-                    "an immutable incident asset already exists with different content"
-                ) from exc
+            return self._recover_immutable_reference(
+                blob,
+                asset,
+                cause=exc,
+            )
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            return self._recover_immutable_reference(
+                blob,
+                asset,
+                cause=exc,
+            )
+        version_id = self._version_id(response)
+        if version_id is None:
+            return self._recover_immutable_reference(
+                blob,
+                asset,
+                cause=ValueError(
+                    "upload response omitted the Blob version ID"
+                ),
+            )
+        return VersionPinnedBlobReference(
+            name=asset.blob_name,
+            version=version_id,
+            contentDigest=asset.payload_sha256,
+        )
 
     def _read_incident_json_blob(
         self,
@@ -952,6 +1101,42 @@ class AzureBlobIncidentAssetPublisher:
                 "current incident asset metadata is invalid"
             )
         return payload
+
+    def _read_immutable_incident_json_blob(
+        self,
+        blob_name: str,
+        *,
+        maximum_bytes: int,
+    ) -> tuple[bytes, str]:
+        blob = self._container.get_blob_client(blob_name)
+        try:
+            downloader = blob.download_blob(
+                offset=0,
+                length=maximum_bytes + 1,
+                max_concurrency=1,
+            )
+            properties = downloader.properties
+            payload = downloader.readall()
+        except (ResourceNotFoundError, HttpResponseError) as exc:
+            raise PresentationAssetUnavailableError(
+                "immutable incident asset is unavailable"
+            ) from exc
+        content_settings = getattr(properties, "content_settings", None)
+        metadata = getattr(properties, "metadata", None)
+        version_id = self._version_id(properties)
+        if (
+            type(payload) is not bytes
+            or not 1 <= len(payload) <= maximum_bytes
+            or getattr(content_settings, "content_type", None)
+            != "application/json"
+            or type(metadata) is not dict
+            or metadata.get("payload_sha256") != sha256_hex(payload)
+            or version_id is None
+        ):
+            raise PresentationAssetUnavailableError(
+                "immutable incident asset metadata or version is invalid"
+            )
+        return payload, version_id
 
     def _publish_current_pointer(self, request: IncidentPublicationRequest) -> None:
         asset = request.current_pointer_asset

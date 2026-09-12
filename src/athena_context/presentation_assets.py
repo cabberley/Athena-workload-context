@@ -9,6 +9,7 @@ from athena_context.contracts import (
     ActiveIncidentIndexAttestation,
     IncidentFeedAttestation,
     IncidentFeedPointer,
+    IncidentOccurrenceReceipt,
     IncidentState,
     PresentationRuntimeManifestV2,
     sha256_hex,
@@ -213,6 +214,34 @@ class IncidentPublicationRequest:
         )
         if actual != expected:
             raise ValueError("incident assets do not exactly match their current pointer")
+        state = IncidentState.model_validate_json(self.state.payload)
+        entry = next(
+            (
+                item
+                for item in self.active_index.incidents
+                if item.incident_id == state.incident_id
+            ),
+            None,
+        )
+        if state.lifecycle == "active":
+            if (
+                entry is None
+                or entry.scenario != state.scenario
+                or entry.workload_role != state.workload_role
+                or entry.pointer_path
+                != f"./{self.pointer_asset.blob_name}"
+                or entry.pointer_sha256
+                != self.pointer_asset.payload_sha256
+                or entry.detected_at != state.detected_at
+                or entry.updated_at != state.updated_at
+            ):
+                raise ValueError(
+                    "active incident index does not match the occurrence"
+                )
+        elif entry is not None:
+            raise ValueError(
+                "resolved incident must not remain in the active index"
+            )
         _validate_active_incident_index_assets(
             active_index=self.active_index,
             active_index_attestation=self.active_index_attestation,
@@ -227,6 +256,17 @@ class IncidentPublicationReceipt:
     incident_id: str
     pointer_sha256: str
     active_index_sha256: str
+    occurrence: IncidentOccurrenceReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if self.occurrence is not None and (
+            self.occurrence.incident_id != self.incident_id
+            or self.occurrence.pointer_reference.content_digest
+            != self.pointer_sha256
+        ):
+            raise ValueError(
+                "incident publication receipt occurrence is invalid"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,12 +284,23 @@ class CurrentIncidentStateSnapshot:
     state: IncidentState
     pointer: IncidentFeedPointer
     pointer_sha256: str
+    occurrence: IncidentOccurrenceReceipt | None = None
 
     def __post_init__(self) -> None:
         if (
             self.pointer.incident_id != self.state.incident_id
             or self.pointer.state_sha256 != sha256_hex(self.state.canonical_bytes())
             or self.pointer_sha256 != sha256_hex(self.pointer.canonical_bytes())
+            or (
+                self.occurrence is not None
+                and (
+                    self.occurrence.incident_id != self.state.incident_id
+                    or self.occurrence.transition_id
+                    != self.state.transition_id
+                    or self.occurrence.pointer_reference.content_digest
+                    != self.pointer_sha256
+                )
+            )
         ):
             raise ValueError("current incident state snapshot binding is invalid")
 
