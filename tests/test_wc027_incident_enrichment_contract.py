@@ -406,7 +406,16 @@ def test_manifest_rejects_guidance_from_another_report() -> None:
         ),
     )
     other_binding = _binding(request=request, report=other_report)
-    _, other_guidance, _ = _guidance_assets(other_binding)
+    other_reference, other_guidance, _ = _guidance_assets(other_binding)
+
+    with pytest.raises(ValueError, match="exact incident occurrence"):
+        build_incident_enrichment_manifest(
+            binding.incident_bound_request,
+            assets["report_reference"],
+            assets["report"],
+            other_reference,
+            other_guidance,
+        )
 
     with pytest.raises(
         ValueError,

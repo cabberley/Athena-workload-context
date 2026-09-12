@@ -86,6 +86,30 @@ def _require_canonical_size(
         raise ValueError(f"{name} exceeds its canonical byte budget")
 
 
+def _guidance_matches_occurrence(
+    guidance: IncidentGuidance,
+    incident_bound_request: IncidentBoundCorrelationRequest,
+    report: CorrelationReport,
+) -> bool:
+    subject = incident_bound_request.incident_subject
+    source = guidance.source_binding
+    return (
+        source.incident_id == subject.incident_id
+        and source.incident_revision == subject.incident_revision
+        and source.incident_state_digest == subject.incident_state_digest
+        and source.incident_subject_id == subject.subject_id
+        and source.incident_subject_digest == subject.subject_digest
+        and source.incident_bound_request_id
+        == incident_bound_request.request_id
+        and source.incident_bound_request_digest
+        == incident_bound_request.binding_digest
+        and source.correlation_report_id == report.report_id
+        and source.correlation_report_digest == report.report_digest
+        and source.correlation_request_digest == report.request_digest
+        and source.transition_digest == report.transition_digest
+    )
+
+
 class PublishedCorrelationReportStatement(_StrictIncidentEnrichmentModel):
     schema_version: Literal["athena.wc027PublishedCorrelationReportStatement.v1"] = Field(
         alias="schemaVersion"
@@ -542,6 +566,14 @@ def build_incident_enrichment_manifest(
         != sha256_hex(guidance.canonical_bytes())
     ):
         raise ValueError("guidance asset does not match exact guidance")
+    if not _guidance_matches_occurrence(
+        guidance,
+        incident_bound_request,
+        report,
+    ):
+        raise ValueError(
+            "guidance does not match exact incident occurrence and report"
+        )
     payload: dict[str, object] = {
         "schemaVersion": "athena.wc027IncidentEnrichmentManifest.v1",
         "incidentId": subject.incident_id,
@@ -687,23 +719,11 @@ def validate_incident_enrichment_manifest_binding(
         or guidance_asset.guidance_digest != guidance.guidance_digest
         or guidance_asset.guidance_reference.content_digest
         != sha256_hex(guidance.canonical_bytes())
-        or guidance.source_binding.incident_id != subject.incident_id
-        or guidance.source_binding.incident_revision != subject.incident_revision
-        or guidance.source_binding.incident_state_digest
-        != subject.incident_state_digest
-        or guidance.source_binding.incident_subject_id != subject.subject_id
-        or guidance.source_binding.incident_subject_digest
-        != subject.subject_digest
-        or guidance.source_binding.incident_bound_request_id
-        != incident_bound_request.request_id
-        or guidance.source_binding.incident_bound_request_digest
-        != incident_bound_request.binding_digest
-        or guidance.source_binding.correlation_report_id != report.report_id
-        or guidance.source_binding.correlation_report_digest
-        != report.report_digest
-        or guidance.source_binding.correlation_request_digest
-        != report.request_digest
-        or guidance.source_binding.transition_digest != report.transition_digest
+        or not _guidance_matches_occurrence(
+            guidance,
+            incident_bound_request,
+            report,
+        )
     ):
         raise ValueError("incident enrichment manifest does not match exact assets")
 
