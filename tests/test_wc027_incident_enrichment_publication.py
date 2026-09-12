@@ -28,8 +28,9 @@ from athena_context.enrichment import (
 )
 from athena_context.eventing import build_incident_publication
 from athena_context.presentation_assets import (
+    ActiveIncidentIndexSnapshot,
+    CurrentIncidentStateSnapshot,
     IncidentPublicationReceipt,
-    _issue_incident_publication_receipt,
 )
 from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import _request
@@ -135,12 +136,31 @@ class _Store:
 
 
 @dataclass(frozen=True, slots=True)
+class _PublicationReader:
+    current: CurrentIncidentStateSnapshot
+    active_index: ActiveIncidentIndexSnapshot
+
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None:
+        return self.current if self.current.state.incident_id == incident_id else None
+
+    def read_active_incident_index(
+        self,
+    ) -> ActiveIncidentIndexSnapshot | None:
+        return self.active_index
+
+
+@dataclass(frozen=True, slots=True)
 class _Fixture:
     correlation_service: object
     verified_report: object
     guidance_binding: object
     incident_publication: IncidentPublicationReceipt
     incident_reader: _Reader
+    publication_reader: _PublicationReader
     authority_reader: _Reader
 
 
@@ -204,7 +224,7 @@ def _fixture(*, selected_runbook: bool = False) -> _Fixture:
         pointer_reference=pointer_reference,
         pointer_attestation_reference=pointer_attestation_reference,
     )
-    incident_publication = _issue_incident_publication_receipt(
+    incident_publication = IncidentPublicationReceipt(
         incident_id=state.incident_id,
         pointer_sha256=publication.pointer_asset.payload_sha256,
         active_index_sha256=(publication.active_index_asset.payload_sha256),
@@ -230,6 +250,18 @@ def _fixture(*, selected_runbook: bool = False) -> _Fixture:
             ): publication.pointer_attestation.canonical_bytes(),
         }
     )
+    publication_reader = _PublicationReader(
+        current=CurrentIncidentStateSnapshot(
+            state=state,
+            pointer=publication.pointer,
+            pointer_sha256=publication.pointer_asset.payload_sha256,
+            occurrence=occurrence,
+        ),
+        active_index=ActiveIncidentIndexSnapshot(
+            index=publication.active_index,
+            payload_sha256=publication.active_index_asset.payload_sha256,
+        ),
+    )
     authority_reference = guidance_binding.guidance_authority_reference
     authority_reader = _Reader(
         {
@@ -245,6 +277,7 @@ def _fixture(*, selected_runbook: bool = False) -> _Fixture:
         guidance_binding=guidance_binding,
         incident_publication=incident_publication,
         incident_reader=incident_reader,
+        publication_reader=publication_reader,
         authority_reader=authority_reader,
     )
 
@@ -261,6 +294,7 @@ def _publication_service(
     return IncidentEnrichmentPublicationService(
         correlation_service=fixture.correlation_service,
         incident_reader=fixture.incident_reader,
+        incident_publication_reader=fixture.publication_reader,
         guidance_authority_reader=fixture.authority_reader,
         artifact_writer=store,
         incident_key_id=(request.incident_subject.incident_state_attestation.key_vault_key_id),
@@ -345,33 +379,18 @@ def test_untrusted_occurrence_fails_before_any_write() -> None:
     assert store.calls == []
 
 
-def test_forged_plain_receipt_cannot_claim_cas_coherence() -> None:
+def test_forged_receipt_cannot_claim_active_index_coherence() -> None:
     fixture = _fixture()
     store = _Store()
-    forged = object.__new__(IncidentPublicationReceipt)
-    object.__setattr__(
-        forged,
-        "incident_id",
-        fixture.incident_publication.incident_id,
-    )
-    object.__setattr__(
-        forged,
-        "pointer_sha256",
-        fixture.incident_publication.pointer_sha256,
-    )
-    object.__setattr__(
-        forged,
-        "active_index_sha256",
-        "sha256:" + "f" * 64,
-    )
-    object.__setattr__(
-        forged,
-        "occurrence",
-        fixture.incident_publication.occurrence,
+    forged = IncidentPublicationReceipt(
+        incident_id=fixture.incident_publication.incident_id,
+        pointer_sha256=fixture.incident_publication.pointer_sha256,
+        active_index_sha256="sha256:" + "f" * 64,
+        occurrence=fixture.incident_publication.occurrence,
     )
     service = _publication_service(fixture, store)
 
-    with pytest.raises(ValueError, match="verified coherent publication"):
+    with pytest.raises(ValueError, match="active-index coherent"):
         service.publish(
             incident_publication=forged,
             verified_report=fixture.verified_report,

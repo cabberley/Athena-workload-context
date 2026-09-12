@@ -59,8 +59,9 @@ from athena_context.correlation import (
 from athena_context.guidance import build_incident_guidance
 from athena_context.presentation import PresentationSigner
 from athena_context.presentation_assets import (
+    ActiveIncidentIndexSnapshot,
+    CurrentIncidentStateSnapshot,
     IncidentPublicationReceipt,
-    require_verified_incident_publication_receipt,
 )
 
 SignatureVerifier = Callable[[bytes, str], bool]
@@ -71,6 +72,18 @@ class IncidentEnrichmentArtifactWriterPort(Protocol):
         self,
         request: ArtifactWriteRequest,
     ) -> VersionPinnedBlobReference: ...
+
+
+class IncidentPublicationReaderPort(Protocol):
+    def read_active_incident_index(
+        self,
+    ) -> ActiveIncidentIndexSnapshot | None: ...
+
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +111,7 @@ class IncidentEnrichmentPublicationReceipt:
 class IncidentEnrichmentPublicationService:
     correlation_service: CorrelationService
     incident_reader: VersionPinnedArtifactReaderPort
+    incident_publication_reader: IncidentPublicationReaderPort
     guidance_authority_reader: VersionPinnedArtifactReaderPort
     artifact_writer: IncidentEnrichmentArtifactWriterPort
     incident_key_id: str
@@ -158,7 +172,8 @@ class IncidentEnrichmentPublicationService:
         verified_report: VerifiedCorrelationReport,
         guidance_binding: PublishedGuidanceAuthorityBinding,
     ) -> IncidentEnrichmentPublicationReceipt:
-        incident_publication = require_verified_incident_publication_receipt(incident_publication)
+        if type(incident_publication) is not IncidentPublicationReceipt:
+            raise TypeError("incident_publication must be an exact IncidentPublicationReceipt")
         if type(verified_report) is not VerifiedCorrelationReport:
             raise TypeError("verified_report must be an exact VerifiedCorrelationReport")
         if type(guidance_binding) is not PublishedGuidanceAuthorityBinding:
@@ -167,6 +182,10 @@ class IncidentEnrichmentPublicationService:
             guidance_binding.model_dump_json(by_alias=True)
         )
         occurrence = incident_publication.occurrence
+        if occurrence is None:
+            raise ValueError(
+                "incident enrichment requires a coherent occurrence receipt"
+            )
         occurrence = IncidentOccurrenceReceipt.model_validate_json(
             occurrence.model_dump_json(by_alias=True)
         )
@@ -176,6 +195,11 @@ class IncidentEnrichmentPublicationService:
             pointer,
             pointer_attestation,
         ) = self._verify_occurrence(incident_publication, occurrence)
+        self._verify_current_publication(
+            incident_publication,
+            occurrence=occurrence,
+            state=state,
+        )
         request = guidance_binding.incident_bound_request
         self._verify_incident_request(
             request,
@@ -456,6 +480,50 @@ class IncidentEnrichmentPublicationService:
         ):
             raise ValueError("incident occurrence is not a trusted coherent publication")
         return state, state_attestation, pointer, pointer_attestation
+
+    def _verify_current_publication(
+        self,
+        publication: IncidentPublicationReceipt,
+        *,
+        occurrence: IncidentOccurrenceReceipt,
+        state: IncidentState,
+    ) -> None:
+        current = self.incident_publication_reader.read_current_incident_state(
+            incident_id=occurrence.incident_id
+        )
+        active_index = self.incident_publication_reader.read_active_incident_index()
+        if (
+            current is None
+            or current.occurrence is None
+            or active_index is None
+            or current.state != state
+            or current.occurrence != occurrence
+            or current.pointer_sha256 != publication.pointer_sha256
+            or active_index.payload_sha256 != publication.active_index_sha256
+        ):
+            raise ValueError("incident publication is not current and active-index coherent")
+        entry = next(
+            (
+                item
+                for item in active_index.index.incidents
+                if item.incident_id == occurrence.incident_id
+            ),
+            None,
+        )
+        if state.lifecycle == "active":
+            if (
+                entry is None
+                or entry.lifecycle != "active"
+                or entry.scenario != state.scenario
+                or entry.workload_role != state.workload_role
+                or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
+                or entry.pointer_sha256 != publication.pointer_sha256
+                or entry.detected_at != state.detected_at
+                or entry.updated_at != state.updated_at
+            ):
+                raise ValueError("active incident publication is not index coherent")
+        elif entry is not None:
+            raise ValueError("resolved incident publication remains in the active index")
 
     def _verify_incident_request(
         self,
@@ -860,4 +928,5 @@ __all__ = [
     "IncidentEnrichmentArtifactWriterPort",
     "IncidentEnrichmentPublicationReceipt",
     "IncidentEnrichmentPublicationService",
+    "IncidentPublicationReaderPort",
 ]

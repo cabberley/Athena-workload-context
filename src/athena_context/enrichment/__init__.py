@@ -5,6 +5,7 @@ from athena_context.enrichment.publication import (
     IncidentEnrichmentArtifactWriterPort,
     IncidentEnrichmentPublicationReceipt,
     IncidentEnrichmentPublicationService,
+    IncidentPublicationReaderPort,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "IncidentEnrichmentArtifactWriterPort",
     "IncidentEnrichmentPublicationReceipt",
     "IncidentEnrichmentPublicationService",
+    "IncidentPublicationReaderPort",
 ]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from athena_context.contracts import (
@@ -21,7 +20,6 @@ MAX_PRESENTATION_PAYLOAD_BYTES = 128 * 1024
 MAX_PRESENTATION_ATTESTATION_BYTES = 24 * 1024
 MAX_INCIDENT_FEED_POINTER_BYTES = 16 * 1024
 MAX_INCIDENT_STATE_BYTES = 64 * 1024
-_VERIFIED_INCIDENT_PUBLICATION_MARKER = object()
 
 
 class PresentationAssetError(RuntimeError):
@@ -95,7 +93,9 @@ class PresentationPublicationRequest:
             )
         actual = [(asset.blob_name, asset.payload_sha256) for asset in self.assets]
         if actual != expected:
-            raise ValueError("publication assets do not exactly match the runtime manifest")
+            raise ValueError(
+                "publication assets do not exactly match the runtime manifest"
+            )
         manifest_bytes = self.manifest.canonical_bytes()
         if len(manifest_bytes) > MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES:
             raise ValueError("runtime manifest exceeds its byte bound")
@@ -128,11 +128,13 @@ def _validate_active_incident_index_assets(
         or active_index_attestation.index_digest != sha256_hex(index_bytes)
         or active_index_attestation_asset.blob_name
         != active_index.index_attestation_path.removeprefix("./")
-        or active_index_attestation_asset.payload != active_index_attestation.canonical_bytes()
+        or active_index_attestation_asset.payload
+        != active_index_attestation.canonical_bytes()
     ):
         raise ValueError("active incident index assets are invalid")
-    if previous_active_index_sha256 is not None and not previous_active_index_sha256.startswith(
-        "sha256:"
+    if (
+        previous_active_index_sha256 is not None
+        and not previous_active_index_sha256.startswith("sha256:")
     ):
         raise ValueError("previous active incident index digest is invalid")
 
@@ -192,7 +194,8 @@ class IncidentPublicationRequest:
         if (
             self.pointer_attestation_asset.blob_name
             != self.pointer.pointer_attestation_path.removeprefix("./")
-            or self.pointer_attestation_asset.payload != self.pointer_attestation.canonical_bytes()
+            or self.pointer_attestation_asset.payload
+            != self.pointer_attestation.canonical_bytes()
         ):
             raise ValueError("incident pointer attestation asset is invalid")
         expected = (
@@ -213,7 +216,11 @@ class IncidentPublicationRequest:
             raise ValueError("incident assets do not exactly match their current pointer")
         state = IncidentState.model_validate_json(self.state.payload)
         entry = next(
-            (item for item in self.active_index.incidents if item.incident_id == state.incident_id),
+            (
+                item
+                for item in self.active_index.incidents
+                if item.incident_id == state.incident_id
+            ),
             None,
         )
         if state.lifecycle == "active":
@@ -221,14 +228,20 @@ class IncidentPublicationRequest:
                 entry is None
                 or entry.scenario != state.scenario
                 or entry.workload_role != state.workload_role
-                or entry.pointer_path != f"./{self.pointer_asset.blob_name}"
-                or entry.pointer_sha256 != self.pointer_asset.payload_sha256
+                or entry.pointer_path
+                != f"./{self.pointer_asset.blob_name}"
+                or entry.pointer_sha256
+                != self.pointer_asset.payload_sha256
                 or entry.detected_at != state.detected_at
                 or entry.updated_at != state.updated_at
             ):
-                raise ValueError("active incident index does not match the occurrence")
+                raise ValueError(
+                    "active incident index does not match the occurrence"
+                )
         elif entry is not None:
-            raise ValueError("resolved incident must not remain in the active index")
+            raise ValueError(
+                "resolved incident must not remain in the active index"
+            )
         _validate_active_incident_index_assets(
             active_index=self.active_index,
             active_index_attestation=self.active_index_attestation,
@@ -238,68 +251,22 @@ class IncidentPublicationRequest:
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True)
 class IncidentPublicationReceipt:
     incident_id: str
     pointer_sha256: str
     active_index_sha256: str
-    occurrence: IncidentOccurrenceReceipt
-    _verification_marker: object = field(
-        repr=False,
-        compare=False,
-    )
+    occurrence: IncidentOccurrenceReceipt | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self._verification_marker is not _VERIFIED_INCIDENT_PUBLICATION_MARKER
-            or re.fullmatch(r"sha256:[a-f0-9]{64}", self.pointer_sha256) is None
-            or re.fullmatch(
-                r"sha256:[a-f0-9]{64}",
-                self.active_index_sha256,
-            )
-            is None
-            or self.occurrence.incident_id != self.incident_id
-            or self.occurrence.pointer_reference.content_digest != self.pointer_sha256
+        if self.occurrence is not None and (
+            self.occurrence.incident_id != self.incident_id
+            or self.occurrence.pointer_reference.content_digest
+            != self.pointer_sha256
         ):
-            raise ValueError("incident publication receipt is not a verified coherent publication")
-
-
-def _issue_incident_publication_receipt(
-    *,
-    incident_id: str,
-    pointer_sha256: str,
-    active_index_sha256: str,
-    occurrence: IncidentOccurrenceReceipt,
-) -> IncidentPublicationReceipt:
-    receipt = object.__new__(IncidentPublicationReceipt)
-    object.__setattr__(receipt, "incident_id", incident_id)
-    object.__setattr__(receipt, "pointer_sha256", pointer_sha256)
-    object.__setattr__(
-        receipt,
-        "active_index_sha256",
-        active_index_sha256,
-    )
-    object.__setattr__(receipt, "occurrence", occurrence)
-    object.__setattr__(
-        receipt,
-        "_verification_marker",
-        _VERIFIED_INCIDENT_PUBLICATION_MARKER,
-    )
-    receipt.__post_init__()
-    return receipt
-
-
-def require_verified_incident_publication_receipt(
-    receipt: IncidentPublicationReceipt,
-) -> IncidentPublicationReceipt:
-    if (
-        type(receipt) is not IncidentPublicationReceipt
-        or getattr(receipt, "_verification_marker", None)
-        is not _VERIFIED_INCIDENT_PUBLICATION_MARKER
-    ):
-        raise ValueError("incident publication receipt is not a verified coherent publication")
-    receipt.__post_init__()
-    return receipt
+            raise ValueError(
+                "incident publication receipt occurrence is invalid"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,8 +295,10 @@ class CurrentIncidentStateSnapshot:
                 self.occurrence is not None
                 and (
                     self.occurrence.incident_id != self.state.incident_id
-                    or self.occurrence.transition_id != self.state.transition_id
-                    or self.occurrence.pointer_reference.content_digest != self.pointer_sha256
+                    or self.occurrence.transition_id
+                    != self.state.transition_id
+                    or self.occurrence.pointer_reference.content_digest
+                    != self.pointer_sha256
                 )
             )
         ):
@@ -400,5 +369,4 @@ __all__ = [
     "PresentationAssetUnavailableError",
     "PresentationPublicationReceipt",
     "PresentationPublicationRequest",
-    "require_verified_incident_publication_receipt",
 ]
