@@ -348,6 +348,16 @@ class PresentationAssetReaderPort(Protocol):
     ) -> PresentationAssetReadResult: ...
 
 
+class VersionedPresentationAssetReaderPort(PresentationAssetReaderPort, Protocol):
+    def read_version(
+        self,
+        *,
+        blob_name: str,
+        version: str,
+        maximum_bytes: int,
+    ) -> PresentationAssetReadResult: ...
+
+
 __all__ = [
     "MAX_PRESENTATION_ATTESTATION_BYTES",
     "MAX_INCIDENT_FEED_POINTER_BYTES",
@@ -366,6 +376,7 @@ __all__ = [
     "PresentationAssetPublisherPort",
     "PresentationAssetReadResult",
     "PresentationAssetReaderPort",
+    "VersionedPresentationAssetReaderPort",
     "PresentationAssetUnavailableError",
     "PresentationPublicationReceipt",
     "PresentationPublicationRequest",

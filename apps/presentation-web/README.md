@@ -35,8 +35,29 @@ Before any lifecycle data is rendered, the browser:
 
 Any failure withholds the complete lifecycle. The browser has no Azure SDK, Blob URL, ARM, MCP,
 storage credential, direct cloud call, mutation, or remediation capability. In live deployment,
-NGINX proxies only `/runtime-manifest.json` and `/live/` to a localhost managed-identity sidecar;
+NGINX proxies only `/runtime-manifest.json`, `/live/`, and `/incidents/` to a localhost
+managed-identity sidecar;
 the browser remains same-origin and the static reviewed key remains at `/trust/...`.
+
+## WC-027 operator guidance
+
+For an independently verified v1 incident, the browser also attempts the dormant WC-027 consumer
+path at `/incidents/feed-v2.json`. It renders guidance only after the v2 index, exact-version feed
+pointer, enrichment manifest, and guidance asset all pass strict schema, byte-bound, digest,
+cross-occurrence, pinned-key fingerprint, and detached RS256 verification. Version-pinned assets
+are requested with the reference's exact Blob version in the `version` query parameter.
+
+The build must pin separate feed, enrichment, and guidance trust anchors:
+
+- `VITE_WC027_FEED_KEY_ID` and `VITE_WC027_FEED_KEY_FINGERPRINT`;
+- `VITE_WC027_ENRICHMENT_KEY_ID` and `VITE_WC027_ENRICHMENT_KEY_FINGERPRINT`; and
+- `VITE_WC027_GUIDANCE_KEY_ID` and `VITE_WC027_GUIDANCE_KEY_FINGERPRINT`.
+
+Their verification-only JWKs are read from `/trust/wc027-feed-public-key.jwk.json`,
+`/trust/wc027-enrichment-public-key.jwk.json`, and
+`/trust/wc027-guidance-public-key.jwk.json`. Until those reviewed anchors and the v2 gateway
+surface are deployed, the verified v1 incident remains visible with an explicit
+guidance-unavailable state. Invalid v2 content is never treated as trusted v1 guidance.
 
 ## Synthetic fixtures
 

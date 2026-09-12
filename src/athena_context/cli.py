@@ -241,6 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_parser.add_argument("--incident-key-id", required=True)
     gateway_parser.add_argument("--incident-key-fingerprint", required=True)
     gateway_parser.add_argument("--incident-public-key", required=True, type=Path)
+    for role in ("feed", "enrichment", "guidance"):
+        gateway_parser.add_argument(f"--wc027-{role}-key-id")
+        gateway_parser.add_argument(f"--wc027-{role}-key-fingerprint")
+        gateway_parser.add_argument(
+            f"--wc027-{role}-public-key",
+            type=Path,
+        )
     gateway_parser.add_argument("--managed-identity-client-id", required=True)
     gateway_parser.add_argument("--port", type=int, default=8081)
     detector_parser = subparsers.add_parser(
@@ -728,6 +735,19 @@ def main(
                 incident_key_id=args.incident_key_id,
                 incident_key_fingerprint=args.incident_key_fingerprint,
                 incident_public_key_path=args.incident_public_key,
+                wc027_feed_key_id=args.wc027_feed_key_id,
+                wc027_feed_key_fingerprint=args.wc027_feed_key_fingerprint,
+                wc027_feed_public_key_path=args.wc027_feed_public_key,
+                wc027_enrichment_key_id=args.wc027_enrichment_key_id,
+                wc027_enrichment_key_fingerprint=(
+                    args.wc027_enrichment_key_fingerprint
+                ),
+                wc027_enrichment_public_key_path=(
+                    args.wc027_enrichment_public_key
+                ),
+                wc027_guidance_key_id=args.wc027_guidance_key_id,
+                wc027_guidance_key_fingerprint=args.wc027_guidance_key_fingerprint,
+                wc027_guidance_public_key_path=args.wc027_guidance_public_key,
                 managed_identity_client_id=args.managed_identity_client_id,
                 port=args.port,
             )

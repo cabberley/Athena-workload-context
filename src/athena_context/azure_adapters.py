@@ -555,6 +555,40 @@ class AzureBlobPresentationAssetReader:
         blob_name: str,
         maximum_bytes: int,
     ) -> PresentationAssetReadResult:
+        return self._read_presentation_asset(
+            blob_name=blob_name,
+            maximum_bytes=maximum_bytes,
+            version=None,
+        )
+
+    def read_version(
+        self,
+        *,
+        blob_name: str,
+        version: str,
+        maximum_bytes: int,
+    ) -> PresentationAssetReadResult:
+        if (
+            type(version) is not str
+            or not version
+            or len(version) > 256
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,255}", version)
+            is None
+        ):
+            raise ValueError("version is not a bounded Blob version")
+        return self._read_presentation_asset(
+            blob_name=blob_name,
+            maximum_bytes=maximum_bytes,
+            version=version,
+        )
+
+    def _read_presentation_asset(
+        self,
+        *,
+        blob_name: str,
+        maximum_bytes: int,
+        version: str | None,
+    ) -> PresentationAssetReadResult:
         if (
             type(blob_name) is not str
             or not blob_name
@@ -569,7 +603,11 @@ class AzureBlobPresentationAssetReader:
             or not 1 <= maximum_bytes <= MAX_ARTIFACT_PAYLOAD_BYTES
         ):
             raise ValueError("maximum_bytes is outside the presentation bound")
-        blob = self._container.get_blob_client(blob_name)
+        blob = (
+            self._container.get_blob_client(blob_name)
+            if version is None
+            else self._container.get_blob_client(blob_name, version_id=version)
+        )
         try:
             downloader = blob.download_blob(
                 offset=0,
@@ -577,6 +615,11 @@ class AzureBlobPresentationAssetReader:
                 max_concurrency=1,
             )
             properties = downloader.properties
+            returned_version = getattr(properties, "version_id", None)
+            if version is not None and returned_version != version:
+                raise PresentationAssetUnavailableError(
+                    "presentation asset Blob version is invalid"
+                )
             size = getattr(downloader, "size", None)
             if type(size) is not int or not 1 <= size <= maximum_bytes:
                 raise PresentationAssetUnavailableError(
