@@ -290,3 +290,75 @@ def test_presentation_store_reads_current_json_with_matching_metadata(
 
     assert result.payload == payload
     assert result.payload_sha256 == sha256_hex(payload)
+
+
+def test_presentation_store_reads_only_the_requested_blob_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'{"schemaVersion":"synthetic-versioned"}\n'
+    version_id = "2026-09-12T12:34:56.0000000Z"
+    digest = sha256_hex(payload)
+    properties = SimpleNamespace(
+        version_id=version_id,
+        content_settings=SimpleNamespace(content_type="application/json"),
+        metadata={"payload_sha256": digest},
+    )
+
+    class _Downloader:
+        size = len(payload)
+
+        def __init__(self) -> None:
+            self.properties = properties
+
+        def readall(self) -> bytes:
+            return payload
+
+    class _Blob:
+        def download_blob(self, **kwargs: object) -> _Downloader:
+            assert kwargs == {
+                "offset": 0,
+                "length": 8 * 1024 * 1024 + 1,
+                "max_concurrency": 1,
+            }
+            return _Downloader()
+
+    class _Container:
+        def get_blob_client(
+            self,
+            blob_name: str,
+            *,
+            version_id: str,
+        ) -> _Blob:
+            assert blob_name == "incidents/inc-aaaaaaaaaaaa/report.json"
+            assert version_id == "2026-09-12T12:34:56.0000000Z"
+            return _Blob()
+
+    class _BlobServiceClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_container_client(self, container_name: str) -> _Container:
+            assert container_name == "presentation-assets"
+            return _Container()
+
+    monkeypatch.setattr(
+        azure_adapters,
+        "_production_credential",
+        lambda **_kwargs: _Credential(),
+    )
+    monkeypatch.setattr(azure_adapters, "BlobServiceClient", _BlobServiceClient)
+    store = AzureBlobPresentationAssetReader(
+        blob_endpoint="https://athenareplay.blob.core.windows.net",
+        container_name="presentation-assets",
+        managed_identity_client_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    result = store.read_version(
+        blob_name="incidents/inc-aaaaaaaaaaaa/report.json",
+        version_id=version_id,
+        expected_payload_sha256=digest,
+        maximum_bytes=8 * 1024 * 1024,
+    )
+
+    assert result.payload == payload
+    assert result.payload_sha256 == digest
