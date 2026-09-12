@@ -63,9 +63,9 @@ transfer size; all other artifact defaults remain unchanged.
 
 The manifest is a maximum-64-KiB immutable join record. It repeats only compact identifiers needed
 to reject cross-incident, cross-occurrence, cross-request, cross-report, or cross-guidance
-substitution. It carries the exact `IncidentGuidanceSourceBinding` and requires the report and
-guidance references to resolve to the same signed occurrence. It never duplicates v1 lifecycle,
-finding, reasoning, impact, or notification fields.
+substitution. It does not duplicate `IncidentGuidanceSourceBinding`; readers recover that binding
+from the exact referenced guidance bytes and cross-check it against the report and occurrence. It
+never duplicates v1 lifecycle, finding, reasoning, impact, or notification fields.
 
 The manifest and report use separate attestations and signing roles. The existing
 `IncidentGuidanceAttestation.v1` and `IncidentGuidanceAssetReference.v1` remain unchanged.

@@ -16,7 +16,6 @@ from athena_context.contracts.correlation import (
 from athena_context.contracts.guidance import (
     IncidentGuidance,
     IncidentGuidanceAssetReference,
-    IncidentGuidanceSourceBinding,
 )
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
@@ -306,7 +305,6 @@ class IncidentEnrichmentManifest(_StrictIncidentEnrichmentModel):
         alias="correlationReportAsset"
     )
     guidance_asset: IncidentGuidanceAssetReference = Field(alias="guidanceAsset")
-    guidance_source_binding: IncidentGuidanceSourceBinding = Field(alias="guidanceSourceBinding")
     no_auto_remediation: Literal[True] = Field(
         default=True,
         alias="noAutoRemediation",
@@ -321,7 +319,6 @@ class IncidentEnrichmentManifest(_StrictIncidentEnrichmentModel):
         )
         report = self.correlation_report_asset
         guidance = self.guidance_asset
-        source = self.guidance_source_binding
         if (
             self.incident_state_reference.name != f"{prefix}/state.json"
             or self.incident_state_attestation_reference.name != f"{prefix}/attestation.json"
@@ -335,17 +332,6 @@ class IncidentEnrichmentManifest(_StrictIncidentEnrichmentModel):
             or report.incident_bound_request_digest != self.incident_bound_request_digest
             or guidance.incident_id != self.incident_id
             or guidance.incident_state_digest != self.incident_state_result_digest
-            or source.incident_id != self.incident_id
-            or source.incident_revision != self.incident_revision
-            or source.incident_state_digest != self.incident_state_result_digest
-            or source.incident_subject_id != self.incident_subject_id
-            or source.incident_subject_digest != self.incident_subject_digest
-            or source.incident_bound_request_id != self.incident_bound_request_id
-            or source.incident_bound_request_digest != self.incident_bound_request_digest
-            or source.correlation_report_id != report.report_id
-            or source.correlation_report_digest != report.report_digest
-            or source.correlation_request_digest != report.correlation_request_digest
-            or source.transition_digest != report.correlation_transition_digest
         ):
             raise ValueError("incident enrichment does not bind one exact occurrence")
         expected = _expected_digest(
@@ -570,7 +556,6 @@ def build_incident_enrichment_manifest(
         "incidentBoundRequestDigest": incident_bound_request.binding_digest,
         "correlationReportAsset": correlation_report_asset,
         "guidanceAsset": guidance_asset,
-        "guidanceSourceBinding": guidance.source_binding,
         "noAutoRemediation": True,
     }
     digest = compute_artifact_digest(_json_value(payload))
@@ -702,7 +687,23 @@ def validate_incident_enrichment_manifest_binding(
         or guidance_asset.guidance_digest != guidance.guidance_digest
         or guidance_asset.guidance_reference.content_digest
         != sha256_hex(guidance.canonical_bytes())
-        or manifest.guidance_source_binding != guidance.source_binding
+        or guidance.source_binding.incident_id != subject.incident_id
+        or guidance.source_binding.incident_revision != subject.incident_revision
+        or guidance.source_binding.incident_state_digest
+        != subject.incident_state_digest
+        or guidance.source_binding.incident_subject_id != subject.subject_id
+        or guidance.source_binding.incident_subject_digest
+        != subject.subject_digest
+        or guidance.source_binding.incident_bound_request_id
+        != incident_bound_request.request_id
+        or guidance.source_binding.incident_bound_request_digest
+        != incident_bound_request.binding_digest
+        or guidance.source_binding.correlation_report_id != report.report_id
+        or guidance.source_binding.correlation_report_digest
+        != report.report_digest
+        or guidance.source_binding.correlation_request_digest
+        != report.request_digest
+        or guidance.source_binding.transition_digest != report.transition_digest
     ):
         raise ValueError("incident enrichment manifest does not match exact assets")
 
