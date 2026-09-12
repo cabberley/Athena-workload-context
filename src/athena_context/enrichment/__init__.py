@@ -1,6 +1,22 @@
 from athena_context.enrichment.azure import (
     AzureBlobIncidentEnrichmentArtifactWriter,
 )
+from athena_context.enrichment.feed_registry import (
+    FEED_V2_RESOLVED_RETENTION,
+    MAX_FEED_V2_REGISTRY_RECORDS,
+    IncidentFeedRegistryCapacityError,
+    IncidentFeedRegistryConflictError,
+    IncidentFeedRegistryError,
+    IncidentFeedRegistryIncompleteError,
+    IncidentFeedRegistryPort,
+    IncidentFeedRegistryProjection,
+    IncidentFeedRegistryRecord,
+    build_incident_feed_registry_record,
+    project_incident_feed_registry,
+)
+from athena_context.enrichment.feed_registry_azure import (
+    AzureTableIncidentFeedRegistry,
+)
 from athena_context.enrichment.publication import (
     IncidentEnrichmentArtifactWriterPort,
     IncidentEnrichmentPublicationReceipt,
@@ -10,8 +26,20 @@ from athena_context.enrichment.publication import (
 
 __all__ = [
     "AzureBlobIncidentEnrichmentArtifactWriter",
+    "AzureTableIncidentFeedRegistry",
+    "FEED_V2_RESOLVED_RETENTION",
+    "MAX_FEED_V2_REGISTRY_RECORDS",
+    "IncidentFeedRegistryCapacityError",
+    "IncidentFeedRegistryConflictError",
+    "IncidentFeedRegistryError",
+    "IncidentFeedRegistryIncompleteError",
+    "IncidentFeedRegistryPort",
+    "IncidentFeedRegistryProjection",
+    "IncidentFeedRegistryRecord",
     "IncidentEnrichmentArtifactWriterPort",
     "IncidentEnrichmentPublicationReceipt",
     "IncidentEnrichmentPublicationService",
     "IncidentPublicationReaderPort",
+    "build_incident_feed_registry_record",
+    "project_incident_feed_registry",
 ]
