@@ -21,6 +21,10 @@ from athena_context.contracts.incident_enrichment import *  # noqa: F403
 from athena_context.contracts.incident_enrichment import (
     __all__ as _incident_enrichment_all,
 )
+from athena_context.contracts.incident_feed_v2 import *  # noqa: F403
+from athena_context.contracts.incident_feed_v2 import (
+    __all__ as _incident_feed_v2_all,
+)
 from athena_context.contracts.manifest import *  # noqa: F403
 from athena_context.contracts.manifest import __all__ as _manifest_all
 from athena_context.contracts.models import *  # noqa: F403
@@ -55,6 +59,7 @@ __all__ = [
     *list(_correlation_all),
     *list(_eventing_all),
     *list(_guidance_all),
+    *list(_incident_feed_v2_all),
     *list(_incident_enrichment_all),
     *list(_manifest_all),
     *list(_monitoring_intent_all),
