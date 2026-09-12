@@ -156,10 +156,17 @@ export interface IncidentGuidance {
   guidanceId: string
   generatedAt: string
   sourceBinding: {
+    incidentSubjectId: string
+    incidentSubjectDigest: Sha256Digest
     incidentId: string
+    incidentRevision: number
     incidentStateDigest: Sha256Digest
+    incidentBoundRequestId: string
+    incidentBoundRequestDigest: Sha256Digest
     correlationReportId: string
     correlationReportDigest: Sha256Digest
+    correlationRequestDigest: Sha256Digest
+    transitionDigest: Sha256Digest
     selectionKind: 'selectedRunbook' | 'noRunbook'
     selectedOptionId?: string
     noRunbookReason?: string
@@ -630,10 +637,30 @@ export const verifyIncidentGuidanceBundle = async (
     manifest.guidanceAsset.guidanceId !== guidance.guidanceId ||
     manifest.guidanceAsset.guidanceDigest !== guidance.guidanceDigest ||
     guidance.sourceBinding.incidentId !== manifest.incidentId ||
+    guidance.sourceBinding.incidentRevision !== manifest.incidentRevision ||
     guidance.sourceBinding.incidentStateDigest !== manifest.incidentStateResultDigest ||
+    guidance.sourceBinding.incidentSubjectId !== manifest.incidentSubjectId ||
+    guidance.sourceBinding.incidentSubjectDigest !== manifest.incidentSubjectDigest ||
+    guidance.sourceBinding.incidentBoundRequestId !== manifest.incidentBoundRequestId ||
+    guidance.sourceBinding.incidentBoundRequestDigest !==
+      manifest.incidentBoundRequestDigest ||
     guidance.sourceBinding.correlationReportId !== manifest.correlationReportAsset.reportId ||
     guidance.sourceBinding.correlationReportDigest !==
-      manifest.correlationReportAsset.reportDigest
+      manifest.correlationReportAsset.reportDigest ||
+    guidance.sourceBinding.correlationRequestDigest !==
+      manifest.correlationReportAsset.correlationRequestDigest ||
+    guidance.sourceBinding.transitionDigest !==
+      manifest.correlationReportAsset.correlationTransitionDigest ||
+    manifest.incidentStateReference.name !== pointer.sourceStateReference.name ||
+    manifest.incidentStateReference.version !== pointer.sourceStateReference.version ||
+    manifest.incidentStateReference.contentDigest !==
+      pointer.sourceStateReference.contentDigest ||
+    manifest.incidentStateAttestationReference.name !==
+      pointer.sourceStateAttestationReference.name ||
+    manifest.incidentStateAttestationReference.version !==
+      pointer.sourceStateAttestationReference.version ||
+    manifest.incidentStateAttestationReference.contentDigest !==
+      pointer.sourceStateAttestationReference.contentDigest
   ) {
     throw new VerificationError('Incident guidance does not match its verified enrichment.')
   }
@@ -713,10 +740,19 @@ interface ParsedEnrichmentReference {
 interface ParsedEnrichmentManifest {
   enrichmentId: string
   incidentId: string
+  incidentRevision: number
   incidentStateResultDigest: Sha256Digest
+  incidentStateReference: VersionPinnedReference
+  incidentStateAttestationReference: VersionPinnedReference
+  incidentSubjectId: string
+  incidentSubjectDigest: Sha256Digest
+  incidentBoundRequestId: string
+  incidentBoundRequestDigest: Sha256Digest
   correlationReportAsset: {
     reportId: string
     reportDigest: Sha256Digest
+    correlationRequestDigest: Sha256Digest
+    correlationTransitionDigest: Sha256Digest
   }
   guidanceAsset: {
     guidanceId: string
@@ -996,7 +1032,18 @@ const parseEnrichmentManifest = async (
     !ENRICHMENT_ID.test(record.enrichmentId) ||
     typeof record.incidentId !== 'string' ||
     !INCIDENT_ID.test(record.incidentId) ||
+    typeof record.incidentTransitionId !== 'string' ||
+    !/^wc016-[a-f0-9]{64}$/.test(record.incidentTransitionId) ||
+    typeof record.incidentRevision !== 'number' ||
+    !Number.isInteger(record.incidentRevision) ||
+    record.incidentRevision < 1 ||
     !isDigest(record.incidentStateResultDigest) ||
+    typeof record.incidentSubjectId !== 'string' ||
+    !/^incident-subject-[a-f0-9]{32}$/.test(record.incidentSubjectId) ||
+    !isDigest(record.incidentSubjectDigest) ||
+    typeof record.incidentBoundRequestId !== 'string' ||
+    !/^incident-bound-request-[a-f0-9]{32}$/.test(record.incidentBoundRequestId) ||
+    !isDigest(record.incidentBoundRequestDigest) ||
     record.noAutoRemediation !== true ||
     !isDigest(record.manifestDigest)
   ) {
@@ -1038,10 +1085,19 @@ const parseEnrichmentManifest = async (
   return {
     enrichmentId: record.enrichmentId,
     incidentId: record.incidentId,
+    incidentRevision: record.incidentRevision as number,
     incidentStateResultDigest: record.incidentStateResultDigest,
+    incidentStateReference: stateReference,
+    incidentStateAttestationReference: stateAttestationReference,
+    incidentSubjectId: record.incidentSubjectId as string,
+    incidentSubjectDigest: record.incidentSubjectDigest as Sha256Digest,
+    incidentBoundRequestId: record.incidentBoundRequestId as string,
+    incidentBoundRequestDigest: record.incidentBoundRequestDigest as Sha256Digest,
     correlationReportAsset: {
       reportId: report.reportId,
       reportDigest: report.reportDigest,
+      correlationRequestDigest: report.correlationRequestDigest,
+      correlationTransitionDigest: report.correlationTransitionDigest,
     },
     guidanceAsset: {
       guidanceId: guidance.guidanceId,
@@ -1065,6 +1121,8 @@ const parseEnrichmentManifest = async (
     incidentBoundRequestDigest: Sha256Digest
     reportId: string
     reportDigest: Sha256Digest
+    correlationRequestDigest: Sha256Digest
+    correlationTransitionDigest: Sha256Digest
   }> {
     const record = requireRecord(value)
     requireExactKeys(record, [
@@ -1107,6 +1165,8 @@ const parseEnrichmentManifest = async (
       typeof record.incidentBoundRequestId !== 'string' ||
       !/^incident-bound-request-[a-f0-9]{32}$/.test(record.incidentBoundRequestId) ||
       !isDigest(record.incidentBoundRequestDigest) ||
+      !isDigest(record.correlationRequestDigest) ||
+      !isDigest(record.correlationTransitionDigest) ||
       typeof record.reportId !== 'string' ||
       !/^report-[a-f0-9]{32}$/.test(record.reportId) ||
       !isDigest(record.reportDigest) ||
@@ -1152,6 +1212,8 @@ const parseEnrichmentManifest = async (
       incidentBoundRequestDigest: record.incidentBoundRequestDigest,
       reportId: record.reportId,
       reportDigest: record.reportDigest,
+      correlationRequestDigest: record.correlationRequestDigest,
+      correlationTransitionDigest: record.correlationTransitionDigest,
     }
   }
 
@@ -1526,10 +1588,17 @@ const parseSourceBinding = (value: unknown): IncidentGuidance['sourceBinding'] =
     throw new VerificationError('Incident guidance selection binding is invalid.')
   }
   return {
+    incidentSubjectId: record.incidentSubjectId,
+    incidentSubjectDigest: record.incidentSubjectDigest,
     incidentId: record.incidentId,
+    incidentRevision: record.incidentRevision,
     incidentStateDigest: record.incidentStateDigest,
+    incidentBoundRequestId: record.incidentBoundRequestId,
+    incidentBoundRequestDigest: record.incidentBoundRequestDigest,
     correlationReportId: record.correlationReportId,
     correlationReportDigest: record.correlationReportDigest,
+    correlationRequestDigest: record.correlationRequestDigest,
+    transitionDigest: record.transitionDigest,
     selectionKind: record.selectionKind,
     selectedOptionId,
     noRunbookReason,
@@ -1629,6 +1698,7 @@ const parseHypothesis = (value: unknown): GuidanceHypothesis => {
     record.rank > 64 ||
     typeof record.hypothesisId !== 'string' ||
     !/^hyp-[a-f0-9]{32}$/.test(record.hypothesisId) ||
+    !isDigest(record.hypothesisDigest) ||
     typeof record.category !== 'string' ||
     !ROOT_CAUSE_CATEGORIES.includes(
       record.category as (typeof ROOT_CAUSE_CATEGORIES)[number],
@@ -1637,9 +1707,29 @@ const parseHypothesis = (value: unknown): GuidanceHypothesis => {
     !Number.isInteger(record.supportingEvidenceCount) ||
     typeof record.supportingEvidenceCount !== 'number' ||
     record.supportingEvidenceCount < 0 ||
-    record.supportingEvidenceCount > 128
+    record.supportingEvidenceCount > 128 ||
+    !isDigest(record.supportingEvidenceDigest) ||
+    (record.causeResourceDigest !== undefined &&
+      !isDigest(record.causeResourceDigest)) ||
+    (record.affectedPathId !== undefined &&
+      (typeof record.affectedPathId !== 'string' ||
+        record.affectedPathId.length < 1 ||
+        record.affectedPathId.length > 128)) ||
+    (record.omittedCandidateCount !== undefined &&
+      (typeof record.omittedCandidateCount !== 'number' ||
+        !Number.isInteger(record.omittedCandidateCount) ||
+        record.omittedCandidateCount < 1 ||
+        record.omittedCandidateCount > 4096)) ||
+    (record.omittedCandidateDigest !== undefined &&
+      !isDigest(record.omittedCandidateDigest)) ||
+    ((record.omittedCandidateCount === undefined) !==
+      (record.omittedCandidateDigest === undefined))
   ) {
     throw new VerificationError('Incident guidance hypothesis is invalid.')
+  }
+  const supportingEvidenceIds = parseStringArray(record.supportingEvidenceIds, 4)
+  if (record.supportingEvidenceCount < supportingEvidenceIds.length) {
+    throw new VerificationError('Incident guidance evidence count is invalid.')
   }
   const contradictionCodes = parseStringArray(record.contradictionCodes, 64)
   const missingEvidenceCodes = parseStringArray(record.missingEvidenceCodes, 64)
@@ -1664,7 +1754,7 @@ const parseHypothesis = (value: unknown): GuidanceHypothesis => {
     hypothesisId: record.hypothesisId,
     category: record.category,
     confidence: record.confidence,
-    supportingEvidenceIds: parseStringArray(record.supportingEvidenceIds, 4),
+    supportingEvidenceIds,
     supportingEvidenceCount: record.supportingEvidenceCount,
     contradictionCodes,
     missingEvidenceCodes,

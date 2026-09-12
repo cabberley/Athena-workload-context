@@ -121,6 +121,20 @@ const buildGuidance = async (
   }
 }
 
+const rebindGuidance = async (
+  guidance: Record<string, JsonValue>,
+): Promise<Record<string, JsonValue>> => {
+  const payload = structuredClone(guidance)
+  delete payload.guidanceId
+  delete payload.guidanceDigest
+  const guidanceDigest = await sha256Digest(canonicalizeJson(payload))
+  return {
+    ...payload,
+    guidanceId: `incident-guidance-${guidanceDigest.slice(7, 39)}`,
+    guidanceDigest,
+  }
+}
+
 describe('WC-027 guidance presentation contract', () => {
   it('accepts bounded lower-confidence read-only guidance', async () => {
     const guidance = await parseIncidentGuidance(await buildGuidance())
@@ -177,5 +191,25 @@ describe('WC-027 guidance presentation contract', () => {
 
     const unknown = await buildGuidance({ unexpected: true })
     await expect(parseIncidentGuidance(unknown)).rejects.toThrow(/unexpected fields/i)
+  })
+
+  it('rejects malformed nested hypothesis digests and omission pairs', async () => {
+    const malformedDigest = await buildGuidance()
+    const malformedHypothesis = (
+      malformedDigest.hypotheses as Record<string, JsonValue>[]
+    )[0]!
+    malformedHypothesis.hypothesisDigest = 'not-a-digest'
+    await expect(
+      parseIncidentGuidance(await rebindGuidance(malformedDigest)),
+    ).rejects.toThrow(/hypothesis is invalid/i)
+
+    const incompleteOmission = await buildGuidance()
+    const omittedHypothesis = (
+      incompleteOmission.hypotheses as Record<string, JsonValue>[]
+    )[0]!
+    omittedHypothesis.omittedCandidateCount = 2
+    await expect(
+      parseIncidentGuidance(await rebindGuidance(incompleteOmission)),
+    ).rejects.toThrow(/hypothesis is invalid/i)
   })
 })

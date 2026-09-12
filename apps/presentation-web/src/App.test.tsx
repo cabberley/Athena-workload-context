@@ -70,12 +70,23 @@ const guidanceFixture = (
     guidanceId: `incident-guidance-${'a'.repeat(32)}`,
     generatedAt: '2026-09-04T03:41:00Z',
     sourceBinding: {
+      incidentSubjectId: `incident-subject-${'9'.repeat(32)}`,
+      incidentSubjectDigest:
+        'sha256:9999999999999999999999999999999999999999999999999999999999999999',
       incidentId: 'inc-123456789abc',
+      incidentRevision: 1,
       incidentStateDigest:
         'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+      incidentBoundRequestId: `incident-bound-request-${'a'.repeat(32)}`,
+      incidentBoundRequestDigest:
+        'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       correlationReportId: `report-${'b'.repeat(32)}`,
       correlationReportDigest:
         'sha256:3333333333333333333333333333333333333333333333333333333333333333',
+      correlationRequestDigest:
+        'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      transitionDigest:
+        'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
       selectionKind: selectedRunbook ? 'selectedRunbook' : 'noRunbook',
       selectedOptionId: selectedRunbook
         ? `guidance-option-${'c'.repeat(32)}`
