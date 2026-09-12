@@ -38,6 +38,31 @@ incidents/<incident-id>/versions/<state-result-digest>/enrichments/<enrichment-i
 The v2 index entries carry only routing/join fields and exact version-pinned pointer/attestation
 references. They do not duplicate state, findings, report, guidance, or enrichment content.
 
+### Producer reconstruction registry
+
+The producer maintains a private Azure Table registry with one latest prepared entry per incident.
+Each row stores the complete signed feed pointer and pointer attestation, not an unsigned lifecycle
+claim. The registry is not a consumer API or lifecycle authority.
+
+Before building an index, the producer verifies every retained row against the configured feed
+signing key. Every v1-active incident must have one matching active registry row with the exact
+state digest and update time derived from its v1 pointer. An active registry row that disappears
+from v1 blocks publication until a verified resolved successor replaces it. This permits gradual
+bootstrap without ever publishing a partial active mirror.
+
+Resolved rows expire seven days after their authoritative state update. The Table adapter removes
+expired rows with ETag-conditional deletes and enforces a bounded retained-record count so expired
+history cannot permanently exhaust the registry. The complete retained set supplies the exact
+resolved total; only the newest 64 entries are exposed in the public index.
+
+The registry keeps a reserved capacity metadata row in the same partition. New incident rows are
+created in one Azure Table transaction with an ETag-conditional retained-count increment. Expiry
+cleanup similarly deletes bounded batches while conditionally decrementing the same row. A stale
+capacity ETag rejects the whole transaction, so concurrent writers cannot admit more than 4,096
+retained incidents or let the metadata diverge from the rows. Startup creates missing metadata
+from one bounded partition snapshot and immediately revalidates the count; mixed-version writers
+or any mismatch fail closed.
+
 `IncidentFeedIndex.v2` has separate maximum-64 active and recently-resolved collections within a
 128-KiB bound. Active
 entries are uniquely ordered by incident ID. Recently resolved entries contain the latest retained
