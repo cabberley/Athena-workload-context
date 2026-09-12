@@ -65,6 +65,7 @@ from athena_context.presentation_assets import (
     PresentationAsset,
     PresentationAssetAlreadyExistsError,
     PresentationAssetUnavailableError,
+    _issue_incident_publication_receipt,
 )
 
 SUBSCRIPTION_ID = "a6add389-9978-47ac-ab1e-a09212e321d4"
@@ -244,23 +245,29 @@ def test_managed_identity_arm_reader_accepts_only_reviewed_operation_paths(
             token="synthetic-token" if scope.endswith("/.default") else ""
         )
     )
-    assert reader.get_json(
-        DB_ID.lower() + "/instanceView",
-        query={"api-version": "2024-11-01"},
-    ) == {}
-    assert reader.get_json(
-        LB_ID.lower() + "/providers/microsoft.insights/metrics",
-        query={
-            "api-version": "2023-10-01",
-            "metricnames": "VipAvailability,DipAvailability",
-            "metricnamespace": "Microsoft.Network/loadBalancers",
-            "timespan": "2026-09-04T03:35:00Z/2026-09-04T03:40:00Z",
-            "interval": "PT1M",
-            "aggregation": "Average",
-            "AutoAdjustTimegrain": "false",
-            "ValidateDimensions": "true",
-        },
-    ) == {}
+    assert (
+        reader.get_json(
+            DB_ID.lower() + "/instanceView",
+            query={"api-version": "2024-11-01"},
+        )
+        == {}
+    )
+    assert (
+        reader.get_json(
+            LB_ID.lower() + "/providers/microsoft.insights/metrics",
+            query={
+                "api-version": "2023-10-01",
+                "metricnames": "VipAvailability,DipAvailability",
+                "metricnamespace": "Microsoft.Network/loadBalancers",
+                "timespan": "2026-09-04T03:35:00Z/2026-09-04T03:40:00Z",
+                "interval": "PT1M",
+                "aggregation": "Average",
+                "AutoAdjustTimegrain": "false",
+                "ValidateDimensions": "true",
+            },
+        )
+        == {}
+    )
 
     parsed = [urlsplit(request.full_url) for request in requests]
     assert [item.path for item in parsed] == [
@@ -336,9 +343,9 @@ def test_request_contract_rederives_all_security_critical_fields() -> None:
     )
     with pytest.raises(ValidationError, match="deterministically bound"):
         request.model_copy(update={"scenario": "singletonDatabaseFailure"}).model_validate(
-            request.model_copy(
-                update={"scenario": "singletonDatabaseFailure"}
-            ).model_dump(by_alias=True)
+            request.model_copy(update={"scenario": "singletonDatabaseFailure"}).model_dump(
+                by_alias=True
+            )
         )
 
 
@@ -575,9 +582,7 @@ def test_per_incident_pointers_and_active_index_preserve_other_incidents() -> No
         index=web_publication.active_index,
         payload_sha256=web_publication.active_index_asset.payload_sha256,
     )
-    _, resolved_db_state, resolved_db_attestation = _state_and_attestation(
-        DB_ID, "start", True
-    )
+    _, resolved_db_state, resolved_db_attestation = _state_and_attestation(DB_ID, "start", True)
     resolved_publication = build_incident_publication(
         resolved_db_state,
         resolved_db_attestation,
@@ -629,10 +634,7 @@ def test_active_incident_index_heartbeat_bootstraps_and_refreshes_without_state_
 
     assert refreshed.active_index.incidents == snapshot.index.incidents
     assert refreshed.active_index.published_at == NOW + timedelta(minutes=5)
-    assert (
-        refreshed.active_index.index_attestation_path
-        != snapshot.index.index_attestation_path
-    )
+    assert refreshed.active_index.index_attestation_path != snapshot.index.index_attestation_path
     assert refreshed.previous_active_index_sha256 == snapshot.payload_sha256
 
 
@@ -672,9 +674,7 @@ def test_concurrent_publication_cas_loss_cannot_replace_indexed_pointer() -> Non
 
     assert winner.pointer_asset.blob_name != loser.pointer_asset.blob_name
     assert winner_entry.pointer_path == f"./{winner.pointer_asset.blob_name}"
-    assert uploaded[winner_entry.pointer_path.removeprefix("./")] == (
-        winner.pointer_asset.payload
-    )
+    assert uploaded[winner_entry.pointer_path.removeprefix("./")] == (winner.pointer_asset.payload)
     assert sha256_hex(uploaded[winner_entry.pointer_path.removeprefix("./")]) == (
         winner_entry.pointer_sha256
     )
@@ -706,13 +706,9 @@ def test_incident_publication_rejects_index_occurrence_mismatch() -> None:
         replace(
             publication,
             active_index=empty_index.active_index,
-            active_index_attestation=(
-                empty_index.active_index_attestation
-            ),
+            active_index_attestation=(empty_index.active_index_attestation),
             active_index_asset=empty_index.active_index_asset,
-            active_index_attestation_asset=(
-                empty_index.active_index_attestation_asset
-            ),
+            active_index_attestation_asset=(empty_index.active_index_attestation_asset),
         )
 
 
@@ -807,19 +803,12 @@ def test_incident_publisher_returns_version_pinned_occurrence(
 
     assert receipt.occurrence is not None
     assert receipt.occurrence.incident_id == state.incident_id
-    assert (
-        receipt.occurrence.pointer_reference.content_digest
-        == receipt.pointer_sha256
-    )
+    assert receipt.occurrence.pointer_reference.content_digest == receipt.pointer_sha256
 
 
 def test_immutable_upload_requires_version_id() -> None:
     asset = PresentationAsset(
-        blob_name=(
-            "incidents/inc-000000000000/versions/"
-            + "0" * 64
-            + "/state.json"
-        ),
+        blob_name=("incidents/inc-000000000000/versions/" + "0" * 64 + "/state.json"),
         payload=b"{}",
         payload_sha256=sha256_hex(b"{}"),
         maximum_bytes=MAX_INCIDENT_STATE_BYTES,
@@ -827,9 +816,7 @@ def test_immutable_upload_requires_version_id() -> None:
 
     class _Downloader:
         properties = SimpleNamespace(
-            content_settings=SimpleNamespace(
-                content_type="application/json"
-            ),
+            content_settings=SimpleNamespace(content_type="application/json"),
             metadata={"payload_sha256": asset.payload_sha256},
             version_id=None,
         )
@@ -938,15 +925,9 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
     assert snapshot.pointer == publication.pointer
     assert snapshot.occurrence is not None
     assert requested_lengths == {
-        publication.current_pointer_asset.blob_name: (
-            MAX_INCIDENT_FEED_POINTER_BYTES + 1
-        ),
-        publication.pointer_asset.blob_name: (
-            MAX_INCIDENT_FEED_POINTER_BYTES + 1
-        ),
-        publication.pointer_attestation_asset.blob_name: (
-            MAX_PRESENTATION_ATTESTATION_BYTES + 1
-        ),
+        publication.current_pointer_asset.blob_name: (MAX_INCIDENT_FEED_POINTER_BYTES + 1),
+        publication.pointer_asset.blob_name: (MAX_INCIDENT_FEED_POINTER_BYTES + 1),
+        publication.pointer_attestation_asset.blob_name: (MAX_PRESENTATION_ATTESTATION_BYTES + 1),
         publication.state.blob_name: MAX_INCIDENT_STATE_BYTES + 1,
         publication.attestation.blob_name: MAX_PRESENTATION_ATTESTATION_BYTES + 1,
     }
@@ -978,9 +959,7 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
         stale_attestation.canonical_bytes(),
         sha256_hex(stale_attestation.canonical_bytes()),
     )
-    legacy_snapshot = publisher.read_current_incident_state(
-        incident_id=state.incident_id
-    )
+    legacy_snapshot = publisher.read_current_incident_state(incident_id=state.incident_id)
     assert legacy_snapshot is not None
     assert legacy_snapshot.state == state
     assert legacy_snapshot.occurrence is None
@@ -1257,9 +1236,7 @@ def test_notification_table_state_transitions_use_etag_ownership() -> None:
             return []
 
     table = _Table()
-    store = AzureTableNotificationDeliveryStore.__new__(
-        AzureTableNotificationDeliveryStore
-    )
+    store = AzureTableNotificationDeliveryStore.__new__(AzureTableNotificationDeliveryStore)
     store._table = table
     store._partition_key = "wc016-notification-delivery"
     store._exists = _Exists
@@ -1280,11 +1257,14 @@ def test_notification_table_state_transitions_use_etag_ownership() -> None:
     assert second.disposition == "acquired"
     assert first.etag is not None
     assert second.etag is not None
-    assert store.mark_dispatching(
-        notification_id=notification_id,
-        etag=first.etag,
-        dispatching_at=NOW + timedelta(seconds=2),
-    ) is None
+    assert (
+        store.mark_dispatching(
+            notification_id=notification_id,
+            etag=first.etag,
+            dispatching_at=NOW + timedelta(seconds=2),
+        )
+        is None
+    )
 
     dispatching_etag = store.mark_dispatching(
         notification_id=notification_id,
@@ -1292,19 +1272,25 @@ def test_notification_table_state_transitions_use_etag_ownership() -> None:
         dispatching_at=NOW + timedelta(seconds=2),
     )
     assert dispatching_etag is not None
-    assert store.acquire(
-        notification_id=notification_id,
-        reserved_at=NOW + timedelta(seconds=3),
-    ).disposition == "dispatching"
+    assert (
+        store.acquire(
+            notification_id=notification_id,
+            reserved_at=NOW + timedelta(seconds=3),
+        ).disposition
+        == "dispatching"
+    )
     assert store.mark_delivered(
         notification_id=notification_id,
         etag=dispatching_etag,
         delivered_at=NOW + timedelta(seconds=4),
     )
-    assert store.acquire(
-        notification_id=notification_id,
-        reserved_at=NOW + timedelta(seconds=5),
-    ).disposition == "delivered"
+    assert (
+        store.acquire(
+            notification_id=notification_id,
+            reserved_at=NOW + timedelta(seconds=5),
+        ).disposition
+        == "delivered"
+    )
 
 
 def test_notification_pruning_never_removes_dispatching_or_delivered_records() -> None:
@@ -1349,9 +1335,7 @@ def test_notification_pruning_never_removes_dispatching_or_delivered_records() -
             self.deleted.append(str(entity["RowKey"]))
 
     table = _Table()
-    store = AzureTableNotificationDeliveryStore.__new__(
-        AzureTableNotificationDeliveryStore
-    )
+    store = AzureTableNotificationDeliveryStore.__new__(AzureTableNotificationDeliveryStore)
     store._table = table
     store._partition_key = "wc016-notification-delivery"
     store._modified = _Modified
@@ -1824,9 +1808,7 @@ class _Publisher:
             pointer_attestation_reference=VersionPinnedBlobReference(
                 name=request.pointer_attestation_asset.blob_name,
                 version="synthetic-pointer-attestation-version",
-                contentDigest=(
-                    request.pointer_attestation_asset.payload_sha256
-                ),
+                contentDigest=(request.pointer_attestation_asset.payload_sha256),
             ),
         )
         self.current = CurrentIncidentStateSnapshot(
@@ -1839,7 +1821,7 @@ class _Publisher:
             index=request.active_index,
             payload_sha256=request.active_index_asset.payload_sha256,
         )
-        return IncidentPublicationReceipt(
+        return _issue_incident_publication_receipt(
             incident_id=request.pointer.incident_id,
             pointer_sha256=request.pointer_asset.payload_sha256,
             active_index_sha256=request.active_index_asset.payload_sha256,
@@ -2067,9 +2049,7 @@ def test_retry_with_incoherent_active_index_does_not_return_receipt() -> None:
     assert first is not None
     assert publisher.snapshot is not None
     entry = publisher.snapshot.index.incidents[0]
-    stale_entry = entry.model_copy(
-        update={"pointer_sha256": "sha256:" + "0" * 64}
-    )
+    stale_entry = entry.model_copy(update={"pointer_sha256": "sha256:" + "0" * 64})
     stale_payload = publisher.snapshot.index.model_dump(
         mode="python",
         by_alias=True,

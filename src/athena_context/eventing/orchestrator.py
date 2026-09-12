@@ -21,6 +21,7 @@ from athena_context.presentation_assets import (
     IncidentAssetPublisherPort,
     IncidentPublicationReceipt,
     PresentationAssetAlreadyExistsError,
+    _issue_incident_publication_receipt,
 )
 
 
@@ -50,9 +51,7 @@ def run_active_incident_index_heartbeat(
 ) -> ActiveIncidentIndexSnapshot:
     if not observations:
         raise ValueError("incident feed heartbeat requires approved observations")
-    observed_resources = {
-        request.target_resource_id: request for request in observations
-    }
+    observed_resources = {request.target_resource_id: request for request in observations}
     if len(observed_resources) != len(observations):
         raise ValueError("incident feed heartbeat observations must be unique")
 
@@ -78,8 +77,7 @@ def run_active_incident_index_heartbeat(
             _validate_active_index_health(latest, observations=observations)
             if (
                 latest is not None
-                and latest.index.published_at
-                >= publication.active_index.published_at
+                and latest.index.published_at >= publication.active_index.published_at
             ):
                 return latest
     assert last_conflict is not None
@@ -92,27 +90,17 @@ def _validate_active_index_health(
     observations: Sequence[ReassessmentRequest],
 ) -> None:
     expected = {
-        request.incident_id: request
-        for request in observations
-        if request.lifecycle == "activated"
+        request.incident_id: request for request in observations if request.lifecycle == "activated"
     }
     actual = {
-        entry.incident_id: entry
-        for entry in (() if snapshot is None else snapshot.index.incidents)
+        entry.incident_id: entry for entry in (() if snapshot is None else snapshot.index.incidents)
     }
     if set(actual) != set(expected):
-        raise ValueError(
-            "active incident index does not match independently verified live health"
-        )
+        raise ValueError("active incident index does not match independently verified live health")
     for incident_id, request in expected.items():
         entry = actual[incident_id]
-        if (
-            entry.scenario != request.scenario
-            or entry.workload_role != request.workload_role
-        ):
-            raise ValueError(
-                "active incident index binding does not match verified live health"
-            )
+        if entry.scenario != request.scenario or entry.workload_role != request.workload_role:
+            raise ValueError("active incident index binding does not match verified live health")
 
 
 def run_incident_reassessment(
@@ -137,9 +125,7 @@ def run_incident_reassessment(
         (
             entry
             for entry in (
-                ()
-                if active_index_snapshot is None
-                else active_index_snapshot.index.incidents
+                () if active_index_snapshot is None else active_index_snapshot.index.incidents
             )
             if entry.incident_id == request.incident_id
         ),
@@ -154,9 +140,7 @@ def run_incident_reassessment(
         not result.verified_healthy and active_entry is not None
     )
     if is_noop_reconciliation:
-        latest = publisher.read_current_incident_state(
-            incident_id=request.incident_id
-        )
+        latest = publisher.read_current_incident_state(incident_id=request.incident_id)
         expected_lifecycle = "resolved" if result.verified_healthy else "active"
         if (
             latest is not None
@@ -168,27 +152,21 @@ def run_incident_reassessment(
             if expected_lifecycle == "active":
                 if (
                     active_entry is None
-                    or active_entry.pointer_sha256
-                    != latest.pointer_sha256
+                    or active_entry.pointer_sha256 != latest.pointer_sha256
                     or active_entry.pointer_path
                     != (
                         "./"
-                        + latest.pointer.state_path.removesuffix(
-                            "/state.json"
-                        ).removeprefix("./")
+                        + latest.pointer.state_path.removesuffix("/state.json").removeprefix("./")
                         + "/pointer.json"
                     )
-                    or active_entry.detected_at
-                    != latest.state.detected_at
+                    or active_entry.detected_at != latest.state.detected_at
                     or active_entry.updated_at != latest.state.updated_at
                 ):
                     raise RuntimeError(
                         "active incident index is not coherent with current occurrence"
                     )
             elif active_entry is not None:
-                raise RuntimeError(
-                    "resolved occurrence remains in the active incident index"
-                )
+                raise RuntimeError("resolved occurrence remains in the active incident index")
             message = notification_message(
                 latest.state,
                 presentation_url=presentation_url,
@@ -200,22 +178,15 @@ def run_incident_reassessment(
                     transition_id=latest.state.transition_id,
                     message=message,
                 )
-            if (
-                latest.occurrence is not None
-                and active_index_snapshot is not None
-            ):
-                return latest.state, IncidentPublicationReceipt(
+            if latest.occurrence is not None and active_index_snapshot is not None:
+                return latest.state, _issue_incident_publication_receipt(
                     incident_id=latest.state.incident_id,
                     pointer_sha256=latest.pointer_sha256,
-                    active_index_sha256=(
-                        active_index_snapshot.payload_sha256
-                    ),
+                    active_index_sha256=(active_index_snapshot.payload_sha256),
                     occurrence=latest.occurrence,
                 )
         return None
-    incident_detected_at = (
-        active_entry.detected_at if active_entry is not None else detected_at
-    )
+    incident_detected_at = active_entry.detected_at if active_entry is not None else detected_at
     state, attestation = build_signed_incident_state(
         request,
         detected_at=incident_detected_at,
