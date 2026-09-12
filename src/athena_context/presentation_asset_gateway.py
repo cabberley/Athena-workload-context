@@ -113,6 +113,13 @@ class _VerifiedIncidentFeedV2Entry:
         return self.assets.get(path.removeprefix("/"))
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedIncidentFeedV2Source:
+    pointer: IncidentEnrichmentFeedPointer
+    state: IncidentState
+    assets: dict[str, bytes]
+
+
 class PresentationAssetGatewayApplication:
     """Serve only the current validated manifest and its allowlisted live assets."""
 
@@ -167,9 +174,16 @@ class PresentationAssetGatewayApplication:
                 {value.key_fingerprint for value in configured_v2_trust}
             )
             != 4
+            or incident_key_id
+            in {value.key_id for value in configured_v2_trust}
+            or incident_key_fingerprint
+            in {
+                value.key_fingerprint
+                for value in configured_v2_trust
+            }
         ):
             raise ValueError(
-                "incident feed v2 trust anchors must use separate keys"
+                "incident lifecycle and feed v2 trust anchors must use separate keys"
             )
         self._incident_feed_v2_trust = incident_feed_v2_trust
         self._incident_report_trust = incident_report_trust
@@ -283,7 +297,10 @@ class PresentationAssetGatewayApplication:
                 )
                 if feed_entry is None:
                     return GatewayResponse(status=404, payload=_ERROR_NOT_FOUND)
-                verified = self._load_incident_feed_v2_entry(feed_entry)
+                verified = self._load_incident_feed_v2_entry(
+                    feed_entry,
+                    requested_path=path,
+                )
                 payload = verified.payload_for(path)
                 if payload is None:
                     return GatewayResponse(status=404, payload=_ERROR_NOT_FOUND)
@@ -454,7 +471,46 @@ class PresentationAssetGatewayApplication:
                 detached_signature=signature,
             ),
         )
+        self._validate_v2_active_entries(
+            index,
+            source_active_index=source_active_index,
+        )
         return index, result.payload, attestation_result.payload
+
+    def _validate_v2_active_entries(
+        self,
+        index: IncidentFeedIndexV2,
+        *,
+        source_active_index: ActiveIncidentIndex,
+    ) -> None:
+        source_by_id = {
+            entry.incident_id: entry
+            for entry in source_active_index.incidents
+        }
+        if {entry.incident_id for entry in index.active} != set(
+            source_by_id
+        ):
+            raise ValueError(
+                "incident feed v2 active set does not match lifecycle authority"
+            )
+        for entry in index.active:
+            source_entry = source_by_id[entry.incident_id]
+            verified = self._load_incident_feed_v2_source(entry)
+            pointer = verified.pointer
+            state = verified.state
+            if (
+                pointer.source_pointer_reference.name
+                != source_entry.pointer_path.removeprefix("./")
+                or pointer.source_pointer_reference.content_digest
+                != source_entry.pointer_sha256
+                or state.scenario != source_entry.scenario
+                or state.workload_role != source_entry.workload_role
+                or state.detected_at != source_entry.detected_at
+                or state.updated_at != source_entry.updated_at
+            ):
+                raise ValueError(
+                    "incident feed v2 active entry does not match lifecycle authority"
+                )
 
     @staticmethod
     def _incident_feed_v2_entry_for_path(
@@ -473,59 +529,19 @@ class PresentationAssetGatewayApplication:
     def _load_incident_feed_v2_entry(
         self,
         entry: IncidentFeedEntryV2,
+        *,
+        requested_path: str,
     ) -> _VerifiedIncidentFeedV2Entry:
-        feed_trust = self._require_v2_trust(self._incident_feed_v2_trust)
+        source = self._load_incident_feed_v2_source(entry)
+        if requested_path.removeprefix("/") in source.assets:
+            return _VerifiedIncidentFeedV2Entry(assets=source.assets)
+
         report_trust = self._require_v2_trust(self._incident_report_trust)
         guidance_trust = self._require_v2_trust(self._incident_guidance_trust)
         enrichment_trust = self._require_v2_trust(
             self._incident_enrichment_trust
         )
-
-        pointer_result = self._read_versioned_incident_asset(
-            entry.feed_pointer_reference,
-            maximum_bytes=MAX_INCIDENT_FEED_V2_POINTER_BYTES,
-        )
-        pointer = IncidentEnrichmentFeedPointer.model_validate_json(
-            pointer_result.payload
-        )
-        if pointer_result.payload != pointer.canonical_bytes():
-            raise ValueError("incident feed v2 pointer bytes are not canonical")
-        pointer_attestation_result = self._read_versioned_incident_asset(
-            entry.feed_pointer_attestation_reference,
-            maximum_bytes=MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES,
-        )
-        pointer_attestation = (
-            IncidentEnrichmentFeedPointerAttestation.model_validate_json(
-                pointer_attestation_result.payload
-            )
-        )
-        if (
-            pointer_attestation_result.payload
-            != pointer_attestation.canonical_bytes()
-        ):
-            raise ValueError(
-                "incident feed v2 pointer attestation is not canonical"
-            )
-        validate_incident_enrichment_feed_pointer_assets(
-            entry,
-            pointer,
-            pointer_attestation,
-            trusted_key_id=feed_trust.key_id,
-            signature_verifier=lambda payload, signature: self._verify_signature(
-                feed_trust,
-                payload=payload,
-                detached_signature=signature,
-            ),
-        )
-
-        source_assets, state = self._load_v2_source_occurrence(pointer)
-        if (
-            pointer.lifecycle != state.lifecycle
-            or pointer.state_updated_at != state.updated_at
-        ):
-            raise ValueError(
-                "incident feed v2 pointer lifecycle does not match v1"
-            )
+        pointer = source.pointer
 
         manifest_result = self._read_versioned_incident_asset(
             pointer.enrichment_asset.manifest_reference,
@@ -638,10 +654,6 @@ class PresentationAssetGatewayApplication:
         )
 
         assets = {
-            entry.feed_pointer_reference.name: pointer_result.payload,
-            entry.feed_pointer_attestation_reference.name: (
-                pointer_attestation_result.payload
-            ),
             pointer.enrichment_asset.manifest_reference.name: (
                 manifest_result.payload
             ),
@@ -656,9 +668,70 @@ class PresentationAssetGatewayApplication:
             guidance_reference.attestation_reference.name: (
                 guidance_attestation_result.payload
             ),
-            **source_assets,
+            **source.assets,
         }
         return _VerifiedIncidentFeedV2Entry(assets=assets)
+
+    def _load_incident_feed_v2_source(
+        self,
+        entry: IncidentFeedEntryV2,
+    ) -> _VerifiedIncidentFeedV2Source:
+        feed_trust = self._require_v2_trust(self._incident_feed_v2_trust)
+        pointer_result = self._read_versioned_incident_asset(
+            entry.feed_pointer_reference,
+            maximum_bytes=MAX_INCIDENT_FEED_V2_POINTER_BYTES,
+        )
+        pointer = IncidentEnrichmentFeedPointer.model_validate_json(
+            pointer_result.payload
+        )
+        if pointer_result.payload != pointer.canonical_bytes():
+            raise ValueError("incident feed v2 pointer bytes are not canonical")
+        pointer_attestation_result = self._read_versioned_incident_asset(
+            entry.feed_pointer_attestation_reference,
+            maximum_bytes=MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES,
+        )
+        pointer_attestation = (
+            IncidentEnrichmentFeedPointerAttestation.model_validate_json(
+                pointer_attestation_result.payload
+            )
+        )
+        if (
+            pointer_attestation_result.payload
+            != pointer_attestation.canonical_bytes()
+        ):
+            raise ValueError(
+                "incident feed v2 pointer attestation is not canonical"
+            )
+        validate_incident_enrichment_feed_pointer_assets(
+            entry,
+            pointer,
+            pointer_attestation,
+            trusted_key_id=feed_trust.key_id,
+            signature_verifier=lambda payload, signature: self._verify_signature(
+                feed_trust,
+                payload=payload,
+                detached_signature=signature,
+            ),
+        )
+        source_assets, state = self._load_v2_source_occurrence(pointer)
+        if (
+            pointer.lifecycle != state.lifecycle
+            or pointer.state_updated_at != state.updated_at
+        ):
+            raise ValueError(
+                "incident feed v2 pointer lifecycle does not match v1"
+            )
+        return _VerifiedIncidentFeedV2Source(
+            pointer=pointer,
+            state=state,
+            assets={
+                entry.feed_pointer_reference.name: pointer_result.payload,
+                entry.feed_pointer_attestation_reference.name: (
+                    pointer_attestation_result.payload
+                ),
+                **source_assets,
+            },
+        )
 
     def _load_v2_source_occurrence(
         self,

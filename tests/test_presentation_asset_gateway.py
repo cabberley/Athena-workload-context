@@ -884,12 +884,268 @@ def _feed_v2_gateway_fixture():
         "reader": reader,
         "feed_index": feed_index,
         "feed_index_attestation": feed_index_attestation,
+        "feed_private": feed_private,
+        "feed_trust": feed_trust,
+        "lifecycle_private": lifecycle_private,
+        "lifecycle_trust": lifecycle_trust,
         "feed_entry": feed_entry,
         "state": state,
         "guidance": guidance,
         "guidance_reference": guidance_reference,
         "guidance_attestation": guidance_attestation,
         "state_reference": state_reference,
+    }
+
+
+def _resolved_feed_v2_source_fixture():
+    fixture = _feed_v2_gateway_fixture()
+    reader = fixture["reader"]
+    lifecycle_private = fixture["lifecycle_private"]
+    lifecycle_trust = fixture["lifecycle_trust"]
+    feed_private = fixture["feed_private"]
+    feed_trust = fixture["feed_trust"]
+    state, unsigned_attestation = _incident_state(lifecycle="resolved")
+    state_attestation = unsigned_attestation.model_copy(
+        update={
+            "key_vault_key_id": lifecycle_trust.key_id,
+            "detached_signature": _signature(
+                lifecycle_private,
+                incident_state_signature_preimage(state),
+            ),
+        }
+    )
+    state_prefix = (
+        f"incidents/{state.incident_id}/versions/"
+        f"{state.result_digest.removeprefix('sha256:')}"
+    )
+    state_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/state.json",
+        version="resolved-state-version",
+        contentDigest=sha256_hex(state.canonical_bytes()),
+    )
+    state_attestation_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/attestation.json",
+        version="resolved-state-attestation-version",
+        contentDigest=sha256_hex(state_attestation.canonical_bytes()),
+    )
+    source_pointer = IncidentFeedPointer(
+        schemaVersion="athena.incidentFeed.v1",
+        incidentId=state.incident_id,
+        statePath=f"./{state_reference.name}",
+        stateSha256=state_reference.content_digest,
+        attestationPath=f"./{state_attestation_reference.name}",
+        attestationSha256=state_attestation_reference.content_digest,
+        pointerAttestationPath=f"./{state_prefix}/pointer-attestation.json",
+        keyId=lifecycle_trust.key_id,
+        keyFingerprint=lifecycle_trust.key_fingerprint,
+        publishedAt=state.updated_at + timedelta(seconds=1),
+    )
+    source_pointer_attestation = IncidentFeedAttestation(
+        schemaVersion="athena.incidentFeedAttestation.v1",
+        pointerDigest=sha256_hex(source_pointer.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=lifecycle_trust.key_id,
+        detachedSignature=_signature(
+            lifecycle_private,
+            source_pointer.canonical_bytes(),
+        ),
+    )
+    source_pointer_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/pointer.json",
+        version="resolved-pointer-version",
+        contentDigest=sha256_hex(source_pointer.canonical_bytes()),
+    )
+    source_pointer_attestation_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/pointer-attestation.json",
+        version="resolved-pointer-attestation-version",
+        contentDigest=sha256_hex(
+            source_pointer_attestation.canonical_bytes()
+        ),
+    )
+    occurrence = build_incident_occurrence_receipt(
+        state,
+        state_attestation,
+        source_pointer,
+        source_pointer_attestation,
+        state_reference=state_reference,
+        state_attestation_reference=state_attestation_reference,
+        pointer_reference=source_pointer_reference,
+        pointer_attestation_reference=(
+            source_pointer_attestation_reference
+        ),
+    )
+    invalid_manifest = b'{"invalid":true}\n'
+    invalid_attestation = b'{"invalid":true}\n'
+    enrichment_id = "incident-enrichment-" + "3" * 32
+    enrichment_prefix = f"{state_prefix}/enrichments/{enrichment_id}"
+    enrichment_payload: dict[str, object] = {
+        "schemaVersion": (
+            "athena.wc027IncidentEnrichmentAssetReference.v1"
+        ),
+        "incidentId": state.incident_id,
+        "incidentStateResultDigest": state.result_digest,
+        "enrichmentId": enrichment_id,
+        "manifestDigest": "sha256:" + "4" * 64,
+        "manifestReference": VersionPinnedBlobReference(
+            name=f"{enrichment_prefix}/manifest.json",
+            version="invalid-manifest-version",
+            contentDigest=sha256_hex(invalid_manifest),
+        ),
+        "attestationReference": VersionPinnedBlobReference(
+            name=f"{enrichment_prefix}/attestation.json",
+            version="invalid-enrichment-attestation-version",
+            contentDigest=sha256_hex(invalid_attestation),
+        ),
+    }
+    enrichment_digest = compute_artifact_digest(
+        _json_value(enrichment_payload)
+    )
+    enrichment_reference = IncidentEnrichmentAssetReference(
+        **enrichment_payload,
+        referenceId=(
+            f"enrichment-asset-"
+            f"{enrichment_digest.removeprefix('sha256:')[:32]}"
+        ),
+        referenceDigest=enrichment_digest,
+    )
+    feed_pointer = build_incident_enrichment_feed_pointer(
+        occurrence,
+        enrichment_reference,
+        state,
+        published_at=occurrence.published_at + timedelta(seconds=1),
+    )
+    feed_pointer_attestation = IncidentEnrichmentFeedPointerAttestation(
+        schemaVersion=(
+            "athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"
+        ),
+        pointerId=feed_pointer.pointer_id,
+        pointerDigest=feed_pointer.pointer_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=feed_trust.key_id,
+        signedPreimageDigest=sha256_hex(feed_pointer.canonical_bytes()),
+        detachedSignature=_signature(
+            feed_private,
+            feed_pointer.canonical_bytes(),
+        ),
+    )
+    feed_entry = IncidentFeedEntryV2(
+        incidentId=state.incident_id,
+        lifecycle="resolved",
+        stateResultDigest=state.result_digest,
+        updatedAt=state.updated_at,
+        feedPointerReference=VersionPinnedBlobReference(
+            name=f"{enrichment_prefix}/feed-pointer.json",
+            version="resolved-feed-pointer-version",
+            contentDigest=sha256_hex(feed_pointer.canonical_bytes()),
+        ),
+        feedPointerAttestationReference=VersionPinnedBlobReference(
+            name=f"{enrichment_prefix}/feed-pointer-attestation.json",
+            version="resolved-feed-pointer-attestation-version",
+            contentDigest=sha256_hex(
+                feed_pointer_attestation.canonical_bytes()
+            ),
+        ),
+    )
+    active_index = ActiveIncidentIndex(
+        schemaVersion="athena.activeIncidentIndex.v1",
+        incidents=(),
+        indexAttestationPath=(
+            "./incidents/index-attestations/" + "b" * 64 + ".json"
+        ),
+        keyId=lifecycle_trust.key_id,
+        keyFingerprint=lifecycle_trust.key_fingerprint,
+        publishedAt=source_pointer.published_at,
+    )
+    active_index_attestation = ActiveIncidentIndexAttestation(
+        schemaVersion="athena.activeIncidentIndexAttestation.v1",
+        indexDigest=sha256_hex(active_index.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=lifecycle_trust.key_id,
+        detachedSignature=_signature(
+            lifecycle_private,
+            active_index.canonical_bytes(),
+        ),
+    )
+    feed_index = build_incident_feed_index_v2(
+        active=(),
+        recently_resolved=(feed_entry,),
+        resolved_retention_start=state.updated_at - timedelta(days=7),
+        resolved_history_truncated=False,
+        resolved_history_total_count=1,
+        omitted_resolved_count=None,
+        source_active_index_digest=sha256_hex(
+            active_index.canonical_bytes()
+        ),
+        key_id=feed_trust.key_id,
+        key_fingerprint=feed_trust.key_fingerprint,
+        published_at=feed_pointer.published_at + timedelta(seconds=1),
+    )
+    feed_index_attestation = IncidentFeedIndexAttestationV2(
+        schemaVersion="athena.wc027IncidentFeedIndexAttestation.v2",
+        indexDigest=sha256_hex(feed_index.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=feed_trust.key_id,
+        detachedSignature=_signature(
+            feed_private,
+            feed_index.canonical_bytes(),
+        ),
+    )
+    reader.content.update(
+        {
+            "incidents/active.json": active_index.canonical_bytes(),
+            active_index.index_attestation_path.removeprefix(
+                "./"
+            ): active_index_attestation.canonical_bytes(),
+            "incidents/feed-v2.json": feed_index.canonical_bytes(),
+            feed_index.index_attestation_path.removeprefix(
+                "./"
+            ): feed_index_attestation.canonical_bytes(),
+        }
+    )
+    reader.versioned_content.update(
+        {
+            (
+                state_reference.name,
+                state_reference.version,
+            ): state.canonical_bytes(),
+            (
+                state_attestation_reference.name,
+                state_attestation_reference.version,
+            ): state_attestation.canonical_bytes(),
+            (
+                source_pointer_reference.name,
+                source_pointer_reference.version,
+            ): source_pointer.canonical_bytes(),
+            (
+                source_pointer_attestation_reference.name,
+                source_pointer_attestation_reference.version,
+            ): source_pointer_attestation.canonical_bytes(),
+            (
+                feed_entry.feed_pointer_reference.name,
+                feed_entry.feed_pointer_reference.version,
+            ): feed_pointer.canonical_bytes(),
+            (
+                feed_entry.feed_pointer_attestation_reference.name,
+                feed_entry.feed_pointer_attestation_reference.version,
+            ): feed_pointer_attestation.canonical_bytes(),
+            (
+                enrichment_reference.manifest_reference.name,
+                enrichment_reference.manifest_reference.version,
+            ): invalid_manifest,
+            (
+                enrichment_reference.attestation_reference.name,
+                enrichment_reference.attestation_reference.version,
+            ): invalid_attestation,
+        }
+    )
+    return {
+        **fixture,
+        "feed_entry": feed_entry,
+        "state": state,
+        "state_reference": state_reference,
+        "invalid_enrichment_path": (
+            enrichment_reference.manifest_reference.name
+        ),
     }
 
 
@@ -972,3 +1228,89 @@ def test_invalid_v2_index_attestation_does_not_replace_v1_lifecycle() -> None:
     assert feed.status == 503
     assert lifecycle.status == 200
     assert lifecycle.payload == fixture["state"].canonical_bytes()
+
+
+def test_v2_active_set_must_exactly_match_v1_lifecycle_authority() -> None:
+    fixture = _feed_v2_gateway_fixture()
+    app = fixture["app"]
+    reader = fixture["reader"]
+    feed_index = fixture["feed_index"]
+    feed_private = fixture["feed_private"]
+    feed_trust = fixture["feed_trust"]
+    replacement = build_incident_feed_index_v2(
+        active=(),
+        recently_resolved=(),
+        resolved_retention_start=feed_index.resolved_retention_start,
+        resolved_history_truncated=False,
+        resolved_history_total_count=0,
+        omitted_resolved_count=None,
+        source_active_index_digest=(
+            feed_index.source_active_index_digest
+        ),
+        key_id=feed_trust.key_id,
+        key_fingerprint=feed_trust.key_fingerprint,
+        published_at=feed_index.published_at,
+    )
+    attestation = IncidentFeedIndexAttestationV2(
+        schemaVersion="athena.wc027IncidentFeedIndexAttestation.v2",
+        indexDigest=sha256_hex(replacement.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=feed_trust.key_id,
+        detachedSignature=_signature(
+            feed_private,
+            replacement.canonical_bytes(),
+        ),
+    )
+    reader.content["incidents/feed-v2.json"] = replacement.canonical_bytes()
+    reader.content[
+        replacement.index_attestation_path.removeprefix("./")
+    ] = attestation.canonical_bytes()
+
+    response = app.handle(
+        method="GET",
+        raw_path="/incidents/feed-v2.json",
+    )
+
+    assert response.status == 503
+
+
+def test_invalid_resolved_enrichment_does_not_hide_verified_v1_state() -> None:
+    fixture = _resolved_feed_v2_source_fixture()
+    app = fixture["app"]
+    state_reference = fixture["state_reference"]
+
+    lifecycle = app.handle(
+        method="GET",
+        raw_path="/" + state_reference.name,
+    )
+    enriched = app.handle(
+        method="GET",
+        raw_path="/" + fixture["invalid_enrichment_path"],
+    )
+
+    assert lifecycle.status == 200
+    assert lifecycle.payload == fixture["state"].canonical_bytes()
+    assert enriched.status == 503
+
+
+def test_v2_keys_must_be_separate_from_lifecycle_key() -> None:
+    _, lifecycle_trust = _trust("shared")
+    _, report_trust = _trust("report-separate")
+    _, guidance_trust = _trust("guidance-separate")
+    _, enrichment_trust = _trust("enrichment-separate")
+    reader = InMemoryPresentationReader({})
+
+    with pytest.raises(ValueError, match="must use separate keys"):
+        PresentationAssetGatewayApplication(
+            reader,
+            incident_reader=reader,
+            incident_key_id=lifecycle_trust.key_id,
+            incident_key_fingerprint=(
+                lifecycle_trust.key_fingerprint
+            ),
+            incident_public_key=lifecycle_trust.public_key,
+            incident_feed_v2_trust=lifecycle_trust,
+            incident_report_trust=report_trust,
+            incident_guidance_trust=guidance_trust,
+            incident_enrichment_trust=enrichment_trust,
+        )
