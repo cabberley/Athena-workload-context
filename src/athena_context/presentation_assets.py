@@ -18,6 +18,7 @@ from athena_context.contracts import (
 MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES = 16 * 1024
 MAX_PRESENTATION_PAYLOAD_BYTES = 128 * 1024
 MAX_PRESENTATION_ATTESTATION_BYTES = 24 * 1024
+MAX_PRESENTATION_VERSION_PINNED_ASSET_BYTES = 8 * 1024 * 1024
 MAX_INCIDENT_FEED_POINTER_BYTES = 16 * 1024
 MAX_INCIDENT_STATE_BYTES = 64 * 1024
 
@@ -347,13 +348,12 @@ class PresentationAssetReaderPort(Protocol):
         maximum_bytes: int,
     ) -> PresentationAssetReadResult: ...
 
-
-class VersionedPresentationAssetReaderPort(PresentationAssetReaderPort, Protocol):
     def read_version(
         self,
         *,
         blob_name: str,
-        version: str,
+        version_id: str,
+        expected_payload_sha256: str,
         maximum_bytes: int,
     ) -> PresentationAssetReadResult: ...
 
@@ -364,6 +364,7 @@ __all__ = [
     "MAX_INCIDENT_STATE_BYTES",
     "MAX_PRESENTATION_PAYLOAD_BYTES",
     "MAX_PRESENTATION_RUNTIME_MANIFEST_BYTES",
+    "MAX_PRESENTATION_VERSION_PINNED_ASSET_BYTES",
     "ActiveIncidentIndexPublicationRequest",
     "ActiveIncidentIndexSnapshot",
     "CurrentIncidentStateSnapshot",
@@ -376,7 +377,6 @@ __all__ = [
     "PresentationAssetPublisherPort",
     "PresentationAssetReadResult",
     "PresentationAssetReaderPort",
-    "VersionedPresentationAssetReaderPort",
     "PresentationAssetUnavailableError",
     "PresentationPublicationReceipt",
     "PresentationPublicationRequest",

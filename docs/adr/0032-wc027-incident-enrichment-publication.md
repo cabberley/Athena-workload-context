@@ -1,6 +1,6 @@
 # ADR 0032: Publish WC-027 incident enrichment as immutable assets
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-11
 
 ## Context
@@ -72,17 +72,20 @@ The manifest and report use separate attestations and signing roles. The existin
 
 ### Publication trust boundary
 
-A later atomic publication service must reject all inputs before writing unless it has:
+The publication service rejects all inputs before writing unless it has:
 
-1. exact-version read and verified the IncidentState v1 and its attestation;
-2. verified the v1 state, incident-subject, and incident-bound-request signatures against pinned
-   trusted keys;
-3. accepted only a `VerifiedCorrelationReport` whose process receipt passes
+1. accepted the coherent `IncidentPublicationReceipt` returned only after the v1 current-pointer
+   and active-index CAS operations complete;
+2. exact-version read and verified all four occurrence assets: state, state attestation, immutable
+   pointer, and pointer attestation;
+3. verified the v1 state, pointer, incident-subject, and incident-bound-request signatures against
+   pinned trusted keys;
+4. accepted only a `VerifiedCorrelationReport` whose process receipt passes
    `CorrelationService.validate_result`;
-4. verified the guidance-authority binding signature and immutable authority bytes;
-5. generated guidance internally with `build_incident_guidance`;
-6. re-parsed and byte-compared the canonical guidance; and
-7. checked every report, guidance, and manifest cross-binding in this contract.
+5. verified the guidance-authority binding signature and exact immutable authority bytes;
+6. generated guidance internally with `build_incident_guidance`;
+7. re-parsed and byte-compared the canonical guidance; and
+8. checked every report, guidance, and manifest cross-binding in this contract.
 
 Attestation fields bind claimed preimages but do not establish that a key is trusted. Trusted key
 roles remain service configuration, never data supplied by the artifact.
@@ -123,6 +126,14 @@ Production composition must also:
   retention controls; and
 - reject selected-runbook publication until the exact immutable runbook bytes can be verified by a
   scheme-specific reader. A verified `noRunbook` outcome remains publishable.
+
+The implementation is split between:
+
+- `athena_context.enrichment.publication.IncidentEnrichmentPublicationService`, which owns the
+  trust-transcoding and staged-saga ordering; and
+- `athena_context.enrichment.azure.AzureBlobIncidentEnrichmentArtifactWriter`, which restricts
+  writes to the six approved incident-enrichment paths and recovers exact current versions without
+  listing.
 
 ## Consequences
 

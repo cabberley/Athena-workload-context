@@ -44,8 +44,9 @@ the browser remains same-origin and the static reviewed key remains at `/trust/.
 For an independently verified v1 incident, the browser also attempts the dormant WC-027 consumer
 path at `/incidents/feed-v2.json`. It renders guidance only after the v2 index, exact-version feed
 pointer, enrichment manifest, and guidance asset all pass strict schema, byte-bound, digest,
-cross-occurrence, pinned-key fingerprint, and detached RS256 verification. Version-pinned assets
-are requested with the reference's exact Blob version in the `version` query parameter.
+cross-occurrence, pinned-key fingerprint, and detached RS256 verification. The browser requests
+only the signed asset name; the private gateway resolves and verifies the reference's exact Blob
+version before returning bytes.
 
 The build must pin separate feed, enrichment, and guidance trust anchors:
 

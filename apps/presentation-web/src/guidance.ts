@@ -2333,7 +2333,6 @@ const fetchVersionedReference = (
     applicationRoot,
     origin,
   )
-  url.searchParams.set('version', reference.version)
   return fetchBoundedJsonAsset(url, maximumBytes, fetchImpl, timeoutMs)
 }
 
