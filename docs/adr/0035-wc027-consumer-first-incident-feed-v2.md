@@ -1,6 +1,6 @@
 # ADR 0035: Add a consumer-first incident enrichment feed
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-12
 
 ## Context
@@ -70,6 +70,23 @@ occurrence per incident and are ordered by updated time descending, incident ID,
 The index declares a resolved-retention start and rejects entries outside its signed interval.
 Any history truncation carries an explicit omitted count. The index also binds the v1 active-index
 digest from which the derivative view was produced.
+
+### Index publication transaction
+
+The publisher reads and verifies `incidents/active.json` and its attestation directly; Blob
+enumeration is never a lifecycle input. It then reads the bounded registry snapshot, verifies every
+retained feed pointer and attestation from the registry's exact Blob versions, and refuses to
+publish unless the active projection exactly matches the signed v1 index.
+
+Each publication uploads the digest-addressed index attestation before conditionally writing
+`incidents/feed-v2.json`. Blob versioning makes the successful feed-v2 write an immutable,
+version-pinned index asset while the stable blob name remains the only discovery head. The stable
+head is created with `If-None-Match` or replaced with `If-Match` against the observed ETag, so an
+attestation-only partial upload is undiscoverable.
+
+After a lost CAS or uncertain response, the publisher rereads and fully verifies the stable head.
+It accepts an exact retry or a winner bound to the same or a newer currently signed v1 authority;
+it never overwrites a newer winner. A same-timestamp, non-equivalent index fails closed.
 
 ## Consumer-first rollout
 
