@@ -718,9 +718,21 @@ describe('WC-027 guidance presentation contract', () => {
       },
       occurrence: { ...occurrence },
     }
-    const advancedAuthority = structuredClone(cachedActive)
-    advancedAuthority.occurrence!.stateVersion =
-      '2026-08-20T23:50:41.3983616Z'
+    const currentV1Authority = structuredClone(cachedActive)
+    delete currentV1Authority.occurrence!.stateVersion
+    delete currentV1Authority.occurrence!.attestationVersion
+    delete currentV1Authority.occurrence!.pointerVersion
+    delete currentV1Authority.occurrence!.pointerAttestationVersion
+    expect(() =>
+      assertCachedGuidanceMatchesCurrentAuthority(
+        cachedActive,
+        'active',
+        currentV1Authority,
+      ),
+    ).not.toThrow()
+
+    const advancedAuthority = structuredClone(currentV1Authority)
+    advancedAuthority.state.resultDigest = digest('9')
     expect(() =>
       assertCachedGuidanceMatchesCurrentAuthority(
         cachedActive,

@@ -1179,16 +1179,12 @@ const requireSameVerifiedOccurrence = (
     expected.transitionId !== actual.transitionId ||
     expected.publishedAt !== actual.publishedAt ||
     expected.statePath !== actual.statePath ||
-    expected.stateVersion !== actual.stateVersion ||
     expected.stateSha256 !== actual.stateSha256 ||
     expected.attestationPath !== actual.attestationPath ||
-    expected.attestationVersion !== actual.attestationVersion ||
     expected.attestationSha256 !== actual.attestationSha256 ||
     expected.pointerPath !== actual.pointerPath ||
-    expected.pointerVersion !== actual.pointerVersion ||
     expected.pointerSha256 !== actual.pointerSha256 ||
     expected.pointerAttestationPath !== actual.pointerAttestationPath ||
-    expected.pointerAttestationVersion !== actual.pointerAttestationVersion ||
     expected.pointerAttestationSha256 !== actual.pointerAttestationSha256
   ) {
     throw new VerificationError(
