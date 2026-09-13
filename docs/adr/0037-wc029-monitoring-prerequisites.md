@@ -26,14 +26,19 @@ and Blob private endpoint. Read-only deployment validations fail closed unless:
 
 - every VM has one successful AMA extension and the exact DCR and DCE associations;
 - the adopted DCR retains Perf, InsightsMetrics, Syslog, bounded Athena JSON, the reviewed CPU,
-  memory, disk, network, and `VmInsights` counters, and the exact workspace destination;
-- the VM Insights workspace solution exists;
+  memory, disk, network, and `VmInsights` counters, with every required stream routed through a
+  destination bound to the exact approved workspace;
+- the DCE and VM Insights workspace solution exist in `australiaeast`, have succeeded provisioning,
+  and the solution is bound to the exact approved workspace;
 - the canonical VNet flow log is enabled for the workload VNet, uses JSON v2 and at least 30 days'
   retention, writes to monitoring-owned storage, and sends 10-minute Traffic Analytics to the
   adopted workspace; and
 - replacement storage retains Microsoft Entra authorization, disabled shared keys/public Blob
   access, default-deny networking with only the Azure-services flow-log ingress exception,
-  versioning, soft delete, lifecycle policy, and an approved Blob private endpoint.
+  versioning, at least 30-day Blob/container soft delete, the enabled reviewed lifecycle actions and
+  exact filters, no overlapping lifecycle rule that can shorten retention below 30 days, and one
+  successfully provisioned, approved Blob private-link connection in the exact collector subnet
+  with the reviewed Blob private DNS zone group and completed collector-VNet DNS link.
 
 The only optional mutations are guest prerequisite extensions. Both use the pinned Azure Verified
 Module `br/public:avm/res/compute/virtual-machine/extension:0.1.0`. Dependency Agent is gated for

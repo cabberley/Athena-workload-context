@@ -3,27 +3,18 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 ROOT = Path(__file__).parents[1]
 INFRA = ROOT / "infra" / "wc029-monitoring-prerequisites"
 MAIN = (INFRA / "main.bicep").read_text(encoding="utf-8")
-GUEST = (INFRA / "modules" / "guest-coverage-validation.bicep").read_text(
-    encoding="utf-8"
-)
-DCR = (INFRA / "modules" / "data-collection-coverage-validation.bicep").read_text(
-    encoding="utf-8"
-)
-NETWORK = (INFRA / "modules" / "network-evidence-validation.bicep").read_text(
-    encoding="utf-8"
-)
-STORAGE = (INFRA / "modules" / "storage-validation.bicep").read_text(
-    encoding="utf-8"
-)
-PARAMETERS = (INFRA / "main.preparation.bicepparam").read_text(
-    encoding="utf-8"
-)
+GUEST = (INFRA / "modules" / "guest-coverage-validation.bicep").read_text(encoding="utf-8")
+DCR = (INFRA / "modules" / "data-collection-coverage-validation.bicep").read_text(encoding="utf-8")
+NETWORK = (INFRA / "modules" / "network-evidence-validation.bicep").read_text(encoding="utf-8")
+STORAGE = (INFRA / "modules" / "storage-validation.bicep").read_text(encoding="utf-8")
+PARAMETERS = (INFRA / "main.preparation.bicepparam").read_text(encoding="utf-8")
 READINESS = (INFRA / "Test-MonitoringReadiness.ps1").read_text(encoding="utf-8")
 WC025_PARAMETERS = (
     ROOT / "infra" / "wc025-change-ingestion" / "main.example.bicepparam"
@@ -65,14 +56,156 @@ def test_wc029_validates_ama_dcr_dce_and_vm_insights_coverage() -> None:
         "VmInsights\\\\DetailedMetrics",
     ):
         assert counter in DCR
-    assert "destinationWorkspaceResourceIds" in DCR
-    assert "fail('The adopted DCR must retain" in DCR
+    assert "approvedWorkspaceDestinationNames" in DCR
+    assert "fail('Every required DCR stream must flow" in DCR
+
+
+def _required_streams_reach_workspace(
+    data_flows: list[dict[str, object]],
+    destinations: list[dict[str, str]],
+    workspace_resource_id: str,
+) -> bool:
+    approved_names = {
+        destination["name"].casefold()
+        for destination in destinations
+        if destination["workspaceResourceId"].casefold() == workspace_resource_id.casefold()
+    }
+    return all(
+        any(
+            stream in flow["streams"]
+            and bool(
+                approved_names.intersection(
+                    destination.casefold() for destination in flow["destinations"]
+                )
+            )
+            for flow in data_flows
+        )
+        for stream in (
+            "Microsoft-Perf",
+            "Microsoft-InsightsMetrics",
+            "Microsoft-Syslog",
+            "Custom-AthenaJson",
+        )
+    )
+
+
+def test_wc029_requires_each_stream_to_reach_the_approved_workspace() -> None:
+    approved_workspace = "/subscriptions/reviewed/workspaces/athena-hackathon-law"
+    destinations = [
+        {"name": "approved", "workspaceResourceId": approved_workspace},
+        {"name": "decoy", "workspaceResourceId": "/subscriptions/other/workspaces/x"},
+    ]
+    positive_flows: list[dict[str, object]] = [
+        {
+            "streams": [
+                "Microsoft-Perf",
+                "Microsoft-InsightsMetrics",
+                "Microsoft-Syslog",
+                "Custom-AthenaJson",
+            ],
+            "destinations": ["approved"],
+        }
+    ]
+    adversarial_flows = [
+        {
+            "streams": [
+                "Microsoft-Perf",
+                "Microsoft-InsightsMetrics",
+                "Microsoft-Syslog",
+            ],
+            "destinations": ["approved"],
+        },
+        {"streams": ["Custom-AthenaJson"], "destinations": ["decoy"]},
+    ]
+
+    assert _required_streams_reach_workspace(positive_flows, destinations, approved_workspace)
+    assert not _required_streams_reach_workspace(
+        adversarial_flows, destinations, approved_workspace
+    )
+    assert "approvedWorkspaceDestinationNames" in DCR
+    assert "streamsMissingApprovedWorkspaceFlow" in DCR
+    assert "contains(flow.streams, stream)" in DCR
+    assert "contains(approvedWorkspaceDestinationNames" in DCR
+    assert "empty(streamsMissingApprovedWorkspaceFlow)" in DCR
+
+
+def test_wc029_dereferences_dce_and_vm_insights_health_and_binding() -> None:
+    assert "resource dataCollectionEndpoint" in GUEST
+    assert "toLower(dataCollectionEndpoint.id)" in GUEST
+    assert "toLower(dataCollectionEndpoint.location) == location" in GUEST
+    assert "dataCollectionEndpoint.properties.provisioningState == 'Succeeded'" in GUEST
+    assert "validatedDataCollectionEndpointResourceId" in GUEST
+    assert "$ama[0].publisher -eq 'Microsoft.Azure.Monitor'" in READINESS
+    assert "$ama[0].typePropertiesType -eq 'AzureMonitorLinuxAgent'" in READINESS
+    assert "toLower(vmInsightsSolution.location) == location" in DCR
+    assert "vmInsightsSolution.properties.provisioningState == 'Succeeded'" in DCR
+    assert "vmInsightsSolution.properties.workspaceResourceId" in DCR
+    assert "validatedVmInsightsSolutionResourceId" in DCR
+
+
+def _monitoring_associations_are_valid(**overrides: object) -> bool:
+    expected_dcr_id = "/subscriptions/reviewed/providers/Microsoft.Insights/dcr/approved"
+    expected_dce_id = "/subscriptions/reviewed/providers/Microsoft.Insights/dce/approved"
+    expected_workspace_id = (
+        "/subscriptions/reviewed/providers/Microsoft.OperationalInsights/workspaces/approved"
+    )
+    posture: dict[str, object] = {
+        "dce_id": expected_dce_id,
+        "dce_location": "australiaeast",
+        "dce_provisioning_state": "Succeeded",
+        "vm_location": "australiaeast",
+        "ama_publisher": "Microsoft.Azure.Monitor",
+        "ama_type": "AzureMonitorLinuxAgent",
+        "ama_provisioning_state": "Succeeded",
+        "dcr_association_id": expected_dcr_id,
+        "dce_association_id": expected_dce_id,
+        "vm_insights_location": "australiaeast",
+        "vm_insights_provisioning_state": "Succeeded",
+        "vm_insights_workspace_id": expected_workspace_id,
+    }
+    posture.update(overrides)
+    return (
+        str(posture["dce_id"]).casefold() == expected_dce_id.casefold()
+        and posture["dce_location"] == "australiaeast"
+        and posture["dce_provisioning_state"] == "Succeeded"
+        and posture["vm_location"] == "australiaeast"
+        and posture["ama_publisher"] == "Microsoft.Azure.Monitor"
+        and posture["ama_type"] == "AzureMonitorLinuxAgent"
+        and posture["ama_provisioning_state"] == "Succeeded"
+        and str(posture["dcr_association_id"]).casefold() == expected_dcr_id.casefold()
+        and str(posture["dce_association_id"]).casefold() == expected_dce_id.casefold()
+        and posture["vm_insights_location"] == "australiaeast"
+        and posture["vm_insights_provisioning_state"] == "Succeeded"
+        and str(posture["vm_insights_workspace_id"]).casefold()
+        == expected_workspace_id.casefold()
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"dce_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dce/decoy"},
+        {"dce_provisioning_state": "Failed"},
+        {"ama_provisioning_state": "Failed"},
+        {"dcr_association_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dcr/decoy"},
+        {"dce_association_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dce/decoy"},
+        {
+            "vm_insights_workspace_id": (
+                "/subscriptions/other/providers/"
+                "Microsoft.OperationalInsights/workspaces/decoy"
+            )
+        },
+    ],
+)
+def test_wc029_rejects_decoy_or_unhealthy_monitoring_associations(
+    override: dict[str, object],
+) -> None:
+    assert _monitoring_associations_are_valid()
+    assert not _monitoring_associations_are_valid(**override)
 
 
 def test_wc029_uses_pinned_avm_for_explicitly_gated_guest_prerequisites() -> None:
-    assert MAIN.count(
-        "br/public:avm/res/compute/virtual-machine/extension:0.1.0"
-    ) == 2
+    assert MAIN.count("br/public:avm/res/compute/virtual-machine/extension:0.1.0") == 2
     assert "param deployVmInsightsDependencyAgent bool = false" in MAIN
     assert "param deployConnectionMonitorAgent bool = false" in MAIN
     assert "Microsoft.Azure.Monitoring.DependencyAgent" in MAIN
@@ -100,6 +233,126 @@ def test_wc029_validates_flow_analytics_and_private_storage_without_shared_keys(
     assert "privateLinkServiceConnections" in STORAGE
     assert "'blob'" in STORAGE
     assert "listKeys(" not in MAIN + STORAGE
+
+
+def _reviewed_storage_posture_is_valid(**overrides: object) -> bool:
+    expected_collector_vnet_id = "/subscriptions/reviewed/virtualNetworks/collector"
+    expected_private_endpoint_subnet_id = f"{expected_collector_vnet_id}/subnets/private-endpoints"
+    expected_blob_private_dns_zone_id = (
+        "/subscriptions/reviewed/privateDnsZones/privatelink.blob.core.windows.net"
+    )
+    posture: dict[str, object] = {
+        "rule_enabled": True,
+        "rule_type": "Lifecycle",
+        "tier_to_cool_days": 30,
+        "base_delete_days": 30,
+        "version_delete_days": 30,
+        "blob_types": ["blockBlob"],
+        "prefixes": [
+            "insights-logs-flowlogflowevent/",
+            "monitoring-evidence/",
+        ],
+        "blob_soft_delete_enabled": True,
+        "blob_soft_delete_days": 30,
+        "container_soft_delete_enabled": True,
+        "container_soft_delete_days": 30,
+        "connection_status": "Approved",
+        "connection_provisioning_state": "Succeeded",
+        "connection_group_ids": ["blob"],
+        "overlapping_delete_days": [30],
+        "private_endpoint_subnet_id": expected_private_endpoint_subnet_id,
+        "dns_zone_group_provisioning_state": "Succeeded",
+        "dns_zone_ids": [expected_blob_private_dns_zone_id],
+        "dns_vnet_link_provisioning_state": "Succeeded",
+        "dns_vnet_link_state": "Completed",
+        "dns_vnet_registration_enabled": False,
+        "dns_vnet_link_vnet_id": expected_collector_vnet_id,
+    }
+    posture.update(overrides)
+    return (
+        posture["rule_enabled"] is True
+        and posture["rule_type"] == "Lifecycle"
+        and posture["tier_to_cool_days"] == 30
+        and int(posture["base_delete_days"]) >= 30
+        and int(posture["version_delete_days"]) >= 30
+        and posture["blob_types"] == ["blockBlob"]
+        and set(posture["prefixes"]) == {"insights-logs-flowlogflowevent/", "monitoring-evidence/"}
+        and posture["blob_soft_delete_enabled"] is True
+        and int(posture["blob_soft_delete_days"]) >= 30
+        and posture["container_soft_delete_enabled"] is True
+        and int(posture["container_soft_delete_days"]) >= 30
+        and posture["connection_status"] == "Approved"
+        and posture["connection_provisioning_state"] == "Succeeded"
+        and posture["connection_group_ids"] == ["blob"]
+        and all(
+            days >= 30 for days in cast(list[int], posture["overlapping_delete_days"])
+        )
+        and str(posture["private_endpoint_subnet_id"]).casefold()
+        == expected_private_endpoint_subnet_id.casefold()
+        and posture["dns_zone_group_provisioning_state"] == "Succeeded"
+        and [
+            str(zone_id).casefold()
+            for zone_id in cast(list[str], posture["dns_zone_ids"])
+        ]
+        == [expected_blob_private_dns_zone_id.casefold()]
+        and posture["dns_vnet_link_provisioning_state"] == "Succeeded"
+        and posture["dns_vnet_link_state"] == "Completed"
+        and posture["dns_vnet_registration_enabled"] is False
+        and str(posture["dns_vnet_link_vnet_id"]).casefold()
+        == expected_collector_vnet_id.casefold()
+    )
+
+
+def test_wc029_accepts_complete_reviewed_storage_posture() -> None:
+    assert _reviewed_storage_posture_is_valid()
+    for required_check in (
+        "rule.enabled == true",
+        "tierToCool.?daysAfterModificationGreaterThan",
+        "baseBlob.?delete.?daysAfterModificationGreaterThan",
+        "version.?delete.?daysAfterCreationGreaterThan",
+        "deleteRetentionPolicy.days >= requiredRetentionDays",
+        "containerDeleteRetentionPolicy.days >= requiredRetentionDays",
+        "privateLinkServiceConnectionState.status == 'Approved'",
+        "connection.properties.provisioningState == 'Succeeded'",
+        "length(connection.properties.groupIds) == 1",
+        "unsafeRetentionRules",
+        "empty(unsafeRetentionRules)",
+        "length(approvedBlobConnections) == 1",
+        "storagePrivateEndpoint.properties.subnet.id",
+        "storagePrivateDnsZoneGroup.properties.provisioningState == 'Succeeded'",
+        "length(approvedBlobPrivateDnsZoneConfigs) == 1",
+        "collectorBlobPrivateDnsVnetLink.properties.virtualNetworkLinkState == 'Completed'",
+    ):
+        assert required_check in STORAGE
+    assert "$filters.PSObject.Properties['prefixMatch']" in READINESS
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"rule_enabled": False},
+        {"blob_soft_delete_enabled": False},
+        {"container_soft_delete_enabled": False},
+        {"base_delete_days": 29},
+        {"version_delete_days": 29},
+        {"blob_soft_delete_days": 29},
+        {"container_soft_delete_days": 29},
+        {"connection_status": "Rejected"},
+        {"connection_provisioning_state": "Failed"},
+        {"connection_group_ids": ["blob", "dfs"]},
+        {"overlapping_delete_days": [30, 29]},
+        {"private_endpoint_subnet_id": "/subscriptions/reviewed/subnets/decoy"},
+        {"dns_zone_group_provisioning_state": "Failed"},
+        {"dns_zone_ids": ["/subscriptions/reviewed/privateDnsZones/decoy"]},
+        {"dns_vnet_link_state": "Disconnected"},
+        {"dns_vnet_registration_enabled": True},
+        {"dns_vnet_link_vnet_id": "/subscriptions/reviewed/virtualNetworks/decoy"},
+    ],
+)
+def test_wc029_rejects_disabled_shortened_or_rejected_storage_posture(
+    override: dict[str, object],
+) -> None:
+    assert not _reviewed_storage_posture_is_valid(**override)
 
 
 def test_wc029_keeps_connection_monitor_and_subscription_export_disabled() -> None:
@@ -158,8 +411,7 @@ def _run_bicep(args: list[str], cwd: Path) -> None:
     )
     if result.returncode != 0:
         pytest.fail(
-            "az bicep validation failed: "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            f"az bicep validation failed: stdout={result.stdout!r} stderr={result.stderr!r}"
         )
 
 

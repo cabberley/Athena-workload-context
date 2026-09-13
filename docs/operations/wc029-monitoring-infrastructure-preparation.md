@@ -8,11 +8,15 @@ This slice is preparation only. It does not authorize or perform an Azure deploy
 - Workload resource group `rg-athena-demo-workload`; monitoring resource group
   `rg-athena-demo-monitoring`; Network Watcher remains in `NetworkWatcherRG`.
 - Existing AMA, `athena-linux-dcr`, `configurationAccessEndpoint`, VM Insights solution, and exact
-  eleven-VM coverage are read and validated, not replaced.
+  eleven-VM coverage are read and validated, not replaced. Every required stream must reach the
+  destination bound to the approved workspace; DCE and VM Insights health/binding are dereferenced.
 - Optional `DependencyAgentLinux` and `NetworkWatcherAgentLinux` installs use pinned AVM 0.1.0.
   Both deployment gates are false in `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam`.
 - The canonical VNet flow log, 10-minute Traffic Analytics, monitoring-owned
-  `athenademomonchab01`, its lifecycle policy, and private Blob endpoint are validated.
+  `athenademomonchab01`, its enabled 30-day lifecycle/soft-delete controls, exact filters, absence
+  of an overlapping rule that shortens retention, and its successfully provisioned Approved Blob
+  private-link connection in the exact collector subnet with the reviewed Blob private DNS zone
+  group and completed collector-VNet DNS link are validated.
 - `athenahackathonflowwhtco` remains a legacy evidence source. This slice neither deletes its blobs
   nor disables its eighteen currently retained subnet/NIC flow-log writers.
 - Connection Monitor definitions remain disabled until exact published intent supplies paths and

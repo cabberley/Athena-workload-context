@@ -118,6 +118,7 @@ module guestCoverageValidation 'modules/guest-coverage-validation.bicep' = {
   params: {
     location: location
     approvedVmNames: approvedVmNames
+    monitoringResourceGroupName: monitoringResourceGroupName
     dataCollectionRuleResourceId: dataCollectionRuleResourceId
     dataCollectionEndpointResourceId: dataCollectionEndpointResourceId
   }

@@ -818,13 +818,54 @@ def _run_az_bicep(args: list[str], output_file: Path) -> None:
         )
 
 
+def _without_bicep_generator_metadata(value: object) -> object:
+    if isinstance(value, list):
+        return [_without_bicep_generator_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    cleaned: dict[str, object] = {}
+    for key, item in value.items():
+        if key == "metadata" and isinstance(item, dict):
+            cleaned[key] = {
+                metadata_key: _without_bicep_generator_metadata(metadata_value)
+                for metadata_key, metadata_value in item.items()
+                if metadata_key != "_generator"
+            }
+        else:
+            cleaned[key] = _without_bicep_generator_metadata(item)
+    return cleaned
+
+
 def _template_without_bicep_generator(path: Path) -> object:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, dict):
-        metadata = payload.get("metadata")
-        if isinstance(metadata, dict):
-            metadata.pop("_generator", None)
-    return payload
+    return _without_bicep_generator_metadata(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+
+
+def test_wc024_generator_metadata_normalization_is_recursive_and_only_metadata() -> None:
+    payload = {
+        "metadata": {"_generator": {"version": "0.46.1"}, "owner": "athena"},
+        "resources": [
+            {
+                "properties": {
+                    "template": {
+                        "metadata": {"_generator": {"version": "0.47.16"}},
+                        "semantic": "retained",
+                    }
+                }
+            }
+        ],
+        "_generator": "not metadata and therefore semantic",
+    }
+
+    assert _without_bicep_generator_metadata(payload) == {
+        "metadata": {"owner": "athena"},
+        "resources": [
+            {"properties": {"template": {"metadata": {}, "semantic": "retained"}}}
+        ],
+        "_generator": "not metadata and therefore semantic",
+    }
 
 
 def test_wc024_checked_in_generated_artifacts_match_current_bicep(tmp_path: Path) -> None:

@@ -21,11 +21,11 @@ resource vmInsightsSolution 'Microsoft.OperationsManagement/solutions@2015-11-01
   name: 'VMInsights(athena-hackathon-law)'
 }
 
-var dataFlowStreams = flatten(map(dataCollectionRule.properties.dataFlows, flow => flow.streams))
+var dataFlows = dataCollectionRule.properties.?dataFlows ?? []
 var performanceCounters = dataCollectionRule.properties.dataSources.?performanceCounters ?? []
 var performanceCounterSpecifiers = flatten(map(performanceCounters, counter => counter.counterSpecifiers))
 var logAnalyticsDestinations = dataCollectionRule.properties.destinations.?logAnalytics ?? []
-var destinationWorkspaceResourceIds = map(logAnalyticsDestinations, destination => toLower(destination.workspaceResourceId))
+var approvedWorkspaceDestinationNames = map(filter(logAnalyticsDestinations, destination => toLower(destination.workspaceResourceId) == toLower(workspaceResourceId)), destination => toLower(destination.name))
 var requiredStreams = [
   'Microsoft-Perf'
   'Microsoft-InsightsMetrics'
@@ -42,15 +42,20 @@ var requiredPerformanceCounters = [
   '\\Network(*)\\Total Bytes Received'
   '\\VmInsights\\DetailedMetrics'
 ]
-var missingStreams = filter(requiredStreams, stream => !contains(dataFlowStreams, stream))
+var streamsMissingApprovedWorkspaceFlow = filter(requiredStreams, stream => empty(filter(dataFlows, flow => contains(flow.streams, stream) && !empty(filter(flow.destinations, destinationName => contains(approvedWorkspaceDestinationNames, toLower(destinationName)))))))
 var missingPerformanceCounters = filter(requiredPerformanceCounters, counter => !contains(performanceCounterSpecifiers, counter))
-var coverageIsValid = toLower(workspace.location) == location && toLower(dataCollectionRule.location) == location && empty(missingStreams) && empty(missingPerformanceCounters) && contains(destinationWorkspaceResourceIds, toLower(workspaceResourceId))
-var validatedDcrResourceId = coverageIsValid ? dataCollectionRule.id : fail('The adopted DCR must retain Perf, InsightsMetrics, Syslog, Athena custom logs, the reviewed guest counters, and the exact monitoring workspace destination.')
+var workspaceIsValid = toLower(workspace.id) == toLower(workspaceResourceId) && toLower(workspace.location) == location && workspace.properties.provisioningState == 'Succeeded'
+var vmInsightsSolutionIsValid = toLower(vmInsightsSolution.location) == location && vmInsightsSolution.properties.provisioningState == 'Succeeded' && toLower(vmInsightsSolution.properties.workspaceResourceId) == toLower(workspaceResourceId)
+var dcrCoverageIsValid = toLower(dataCollectionRule.location) == location && dataCollectionRule.properties.provisioningState == 'Succeeded' && !empty(approvedWorkspaceDestinationNames) && empty(streamsMissingApprovedWorkspaceFlow) && empty(missingPerformanceCounters)
+var validatedWorkspaceResourceId = workspaceIsValid ? workspace.id : fail('The adopted Log Analytics workspace must exist in australiaeast with a Succeeded provisioning state and the exact reviewed resource ID.')
+var validatedVmInsightsSolutionResourceId = vmInsightsSolutionIsValid ? vmInsightsSolution.id : fail('The VM Insights solution must exist in australiaeast with a Succeeded provisioning state and be bound to the exact monitoring workspace.')
+var validatedDcrResourceId = dcrCoverageIsValid ? dataCollectionRule.id : fail('Every required DCR stream must flow to the destination bound to the approved workspace, and the DCR must retain the reviewed guest counters with a Succeeded provisioning state.')
 
 output coverage object = {
-  workspaceResourceId: workspace.id
+  workspaceResourceId: validatedWorkspaceResourceId
   dataCollectionRuleResourceId: validatedDcrResourceId
-  vmInsightsSolutionResourceId: vmInsightsSolution.id
+  vmInsightsSolutionResourceId: validatedVmInsightsSolutionResourceId
   streams: requiredStreams
   performanceCounters: requiredPerformanceCounters
+  approvedWorkspaceDestinationNames: approvedWorkspaceDestinationNames
 }
