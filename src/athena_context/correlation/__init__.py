@@ -10,6 +10,7 @@ from athena_context.correlation.verification import (
     ImmutableArtifactReader,
     TrustedChangeArtifactVerifier,
     TrustedMonitoringHandoffVerifier,
+    TrustedMonitoringIntentAssetVerifier,
     VerifiedCorrelationReport,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     "ImmutableArtifactReader",
     "TrustedChangeArtifactVerifier",
     "TrustedMonitoringHandoffVerifier",
+    "TrustedMonitoringIntentAssetVerifier",
     "VerifiedCorrelationReport",
     "classify_confidence",
 ]

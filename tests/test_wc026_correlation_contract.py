@@ -12,9 +12,7 @@ from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_CONFIDENCE_THRESHOLDS,
     CORRELATION_REPORT_SCHEMA_VERSION,
-    CORRELATION_REQUEST_SCHEMA_VERSION,
     CORRELATION_REQUIRED_CAPS,
-    MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ApprovedChangeScope,
     ChangeEvidenceArtifact,
     ChangeEvidenceAttestation,
@@ -53,6 +51,12 @@ from athena_context.contracts import (
     sha256_hex,
     validate_correlation_report_binding,
     validate_runtime_correlation_report,
+)
+from athena_context.contracts import (
+    LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION as CORRELATION_REQUEST_SCHEMA_VERSION,
+)
+from athena_context.contracts import (
+    LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION as MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 )
 from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
 from athena_context.eventing.change_ingestion import normalize_resource_graph_change

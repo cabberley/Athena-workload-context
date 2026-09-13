@@ -141,14 +141,22 @@ class MonitoringIntentScope(_StrictMonitoringIntentModel):
         min_length=1,
         max_length=64,
     )
+    evidence_resource_ids: tuple[str, ...] | None = Field(
+        default=None,
+        alias="evidenceResourceIds",
+        min_length=1,
+        max_length=128,
+    )
     scope_digest: Sha256Digest = Field(alias="scopeDigest")
 
-    @field_validator("resource_ids")
+    @field_validator("resource_ids", "evidence_resource_ids")
     @classmethod
     def validate_resource_ids(
         cls,
-        values: tuple[str, ...],
-    ) -> tuple[str, ...]:
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
         normalized = tuple(value.casefold() for value in values)
         if any(_RESOURCE_ID_PATTERN.fullmatch(value) is None for value in normalized):
             raise ValueError("monitoring scope contains an invalid resource ID")
@@ -175,6 +183,10 @@ class MonitoringIntentScope(_StrictMonitoringIntentModel):
 
     @model_validator(mode="after")
     def validate_digest(self) -> MonitoringIntentScope:
+        if self.evidence_resource_ids is not None and set(
+            self.evidence_resource_ids
+        ).intersection(self.resource_ids):
+            raise ValueError("monitoring evidence resources must be separate from path resources")
         expected = _expected_digest(
             self,
             excluded_fields={"scope_digest"},
@@ -325,6 +337,11 @@ class ActivityLogMonitoringSignal(_StrictMonitoringIntentModel):
 
 class ResourceHealthMonitoringSignal(_StrictMonitoringIntentModel):
     signal_kind: Literal["resourceHealth"] = Field(alias="signalKind")
+    maximum_event_age_seconds: int = Field(
+        alias="maximumEventAgeSeconds",
+        ge=60,
+        le=3600,
+    )
     event_statuses: tuple[
         Literal["Active", "In Progress", "Resolved", "Updated"],
         ...,
@@ -400,7 +417,7 @@ class PublishedMonitoringIntentControl(_StrictMonitoringIntentModel):
 
 
 class PublishedMonitoringIntent(_StrictMonitoringIntentModel):
-    schema_version: Literal["athena.wc028PublishedMonitoringIntent.v1"] = Field(
+    schema_version: Literal["athena.wc028PublishedMonitoringIntent.v2"] = Field(
         alias="schemaVersion"
     )
     intent_id: str = Field(
@@ -573,7 +590,7 @@ def build_published_monitoring_intent(
         raise ValueError("monitoring control references an unknown path")
     _validate_control_scopes(context, controls)
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028PublishedMonitoringIntent.v1",
+        "schemaVersion": "athena.wc028PublishedMonitoringIntent.v2",
         "environment": environment,
         "workloadId": context.workload_id,
         "manifestId": context.manifest_id,
@@ -654,6 +671,10 @@ def validate_monitoring_intent_activation_eligible(
     intent = PublishedMonitoringIntent.model_validate_json(intent.model_dump_json(by_alias=True))
     if any(item.dry_run_only for item in intent.controls):
         raise ValueError("dry-run-only monitoring intent cannot be activated")
+    if any(item.missing_data_behavior == "treatAsHealthy" for item in intent.controls):
+        raise ValueError(
+            "activation-eligible monitoring intent cannot treat missing data as healthy"
+        )
 
 
 def validate_published_monitoring_intent_assets(

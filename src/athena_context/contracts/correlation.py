@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from ipaddress import ip_address
 from types import MappingProxyType
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -20,10 +20,22 @@ from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDa
 from athena_context.contracts.monitoring import MonitoringEvidenceHandoff
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
-MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION = (
+LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
+    Literal["athena.wc026MonitoringEvidenceBundle.v1"]
+] = (
     "athena.wc026MonitoringEvidenceBundle.v1"
 )
-CORRELATION_REQUEST_SCHEMA_VERSION = "athena.wc026CorrelationRequest.v2"
+MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
+    Literal["athena.wc028MonitoringEvidenceBundle.v2"]
+] = (
+    "athena.wc028MonitoringEvidenceBundle.v2"
+)
+LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+    Literal["athena.wc026CorrelationRequest.v2"]
+] = "athena.wc026CorrelationRequest.v2"
+CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+    Literal["athena.wc028CorrelationRequest.v3"]
+] = "athena.wc028CorrelationRequest.v3"
 CORRELATION_REPORT_SCHEMA_VERSION = "athena.wc026CorrelationReport.v1"
 CORRELATION_ALGORITHM_ID = "athena.wc026.correlation.v1"
 CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
@@ -347,6 +359,73 @@ class CorrelationEvidenceCitation(_StrictCorrelationModel):
         return self
 
 
+class MonitoringControlProvenance(_StrictCorrelationModel):
+    control_id: str = Field(
+        alias="controlId",
+        pattern=r"^monitoring-control-[a-f0-9]{32}$",
+    )
+    control_digest: Sha256Digest = Field(alias="controlDigest")
+    source_clause_path: str = Field(
+        alias="sourceClausePath",
+        pattern=r"^/[A-Za-z0-9._~/-]{1,511}$",
+    )
+
+
+class MonitoringIntentEvidenceReference(_StrictCorrelationModel):
+    intent_id: str = Field(
+        alias="intentId",
+        pattern=r"^monitoring-intent-[a-f0-9]{32}$",
+    )
+    intent_digest: Sha256Digest = Field(alias="intentDigest")
+    asset_reference_id: str = Field(
+        alias="assetReferenceId",
+        pattern=r"^monitoring-intent-asset-[a-f0-9]{32}$",
+    )
+    asset_reference_digest: Sha256Digest = Field(alias="assetReferenceDigest")
+    intent_reference: VersionPinnedBlobReference = Field(alias="intentReference")
+    attestation_reference: VersionPinnedBlobReference = Field(
+        alias="attestationReference"
+    )
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> MonitoringIntentEvidenceReference:
+        prefix = f"monitoring-intent/{self.intent_id}"
+        if (
+            self.intent_reference.name != f"{prefix}/intent.json"
+            or self.attestation_reference.name != f"{prefix}/attestation.json"
+        ):
+            raise ValueError("monitoring intent evidence asset paths are invalid")
+        expected = compute_artifact_digest(
+            {
+                "schemaVersion": (
+                    "athena.wc028PublishedMonitoringIntentAssetReference.v1"
+                ),
+                "intentId": self.intent_id,
+                "intentDigest": self.intent_digest,
+                "intentReference": self.intent_reference.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                "attestationReference": self.attestation_reference.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+            }
+        )
+        if self.asset_reference_digest != expected:
+            raise ValueError(
+                "assetReferenceDigest does not bind monitoring intent evidence"
+            )
+        if (
+            self.asset_reference_id
+            != f"monitoring-intent-asset-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("assetReferenceId is not digest-bound")
+        return self
+
+
 class _MonitoringObservation(_StrictCorrelationModel):
     observation_id: str = Field(alias="observationId")
     subject_resource_id: str = Field(
@@ -370,6 +449,14 @@ class _MonitoringObservation(_StrictCorrelationModel):
         min_length=1,
         max_length=128,
         pattern=r"^[a-z][A-Za-z0-9.-]{0,127}$",
+    )
+    control_provenance: MonitoringControlProvenance | None = Field(
+        default=None,
+        alias="controlProvenance",
+    )
+    query_execution_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="queryExecutionDigest",
     )
     observation_digest: Sha256Digest = Field(alias="observationDigest")
 
@@ -801,6 +888,15 @@ class EvidenceCoverage(_StrictCorrelationModel):
     )
     coverage_start: UtcDateTime = Field(alias="coverageStart")
     coverage_end: UtcDateTime = Field(alias="coverageEnd")
+    control_provenance: MonitoringControlProvenance | None = Field(
+        default=None,
+        alias="controlProvenance",
+    )
+    query_execution_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="queryExecutionDigests",
+        max_length=1440,
+    )
     status: CoverageStatus
     detail: str | None = Field(default=None, min_length=1, max_length=500)
     coverage_digest: Sha256Digest = Field(alias="coverageDigest")
@@ -808,6 +904,15 @@ class EvidenceCoverage(_StrictCorrelationModel):
     @model_validator(mode="after")
     def validate_coverage(self) -> EvidenceCoverage:
         _require_interval(self.coverage_start, self.coverage_end)
+        if self.query_execution_digests is not None:
+            _require_sorted_unique(
+                self.query_execution_digests,
+                "queryExecutionDigests",
+            )
+        if self.query_execution_digests and self.control_provenance is None:
+            raise ValueError(
+                "query-derived coverage requires resolvable control provenance"
+            )
         if self.provenance_root_digest != sha256_hex(self.source_root_reference):
             raise ValueError(
                 "provenanceRootDigest must derive from sourceRootReference"
@@ -836,9 +941,12 @@ class EvidenceCoverage(_StrictCorrelationModel):
             raise ValueError(
                 "complete Connection Monitor coverage requires path and endpoint test"
             )
+        excluded_fields = {"coverage_id", "coverage_digest"}
+        if not self.query_execution_digests:
+            excluded_fields.add("query_execution_digests")
         expected = _expected_digest(
             self,
-            excluded_fields={"coverage_id", "coverage_digest"},
+            excluded_fields=excluded_fields,
         )
         if self.coverage_digest != expected:
             raise ValueError("coverageDigest does not bind the coverage record")
@@ -848,9 +956,10 @@ class EvidenceCoverage(_StrictCorrelationModel):
 
 
 class MonitoringEvidenceBundle(_StrictCorrelationModel):
-    schema_version: Literal["athena.wc026MonitoringEvidenceBundle.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc026MonitoringEvidenceBundle.v1",
+        "athena.wc028MonitoringEvidenceBundle.v2",
+    ] = Field(alias="schemaVersion")
     workload_id: str = Field(
         alias="workloadId",
         min_length=1,
@@ -860,6 +969,11 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
     monitoring_contract_digest: Sha256Digest = Field(
         alias="monitoringContractDigest"
     )
+    monitoring_intent_reference: MonitoringIntentEvidenceReference | None = Field(
+        default=None,
+        alias="monitoringIntentReference",
+    )
+    collected_at: UtcDateTime | None = Field(default=None, alias="collectedAt")
     observed_start: UtcDateTime = Field(alias="observedStart")
     observed_end: UtcDateTime = Field(alias="observedEnd")
     observations: tuple[MonitoringObservation, ...] = Field(max_length=1000)
@@ -911,12 +1025,109 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             "expectedCoverageScopeDigests",
         )
         actual_scope_digests = tuple(
-            sorted(item.scope.scope_digest for item in self.coverage)
+            sorted({item.scope.scope_digest for item in self.coverage})
         )
         if actual_scope_digests != self.expected_coverage_scope_digests:
             raise ValueError(
                 "coverage must account for every expected monitoring query scope"
             )
+        if self.schema_version == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION:
+            if (
+                self.monitoring_intent_reference is not None
+                or self.collected_at is not None
+                or any(
+                    item.control_provenance is not None
+                    or item.query_execution_digest is not None
+                    for item in self.observations
+                )
+                or any(
+                    item.control_provenance is not None
+                    or item.query_execution_digests is not None
+                    for item in self.coverage
+                )
+            ):
+                raise ValueError(
+                    "legacy monitoring bundle cannot contain WC028 provenance fields"
+                )
+        else:
+            if self.monitoring_intent_reference is None or self.collected_at is None:
+                raise ValueError(
+                    "WC028 monitoring bundle requires signed intent references and collectedAt"
+                )
+            if any(
+                item.control_provenance is None for item in self.observations
+            ) or any(item.control_provenance is None for item in self.coverage):
+                raise ValueError(
+                    "signed monitoring evidence requires resolvable control provenance"
+                )
+            query_observations = tuple(
+                item
+                for item in self.observations
+                if not isinstance(item, PlatformHealthObservation)
+            )
+            if any(item.query_execution_digest is None for item in query_observations):
+                raise ValueError(
+                    "query-derived observations require exact execution digests"
+                )
+            observations_by_execution = {
+                item.query_execution_digest: item
+                for item in query_observations
+                if item.query_execution_digest is not None
+            }
+            if len(observations_by_execution) != len(query_observations):
+                raise ValueError(
+                    "query-derived observation execution digests must be unique"
+                )
+            coverage_by_execution: dict[str, list[EvidenceCoverage]] = {}
+            for coverage in self.coverage:
+                for digest in coverage.query_execution_digests or ():
+                    coverage_by_execution.setdefault(digest, []).append(coverage)
+            if set(coverage_by_execution) != set(observations_by_execution) or any(
+                len(items) != 1 for items in coverage_by_execution.values()
+            ):
+                raise ValueError(
+                    "every query observation must be covered exactly once"
+                )
+            for digest, observation in observations_by_execution.items():
+                coverage_item = coverage_by_execution[digest][0]
+                observation_provenance = observation.control_provenance
+                if (
+                    observation_provenance is None
+                    or coverage_item.control_provenance != observation_provenance
+                    or coverage_item.family != _observation_family(observation)
+                    or observation.observed_start < coverage_item.coverage_start
+                    or observation.observed_end > coverage_item.coverage_end
+                    or not set(
+                        _observation_coverage_resource_ids(observation)
+                    ).issubset(
+                        coverage_item.scope.resource_ids
+                    )
+                ):
+                    raise ValueError(
+                        "query observation coverage is incompatible with its scope or control"
+                    )
+                if isinstance(
+                    observation,
+                    (
+                        NetworkFlowObservation,
+                        ConnectionMonitorObservation,
+                        EndpointHealthObservation,
+                    ),
+                ) and coverage_item.scope.path_id != observation.path_id:
+                    raise ValueError(
+                        "query observation coverage is incompatible with its path"
+                    )
+                if isinstance(
+                    observation,
+                    (NetworkFlowObservation, ConnectionMonitorObservation),
+                ) and (
+                    coverage_item.scope.direction != observation.direction
+                    or coverage_item.scope.five_tuple_digest
+                    != observation.five_tuple_digest
+                ):
+                    raise ValueError(
+                        "query observation coverage is incompatible with its network tuple"
+                    )
         return self
 
 
@@ -955,6 +1166,15 @@ def _observation_resource_ids(
     elif isinstance(observation, EndpointHealthObservation):
         resource_ids.update(observation.backend_resource_ids)
     return tuple(sorted(resource_ids))
+
+
+def _observation_coverage_resource_ids(
+    observation: MonitoringObservation,
+) -> tuple[str, ...]:
+    resources = set(_observation_resource_ids(observation))
+    if isinstance(observation, ConnectionMonitorObservation):
+        resources.discard(observation.monitor_resource_id)
+    return tuple(sorted(resources))
 
 
 def _monitoring_evidence_index(
@@ -1437,6 +1657,14 @@ class CorrelationEvidenceInventory(_StrictCorrelationModel):
         max_length=256,
     )
     evidence_index_digest: Sha256Digest = Field(alias="evidenceIndexDigest")
+    monitoring_intent_asset_reference_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="monitoringIntentAssetReferenceDigest",
+    )
+    monitoring_control_provenance_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="monitoringControlProvenanceDigest",
+    )
     source_references: tuple[VersionPinnedBlobReference, ...] = Field(
         alias="sourceReferences",
         min_length=1,
@@ -1468,9 +1696,10 @@ class CorrelationEvidenceInventory(_StrictCorrelationModel):
 class CorrelationRequest(_StrictCorrelationModel):
     """Untrusted wire envelope that must pass the later verification adapter."""
 
-    schema_version: Literal["athena.wc026CorrelationRequest.v2"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc026CorrelationRequest.v2",
+        "athena.wc028CorrelationRequest.v3",
+    ] = Field(alias="schemaVersion")
     request_id: str = Field(alias="requestId")
     algorithm_id: Literal["athena.wc026.correlation.v1"] = Field(alias="algorithmId")
     rule_catalog_digest: Sha256Digest = Field(alias="ruleCatalogDigest")
@@ -1502,6 +1731,28 @@ class CorrelationRequest(_StrictCorrelationModel):
 
     @model_validator(mode="after")
     def validate_request(self) -> CorrelationRequest:
+        if self.schema_version == LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION:
+            if (
+                self.monitoring_bundle.schema_version
+                != LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest
+                is not None
+                or self.evidence_inventory.monitoring_control_provenance_digest
+                is not None
+            ):
+                raise ValueError(
+                    "legacy correlation request cannot contain WC028 provenance fields"
+                )
+        elif (
+            self.monitoring_bundle.schema_version
+            != MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            or self.evidence_inventory.monitoring_intent_asset_reference_digest
+            is None
+            or self.evidence_inventory.monitoring_control_provenance_digest is None
+        ):
+            raise ValueError(
+                "WC028 correlation request requires the WC028 evidence bundle and inventory"
+            )
         if not (
             self.issued_at <= self.trusted_as_of <= self.expires_at
             and self.expires_at - self.issued_at <= timedelta(minutes=15)
@@ -1624,6 +1875,14 @@ class CorrelationRequest(_StrictCorrelationModel):
             sorted(
                 (
                     self.monitoring_handoff.evidence,
+                    *(
+                        (
+                            self.monitoring_bundle.monitoring_intent_reference.intent_reference,
+                            self.monitoring_bundle.monitoring_intent_reference.attestation_reference,
+                        )
+                        if self.monitoring_bundle.monitoring_intent_reference is not None
+                        else ()
+                    ),
                     *(
                         (self.context_binding.publication_authority_reference,)
                         if isinstance(
@@ -1823,6 +2082,34 @@ class CorrelationRequest(_StrictCorrelationModel):
                 for item in self.evidence_index
             ]
         )
+        control_provenance = {
+            (
+                item.control_provenance.control_id,
+                item.control_provenance.control_digest,
+                item.control_provenance.source_clause_path,
+            )
+            for item in (
+                *self.monitoring_bundle.observations,
+                *self.monitoring_bundle.coverage,
+            )
+            if item.control_provenance is not None
+        }
+        control_provenance_digest = (
+            compute_artifact_digest(
+                [
+                    {
+                        "controlId": control_id,
+                        "controlDigest": control_digest,
+                        "sourceClausePath": source_clause_path,
+                    }
+                    for control_id, control_digest, source_clause_path in sorted(
+                        control_provenance
+                    )
+                ]
+            )
+            if control_provenance
+            else None
+        )
         if (
             self.evidence_inventory.rule_catalog_digest != self.rule_catalog_digest
             or self.evidence_inventory.context_binding_digest
@@ -1834,6 +2121,14 @@ class CorrelationRequest(_StrictCorrelationModel):
             != monitoring_bundle_digest
             or self.evidence_inventory.change_artifact_digests != change_digests
             or self.evidence_inventory.evidence_index_digest != evidence_index_digest
+            or self.evidence_inventory.monitoring_intent_asset_reference_digest
+            != (
+                self.monitoring_bundle.monitoring_intent_reference.asset_reference_digest
+                if self.monitoring_bundle.monitoring_intent_reference is not None
+                else None
+            )
+            or self.evidence_inventory.monitoring_control_provenance_digest
+            != control_provenance_digest
             or self.evidence_inventory.source_references
             != expected_source_references
         ):
@@ -3407,6 +3702,8 @@ __all__ = [
     "CORRELATION_REPORT_SCHEMA_VERSION",
     "CORRELATION_REQUIRED_CAPS",
     "CORRELATION_REQUEST_SCHEMA_VERSION",
+    "LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION",
+    "LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "BindingMode",
     "ConfidenceCap",
@@ -3443,8 +3740,10 @@ __all__ = [
     "IncidentHealthTransition",
     "MissingCorrelationEvidence",
     "MissingEvidenceCode",
+    "MonitoringControlProvenance",
     "MonitoringEvidenceBundle",
     "MonitoringEvidenceFamily",
+    "MonitoringIntentEvidenceReference",
     "MonitoringObservation",
     "NetworkFlowObservation",
     "NetworkAttributionMethod",

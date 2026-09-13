@@ -29,6 +29,7 @@ from athena_context.correlation import (
     CorrelationService,
     TrustedChangeArtifactVerifier,
     TrustedMonitoringHandoffVerifier,
+    TrustedMonitoringIntentAssetVerifier,
     VerifiedCorrelationReport,
     classify_confidence,
 )
@@ -150,6 +151,9 @@ def _test_service(
         "change_verifier",
         _ChangeVerifier([] if calls is None else calls),
     )
+    object.__setattr__(service, "monitoring_intent_reader", None)
+    object.__setattr__(service, "monitoring_intent_verifier", None)
+    object.__setattr__(service, "_require_signed_monitoring_intent", False)
     object.__setattr__(
         service,
         "_sealing_key",
@@ -458,8 +462,16 @@ def test_public_service_requires_separate_reader_identities() -> None:
                 managed_identity_client_id=shared_identity,
                 required_prefix="context-authority/",
             ),
+            monitoring_intent_reader=_production_reader_stub(
+                container_name="intent",
+                managed_identity_client_id=shared_identity,
+                required_prefix="monitoring-intent/",
+            ),
             monitoring_verifier=object.__new__(TrustedMonitoringHandoffVerifier),
             change_verifier=object.__new__(TrustedChangeArtifactVerifier),
+            monitoring_intent_verifier=object.__new__(
+                TrustedMonitoringIntentAssetVerifier
+            ),
         )
 
 
@@ -481,8 +493,16 @@ def test_public_service_requires_separate_storage_containers() -> None:
                 managed_identity_client_id="00000000-0000-0000-0000-000000000003",
                 required_prefix="context-authority/",
             ),
+            monitoring_intent_reader=_production_reader_stub(
+                container_name="shared",
+                managed_identity_client_id="00000000-0000-0000-0000-000000000004",
+                required_prefix="monitoring-intent/",
+            ),
             monitoring_verifier=object.__new__(TrustedMonitoringHandoffVerifier),
             change_verifier=object.__new__(TrustedChangeArtifactVerifier),
+            monitoring_intent_verifier=object.__new__(
+                TrustedMonitoringIntentAssetVerifier
+            ),
         )
 
 
@@ -491,6 +511,15 @@ def test_public_service_rejects_draft_preview_requests() -> None:
     service = object.__new__(CorrelationService)
 
     with pytest.raises(ValueError, match="published runtime context"):
+        service.correlate(request)
+
+
+def test_production_service_rejects_legacy_unsigned_request() -> None:
+    request = _request()
+    service = _test_service(request)
+    object.__setattr__(service, "_require_signed_monitoring_intent", True)
+
+    with pytest.raises(ValueError, match="signed monitoring intent"):
         service.correlate(request)
 
 
