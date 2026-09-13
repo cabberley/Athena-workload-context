@@ -55,6 +55,21 @@ param signingKeyName string = 'wc013-signing'
 @maxLength(127)
 param incidentSigningKeyName string = 'wc016-incident-signing'
 
+@description('Name of the dedicated non-exportable WC-027 feed signing key.')
+param incidentFeedV2SigningKeyName string = 'wc027-feed-v2-signing'
+
+@description('Name of the dedicated non-exportable WC-027 report signing key.')
+param incidentReportSigningKeyName string = 'wc027-report-signing'
+
+@description('Name of the dedicated non-exportable WC-027 guidance signing key.')
+param incidentGuidanceSigningKeyName string = 'wc027-guidance-signing'
+
+@description('Name of the dedicated non-exportable WC-027 enrichment signing key.')
+param incidentEnrichmentSigningKeyName string = 'wc027-enrichment-signing'
+
+@description('Name of the dedicated non-exportable WC-027 notification signing key.')
+param incidentNotificationSigningKeyName string = 'wc027-notification-signing'
+
 @description('Globally unique lowercase Storage account name for WC-013 replay reservations.')
 @minLength(3)
 @maxLength(24)
@@ -192,8 +207,51 @@ param signingKeyFingerprint string
 ])
 param incidentSigningKeyId string = 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
 
+@description('Exact logical WC-027 feed signing key ID.')
+param incidentFeedV2SigningKeyId string
+
+@description('SHA-256 fingerprint of the exact WC-027 feed signing public key.')
+@minLength(71)
+@maxLength(71)
+param incidentFeedV2SigningKeyFingerprint string
+
+@description('Exact logical WC-027 report signing key ID.')
+param incidentReportSigningKeyId string
+
+@description('SHA-256 fingerprint of the exact WC-027 report signing public key.')
+@minLength(71)
+@maxLength(71)
+param incidentReportSigningKeyFingerprint string
+
+@description('Exact logical WC-027 guidance signing key ID.')
+param incidentGuidanceSigningKeyId string
+
+@description('SHA-256 fingerprint of the exact WC-027 guidance signing public key.')
+@minLength(71)
+@maxLength(71)
+param incidentGuidanceSigningKeyFingerprint string
+
+@description('Exact logical WC-027 enrichment signing key ID.')
+param incidentEnrichmentSigningKeyId string
+
+@description('SHA-256 fingerprint of the exact WC-027 enrichment signing public key.')
+@minLength(71)
+@maxLength(71)
+param incidentEnrichmentSigningKeyFingerprint string
+
+@description('Exact logical WC-027 notification signing key ID.')
+param incidentNotificationSigningKeyId string
+
+@description('SHA-256 fingerprint of the exact WC-027 notification signing public key.')
+@minLength(71)
+@maxLength(71)
+param incidentNotificationSigningKeyFingerprint string
+
 @description('Activates WC-016 queues and Jobs only after the deployed incident key public material is pinned in both presentation verification layers.')
 param wc016RuntimeEnabled bool = false
+
+@description('Enables WC-027 notification v2 only after its separate enrichment/feed-v2 producer is deployed and healthy.')
+param wc027FeedV2ProducerReady bool = false
 
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
@@ -588,6 +646,11 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     keyVaultName: keyVaultName
     signingKeyName: signingKeyName
     incidentSigningKeyName: incidentSigningKeyName
+    incidentFeedV2SigningKeyName: incidentFeedV2SigningKeyName
+    incidentReportSigningKeyName: incidentReportSigningKeyName
+    incidentGuidanceSigningKeyName: incidentGuidanceSigningKeyName
+    incidentEnrichmentSigningKeyName: incidentEnrichmentSigningKeyName
+    incidentNotificationSigningKeyName: incidentNotificationSigningKeyName
     replayStorageAccountName: replayStorageAccountName
     replayTableName: replayTableName
     detectorStateTableName: wc016DetectorStateTableName
@@ -698,6 +761,39 @@ module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
   }
 }
 
+var notificationV2ConfigurationJson = string({
+  lifecycle: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentSigningKeyUriWithVersion
+    keyId: incidentSigningKeyId
+    keyFingerprint: signingKeyFingerprint
+  }
+  feed: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentFeedV2SigningKeyUriWithVersion
+    keyId: incidentFeedV2SigningKeyId
+    keyFingerprint: incidentFeedV2SigningKeyFingerprint
+  }
+  report: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentReportSigningKeyUriWithVersion
+    keyId: incidentReportSigningKeyId
+    keyFingerprint: incidentReportSigningKeyFingerprint
+  }
+  guidance: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentGuidanceSigningKeyUriWithVersion
+    keyId: incidentGuidanceSigningKeyId
+    keyFingerprint: incidentGuidanceSigningKeyFingerprint
+  }
+  enrichment: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentEnrichmentSigningKeyUriWithVersion
+    keyId: incidentEnrichmentSigningKeyId
+    keyFingerprint: incidentEnrichmentSigningKeyFingerprint
+  }
+  notification: {
+    keyVaultKeyId: acceptanceResources.outputs.incidentNotificationSigningKeyUriWithVersion
+    keyId: incidentNotificationSigningKeyId
+    keyFingerprint: incidentNotificationSigningKeyFingerprint
+  }
+})
+
 module wc016Runtime '../wc016-event-reassessment/main.bicep' = if (validatedWc016RuntimeEnabled) {
   name: 'wc016-deployable-runtime'
   scope: foundationResourceGroup
@@ -742,6 +838,8 @@ module wc016Runtime '../wc016-event-reassessment/main.bicep' = if (validatedWc01
     signingKeyUriWithVersion: acceptanceResources.outputs.incidentSigningKeyUriWithVersion
     signingKeyId: incidentSigningKeyId
     signingKeyFingerprint: signingKeyFingerprint
+    notificationV2ConfigurationJson: notificationV2ConfigurationJson
+    notificationV2ProducerReady: wc027FeedV2ProducerReady
     teamsConnectionName: 'teams'
     teamsNotifierWorkflowName: 'athena-wc016-teams-notifier'
     tags: resourceTags

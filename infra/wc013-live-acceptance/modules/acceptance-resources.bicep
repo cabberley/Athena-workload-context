@@ -53,6 +53,21 @@ param signingKeyName string
 @description('Name of the dedicated WC-016 incident RSA signing key.')
 param incidentSigningKeyName string
 
+@description('Name of the dedicated WC-027 feed RSA signing key.')
+param incidentFeedV2SigningKeyName string
+
+@description('Name of the dedicated WC-027 report RSA signing key.')
+param incidentReportSigningKeyName string
+
+@description('Name of the dedicated WC-027 guidance RSA signing key.')
+param incidentGuidanceSigningKeyName string
+
+@description('Name of the dedicated WC-027 enrichment RSA signing key.')
+param incidentEnrichmentSigningKeyName string
+
+@description('Name of the dedicated WC-027 notification RSA signing key.')
+param incidentNotificationSigningKeyName string
+
 @description('Globally unique lowercase Storage account name for replay reservations.')
 param replayStorageAccountName string
 
@@ -260,6 +275,22 @@ module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
       bypass: 'AzureServices'
       defaultAction: 'Deny'
     }
+    roleAssignments: wc016RuntimeEnabled
+      ? [
+          {
+            roleDefinitionIdOrName: 'Key Vault Reader'
+            principalId: incidentOrchestratorPrincipalId
+            principalType: 'ServicePrincipal'
+            description: 'The WC-016 orchestrator can read only public source-key material.'
+          }
+          {
+            roleDefinitionIdOrName: 'Key Vault Reader'
+            principalId: notificationDispatcherPrincipalId
+            principalType: 'ServicePrincipal'
+            description: 'The WC-016 notification dispatcher can read only public verification keys.'
+          }
+        ]
+      : []
     privateEndpoints: [
       {
         name: '${namePrefix}-wc013-kv-pe'
@@ -320,6 +351,76 @@ module signingKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
                 principalId: incidentOrchestratorPrincipalId
                 principalType: 'ServicePrincipal'
                 description: 'The WC-016 orchestrator can sign only the dedicated incident feed.'
+              }
+            ]
+          : []
+      }
+      {
+        name: incidentFeedV2SigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+      }
+      {
+        name: incidentReportSigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+      }
+      {
+        name: incidentGuidanceSigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+      }
+      {
+        name: incidentEnrichmentSigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+      }
+      {
+        name: incidentNotificationSigningKeyName
+        kty: 'RSA'
+        keySize: 3072
+        keyOps: [
+          'sign'
+          'verify'
+        ]
+        attributes: {
+          enabled: true
+        }
+        roleAssignments: wc016RuntimeEnabled
+          ? [
+              {
+                roleDefinitionIdOrName: 'Key Vault Crypto User'
+                principalId: incidentOrchestratorPrincipalId
+                principalType: 'ServicePrincipal'
+                description: 'The WC-016 orchestrator can sign only Notification v2 envelopes with this key.'
               }
             ]
           : []
@@ -717,6 +818,26 @@ resource incidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@20
   ]
 }
 
+resource notificationIncidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    incidentAssetContainer.id,
+    notificationDispatcherPrincipalId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: incidentAssetContainer
+  properties: {
+    principalId: notificationDispatcherPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleDefinitionId
+    )
+  }
+  dependsOn: [
+    replayStorage
+  ]
+}
+
 module acceptanceJob 'br/public:avm/res/app/job:0.7.2' = {
   name: 'wc013-one-shot-job'
   params: {
@@ -1078,6 +1199,16 @@ output signingKeyUriWithVersion string = signingKeyVault.outputs.keys[0].uriWith
 
 @description('Exact versioned WC-016 incident signing-key URI.')
 output incidentSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[1].uriWithVersion
+
+output incidentFeedV2SigningKeyUriWithVersion string = signingKeyVault.outputs.keys[2].uriWithVersion
+
+output incidentReportSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[3].uriWithVersion
+
+output incidentGuidanceSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[4].uriWithVersion
+
+output incidentEnrichmentSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[5].uriWithVersion
+
+output incidentNotificationSigningKeyUriWithVersion string = signingKeyVault.outputs.keys[6].uriWithVersion
 
 @description('Resource ID of the replay Storage account.')
 output replayStorageAccountResourceId string = replayStorage.outputs.resourceId

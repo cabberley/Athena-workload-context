@@ -29,6 +29,15 @@ from athena_context.eventing.normalization import (
     EventNormalizationError,
     normalize_monitor_event,
 )
+from athena_context.eventing.notification_v2 import (
+    NotificationV2OutboxPort,
+    NotificationV2PublicationService,
+    NotificationV2SourceNotReadyError,
+    NotificationV2SourceVerifier,
+    NotificationV2Trust,
+    render_teams_notification_v2,
+    verify_notification_v2_envelope,
+)
 from athena_context.eventing.orchestrator import (
     run_active_incident_index_heartbeat,
     run_incident_reassessment,
@@ -39,6 +48,8 @@ from athena_context.eventing.routing import (
 )
 from athena_context.eventing.runtime import (
     ApprovedLiveReassessmentAdapter,
+    NotificationV2KeyAuthority,
+    NotificationV2RuntimeConfiguration,
     run_incident_feed_heartbeat,
     run_incident_orchestrator_worker,
     run_notification_dispatcher_worker,
@@ -76,4 +87,13 @@ __all__ = [
     "run_notification_dispatcher_worker",
     "run_scheduled_signal_detector",
     "ManagedIdentityResourceGraphChangeHistoryClient",
+    "NotificationV2OutboxPort",
+    "NotificationV2PublicationService",
+    "NotificationV2SourceNotReadyError",
+    "NotificationV2SourceVerifier",
+    "NotificationV2Trust",
+    "NotificationV2KeyAuthority",
+    "NotificationV2RuntimeConfiguration",
+    "render_teams_notification_v2",
+    "verify_notification_v2_envelope",
 ]
