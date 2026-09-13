@@ -296,13 +296,31 @@ Set `.azure/wc013.parameters.json` `collectorControllerImage` to
 placeholder is rejected by Bicep, just like the presentation placeholder.
 
 Build the presentation from its dedicated context. ACR remote build uses the same multi-stage,
-digest-pinned Dockerfile without requiring a local Docker daemon:
+digest-pinned Dockerfile without requiring a local Docker daemon. Supply all eight reviewed,
+non-secret WC-027 trust anchors; the build fails if any anchor is absent:
 
 ```powershell
+$wc027FeedKeyId = '<reviewed-feed-key-id>'
+$wc027FeedKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027ReportKeyId = '<reviewed-report-key-id>'
+$wc027ReportKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027EnrichmentKeyId = '<reviewed-enrichment-key-id>'
+$wc027EnrichmentKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027GuidanceKeyId = '<reviewed-guidance-key-id>'
+$wc027GuidanceKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+
 az acr build `
   --registry athenademoa6add389 `
   --image athena/presentation-web:<reviewed-tag> `
   --file apps/presentation-web/Dockerfile `
+  --build-arg "VITE_WC027_FEED_KEY_ID=$wc027FeedKeyId" `
+  --build-arg "VITE_WC027_FEED_KEY_FINGERPRINT=$wc027FeedKeyFingerprint" `
+  --build-arg "VITE_WC027_REPORT_KEY_ID=$wc027ReportKeyId" `
+  --build-arg "VITE_WC027_REPORT_KEY_FINGERPRINT=$wc027ReportKeyFingerprint" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_ID=$wc027EnrichmentKeyId" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_FINGERPRINT=$wc027EnrichmentKeyFingerprint" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_ID=$wc027GuidanceKeyId" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_FINGERPRINT=$wc027GuidanceKeyFingerprint" `
   apps/presentation-web
 
 $presentationDigest = az acr repository show `

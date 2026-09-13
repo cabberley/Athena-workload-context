@@ -14,7 +14,49 @@ import type { VerifiedIncident } from './incidents'
 const digest = (character: string): Sha256Digest =>
   `sha256:${character.repeat(64)}`
 
+const canonicalizePythonUtcTimestamp = (value: string): string => {
+  const normalized = new Date(value).toISOString()
+  return normalized.endsWith('.000Z')
+    ? normalized.replace(/\.000Z$/, 'Z')
+    : normalized
+}
+
+const canonicalizeFeedIndexVersionPayload = (
+  index: Record<string, JsonValue>,
+): Record<string, JsonValue> => {
+  const payload = structuredClone(index)
+  delete payload.schemaVersion
+  delete payload.indexAttestationPath
+  payload.resolvedRetentionStart = canonicalizePythonUtcTimestamp(
+    String(payload.resolvedRetentionStart),
+  )
+  payload.publishedAt = canonicalizePythonUtcTimestamp(
+    String(payload.publishedAt),
+  )
+  for (const field of ['active', 'recentlyResolved'] as const) {
+    const entries = payload[field] as Record<string, JsonValue>[]
+    for (const entry of entries) {
+      entry.updatedAt = canonicalizePythonUtcTimestamp(
+        String(entry.updatedAt),
+      )
+    }
+  }
+  return payload
+}
+
 const bindFeedIndexAttestationPath = async (
+  index: Record<string, JsonValue>,
+): Promise<Record<string, JsonValue>> => {
+  const payload = canonicalizeFeedIndexVersionPayload(index)
+  const indexDigest = await sha256Digest(canonicalizeJson(payload))
+  return {
+    ...index,
+    indexAttestationPath:
+      `./incidents/feed-v2-index-attestations/${indexDigest.slice(7)}.json`,
+  }
+}
+
+const bindRawFeedIndexAttestationPath = async (
   index: Record<string, JsonValue>,
 ): Promise<Record<string, JsonValue>> => {
   const payload = structuredClone(index)
@@ -324,7 +366,7 @@ describe('WC-027 guidance presentation contract', () => {
         },
       },
       {
-        name: 'Blob version length',
+        name: 'feed pointer Blob version length',
         mutate: (value) => {
           const resolved = value.recentlyResolved as Record<string, JsonValue>[]
           const reference = resolved[0]!
@@ -333,7 +375,28 @@ describe('WC-027 guidance presentation contract', () => {
         },
       },
       {
-        name: 'entry attestation path',
+        name: 'feed pointer attestation Blob version length',
+        mutate: (value) => {
+          const resolved = value.recentlyResolved as Record<string, JsonValue>[]
+          const reference = resolved[0]!
+            .feedPointerAttestationReference as Record<string, JsonValue>
+          reference.version = 'v'.repeat(65)
+        },
+      },
+      {
+        name: 'canonical feed pointer path',
+        mutate: (value) => {
+          const resolved = value.recentlyResolved as Record<string, JsonValue>[]
+          const reference = resolved[0]!
+            .feedPointerReference as Record<string, JsonValue>
+          reference.name = String(reference.name).replace(
+            'feed-pointer.json',
+            'other-pointer.json',
+          )
+        },
+      },
+      {
+        name: 'canonical feed pointer attestation path',
         mutate: (value) => {
           const resolved = value.recentlyResolved as Record<string, JsonValue>[]
           const reference = resolved[0]!
@@ -362,6 +425,48 @@ describe('WC-027 guidance presentation contract', () => {
         parseFeedIndex(candidate),
         testCase.name,
       ).rejects.toThrow(/incident feed v2/i)
+    }
+  })
+
+  it('matches Python UTC normalization for feed-index version digests', async () => {
+    const index = await buildFeedIndex()
+    index.resolvedRetentionStart = '2026-09-04T03:40:00.0+00:00'
+    index.publishedAt = '2026-09-04T03:50:00+00:00'
+    const active = index.active as Record<string, JsonValue>[]
+    active[0]!.updatedAt = '2026-09-04T03:48:00.1+00:00'
+    const resolved = index.recentlyResolved as Record<string, JsonValue>[]
+    resolved[0]!.updatedAt = '2026-09-04T03:47:00.12+00:00'
+    resolved[1]!.updatedAt = '2026-09-04T03:46:00.123+00:00'
+
+    const candidate = await bindFeedIndexAttestationPath(index)
+
+    await expect(parseFeedIndex(candidate)).resolves.toMatchObject({
+      publishedAt: '2026-09-04T03:50:00Z',
+      active: [{ updatedAt: '2026-09-04T03:48:00.100Z' }],
+      recentlyResolved: [
+        { updatedAt: '2026-09-04T03:47:00.120Z' },
+        { updatedAt: '2026-09-04T03:46:00.123Z' },
+      ],
+    })
+  })
+
+  it('rejects Date.parse-compatible timestamps outside the Python UTC grammar', async () => {
+    const invalidTimestamps = [
+      '2026-09-04',
+      '2026-09-04 03:50:00Z',
+      '2026-09-04T03:50:00.0000Z',
+      '2026-09-04T04:50:00+01:00',
+      '2026-02-30T03:50:00Z',
+    ]
+    for (const timestamp of invalidTimestamps) {
+      const index = await buildFeedIndex()
+      index.publishedAt = timestamp
+      const candidate = await bindRawFeedIndexAttestationPath(index)
+
+      await expect(
+        parseFeedIndex(candidate),
+        timestamp,
+      ).rejects.toThrow(/index schema is invalid/i)
     }
   })
 

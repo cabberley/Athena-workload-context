@@ -3,12 +3,6 @@ FROM node:24.7.0-bookworm-slim@sha256:0104d9447ea3ddf7373643be7f9915fc7b7c896e41
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts --no-audit --fund=false
-
-COPY index.html tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts vitest.config.ts ./
-COPY public ./public
-COPY src ./src
 ARG VITE_WC027_FEED_KEY_ID
 ARG VITE_WC027_FEED_KEY_FINGERPRINT
 ARG VITE_WC027_REPORT_KEY_ID
@@ -17,6 +11,14 @@ ARG VITE_WC027_ENRICHMENT_KEY_ID
 ARG VITE_WC027_ENRICHMENT_KEY_FINGERPRINT
 ARG VITE_WC027_GUIDANCE_KEY_ID
 ARG VITE_WC027_GUIDANCE_KEY_FINGERPRINT
+RUN : "${VITE_WC027_FEED_KEY_ID:?required build argument VITE_WC027_FEED_KEY_ID is missing}" \
+    && : "${VITE_WC027_FEED_KEY_FINGERPRINT:?required build argument VITE_WC027_FEED_KEY_FINGERPRINT is missing}" \
+    && : "${VITE_WC027_REPORT_KEY_ID:?required build argument VITE_WC027_REPORT_KEY_ID is missing}" \
+    && : "${VITE_WC027_REPORT_KEY_FINGERPRINT:?required build argument VITE_WC027_REPORT_KEY_FINGERPRINT is missing}" \
+    && : "${VITE_WC027_ENRICHMENT_KEY_ID:?required build argument VITE_WC027_ENRICHMENT_KEY_ID is missing}" \
+    && : "${VITE_WC027_ENRICHMENT_KEY_FINGERPRINT:?required build argument VITE_WC027_ENRICHMENT_KEY_FINGERPRINT is missing}" \
+    && : "${VITE_WC027_GUIDANCE_KEY_ID:?required build argument VITE_WC027_GUIDANCE_KEY_ID is missing}" \
+    && : "${VITE_WC027_GUIDANCE_KEY_FINGERPRINT:?required build argument VITE_WC027_GUIDANCE_KEY_FINGERPRINT is missing}"
 ENV VITE_WC027_FEED_KEY_ID=$VITE_WC027_FEED_KEY_ID \
     VITE_WC027_FEED_KEY_FINGERPRINT=$VITE_WC027_FEED_KEY_FINGERPRINT \
     VITE_WC027_REPORT_KEY_ID=$VITE_WC027_REPORT_KEY_ID \
@@ -25,6 +27,13 @@ ENV VITE_WC027_FEED_KEY_ID=$VITE_WC027_FEED_KEY_ID \
     VITE_WC027_ENRICHMENT_KEY_FINGERPRINT=$VITE_WC027_ENRICHMENT_KEY_FINGERPRINT \
     VITE_WC027_GUIDANCE_KEY_ID=$VITE_WC027_GUIDANCE_KEY_ID \
     VITE_WC027_GUIDANCE_KEY_FINGERPRINT=$VITE_WC027_GUIDANCE_KEY_FINGERPRINT
+
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --fund=false
+
+COPY index.html tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts vitest.config.ts ./
+COPY public ./public
+COPY src ./src
 RUN npm run build
 
 FROM nginxinc/nginx-unprivileged:1.29.1-alpine3.22-slim@sha256:ba47582e1ad3ad1df0c12a21bf464770c5b995e5f06db4aabead4ab1ae2858c4

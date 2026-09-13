@@ -1425,13 +1425,17 @@ export const parseFeedIndex = async (
     'keyFingerprint',
     'publishedAt',
   ], ['omittedResolvedCount'])
+  const resolvedRetentionStart = canonicalizeUtcTimestamp(
+    record.resolvedRetentionStart,
+  )
+  const publishedAt = canonicalizeUtcTimestamp(record.publishedAt)
   if (
     record.schemaVersion !== 'athena.wc027IncidentFeedIndex.v2' ||
     !Array.isArray(record.active) ||
     record.active.length > 64 ||
     !Array.isArray(record.recentlyResolved) ||
     record.recentlyResolved.length > 64 ||
-    !isTimestamp(record.resolvedRetentionStart) ||
+    resolvedRetentionStart === null ||
     typeof record.resolvedHistoryTruncated !== 'boolean' ||
     typeof record.resolvedHistoryTotalCount !== 'number' ||
     !Number.isInteger(record.resolvedHistoryTotalCount) ||
@@ -1449,7 +1453,7 @@ export const parseFeedIndex = async (
     !/^\.[/]incidents[/]feed-v2-index-attestations[/][a-f0-9]{64}[.]json$/.test(
       record.indexAttestationPath,
     ) ||
-    !isTimestamp(record.publishedAt)
+    publishedAt === null
   ) {
     throw new VerificationError('Incident feed v2 index schema is invalid.')
   }
@@ -1481,17 +1485,15 @@ export const parseFeedIndex = async (
     new Set(resolved.map((entry) => entry.incidentId)).size !== resolved.length ||
     resolved.some((entry) => activeIds.includes(entry.incidentId)) ||
     !resolvedIsOrdered ||
-    Date.parse(record.resolvedRetentionStart as string) >
-      Date.parse(record.publishedAt as string) ||
+    Date.parse(resolvedRetentionStart) > Date.parse(publishedAt) ||
     active.some(
       (entry) =>
-        Date.parse(entry.updatedAt) > Date.parse(record.publishedAt as string),
+        Date.parse(entry.updatedAt) > Date.parse(publishedAt),
     ) ||
     resolved.some(
       (entry) =>
-        Date.parse(entry.updatedAt) <
-          Date.parse(record.resolvedRetentionStart as string) ||
-        Date.parse(entry.updatedAt) > Date.parse(record.publishedAt as string),
+        Date.parse(entry.updatedAt) < Date.parse(resolvedRetentionStart) ||
+        Date.parse(entry.updatedAt) > Date.parse(publishedAt),
     ) ||
     record.resolvedHistoryTotalCount !==
       resolved.length + omittedResolvedCount ||
@@ -1501,7 +1503,7 @@ export const parseFeedIndex = async (
       (record.resolvedHistoryTotalCount > resolved.length) ||
     (record.resolvedHistoryTruncated &&
       (resolved.length === 0 ||
-        Date.parse(record.resolvedRetentionStart as string) !==
+        Date.parse(resolvedRetentionStart) !==
           Math.min(...resolved.map((entry) => Date.parse(entry.updatedAt)))))
   ) {
     throw new VerificationError(
@@ -1509,15 +1511,15 @@ export const parseFeedIndex = async (
     )
   }
   const versionPayload: Record<string, JsonValue> = {
-    active: record.active,
-    recentlyResolved: record.recentlyResolved,
-    resolvedRetentionStart: record.resolvedRetentionStart,
+    active: active.map(toCanonicalFeedEntry),
+    recentlyResolved: resolved.map(toCanonicalFeedEntry),
+    resolvedRetentionStart,
     resolvedHistoryTruncated: record.resolvedHistoryTruncated,
     resolvedHistoryTotalCount: record.resolvedHistoryTotalCount,
     sourceActiveIndexDigest: record.sourceActiveIndexDigest,
     keyId: record.keyId,
     keyFingerprint: record.keyFingerprint,
-    publishedAt: record.publishedAt,
+    publishedAt,
   }
   if (record.omittedResolvedCount !== undefined) {
     versionPayload.omittedResolvedCount = record.omittedResolvedCount
@@ -1543,7 +1545,7 @@ export const parseFeedIndex = async (
     indexAttestationPath: record.indexAttestationPath,
     keyId: record.keyId,
     keyFingerprint: record.keyFingerprint,
-    publishedAt: record.publishedAt,
+    publishedAt,
   }
 }
 
@@ -1557,12 +1559,13 @@ const parseFeedEntry = (value: unknown): ParsedFeedEntry => {
     'feedPointerReference',
     'feedPointerAttestationReference',
   ])
+  const updatedAt = canonicalizeUtcTimestamp(record.updatedAt)
   if (
     typeof record.incidentId !== 'string' ||
     !INCIDENT_ID.test(record.incidentId) ||
     (record.lifecycle !== 'active' && record.lifecycle !== 'resolved') ||
     !isDigest(record.stateResultDigest) ||
-    !isTimestamp(record.updatedAt)
+    updatedAt === null
   ) {
     throw new VerificationError('Incident feed v2 entry schema is invalid.')
   }
@@ -1591,11 +1594,30 @@ const parseFeedEntry = (value: unknown): ParsedFeedEntry => {
     incidentId: record.incidentId,
     lifecycle: record.lifecycle,
     stateResultDigest: record.stateResultDigest,
-    updatedAt: record.updatedAt,
+    updatedAt,
     feedPointerReference,
     feedPointerAttestationReference,
   }
 }
+
+const toCanonicalFeedEntry = (
+  entry: ParsedFeedEntry,
+): Record<string, JsonValue> => ({
+  incidentId: entry.incidentId,
+  lifecycle: entry.lifecycle,
+  stateResultDigest: entry.stateResultDigest,
+  updatedAt: entry.updatedAt,
+  feedPointerReference: {
+    name: entry.feedPointerReference.name,
+    version: entry.feedPointerReference.version,
+    contentDigest: entry.feedPointerReference.contentDigest,
+  },
+  feedPointerAttestationReference: {
+    name: entry.feedPointerAttestationReference.name,
+    version: entry.feedPointerAttestationReference.version,
+    contentDigest: entry.feedPointerAttestationReference.contentDigest,
+  },
+})
 
 const parseFeedPointer = async (
   record: Record<string, JsonValue>,
@@ -3066,8 +3088,28 @@ const parseStringArray = (value: unknown, maximum: number): string[] => {
 const isDigest = (value: unknown): value is Sha256Digest =>
   typeof value === 'string' && DIGEST.test(value)
 
+const UTC_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(?:Z|\+00:00)$/
+
+const canonicalizeUtcTimestamp = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null
+  const match = UTC_TIMESTAMP.exec(value)
+  if (!match || Number(match[1]) === 0) return null
+  const base = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`
+  const milliseconds = (match[7] ?? '').padEnd(3, '0')
+  const normalized = `${base}.${milliseconds}Z`
+  const parsed = new Date(normalized)
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString() !== normalized
+  ) {
+    return null
+  }
+  return milliseconds === '000' ? `${base}Z` : normalized
+}
+
 const isTimestamp = (value: unknown): value is string =>
-  typeof value === 'string' && !Number.isNaN(Date.parse(value))
+  canonicalizeUtcTimestamp(value) !== null
 
 const isConfidence = (value: unknown): value is GuidanceConfidence =>
   typeof value === 'string' &&

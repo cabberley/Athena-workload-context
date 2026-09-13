@@ -5,6 +5,16 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+WC027_TRUST_ANCHORS = (
+    "VITE_WC027_FEED_KEY_ID",
+    "VITE_WC027_FEED_KEY_FINGERPRINT",
+    "VITE_WC027_REPORT_KEY_ID",
+    "VITE_WC027_REPORT_KEY_FINGERPRINT",
+    "VITE_WC027_ENRICHMENT_KEY_ID",
+    "VITE_WC027_ENRICHMENT_KEY_FINGERPRINT",
+    "VITE_WC027_GUIDANCE_KEY_ID",
+    "VITE_WC027_GUIDANCE_KEY_FINGERPRINT",
+)
 
 
 def _read(relative_path: str) -> str:
@@ -28,9 +38,15 @@ def test_presentation_image_is_reproducible_and_runs_unprivileged() -> None:
         "nginxinc/nginx-unprivileged:1.29.1-alpine3.22-slim@sha256:"
     )
     assert "npm ci --ignore-scripts --no-audit --fund=false" in dockerfile
-    assert "ARG VITE_WC027_FEED_KEY_ID" in dockerfile
-    assert "VITE_WC027_REPORT_KEY_FINGERPRINT" in dockerfile
-    assert "VITE_WC027_GUIDANCE_KEY_FINGERPRINT" in dockerfile
+    for anchor in WC027_TRUST_ANCHORS:
+        assert f"ARG {anchor}" in dockerfile
+        assert (
+            f"${{{anchor}:?required build argument {anchor} is missing}}"
+            in dockerfile
+        )
+    assert dockerfile.index("required build argument") < dockerfile.index(
+        "npm ci --ignore-scripts"
+    )
     assert "RUN npm run build" in dockerfile
     assert "COPY --from=build --chown=101:101 /app/dist" in dockerfile
     assert "USER 101:101" in dockerfile
@@ -38,6 +54,20 @@ def test_presentation_image_is_reproducible_and_runs_unprivileged() -> None:
     assert "http://127.0.0.1:8080/healthz" in dockerfile
     assert "node_modules" in dockerignore
     assert ".env" in dockerignore
+
+
+def test_supported_presentation_build_paths_pass_all_wc027_trust_anchors() -> None:
+    container_test = _read("apps/presentation-web/test-container.ps1")
+    app_readme = _read("apps/presentation-web/README.md")
+    acceptance_runbook = _read("docs/operations/wc013-live-acceptance.md")
+    workflow = _read(".github/workflows/ci.yml")
+
+    for anchor in WC027_TRUST_ANCHORS:
+        assert anchor in container_test
+        assert app_readme.count(f'--build-arg "{anchor}=') == 2
+        assert acceptance_runbook.count(f'--build-arg "{anchor}=') == 1
+    assert "Assert-MissingTrustAnchorFails -Name $AnchorName" in container_test
+    assert "run: ./test-container.ps1" in workflow
 
 
 def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
