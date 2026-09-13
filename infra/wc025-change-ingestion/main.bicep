@@ -17,6 +17,11 @@ param hostingResourceGroupName string
 ])
 param workloadResourceGroupName string = 'rg-athena-demo-workload'
 
+@description('Must remain false. Subscription-wide Activity Log diagnostic export requires a separate approved security and data-governance change.')
+@allowed([
+  false
+])
+param subscriptionActivityLogExportEnabled bool = false
 @description('Existing internal Container Apps managed environment resource ID.')
 param managedEnvironmentResourceId string
 
@@ -347,3 +352,6 @@ output deadLetterPurgeJobResourceId string = workers.outputs.deadLetterPurgeJobR
 
 @description('Identity-isolated Resource Graph change-history Job resource ID.')
 output queryWorkerJobResourceId string = workers.outputs.queryWorkerJobResourceId
+
+@description('Subscription Activity Log export is deliberately unavailable; the resource-group Event Grid route is authoritative.')
+output subscriptionActivityLogExportEnabled bool = subscriptionActivityLogExportEnabled

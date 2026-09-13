@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "9619163693346661893"
+      "templateHash": "14251740359747777807"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -259,6 +259,7 @@
     "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-foundation', 'dataBoundary', 'customer', 'managedBy', 'bicep', 'autoRemediation', 'disabled'))]",
     "legacyFlowLogStorageAccountName": "athenahackathonflowwhtco",
     "workloadResourceGroupId": "[format('{0}/resourceGroups/{1}', subscription().id, parameters('workloadResourceGroupName'))]",
+    "legacyFlowLogStorageAccountResourceId": "[format('{0}/providers/Microsoft.Storage/storageAccounts/{1}', variables('workloadResourceGroupId'), variables('legacyFlowLogStorageAccountName'))]",
     "reviewedWorkloadVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet', variables('workloadResourceGroupId'))]",
     "reviewedWorkloadPrivateEndpointSubnetResourceId": "[format('{0}/subnets/snet-paas-private-endpoints', variables('reviewedWorkloadVirtualNetworkResourceId'))]",
     "reviewedCollectorRuntimeVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet', subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName')))]",
@@ -2788,6 +2789,9 @@
           "replacementStorageAccountResourceId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
           },
+          "legacyFlowLogStorageAccountResourceId": {
+            "value": "[variables('legacyFlowLogStorageAccountResourceId')]"
+          },
           "legacyFlowLogNames": {
             "value": "[parameters('legacyFlowLogNames')]"
           },
@@ -2805,7 +2809,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "13925719048038281809"
+              "templateHash": "12150490472155557433"
             }
           },
           "parameters": {
@@ -2831,6 +2835,12 @@
               "type": "string",
               "metadata": {
                 "description": "Replacement monitoring storage account configured on disabled redundant flow logs."
+              }
+            },
+            "legacyFlowLogStorageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Retained legacy storage account that every reviewed redundant flow log must currently use."
               }
             },
             "legacyFlowLogNames": {
@@ -2878,7 +2888,81 @@
                 "input": "[format('{0}|{1}', toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].name), toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].targetResourceId))]"
               }
             ],
-            "reviewedLegacyFlowLogMigrationAllowlist": [],
+            "workloadScopeId": "[format('{0}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network', subscription().id)]",
+            "reviewedLegacyFlowLogMigrationAllowlist": [
+              {
+                "name": "snet-data-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-data', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-03-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-03-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-management-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-management', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-client-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-client', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-iris-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-iris-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-middle-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-middle', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-mid-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-mid-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-sqlvm-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-sqlvm-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-mid-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-mid-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-web-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-web', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-03-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-03-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-appgw-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-appgw', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-client-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-client-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-paas-private-endpoints-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-paas-private-endpoints', variables('workloadScopeId'))]"
+              }
+            ],
             "unreviewedLegacyFlowLogMigrationPairs": "[filter(variables('requestedLegacyFlowLogMigrationPairs'), lambda('requestedPair', not(contains(variables('reviewedLegacyFlowLogMigrationPairs'), lambdaVariables('requestedPair')))))]",
             "legacyFlowLogMigrationIsValid": "[and(and(and(and(equals(length(parameters('legacyFlowLogNames')), length(parameters('legacyFlowLogTargetResourceIds'))), empty(variables('unreviewedLegacyFlowLogMigrationPairs'))), not(contains(map(parameters('legacyFlowLogNames'), lambda('flowLogName', toLower(string(lambdaVariables('flowLogName'))))), toLower(parameters('canonicalVnetFlowLogName'))))), not(contains(map(parameters('legacyFlowLogTargetResourceIds'), lambda('targetResourceId', toLower(string(lambdaVariables('targetResourceId'))))), toLower(parameters('workloadVirtualNetworkResourceId'))))), or(empty(parameters('legacyFlowLogNames')), parameters('canonicalVnetFlowLogCutoverConfirmed')))]",
             "validatedLegacyFlowLogMigrations": "[if(variables('legacyFlowLogMigrationIsValid'), variables('requestedLegacyFlowLogMigrations'), fail('legacy flow-log migration requires exact reviewed name/target allowlist entries, paired non-VNet targets, and explicit canonical VNet cutover confirmation'))]"
@@ -2893,7 +2977,7 @@
               "apiVersion": "2024-10-01",
               "name": "[format('{0}/{1}', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name)]",
               "properties": {
-                "targetResourceId": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').targetResourceId), toLower(variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId)), variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId, fail('WC-024 refuses to disable a legacy flow log unless its existing target matches the reviewed allowlist.'))]",
+                "targetResourceId": "[if(and(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').targetResourceId), toLower(variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId)), equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').storageId), toLower(parameters('legacyFlowLogStorageAccountResourceId')))), variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId, fail('WC-024 refuses to disable a legacy flow log unless its existing target and storage account match the reviewed allowlist.'))]",
                 "storageId": "[parameters('replacementStorageAccountResourceId')]",
                 "enabled": false,
                 "retentionPolicy": {

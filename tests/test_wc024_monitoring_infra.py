@@ -333,7 +333,9 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
     assert "legacyFlowLogNames" in MAIN
     assert "legacyFlowLogTargetResourceIds" in MAIN
     assert "reviewedLegacyFlowLogMigrationAllowlist" not in MAIN
-    assert "var reviewedLegacyFlowLogMigrationAllowlist = []" in LEGACY_FLOW_LOG_MIGRATION
+    assert "var reviewedLegacyFlowLogMigrationAllowlist = [" in LEGACY_FLOW_LOG_MIGRATION
+    assert LEGACY_FLOW_LOG_MIGRATION.count("targetResourceId: '${workloadScopeId}") == 18
+    assert "legacyFlowLogStorageAccountResourceId" in LEGACY_FLOW_LOG_MIGRATION
     assert "canonicalVnetFlowLogCutoverConfirmed" in MAIN
     assert "dependsOn: [\n    vnetFlowLog\n  ]" in MAIN
     assert "@maxLength(32)" in LEGACY_FLOW_LOG_MIGRATION
@@ -344,7 +346,9 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
     assert "unreviewedLegacyFlowLogMigrationPairs" in LEGACY_FLOW_LOG_MIGRATION
     assert "existingLegacyFlowLogs" in LEGACY_FLOW_LOG_MIGRATION
     assert "properties.targetResourceId" in LEGACY_FLOW_LOG_MIGRATION
-    assert "existing target matches the reviewed allowlist" in LEGACY_FLOW_LOG_MIGRATION
+    assert "existing target and storage account match the reviewed allowlist" in (
+        LEGACY_FLOW_LOG_MIGRATION
+    )
     assert "toLower(canonicalVnetFlowLogName)" in (
         LEGACY_FLOW_LOG_MIGRATION
     )

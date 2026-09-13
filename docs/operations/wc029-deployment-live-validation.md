@@ -40,6 +40,7 @@ Deploy and review each root independently:
 - `infra/wc024-monitoring-connectivity/main.bicep`
 - `infra/wc024-monitoring-foundation/main.bicep`
 - `infra/wc025-change-ingestion/main.bicep`
+- `infra/wc029-monitoring-prerequisites/main.bicep` (preparation/readiness and explicitly gated guest extensions)
 
 `bootstrap-ampls.bicep` is not a repeatable deployment root. It sets AMPLS access modes to
 `Open/Open` and is resource-group scoped. Verify an existing AMPLS read-only. A missing AMPLS may
@@ -134,11 +135,17 @@ Use scope-correct, reviewed parameters for every root:
 | WC-024 connectivity | Subscription | Reviewed copy of `main.example.bicepparam` |
 | WC-024 foundation | Subscription | Reviewed environment parameter artifact; examples are not deployable approval |
 | WC-025 change ingestion | Subscription | New reviewed parameter artifact containing the exact image, identities, resource allowlist, containers, and versioned signing key |
+| WC-029 monitoring prerequisites | Subscription | `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam` with both extension gates false; enabling either requires a separately reviewed immutable copy |
 
 The release cannot proceed while any non-WC-013 root lacks its reviewed immutable parameter
 artifact. Run `az deployment sub validate` and `az deployment sub what-if` separately for each
 subscription-scope root. Save raw JSON before review. AMPLS bootstrap, when genuinely required,
 uses `az deployment group` only through its guarded wrapper.
+
+The checked-in WC-029 artifact is preparation-only: it validates the existing baseline and leaves
+Dependency Agent and Network Watcher Agent deployment disabled. See
+[WC-029 monitoring infrastructure preparation](wc029-monitoring-infrastructure-preparation.md)
+for exact prepared scope and blockers. It is not deployment approval.
 
 The gate fails on:
 

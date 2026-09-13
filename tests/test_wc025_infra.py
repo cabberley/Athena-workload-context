@@ -36,7 +36,10 @@ def test_wc025_bicep_bounds_event_grid_to_one_resource_group_and_private_queue()
     assert "key: 'data.resourceUri'" in source
     assert "operatorType: 'StringIn'" in source
     assert "Microsoft.Insights/eventtypes" not in source
-    assert "activity log" not in source.casefold()
+    assert "Microsoft.Insights/diagnosticSettings" not in source
+    assert "param subscriptionActivityLogExportEnabled bool = false" in source
+    assert "@allowed([\n  false\n])" in source
+    assert "resource-group Event Grid route is authoritative" in source
     assert "requiresDuplicateDetection: true" in source
     assert "publicNetworkAccess: 'Enabled'" in source
     assert "defaultAction: 'Deny'" in source
