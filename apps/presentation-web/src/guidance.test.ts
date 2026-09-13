@@ -2,7 +2,11 @@ import { canonicalizeJson, sha256Digest, type JsonValue } from './canonical'
 import type { Sha256Digest } from './contracts'
 import {
   assertGuidanceMatchesVerifiedOccurrence,
+  createGuidanceLoadCache,
+  fetchBudgetedGuidanceAsset,
+  fetchCachedGuidanceReference,
   loadVerifiedOperatorGuidanceFeed,
+  mapWithGuidanceConcurrency,
   parseFeedIndex,
   parseIncidentGuidance,
   requireOccurrenceBinding,
@@ -15,10 +19,7 @@ const digest = (character: string): Sha256Digest =>
   `sha256:${character.repeat(64)}`
 
 const canonicalizePythonUtcTimestamp = (value: string): string => {
-  const normalized = new Date(value).toISOString()
-  return normalized.endsWith('.000Z')
-    ? normalized.replace(/\.000Z$/, 'Z')
-    : normalized
+  return new Date(value).toISOString()
 }
 
 const canonicalizeFeedIndexVersionPayload = (
@@ -284,6 +285,85 @@ const rebindGuidance = async (
 }
 
 describe('WC-027 guidance presentation contract', () => {
+  it('caches digest-verified immutable assets by name, version, and digest', async () => {
+    const bytes = new TextEncoder().encode('{"synthetic":true}\n')
+    const reference = {
+      name: 'incidents/inc-111111111111/versions/immutable/asset.json',
+      version: '2026-08-20T23:50:41.2983616Z',
+      contentDigest: await sha256Digest(bytes),
+    }
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(bytes, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const cache = createGuidanceLoadCache()
+    const budget = { remainingBytes: 1024 }
+    const arguments_ = [
+      reference,
+      512,
+      new URL('https://presentation.example.invalid/'),
+      'https://presentation.example.invalid',
+      fetchImpl,
+      1_000,
+      globalThis.crypto,
+      cache,
+      budget,
+    ] as const
+
+    await fetchCachedGuidanceReference(...arguments_)
+    await fetchCachedGuidanceReference(...arguments_)
+    await fetchCachedGuidanceReference(
+      { ...reference, version: '2026-08-20T23:50:41.3983616Z' },
+      512,
+      new URL('https://presentation.example.invalid/'),
+      'https://presentation.example.invalid',
+      fetchImpl,
+      1_000,
+      globalThis.crypto,
+      cache,
+      budget,
+    )
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(budget.remainingBytes).toBe(986)
+  })
+
+  it('enforces aggregate response budgets before starting another fetch', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+
+    await expect(
+      fetchBudgetedGuidanceAsset(
+        new URL('https://presentation.example.invalid/incidents/feed-v2.json'),
+        128,
+        fetchImpl,
+        1_000,
+        { remainingBytes: 127 },
+      ),
+    ).rejects.toThrow(/aggregate response budget/i)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('bounds concurrent immutable-entry loading', async () => {
+    let active = 0
+    let maximumActive = 0
+    const values = await mapWithGuidanceConcurrency(
+      [1, 2, 3, 4, 5, 6],
+      2,
+      async (value) => {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 5))
+        active -= 1
+        return value * 2
+      },
+    )
+
+    expect(values).toEqual([2, 4, 6, 8, 10, 12])
+    expect(maximumActive).toBe(2)
+  })
+
   it('continues to the signed v2 feed when the verified v1 active set is empty', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
@@ -441,7 +521,7 @@ describe('WC-027 guidance presentation contract', () => {
     const candidate = await bindFeedIndexAttestationPath(index)
 
     await expect(parseFeedIndex(candidate)).resolves.toMatchObject({
-      publishedAt: '2026-09-04T03:50:00Z',
+      publishedAt: '2026-09-04T03:50:00.000Z',
       active: [{ updatedAt: '2026-09-04T03:48:00.100Z' }],
       recentlyResolved: [
         { updatedAt: '2026-09-04T03:47:00.120Z' },

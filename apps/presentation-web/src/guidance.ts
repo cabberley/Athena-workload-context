@@ -1,4 +1,9 @@
-import { canonicalizeJson, sha256Digest, type JsonValue } from './canonical'
+import {
+  canonicalizeJson,
+  canonicalizeUtcTimestamp,
+  sha256Digest,
+  type JsonValue,
+} from './canonical'
 import { type Sha256Digest } from './contracts'
 import {
   verifyIncidentOccurrenceAssets,
@@ -27,6 +32,11 @@ const MAX_ATTESTATION_BYTES = 16 * 1024
 const MAX_INCIDENT_ATTESTATION_BYTES = 24 * 1024
 const MAX_FEED_AGE_MS = 15 * 60_000
 const MAX_CLOCK_SKEW_MS = 60_000
+const MAX_GUIDANCE_REFRESH_BYTES = 64 * 1024 * 1024
+const MAX_GUIDANCE_ENTRY_CONCURRENCY = 4
+const MAX_CACHED_GUIDANCE_ASSETS = 2048
+const MAX_CACHED_GUIDANCE_ASSET_BYTES = 64 * 1024 * 1024
+const MAX_CACHED_GUIDANCE_ENTRIES = 256
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const INCIDENT_ID = /^inc-[a-f0-9]{12}$/
@@ -271,6 +281,8 @@ export interface IncidentGuidanceBundle {
 
 export interface GuidanceLoadOptions extends LoadPresentationOptions {
   feedIndexUrl?: URL
+  maximumAggregateBytes?: number
+  maximumConcurrentEntries?: number
   anchors?: Omit<GuidanceTrustAnchors['feed'], 'publicKey'> & {
     enrichmentKeyId: string
     enrichmentFingerprint: Sha256Digest
@@ -281,11 +293,37 @@ export interface GuidanceLoadOptions extends LoadPresentationOptions {
   }
 }
 
+export interface GuidanceLoadCache {
+  assets: Map<string, BoundedJsonAsset>
+  assetBytes: number
+  entries: Map<string, Promise<VerifiedOperatorGuidance>>
+}
+
+export interface GuidanceFetchBudget {
+  remainingBytes: number
+}
+
 interface ParsedAttestation {
   signatureAlgorithm: 'RS256'
   keyVaultKeyId: string
   detachedSignature: string
   signedPreimageDigest?: Sha256Digest
+}
+
+const guidanceCaches = new WeakMap<typeof fetch, GuidanceLoadCache>()
+
+export const createGuidanceLoadCache = (): GuidanceLoadCache => ({
+  assets: new Map(),
+  assetBytes: 0,
+  entries: new Map(),
+})
+
+const loadCacheFor = (fetchImpl: typeof fetch): GuidanceLoadCache => {
+  const existing = guidanceCaches.get(fetchImpl)
+  if (existing) return existing
+  const created = createGuidanceLoadCache()
+  guidanceCaches.set(fetchImpl, created)
+  return created
 }
 
 export const loadVerifiedOperatorGuidanceFeed = async (
@@ -300,6 +338,24 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   const cryptoProvider = options.cryptoProvider ?? globalThis.crypto
   const origin = options.origin ?? globalThis.location.origin
   const timeoutMs = options.timeoutMs ?? 5_000
+  const maximumAggregateBytes =
+    options.maximumAggregateBytes ?? MAX_GUIDANCE_REFRESH_BYTES
+  const maximumConcurrentEntries =
+    options.maximumConcurrentEntries ?? MAX_GUIDANCE_ENTRY_CONCURRENCY
+  if (
+    !Number.isSafeInteger(maximumAggregateBytes) ||
+    maximumAggregateBytes < MAX_FEED_BYTES + MAX_ATTESTATION_BYTES ||
+    maximumAggregateBytes > MAX_GUIDANCE_REFRESH_BYTES ||
+    !Number.isSafeInteger(maximumConcurrentEntries) ||
+    maximumConcurrentEntries < 1 ||
+    maximumConcurrentEntries > MAX_GUIDANCE_ENTRY_CONCURRENCY
+  ) {
+    throw new VerificationError('Incident guidance loading limits are invalid.')
+  }
+  const budget: GuidanceFetchBudget = {
+    remainingBytes: maximumAggregateBytes,
+  }
+  const cache = loadCacheFor(fetchImpl)
   const applicationRoot = new URL('/', `${origin}/`)
   const indexUrl =
     options.feedIndexUrl ??
@@ -311,11 +367,12 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   ) {
     throw new VerificationError('Incident feed v2 must use the application origin.')
   }
-  const feedIndex = await fetchBoundedJsonAsset(
+  const feedIndex = await fetchBudgetedGuidanceAsset(
     indexUrl,
     MAX_FEED_BYTES,
     fetchImpl,
     timeoutMs,
+    budget,
   )
   const index = await parseFeedIndex(
     await requireCanonicalAsset(
@@ -325,39 +382,105 @@ export const loadVerifiedOperatorGuidanceFeed = async (
     ),
     cryptoProvider,
   )
-  const feedIndexAttestation = await fetchBoundedJsonAsset(
+  const feedIndexAttestation = await fetchBudgetedGuidanceAsset(
     resolveSameOriginAssetUrl(index.indexAttestationPath, applicationRoot, origin),
     MAX_ATTESTATION_BYTES,
     fetchImpl,
     timeoutMs,
+    budget,
   )
-  const keyAssets = await Promise.all(
-    [
-      './trust/incident-public-key.jwk.json',
+  const feedKey = await fetchBudgetedGuidanceAsset(
+    resolveSameOriginAssetUrl(
       './trust/wc027-feed-public-key.jwk.json',
-      './trust/wc027-report-public-key.jwk.json',
-      './trust/wc027-enrichment-public-key.jwk.json',
-      './trust/wc027-guidance-public-key.jwk.json',
-    ].map((path) =>
-      fetchBoundedJsonAsset(
-        resolveSameOriginAssetUrl(path, applicationRoot, origin),
+      applicationRoot,
+      origin,
+    ),
+    16 * 1024,
+    fetchImpl,
+    timeoutMs,
+    budget,
+  )
+  const feedAnchor: GuidanceTrustAnchor = {
+    keyId: configured.keyId,
+    fingerprint: configured.fingerprint,
+    publicKey: feedKey.value,
+  }
+  await verifyFeedIndex(
+    feedIndex,
+    feedIndexAttestation,
+    incidentFeed,
+    feedAnchor,
+    cryptoProvider,
+  )
+  const activeById = new Map(
+    incidentFeed.incidents.map((incident) => [incident.state.incidentId, incident]),
+  )
+  if (
+    index.active.length !== activeById.size ||
+    index.active.some((entry) => !activeById.has(entry.incidentId))
+  ) {
+    throw new VerificationError(
+      'Incident feed v2 active set does not match verified v1 authority.',
+    )
+  }
+  const entries = [...index.active, ...index.recentlyResolved]
+  if (entries.length === 0) {
+    return {
+      publishedAt: index.publishedAt,
+      active: [],
+      recentlyResolved: [],
+    }
+  }
+  const [lifecycleKey, reportKey, enrichmentKey, guidanceKey] = await Promise.all(
+    [
+      fetchBudgetedGuidanceAsset(
+        resolveSameOriginAssetUrl(
+          './trust/incident-public-key.jwk.json',
+          applicationRoot,
+          origin,
+        ),
         16 * 1024,
         fetchImpl,
         timeoutMs,
+        budget,
       ),
-    ),
+      fetchBudgetedGuidanceAsset(
+        resolveSameOriginAssetUrl(
+          './trust/wc027-report-public-key.jwk.json',
+          applicationRoot,
+          origin,
+        ),
+        16 * 1024,
+        fetchImpl,
+        timeoutMs,
+        budget,
+      ),
+      fetchBudgetedGuidanceAsset(
+        resolveSameOriginAssetUrl(
+          './trust/wc027-enrichment-public-key.jwk.json',
+          applicationRoot,
+          origin,
+        ),
+        16 * 1024,
+        fetchImpl,
+        timeoutMs,
+        budget,
+      ),
+      fetchBudgetedGuidanceAsset(
+        resolveSameOriginAssetUrl(
+          './trust/wc027-guidance-public-key.jwk.json',
+          applicationRoot,
+          origin,
+        ),
+        16 * 1024,
+        fetchImpl,
+        timeoutMs,
+        budget,
+      ),
+    ],
   )
-  const lifecycleKey = keyAssets[0]!
-  const feedKey = keyAssets[1]!
-  const reportKey = keyAssets[2]!
-  const enrichmentKey = keyAssets[3]!
-  const guidanceKey = keyAssets[4]!
   const anchors: GuidanceTrustAnchors = {
-    feed: {
-      keyId: configured.keyId,
-      fingerprint: configured.fingerprint,
-      publicKey: feedKey.value,
-    },
+    feed: feedAnchor,
     report: {
       keyId: configured.reportKeyId,
       fingerprint: configured.reportFingerprint,
@@ -374,43 +497,35 @@ export const loadVerifiedOperatorGuidanceFeed = async (
       publicKey: guidanceKey.value,
     },
   }
-  await verifyFeedIndex(
-    feedIndex,
-    feedIndexAttestation,
-    incidentFeed,
-    anchors.feed,
-    cryptoProvider,
-  )
-  const activeById = new Map(
-    incidentFeed.incidents.map((incident) => [incident.state.incidentId, incident]),
-  )
-  if (
-    index.active.length !== activeById.size ||
-    index.active.some((entry) => !activeById.has(entry.incidentId))
-  ) {
-    throw new VerificationError(
-      'Incident feed v2 active set does not match verified v1 authority.',
-    )
-  }
   const verifyEntry = async (
     entry: ParsedFeedEntry,
   ): Promise<VerifiedOperatorGuidance> => {
+    const entryCacheKey = guidanceEntryCacheKey(entry, configured)
+    const cached = cache.entries.get(entryCacheKey)
+    if (cached) return cached
+    const pending = (async () => {
       const [feedPointer, feedPointerAttestation] = await Promise.all([
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           entry.feedPointerReference,
           MAX_POINTER_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           entry.feedPointerAttestationReference,
           MAX_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
       ])
       const pointer = await parseFeedPointer(
@@ -429,53 +544,71 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         enrichmentManifest,
         enrichmentAttestation,
       ] = await Promise.all([
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.sourceStateReference,
           MAX_STATE_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.sourceStateAttestationReference,
           MAX_INCIDENT_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.sourcePointerReference,
           MAX_POINTER_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.sourcePointerAttestationReference,
           MAX_INCIDENT_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.enrichmentAsset.manifestReference,
           MAX_MANIFEST_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           pointer.enrichmentAsset.attestationReference,
           MAX_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
       ])
       const incident = await verifyIncidentOccurrenceAssets(
@@ -522,37 +655,49 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         guidance,
         guidanceAttestation,
       ] = await Promise.all([
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           manifest.correlationReportAsset.reportReference,
           MAX_REPORT_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           manifest.correlationReportAsset.attestationReference,
           MAX_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           manifest.guidanceAsset.guidanceReference,
           MAX_GUIDANCE_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
-        fetchVersionedReference(
+        fetchCachedGuidanceReference(
           manifest.guidanceAsset.attestationReference,
           MAX_ATTESTATION_BYTES,
           applicationRoot,
           origin,
           fetchImpl,
           timeoutMs,
+          cryptoProvider,
+          cache,
+          budget,
         ),
       ])
       return verifyIncidentGuidanceBundle(
@@ -573,11 +718,18 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         anchors,
         cryptoProvider,
       )
+    })()
+    rememberCached(cache.entries, entryCacheKey, pending, MAX_CACHED_GUIDANCE_ENTRIES)
+    pending.catch(() => cache.entries.delete(entryCacheKey))
+    return pending
   }
-  const [active, recentlyResolved] = await Promise.all([
-    Promise.all(index.active.map(verifyEntry)),
-    Promise.all(index.recentlyResolved.map(verifyEntry)),
-  ])
+  const verifiedEntries = await mapWithGuidanceConcurrency(
+    entries,
+    maximumConcurrentEntries,
+    verifyEntry,
+  )
+  const active = verifiedEntries.slice(0, index.active.length)
+  const recentlyResolved = verifiedEntries.slice(index.active.length)
   return {
     publishedAt: index.publishedAt,
     active,
@@ -3088,26 +3240,6 @@ const parseStringArray = (value: unknown, maximum: number): string[] => {
 const isDigest = (value: unknown): value is Sha256Digest =>
   typeof value === 'string' && DIGEST.test(value)
 
-const UTC_TIMESTAMP =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(?:Z|\+00:00)$/
-
-const canonicalizeUtcTimestamp = (value: unknown): string | null => {
-  if (typeof value !== 'string') return null
-  const match = UTC_TIMESTAMP.exec(value)
-  if (!match || Number(match[1]) === 0) return null
-  const base = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`
-  const milliseconds = (match[7] ?? '').padEnd(3, '0')
-  const normalized = `${base}.${milliseconds}Z`
-  const parsed = new Date(normalized)
-  if (
-    Number.isNaN(parsed.getTime()) ||
-    parsed.toISOString() !== normalized
-  ) {
-    return null
-  }
-  return milliseconds === '000' ? `${base}Z` : normalized
-}
-
 const isTimestamp = (value: unknown): value is string =>
   canonicalizeUtcTimestamp(value) !== null
 
@@ -3134,20 +3266,143 @@ const equalBytes = (left: Uint8Array, right: Uint8Array): boolean =>
   left.byteLength === right.byteLength &&
   left.every((value, index) => value === right[index])
 
-const fetchVersionedReference = (
+export const fetchCachedGuidanceReference = async (
   reference: VersionPinnedReference,
   maximumBytes: number,
   applicationRoot: URL,
   origin: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  cryptoProvider: Crypto,
+  cache: GuidanceLoadCache,
+  budget: GuidanceFetchBudget,
 ): Promise<BoundedJsonAsset> => {
   const url = resolveSameOriginAssetUrl(
     `./${reference.name}`,
     applicationRoot,
     origin,
   )
-  return fetchBoundedJsonAsset(url, maximumBytes, fetchImpl, timeoutMs)
+  const key = [
+    origin,
+    reference.name,
+    reference.version,
+    reference.contentDigest,
+    maximumBytes,
+  ].join('\0')
+  const cached = cache.assets.get(key)
+  if (cached) return cached
+  const asset = await fetchBudgetedGuidanceAsset(
+    url,
+    maximumBytes,
+    fetchImpl,
+    timeoutMs,
+    budget,
+  )
+  if ((await sha256Digest(asset.bytes, cryptoProvider)) !== reference.contentDigest) {
+    throw new VerificationError('Version-pinned incident asset digest is invalid.')
+  }
+  while (
+    cache.assets.size >= MAX_CACHED_GUIDANCE_ASSETS ||
+    cache.assetBytes + asset.bytes.byteLength > MAX_CACHED_GUIDANCE_ASSET_BYTES
+  ) {
+    const oldest = cache.assets.entries().next()
+    if (oldest.done) break
+    cache.assets.delete(oldest.value[0])
+    cache.assetBytes -= oldest.value[1].bytes.byteLength
+  }
+  if (asset.bytes.byteLength <= MAX_CACHED_GUIDANCE_ASSET_BYTES) {
+    cache.assets.set(key, asset)
+    cache.assetBytes += asset.bytes.byteLength
+  }
+  return asset
+}
+
+export const fetchBudgetedGuidanceAsset = async (
+  url: URL,
+  maximumBytes: number,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  budget: GuidanceFetchBudget,
+): Promise<BoundedJsonAsset> => {
+  if (maximumBytes > budget.remainingBytes) {
+    throw new VerificationError('Incident guidance aggregate response budget was exceeded.')
+  }
+  budget.remainingBytes -= maximumBytes
+  try {
+    const asset = await fetchBoundedJsonAsset(url, maximumBytes, fetchImpl, timeoutMs)
+    budget.remainingBytes += maximumBytes - asset.bytes.byteLength
+    return asset
+  } catch (error) {
+    budget.remainingBytes += maximumBytes
+    throw error
+  }
+}
+
+const guidanceEntryCacheKey = (
+  entry: ParsedFeedEntry,
+  anchors: NonNullable<GuidanceLoadOptions['anchors']>,
+): string =>
+  canonicalizeJson({
+    incidentId: entry.incidentId,
+    lifecycle: entry.lifecycle,
+    stateResultDigest: entry.stateResultDigest,
+    updatedAt: entry.updatedAt,
+    feedPointerReference: {
+      name: entry.feedPointerReference.name,
+      version: entry.feedPointerReference.version,
+      contentDigest: entry.feedPointerReference.contentDigest,
+    },
+    feedPointerAttestationReference: {
+      name: entry.feedPointerAttestationReference.name,
+      version: entry.feedPointerAttestationReference.version,
+      contentDigest: entry.feedPointerAttestationReference.contentDigest,
+    },
+    anchors: {
+      keyId: anchors.keyId,
+      fingerprint: anchors.fingerprint,
+      reportKeyId: anchors.reportKeyId,
+      reportFingerprint: anchors.reportFingerprint,
+      enrichmentKeyId: anchors.enrichmentKeyId,
+      enrichmentFingerprint: anchors.enrichmentFingerprint,
+      guidanceKeyId: anchors.guidanceKeyId,
+      guidanceFingerprint: anchors.guidanceFingerprint,
+    },
+  })
+
+const rememberCached = <Key, Value>(
+  cache: Map<Key, Value>,
+  key: Key,
+  value: Value,
+  maximumEntries: number,
+): void => {
+  if (!cache.has(key) && cache.size >= maximumEntries) {
+    const oldest = cache.keys().next()
+    if (!oldest.done) cache.delete(oldest.value)
+  }
+  cache.set(key, value)
+}
+
+export const mapWithGuidanceConcurrency = async <Input, Output>(
+  values: readonly Input[],
+  maximumConcurrency: number,
+  mapper: (value: Input) => Promise<Output>,
+): Promise<Output[]> => {
+  const output = new Array<Output>(values.length)
+  let nextIndex = 0
+  const worker = async (): Promise<void> => {
+    while (nextIndex < values.length) {
+      const index = nextIndex
+      nextIndex += 1
+      output[index] = await mapper(values[index]!)
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(maximumConcurrency, values.length) },
+      () => worker(),
+    ),
+  )
+  return output
 }
 
 const trustAnchorsFromEnvironment = (): NonNullable<GuidanceLoadOptions['anchors']> => {
