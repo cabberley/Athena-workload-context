@@ -461,8 +461,21 @@ def test_writer_reference_mismatch_fails_closed() -> None:
     assert len(store.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "asset_suffix",
+    [
+        "correlation-reports/report-" + "2" * 32 + "/report.json",
+        "enrichments/incident-enrichment-" + "3" * 32 + "/feed-pointer.json",
+        (
+            "enrichments/incident-enrichment-"
+            + "3" * 32
+            + "/feed-pointer-attestation.json"
+        ),
+    ],
+)
 def test_azure_store_recovers_exact_current_version(
     monkeypatch: pytest.MonkeyPatch,
+    asset_suffix: str,
 ) -> None:
     writer = object.__new__(AzureBlobCreateOnlyArtifactWriter)
     reader = object.__new__(AzureBlobVersionPinnedArtifactReader)
@@ -475,9 +488,8 @@ def test_azure_store_recovers_exact_current_version(
         blob_name=(
             "incidents/inc-0123456789ab/versions/"
             + "1" * 64
-            + "/correlation-reports/report-"
-            + "2" * 32
-            + "/report.json"
+            + "/"
+            + asset_suffix
         ),
         payload=payload,
         content_type="application/json",

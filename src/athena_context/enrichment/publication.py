@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -37,6 +37,7 @@ from athena_context.contracts import (
     PublishedCorrelationReportAttestation,
     PublishedGuidanceAuthorityBinding,
     PublishedRuntimeContextBinding,
+    UtcDateTime,
     VersionPinnedBlobReference,
     build_incident_enrichment_manifest,
     build_incident_occurrence_receipt,
@@ -65,6 +66,7 @@ from athena_context.presentation_assets import (
 )
 
 SignatureVerifier = Callable[[bytes, str], bool]
+_INCIDENT_ENRICHMENT_PUBLICATION_RECEIPT_TOKEN = object()
 
 
 class IncidentEnrichmentArtifactWriterPort(Protocol):
@@ -92,8 +94,34 @@ class IncidentEnrichmentPublicationReceipt:
     correlation_report_asset: PublishedCorrelationReportAssetReference
     guidance_asset: IncidentGuidanceAssetReference
     enrichment_asset: IncidentEnrichmentAssetReference
+    report_key_id: str
+    guidance_key_id: str
+    enrichment_key_id: str
+    published_at: UtcDateTime
+    _verification_token: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _verification_token: object) -> None:
+        if _verification_token is not _INCIDENT_ENRICHMENT_PUBLICATION_RECEIPT_TOKEN:
+            raise TypeError(
+                "incident enrichment publication receipts are created only by "
+                "verified publication"
+            )
+        key_ids = (
+            self.report_key_id,
+            self.guidance_key_id,
+            self.enrichment_key_id,
+        )
+        if (
+            any(type(value) is not str or not value for value in key_ids)
+            or len(set(key_ids)) != len(key_ids)
+        ):
+            raise ValueError(
+                "incident enrichment receipt signing authorities are invalid"
+            )
+        if self.published_at < self.occurrence.published_at:
+            raise ValueError(
+                "incident enrichment publication predates its occurrence"
+            )
         if (
             self.correlation_report_asset.incident_id != self.occurrence.incident_id
             or self.guidance_asset.incident_id != self.occurrence.incident_id
@@ -409,6 +437,13 @@ class IncidentEnrichmentPublicationService:
             correlation_report_asset=report_asset,
             guidance_asset=guidance_asset,
             enrichment_asset=enrichment_asset,
+            report_key_id=self.report_key_id,
+            guidance_key_id=self.guidance_key_id,
+            enrichment_key_id=self.enrichment_key_id,
+            published_at=guidance.generated_at,
+            _verification_token=(
+                _INCIDENT_ENRICHMENT_PUBLICATION_RECEIPT_TOKEN
+            ),
         )
 
     def _verify_occurrence(
