@@ -35,8 +35,37 @@ Before any lifecycle data is rendered, the browser:
 
 Any failure withholds the complete lifecycle. The browser has no Azure SDK, Blob URL, ARM, MCP,
 storage credential, direct cloud call, mutation, or remediation capability. In live deployment,
-NGINX proxies only `/runtime-manifest.json` and `/live/` to a localhost managed-identity sidecar;
+NGINX proxies only `/runtime-manifest.json`, `/live/`, and `/incidents/` to a localhost
+managed-identity sidecar;
 the browser remains same-origin and the static reviewed key remains at `/trust/...`.
+
+## WC-027 operator guidance
+
+After independently verifying the v1 active index, the browser also attempts the dormant WC-027
+consumer path at `/incidents/feed-v2.json`. It supports both active and recently resolved v2
+entries, independently re-verifies each referenced v1 occurrence, and renders guidance only after
+the exact-version feed pointer, correlation report publication, enrichment manifest, and guidance
+asset all pass strict schema, byte-bound, digest, cross-occurrence, pinned-key fingerprint, and
+detached RS256 verification. The browser requests only the signed asset name; the private gateway
+resolves and verifies the reference's exact Blob version before returning bytes.
+
+The build must pin separate feed, report, enrichment, and guidance trust anchors:
+
+- `VITE_WC027_FEED_KEY_ID` and `VITE_WC027_FEED_KEY_FINGERPRINT`;
+- `VITE_WC027_REPORT_KEY_ID` and `VITE_WC027_REPORT_KEY_FINGERPRINT`;
+- `VITE_WC027_ENRICHMENT_KEY_ID` and `VITE_WC027_ENRICHMENT_KEY_FINGERPRINT`; and
+- `VITE_WC027_GUIDANCE_KEY_ID` and `VITE_WC027_GUIDANCE_KEY_FINGERPRINT`.
+
+All eight values are required non-secret build arguments. The image build fails before dependency
+installation when any value is absent; an image that silently withholds guidance is not a
+supported build.
+
+Their verification-only JWKs are read from `/trust/wc027-feed-public-key.jwk.json`,
+`/trust/wc027-report-public-key.jwk.json`,
+`/trust/wc027-enrichment-public-key.jwk.json`, and
+`/trust/wc027-guidance-public-key.jwk.json`. Until those reviewed anchors and the v2 gateway
+surface are deployed, the verified v1 incident remains visible with an explicit
+guidance-unavailable state. Invalid v2 content is never treated as trusted v1 guidance.
 
 ## Synthetic fixtures
 
@@ -90,7 +119,24 @@ container described in
 Build locally from the app context:
 
 ```powershell
+$wc027FeedKeyId = '<reviewed-feed-key-id>'
+$wc027FeedKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027ReportKeyId = '<reviewed-report-key-id>'
+$wc027ReportKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027EnrichmentKeyId = '<reviewed-enrichment-key-id>'
+$wc027EnrichmentKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+$wc027GuidanceKeyId = '<reviewed-guidance-key-id>'
+$wc027GuidanceKeyFingerprint = 'sha256:<reviewed-64-lowercase-hex>'
+
 docker build --file apps/presentation-web/Dockerfile `
+  --build-arg "VITE_WC027_FEED_KEY_ID=$wc027FeedKeyId" `
+  --build-arg "VITE_WC027_FEED_KEY_FINGERPRINT=$wc027FeedKeyFingerprint" `
+  --build-arg "VITE_WC027_REPORT_KEY_ID=$wc027ReportKeyId" `
+  --build-arg "VITE_WC027_REPORT_KEY_FINGERPRINT=$wc027ReportKeyFingerprint" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_ID=$wc027EnrichmentKeyId" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_FINGERPRINT=$wc027EnrichmentKeyFingerprint" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_ID=$wc027GuidanceKeyId" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_FINGERPRINT=$wc027GuidanceKeyFingerprint" `
   --tag athena-presentation-web:local `
   apps/presentation-web
 docker run --rm --publish 127.0.0.1:8080:8080 athena-presentation-web:local
@@ -107,6 +153,14 @@ az acr build `
   --registry athenademoa6add389 `
   --image athena/presentation-web:<reviewed-tag> `
   --file apps/presentation-web/Dockerfile `
+  --build-arg "VITE_WC027_FEED_KEY_ID=$wc027FeedKeyId" `
+  --build-arg "VITE_WC027_FEED_KEY_FINGERPRINT=$wc027FeedKeyFingerprint" `
+  --build-arg "VITE_WC027_REPORT_KEY_ID=$wc027ReportKeyId" `
+  --build-arg "VITE_WC027_REPORT_KEY_FINGERPRINT=$wc027ReportKeyFingerprint" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_ID=$wc027EnrichmentKeyId" `
+  --build-arg "VITE_WC027_ENRICHMENT_KEY_FINGERPRINT=$wc027EnrichmentKeyFingerprint" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_ID=$wc027GuidanceKeyId" `
+  --build-arg "VITE_WC027_GUIDANCE_KEY_FINGERPRINT=$wc027GuidanceKeyFingerprint" `
   apps/presentation-web
 
 az acr repository show `

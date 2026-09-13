@@ -14,6 +14,7 @@ import {
   fetchBoundedJsonAsset,
   requireContentDigest,
   resolveSameOriginAssetUrl,
+  type BoundedJsonAsset,
   type LoadPresentationOptions,
 } from './runtime'
 
@@ -128,12 +129,53 @@ export interface VerifiedIncident {
   state: IncidentState
   publishedAt: string
   keyFingerprint: Sha256Digest
+  occurrence?: {
+    transitionId: string
+    publishedAt: string
+    statePath: string
+    stateVersion?: string
+    stateSha256: Sha256Digest
+    attestationPath: string
+    attestationVersion?: string
+    attestationSha256: Sha256Digest
+    pointerPath: string
+    pointerVersion?: string
+    pointerSha256: Sha256Digest
+    pointerAttestationPath: string
+    pointerAttestationVersion?: string
+    pointerAttestationSha256: Sha256Digest
+  }
+}
+
+export interface IncidentOccurrenceReference {
+  name: string
+  version: string
+  contentDigest: Sha256Digest
+}
+
+export interface IncidentOccurrenceAssets {
+  state: BoundedJsonAsset
+  stateAttestation: BoundedJsonAsset
+  pointer: BoundedJsonAsset
+  pointerAttestation: BoundedJsonAsset
+}
+
+export interface IncidentOccurrenceExpectation {
+  incidentId: string
+  lifecycle: IncidentLifecycle
+  stateResultDigest: Sha256Digest
+  updatedAt: string
+  stateReference: IncidentOccurrenceReference
+  stateAttestationReference: IncidentOccurrenceReference
+  pointerReference: IncidentOccurrenceReference
+  pointerAttestationReference: IncidentOccurrenceReference
 }
 
 export interface VerifiedIncidentFeed {
   incidents: VerifiedIncident[]
   publishedAt: string
   keyFingerprint: Sha256Digest
+  sourceIndexDigest?: Sha256Digest
 }
 
 export const assertIncidentFeedFreshness = (
@@ -216,6 +258,7 @@ export const loadVerifiedIncidents = async (
     incidents,
     publishedAt: index.publishedAt,
     keyFingerprint: key.fingerprint,
+    sourceIndexDigest: await sha256Digest(indexAsset.bytes, cryptoProvider),
   }
 }
 
@@ -328,7 +371,128 @@ const loadVerifiedIncidentEntry = async (
   if (Date.parse(state.updatedAt) - Date.now() > 60_000) {
     throw new VerificationError('Incident state timestamp is in the future.')
   }
-  return { state, publishedAt: pointer.publishedAt, keyFingerprint: key.fingerprint }
+  return {
+    state,
+    publishedAt: pointer.publishedAt,
+    keyFingerprint: key.fingerprint,
+    occurrence: {
+      transitionId: state.transitionId,
+      publishedAt: pointer.publishedAt,
+      statePath: removeRelativePrefix(pointer.statePath),
+      stateSha256: pointer.stateSha256,
+      attestationPath: removeRelativePrefix(pointer.attestationPath),
+      attestationSha256: pointer.attestationSha256,
+      pointerPath: removeRelativePrefix(entry.pointerPath),
+      pointerSha256: entry.pointerSha256,
+      pointerAttestationPath: removeRelativePrefix(pointer.pointerAttestationPath),
+      pointerAttestationSha256: await sha256Digest(
+        pointerAttestationAsset.bytes,
+        cryptoProvider,
+      ),
+    },
+  }
+}
+
+export const verifyIncidentOccurrenceAssets = async (
+  assets: IncidentOccurrenceAssets,
+  expected: IncidentOccurrenceExpectation,
+  publicKeyValue: unknown,
+  cryptoProvider: Crypto = globalThis.crypto,
+): Promise<VerifiedIncident> => {
+  const key = parsePresentationPublicKey(publicKeyValue)
+  await Promise.all([
+    requireContentDigest(
+      assets.pointer.bytes,
+      expected.pointerReference.contentDigest,
+      cryptoProvider,
+      'incident pointer',
+    ),
+    requireContentDigest(
+      assets.pointerAttestation.bytes,
+      expected.pointerAttestationReference.contentDigest,
+      cryptoProvider,
+      'incident attestation',
+    ),
+    requireContentDigest(
+      assets.state.bytes,
+      expected.stateReference.contentDigest,
+      cryptoProvider,
+      'incident state',
+    ),
+    requireContentDigest(
+      assets.stateAttestation.bytes,
+      expected.stateAttestationReference.contentDigest,
+      cryptoProvider,
+      'incident attestation',
+    ),
+  ])
+  const pointer = parseIncidentPointer(assets.pointer.value)
+  const pointerAttestation = parseIncidentPointerAttestation(
+    assets.pointerAttestation.value,
+  )
+  const state = parseIncidentState(assets.state.value)
+  const attestation = parseIncidentAttestation(assets.stateAttestation.value)
+  const importedKey = await verifySignedBytes(
+    assets.pointer.bytes,
+    pointerAttestation.pointerDigest,
+    pointerAttestation.detachedSignature,
+    pointer.keyId,
+    pointer.keyFingerprint,
+    pointerAttestation.keyVaultKeyId,
+    key,
+    cryptoProvider,
+    'Incident pointer',
+  )
+  await verifyIncident(
+    pointer,
+    state,
+    attestation,
+    key,
+    cryptoProvider,
+    importedKey,
+  )
+  if (
+    pointer.incidentId !== expected.incidentId ||
+    state.incidentId !== expected.incidentId ||
+    state.lifecycle !== expected.lifecycle ||
+    state.resultDigest !== expected.stateResultDigest ||
+    state.updatedAt !== expected.updatedAt ||
+    removeRelativePrefix(pointer.statePath) !== expected.stateReference.name ||
+    pointer.stateSha256 !== expected.stateReference.contentDigest ||
+    removeRelativePrefix(pointer.attestationPath) !==
+      expected.stateAttestationReference.name ||
+    pointer.attestationSha256 !==
+      expected.stateAttestationReference.contentDigest ||
+    removeRelativePrefix(pointer.pointerAttestationPath) !==
+      expected.pointerAttestationReference.name
+  ) {
+    throw new VerificationError(
+      'Incident occurrence does not match its signed v2 references.',
+    )
+  }
+  return {
+    state,
+    publishedAt: pointer.publishedAt,
+    keyFingerprint: key.fingerprint,
+    occurrence: {
+      transitionId: state.transitionId,
+      publishedAt: pointer.publishedAt,
+      statePath: expected.stateReference.name,
+      stateVersion: expected.stateReference.version,
+      stateSha256: expected.stateReference.contentDigest,
+      attestationPath: expected.stateAttestationReference.name,
+      attestationVersion: expected.stateAttestationReference.version,
+      attestationSha256: expected.stateAttestationReference.contentDigest,
+      pointerPath: expected.pointerReference.name,
+      pointerVersion: expected.pointerReference.version,
+      pointerSha256: expected.pointerReference.contentDigest,
+      pointerAttestationPath: expected.pointerAttestationReference.name,
+      pointerAttestationVersion:
+        expected.pointerAttestationReference.version,
+      pointerAttestationSha256:
+        expected.pointerAttestationReference.contentDigest,
+    },
+  }
 }
 
 const verifySignedBytes = async (
@@ -708,6 +872,7 @@ const exactRecord = (value: unknown, keys: string[]): Record<string, unknown> =>
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new VerificationError('Incident asset must be an object.')
   }
+
   const record = value as Record<string, unknown>
   if (
     Object.keys(record).length !== keys.length ||
@@ -717,6 +882,9 @@ const exactRecord = (value: unknown, keys: string[]): Record<string, unknown> =>
   }
   return record
 }
+
+const removeRelativePrefix = (value: string): string =>
+  value.startsWith('./') ? value.slice(2) : value
 
 const isDigest = (value: unknown): value is Sha256Digest =>
   typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value)

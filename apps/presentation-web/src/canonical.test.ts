@@ -13,6 +13,17 @@ describe('RFC 8785 presentation canonicalization', () => {
     ).toBe('{"a":1,"at":"2026-08-17T00:00:00.000Z","z":"é"}')
   })
 
+  it('preserves opaque Azure Blob versions while canonicalizing real timestamps', () => {
+    expect(
+      canonicalizeJson({
+        publishedAt: '2026-08-20T23:50:41Z',
+        version: '2026-08-20T23:50:41.2983616Z',
+      }),
+    ).toBe(
+      '{"publishedAt":"2026-08-20T23:50:41.000Z","version":"2026-08-20T23:50:41.2983616Z"}',
+    )
+  })
+
   it('matches every frozen presentation result digest with resultDigest excluded', async () => {
     for (const phase of ['baseline', 'faulted', 'recovered'] as const) {
       const payload = parsePresentationPayload(payloadFor(phase), phase)

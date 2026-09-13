@@ -143,6 +143,87 @@ code {
   font-weight: 700;
 }
 
+.operator-guidance,
+.guidance-unavailable {
+  margin-top: 1.5rem;
+  padding: 1.25rem;
+  border: 1px solid #5e7f9f;
+  border-radius: 0.75rem;
+  background: rgb(7 20 35 / 78%);
+}
+
+.operator-guidance h4,
+.operator-guidance h5,
+.guidance-unavailable h4 {
+  margin-bottom: 0.5rem;
+}
+
+.guidance-summary {
+  margin: 1rem 0 1.5rem;
+}
+
+.guidance-list {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  padding-left: 1.5rem;
+}
+
+.guidance-list li {
+  padding-left: 0.25rem;
+}
+
+.guidance-list p {
+  margin: 0.35rem 0 0;
+}
+
+.guidance-mode {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.guidance-parameters {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.6rem 0 0;
+}
+
+.guidance-parameters div {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.35fr) 1fr;
+  gap: 0.5rem;
+}
+
+.guidance-parameters dt {
+  color: var(--muted);
+}
+
+.guidance-parameters dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.guidance-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.guidance-evidence code {
+  overflow-wrap: anywhere;
+}
+
+.guidance-boundary {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid #5e7f9f;
+  font-weight: 700;
+}
+
 .trust-strip h2 {
   margin: 0;
   font-size: 1.4rem;

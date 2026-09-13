@@ -10,6 +10,14 @@ import {
   type VerifiedIncident,
   type VerifiedIncidentFeed,
 } from './incidents'
+import {
+  guidanceTemplateLabel,
+  loadVerifiedOperatorGuidanceFeed,
+  type GuidanceRunbookLink,
+  type GuidanceStep,
+  type VerifiedOperatorGuidance,
+  type VerifiedOperatorGuidanceFeed,
+} from './guidance'
 import type { BlastRadius, ImpactLevel } from './derivations'
 import type { VerifiedLifecycle } from './verification'
 import './App.css'
@@ -17,6 +25,9 @@ import './App.css'
 export interface AppProps {
   loader?: () => Promise<VerifiedLifecycle>
   incidentLoader?: () => Promise<VerifiedIncidentFeed>
+  guidanceLoader?: (
+    incidentFeed: VerifiedIncidentFeed,
+  ) => Promise<VerifiedOperatorGuidanceFeed>
   incidentPollMs?: number
 }
 
@@ -35,6 +46,7 @@ const BLAST_RADIUS_LABELS: Record<BlastRadius, string> = {
 function App({
   loader = loadVerifiedLifecycle,
   incidentLoader = loadVerifiedIncidents,
+  guidanceLoader = loadVerifiedOperatorGuidanceFeed,
   incidentPollMs = 8_000,
 }: AppProps) {
   const [lifecycle, setLifecycle] = useState<VerifiedLifecycle | null>(null)
@@ -43,6 +55,9 @@ function App({
   const phaseHeadingRef = useRef<HTMLHeadingElement>(null)
   const [incidentFeed, setIncidentFeed] = useState<VerifiedIncidentFeed | null>(null)
   const [incidentUnavailable, setIncidentUnavailable] = useState(false)
+  const [guidanceFeed, setGuidanceFeed] =
+    useState<VerifiedOperatorGuidanceFeed | null>(null)
+  const [guidanceUnavailable, setGuidanceUnavailable] = useState(false)
 
   useEffect(() => {
     let current = true
@@ -62,20 +77,65 @@ function App({
     let current = true
     let timer: ReturnType<typeof globalThis.setTimeout> | undefined
     let latestPublishedAt = 0
+    let latestGuidancePublishedAt = 0
+    let latestGuidanceBindings: Record<string, string> = {}
     const refresh = async (): Promise<void> => {
       try {
         const verified = await incidentLoader()
+        let verifiedGuidance: VerifiedOperatorGuidanceFeed | null = null
+        let guidanceFailed = false
+        if (guidanceLoader) {
+          try {
+            verifiedGuidance = await guidanceLoader(verified)
+          } catch {
+            guidanceFailed = true
+          }
+        }
         if (!current) return
         const publishedAt = Date.parse(verified.publishedAt)
         if (publishedAt >= latestPublishedAt) {
           latestPublishedAt = publishedAt
           setIncidentFeed(verified)
           setIncidentUnavailable(false)
+          if (verifiedGuidance) {
+            const guidancePublishedAt = Date.parse(verifiedGuidance.publishedAt)
+            const allGuidance = [
+              ...verifiedGuidance.active,
+              ...verifiedGuidance.recentlyResolved,
+            ]
+            const nextBindings = Object.fromEntries(
+              allGuidance.map((guidance) => [
+                guidance.incidentId,
+                guidance.stateResultDigest,
+              ]),
+            )
+            const sameOccurrenceBindings =
+              Object.keys(nextBindings).length ===
+                Object.keys(latestGuidanceBindings).length &&
+              Object.entries(nextBindings).every(
+                ([incidentId, digest]) =>
+                  latestGuidanceBindings[incidentId] === digest,
+              )
+            if (
+              guidancePublishedAt >= latestGuidancePublishedAt ||
+              !sameOccurrenceBindings
+            ) {
+              latestGuidancePublishedAt = guidancePublishedAt
+              latestGuidanceBindings = nextBindings
+              setGuidanceFeed(verifiedGuidance)
+              setGuidanceUnavailable(false)
+            }
+          } else if (guidanceFailed) {
+            setGuidanceFeed(null)
+            setGuidanceUnavailable(true)
+          }
         }
       } catch {
         if (current) {
           setIncidentFeed(null)
           setIncidentUnavailable(true)
+          setGuidanceFeed(null)
+          setGuidanceUnavailable(false)
         }
       } finally {
         if (current) timer = globalThis.setTimeout(() => void refresh(), incidentPollMs)
@@ -86,7 +146,7 @@ function App({
       current = false
       if (timer !== undefined) globalThis.clearTimeout(timer)
     }
-  }, [incidentLoader, incidentPollMs])
+  }, [guidanceLoader, incidentLoader, incidentPollMs])
 
   useEffect(() => {
     if (lifecycle) phaseHeadingRef.current?.focus()
@@ -172,6 +232,16 @@ function App({
         <IncidentPanel
           incidents={incidentFeed?.incidents ?? null}
           unavailable={incidentUnavailable}
+          guidanceByIncidentId={Object.fromEntries(
+            (guidanceFeed?.active ?? []).map((guidance) => [
+              guidance.incidentId,
+              guidance,
+            ]),
+          )}
+          guidanceUnavailable={guidanceUnavailable}
+        />
+        <RecentlyResolvedGuidance
+          guidance={guidanceFeed?.recentlyResolved ?? []}
         />
         <section className="trust-strip" aria-labelledby="trust-heading">
           <div>
@@ -424,12 +494,50 @@ function App({
   )
 }
 
+const RecentlyResolvedGuidance = ({
+  guidance,
+}: {
+  guidance: VerifiedOperatorGuidance[]
+}) => {
+  if (guidance.length === 0) return null
+  return (
+    <section
+      className="incident-panel"
+      aria-labelledby="recently-resolved-heading"
+    >
+      <p className="status-kicker">Recent operational history</p>
+      <h2 id="recently-resolved-heading">
+        {guidance.length === 1
+          ? '1 verified recently resolved incident'
+          : `${guidance.length} verified recently resolved incidents`}
+      </h2>
+      {guidance.map((verified) => (
+        <article
+          key={verified.incidentId}
+          className="incident-entry incident-resolved"
+          aria-labelledby={`resolved-${verified.incidentId}`}
+        >
+          <h3 id={`resolved-${verified.incidentId}`}>
+            Resolved incident: {scenarioLabel(verified.incident.state.scenario)}
+          </h3>
+          <p role="status">{verified.incident.state.findings[0]!.summary}</p>
+          <OperatorGuidancePanel guidance={verified} />
+        </article>
+      ))}
+    </section>
+  )
+}
+
 function IncidentPanel({
   incidents,
   unavailable,
+  guidanceByIncidentId,
+  guidanceUnavailable,
 }: {
   incidents: VerifiedIncident[] | null
   unavailable: boolean
+  guidanceByIncidentId: Readonly<Record<string, VerifiedOperatorGuidance>>
+  guidanceUnavailable: boolean
 }) {
   if (!incidents || incidents.length === 0) {
     return (
@@ -502,11 +610,221 @@ function IncidentPanel({
             Athena does not remediate automatically. Recovery requires a separately governed
             operator action.
           </p>
+          {guidanceByIncidentId[state.incidentId] ? (
+            <OperatorGuidancePanel
+              guidance={guidanceByIncidentId[state.incidentId]!}
+            />
+          ) : guidanceUnavailable ? (
+            <section className="guidance-unavailable" aria-label="Operator guidance unavailable">
+              <h4>Operator guidance unavailable</h4>
+              <p role="status">
+                The incident remains independently verified through the v1 feed, but its v2
+                enrichment was unavailable or failed verification. No unverified guidance was
+                rendered.
+              </p>
+            </section>
+          ) : null}
         </article>
       ))}
     </section>
   )
 }
+
+const OperatorGuidancePanel = ({
+  guidance: verified,
+}: {
+  guidance: VerifiedOperatorGuidance
+}) => {
+  const guidance = verified.guidance
+  const topHypothesis = guidance.hypotheses[0]!
+  return (
+    <section
+      className="operator-guidance"
+      aria-labelledby={`guidance-${verified.incidentId}`}
+    >
+      <p className="status-kicker">Verified v2 enrichment</p>
+      <h4 id={`guidance-${verified.incidentId}`}>Incident-specific operator guidance</h4>
+      <p>
+        This bounded guidance is evidence-linked and confidence-sensitive. It does not authorize
+        execution or automatic remediation.
+      </p>
+      <dl className="incident-details guidance-summary">
+        <div>
+          <dt>Affected role</dt>
+          <dd>{guidance.affectedRoleImpact.roleRef}</dd>
+        </div>
+        <div>
+          <dt>Declared profile</dt>
+          <dd>{guidance.affectedRoleImpact.profileId}</dd>
+        </div>
+        <div>
+          <dt>Impact</dt>
+          <dd>
+            {humanizeCode(guidance.affectedRoleImpact.impactCode)} (
+            {guidance.affectedRoleImpact.impactSeverity})
+          </dd>
+        </div>
+        <div>
+          <dt>Top confidence</dt>
+          <dd>{topHypothesis.confidence}</dd>
+        </div>
+        <div>
+          <dt>Generated</dt>
+          <dd>
+            <time dateTime={guidance.generatedAt}>{guidance.generatedAt}</time>
+          </dd>
+        </div>
+        <div>
+          <dt>Execution authorization</dt>
+          <dd>Required separately</dd>
+        </div>
+      </dl>
+
+      <h5>Evidence timeline</h5>
+      <ol className="guidance-list">
+        {guidance.timeline.map((entry) => (
+          <li key={entry.entryId}>
+            <strong>{humanizeCode(entry.timelineKind)}</strong>: {humanizeCode(entry.summaryCode)}
+            <br />
+            <time dateTime={entry.observedStart}>{entry.observedStart}</time>
+            {entry.observedEnd !== entry.observedStart ? (
+              <>
+                {' '}
+                to <time dateTime={entry.observedEnd}>{entry.observedEnd}</time>
+              </>
+            ) : null}
+            <EvidenceList values={entry.evidenceIds} />
+          </li>
+        ))}
+      </ol>
+
+      <h5>Ranked hypotheses</h5>
+      <ol className="guidance-list">
+        {guidance.hypotheses.map((hypothesis) => (
+          <li key={hypothesis.hypothesisId}>
+            <strong>
+              {humanizeCode(hypothesis.category)} — {hypothesis.confidence}
+            </strong>
+            <p>
+              {hypothesis.supportingEvidenceCount} supporting evidence item
+              {hypothesis.supportingEvidenceCount === 1 ? '' : 's'}.
+            </p>
+            <EvidenceList values={hypothesis.supportingEvidenceIds} />
+            <CodeList label="Contradictions" values={hypothesis.contradictionCodes} />
+            <CodeList label="Missing evidence" values={hypothesis.missingEvidenceCodes} />
+          </li>
+        ))}
+      </ol>
+
+      <GuidanceSteps heading="Confirmation checks" steps={guidance.confirmationChecks} />
+      <GuidanceSteps heading="Investigation checks" steps={guidance.investigationSteps} />
+      <GuidanceSteps heading="Safe manual options" steps={guidance.safeManualOptions} />
+      <GuidanceSteps
+        heading="Rollback considerations"
+        steps={guidance.rollbackConsiderations}
+      />
+      <GuidanceSteps heading="Recovery validation" steps={guidance.recoveryValidation} />
+      <GuidanceSteps heading="Escalation" steps={guidance.escalation} />
+      <RunbookLinks links={guidance.runbookLinks} />
+      <CodeList label="Guidance-wide missing evidence" values={guidance.missingEvidence} />
+      <CodeList label="Withheld because" values={guidance.legality.withheldReasons} />
+
+      <p className="guidance-boundary">
+        Athena never executes these steps. Manual and rollback options appear only when the signed
+        guidance legality permits them, and every execution still requires separate operator
+        authorization.
+      </p>
+    </section>
+  )
+}
+
+const GuidanceSteps = ({
+  heading,
+  steps,
+}: {
+  heading: string
+  steps: GuidanceStep[]
+}) => {
+  if (steps.length === 0) return null
+  return (
+    <section className="guidance-group" aria-label={heading}>
+      <h5>{heading}</h5>
+      <ol className="guidance-list">
+        {steps.map((step) => (
+          <li key={step.stepId}>
+            <strong>{guidanceTemplateLabel(step.templateCode)}</strong>
+            <span className="guidance-mode">
+              {step.readOnly ? 'Read-only check' : 'Operator-authorized option'}
+            </span>
+            {step.parameters.length > 0 ? (
+              <dl className="guidance-parameters">
+                {step.parameters.map((parameter) => (
+                  <div key={parameter.parameterKind}>
+                    <dt>{humanizeCode(parameter.parameterKind)}</dt>
+                    <dd>
+                      <code>{parameter.value}</code>
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+            <EvidenceList values={step.evidenceIds} />
+            {step.provenanceClauseRef ? (
+              <p>
+                Approved clause: <code>{step.provenanceClauseRef}</code>
+              </p>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    </section>
+  )
+}
+
+const RunbookLinks = ({ links }: { links: GuidanceRunbookLink[] }) => {
+  if (links.length === 0) return null
+  return (
+    <section className="guidance-group" aria-label="Approved runbook references">
+      <h5>Approved runbook references</h5>
+      <ul className="guidance-list">
+        {links.map((link) => (
+          <li key={link.linkId}>
+            {link.reference.referenceKind === 'https' ? (
+              <a href={link.reference.uri} rel="noreferrer">
+                Open approved operator runbook
+              </a>
+            ) : (
+              <>
+                Approved opaque reference: <code>{link.reference.opaqueRef}</code>
+              </>
+            )}
+            <span className="guidance-mode">Reference only · {link.reference.version}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+const EvidenceList = ({ values }: { values: string[] }) =>
+  values.length > 0 ? (
+    <p className="guidance-evidence">
+      Evidence: {values.map((value) => <code key={value}>{value}</code>)}
+    </p>
+  ) : null
+
+const CodeList = ({ label, values }: { label: string; values: string[] }) =>
+  values.length > 0 ? (
+    <p className="guidance-evidence">
+      {label}: {values.map((value) => <code key={value}>{humanizeCode(value)}</code>)}
+    </p>
+  ) : null
+
+const humanizeCode = (value: string): string =>
+  value
+    .replaceAll(/[._-]+/g, ' ')
+    .replaceAll(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/^./, (character) => character.toUpperCase())
 
 const scenarioLabel = (scenario: VerifiedIncident['state']['scenario']): string => {
   if (scenario === 'singletonDatabaseFailure') return 'database server failure'

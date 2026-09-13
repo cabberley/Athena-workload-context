@@ -98,7 +98,9 @@ lists, writes, redirects, returns credentials, or accepts arbitrary Blob paths.
 
 Set `presentationAssetContainerName` to `presentation-assets` or use its default. Build both the
 presentation image and WC-013 delivery image, resolve their ACR RepoDigests, update the reviewed
-parameters, and run:
+parameters, and run. The presentation image is supported only when all eight reviewed, non-secret
+WC-027 trust-anchor build arguments documented in
+[`apps/presentation-web/README.md`](../../apps/presentation-web/README.md) are supplied:
 
 ```powershell
 az bicep build --file infra/wc013-live-acceptance/main.bicep --stdout > $null

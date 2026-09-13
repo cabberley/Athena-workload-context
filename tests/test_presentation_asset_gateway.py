@@ -886,6 +886,9 @@ def _feed_v2_gateway_fixture():
         "feed_index_attestation": feed_index_attestation,
         "feed_private": feed_private,
         "feed_trust": feed_trust,
+        "report_trust": report_trust,
+        "enrichment_trust": enrichment_trust,
+        "guidance_trust": guidance_trust,
         "lifecycle_private": lifecycle_private,
         "lifecycle_trust": lifecycle_trust,
         "feed_entry": feed_entry,
@@ -1176,6 +1179,31 @@ def test_gateway_serves_only_fully_verified_feed_v2_assets_by_exact_version() ->
         guidance_reference.guidance_reference.content_digest,
         64 * 1024,
     ) in reader.version_requests
+
+
+@pytest.mark.parametrize(
+    ("path", "trust_name"),
+    [
+        ("/trust/wc027-feed-public-key.jwk.json", "feed_trust"),
+        ("/trust/wc027-report-public-key.jwk.json", "report_trust"),
+        ("/trust/wc027-enrichment-public-key.jwk.json", "enrichment_trust"),
+        ("/trust/wc027-guidance-public-key.jwk.json", "guidance_trust"),
+    ],
+)
+def test_gateway_exposes_only_configured_wc027_verification_keys(
+    path: str,
+    trust_name: str,
+) -> None:
+    fixture = _feed_v2_gateway_fixture()
+    trust = fixture[trust_name]
+
+    response = fixture["app"].handle(method="GET", raw_path=path)
+
+    assert response.status == 200
+    payload = json.loads(response.payload)
+    assert payload["keyId"] == trust.key_id
+    assert payload["fingerprint"] == trust.key_fingerprint
+    assert payload["jwk"]["key_ops"] == ["verify"]
 
 
 def test_invalid_v2_guidance_fails_closed_without_hiding_verified_v1_lifecycle() -> None:

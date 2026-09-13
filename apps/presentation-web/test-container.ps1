@@ -5,12 +5,59 @@ $Image = 'athena-presentation-web:container-test'
 $Port = 18080
 $Root = Split-Path -Parent $PSCommandPath
 $ContainerId = $null
+$TrustAnchors = [ordered]@{
+    VITE_WC027_FEED_KEY_ID = 'synthetic-feed-key'
+    VITE_WC027_FEED_KEY_FINGERPRINT = "sha256:$('1' * 64)"
+    VITE_WC027_REPORT_KEY_ID = 'synthetic-report-key'
+    VITE_WC027_REPORT_KEY_FINGERPRINT = "sha256:$('2' * 64)"
+    VITE_WC027_ENRICHMENT_KEY_ID = 'synthetic-enrichment-key'
+    VITE_WC027_ENRICHMENT_KEY_FINGERPRINT = "sha256:$('3' * 64)"
+    VITE_WC027_GUIDANCE_KEY_ID = 'synthetic-guidance-key'
+    VITE_WC027_GUIDANCE_KEY_FINGERPRINT = "sha256:$('4' * 64)"
+}
 
 function Invoke-Docker {
     param([Parameter(Mandatory)][string[]]$Arguments)
     & docker @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "docker $($Arguments[0]) failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Get-BuildArguments {
+    param(
+        [Parameter(Mandatory)][string]$Tag,
+        [string]$OmitAnchor
+    )
+    $BuildArguments = @('build', '--file', 'Dockerfile', '--tag', $Tag)
+    foreach ($Anchor in $TrustAnchors.GetEnumerator()) {
+        if ($Anchor.Key -ne $OmitAnchor) {
+            $BuildArguments += @('--build-arg', "$($Anchor.Key)=$($Anchor.Value)")
+        }
+    }
+    $BuildArguments += '.'
+    return $BuildArguments
+}
+
+function Assert-MissingTrustAnchorFails {
+    param([Parameter(Mandatory)][string]$Name)
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $BuildArguments = Get-BuildArguments `
+            -Tag "$Image-missing-anchor" `
+            -OmitAnchor $Name
+        $Output = (& docker @BuildArguments 2>&1 | Out-String)
+        $ExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    if ($ExitCode -eq 0) {
+        throw "container build unexpectedly accepted missing build argument $Name"
+    }
+    if (-not $Output.Contains("required build argument $Name is missing")) {
+        throw "container build did not clearly identify missing build argument $Name"
     }
 }
 
@@ -36,7 +83,10 @@ function Get-Response {
 try {
     Push-Location $Root
     try {
-        Invoke-Docker -Arguments @('build', '--file', 'Dockerfile', '--tag', $Image, '.')
+        foreach ($AnchorName in $TrustAnchors.Keys) {
+            Assert-MissingTrustAnchorFails -Name $AnchorName
+        }
+        Invoke-Docker -Arguments (Get-BuildArguments -Tag $Image)
     }
     finally {
         Pop-Location

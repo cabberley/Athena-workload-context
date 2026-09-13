@@ -8,10 +8,15 @@ import {
 } from './test/fixtures'
 import type { VerifiedLifecycle } from './verification'
 import type { VerifiedIncident, VerifiedIncidentFeed } from './incidents'
+import type {
+  IncidentGuidance,
+  VerifiedOperatorGuidanceFeed,
+} from './guidance'
 
 const incidentFixture = (
   scenario: VerifiedIncident['state']['scenario'],
   updatedAt: string,
+  lifecycle: VerifiedIncident['state']['lifecycle'] = 'active',
 ): VerifiedIncidentFeed => ({
   publishedAt: updatedAt,
   keyFingerprint:
@@ -25,7 +30,7 @@ const incidentFixture = (
     incidentId: 'inc-123456789abc',
     transitionId: `wc016-${'1'.repeat(64)}`,
     scenario,
-    lifecycle: 'active',
+    lifecycle,
     workloadRole:
       scenario === 'singletonDatabaseFailure'
         ? 'database-primary'
@@ -55,6 +60,193 @@ const incidentFixture = (
     },
   }],
 })
+
+const guidanceFixture = (
+  confidence: IncidentGuidance['legality']['confidence'] = 'Confirmed',
+  lifecycle: 'active' | 'resolved' = 'active',
+): VerifiedOperatorGuidanceFeed => {
+  const selectedRunbook = confidence === 'High' || confidence === 'Confirmed'
+  const confirmed = confidence === 'Confirmed'
+  const guidance: IncidentGuidance = {
+    schemaVersion: 'athena.wc027IncidentGuidance.v1',
+    guidanceId: `incident-guidance-${'a'.repeat(32)}`,
+    generatedAt: '2026-09-04T03:41:00Z',
+    sourceBinding: {
+      incidentSubjectId: `incident-subject-${'9'.repeat(32)}`,
+      incidentSubjectDigest:
+        'sha256:9999999999999999999999999999999999999999999999999999999999999999',
+      incidentId: 'inc-123456789abc',
+      incidentRevision: 1,
+      incidentStateDigest:
+        'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+      incidentBoundRequestId: `incident-bound-request-${'a'.repeat(32)}`,
+      incidentBoundRequestDigest:
+        'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      correlationReportId: `report-${'b'.repeat(32)}`,
+      correlationReportDigest:
+        'sha256:3333333333333333333333333333333333333333333333333333333333333333',
+      correlationRequestDigest:
+        'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      transitionDigest:
+        'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      selectionKind: selectedRunbook ? 'selectedRunbook' : 'noRunbook',
+      selectedOptionId: selectedRunbook
+        ? `guidance-option-${'c'.repeat(32)}`
+        : undefined,
+      noRunbookReason: selectedRunbook ? undefined : 'confidenceTooLow',
+    },
+    affectedRoleImpact: {
+      roleRef: 'load-balancer',
+      profileId: 'Production',
+      impactSeverity: 'critical',
+      impactCode: 'ingressUnavailable',
+    },
+    timeline: [
+      {
+        entryId: `guidance-timeline-${'d'.repeat(32)}`,
+        timelineKind: 'healthTransition',
+        observedStart: '2026-09-04T03:40:00Z',
+        observedEnd: '2026-09-04T03:40:03Z',
+        summaryCode: 'synthetic.ingress-unavailable',
+        evidenceIds: [`obs-${'e'.repeat(32)}`],
+      },
+    ],
+    hypotheses: [
+      {
+        rank: 1,
+        hypothesisId: `hyp-${'f'.repeat(32)}`,
+        category: 'networkSecurityChange',
+        confidence,
+        supportingEvidenceIds: [`obs-${'e'.repeat(32)}`],
+        supportingEvidenceCount: 1,
+        contradictionCodes: ['competingCause'],
+        missingEvidenceCodes: confidence === 'Confirmed' ? [] : ['effectiveRuleAttribution'],
+      },
+    ],
+    confirmationChecks: [
+      {
+        stepId: `guidance-step-${'1'.repeat(32)}`,
+        actionKind: 'confirmationCheck',
+        templateCode: 'confirmBackendHealth',
+        parameters: [],
+        evidenceIds: [`obs-${'e'.repeat(32)}`],
+        readOnly: true,
+        requiresAuthorization: false,
+      },
+    ],
+    investigationSteps: [
+      {
+        stepId: `guidance-step-${'2'.repeat(32)}`,
+        actionKind: 'investigationCheck',
+        templateCode: 'inspectNetworkPath',
+        parameters: [{ parameterKind: 'roleRef', value: 'load-balancer' }],
+        evidenceIds: [`obs-${'e'.repeat(32)}`],
+        readOnly: true,
+        requiresAuthorization: false,
+      },
+    ],
+    safeManualOptions: confirmed
+      ? [
+          {
+            stepId: `guidance-step-${'3'.repeat(32)}`,
+            actionKind: 'manualResolutionOption',
+            templateCode: 'reviewApprovedManualOption',
+            parameters: [],
+            evidenceIds: [],
+            provenanceClauseRef: '/profiles/Production/controls/ingress',
+            optionId: `guidance-option-${'c'.repeat(32)}`,
+            readOnly: false,
+            requiresAuthorization: true,
+          },
+        ]
+      : [],
+    rollbackConsiderations: confirmed
+      ? [
+          {
+            stepId: `guidance-step-${'4'.repeat(32)}`,
+            actionKind: 'rollbackConsideration',
+            templateCode: 'reviewRollbackAuthority',
+            parameters: [],
+            evidenceIds: [],
+            provenanceClauseRef: '/profiles/Production/controls/ingress',
+            optionId: `guidance-option-${'c'.repeat(32)}`,
+            readOnly: false,
+            requiresAuthorization: true,
+          },
+        ]
+      : [],
+    recoveryValidation: [
+      {
+        stepId: `guidance-step-${'5'.repeat(32)}`,
+        actionKind: 'recoveryValidation',
+        templateCode: 'validateRecoverySignals',
+        parameters: [],
+        evidenceIds: [`obs-${'e'.repeat(32)}`],
+        readOnly: true,
+        requiresAuthorization: false,
+      },
+    ],
+    escalation: [
+      {
+        stepId: `guidance-step-${'6'.repeat(32)}`,
+        actionKind: 'escalation',
+        templateCode: 'escalateHumanReview',
+        parameters: [],
+        evidenceIds: [],
+        readOnly: true,
+        requiresAuthorization: false,
+      },
+    ],
+    runbookLinks: selectedRunbook
+      ? [
+          {
+            linkId: `guidance-link-${'7'.repeat(32)}`,
+            optionId: `guidance-option-${'c'.repeat(32)}`,
+            reference: {
+              referenceKind: 'https',
+              uri: 'https://example.invalid/runbooks/synthetic-ingress',
+              version: '1.0.0',
+              contentDigest:
+                'sha256:4444444444444444444444444444444444444444444444444444444444444444',
+            },
+          },
+        ]
+      : [],
+    missingEvidence: confidence === 'Confirmed' ? [] : ['effectiveRuleAttribution'],
+    legality: {
+      confidence,
+      selectionKind: selectedRunbook ? 'selectedRunbook' : 'noRunbook',
+      manualActionsAuthorized: confirmed,
+      rollbackAuthorized: confirmed,
+      runbookReferenceAuthorized: selectedRunbook,
+      executionAuthorizationRequired: true,
+      withheldReasons: confirmed ? [] : ['confidenceTooLow'],
+    },
+    noAutoRemediation: true,
+    guidanceDigest:
+      'sha256:5555555555555555555555555555555555555555555555555555555555555555',
+  }
+  const verifiedGuidance = {
+    status: 'verified' as const,
+    incidentId: 'inc-123456789abc',
+    lifecycle,
+    stateResultDigest:
+      'sha256:2222222222222222222222222222222222222222222222222222222222222222' as const,
+    feedPublishedAt: '2026-09-04T03:41:01Z',
+    enrichmentId: `incident-enrichment-${'8'.repeat(32)}`,
+    incident: incidentFixture(
+      'loadBalancerFailure',
+      '2026-09-04T03:40:03Z',
+      lifecycle,
+    ).incidents[0]!,
+    guidance,
+  }
+  return {
+    publishedAt: '2026-09-04T03:41:01Z',
+    active: lifecycle === 'active' ? [verifiedGuidance] : [],
+    recentlyResolved: lifecycle === 'resolved' ? [verifiedGuidance] : [],
+  }
+}
 
 describe('standalone Athena presentation', () => {
   it('withholds all lifecycle data until the complete set verifies', async () => {
@@ -252,5 +444,145 @@ describe('standalone Athena presentation', () => {
     expect(
       screen.queryByRole('heading', { name: /verified incident: web server failure/i }),
     ).not.toBeInTheDocument()
+  })
+
+  it('renders bounded incident-specific v2 guidance only after its loader verifies', async () => {
+    const { container } = render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve(incidentFixture('loadBalancerFailure', '2026-09-04T03:40:03Z'))
+        }
+        guidanceLoader={() => Promise.resolve(guidanceFixture())}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: /incident-specific operator guidance/i }),
+    ).toBeInTheDocument()
+    expect(screen.getAllByText('load-balancer').length).toBeGreaterThan(0)
+    expect(screen.getByText(/ingress unavailable \(critical\)/i)).toBeInTheDocument()
+    expect(screen.getByText(/network security change — confirmed/i)).toBeInTheDocument()
+    expect(screen.getByText('Role Ref')).toBeInTheDocument()
+    expect(screen.getByText(/review the approved manual resolution option/i)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /open approved operator runbook/i })).toHaveAttribute(
+      'href',
+      'https://example.invalid/runbooks/synthetic-ingress',
+    )
+    expect(screen.getAllByText(/requires separate operator authorization/i).length).toBeGreaterThan(
+      0,
+    )
+    expect((await axe(container)).violations).toHaveLength(0)
+  })
+
+  it('renders independently verified recently resolved guidance when v1 active is empty', async () => {
+    const guidanceLoader = vi
+      .fn()
+      .mockResolvedValue(guidanceFixture('Confirmed', 'resolved'))
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve({
+            incidents: [],
+            publishedAt: '2026-09-04T03:40:03Z',
+            keyFingerprint:
+              'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964',
+            sourceIndexDigest:
+              'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+          })
+        }
+        guidanceLoader={guidanceLoader}
+      />,
+    )
+
+    await waitFor(() => expect(guidanceLoader).toHaveBeenCalled())
+    expect(
+      await screen.findByRole('heading', {
+        name: /1 verified recently resolved incident/i,
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', {
+        name: /resolved incident: azure load balancer failure/i,
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', {
+        name: /incident-specific operator guidance/i,
+      }),
+    ).toBeInTheDocument()
+  })
+
+  it('retains independently verified v1 incident data when v2 guidance fails closed', async () => {
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve(incidentFixture('webServerFailure', '2026-09-04T03:40:03Z'))
+        }
+        guidanceLoader={() => Promise.reject(new Error('untrusted enrichment detail'))}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: /verified incident: web server failure/i }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { name: /operator guidance unavailable/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/no unverified guidance was rendered/i)).toBeInTheDocument()
+    expect(screen.queryByText(/untrusted enrichment detail/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: /incident-specific operator guidance/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('keeps lower-confidence guidance read-only and withholds runbook actions', async () => {
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve(incidentFixture('loadBalancerFailure', '2026-09-04T03:40:03Z'))
+        }
+        guidanceLoader={() => Promise.resolve(guidanceFixture('Medium'))}
+      />,
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: /incident-specific operator guidance/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/network security change — medium/i)).toBeInTheDocument()
+    expect(screen.getAllByText('Read-only check').length).toBeGreaterThan(0)
+    expect(
+      screen.queryByRole('heading', { name: /safe manual options/i }),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /approved operator runbook/i })).not.toBeInTheDocument()
+  })
+
+  it('does not replace newer verified guidance with an older v2 poll response', async () => {
+    const newer = guidanceFixture('Confirmed')
+    const older = {
+      ...guidanceFixture('Medium'),
+      publishedAt: '2026-09-04T03:40:59Z',
+    }
+    const guidanceLoader = vi
+      .fn()
+      .mockResolvedValueOnce(newer)
+      .mockResolvedValue(older)
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve(incidentFixture('loadBalancerFailure', '2026-09-04T03:40:03Z'))
+        }
+        guidanceLoader={guidanceLoader}
+        incidentPollMs={100}
+      />,
+    )
+
+    expect(await screen.findByText(/network security change — confirmed/i)).toBeInTheDocument()
+    await waitFor(() => expect(guidanceLoader).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText(/network security change — medium/i)).not.toBeInTheDocument()
   })
 })

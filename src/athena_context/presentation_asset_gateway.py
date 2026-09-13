@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -211,6 +212,9 @@ class PresentationAssetGatewayApplication:
         if path == "/healthz":
             return GatewayResponse(status=200, payload=_HEALTHY)
         try:
+            trust_asset = self._wc027_public_key_asset(path)
+            if trust_asset is not None:
+                return GatewayResponse(status=200, payload=trust_asset)
             if path.startswith("/incidents/"):
                 index, index_bytes = self._load_active_incident_index()
                 if path == "/incidents/active.json":
@@ -338,6 +342,10 @@ class PresentationAssetGatewayApplication:
             "/healthz",
             "/runtime-manifest.json",
             "/incidents/active.json",
+            "/trust/wc027-feed-public-key.jwk.json",
+            "/trust/wc027-report-public-key.jwk.json",
+            "/trust/wc027-enrichment-public-key.jwk.json",
+            "/trust/wc027-guidance-public-key.jwk.json",
         }:
             return parsed.path
         if parsed.path.startswith("/incidents/"):
@@ -349,6 +357,48 @@ class PresentationAssetGatewayApplication:
         if any(segment in {"", ".", ".."} for segment in parsed.path[1:].split("/")):
             return None
         return parsed.path
+
+    def _wc027_public_key_asset(self, path: str) -> bytes | None:
+        anchors = {
+            "/trust/wc027-feed-public-key.jwk.json": self._incident_feed_v2_trust,
+            "/trust/wc027-report-public-key.jwk.json": (
+                self._incident_report_trust
+            ),
+            "/trust/wc027-enrichment-public-key.jwk.json": (
+                self._incident_enrichment_trust
+            ),
+            "/trust/wc027-guidance-public-key.jwk.json": (
+                self._incident_guidance_trust
+            ),
+        }
+        anchor = anchors.get(path)
+        if anchor is None:
+            return None
+        numbers = anchor.public_key.public_numbers()
+
+        def encode(value: int) -> str:
+            size = (value.bit_length() + 7) // 8
+            return base64.urlsafe_b64encode(
+                value.to_bytes(size, "big")
+            ).decode("ascii").rstrip("=")
+
+        payload = {
+            "schemaVersion": "athena.presentationWeb.publicKey.v1",
+            "keyId": anchor.key_id,
+            "fingerprint": anchor.key_fingerprint,
+            "jwk": {
+                "kty": "RSA",
+                "n": encode(numbers.n),
+                "e": encode(numbers.e),
+                "alg": "RS256",
+                "key_ops": ["verify"],
+                "ext": True,
+            },
+        }
+        return (
+            json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
 
     def _load_manifest(
         self,
