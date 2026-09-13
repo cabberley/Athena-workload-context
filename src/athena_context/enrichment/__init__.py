@@ -15,6 +15,7 @@ from athena_context.enrichment.feed_index_publication import (
     IncidentFeedIndexPublisherPort,
     IncidentFeedIndexSnapshot,
     VerifiedActiveIncidentIndexReaderPort,
+    VerifiedCurrentIncidentStateReaderPort,
 )
 from athena_context.enrichment.feed_registry import (
     FEED_V2_RESOLVED_RETENTION,
@@ -28,6 +29,7 @@ from athena_context.enrichment.feed_registry import (
     IncidentFeedRegistryRecord,
     build_incident_feed_registry_record,
     project_incident_feed_registry,
+    validate_incident_feed_registry_record_authority,
 )
 from athena_context.enrichment.feed_registry_azure import (
     AzureTableIncidentFeedRegistry,
@@ -66,6 +68,8 @@ __all__ = [
     "IncidentEnrichmentPublicationService",
     "IncidentPublicationReaderPort",
     "VerifiedActiveIncidentIndexReaderPort",
+    "VerifiedCurrentIncidentStateReaderPort",
     "build_incident_feed_registry_record",
     "project_incident_feed_registry",
+    "validate_incident_feed_registry_record_authority",
 ]

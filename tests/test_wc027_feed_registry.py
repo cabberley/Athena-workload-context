@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -12,8 +13,16 @@ from athena_context.contracts import (
     IncidentEnrichmentAssetReference,
     IncidentEnrichmentFeedPointer,
     IncidentEnrichmentFeedPointerAttestation,
+    IncidentFeedAttestation,
     IncidentFeedEntryV2,
+    IncidentFeedPointer,
+    IncidentFinding,
+    IncidentState,
+    IncidentStateAttestation,
     VersionPinnedBlobReference,
+    build_incident_enrichment_feed_pointer,
+    build_incident_occurrence_receipt,
+    canonicalize_json,
     compute_artifact_digest,
     sha256_hex,
 )
@@ -28,12 +37,16 @@ from athena_context.enrichment import (
     feed_registry_azure,
     project_incident_feed_registry,
 )
+from athena_context.presentation_assets import CurrentIncidentStateSnapshot
 from test_wc026_correlation_contract import NOW
 from test_wc027_incident_enrichment_contract import _json_value
 
 _VERSION = "v" * 64
 _SIGNATURE = "c3ludGhldGlj"
 _KEY_ID = "https://synthetic-wc027.vault.azure.net/keys/feed-v2/0123456789abcdef0123456789abcdef"
+_INCIDENT_KEY_ID = (
+    "https://synthetic-wc027.vault.azure.net/keys/incident/0123456789abcdef0123456789abcdef"
+)
 _KEY_FINGERPRINT = "sha256:" + "4" * 64
 
 
@@ -46,10 +59,103 @@ def _pointer_bundle(
     IncidentFeedEntryV2,
     IncidentEnrichmentFeedPointer,
     IncidentEnrichmentFeedPointerAttestation,
+    CurrentIncidentStateSnapshot,
 ]:
     incident_id = f"inc-{index:012x}"
-    state_digest = "sha256:" + f"{index + 1:064x}"
+    detected_at = updated_at - timedelta(minutes=1)
+    finding = IncidentFinding(
+        clauseId="synthetic.wc027.registry",
+        verdict="fail" if lifecycle == "active" else "resolved",
+        summary="Synthetic registry lifecycle evidence.",
+        evidenceRefs=("synthetic-registry-evidence",),
+    )
+    unsigned_state: dict[str, object] = {
+        "schemaVersion": "athena.incidentState.v1",
+        "incidentId": incident_id,
+        "transitionId": (
+            "wc016-"
+            + sha256_hex(f"{index}:{updated_at.isoformat()}:{lifecycle}".encode()).removeprefix(
+                "sha256:"
+            )
+        ),
+        "scenario": "webServerFailure",
+        "lifecycle": lifecycle,
+        "workloadRole": "web",
+        "detectedAt": detected_at,
+        "updatedAt": updated_at,
+        "targetBinding": "sha256:" + "9" * 64,
+        "availability": "warning" if lifecycle == "active" else "normal",
+        "blastRadius": "web-tier" if lifecycle == "active" else "none",
+        "operatorAttention": "required" if lifecycle == "active" else "normal",
+        "findings": [finding.model_dump(mode="json", by_alias=True, exclude_none=True)],
+        "reasoning": ["Synthetic registry lifecycle assessment."],
+        "notificationStatus": "pendingDispatch",
+        "noAutoRemediation": True,
+    }
+    state_digest = sha256_hex(canonicalize_json(unsigned_state).encode())
+    state = IncidentState(
+        **{
+            **unsigned_state,
+            "findings": (finding,),
+            "reasoning": ("Synthetic registry lifecycle assessment.",),
+        },
+        resultDigest=state_digest,
+    )
+    state_attestation = IncidentStateAttestation(
+        schemaVersion="athena.incidentStateAttestation.v1",
+        resultDigest=state_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=_INCIDENT_KEY_ID,
+        detachedSignature=_SIGNATURE,
+    )
     state_prefix = f"incidents/{incident_id}/versions/{state_digest.removeprefix('sha256:')}"
+    state_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/state.json",
+        version=_VERSION,
+        contentDigest=sha256_hex(state.canonical_bytes()),
+    )
+    state_attestation_reference = VersionPinnedBlobReference(
+        name=f"{state_prefix}/attestation.json",
+        version=_VERSION,
+        contentDigest=sha256_hex(state_attestation.canonical_bytes()),
+    )
+    source_pointer = IncidentFeedPointer(
+        schemaVersion="athena.incidentFeed.v1",
+        incidentId=incident_id,
+        statePath=f"./{state_reference.name}",
+        stateSha256=state_reference.content_digest,
+        attestationPath=f"./{state_attestation_reference.name}",
+        attestationSha256=state_attestation_reference.content_digest,
+        pointerAttestationPath=f"./{state_prefix}/pointer-attestation.json",
+        keyId=_INCIDENT_KEY_ID,
+        keyFingerprint=_KEY_FINGERPRINT,
+        publishedAt=max(updated_at, NOW),
+    )
+    source_pointer_attestation = IncidentFeedAttestation(
+        schemaVersion="athena.incidentFeedAttestation.v1",
+        pointerDigest=sha256_hex(source_pointer.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=_INCIDENT_KEY_ID,
+        detachedSignature=_SIGNATURE,
+    )
+    occurrence = build_incident_occurrence_receipt(
+        state,
+        state_attestation,
+        source_pointer,
+        source_pointer_attestation,
+        state_reference=state_reference,
+        state_attestation_reference=state_attestation_reference,
+        pointer_reference=VersionPinnedBlobReference(
+            name=f"{state_prefix}/pointer.json",
+            version=_VERSION,
+            contentDigest=sha256_hex(source_pointer.canonical_bytes()),
+        ),
+        pointer_attestation_reference=VersionPinnedBlobReference(
+            name=f"{state_prefix}/pointer-attestation.json",
+            version=_VERSION,
+            contentDigest=sha256_hex(source_pointer_attestation.canonical_bytes()),
+        ),
+    )
     enrichment_id = "incident-enrichment-" + f"{index + 1:032x}"
     enrichment_prefix = f"{state_prefix}/enrichments/{enrichment_id}"
     enrichment_payload: dict[str, object] = {
@@ -75,44 +181,11 @@ def _pointer_bundle(
         referenceId=(f"enrichment-asset-{enrichment_digest.removeprefix('sha256:')[:32]}"),
         referenceDigest=enrichment_digest,
     )
-    pointer_payload: dict[str, object] = {
-        "schemaVersion": ("athena.wc027IncidentEnrichmentFeedPointer.v2"),
-        "incidentId": incident_id,
-        "lifecycle": lifecycle,
-        "stateResultDigest": state_digest,
-        "stateUpdatedAt": updated_at,
-        "occurrenceDigest": "sha256:" + f"{index + 5:064x}",
-        "sourceStateReference": VersionPinnedBlobReference(
-            name=f"{state_prefix}/state.json",
-            version=_VERSION,
-            contentDigest="sha256:" + f"{index + 6:064x}",
-        ),
-        "sourceStateAttestationReference": VersionPinnedBlobReference(
-            name=f"{state_prefix}/attestation.json",
-            version=_VERSION,
-            contentDigest="sha256:" + f"{index + 7:064x}",
-        ),
-        "sourcePointerReference": VersionPinnedBlobReference(
-            name=f"{state_prefix}/pointer.json",
-            version=_VERSION,
-            contentDigest="sha256:" + f"{index + 8:064x}",
-        ),
-        "sourcePointerAttestationReference": (
-            VersionPinnedBlobReference(
-                name=f"{state_prefix}/pointer-attestation.json",
-                version=_VERSION,
-                contentDigest="sha256:" + f"{index + 9:064x}",
-            )
-        ),
-        "enrichmentAsset": enrichment,
-        "publishedAt": max(updated_at, NOW),
-        "noAutoRemediation": True,
-    }
-    pointer_digest = compute_artifact_digest(_json_value(pointer_payload))
-    pointer = IncidentEnrichmentFeedPointer(
-        **pointer_payload,
-        pointerId=("incident-feed-v2-pointer-" + pointer_digest.removeprefix("sha256:")[:32]),
-        pointerDigest=pointer_digest,
+    pointer = build_incident_enrichment_feed_pointer(
+        occurrence,
+        enrichment,
+        state,
+        published_at=max(updated_at, NOW),
     )
     pointer_attestation = IncidentEnrichmentFeedPointerAttestation(
         schemaVersion=("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
@@ -139,7 +212,13 @@ def _pointer_bundle(
             contentDigest=sha256_hex(pointer_attestation.canonical_bytes()),
         ),
     )
-    return entry, pointer, pointer_attestation
+    authority = CurrentIncidentStateSnapshot(
+        state=state,
+        pointer=source_pointer,
+        pointer_sha256=sha256_hex(source_pointer.canonical_bytes()),
+        occurrence=occurrence,
+    )
+    return entry, pointer, pointer_attestation, authority
 
 
 def _record(
@@ -148,7 +227,7 @@ def _record(
     lifecycle: str,
     updated_at=NOW,
 ) -> IncidentFeedRegistryRecord:
-    entry, pointer, attestation = _pointer_bundle(
+    entry, pointer, attestation, _authority = _pointer_bundle(
         index,
         lifecycle=lifecycle,
         updated_at=updated_at,
@@ -158,6 +237,19 @@ def _record(
         pointer,
         attestation,
     )
+
+
+def _authority(
+    index: int,
+    *,
+    lifecycle: str,
+    updated_at=NOW,
+) -> CurrentIncidentStateSnapshot:
+    return _pointer_bundle(
+        index,
+        lifecycle=lifecycle,
+        updated_at=updated_at,
+    )[3]
 
 
 def _active_index(
@@ -233,6 +325,7 @@ def test_projection_requires_every_v1_active_incident() -> None:
         project_incident_feed_registry(
             (),
             source_active_index=_active_index((active.entry,)),
+            source_current_incidents={},
             as_of=NOW,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -247,6 +340,7 @@ def test_registry_rejects_non_millisecond_as_of() -> None:
         project_incident_feed_registry(
             (active,),
             source_active_index=_active_index((active.entry,)),
+            source_current_incidents={active.entry.incident_id: _authority(1, lifecycle="active")},
             as_of=non_canonical_as_of,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -271,6 +365,7 @@ def test_projection_rejects_stale_or_orphaned_active_records() -> None:
         project_incident_feed_registry(
             (stale,),
             source_active_index=_active_index((active.entry,)),
+            source_current_incidents={active.entry.incident_id: _authority(1, lifecycle="active")},
             as_of=NOW,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -283,6 +378,7 @@ def test_projection_rejects_stale_or_orphaned_active_records() -> None:
         project_incident_feed_registry(
             (active,),
             source_active_index=_active_index(()),
+            source_current_incidents={active.entry.incident_id: _authority(1, lifecycle="active")},
             as_of=NOW,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -295,9 +391,7 @@ def test_projection_rejects_active_pointer_digest_not_authorized_by_v1() -> None
     mismatched_source = source.model_copy(
         update={
             "incidents": (
-                source.incidents[0].model_copy(
-                    update={"pointer_sha256": "sha256:" + "f" * 64}
-                ),
+                source.incidents[0].model_copy(update={"pointer_sha256": "sha256:" + "f" * 64}),
             )
         }
     )
@@ -309,6 +403,7 @@ def test_projection_rejects_active_pointer_digest_not_authorized_by_v1() -> None
         project_incident_feed_registry(
             (active,),
             source_active_index=mismatched_source,
+            source_current_incidents={active.entry.incident_id: _authority(1, lifecycle="active")},
             as_of=NOW,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -316,7 +411,7 @@ def test_projection_rejects_active_pointer_digest_not_authorized_by_v1() -> None
 
 
 def test_projection_rejects_unsigned_resolved_registry_record() -> None:
-    entry, pointer, attestation = _pointer_bundle(
+    entry, pointer, attestation, authority = _pointer_bundle(
         2,
         lifecycle="resolved",
     )
@@ -340,6 +435,114 @@ def test_projection_rejects_unsigned_resolved_registry_record() -> None:
         project_incident_feed_registry(
             (tampered,),
             source_active_index=_active_index(()),
+            source_current_incidents={entry.incident_id: authority},
+            as_of=NOW,
+            trusted_feed_key_id=_KEY_ID,
+            feed_signature_verifier=_verify,
+        )
+
+
+def test_projection_rejects_replayed_older_resolved_occurrence() -> None:
+    replayed = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=2),
+    )
+    latest = _authority(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=1),
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="authoritative current occurrence",
+    ):
+        project_incident_feed_registry(
+            (replayed,),
+            source_active_index=_active_index(()),
+            source_current_incidents={replayed.entry.incident_id: latest},
+            as_of=NOW,
+            trusted_feed_key_id=_KEY_ID,
+            feed_signature_verifier=_verify,
+        )
+
+
+def test_projection_rejects_expired_replay_instead_of_silently_omitting_it() -> None:
+    replayed = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(days=8),
+    )
+    latest = _authority(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(days=1),
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="authoritative current occurrence",
+    ):
+        project_incident_feed_registry(
+            (replayed,),
+            source_active_index=_active_index(()),
+            source_current_incidents={replayed.entry.incident_id: latest},
+            as_of=NOW,
+            trusted_feed_key_id=_KEY_ID,
+            feed_signature_verifier=_verify,
+        )
+
+
+def test_projection_fails_closed_without_current_occurrence_authority() -> None:
+    resolved = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=1),
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryIncompleteError,
+        match="authoritative current occurrence",
+    ):
+        project_incident_feed_registry(
+            (resolved,),
+            source_active_index=_active_index(()),
+            source_current_incidents={},
+            as_of=NOW,
+            trusted_feed_key_id=_KEY_ID,
+            feed_signature_verifier=_verify,
+        )
+
+
+def test_projection_fails_closed_on_corrupt_current_occurrence_authority() -> None:
+    resolved = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=1),
+    )
+    authority = _authority(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=1),
+    )
+    occurrence = authority.occurrence
+    assert occurrence is not None
+    corrupt = CurrentIncidentStateSnapshot(
+        state=authority.state,
+        pointer=authority.pointer,
+        pointer_sha256=authority.pointer_sha256,
+        occurrence=occurrence.model_copy(update={"occurrence_digest": "sha256:" + "f" * 64}),
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryIncompleteError,
+        match="authority is invalid",
+    ):
+        project_incident_feed_registry(
+            (resolved,),
+            source_active_index=_active_index(()),
+            source_current_incidents={resolved.entry.incident_id: corrupt},
             as_of=NOW,
             trusted_feed_key_id=_KEY_ID,
             feed_signature_verifier=_verify,
@@ -369,6 +572,22 @@ def test_projection_keeps_exact_bounded_resolved_history() -> None:
             expired,
         ),
         source_active_index=_active_index((active.entry,)),
+        source_current_incidents={
+            active.entry.incident_id: _authority(1, lifecycle="active"),
+            **{
+                record.entry.incident_id: _authority(
+                    int(record.entry.incident_id.removeprefix("inc-"), 16),
+                    lifecycle="resolved",
+                    updated_at=record.entry.updated_at,
+                )
+                for record in resolved
+            },
+            expired.entry.incident_id: _authority(
+                100,
+                lifecycle="resolved",
+                updated_at=expired.entry.updated_at,
+            ),
+        },
         as_of=NOW,
         trusted_feed_key_id=_KEY_ID,
         feed_signature_verifier=_verify,
@@ -477,22 +696,14 @@ class _Table:
                 candidate[row_key] = _Entity(dict(entity), etag=self._etag())
             elif action == "update":
                 current = candidate.get(row_key)
-                if (
-                    current is None
-                    or not options
-                    or current.metadata["etag"] != options[0]["etag"]
-                ):
+                if current is None or not options or current.metadata["etag"] != options[0]["etag"]:
                     from azure.core.exceptions import ResourceModifiedError
 
                     raise ResourceModifiedError("synthetic stale update")
                 candidate[row_key] = _Entity(dict(entity), etag=self._etag())
             elif action == "delete":
                 current = candidate.get(row_key)
-                if (
-                    current is None
-                    or not options
-                    or current.metadata["etag"] != options[0]["etag"]
-                ):
+                if current is None or not options or current.metadata["etag"] != options[0]["etag"]:
                     from azure.core.exceptions import ResourceModifiedError
 
                     raise ResourceModifiedError("synthetic stale delete")
@@ -558,6 +769,29 @@ def test_azure_registry_prunes_expired_rows() -> None:
         registry._entity(expired),
         etag="expired-etag",
     )
+
+    records = registry.list_records(as_of=NOW)
+    assert records == (expired,)
+    with pytest.raises(TypeError, match="verified"):
+        registry.prune_expired(records)  # type: ignore[arg-type]
+    assert registry.list_records(as_of=NOW) == (expired,)
+    projection = project_incident_feed_registry(
+        records,
+        source_active_index=_active_index(()),
+        source_current_incidents={
+            expired.entry.incident_id: _authority(
+                2,
+                lifecycle="resolved",
+                updated_at=expired.entry.updated_at,
+            )
+        },
+        as_of=NOW,
+        trusted_feed_key_id=_KEY_ID,
+        feed_signature_verifier=_verify,
+    )
+    with pytest.raises(TypeError, match="dataclass"):
+        replace(projection.prune_plan, records=())
+    registry.prune_expired(projection.prune_plan)
 
     assert registry.list_records(as_of=NOW) == ()
     assert table.delete_count == 1

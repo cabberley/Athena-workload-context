@@ -27,7 +27,9 @@ from athena_context.enrichment.feed_registry import (
     IncidentFeedRegistryCapacityError,
     IncidentFeedRegistryConflictError,
     IncidentFeedRegistryError,
+    IncidentFeedRegistryPrunePlan,
     IncidentFeedRegistryRecord,
+    _validated_prune_plan,
 )
 
 _TABLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]{2,62}$")
@@ -37,8 +39,7 @@ _CAPACITY_SCHEMA_VERSION = "athena.incidentFeedRegistryCapacity.v1"
 _MAX_TRANSACTION_OPERATIONS = 100
 _MAX_EXPIRY_DELETES = _MAX_TRANSACTION_OPERATIONS - 1
 _MAX_CLEANUP_PASSES = (
-    (MAX_FEED_V2_REGISTRY_RECORDS + _MAX_EXPIRY_DELETES - 1)
-    // _MAX_EXPIRY_DELETES
+    (MAX_FEED_V2_REGISTRY_RECORDS + _MAX_EXPIRY_DELETES - 1) // _MAX_EXPIRY_DELETES
 ) + 2
 
 
@@ -94,7 +95,7 @@ class AzureTableIncidentFeedRegistry:
         record = IncidentFeedRegistryRecord.model_validate_json(
             record.model_dump_json(by_alias=True)
         )
-        snapshot = self._load_snapshot(as_of=datetime.now(UTC))
+        snapshot = self._read_snapshot()
         current = next(
             (
                 entity
@@ -173,7 +174,7 @@ class AzureTableIncidentFeedRegistry:
             or as_of.microsecond % 1000
         ):
             raise ValueError("as_of must be a UTC timestamp with millisecond precision")
-        snapshot = self._load_snapshot(as_of=as_of)
+        snapshot = self._read_snapshot()
         return tuple(
             sorted(
                 (record for _entity, record in snapshot.records),
@@ -181,27 +182,58 @@ class AzureTableIncidentFeedRegistry:
             )
         )
 
-    def _load_snapshot(
+    def prune_expired(
         self,
-        *,
-        as_of: UtcDateTime,
-    ) -> _RegistrySnapshot:
+        plan: IncidentFeedRegistryPrunePlan,
+    ) -> None:
+        records, as_of = _validated_prune_plan(plan)
+        if len(records) > MAX_FEED_V2_REGISTRY_RECORDS:
+            raise IncidentFeedRegistryCapacityError(
+                "feed registry cleanup exceeds its safe record bound"
+            )
+        parsed = tuple(
+            IncidentFeedRegistryRecord.model_validate_json(record.model_dump_json(by_alias=True))
+            for record in records
+        )
+        pending = {
+            record.entry.incident_id: record
+            for record in parsed
+            if record.retained_until is not None and record.retained_until <= as_of
+        }
+        if len(pending) != sum(
+            record.retained_until is not None and record.retained_until <= as_of
+            for record in parsed
+        ):
+            raise IncidentFeedRegistryError(
+                "feed registry cleanup received duplicate incident records"
+            )
         for _ in range(_MAX_CLEANUP_PASSES):
             snapshot = self._read_snapshot()
+            current = {
+                record.entry.incident_id: (entity, record) for entity, record in snapshot.records
+            }
+            for incident_id, expected in tuple(pending.items()):
+                actual = current.get(incident_id)
+                if actual is None:
+                    del pending[incident_id]
+                elif actual[1] != expected:
+                    raise IncidentFeedRegistryConflictError(
+                        "feed registry changed after expiry authority validation"
+                    )
+            if not pending:
+                return
             expired = tuple(
-                (entity, record)
-                for entity, record in snapshot.records
-                if (record.retained_until is not None and record.retained_until <= as_of)
+                current[incident_id] for incident_id in sorted(pending)[:_MAX_EXPIRY_DELETES]
             )
-            if not expired:
-                return snapshot
             try:
                 self._delete_expired_batch(
                     snapshot,
-                    expired[:_MAX_EXPIRY_DELETES],
+                    expired,
                 )
             except IncidentFeedRegistryConflictError:
                 continue
+            for _entity, record in expired:
+                del pending[record.entry.incident_id]
         raise IncidentFeedRegistryCapacityError(
             "feed registry expiry cleanup exceeded its safe pass bound"
         )
@@ -226,14 +258,10 @@ class AzureTableIncidentFeedRegistry:
                 raise IncidentFeedRegistryCapacityError(
                     "feed registry exceeds its safe retained record bound"
                 )
-            parsed = tuple(
-                (entity, self._parse_entity(entity)) for entity in record_entities
-            )
+            parsed = tuple((entity, self._parse_entity(entity)) for entity in record_entities)
             incident_ids = tuple(record.entry.incident_id for _entity, record in parsed)
             if len(incident_ids) != len(set(incident_ids)):
-                raise IncidentFeedRegistryError(
-                    "feed registry returned duplicate incident records"
-                )
+                raise IncidentFeedRegistryError("feed registry returned duplicate incident records")
             retained_count = self._parse_capacity_entity(capacity_entities[0])
             if retained_count != len(parsed):
                 raise IncidentFeedRegistryError(
@@ -278,9 +306,7 @@ class AzureTableIncidentFeedRegistry:
         except HttpResponseError as exc:
             if exc.status_code == 409:
                 return
-            raise IncidentFeedRegistryError(
-                "feed registry capacity initialization failed"
-            ) from exc
+            raise IncidentFeedRegistryError("feed registry capacity initialization failed") from exc
 
     def _delete_expired_batch(
         self,
@@ -343,9 +369,7 @@ class AzureTableIncidentFeedRegistry:
                 raise IncidentFeedRegistryConflictError(
                     "feed registry expiry changed during cleanup"
                 ) from exc
-            raise IncidentFeedRegistryError(
-                "feed registry expiry cleanup failed"
-            ) from exc
+            raise IncidentFeedRegistryError("feed registry expiry cleanup failed") from exc
 
     def _capacity_entity(
         self,
@@ -374,9 +398,7 @@ class AzureTableIncidentFeedRegistry:
             or type(retained_count) is not int
             or not 0 <= retained_count <= MAX_FEED_V2_REGISTRY_RECORDS
         ):
-            raise IncidentFeedRegistryError(
-                "feed registry returned invalid capacity metadata"
-            )
+            raise IncidentFeedRegistryError("feed registry returned invalid capacity metadata")
         self._entity_etag(
             entity,
             context="feed registry capacity entity",
