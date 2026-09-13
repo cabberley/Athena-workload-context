@@ -91,8 +91,8 @@ def _verifier(public_key: rsa.RSAPublicKey):
     return verify
 
 
-def _service():
-    fixture = _feed_v2_gateway_fixture()
+def _service(*, lifecycle_key_id: str | None = None):
+    fixture = _feed_v2_gateway_fixture(lifecycle_key_id=lifecycle_key_id)
     outbox = _Outbox()
     notification_private = rsa.generate_private_key(
         public_exponent=65537,
@@ -214,6 +214,23 @@ def test_notification_v2_binds_verified_assets_and_incident_deep_link() -> None:
     assert "Leading hypothesis:" in notification.message
     assert "Athena did not perform remediation." in notification.message
     assert len(notification.message) < 512
+
+
+def test_notification_v2_trusts_existing_wc016_lifecycle_logical_key_id() -> None:
+    lifecycle_key_id = (
+        "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
+    )
+    fixture, service, outbox = _service(lifecycle_key_id=lifecycle_key_id)
+
+    envelope = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=fixture["feed_index"].published_at,
+    )
+
+    assert fixture["lifecycle_trust"].key_id == lifecycle_key_id
+    assert service.trust.lifecycle_key_id == lifecycle_key_id
+    assert envelope.notification.incident_id == fixture["state"].incident_id
+    assert outbox.envelopes == [envelope]
 
 
 @pytest.mark.parametrize(

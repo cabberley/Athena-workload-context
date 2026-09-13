@@ -40,11 +40,28 @@ from athena_context.enrichment.feed_registry import (
 from athena_context.enrichment.feed_registry_azure import (
     AzureTableIncidentFeedRegistry,
 )
+from athena_context.enrichment.production import (
+    Wc027EnrichmentFeedProductionConfiguration,
+    build_wc027_enrichment_feed_runtime,
+    load_wc027_enrichment_feed_configuration,
+    run_wc027_enrichment_feed_worker,
+    submit_wc027_enrichment_feed_trigger,
+)
 from athena_context.enrichment.publication import (
     IncidentEnrichmentArtifactWriterPort,
     IncidentEnrichmentPublicationReceipt,
     IncidentEnrichmentPublicationService,
     IncidentPublicationReaderPort,
+)
+from athena_context.enrichment.runtime import (
+    MAX_WC027_ENRICHMENT_TRIGGER_BYTES,
+    WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
+    Wc027EnrichmentFeedRuntime,
+    Wc027EnrichmentFeedRuntimeReceipt,
+    Wc027EnrichmentSourceNotReadyError,
+    parse_wc027_enrichment_trigger,
+    utc_now_millisecond,
+    validate_wc027_enrichment_broker_metadata,
 )
 
 __all__ = [
@@ -76,6 +93,19 @@ __all__ = [
     "IncidentEnrichmentArtifactWriterPort",
     "IncidentEnrichmentPublicationReceipt",
     "IncidentEnrichmentPublicationService",
+    "MAX_WC027_ENRICHMENT_TRIGGER_BYTES",
+    "WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION",
+    "Wc027EnrichmentFeedRuntime",
+    "Wc027EnrichmentFeedRuntimeReceipt",
+    "Wc027EnrichmentFeedProductionConfiguration",
+    "Wc027EnrichmentSourceNotReadyError",
+    "build_wc027_enrichment_feed_runtime",
+    "load_wc027_enrichment_feed_configuration",
+    "parse_wc027_enrichment_trigger",
+    "run_wc027_enrichment_feed_worker",
+    "submit_wc027_enrichment_feed_trigger",
+    "utc_now_millisecond",
+    "validate_wc027_enrichment_broker_metadata",
     "IncidentPublicationReaderPort",
     "VerifiedActiveIncidentIndexReaderPort",
     "VerifiedCurrentIncidentStateReaderPort",
