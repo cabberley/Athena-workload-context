@@ -786,7 +786,11 @@ class _CommitPort:
             contentDigest=bundle_digest,
         )
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
+            "schemaVersion": (
+                "athena.wc028MonitoringEvidenceHandoff.v2"
+                if bundle.acquisition_receipt is not None
+                else "athena.wc024MonitoringEvidenceHandoff.v1"
+            ),
             "collectorContractDigest": DIGEST_C,
             "collectionId": collection_id,
             "observedAt": NOW,
@@ -796,6 +800,10 @@ class _CommitPort:
                 exclude_none=True,
             ),
         }
+        if bundle.acquisition_receipt is not None:
+            payload["acquisitionReceiptDigest"] = (
+                bundle.acquisition_receipt.receipt_digest
+            )
         handoff = MonitoringEvidenceHandoff(
             **payload,
             collectorAttestation=MonitoringEvidenceAttestation(

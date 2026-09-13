@@ -502,6 +502,7 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
 
 @description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
 output monitoringCollectorContract object = collectorContract.outputs.collectorContract
+output monitoringAcquisitionCollectorContract object = collectorContract.outputs.acquisitionCollectorContract
 
 @description('Monitoring-owned replacement storage. It is separate from the retained legacy flow-log destination.')
 output replacementMonitoringStorageAccountResourceId string = monitoringStorage.outputs.storageAccountResourceId

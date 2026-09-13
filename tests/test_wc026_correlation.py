@@ -118,6 +118,10 @@ class _MonitoringVerifier:
         self._calls.append(f"monitoring:{as_of.isoformat()}")
         return handoff.compute_artifact_digest_value()
 
+    def verify_acquisition_receipt(self, receipt, *, as_of):
+        self._calls.append(f"acquisition:{as_of.isoformat()}")
+        return receipt.receipt_digest
+
 
 class _ChangeVerifier:
     def __init__(self, calls: list[str]) -> None:

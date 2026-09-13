@@ -46,8 +46,10 @@ from athena_context.contracts.models import (
     UtcDateTime,
 )
 from athena_context.contracts.monitoring import (
+    MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
     MonitoringEvidenceHandoff,
+    verify_monitoring_acquisition_receipt_attestation,
     verify_monitoring_evidence_handoff_attestation,
 )
 from athena_context.contracts.monitoring_intent import (
@@ -86,6 +88,13 @@ class MonitoringHandoffVerifier(Protocol):
     def verify(
         self,
         handoff: MonitoringEvidenceHandoff,
+        *,
+        as_of: UtcDateTime,
+    ) -> str: ...
+
+    def verify_acquisition_receipt(
+        self,
+        receipt: MonitoringAcquisitionReceipt,
         *,
         as_of: UtcDateTime,
     ) -> str: ...
@@ -150,11 +159,32 @@ class TrustedMonitoringHandoffVerifier:
     reviewed_contract: MonitoringCollectorContract
     trusted_key_anchor: TrustedKeyAnchor
     key_resolver: KeyVaultTrustedKeyResolver
+    expected_acquisition_authority_digest: str | None = None
+    expected_authenticated_principal_id: str | None = None
+    expected_athena_context_identity_id: str | None = None
+    expected_deployment_identity_contract_digest: str | None = None
+    expected_receipt_signing_key_id: str | None = None
+    acquisition_receipt_maximum_age_seconds: int = 900
+    receipt_trusted_key_anchor: TrustedKeyAnchor | None = None
+    receipt_key_resolver: KeyVaultTrustedKeyResolver | None = None
 
     def __post_init__(self) -> None:
         if type(self.key_resolver) is not KeyVaultTrustedKeyResolver:
             raise TypeError(
                 "production monitoring verification requires KeyVaultTrustedKeyResolver"
+            )
+        if (self.receipt_trusted_key_anchor is None) != (
+            self.receipt_key_resolver is None
+        ):
+            raise TypeError(
+                "receipt key anchor and resolver must be configured together"
+            )
+        if (
+            self.receipt_key_resolver is not None
+            and type(self.receipt_key_resolver) is not KeyVaultTrustedKeyResolver
+        ):
+            raise TypeError(
+                "production receipt verification requires KeyVaultTrustedKeyResolver"
             )
 
     def verify(
@@ -171,6 +201,61 @@ class TrustedMonitoringHandoffVerifier:
             key_resolver=self.key_resolver,
         )
         return handoff.compute_artifact_digest_value()
+
+    def verify_acquisition_receipt(
+        self,
+        receipt: MonitoringAcquisitionReceipt,
+        *,
+        as_of: UtcDateTime,
+    ) -> str:
+        if (
+            self.expected_acquisition_authority_digest is None
+            or self.expected_authenticated_principal_id is None
+            or self.expected_athena_context_identity_id is None
+            or self.expected_deployment_identity_contract_digest is None
+            or self.expected_receipt_signing_key_id is None
+        ):
+            raise ValueError(
+                "production acquisition verification requires deployed identity policy"
+            )
+        receipt_anchor = self.receipt_trusted_key_anchor
+        receipt_resolver = self.receipt_key_resolver
+        if receipt_anchor is None or receipt_resolver is None:
+            if (
+                self.expected_receipt_signing_key_id.casefold().rstrip("/")
+                != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/")
+            ):
+                raise ValueError(
+                    "distinct receipt signing key requires a dedicated trusted anchor"
+                )
+            receipt_anchor = self.trusted_key_anchor
+            receipt_resolver = self.key_resolver
+        verify_monitoring_acquisition_receipt_attestation(
+            receipt,
+            as_of=as_of,
+            trusted_key_anchor=receipt_anchor,
+            key_resolver=receipt_resolver,
+            expected_acquisition_authority_digest=(
+                self.expected_acquisition_authority_digest
+            ),
+            expected_authenticated_principal_id=(
+                self.expected_authenticated_principal_id
+            ),
+            expected_athena_context_identity_id=(
+                self.expected_athena_context_identity_id
+            ),
+            expected_deployment_identity_contract_digest=(
+                self.expected_deployment_identity_contract_digest
+            ),
+            expected_collector_contract_digest=(
+                self.reviewed_contract.compute_artifact_digest_value()
+            ),
+            expected_receipt_signing_key_id=self.expected_receipt_signing_key_id,
+            maximum_receipt_age_seconds=(
+                self.acquisition_receipt_maximum_age_seconds
+            ),
+        )
+        return receipt.receipt_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +526,36 @@ class _CorrelationVerificationService:
             != request.monitoring_handoff.compute_artifact_digest_value()
         ):
             raise ValueError("monitoring handoff verification proof is invalid")
+        acquisition_receipt = request.monitoring_bundle.acquisition_receipt
+        if acquisition_receipt is not None:
+            acquisition_manifest = request.monitoring_bundle.acquisition_manifest
+            intent_reference = request.monitoring_bundle.monitoring_intent_reference
+            if (
+                acquisition_manifest is None
+                or intent_reference is None
+                or acquisition_receipt.intent_id != intent_reference.intent_id
+                or acquisition_receipt.intent_digest != intent_reference.intent_digest
+                or acquisition_receipt.context_binding_digest
+                != request.context_binding.binding_digest
+                or acquisition_receipt.collection_batch_digest
+                != acquisition_manifest.collection_batch_digest
+                or acquisition_receipt.normalized_evidence_digest
+                != acquisition_manifest.normalized_evidence_digest
+                or acquisition_receipt.normalized_evidence_digest
+                != request.monitoring_bundle.compute_normalized_evidence_digest_value()
+                or acquisition_receipt.exchanges != acquisition_manifest.exchanges
+            ):
+                raise ValueError(
+                    "acquisition receipt does not bind the persisted evidence manifest"
+                )
+            if (
+                self.monitoring_verifier.verify_acquisition_receipt(
+                    acquisition_receipt,
+                    as_of=evaluated_at,
+                )
+                != acquisition_receipt.receipt_digest
+            ):
+                raise ValueError("acquisition receipt verification proof is invalid")
 
         for artifact, handoff in zip(
             request.change_artifacts,

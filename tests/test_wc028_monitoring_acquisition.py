@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import base64
+import json
+from datetime import datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -9,6 +11,7 @@ from athena_context.contracts import (
     ResourceHealthMonitoringSignal,
     build_published_monitoring_intent,
     compute_artifact_digest,
+    sha256_hex,
 )
 from athena_context.monitoring_acquisition import (
     MAX_ACQUISITION_RESPONSE_BYTES,
@@ -20,6 +23,7 @@ from athena_context.monitoring_acquisition import (
     HeartbeatRow,
     IpFlowVerifyRequest,
     IpFlowVerifyResult,
+    LogAggregateCompletenessProof,
     LogAnalyticsQueryRequest,
     LogAnalyticsQueryResult,
     LogCoverageDescriptor,
@@ -37,6 +41,7 @@ from athena_context.monitoring_acquisition import (
 )
 from athena_context.monitoring_collection import (
     AmaHeartbeatRecord,
+    MonitoringCollectionError,
     NetworkWatcherFlowRecord,
     ResourceChangeRecord,
     VmConnectionHealthRecord,
@@ -56,6 +61,7 @@ from test_wc028_monitoring_collection import (
     INTENT_KEY_ID,
     INTENT_SIGNATURE,
     MONITOR_ID,
+    MONITORING_KEY_ID,
     _CommitPort,
     _control,
     _controls,
@@ -83,11 +89,57 @@ OUT_OF_SCOPE_ID = (
 )
 
 
+class _Runtime:
+    def __init__(
+        self,
+        *,
+        principal_id: str = READER_ID,
+        now: datetime = NOW,
+    ) -> None:
+        self.principal_id = principal_id
+        self.now = now
+
+    def authenticated_principal_id(self) -> str:
+        return self.principal_id
+
+    def utc_now(self) -> datetime:
+        return self.now
+
+
+class _ReceiptSigner:
+    def sign_preimage(self, canonical_preimage: bytes) -> str:
+        assert canonical_preimage
+        return base64.b64encode(b"synthetic-acquisition-receipt").decode("ascii")
+
+
+def _aggregate_proof(
+    request: LogAnalyticsQueryRequest,
+    *,
+    ingestion_complete_through: datetime | None = None,
+) -> LogAggregateCompletenessProof:
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028LogAggregateCompletenessProof.v1",
+        "rawInputRowCount": 1,
+        "ingestionCompleteThrough": (
+            request.window_end if ingestion_complete_through is None else ingestion_complete_through
+        ),
+        "windowStart": request.window_start,
+        "windowEnd": request.window_end,
+        "requestDigest": request.request_digest,
+        "queryDigest": request.query_digest,
+    }
+    return LogAggregateCompletenessProof(
+        **payload,
+        proofDigest=compute_artifact_digest(payload),
+    )
+
+
 def _acquisition_authority(
     *,
     reader_identity_id: str = READER_ID,
     context_identity_id: str = CONTEXT_ID,
     max_freshness_seconds: int = 900,
+    max_acquisition_calls: int = 32,
 ) -> MonitoringAcquisitionAuthority:
     allowed_sources = (
         "activityLog",
@@ -100,7 +152,7 @@ def _acquisition_authority(
         sorted(item.casefold() for item in (WEB_ID, DB_ID, NSG_ID, NSG_RULE_ID, MONITOR_ID))
     )
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v1",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v2",
         "monitoringReaderIdentityId": reader_identity_id.casefold(),
         "athenaContextIdentityId": context_identity_id.casefold(),
         "collectorContractDigest": DIGEST_C,
@@ -110,9 +162,21 @@ def _acquisition_authority(
         "maxBytes": MAX_ACQUISITION_RESPONSE_BYTES,
         "maxWindowSeconds": 86400,
         "maxFreshnessSeconds": max_freshness_seconds,
+        "maxAcquisitionCalls": max_acquisition_calls,
+        "receiptSigningKeyId": MONITORING_KEY_ID,
+        "monitoringReaderHasReadOnlyWorkloadAccess": True,
         "readOnly": True,
         "athenaContextHasWorkloadReader": False,
     }
+    payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
+        {
+            "monitoringReaderIdentityId": reader_identity_id.casefold(),
+            "athenaContextIdentityId": context_identity_id.casefold(),
+            "monitoringReaderHasReadOnlyWorkloadAccess": True,
+            "athenaContextHasWorkloadReader": False,
+            "readOnly": True,
+        }
+    )
     digest = compute_artifact_digest(payload)
     return MonitoringAcquisitionAuthority(
         **{
@@ -125,12 +189,14 @@ def _acquisition_authority(
     )
 
 
-def _authority(controls=None):
+def _authority(controls=None, *, required_control_names: set[str] | None = None):
     controls = _controls() if controls is None else controls
     path = _dependency_path()
     required_values = []
     for name, control in controls.items():
-        if name == "change":
+        if name == "change" or (
+            required_control_names is not None and name not in required_control_names
+        ):
             continue
         coverage_kwargs: dict[str, object] = {}
         if name == "monitor":
@@ -191,6 +257,12 @@ class _AcquisitionPort:
         all_vm_mappings_ambiguous: bool = False,
         multiple_heartbeat_rows: bool = False,
         missing_current_db_heartbeat: bool = False,
+        unproven_current_heartbeat_zero: bool = False,
+        traffic_analytics_rows: int = 1,
+        backdated_ip_flow: bool = False,
+        mismatched_aggregate_proof: bool = False,
+        future_aggregate_proof: bool = False,
+        truncated_heartbeat: bool = False,
     ) -> None:
         self.reverse_rows = reverse_rows
         self.ambiguous_vm_mapping = ambiguous_vm_mapping
@@ -212,6 +284,13 @@ class _AcquisitionPort:
         self.all_vm_mappings_ambiguous = all_vm_mappings_ambiguous
         self.multiple_heartbeat_rows = multiple_heartbeat_rows
         self.missing_current_db_heartbeat = missing_current_db_heartbeat
+        self.unproven_current_heartbeat_zero = unproven_current_heartbeat_zero
+        self.traffic_analytics_rows = traffic_analytics_rows
+        self.backdated_ip_flow = backdated_ip_flow
+        self.mismatched_aggregate_proof = mismatched_aggregate_proof
+        self.future_aggregate_proof = future_aggregate_proof
+        self.truncated_heartbeat = truncated_heartbeat
+        self.ip_flow_calls = 0
         self.requests: list[object] = []
 
     def _collected_at(self):
@@ -305,27 +384,26 @@ class _AcquisitionPort:
                 )
             )
         else:
-            rows = (
-                TrafficAnalyticsRow(
-                    rowKind="trafficAnalytics",
-                    subjectResourceCandidates=(WEB_ID,),
-                    pathId=path.path_id,
-                    decision="denied",
-                    direction="inbound",
-                    protocol="Tcp",
-                    sourceResourceCandidates=(WEB_ID,),
-                    destinationResourceCandidates=(DB_ID,),
-                    sourceAddress="192.0.2.10",
-                    destinationAddress="192.0.2.20",
-                    sourcePort=443,
-                    destinationPort=1433,
-                    enforcementResourceId=NSG_ID,
-                    ruleResourceId=NSG_RULE_ID,
-                    trafficAnalyticsLimitation="aggregatedNotPacketCausal",
-                    observedStart=request.window_start,
-                    observedEnd=request.window_end,
-                ),
+            traffic_row = TrafficAnalyticsRow(
+                rowKind="trafficAnalytics",
+                subjectResourceCandidates=(WEB_ID,),
+                pathId=path.path_id,
+                decision="denied",
+                direction="inbound",
+                protocol="Tcp",
+                sourceResourceCandidates=(WEB_ID,),
+                destinationResourceCandidates=(DB_ID,),
+                sourceAddress="192.0.2.10",
+                destinationAddress="192.0.2.20",
+                sourcePort=443,
+                destinationPort=1433,
+                enforcementResourceId=NSG_ID,
+                ruleResourceId=NSG_RULE_ID,
+                trafficAnalyticsLimitation="aggregatedNotPacketCausal",
+                observedStart=request.window_start,
+                observedEnd=request.window_end,
             )
+            rows = tuple(traffic_row for _ in range(self.traffic_analytics_rows))
         coverage_descriptor = None
         if request.table == "NWConnectionMonitorTestResult":
             coverage_descriptor = LogCoverageDescriptor(
@@ -343,6 +421,30 @@ class _AcquisitionPort:
                 direction="inbound",
                 fiveTupleDigest=_five_tuple_digest(),
             )
+        aggregate_proof = (
+            None
+            if request.table not in {"Heartbeat", "VMConnection"}
+            or (
+                request.table == "Heartbeat" and is_current and self.unproven_current_heartbeat_zero
+            )
+            else _aggregate_proof(
+                request,
+                ingestion_complete_through=(
+                    NOW + timedelta(minutes=1) if self.future_aggregate_proof else None
+                ),
+            )
+        )
+        if aggregate_proof is not None and self.mismatched_aggregate_proof:
+            proof_payload = aggregate_proof.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude={"proof_digest"},
+            )
+            proof_payload["requestDigest"] = "sha256:" + "f" * 64
+            aggregate_proof = LogAggregateCompletenessProof(
+                **proof_payload,
+                proofDigest=compute_artifact_digest(proof_payload),
+            )
         return LogAnalyticsQueryResult(
             schemaVersion="athena.wc028LogAnalyticsQueryResult.v1",
             source="logAnalytics",
@@ -352,7 +454,9 @@ class _AcquisitionPort:
             collectedAt=self._collected_at(),
             columns=request.expected_columns,
             coverageDescriptor=coverage_descriptor,
-            truncated=self.truncated_flow and request.table == "NTANetAnalytics",
+            aggregateCompletenessProof=aggregate_proof,
+            truncated=(self.truncated_flow and request.table == "NTANetAnalytics")
+            or (self.truncated_heartbeat and request.table == "Heartbeat"),
             responseBytes=4096,
             rows=rows,
         )
@@ -362,6 +466,7 @@ class _AcquisitionPort:
         request: IpFlowVerifyRequest,
     ) -> IpFlowVerifyResult:
         self.requests.append(request)
+        self.ip_flow_calls += 1
         return IpFlowVerifyResult(
             schemaVersion="athena.wc028IpFlowVerifyResult.v1",
             source="ipFlowVerify",
@@ -370,7 +475,11 @@ class _AcquisitionPort:
             ),
             sourceIdentityId=self.source_identity_id,
             collectedAt=self._collected_at(),
-            checkedAt=request.checked_at,
+            checkedAt=(
+                request.checked_at - timedelta(minutes=1)
+                if self.backdated_ip_flow
+                else request.checked_at
+            ),
             access="Deny",
             ruleResourceId=NSG_RULE_ID,
             responseBytes=1024,
@@ -518,10 +627,19 @@ class _AcquisitionPort:
         )
 
 
-def _execute(port: _AcquisitionPort, *, authority=None):
+def _execute(
+    port: _AcquisitionPort,
+    *,
+    authority=None,
+    runtime: _Runtime | None = None,
+    collected_at: datetime = NOW,
+    acquisition_authority: MonitoringAcquisitionAuthority | None = None,
+):
     context, intent, _ = _authority() if authority is None else authority
     commit = _CommitPort()
-    acquisition_authority = _acquisition_authority()
+    acquisition_authority = (
+        _acquisition_authority() if acquisition_authority is None else acquisition_authority
+    )
     outcome = MonitoringAcquisitionCoordinator(
         acquisition_port=port,
         acquisition_authority=acquisition_authority,
@@ -532,11 +650,13 @@ def _execute(port: _AcquisitionPort, *, authority=None):
         ),
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime() if runtime is None else runtime,
+        receipt_signer=_ReceiptSigner(),
     ).execute(
         monitoring_intent=intent,
         context_binding=context,
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
-        collected_at=NOW,
+        collected_at=collected_at,
         collector_contract_digest=DIGEST_C,
         change_scope=_scope_contract(),
         commit_port=commit,
@@ -555,9 +675,7 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert commit.calls == 1
     assert outcome.batch == outcome.batch.model_copy()
     assert outcome.prepared.intent_id == intent.intent_id
-    assert (
-        len([item for item in outcome.batch.records if isinstance(item, ResourceChangeRecord)]) == 1
-    )
+    assert not any(isinstance(item, ResourceChangeRecord) for item in outcome.batch.records)
     acquisition_authority = _acquisition_authority()
     assert all(
         request.monitoring_reader_identity_id == READER_ID.casefold()
@@ -579,6 +697,10 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     log_requests = [
         request for request in port.requests if isinstance(request, LogAnalyticsQueryRequest)
     ]
+    assert not any(
+        isinstance(request, (ActivityLogQueryRequest, ResourceGraphChangeQueryRequest))
+        for request in port.requests
+    )
     assert all(
         request.query_digest
         == next(
@@ -597,8 +719,87 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     flow = next(
         item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
     )
-    assert flow.attribution_evidence is not None
-    assert flow.change_correlation_id == CHANGE_CORRELATION_ID
+    assert flow.attribution_evidence is None
+    assert flow.change_correlation_id is None
+    assert any(
+        "supporting control has no required coverage scope" in item
+        for item in outcome.manual_investigation_reasons
+    )
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    manifest = outcome.prepared.monitoring_bundle.acquisition_manifest
+    assert receipt is not None
+    assert manifest is not None
+    assert (
+        outcome.prepared.monitoring_bundle.schema_version
+        == "athena.wc028MonitoringEvidenceBundle.v3"
+    )
+    assert (
+        outcome.committed.monitoring_handoff.schema_version
+        == "athena.wc028MonitoringEvidenceHandoff.v2"
+    )
+    assert receipt.authenticated_principal_id == READER_ID.casefold()
+    assert receipt.acquisition_authority_digest == acquisition_authority.authority_digest
+    assert receipt.collection_batch_digest == sha256_hex(outcome.batch.canonical_bytes())
+    assert manifest.collection_batch_digest == receipt.collection_batch_digest
+    assert (
+        receipt.normalized_evidence_digest
+        == outcome.prepared.monitoring_bundle.compute_normalized_evidence_digest_value()
+    )
+    assert manifest.normalized_evidence_digest == receipt.normalized_evidence_digest
+    assert manifest.exchanges == receipt.exchanges
+    assert len(receipt.exchanges) == len(port.requests)
+    assert tuple(item.request_digest for item in receipt.exchanges) == tuple(
+        request.request_digest for request in port.requests
+    )
+    ip_flow_exchange = next(item for item in receipt.exchanges if item.source == "ipFlowVerify")
+    assert ip_flow_exchange.checked_at == NOW
+    assert outcome.committed.monitoring_handoff.acquisition_receipt_digest == receipt.receipt_digest
+    tampered_bundle = outcome.prepared.monitoring_bundle.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    tampered_manifest = tampered_bundle["acquisitionManifest"]
+    assert isinstance(tampered_manifest, dict)
+    tampered_manifest["collectionBatchDigest"] = "sha256:" + "f" * 64
+    tampered_manifest["manifestDigest"] = compute_artifact_digest(
+        {
+            key: value
+            for key, value in tampered_manifest.items()
+            if key != "manifestDigest"
+        }
+    )
+    with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
+        type(outcome.prepared.monitoring_bundle).model_validate_json(
+            json.dumps(tampered_bundle)
+        )
+    tampered_evidence = outcome.prepared.monitoring_bundle.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    tampered_observation = tampered_evidence["observations"][0]
+    assert isinstance(tampered_observation, dict)
+    tampered_observation["summaryCode"] = "tamperedEvidence"
+    observation_digest = compute_artifact_digest(
+        {
+            key: value
+            for key, value in tampered_observation.items()
+            if key not in {"observationId", "observationDigest"}
+        }
+    )
+    tampered_observation["observationDigest"] = observation_digest
+    tampered_observation["observationId"] = (
+        f"obs-{observation_digest.removeprefix('sha256:')[:32]}"
+    )
+    tampered_evidence["observations"] = sorted(
+        tampered_evidence["observations"],
+        key=lambda item: item["observationId"],
+    )
+    with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
+        type(outcome.prepared.monitoring_bundle).model_validate_json(
+            json.dumps(tampered_evidence)
+        )
 
 
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
@@ -615,7 +816,9 @@ def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
     ]
     assert len(endpoint_records) == 1
     endpoint_coverage = next(
-        item for item in outcome.batch.coverage if item.family == "endpointHealth"
+        item
+        for item in outcome.batch.coverage
+        if item.family == "endpointHealth" and item.status == "partial"
     )
     flow_coverage = next(item for item in outcome.batch.coverage if item.family == "networkFlow")
     assert endpoint_coverage.status == "partial"
@@ -733,6 +936,8 @@ def test_ip_flow_verify_must_bind_the_exact_network_tuple() -> None:
         ),
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime(),
+        receipt_signer=_ReceiptSigner(),
     )
 
     with pytest.raises(MonitoringAcquisitionError, match="exact request"):
@@ -761,60 +966,35 @@ def test_healthy_guest_signal_does_not_block_endpoint_incident() -> None:
     assert outcome.batch.incident_resource_id == WEB_ID.casefold()
 
 
-def test_incomplete_change_sources_cannot_support_direct_attribution() -> None:
-    outcome, commit, _ = _execute(_AcquisitionPort(truncated_change=True))
+def test_optional_change_controls_are_not_executed_or_attributed() -> None:
+    port = _AcquisitionPort(
+        truncated_change=True,
+        duplicate_activity=True,
+        fail_resource_graph=True,
+    )
+    outcome, commit, _ = _execute(port)
 
     assert commit.calls == 1
+    assert not any(
+        isinstance(request, (ActivityLogQueryRequest, ResourceGraphChangeQueryRequest))
+        for request in port.requests
+    )
     flow = next(
         item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
     )
     assert flow.attribution_evidence is None
     assert flow.change_correlation_id is None
-    assert any("truncated" in item for item in outcome.manual_investigation_reasons)
+    assert any(
+        "supporting control has no required coverage scope and was not executed" in item
+        for item in outcome.manual_investigation_reasons
+    )
 
 
-def test_source_failure_or_stale_response_never_enters_commit() -> None:
-    context, intent, _ = _authority()
-    for port, message in (
-        (_AcquisitionPort(fail_resource_graph=True), "source acquisition failed"),
-        (_AcquisitionPort(stale=True), "stale"),
-    ):
-        commit = _CommitPort()
-        coordinator = MonitoringAcquisitionCoordinator(
-            acquisition_port=port,
-            acquisition_authority=_acquisition_authority(),
-            expected_acquisition_authority_digest=(_acquisition_authority().authority_digest),
-            monitoring_intent_trusted_key_id=INTENT_KEY_ID,
-            monitoring_intent_signature_verifier=(
-                lambda _payload, signature: signature == INTENT_SIGNATURE
-            ),
-            monitoring_intent_asset_loader=_intent_assets,
-            collection_transaction=_transaction(),
-        )
-        with pytest.raises(MonitoringAcquisitionError, match=message):
-            coordinator.execute(
-                monitoring_intent=intent,
-                context_binding=context,
-                expected_active_context_authority_digest=(
-                    context.publication_authority.authority_digest
-                ),
-                collected_at=NOW,
-                collector_contract_digest=DIGEST_C,
-                change_scope=_scope_contract(),
-                commit_port=commit,
-                incident_revision=1,
-                issued_at=NOW,
-                trusted_as_of=NOW + timedelta(minutes=1),
-                expires_at=NOW + timedelta(minutes=10),
-            )
-        assert commit.calls == 0
-
-
-def test_recovered_historical_outage_is_not_selected_as_current() -> None:
+def test_source_failure_never_enters_commit() -> None:
     context, intent, _ = _authority()
     commit = _CommitPort()
     coordinator = MonitoringAcquisitionCoordinator(
-        acquisition_port=_AcquisitionPort(recovered=True),
+        acquisition_port=_AcquisitionPort(stale=True),
         acquisition_authority=_acquisition_authority(),
         expected_acquisition_authority_digest=(_acquisition_authority().authority_digest),
         monitoring_intent_trusted_key_id=INTENT_KEY_ID,
@@ -823,9 +1003,10 @@ def test_recovered_historical_outage_is_not_selected_as_current() -> None:
         ),
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime(),
+        receipt_signer=_ReceiptSigner(),
     )
-
-    with pytest.raises(MonitoringAcquisitionError, match="exactly one unambiguous"):
+    with pytest.raises(MonitoringAcquisitionError, match="collector clock"):
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
@@ -844,11 +1025,11 @@ def test_recovered_historical_outage_is_not_selected_as_current() -> None:
     assert commit.calls == 0
 
 
-def test_activity_and_change_pairing_must_be_unique() -> None:
+def test_recovered_historical_outage_is_not_selected_as_current() -> None:
     context, intent, _ = _authority()
     commit = _CommitPort()
     coordinator = MonitoringAcquisitionCoordinator(
-        acquisition_port=_AcquisitionPort(duplicate_activity=True),
+        acquisition_port=_AcquisitionPort(recovered=True),
         acquisition_authority=_acquisition_authority(),
         expected_acquisition_authority_digest=(_acquisition_authority().authority_digest),
         monitoring_intent_trusted_key_id=INTENT_KEY_ID,
@@ -857,9 +1038,11 @@ def test_activity_and_change_pairing_must_be_unique() -> None:
         ),
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime(),
+        receipt_signer=_ReceiptSigner(),
     )
 
-    with pytest.raises(MonitoringAcquisitionError, match="pairing is not unique"):
+    with pytest.raises(MonitoringAcquisitionError, match="exactly one unambiguous"):
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
@@ -1015,6 +1198,8 @@ def test_signed_intent_is_verified_before_any_source_query() -> None:
         monitoring_intent_signature_verifier=lambda _payload, _signature: False,
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime(),
+        receipt_signer=_ReceiptSigner(),
     )
 
     with pytest.raises(MonitoringAcquisitionError, match="authority is invalid"):
@@ -1064,6 +1249,8 @@ def test_acquisition_authority_and_freshness_are_checked_before_reads() -> None:
                 ),
                 monitoring_intent_asset_loader=_intent_assets,
                 collection_transaction=_transaction(),
+                runtime=_Runtime(),
+                receipt_signer=_ReceiptSigner(),
             )
             coordinator.execute(
                 monitoring_intent=intent,
@@ -1092,13 +1279,220 @@ def test_acquisition_identity_must_be_separate_from_context_identity() -> None:
         )
 
 
+def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> None:
+    payload = _acquisition_authority().model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={
+            "authority_id",
+            "authority_digest",
+            "max_acquisition_calls",
+            "receipt_signing_key_id",
+            "monitoring_reader_has_read_only_workload_access",
+            "deployment_identity_contract_digest",
+        },
+    )
+    payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v1"
+    digest = compute_artifact_digest(payload)
+    payload["allowedSources"] = tuple(payload["allowedSources"])
+    payload["allowedResourceIds"] = tuple(payload["allowedResourceIds"])
+    authority = MonitoringAcquisitionAuthority(
+        **payload,
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+
+    assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1"
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v2"):
+        MonitoringAcquisitionCoordinator(
+            acquisition_port=_AcquisitionPort(),
+            acquisition_authority=authority,
+            expected_acquisition_authority_digest=authority.authority_digest,
+            monitoring_intent_trusted_key_id=INTENT_KEY_ID,
+            monitoring_intent_signature_verifier=(
+                lambda _payload, signature: signature == INTENT_SIGNATURE
+            ),
+            monitoring_intent_asset_loader=_intent_assets,
+            collection_transaction=_transaction(),
+            runtime=_Runtime(),
+            receipt_signer=_ReceiptSigner(),
+        )
+
+
+def test_forged_port_identity_cannot_override_authenticated_principal() -> None:
+    port = _AcquisitionPort(source_identity_id=CONTEXT_ID)
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="conflicts with the authenticated principal",
+    ):
+        _execute(port)
+
+
+def test_deployment_identity_is_fail_closed_before_reads() -> None:
+    port = _AcquisitionPort()
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="authenticated deployment identity",
+    ):
+        _execute(
+            port,
+            runtime=_Runtime(principal_id=CONTEXT_ID),
+        )
+    assert port.requests == []
+
+
+def test_caller_collection_time_cannot_backdate_collector_receipt() -> None:
+    outcome, commit, _ = _execute(
+        _AcquisitionPort(),
+        runtime=_Runtime(now=NOW),
+        collected_at=NOW - timedelta(minutes=5),
+    )
+
+    assert commit.calls == 1
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert receipt.execution_started_at == NOW
+    assert outcome.batch.collected_at == NOW
+
+
+def test_backdated_ip_flow_result_is_rejected() -> None:
+    port = _AcquisitionPort(backdated_ip_flow=True)
+    with pytest.raises(MonitoringAcquisitionError, match="IP Flow Verify response is stale"):
+        _execute(port)
+    assert port.ip_flow_calls == 1
+
+
+def test_unproven_empty_aggregate_is_unavailable_not_healthy() -> None:
+    outcome, commit, _ = _execute(_AcquisitionPort(unproven_current_heartbeat_zero=True))
+
+    assert commit.calls == 1
+    assert not any(
+        isinstance(item, AmaHeartbeatRecord) and item.observed_end == NOW
+        for item in outcome.batch.records
+    )
+    current_guest_coverage = next(
+        item
+        for item in outcome.batch.coverage
+        if item.family == "guest" and item.observed_end == NOW
+    )
+    assert current_guest_coverage.status == "unavailable"
+    assert current_guest_coverage.detail is not None
+    assert "aggregate zero lacked positive raw-input" in current_guest_coverage.detail
+
+
+def test_aggregate_completeness_proof_cannot_be_reused_for_another_request() -> None:
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="exact query execution",
+    ):
+        _execute(_AcquisitionPort(mismatched_aggregate_proof=True))
+
+
+def test_truncated_zero_aggregate_is_not_persisted_as_health_evidence() -> None:
+    outcome, commit, _ = _execute(_AcquisitionPort(truncated_heartbeat=True))
+
+    assert commit.calls == 1
+    assert not any(
+        isinstance(item, AmaHeartbeatRecord)
+        and item.observed_end == NOW
+        and item.heartbeat_count == 0
+        for item in outcome.batch.records
+    )
+    current_guest_coverage = next(
+        item
+        for item in outcome.batch.coverage
+        if item.family == "guest" and item.observed_end == NOW
+    )
+    assert current_guest_coverage.status == "unavailable"
+
+
+def test_future_aggregate_ingestion_proof_is_unavailable_not_healthy() -> None:
+    outcome, commit, _ = _execute(_AcquisitionPort(future_aggregate_proof=True))
+
+    assert commit.calls == 1
+    assert not any(
+        isinstance(item, AmaHeartbeatRecord)
+        and item.observed_end == NOW
+        and item.heartbeat_count == 0
+        for item in outcome.batch.records
+    )
+    current_guest_coverage = next(
+        item
+        for item in outcome.batch.coverage
+        if item.family == "guest" and item.observed_end == NOW
+    )
+    assert current_guest_coverage.status == "unavailable"
+    assert current_guest_coverage.detail is not None
+    assert "aggregate zero lacked positive raw-input" in current_guest_coverage.detail
+
+
+def test_executable_optional_control_cannot_select_incident() -> None:
+    authority = _authority(required_control_names={"heartbeat", "endpoint", "monitor", "flow"})
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="must belong to required coverage scope",
+    ):
+        _execute(_AcquisitionPort(), authority=authority)
+
+
+def test_transaction_rejects_receipt_replay_with_altered_batch() -> None:
+    outcome, _, intent = _execute(_AcquisitionPort())
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    context, _, _ = _authority()
+    altered_records = tuple(
+        item.model_copy(update={"failed_connection_count": 999})
+        if isinstance(item, VmConnectionHealthRecord)
+        else item
+        for item in outcome.batch.records
+    )
+    altered_batch = outcome.batch.model_copy(update={"records": altered_records})
+
+    with pytest.raises(
+        MonitoringCollectionError,
+        match="does not bind its trusted execution",
+    ):
+        _transaction().prepare(
+            altered_batch,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=1),
+            acquisition_receipt=receipt,
+        )
+
+
+def test_traffic_analytics_cardinality_is_rejected_before_ip_flow_calls() -> None:
+    port = _AcquisitionPort(traffic_analytics_rows=500)
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="Traffic Analytics returned multiple rows",
+    ):
+        _execute(port)
+    assert port.ip_flow_calls == 0
+    assert len(port.requests) <= 32
+
+
+def test_total_acquisition_call_budget_fails_before_extra_read() -> None:
+    port = _AcquisitionPort()
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="total call budget",
+    ):
+        _execute(
+            port,
+            acquisition_authority=_acquisition_authority(max_acquisition_calls=1),
+        )
+    assert len(port.requests) == 1
+
+
 @pytest.mark.parametrize(
     "port, message",
     (
-        (
-            _AcquisitionPort(source_identity_id=CONTEXT_ID),
-            "unexpected Azure identity",
-        ),
         (
             _AcquisitionPort(out_of_scope_heartbeat=True),
             "published workload resource scope",
@@ -1122,6 +1516,8 @@ def test_source_identity_and_resource_scope_are_fail_closed(
         ),
         monitoring_intent_asset_loader=_intent_assets,
         collection_transaction=_transaction(),
+        runtime=_Runtime(),
+        receipt_signer=_ReceiptSigner(),
     )
 
     with pytest.raises(MonitoringAcquisitionError, match=message):

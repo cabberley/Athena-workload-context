@@ -87,7 +87,7 @@ var validatedConnectionMonitorDeploymentMode = connectionMonitorDeploymentMode =
   ? connectionMonitorDeploymentMode
   : fail('collector contracts require the generic Connection Monitor capability-only mode')
 
-output collectorContract object = {
+var collectorContract = {
   schemaVersion: 'athena.wc024MonitoringCollectorContract.v2'
   collectorIdentityResourceId: collectorIdentityResourceId
   collectorIdentityClientId: collectorIdentityClientId
@@ -138,3 +138,10 @@ output collectorContract object = {
   evidenceContainerName: 'monitoring-evidence'
   connectionMonitorDeploymentMode: validatedConnectionMonitorDeploymentMode
 }
+
+output collectorContract object = collectorContract
+
+output acquisitionCollectorContract object = union(collectorContract, {
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v3'
+  handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
+})

@@ -14,13 +14,18 @@ from athena_context.contracts import (
     ApprovedChangeScope,
     CorrelationRequest,
     LogQueryMonitoringSignal,
+    MonitoringAcquisitionExchange,
+    MonitoringAcquisitionReceipt,
+    MonitoringEvidenceAttestation,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
     PublishedMonitoringIntentControl,
     PublishedRuntimeContextBinding,
     ResourceHealthMonitoringSignal,
+    canonicalize_json,
     compute_artifact_digest,
+    monitoring_acquisition_receipt_preimage,
     sha256_hex,
     validate_monitoring_intent_activation_eligible,
     validate_published_monitoring_intent_assets,
@@ -47,6 +52,7 @@ from athena_context.monitoring_collection import (
 MAX_ACQUISITION_ROWS = 500
 MAX_ACQUISITION_RESPONSE_BYTES = 256 * 1024
 MAX_ACQUISITION_WINDOW_SECONDS = 86400
+MAX_ACQUISITION_CALLS = 32
 EVENT_LOOKBACK_SECONDS = 900
 _READER_IDENTITY_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/"
@@ -167,9 +173,10 @@ class _StrictAcquisitionModel(AthenaBaseModel):
 class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     """Digest-pinned authorization for the read-only monitoring acquisition boundary."""
 
-    schema_version: Literal["athena.wc028MonitoringAcquisitionAuthority.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc028MonitoringAcquisitionAuthority.v1",
+        "athena.wc028MonitoringAcquisitionAuthority.v2",
+    ] = Field(alias="schemaVersion")
     authority_id: str = Field(
         alias="authorityId",
         pattern=r"^monitoring-acquisition-authority-[a-f0-9]{32}$",
@@ -195,9 +202,29 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         ge=60,
         le=3600,
     )
+    max_acquisition_calls: int | None = Field(
+        default=None,
+        alias="maxAcquisitionCalls",
+        ge=1,
+        le=32,
+    )
+    receipt_signing_key_id: str | None = Field(
+        default=None,
+        alias="receiptSigningKeyId",
+        pattern=(
+            r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/"
+            r"[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
+        ),
+    )
+    monitoring_reader_has_read_only_workload_access: Literal[True] | None = Field(
+        default=None, alias="monitoringReaderHasReadOnlyWorkloadAccess"
+    )
     read_only: Literal[True] = Field(alias="readOnly")
     athena_context_has_workload_reader: Literal[False] = Field(
         alias="athenaContextHasWorkloadReader"
+    )
+    deployment_identity_contract_digest: Sha256Digest | None = Field(
+        default=None, alias="deploymentIdentityContractDigest"
     )
     authority_digest: Sha256Digest = Field(alias="authorityDigest")
 
@@ -230,6 +257,33 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             raise ValueError(
                 "monitoring acquisition identity must be separate from the Athena context identity"
             )
+        receipt_fields = (
+            self.max_acquisition_calls,
+            self.receipt_signing_key_id,
+            self.monitoring_reader_has_read_only_workload_access,
+            self.deployment_identity_contract_digest,
+        )
+        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1":
+            if any(item is not None for item in receipt_fields):
+                raise ValueError("v1 acquisition authority cannot contain receipt policy")
+        elif any(item is None for item in receipt_fields):
+            raise ValueError("v2 acquisition authority requires receipt policy")
+        deployment_digest = compute_artifact_digest(
+            {
+                "monitoringReaderIdentityId": self.monitoring_reader_identity_id,
+                "athenaContextIdentityId": self.athena_context_identity_id,
+                "monitoringReaderHasReadOnlyWorkloadAccess": (
+                    self.monitoring_reader_has_read_only_workload_access
+                ),
+                "athenaContextHasWorkloadReader": self.athena_context_has_workload_reader,
+                "readOnly": self.read_only,
+            }
+        )
+        if (
+            self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2"
+            and self.deployment_identity_contract_digest != deployment_digest
+        ):
+            raise ValueError("deploymentIdentityContractDigest does not bind identity separation")
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -268,6 +322,14 @@ def _canonical_ip(value: str) -> str:
         raise ValueError("network address is invalid") from exc
 
 
+def _trusted_runtime_time(value: datetime) -> datetime:
+    if value.utcoffset() != UTC.utcoffset(value) or value.microsecond % 1000:
+        raise MonitoringAcquisitionError(
+            "collector runtime time must use UTC with millisecond precision"
+        )
+    return value
+
+
 def _json_value(value: object) -> object:
     if isinstance(value, AthenaBaseModel):
         return value.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -292,6 +354,7 @@ def _request_digest(model: _StrictAcquisitionModel) -> str:
 
 
 class _AcquisitionRequest(_StrictAcquisitionModel):
+    source: AcquisitionSource
     request_digest: Sha256Digest = Field(alias="requestDigest")
     monitoring_reader_identity_id: str = Field(alias="monitoringReaderIdentityId")
     acquisition_authority_id: str = Field(
@@ -747,6 +810,40 @@ class _AcquisitionResult(_StrictAcquisitionModel):
         return _canonical_identity_id(value)
 
 
+class LogAggregateCompletenessProof(_StrictAcquisitionModel):
+    """Positive source proof that a zero aggregate was computed from ingested rows."""
+
+    schema_version: Literal["athena.wc028LogAggregateCompletenessProof.v1"] = Field(
+        alias="schemaVersion"
+    )
+    raw_input_row_count: int = Field(alias="rawInputRowCount", ge=1)
+    ingestion_complete_through: UtcDateTime = Field(alias="ingestionCompleteThrough")
+    window_start: UtcDateTime = Field(alias="windowStart")
+    window_end: UtcDateTime = Field(alias="windowEnd")
+    request_digest: Sha256Digest = Field(alias="requestDigest")
+    query_digest: Sha256Digest = Field(alias="queryDigest")
+    proof_digest: Sha256Digest = Field(alias="proofDigest")
+
+    @model_validator(mode="after")
+    def validate_proof(self) -> LogAggregateCompletenessProof:
+        if (
+            self.window_start >= self.window_end
+            or self.ingestion_complete_through < self.window_end
+        ):
+            raise ValueError("aggregate completeness proof does not cover the query window")
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"proof_digest"},
+                exclude_none=True,
+            )
+        )
+        if self.proof_digest != expected:
+            raise ValueError("proofDigest does not bind aggregate completeness")
+        return self
+
+
 class LogAnalyticsQueryResult(_AcquisitionResult):
     schema_version: Literal["athena.wc028LogAnalyticsQueryResult.v1"] = Field(alias="schemaVersion")
     source: Literal["logAnalytics"]
@@ -759,6 +856,10 @@ class LogAnalyticsQueryResult(_AcquisitionResult):
     coverage_descriptor: LogCoverageDescriptor | None = Field(
         default=None,
         alias="coverageDescriptor",
+    )
+    aggregate_completeness_proof: LogAggregateCompletenessProof | None = Field(
+        default=None,
+        alias="aggregateCompletenessProof",
     )
     rows: tuple[LogAnalyticsRow, ...] = Field(max_length=MAX_ACQUISITION_ROWS)
 
@@ -778,6 +879,13 @@ class LogAnalyticsQueryResult(_AcquisitionResult):
             or descriptor.endpoint_test_digest is None
         ):
             raise ValueError("Connection Monitor results require an exact endpoint test descriptor")
+        if self.aggregate_completeness_proof is not None and self.table not in {
+            "Heartbeat",
+            "VMConnection",
+        }:
+            raise ValueError(
+                "aggregate completeness proof is only valid for reviewed aggregate queries"
+            )
         return self
 
 
@@ -830,6 +938,55 @@ class MonitoringAcquisitionPort(Protocol):
         self,
         request: IpFlowVerifyRequest,
     ) -> IpFlowVerifyResult: ...
+
+
+class MonitoringAcquisitionRuntime(Protocol):
+    """Trusted collector runtime, not the source port or request caller."""
+
+    def authenticated_principal_id(self) -> str: ...
+
+    def utc_now(self) -> datetime: ...
+
+
+class MonitoringAcquisitionReceiptSigner(Protocol):
+    def sign_preimage(self, canonical_preimage: bytes) -> str: ...
+
+
+@dataclass(slots=True)
+class _AcquisitionExecution:
+    runtime: MonitoringAcquisitionRuntime
+    max_calls: int
+    started_at: datetime
+    exchanges: list[MonitoringAcquisitionExchange]
+
+    def invoke[RequestT: _AcquisitionRequest, ResultT: _StrictAcquisitionModel](
+        self,
+        request: RequestT,
+        operation: Callable[[RequestT], ResultT],
+    ) -> ResultT:
+        if len(self.exchanges) >= self.max_calls:
+            raise MonitoringAcquisitionError(
+                "monitoring acquisition exceeded its total call budget"
+            )
+        requested_at = _trusted_runtime_time(self.runtime.utc_now())
+        result = operation(request)
+        received_at = _trusted_runtime_time(self.runtime.utc_now())
+        if requested_at < self.started_at or received_at < requested_at:
+            raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        source = cast(AcquisitionSource, request.source)
+        checked_at = request.checked_at if isinstance(request, IpFlowVerifyRequest) else None
+        self.exchanges.append(
+            MonitoringAcquisitionExchange(
+                sequence=len(self.exchanges) + 1,
+                source=source,
+                requestDigest=request.request_digest,
+                resultDigest=sha256_hex(result.canonical_bytes()),
+                requestedAt=requested_at,
+                receivedAt=received_at,
+                checkedAt=checked_at,
+            )
+        )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,17 +1128,19 @@ def _validate_result(
     result: _AcquisitionResult,
     request: _AcquisitionRequest,
     *,
-    expected_identity_id: str,
+    authenticated_principal_id: str,
+    collector_collection_time: datetime,
     expected_columns: tuple[str, ...],
-    expected_collected_at: datetime,
 ) -> None:
     if result.request_digest != request.request_digest:
         raise MonitoringAcquisitionError("source response does not bind the exact request")
-    if result.source_identity_id != expected_identity_id:
-        raise MonitoringAcquisitionError("source response used an unexpected Azure identity")
-    if result.collected_at != expected_collected_at:
+    if result.source_identity_id != authenticated_principal_id:
         raise MonitoringAcquisitionError(
-            "source response is stale or has an invalid collection time"
+            "source response identity claim conflicts with the authenticated principal"
+        )
+    if result.collected_at != collector_collection_time:
+        raise MonitoringAcquisitionError(
+            "source response time claim conflicts with the collector clock"
         )
     if result.columns != expected_columns:
         raise MonitoringAcquisitionError("source response columns do not match the strict schema")
@@ -1008,17 +1167,47 @@ def _validate_row_window(
         raise MonitoringAcquisitionError("log query row does not cover the exact published window")
 
 
+def _has_positive_aggregate_completeness(
+    result: LogAnalyticsQueryResult,
+    request: LogAnalyticsQueryRequest,
+    *,
+    collector_collection_time: datetime,
+) -> bool:
+    proof = result.aggregate_completeness_proof
+    if proof is None:
+        return False
+    if result.truncated:
+        return False
+    if (
+        proof.window_start != request.window_start
+        or proof.window_end != request.window_end
+        or proof.request_digest != request.request_digest
+        or proof.query_digest != request.query_digest
+    ):
+        raise MonitoringAcquisitionError(
+            "aggregate completeness proof does not bind the exact query execution"
+        )
+    return proof.ingestion_complete_through <= collector_collection_time
+
+
 def _validate_ip_flow_result(
     result: IpFlowVerifyResult,
     request: IpFlowVerifyRequest,
     *,
-    expected_identity_id: str,
+    authenticated_principal_id: str,
+    collector_collection_time: datetime,
 ) -> None:
     if result.request_digest != request.request_digest:
         raise MonitoringAcquisitionError("IP Flow Verify response does not bind the exact request")
-    if result.source_identity_id != expected_identity_id:
-        raise MonitoringAcquisitionError("IP Flow Verify used an unexpected Azure identity")
-    if result.collected_at != request.window_end or result.checked_at != request.checked_at:
+    if result.source_identity_id != authenticated_principal_id:
+        raise MonitoringAcquisitionError(
+            "IP Flow Verify identity claim conflicts with the authenticated principal"
+        )
+    if result.collected_at != collector_collection_time:
+        raise MonitoringAcquisitionError(
+            "IP Flow Verify time claim conflicts with the collector clock"
+        )
+    if result.checked_at != request.checked_at:
         raise MonitoringAcquisitionError("IP Flow Verify response is stale")
     if result.response_bytes > request.max_bytes:
         raise MonitoringAcquisitionError("IP Flow Verify response exceeds its byte bound")
@@ -1149,6 +1338,8 @@ class MonitoringAcquisitionCoordinator:
             ],
         ],
         collection_transaction: MonitoringCollectionTransaction,
+        runtime: MonitoringAcquisitionRuntime,
+        receipt_signer: MonitoringAcquisitionReceiptSigner,
     ) -> None:
         self._acquisition_port = acquisition_port
         try:
@@ -1163,6 +1354,13 @@ class MonitoringAcquisitionCoordinator:
             raise MonitoringAcquisitionError(
                 "monitoring acquisition authority is not the configured authority"
             )
+        if (
+            self._acquisition_authority.schema_version
+            != "athena.wc028MonitoringAcquisitionAuthority.v2"
+        ):
+            raise MonitoringAcquisitionError(
+                "receipt-bearing acquisition requires authority schema v2"
+            )
         self._monitoring_reader_identity_id = (
             self._acquisition_authority.monitoring_reader_identity_id
         )
@@ -1170,6 +1368,74 @@ class MonitoringAcquisitionCoordinator:
         self._monitoring_intent_signature_verifier = monitoring_intent_signature_verifier
         self._monitoring_intent_asset_loader = monitoring_intent_asset_loader
         self._collection_transaction = collection_transaction
+        self._runtime = runtime
+        self._receipt_signer = receipt_signer
+
+    def _build_receipt(
+        self,
+        *,
+        execution: _AcquisitionExecution,
+        authenticated_principal_id: str,
+        monitoring_intent: PublishedMonitoringIntent,
+        context_binding: PublishedRuntimeContextBinding,
+        collection_batch_digest: str,
+        normalized_evidence_digest: str,
+    ) -> MonitoringAcquisitionReceipt:
+        execution_completed_at = _trusted_runtime_time(self._runtime.utc_now())
+        receipt_issued_at = _trusted_runtime_time(self._runtime.utc_now())
+        if (
+            execution_completed_at < execution.started_at
+            or receipt_issued_at < execution_completed_at
+        ):
+            raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        payload: dict[str, object] = {
+            "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v1",
+            "authenticatedPrincipalId": authenticated_principal_id,
+            "athenaContextIdentityId": self._acquisition_authority.athena_context_identity_id,
+            "deploymentIdentityContractDigest": (
+                cast(
+                    str,
+                    self._acquisition_authority.deployment_identity_contract_digest,
+                )
+            ),
+            "acquisitionAuthorityDigest": self._acquisition_authority.authority_digest,
+            "collectorContractDigest": self._acquisition_authority.collector_contract_digest,
+            "intentId": monitoring_intent.intent_id,
+            "intentDigest": monitoring_intent.intent_digest,
+            "contextBindingDigest": context_binding.binding_digest,
+            "collectionBatchDigest": collection_batch_digest,
+            "normalizedEvidenceDigest": normalized_evidence_digest,
+            "executionStartedAt": execution.started_at,
+            "executionCompletedAt": execution_completed_at,
+            "receiptIssuedAt": receipt_issued_at,
+            "exchanges": tuple(execution.exchanges),
+        }
+        receipt_digest = compute_artifact_digest(_json_value(payload))
+        signed_payload = {
+            **payload,
+            "receiptId": (
+                f"monitoring-acquisition-receipt-{receipt_digest.removeprefix('sha256:')[:32]}"
+            ),
+            "receiptDigest": receipt_digest,
+        }
+        preimage = monitoring_acquisition_receipt_preimage(
+            cast(dict[str, object], _json_value(signed_payload))
+        )
+        signature = self._receipt_signer.sign_preimage(canonicalize_json(preimage).encode("utf-8"))
+        return MonitoringAcquisitionReceipt.model_validate(
+            {
+                **signed_payload,
+                "collectorAttestation": MonitoringEvidenceAttestation(
+                    signatureAlgorithm="RS256",
+                    trustAnchorRef=cast(
+                        str,
+                        self._acquisition_authority.receipt_signing_key_id,
+                    ),
+                    signedPreimageDigest=compute_artifact_digest(preimage),
+                    signature=signature,
+                ),
+            }
+        )
 
     def execute(
         self,
@@ -1190,11 +1456,25 @@ class MonitoringAcquisitionCoordinator:
             raise TypeError("acquisition requires an exact PublishedMonitoringIntent")
         if type(context_binding) is not PublishedRuntimeContextBinding:
             raise TypeError("acquisition requires an exact PublishedRuntimeContextBinding")
+        del collected_at
+        execution_started_at = _trusted_runtime_time(self._runtime.utc_now())
+        authenticated_principal_id = _canonical_identity_id(
+            self._runtime.authenticated_principal_id()
+        )
         if (
-            collected_at.utcoffset() != UTC.utcoffset(collected_at)
-            or collected_at.microsecond % 1000
+            authenticated_principal_id != self._acquisition_authority.monitoring_reader_identity_id
+            or authenticated_principal_id == self._acquisition_authority.athena_context_identity_id
         ):
-            raise MonitoringAcquisitionError("collectedAt must use UTC with millisecond precision")
+            raise MonitoringAcquisitionError(
+                "authenticated deployment identity violates acquisition separation"
+            )
+        collected_at = execution_started_at
+        execution = _AcquisitionExecution(
+            runtime=self._runtime,
+            max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
+            started_at=execution_started_at,
+            exchanges=[],
+        )
         if collector_contract_digest != self._acquisition_authority.collector_contract_digest:
             raise MonitoringAcquisitionError(
                 "collector contract digest does not match acquisition authority"
@@ -1269,27 +1549,25 @@ class MonitoringAcquisitionCoordinator:
         records: list[MonitoringCollectionRecord] = []
         coverage: list[MonitoringCoverageRecord] = []
         manual_reasons: list[str] = []
-        attribution_changes: list[ResourceChangeRecord] = []
+        attribution_changes: tuple[ResourceChangeRecord, ...] = ()
         controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
+        if any(
+            isinstance(control.signal, ActivityLogMonitoringSignal)
+            for control in monitoring_intent.controls
+        ):
+            manual_reasons.append(
+                "supporting control has no required coverage scope and was not executed"
+            )
 
         try:
-            for control in monitoring_intent.controls:
-                if isinstance(control.signal, ActivityLogMonitoringSignal):
-                    new_records, reasons, attributable = self._acquire_change_control(
-                        control,
-                        monitoring_intent=monitoring_intent,
-                        collected_at=collected_at,
-                    )
-                    records.extend(new_records)
-                    manual_reasons.extend(reasons)
-                    attribution_changes.extend(attributable)
             for control in monitoring_intent.controls:
                 if isinstance(control.signal, LogQueryMonitoringSignal):
                     new_records, new_coverage, reasons = self._acquire_log_control(
                         control,
                         monitoring_intent=monitoring_intent,
                         collected_at=collected_at,
-                        acquired_changes=tuple(attribution_changes),
+                        acquired_changes=attribution_changes,
+                        execution=execution,
                     )
                     records.extend(new_records)
                     coverage.extend(new_coverage)
@@ -1300,6 +1578,7 @@ class MonitoringAcquisitionCoordinator:
                         monitoring_intent=monitoring_intent,
                         collected_at=collected_at,
                         trusted_as_of=trusted_as_of,
+                        execution=execution,
                     )
                     records.extend(new_records)
                     coverage.append(health_coverage)
@@ -1328,9 +1607,35 @@ class MonitoringAcquisitionCoordinator:
             raise MonitoringAcquisitionError(
                 "acquired coverage does not satisfy the exact published runtime scope"
             )
+        if len(selected_coverage) != len(coverage):
+            raise MonitoringAcquisitionError(
+                "executable monitoring controls must belong to required coverage scope"
+            )
+        required_control_ids = {item.control_id for item in selected_coverage}
+        unit_records: list[MonitoringCollectionRecord] = []
+        for item in records:
+            if isinstance(item, ResourceChangeRecord):
+                continue
+            if item.control_id not in required_control_ids:
+                continue
+            if isinstance(item, NetworkWatcherFlowRecord) and (
+                item.change_correlation_id is not None or item.attribution_evidence is not None
+            ):
+                item = item.model_copy(
+                    update={
+                        "change_correlation_id": None,
+                        "attribution_method": None,
+                        "attribution_evidence": None,
+                    }
+                )
+                manual_reasons.append(
+                    "direct change attribution was omitted because its supporting "
+                    "control has no required coverage scope"
+                )
+            unit_records.append(item)
 
         previous_id, current_ids, incident_resource_id = self._select_incident(
-            records,
+            unit_records,
             controls_by_id,
         )
         batch = MonitoringCollectionBatch(
@@ -1341,7 +1646,7 @@ class MonitoringAcquisitionCoordinator:
             currentHealthSourceRecordIds=current_ids,
             records=tuple(
                 sorted(
-                    records,
+                    unit_records,
                     key=lambda item: (
                         item.record_kind,
                         item.source_record_id,
@@ -1359,6 +1664,27 @@ class MonitoringAcquisitionCoordinator:
                 )
             ),
         )
+        preliminary = self._collection_transaction.prepare(
+            batch,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            expected_active_context_authority_digest=(
+                expected_active_context_authority_digest
+            ),
+            collector_contract_digest=collector_contract_digest,
+            change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
+        )
+        acquisition_receipt = self._build_receipt(
+            execution=execution,
+            authenticated_principal_id=authenticated_principal_id,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            collection_batch_digest=sha256_hex(batch.canonical_bytes()),
+            normalized_evidence_digest=(
+                preliminary.monitoring_bundle.compute_normalized_evidence_digest_value()
+            ),
+        )
         prepared, committed, correlation_request = self._collection_transaction.execute(
             batch,
             monitoring_intent=monitoring_intent,
@@ -1371,6 +1697,7 @@ class MonitoringAcquisitionCoordinator:
             issued_at=issued_at,
             trusted_as_of=trusted_as_of,
             expires_at=expires_at,
+            acquisition_receipt=acquisition_receipt,
         )
         return MonitoringAcquisitionOutcome(
             batch=batch,
@@ -1387,6 +1714,7 @@ class MonitoringAcquisitionCoordinator:
         monitoring_intent: PublishedMonitoringIntent,
         collected_at: datetime,
         acquired_changes: tuple[ResourceChangeRecord, ...],
+        execution: _AcquisitionExecution,
     ) -> tuple[
         tuple[MonitoringCollectionRecord, ...],
         tuple[MonitoringCoverageRecord, ...],
@@ -1440,15 +1768,22 @@ class MonitoringAcquisitionCoordinator:
         )
         responses: list[tuple[LogAnalyticsQueryRequest, LogAnalyticsQueryResult]] = []
         for request in requests:
-            result = self._acquisition_port.query_log_analytics(request)
+            result = execution.invoke(
+                request,
+                self._acquisition_port.query_log_analytics,
+            )
             if type(result) is not LogAnalyticsQueryResult:
                 raise MonitoringAcquisitionError("log source returned an unexpected response type")
+            if table == "NTANetAnalytics" and len(result.rows) > 1:
+                raise MonitoringAcquisitionError(
+                    "Traffic Analytics returned multiple rows for one bounded query"
+                )
             _validate_result(
                 result,
                 request,
-                expected_identity_id=self._monitoring_reader_identity_id,
+                authenticated_principal_id=self._monitoring_reader_identity_id,
+                collector_collection_time=collected_at,
                 expected_columns=_LOG_COLUMNS[table],
-                expected_collected_at=collected_at,
             )
             if result.table != table:
                 raise MonitoringAcquisitionError("log response table does not match the request")
@@ -1458,10 +1793,22 @@ class MonitoringAcquisitionCoordinator:
         partial = False
         reasons: list[str] = []
         for request, result in responses:
+            aggregate_complete = _has_positive_aggregate_completeness(
+                result,
+                request,
+                collector_collection_time=collected_at,
+            )
             for row in result.rows:
                 _validate_row_window(row, request, exact=True)
                 if table == "Heartbeat" and isinstance(row, HeartbeatRow):
                     _require_control_scope(control, row.resource_id)
+                    if row.heartbeat_count == 0 and not aggregate_complete:
+                        partial = True
+                        reasons.append(
+                            "Heartbeat aggregate zero lacked positive raw-input and "
+                            "ingestion-completeness proof"
+                        )
+                        continue
                     source_record_id = _record_id(
                         "heartbeat",
                         request.request_digest,
@@ -1506,6 +1853,13 @@ class MonitoringAcquisitionCoordinator:
                         reasons.append(
                             "VMConnection IP-to-resource mapping was ambiguous and no causality "
                             "was claimed"
+                        )
+                        continue
+                    if row.failed_connection_count == 0 and not aggregate_complete:
+                        partial = True
+                        reasons.append(
+                            "VMConnection aggregate zero lacked positive raw-input and "
+                            "ingestion-completeness proof"
                         )
                         continue
                     source_record_id = _record_id(
@@ -1599,6 +1953,7 @@ class MonitoringAcquisitionCoordinator:
                         control=control,
                         signal=signal,
                         acquired_changes=acquired_changes,
+                        execution=execution,
                     )
                     if flow_record is None:
                         partial = True
@@ -1790,6 +2145,7 @@ class MonitoringAcquisitionCoordinator:
         control: PublishedMonitoringIntentControl,
         signal: LogQueryMonitoringSignal,
         acquired_changes: tuple[ResourceChangeRecord, ...],
+        execution: _AcquisitionExecution,
     ) -> tuple[NetworkWatcherFlowRecord | None, str | None]:
         candidate_sets = (
             row.subject_resource_candidates,
@@ -1809,6 +2165,7 @@ class MonitoringAcquisitionCoordinator:
                 "Traffic Analytics IP-to-resource mapping was ambiguous and no "
                 "causality was claimed",
             )
+        checked_at = _trusted_runtime_time(self._runtime.utc_now())
         verification_request = _build_request(
             IpFlowVerifyRequest,
             {
@@ -1823,11 +2180,11 @@ class MonitoringAcquisitionCoordinator:
                 "controlId": request.control_id,
                 "controlDigest": request.control_digest,
                 "scopeDigest": request.scope_digest,
-                "windowStart": request.window_end - timedelta(seconds=60),
-                "windowEnd": request.window_end,
+                "windowStart": checked_at - timedelta(seconds=60),
+                "windowEnd": checked_at,
                 "maxRows": self._acquisition_authority.max_rows,
                 "maxBytes": self._acquisition_authority.max_bytes,
-                "checkedAt": request.window_end,
+                "checkedAt": checked_at,
                 "targetResourceId": row.subject_resource_candidates[0],
                 "direction": row.direction,
                 "protocol": row.protocol,
@@ -1837,13 +2194,17 @@ class MonitoringAcquisitionCoordinator:
                 "destinationPort": row.destination_port,
             },
         )
-        verification = self._acquisition_port.query_ip_flow_verify(verification_request)
+        verification = execution.invoke(
+            verification_request,
+            self._acquisition_port.query_ip_flow_verify,
+        )
         if type(verification) is not IpFlowVerifyResult:
             raise MonitoringAcquisitionError("IP Flow Verify returned an unexpected response type")
         _validate_ip_flow_result(
             verification,
             verification_request,
-            expected_identity_id=self._monitoring_reader_identity_id,
+            authenticated_principal_id=self._monitoring_reader_identity_id,
+            collector_collection_time=verification_request.checked_at,
         )
         if verification.rule_resource_id is not None:
             _require_control_scope(control, verification.rule_resource_id)
@@ -1936,6 +2297,7 @@ class MonitoringAcquisitionCoordinator:
         *,
         monitoring_intent: PublishedMonitoringIntent,
         collected_at: datetime,
+        execution: _AcquisitionExecution,
     ) -> tuple[
         tuple[MonitoringCollectionRecord, ...],
         tuple[str, ...],
@@ -1971,7 +2333,10 @@ class MonitoringAcquisitionCoordinator:
                 "expectedColumns": _ACTIVITY_COLUMNS,
             },
         )
-        activity = self._acquisition_port.query_activity_log(activity_request)
+        activity = execution.invoke(
+            activity_request,
+            self._acquisition_port.query_activity_log,
+        )
         if type(activity) is not ActivityLogQueryResult:
             raise MonitoringAcquisitionError(
                 "Activity Log source returned an unexpected response type"
@@ -1979,9 +2344,9 @@ class MonitoringAcquisitionCoordinator:
         _validate_result(
             activity,
             activity_request,
-            expected_identity_id=self._monitoring_reader_identity_id,
+            authenticated_principal_id=self._monitoring_reader_identity_id,
+            collector_collection_time=collected_at,
             expected_columns=_ACTIVITY_COLUMNS,
-            expected_collected_at=collected_at,
         )
         graph_request = _build_request(
             ResourceGraphChangeQueryRequest,
@@ -1993,7 +2358,10 @@ class MonitoringAcquisitionCoordinator:
                 "expectedColumns": _RESOURCE_GRAPH_COLUMNS,
             },
         )
-        graph = self._acquisition_port.query_resource_graph_changes(graph_request)
+        graph = execution.invoke(
+            graph_request,
+            self._acquisition_port.query_resource_graph_changes,
+        )
         if type(graph) is not ResourceGraphChangeQueryResult:
             raise MonitoringAcquisitionError(
                 "Resource Graph source returned an unexpected response type"
@@ -2001,9 +2369,9 @@ class MonitoringAcquisitionCoordinator:
         _validate_result(
             graph,
             graph_request,
-            expected_identity_id=self._monitoring_reader_identity_id,
+            authenticated_principal_id=self._monitoring_reader_identity_id,
+            collector_collection_time=collected_at,
             expected_columns=_RESOURCE_GRAPH_COLUMNS,
-            expected_collected_at=collected_at,
         )
 
         activity_by_key: dict[tuple[str, str, datetime, str, str], ActivityLogRow] = {}
@@ -2082,6 +2450,7 @@ class MonitoringAcquisitionCoordinator:
         monitoring_intent: PublishedMonitoringIntent,
         collected_at: datetime,
         trusted_as_of: datetime,
+        execution: _AcquisitionExecution,
     ) -> tuple[
         tuple[MonitoringCollectionRecord, ...],
         MonitoringCoverageRecord,
@@ -2114,7 +2483,10 @@ class MonitoringAcquisitionCoordinator:
                 "expectedColumns": _RESOURCE_HEALTH_COLUMNS,
             },
         )
-        result = self._acquisition_port.query_resource_health(request)
+        result = execution.invoke(
+            request,
+            self._acquisition_port.query_resource_health,
+        )
         if type(result) is not ResourceHealthQueryResult:
             raise MonitoringAcquisitionError(
                 "Resource Health source returned an unexpected response type"
@@ -2122,9 +2494,9 @@ class MonitoringAcquisitionCoordinator:
         _validate_result(
             result,
             request,
-            expected_identity_id=self._monitoring_reader_identity_id,
+            authenticated_principal_id=self._monitoring_reader_identity_id,
+            collector_collection_time=collected_at,
             expected_columns=_RESOURCE_HEALTH_COLUMNS,
-            expected_collected_at=collected_at,
         )
         records: list[MonitoringCollectionRecord] = []
         for row in result.rows:
@@ -2296,8 +2668,10 @@ __all__ = [
     "IpFlowVerifyRequest",
     "IpFlowVerifyResult",
     "LogCoverageDescriptor",
+    "LogAggregateCompletenessProof",
     "LogAnalyticsQueryRequest",
     "LogAnalyticsQueryResult",
+    "MAX_ACQUISITION_CALLS",
     "MAX_ACQUISITION_RESPONSE_BYTES",
     "MAX_ACQUISITION_ROWS",
     "MonitoringAcquisitionAuthority",
@@ -2305,6 +2679,8 @@ __all__ = [
     "MonitoringAcquisitionError",
     "MonitoringAcquisitionOutcome",
     "MonitoringAcquisitionPort",
+    "MonitoringAcquisitionReceiptSigner",
+    "MonitoringAcquisitionRuntime",
     "ResourceGraphChangeQueryRequest",
     "ResourceGraphChangeQueryResult",
     "ResourceGraphChangeRow",
