@@ -500,9 +500,18 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   const verifyEntry = async (
     entry: ParsedFeedEntry,
   ): Promise<VerifiedOperatorGuidance> => {
-    const entryCacheKey = guidanceEntryCacheKey(entry, configured)
+    const activeIncident = activeById.get(entry.incidentId)
+    const entryCacheKey = guidanceEntryCacheKey(entry, configured, activeIncident)
     const cached = cache.entries.get(entryCacheKey)
-    if (cached) return cached
+    if (cached) {
+      const verified = await cached
+      assertCachedGuidanceMatchesCurrentAuthority(
+        verified.incident,
+        verified.lifecycle,
+        activeIncident,
+      )
+      return verified
+    }
     const pending = (async () => {
       const [feedPointer, feedPointerAttestation] = await Promise.all([
         fetchCachedGuidanceReference(
@@ -632,7 +641,6 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         lifecycleKey.value,
         cryptoProvider,
       )
-      const activeIncident = activeById.get(entry.incidentId)
       if (entry.lifecycle === 'active') {
         if (!activeIncident) {
           throw new VerificationError(
@@ -1171,18 +1179,36 @@ const requireSameVerifiedOccurrence = (
     expected.transitionId !== actual.transitionId ||
     expected.publishedAt !== actual.publishedAt ||
     expected.statePath !== actual.statePath ||
+    expected.stateVersion !== actual.stateVersion ||
     expected.stateSha256 !== actual.stateSha256 ||
     expected.attestationPath !== actual.attestationPath ||
+    expected.attestationVersion !== actual.attestationVersion ||
     expected.attestationSha256 !== actual.attestationSha256 ||
     expected.pointerPath !== actual.pointerPath ||
+    expected.pointerVersion !== actual.pointerVersion ||
     expected.pointerSha256 !== actual.pointerSha256 ||
     expected.pointerAttestationPath !== actual.pointerAttestationPath ||
+    expected.pointerAttestationVersion !== actual.pointerAttestationVersion ||
     expected.pointerAttestationSha256 !== actual.pointerAttestationSha256
   ) {
     throw new VerificationError(
       'Incident feed v2 active occurrence does not match verified v1 authority.',
     )
   }
+}
+
+export const assertCachedGuidanceMatchesCurrentAuthority = (
+  cachedIncident: VerifiedIncident,
+  lifecycle: VerifiedOperatorGuidance['lifecycle'],
+  activeIncident: VerifiedIncident | undefined,
+): void => {
+  if (lifecycle !== 'active') return
+  if (!activeIncident) {
+    throw new VerificationError(
+      'Cached incident guidance has no current verified v1 authority.',
+    )
+  }
+  requireSameVerifiedOccurrence(activeIncident, cachedIncident)
 }
 
 export const requireOccurrenceBinding = async (
@@ -3341,6 +3367,7 @@ export const fetchBudgetedGuidanceAsset = async (
 const guidanceEntryCacheKey = (
   entry: ParsedFeedEntry,
   anchors: NonNullable<GuidanceLoadOptions['anchors']>,
+  activeIncident: VerifiedIncident | undefined,
 ): string =>
   canonicalizeJson({
     incidentId: entry.incidentId,
@@ -3367,6 +3394,22 @@ const guidanceEntryCacheKey = (
       guidanceKeyId: anchors.guidanceKeyId,
       guidanceFingerprint: anchors.guidanceFingerprint,
     },
+    activeAuthority:
+      activeIncident?.occurrence === undefined
+        ? null
+        : {
+            stateResultDigest: activeIncident.state.resultDigest,
+            updatedAt: activeIncident.state.updatedAt,
+            transitionId: activeIncident.occurrence.transitionId,
+            publishedAt: activeIncident.occurrence.publishedAt,
+            stateVersion: activeIncident.occurrence.stateVersion ?? null,
+            attestationVersion:
+              activeIncident.occurrence.attestationVersion ?? null,
+            pointerVersion: activeIncident.occurrence.pointerVersion ?? null,
+            pointerAttestationVersion:
+              activeIncident.occurrence.pointerAttestationVersion ?? null,
+            pointerSha256: activeIncident.occurrence.pointerSha256,
+          },
   })
 
 const rememberCached = <Key, Value>(

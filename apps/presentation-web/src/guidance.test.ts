@@ -2,6 +2,7 @@ import { canonicalizeJson, sha256Digest, type JsonValue } from './canonical'
 import type { Sha256Digest } from './contracts'
 import {
   assertGuidanceMatchesVerifiedOccurrence,
+  assertCachedGuidanceMatchesCurrentAuthority,
   createGuidanceLoadCache,
   fetchBudgetedGuidanceAsset,
   fetchCachedGuidanceReference,
@@ -514,6 +515,8 @@ describe('WC-027 guidance presentation contract', () => {
     index.publishedAt = '2026-09-04T03:50:00+00:00'
     const active = index.active as Record<string, JsonValue>[]
     active[0]!.updatedAt = '2026-09-04T03:48:00.1+00:00'
+    const activePointer = active[0]!.feedPointerReference as Record<string, JsonValue>
+    activePointer.version = '2026-08-20T23:50:41.2983616Z'
     const resolved = index.recentlyResolved as Record<string, JsonValue>[]
     resolved[0]!.updatedAt = '2026-09-04T03:47:00.12+00:00'
     resolved[1]!.updatedAt = '2026-09-04T03:46:00.123+00:00'
@@ -522,7 +525,12 @@ describe('WC-027 guidance presentation contract', () => {
 
     await expect(parseFeedIndex(candidate)).resolves.toMatchObject({
       publishedAt: '2026-09-04T03:50:00.000Z',
-      active: [{ updatedAt: '2026-09-04T03:48:00.100Z' }],
+      active: [{
+        updatedAt: '2026-09-04T03:48:00.100Z',
+        feedPointerReference: {
+          version: '2026-08-20T23:50:41.2983616Z',
+        },
+      }],
       recentlyResolved: [
         { updatedAt: '2026-09-04T03:47:00.120Z' },
         { updatedAt: '2026-09-04T03:46:00.123Z' },
@@ -699,6 +707,27 @@ describe('WC-027 guidance presentation contract', () => {
     await expect(
       requireOccurrenceBinding(pointer, publicationChanged, globalThis.crypto),
     ).rejects.toThrow(/verified v1 occurrence/i)
+
+    const cachedActive: VerifiedIncident = {
+      ...incident,
+      state: {
+        ...incident.state,
+        lifecycle: 'active',
+        availability: 'warning',
+        operatorAttention: 'required',
+      },
+      occurrence: { ...occurrence },
+    }
+    const advancedAuthority = structuredClone(cachedActive)
+    advancedAuthority.occurrence!.stateVersion =
+      '2026-08-20T23:50:41.3983616Z'
+    expect(() =>
+      assertCachedGuidanceMatchesCurrentAuthority(
+        cachedActive,
+        'active',
+        advancedAuthority,
+      ),
+    ).toThrow(/verified v1 authority/i)
   })
 
   it('accepts bounded lower-confidence read-only guidance', async () => {
