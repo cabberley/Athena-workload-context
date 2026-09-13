@@ -14,9 +14,11 @@ from athena_context.contracts import (
     ApprovedChangeScope,
     ChangeEvidencePersistenceHandoff,
     LogQueryMonitoringSignal,
+    MonitoringControlProvenance,
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
     MonitoringIntentScope,
+    PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
     PublishedMonitoringIntentControl,
@@ -26,8 +28,11 @@ from athena_context.contracts import (
     compute_artifact_digest,
     monitoring_handoff_preimage,
     sha256_hex,
+    validate_published_monitoring_intent_assets,
 )
+from athena_context.correlation.verification import _verify_signed_monitoring_intent
 from athena_context.monitoring_collection import (
+    MAX_COLLECTION_TRUST_DELAY_SECONDS,
     AmaHeartbeatRecord,
     CommittedMonitoringCollection,
     ConnectionMonitorRecord,
@@ -250,7 +255,7 @@ def _coverage_scope_digest(
     *,
     control: PublishedMonitoringIntentControl,
     resource_ids: tuple[str, ...],
-    path_id: str,
+    path_id: str | None,
     direction: str | None = None,
     five_tuple_digest: str | None = None,
     endpoint_test_reference: str | None = None,
@@ -287,6 +292,11 @@ def _authority(
     required = tuple(
         sorted(
             (
+                _coverage_scope_digest(
+                    control=controls["heartbeat"],
+                    resource_ids=(WEB_ID,),
+                    path_id=None,
+                ),
                 _coverage_scope_digest(
                     control=controls["flow"],
                     resource_ids=(WEB_ID, DB_ID, NSG_ID, NSG_RULE_ID),
@@ -690,6 +700,46 @@ def _batch(
             ),
             status="complete",
         ),
+        MonitoringCoverageRecord(
+            controlId=controls["endpoint"].control_id,
+            sourceRecordId="coverage-endpoint-healthy",
+            family="endpointHealth",
+            resourceIds=tuple(sorted((WEB_ID.casefold(), DB_ID.casefold()))),
+            pathId=path.path_id,
+            observedStart=NOW - timedelta(minutes=10),
+            observedEnd=NOW - timedelta(minutes=5),
+            **_coverage_query_fields(
+                controls["endpoint"],
+                (records_by_id["endpoint-healthy"],),
+            ),
+            status="complete",
+        ),
+        MonitoringCoverageRecord(
+            controlId=controls["heartbeat"].control_id,
+            sourceRecordId="coverage-heartbeat-healthy",
+            family="guest",
+            resourceIds=(WEB_ID.casefold(),),
+            observedStart=NOW - timedelta(minutes=10),
+            observedEnd=NOW - timedelta(minutes=5),
+            **_coverage_query_fields(
+                controls["heartbeat"],
+                (records_by_id["heartbeat-healthy"],),
+            ),
+            status="complete",
+        ),
+        MonitoringCoverageRecord(
+            controlId=controls["heartbeat"].control_id,
+            sourceRecordId="coverage-heartbeat-unhealthy",
+            family="guest",
+            resourceIds=(WEB_ID.casefold(),),
+            observedStart=NOW - timedelta(minutes=5),
+            observedEnd=NOW,
+            **_coverage_query_fields(
+                controls["heartbeat"],
+                (records_by_id["heartbeat-unhealthy"],),
+            ),
+            status="complete",
+        ),
     )
     return MonitoringCollectionBatch(
         schemaVersion="athena.wc028MonitoringCollectionBatch.v2",
@@ -835,6 +885,38 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
 
     assert commit.calls == 1
     assert prepared.intent_digest
+    assert prepared.monitoring_bundle.monitoring_intent_reference is not None
+    query_observation_digests = {
+        item.query_execution_digest
+        for item in prepared.monitoring_bundle.observations
+        if item.query_execution_digest is not None
+    }
+    covered_query_digests = [
+        digest
+        for item in prepared.monitoring_bundle.coverage
+        for digest in item.query_execution_digests
+    ]
+    assert query_observation_digests
+    assert sorted(query_observation_digests) == sorted(covered_query_digests)
+    assert len(covered_query_digests) == len(set(covered_query_digests))
+    assert all(
+        item.control_provenance is not None
+        for item in (
+            *prepared.monitoring_bundle.observations,
+            *prepared.monitoring_bundle.coverage,
+        )
+    )
+    intent_reference = prepared.monitoring_bundle.monitoring_intent_reference
+    assert intent_reference.intent_reference in request.evidence_inventory.source_references
+    assert (
+        intent_reference.attestation_reference
+        in request.evidence_inventory.source_references
+    )
+    assert (
+        request.evidence_inventory.monitoring_intent_asset_reference_digest
+        == intent_reference.asset_reference_digest
+    )
+    assert request.evidence_inventory.monitoring_control_provenance_digest
     assert hypothesis.category == "networkSecurityChange"
     assert hypothesis.confidence == "Confirmed"
     assert hypothesis.cause_resource_id == NSG_RULE_ID.casefold()
@@ -1419,6 +1501,53 @@ def test_complete_coverage_rejects_unknown_query_execution_digest() -> None:
     assert commit.calls == 0
 
 
+def test_every_query_observation_requires_exactly_one_compatible_coverage() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    uncovered = tuple(
+        item.model_copy(
+            update={
+                "status": "unavailable",
+                "detail": "synthetic query outage",
+                "query_execution_digests": (),
+            }
+        )
+        if item.source_record_id == "coverage-heartbeat-healthy"
+        else item
+        for item in batch.coverage
+    )
+
+    with pytest.raises(MonitoringCollectionError, match="exactly one compatible coverage"):
+        _transaction().prepare(
+            batch.model_copy(update={"coverage": uncovered}),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=1),
+        )
+
+    flow = next(
+        item for item in batch.coverage if item.source_record_id == "coverage-flow"
+    )
+    duplicated = (*batch.coverage, flow.model_copy(update={"source_record_id": "coverage-flow-2"}))
+    with pytest.raises(MonitoringCollectionError, match="exactly one compatible coverage"):
+        _transaction().prepare(
+            batch.model_copy(update={"coverage": duplicated}),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=1),
+        )
+
+
 def test_v1_collection_batch_is_rejected_after_query_binding_upgrade() -> None:
     context, intent, controls = _authority()
     batch = _batch(controls).model_copy(
@@ -1680,6 +1809,115 @@ def test_resource_health_freshness_is_rechecked_at_trusted_as_of() -> None:
         )
 
     assert commit.calls == 0
+
+
+def test_collection_to_trusted_as_of_delay_is_bounded() -> None:
+    context, intent, controls = _authority()
+
+    with pytest.raises(MonitoringCollectionError, match="bounded"):
+        _transaction().prepare(
+            _batch(controls),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW
+            + timedelta(seconds=MAX_COLLECTION_TRUST_DELAY_SECONDS + 1),
+        )
+
+
+class _IntentAssetReader:
+    def __init__(
+        self,
+        reference: PublishedMonitoringIntentAssetReference,
+        intent: PublishedMonitoringIntent,
+        attestation: PublishedMonitoringIntentAttestation,
+    ) -> None:
+        self.references: list[VersionPinnedBlobReference] = []
+        self.payloads = {
+            reference.intent_reference: intent.canonical_bytes(),
+            reference.attestation_reference: attestation.canonical_bytes(),
+        }
+
+    def read(self, reference: VersionPinnedBlobReference) -> bytes:
+        self.references.append(reference)
+        return self.payloads[reference]
+
+
+class _IntentAssetVerifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def verify(self, reference, intent, attestation) -> str:
+        self.calls += 1
+        validate_published_monitoring_intent_assets(
+            reference,
+            intent,
+            attestation,
+            trusted_key_id=INTENT_KEY_ID,
+            signature_verifier=(
+                lambda _payload, signature: signature == INTENT_SIGNATURE
+            ),
+        )
+        return reference.reference_digest
+
+
+def test_downstream_verification_rereads_signed_intent_and_resolves_controls() -> None:
+    _, intent, _ = _authority()
+    reference, attestation = _intent_assets(intent)
+    _, _, request, _ = _execute(direct_attribution=True)
+    reader = _IntentAssetReader(reference, intent, attestation)
+    verifier = _IntentAssetVerifier()
+
+    _verify_signed_monitoring_intent(
+        request,
+        reader=reader,
+        verifier=verifier,
+    )
+
+    assert reader.references == [
+        reference.intent_reference,
+        reference.attestation_reference,
+    ]
+    assert verifier.calls == 1
+
+    reader.payloads[reference.intent_reference] = b"{}\n"
+    with pytest.raises(ValueError, match="immutable references"):
+        _verify_signed_monitoring_intent(
+            request,
+            reader=reader,
+            verifier=verifier,
+        )
+    reader.payloads[reference.intent_reference] = intent.canonical_bytes()
+
+    observation = request.monitoring_bundle.observations[0]
+    assert observation.control_provenance is not None
+    forged_provenance = MonitoringControlProvenance(
+        controlId="monitoring-control-" + "f" * 32,
+        controlDigest="sha256:" + "f" * 64,
+        sourceClausePath="/controls/forged",
+    )
+    forged_observation = observation.model_copy(
+        update={"control_provenance": forged_provenance}
+    )
+    forged_bundle = request.monitoring_bundle.model_copy(
+        update={
+            "observations": (
+                forged_observation,
+                *request.monitoring_bundle.observations[1:],
+            )
+        }
+    )
+    forged_request = request.model_copy(update={"monitoring_bundle": forged_bundle})
+    with pytest.raises(ValueError, match="does not resolve"):
+        _verify_signed_monitoring_intent(
+            forged_request,
+            reader=reader,
+            verifier=verifier,
+        )
 
 
 def test_preparation_is_deterministic_for_input_order() -> None:

@@ -36,7 +36,20 @@ The boundary:
   collector cannot claim another collector's completeness;
 - binds query-derived coverage to exact query-execution digests, reviewed query digest and target,
   evaluation window, and frequency. Complete coverage must be composed solely of bounded,
-  contiguous, fresh executions with an exact matching resource/path/tuple scope;
+  contiguous, fresh executions with an exact matching resource/path/tuple scope. Every persisted
+  query-derived observation carries its own execution digest, and that digest must occur exactly
+  once in compatible persisted coverage for the same control and scope;
+- rejects `treatAsHealthy` for activation-eligible intent. The value remains parseable for
+  backward-compatible draft inspection, but production activation cannot convert missing
+  telemetry into healthy evidence;
+- validates every observation interval, coverage interval, and normalized Resource Graph change
+  against `trustedAsOf`, and bounds the delay from collection to trusted evaluation to 20 minutes;
+- persists the immutable intent and attestation Blob references with the monitoring bundle,
+  includes them in the correlation evidence inventory, and records digest-bound `controlId`,
+  `controlDigest`, and `sourceClausePath` provenance on every observation and coverage record;
+- requires the production correlation verifier to re-read the version-pinned intent and
+  attestation, verify the detached signature and active-context binding, and resolve every
+  persisted control provenance tuple before evaluating any hypothesis;
 - keeps monitoring-owned evidence resources, such as a Connection Monitor resource, in a signed
   `evidenceResourceIds` scope distinct from workload dependency-path coverage resources;
 - normalizes into the existing WC-026 observation, coverage, change-artifact, incident-transition,
@@ -66,6 +79,12 @@ intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health con
 required freshness bound. Version 1 assets are rejected rather than silently treating unbound
 coverage or unbounded health events as activation eligible.
 
+The shared WC-026 bundle and request schema identifiers remain unchanged for compatibility with
+previously persisted evidence. Their new provenance and query-execution fields are optional when
+parsing legacy artifacts. WC-028 always emits them, and the production `CorrelationService` fails
+closed when the signed intent references or resolvable provenance are absent. Legacy unsigned
+fixtures remain usable only through the non-production verification harness.
+
 ## Consequences
 
 - A complete synthetic NSG-change/connectivity-loss batch produces a Confirmed existing
@@ -76,6 +95,9 @@ coverage or unbounded health events as activation eligible.
   before the persistence port is called.
 - Unsigned, incorrectly signed, or dry-run-only monitoring intent fails before evidence
   normalization or persistence.
+- Activation-eligible intent using `treatAsHealthy`, uncovered or multiply covered query
+  observations, excessive collection-to-trust delay, and unresolved signed control provenance all
+  fail closed.
 - No Azure resource, RBAC assignment, query deployment, alert rule, or connection monitor is
   created by this slice.
 - A later slice must implement the identity-isolated Azure acquisition and atomic persistence port,
@@ -97,4 +119,8 @@ coverage or unbounded health events as activation eligible.
 - High-confidence cap and explicit IP Flow Verify investigation evidence without direct
   attribution.
 - No persistence call when an unreviewed query digest is supplied.
+- Persisted query observations and coverage retain exact execution digests with one-to-one
+  compatible coverage.
+- Production verification re-reads the immutable signed monitoring intent and attestation and
+  rejects unresolved control provenance.
 - Stable bundle and change-artifact bytes under input reordering.

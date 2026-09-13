@@ -671,6 +671,10 @@ def validate_monitoring_intent_activation_eligible(
     intent = PublishedMonitoringIntent.model_validate_json(intent.model_dump_json(by_alias=True))
     if any(item.dry_run_only for item in intent.controls):
         raise ValueError("dry-run-only monitoring intent cannot be activated")
+    if any(item.missing_data_behavior == "treatAsHealthy" for item in intent.controls):
+        raise ValueError(
+            "activation-eligible monitoring intent cannot treat missing data as healthy"
+        )
 
 
 def validate_published_monitoring_intent_assets(

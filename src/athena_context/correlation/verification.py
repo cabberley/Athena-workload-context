@@ -13,6 +13,7 @@ from typing import Protocol
 from athena_context.artifacts import ArtifactReadRequest
 from athena_context.azure_adapters import (
     AzureBlobVersionPinnedArtifactReader,
+    KeyVaultRsaSigner,
     KeyVaultTrustedKeyResolver,
 )
 from athena_context.contracts.change_ingestion import (
@@ -48,6 +49,13 @@ from athena_context.contracts.monitoring import (
     MonitoringEvidenceHandoff,
     verify_monitoring_evidence_handoff_attestation,
 )
+from athena_context.contracts.monitoring_intent import (
+    PublishedMonitoringIntent,
+    PublishedMonitoringIntentAssetReference,
+    PublishedMonitoringIntentAttestation,
+    validate_monitoring_intent_activation_eligible,
+    validate_published_monitoring_intent_assets,
+)
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 from athena_context.correlation.rules import (
     CORRELATION_RULE_CATALOG,
@@ -81,6 +89,15 @@ class ChangeArtifactVerifier(Protocol):
         artifact: ChangeEvidenceArtifact,
         *,
         as_of: UtcDateTime,
+    ) -> str: ...
+
+
+class MonitoringIntentAssetVerifier(Protocol):
+    def verify(
+        self,
+        reference: PublishedMonitoringIntentAssetReference,
+        intent: PublishedMonitoringIntent,
+        attestation: PublishedMonitoringIntentAttestation,
     ) -> str: ...
 
 
@@ -185,12 +202,112 @@ class TrustedChangeArtifactVerifier:
 
 
 @dataclass(frozen=True, slots=True)
+class TrustedMonitoringIntentAssetVerifier:
+    trusted_key_id: str
+    signer: KeyVaultRsaSigner
+
+    def __post_init__(self) -> None:
+        if type(self.signer) is not KeyVaultRsaSigner:
+            raise TypeError(
+                "production monitoring intent verification requires KeyVaultRsaSigner"
+            )
+        if self.signer.trusted_key_anchor.key_vault_key_id != self.trusted_key_id:
+            raise ValueError(
+                "monitoring intent verifier key does not match the trusted key"
+            )
+
+    def verify(
+        self,
+        reference: PublishedMonitoringIntentAssetReference,
+        intent: PublishedMonitoringIntent,
+        attestation: PublishedMonitoringIntentAttestation,
+    ) -> str:
+        validate_published_monitoring_intent_assets(
+            reference,
+            intent,
+            attestation,
+            trusted_key_id=self.trusted_key_id,
+            signature_verifier=self.signer.verify_preimage,
+        )
+        return reference.reference_digest
+
+
+def _verify_signed_monitoring_intent(
+    request: CorrelationRequest,
+    *,
+    reader: ImmutableArtifactReader | None,
+    verifier: MonitoringIntentAssetVerifier | None,
+) -> None:
+    evidence_reference = request.monitoring_bundle.monitoring_intent_reference
+    if evidence_reference is None or reader is None or verifier is None:
+        raise ValueError(
+            "production correlation requires signed monitoring intent assets"
+        )
+    intent_bytes = reader.read(evidence_reference.intent_reference)
+    attestation_bytes = reader.read(evidence_reference.attestation_reference)
+    if (
+        sha256_hex(intent_bytes) != evidence_reference.intent_reference.content_digest
+        or sha256_hex(attestation_bytes)
+        != evidence_reference.attestation_reference.content_digest
+    ):
+        raise ValueError(
+            "monitoring intent Blob bytes do not match immutable references"
+        )
+    intent = PublishedMonitoringIntent.model_validate_json(intent_bytes)
+    attestation = PublishedMonitoringIntentAttestation.model_validate_json(
+        attestation_bytes
+    )
+    reference = PublishedMonitoringIntentAssetReference(
+        schemaVersion="athena.wc028PublishedMonitoringIntentAssetReference.v1",
+        referenceId=evidence_reference.asset_reference_id,
+        referenceDigest=evidence_reference.asset_reference_digest,
+        intentId=evidence_reference.intent_id,
+        intentDigest=evidence_reference.intent_digest,
+        intentReference=evidence_reference.intent_reference,
+        attestationReference=evidence_reference.attestation_reference,
+    )
+    if verifier.verify(reference, intent, attestation) != reference.reference_digest:
+        raise ValueError("monitoring intent verification proof is invalid")
+    if not isinstance(request.context_binding, PublishedRuntimeContextBinding):
+        raise ValueError("monitoring intent requires published runtime context")
+    validate_monitoring_intent_activation_eligible(
+        intent,
+        request.context_binding,
+        expected_active_context_authority_digest=(
+            request.context_binding.publication_authority.authority_digest
+        ),
+    )
+    controls = {item.control_id: item for item in intent.controls}
+    for item in (
+        *request.monitoring_bundle.observations,
+        *request.monitoring_bundle.coverage,
+    ):
+        provenance = item.control_provenance
+        if provenance is None:
+            raise ValueError(
+                "monitoring evidence lacks signed control provenance"
+            )
+        control = controls.get(provenance.control_id)
+        if (
+            control is None
+            or provenance.control_digest != control.control_digest
+            or provenance.source_clause_path != control.source_clause_path
+        ):
+            raise ValueError(
+                "monitoring evidence control provenance does not resolve in signed intent"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class _CorrelationVerificationService:
     monitoring_reader: ImmutableArtifactReader
     change_reader: ImmutableArtifactReader
     authority_reader: ImmutableArtifactReader
     monitoring_verifier: MonitoringHandoffVerifier
     change_verifier: ChangeArtifactVerifier
+    monitoring_intent_reader: ImmutableArtifactReader | None = None
+    monitoring_intent_verifier: MonitoringIntentAssetVerifier | None = None
+    require_signed_monitoring_intent: bool = False
 
     def compute(
         self,
@@ -227,6 +344,12 @@ class _CorrelationVerificationService:
         persisted_bundle = MonitoringEvidenceBundle.model_validate_json(monitoring_bytes)
         if persisted_bundle != request.monitoring_bundle:
             raise ValueError("monitoring bundle does not match the immutable Blob")
+        if self.require_signed_monitoring_intent:
+            _verify_signed_monitoring_intent(
+                request,
+                reader=self.monitoring_intent_reader,
+                verifier=self.monitoring_intent_verifier,
+            )
         _verify_canonical_incident_anchor(request)
         _verify_network_rule_parents(request)
         if (
@@ -300,6 +423,14 @@ class CorrelationService:
     authority_reader: AzureBlobCorrelationArtifactReader
     monitoring_verifier: TrustedMonitoringHandoffVerifier
     change_verifier: TrustedChangeArtifactVerifier
+    monitoring_intent_reader: AzureBlobCorrelationArtifactReader | None = None
+    monitoring_intent_verifier: TrustedMonitoringIntentAssetVerifier | None = None
+    _require_signed_monitoring_intent: bool = field(
+        default=True,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _sealing_key: bytes = field(
         default_factory=lambda: secrets.token_bytes(32),
         init=False,
@@ -314,10 +445,22 @@ class CorrelationService:
     )
 
     def __post_init__(self) -> None:
+        if type(self.monitoring_intent_reader) is not AzureBlobCorrelationArtifactReader:
+            raise TypeError(
+                "production correlation requires monitoring intent artifact reader"
+            )
+        if (
+            type(self.monitoring_intent_verifier)
+            is not TrustedMonitoringIntentAssetVerifier
+        ):
+            raise TypeError(
+                "production correlation requires TrustedMonitoringIntentAssetVerifier"
+            )
         readers = (
             self.monitoring_reader,
             self.change_reader,
             self.authority_reader,
+            self.monitoring_intent_reader,
         )
         if any(type(item) is not AzureBlobCorrelationArtifactReader for item in readers):
             raise TypeError("production correlation requires AzureBlobCorrelationArtifactReader")
@@ -325,6 +468,7 @@ class CorrelationService:
             "wc024-monitoring/",
             "change-evidence/",
             "context-authority/",
+            "monitoring-intent/",
         )
         if tuple(item.required_prefix for item in readers) != expected_prefixes:
             raise ValueError("production correlation artifact readers use invalid prefixes")
@@ -354,12 +498,22 @@ class CorrelationService:
     ) -> VerifiedCorrelationReport:
         if not isinstance(request.context_binding, PublishedRuntimeContextBinding):
             raise ValueError("production correlation requires published runtime context")
+        if self._require_signed_monitoring_intent and (
+            self.monitoring_intent_reader is None
+            or self.monitoring_intent_verifier is None
+        ):
+            raise ValueError(
+                "production correlation requires signed monitoring intent verification"
+            )
         hypotheses = _CorrelationVerificationService(
             monitoring_reader=self.monitoring_reader,
             change_reader=self.change_reader,
             authority_reader=self.authority_reader,
             monitoring_verifier=self.monitoring_verifier,
             change_verifier=self.change_verifier,
+            monitoring_intent_reader=self.monitoring_intent_reader,
+            monitoring_intent_verifier=self.monitoring_intent_verifier,
+            require_signed_monitoring_intent=self._require_signed_monitoring_intent,
         ).compute(
             request,
             evaluated_at=self._clock(),

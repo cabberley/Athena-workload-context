@@ -181,6 +181,10 @@ class KeyVaultRsaSigner:
             credential,
         )
 
+    @property
+    def trusted_key_anchor(self) -> TrustedKeyAnchor:
+        return self._trusted_key_anchor
+
     def sign(self, request: SnapshotSigningRequest) -> str:
         if (
             request.trusted_key_anchor != self._trusted_key_anchor

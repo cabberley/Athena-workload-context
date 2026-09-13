@@ -10,6 +10,7 @@ from athena_context.contracts import (
     LogQueryMonitoringSignal,
     MetricMonitoringSignal,
     MonitoringIntentScope,
+    MonitoringMissingDataBehavior,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
@@ -86,12 +87,13 @@ def _control(
     signal=None,
     dry_run_only: bool = False,
     source_clause_path: str = "/controls/cpu-pressure",
+    missing_data_behavior: MonitoringMissingDataBehavior = "reviewRequired",
 ) -> PublishedMonitoringIntentControl:
     payload: dict[str, object] = {
         "sourceClausePath": source_clause_path,
         "ownerRef": "synthetic-platform-owner",
         "severity": 2,
-        "missingDataBehavior": "reviewRequired",
+        "missingDataBehavior": missing_data_behavior,
         "actionBehavior": "none",
         "dryRunOnly": dry_run_only,
         "scope": _scope(),
@@ -495,6 +497,22 @@ def test_dry_run_intent_cannot_be_activated() -> None:
     context = _context_binding()
 
     with pytest.raises(ValueError, match="dry-run-only"):
+        validate_monitoring_intent_activation_eligible(
+            intent,
+            context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+        )
+
+
+def test_treat_as_healthy_intent_cannot_be_activated() -> None:
+    intent = _intent(
+        controls=(_control(missing_data_behavior="treatAsHealthy"),)
+    )
+    context = _context_binding()
+
+    with pytest.raises(ValueError, match="cannot treat missing data as healthy"):
         validate_monitoring_intent_activation_eligible(
             intent,
             context,

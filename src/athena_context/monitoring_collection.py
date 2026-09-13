@@ -28,8 +28,10 @@ from athena_context.contracts import (
     GuestSignalObservation,
     IncidentHealthTransition,
     LogQueryMonitoringSignal,
+    MonitoringControlProvenance,
     MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
+    MonitoringIntentEvidenceReference,
     MonitoringObservation,
     NetworkFlowObservation,
     NormalizedChangeEvidence,
@@ -57,6 +59,7 @@ from athena_context.eventing.change_ingestion import (
 MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
 MAX_MONITORING_COLLECTION_BYTES = 512 * 1024
 MAX_MONITORING_COLLECTION_RECORDS = 1000
+MAX_COLLECTION_TRUST_DELAY_SECONDS = 1200
 _DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 _CAUSAL_NSG_PROPERTY_PREFIXES = (
     "properties.access",
@@ -569,6 +572,7 @@ class PreparedMonitoringCollection:
     intent_id: str
     intent_digest: str
     context_binding_digest: str
+    monitoring_intent_reference: PublishedMonitoringIntentAssetReference
     monitoring_bundle: MonitoringEvidenceBundle
     change_artifacts: tuple[ChangeEvidenceArtifact, ...]
     incident_resource_id: str
@@ -607,6 +611,29 @@ def _source_root(control: PublishedMonitoringIntentControl, intent_digest: str) 
     return _opaque_reference(
         "monitoring-control",
         f"{intent_digest}\0{control.control_id}\0{control.control_digest}",
+    )
+
+
+def _control_provenance(
+    control: PublishedMonitoringIntentControl,
+) -> MonitoringControlProvenance:
+    return MonitoringControlProvenance(
+        controlId=control.control_id,
+        controlDigest=control.control_digest,
+        sourceClausePath=control.source_clause_path,
+    )
+
+
+def _monitoring_intent_evidence_reference(
+    reference: PublishedMonitoringIntentAssetReference,
+) -> MonitoringIntentEvidenceReference:
+    return MonitoringIntentEvidenceReference(
+        intentId=reference.intent_id,
+        intentDigest=reference.intent_digest,
+        assetReferenceId=reference.reference_id,
+        assetReferenceDigest=reference.reference_digest,
+        intentReference=reference.intent_reference,
+        attestationReference=reference.attestation_reference,
     )
 
 
@@ -687,9 +714,12 @@ def _coverage(
         ),
         "coverageStart": record.observed_start,
         "coverageEnd": record.observed_end,
+        "controlProvenance": _control_provenance(control),
         "status": record.status,
         "detail": record.detail,
     }
+    if record.query_execution_digests:
+        payload["queryExecutionDigests"] = record.query_execution_digests
     digest = compute_artifact_digest(_json_value(payload))
     return EvidenceCoverage.model_validate(
         {
@@ -861,9 +891,12 @@ def _require_path(
 def _validate_record_window(
     record: _WindowedCollectionRecord,
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> None:
-    if record.observed_end > collected_at:
-        raise MonitoringCollectionError("collector record is newer than collectedAt")
+    if record.observed_end > collected_at or record.observed_end > trusted_as_of:
+        raise MonitoringCollectionError(
+            "collector record is newer than collectedAt or trustedAsOf"
+        )
 
 
 def _heartbeat_observation(
@@ -897,6 +930,8 @@ def _heartbeat_observation(
             "ama-heartbeat",
             record.source_record_id,
         ),
+        "controlProvenance": _control_provenance(control),
+        "queryExecutionDigest": record.query_execution_digest,
         "summaryCode": (
             "guest.heartbeat-review"
             if condition is None
@@ -951,6 +986,8 @@ def _endpoint_observation(
             "vm-insights",
             record.source_record_id,
         ),
+        "controlProvenance": _control_provenance(control),
+        "queryExecutionDigest": record.query_execution_digest,
         "summaryCode": (
             "endpoint.vm-connection-review"
             if condition is None
@@ -1185,6 +1222,8 @@ def _connection_monitor_observation(
             "connection-monitor",
             record.source_record_id,
         ),
+        "controlProvenance": _control_provenance(control),
+        "queryExecutionDigest": record.query_execution_digest,
         "summaryCode": f"network.connection-monitor-{record.status}",
         "pathId": record.path_id,
         "monitorResourceId": monitor_id,
@@ -1320,6 +1359,8 @@ def _network_flow_observation(
             "network-watcher",
             record.source_record_id,
         ),
+        "controlProvenance": _control_provenance(control),
+        "queryExecutionDigest": record.query_execution_digest,
         "summaryCode": f"network.flow-{record.decision}",
         "pathId": record.path_id,
         "decision": record.decision,
@@ -1412,6 +1453,7 @@ def _resource_health_observation(
             "resource-health",
             record.source_record_id,
         ),
+        "controlProvenance": _control_provenance(control),
         "summaryCode": f"health.resource-{record.current_status.casefold()}",
         "healthKind": "resourceHealth",
         "status": state_by_status[record.current_status],
@@ -1568,9 +1610,11 @@ class MonitoringCollectionTransaction:
             trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)
             or trusted_as_of.microsecond % 1000
             or trusted_as_of < batch.collected_at
+            or (trusted_as_of - batch.collected_at).total_seconds()
+            > MAX_COLLECTION_TRUST_DELAY_SECONDS
         ):
             raise MonitoringCollectionError(
-                "collection trustedAsOf must be millisecond UTC at or after collectedAt"
+                "collection trustedAsOf must be bounded millisecond UTC after collectedAt"
             )
         if _DIGEST_PATTERN.fullmatch(collector_contract_digest) is None:
             raise MonitoringCollectionError("collector contract digest is invalid")
@@ -1618,6 +1662,8 @@ class MonitoringCollectionTransaction:
                 != _canonical_resource_id(change_record.target_resource_id)
                 or evidence.correlation_id != change_record.correlation_id
                 or evidence.occurred_at != change_record.occurred_at
+                or evidence.occurred_at > trusted_as_of
+                or evidence.received_at > trusted_as_of
                 or evidence.operation_name != change_record.operation_name.casefold()
                 or evidence.result != change_record.result_type.casefold()
             ):
@@ -1654,7 +1700,11 @@ class MonitoringCollectionTransaction:
         for collection_record in batch.records:
             if isinstance(collection_record, ResourceChangeRecord):
                 continue
-            _validate_record_window(collection_record, batch.collected_at)
+            _validate_record_window(
+                collection_record,
+                batch.collected_at,
+                trusted_as_of,
+            )
             control = selected_controls[collection_record.source_record_id]
             observation: MonitoringObservation
             if isinstance(collection_record, AmaHeartbeatRecord):
@@ -1718,6 +1768,15 @@ class MonitoringCollectionTransaction:
                 records_by_execution,
                 collected_at=batch.collected_at,
             )
+        coverage_counts = dict.fromkeys(records_by_execution, 0)
+        for coverage_record in batch.coverage:
+            for digest in coverage_record.query_execution_digests:
+                if digest in coverage_counts:
+                    coverage_counts[digest] += 1
+        if any(count != 1 for count in coverage_counts.values()):
+            raise MonitoringCollectionError(
+                "every persisted query observation must have exactly one compatible coverage"
+            )
         coverage_pairs = tuple(
             (
                 coverage_record,
@@ -1730,7 +1789,11 @@ class MonitoringCollectionTransaction:
             for coverage_record in batch.coverage
         )
         for coverage_record, item in coverage_pairs:
-            _validate_record_window(coverage_record, batch.collected_at)
+            _validate_record_window(
+                coverage_record,
+                batch.collected_at,
+                trusted_as_of,
+            )
             control = coverage_controls[coverage_record.source_record_id]
             _require_resources(control, *item.scope.resource_ids)
             if item.scope.path_id is not None:
@@ -1776,12 +1839,15 @@ class MonitoringCollectionTransaction:
             schemaVersion="athena.wc026MonitoringEvidenceBundle.v1",
             workloadId=monitoring_intent.workload_id,
             monitoringContractDigest=collector_contract_digest,
+            monitoringIntentReference=_monitoring_intent_evidence_reference(
+                monitoring_intent_reference
+            ),
             observedStart=observed_start,
             observedEnd=observed_end,
             observations=observations,
             coverage=coverage,
             expectedCoverageScopeDigests=tuple(
-                sorted(item.scope.scope_digest for item in coverage)
+                sorted({item.scope.scope_digest for item in coverage})
             ),
         )
         if (
@@ -1860,6 +1926,7 @@ class MonitoringCollectionTransaction:
             intent_id=monitoring_intent.intent_id,
             intent_digest=monitoring_intent.intent_digest,
             context_binding_digest=context_binding.binding_digest,
+            monitoring_intent_reference=monitoring_intent_reference,
             monitoring_bundle=bundle,
             change_artifacts=artifacts,
             incident_resource_id=incident_resource_id,
@@ -2082,11 +2149,37 @@ def build_collected_correlation_request(
     change_digests = tuple(
         sorted(sha256_hex(item.canonical_bytes()) for item in prepared.change_artifacts)
     )
+    control_provenance = {
+        (
+            item.control_provenance.control_id,
+            item.control_provenance.control_digest,
+            item.control_provenance.source_clause_path,
+        )
+        for item in (
+            *prepared.monitoring_bundle.observations,
+            *prepared.monitoring_bundle.coverage,
+        )
+        if item.control_provenance is not None
+    }
+    control_provenance_digest = compute_artifact_digest(
+        [
+            {
+                "controlId": control_id,
+                "controlDigest": control_digest,
+                "sourceClausePath": source_clause_path,
+            }
+            for control_id, control_digest, source_clause_path in sorted(
+                control_provenance
+            )
+        ]
+    )
     source_references: tuple[VersionPinnedBlobReference, ...] = tuple(
         sorted(
             (
                 committed.monitoring_handoff.evidence,
                 context_binding.publication_authority_reference,
+                prepared.monitoring_intent_reference.intent_reference,
+                prepared.monitoring_intent_reference.attestation_reference,
                 *(item.artifact for item in committed.change_handoffs),
             ),
             key=lambda item: (item.name, item.version, item.content_digest),
@@ -2105,6 +2198,10 @@ def build_collected_correlation_request(
                 for item in evidence_index
             ]
         ),
+        "monitoringIntentAssetReferenceDigest": (
+            prepared.monitoring_intent_reference.reference_digest
+        ),
+        "monitoringControlProvenanceDigest": control_provenance_digest,
         "sourceReferences": source_references,
     }
     inventory_digest = compute_artifact_digest(_json_value(inventory_payload))
@@ -2146,6 +2243,7 @@ __all__ = [
     "AmaHeartbeatRecord",
     "CommittedMonitoringCollection",
     "ConnectionMonitorRecord",
+    "MAX_COLLECTION_TRUST_DELAY_SECONDS",
     "MAX_MONITORING_COLLECTION_BYTES",
     "MonitoringCollectionBatch",
     "MonitoringCollectionCommitPort",
