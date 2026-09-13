@@ -176,6 +176,7 @@ def test_wc027_runtime_configuration_is_derived_from_referenced_resources() -> N
         "blobEndpoint: replayStorage.properties.primaryEndpoints.blob",
         "tableEndpoint: replayStorage.properties.primaryEndpoints.table",
         "keyVaultKeyId: incidentKey.properties.keyUriWithVersion",
+        "keyId: 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'",
         "keyVaultKeyId: reportKey.properties.keyUriWithVersion",
         "keyVaultKeyId: feedKey.properties.keyUriWithVersion",
         "keyId: guidanceBindingKey.properties.keyUriWithVersion",

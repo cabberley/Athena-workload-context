@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -22,7 +23,9 @@ from athena_context.enrichment.production import (
     _MonitoringCollectorKey,
     _SplitIncidentPresentationReader,
     _WritableBlobSource,
+    load_wc027_enrichment_feed_configuration,
 )
+from test_wc024_monitoring_contract import _collector_contract
 from test_wc026_correlation_contract import NOW
 from test_wc027_enrichment_feed_pipeline import (
     PUBLISHED_AT,
@@ -159,6 +162,160 @@ class _ArtifactReaderProbe:
             payload=b"{}",
             payload_sha256=request.expected_payload_sha256,
             size_bytes=2,
+        )
+
+
+def _bicep_generated_runtime_configuration() -> dict[str, object]:
+    identity_client_ids = [
+        f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 17)
+    ]
+
+    def identity_resource_id(index: int) -> str:
+        return (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourceGroups/rg-athena-wc027/providers/Microsoft.ManagedIdentity/"
+            f"userAssignedIdentities/wc027-identity-{index}"
+        )
+
+    def source(index: int, container_name: str) -> dict[str, str]:
+        return {
+            "blobEndpoint": "https://athenawc027.blob.core.windows.net",
+            "containerName": container_name,
+            "identityClientId": identity_client_ids[index],
+            "identityResourceId": identity_resource_id(index),
+        }
+
+    def key(
+        index: int,
+        identity_index: int,
+        *,
+        logical_key_id: str | None = None,
+    ) -> dict[str, str]:
+        key_vault_key_id = (
+            "https://athena-wc027.vault.azure.net/keys/"
+            f"key-{index}/{index:032x}"
+        )
+        return {
+            "keyId": logical_key_id or key_vault_key_id,
+            "keyVaultKeyId": key_vault_key_id,
+            "keyFingerprint": "sha256:" + f"{index:x}"[-1] * 64,
+            "identityClientId": identity_client_ids[identity_index],
+            "identityResourceId": identity_resource_id(identity_index),
+        }
+
+    attached_identity_resource_ids = [
+        identity_resource_id(index) for index in range(16)
+    ]
+    monitoring_collector_key: dict[str, object] = {
+        **key(1, 10),
+        "activatedAt": NOW.isoformat().replace("+00:00", "Z"),
+        "expiresAt": None,
+    }
+    return {
+        "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v1",
+        "serviceBus": {
+            "namespace": "athena-wc027.servicebus.windows.net",
+            "triggerQueueName": "wc027-enrichment-trigger",
+            "notificationQueueName": "wc027-notification-v2",
+            "brokerIdentityClientId": identity_client_ids[0],
+            "brokerIdentityResourceId": identity_resource_id(0),
+        },
+        "incidentLifecycleAssets": source(1, "incident-assets"),
+        "enrichmentFeedAssets": {
+            "blobEndpoint": "https://athenawc027.blob.core.windows.net",
+            "containerName": "wc027-enrichment-feed-v2",
+            "readerIdentityClientId": identity_client_ids[2],
+            "readerIdentityResourceId": identity_resource_id(2),
+            "writerIdentityClientId": identity_client_ids[3],
+            "writerIdentityResourceId": identity_resource_id(3),
+        },
+        "feedRegistry": {
+            "tableEndpoint": "https://athenawc027.table.core.windows.net",
+            "tableName": "Wc027FeedRegistry",
+            "partitionKey": "wc027-feed-v2",
+            "identityClientId": identity_client_ids[4],
+            "identityResourceId": identity_resource_id(4),
+        },
+        "deploymentBinding": {
+            "bindingEvidenceId": "00000000-0000-0000-0000-000000000099",
+            "attachedIdentityResourceIds": attached_identity_resource_ids,
+            "rbacResourceIds": [
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "providers/Microsoft.Authorization/roleDefinitions/"
+                "00000000-0000-0000-0000-000000000098"
+            ],
+        },
+        "presentationUrl": "https://athena.synthetic.example/incidents",
+        "correlationSources": {
+            "monitoring": source(5, "wc024-monitoring"),
+            "change": source(6, "change-evidence"),
+            "contextAuthority": source(7, "context-authority"),
+            "monitoringIntent": source(8, "monitoring-intent"),
+        },
+        "guidanceAuthoritySource": source(9, "guidance-authority"),
+        "monitoringCollectorContract": _collector_contract().model_dump(
+            mode="json",
+            by_alias=True,
+        ),
+        "monitoringCollectorKey": monitoring_collector_key,
+        "keys": {
+            "incident": key(
+                4,
+                10,
+                logical_key_id=(
+                    "synthetic-key://athena-argus-demo/"
+                    "wc016-incidents-rs256-v1"
+                ),
+            ),
+            "correlationBinding": key(5, 10),
+            "guidanceBinding": key(6, 10),
+            "change": key(2, 10),
+            "monitoringIntent": key(3, 10),
+            "report": key(7, 11),
+            "guidance": key(8, 12),
+            "enrichment": key(9, 13),
+            "feed": key(10, 14),
+            "notification": key(11, 15),
+        },
+    }
+
+
+def test_complete_bicep_generated_configuration_starts_with_bound_key_authorities() -> None:
+    payload = _bicep_generated_runtime_configuration()
+
+    configuration = load_wc027_enrichment_feed_configuration(
+        path=None,
+        environment_json=json.dumps(payload),
+    )
+
+    assert (
+        configuration.monitoring_collector_key.authority.identity_resource_id
+        == payload["monitoringCollectorKey"]["identityResourceId"]  # type: ignore[index]
+    )
+    assert (
+        configuration.incident_key.key_id
+        == "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
+    )
+    assert (
+        configuration.incident_key.key_vault_key_id
+        == payload["keys"]["incident"]["keyVaultKeyId"]  # type: ignore[index]
+    )
+    assert (
+        configuration.incident_key.anchor.key_vault_key_id
+        == configuration.incident_key.key_vault_key_id
+    )
+
+
+def test_only_lifecycle_authority_may_separate_logical_and_physical_key_ids() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["keys"]["feed"]["keyId"] = "synthetic-key://wc027/feed"  # type: ignore[index]
+
+    with pytest.raises(
+        ValueError,
+        match=r"keys\.feed\.keyId must equal the referenced key version",
+    ):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
+            json.dumps(payload)
         )
 
 

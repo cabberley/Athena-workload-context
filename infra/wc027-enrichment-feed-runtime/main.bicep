@@ -915,7 +915,7 @@ var runtimeConfiguration = {
   }
   keys: {
     incident: {
-      keyId: incidentKey.properties.keyUriWithVersion
+      keyId: 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
       keyVaultKeyId: incidentKey.properties.keyUriWithVersion
       keyFingerprint: trustDomainMetadata.incident.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId

@@ -503,8 +503,17 @@ def _reference_with_attestation_digest(
     )
 
 
-def _feed_v2_gateway_fixture():
+def _feed_v2_gateway_fixture(
+    *,
+    lifecycle_key_id: str | None = None,
+):
     lifecycle_private, lifecycle_trust = _trust("lifecycle")
+    if lifecycle_key_id is not None:
+        lifecycle_trust = GatewaySignatureTrustAnchor(
+            key_id=lifecycle_key_id,
+            key_fingerprint=lifecycle_trust.key_fingerprint,
+            public_key=lifecycle_trust.public_key,
+        )
     feed_private, feed_trust = _trust("feed")
     report_private, report_trust = _trust("report")
     guidance_private, guidance_trust = _trust("guidance")

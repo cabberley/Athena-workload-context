@@ -369,13 +369,19 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 root["guidanceAuthoritySource"],
                 "guidanceAuthoritySource",
             ),
-            monitoring_collector_contract=MonitoringCollectorContract.model_validate(
-                root["monitoringCollectorContract"]
+            monitoring_collector_contract=(
+                MonitoringCollectorContract.model_validate_json(
+                    json.dumps(root["monitoringCollectorContract"])
+                )
             ),
             monitoring_collector_key=_monitoring_collector_key(
                 root["monitoringCollectorKey"]
             ),
-            incident_key=_key_authority(keys["incident"], "keys.incident"),
+            incident_key=_key_authority(
+                keys["incident"],
+                "keys.incident",
+                allow_logical_key_id=True,
+            ),
             correlation_binding_key=_key_authority(
                 keys["correlationBinding"],
                 "keys.correlationBinding",
@@ -1156,7 +1162,12 @@ def _writable_blob_source(
     )
 
 
-def _key_authority(value: object, label: str) -> _KeyAuthority:
+def _key_authority(
+    value: object,
+    label: str,
+    *,
+    allow_logical_key_id: bool = False,
+) -> _KeyAuthority:
     authority = _mapping(value, label)
     _require_keys(
         authority,
@@ -1191,7 +1202,7 @@ def _key_authority(value: object, label: str) -> _KeyAuthority:
         ),
     )
     _ = result.anchor
-    if result.key_id != result.key_vault_key_id:
+    if not allow_logical_key_id and result.key_id != result.key_vault_key_id:
         raise ValueError(f"{label}.keyId must equal the referenced key version")
     return result
 
@@ -1220,6 +1231,7 @@ def _monitoring_collector_key(value: object) -> _MonitoringCollectorKey:
                     "keyVaultKeyId",
                     "keyFingerprint",
                     "identityClientId",
+                    "identityResourceId",
                 )
             },
             "monitoringCollectorKey",
