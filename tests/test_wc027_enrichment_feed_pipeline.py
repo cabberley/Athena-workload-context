@@ -24,6 +24,7 @@ from athena_context.enrichment import (
     IncidentFeedRegistryConflictError,
     IncidentFeedRegistryError,
     IncidentFeedRegistryRecord,
+    validate_incident_feed_registry_record_authority,
 )
 from athena_context.enrichment.publication import (
     _INCIDENT_ENRICHMENT_PUBLICATION_RECEIPT_TOKEN,
@@ -105,20 +106,25 @@ class _Registry:
         self.raise_after_put: IncidentFeedRegistryError | None = None
         self.forced_record: IncidentFeedRegistryRecord | None = None
 
-    def put(self, record: IncidentFeedRegistryRecord) -> None:
+    def put(self, record: IncidentFeedRegistryRecord, *, authority) -> None:
         self.operations.append("registry.put")
+        validate_incident_feed_registry_record_authority(record, authority)
         if self.forced_record is not None:
             self.records[record.entry.incident_id] = self.forced_record
             raise IncidentFeedRegistryConflictError("synthetic conflicting replay")
         current = self.records.get(record.entry.incident_id)
-        if (
-            current is not None
-            and current != record
-            and current.entry.updated_at >= record.entry.updated_at
-        ):
-            raise IncidentFeedRegistryConflictError(
-                "synthetic stale or conflicting record"
-            )
+        if current is not None and current != record:
+            try:
+                validate_incident_feed_registry_record_authority(
+                    current,
+                    authority,
+                )
+            except IncidentFeedRegistryConflictError:
+                pass
+            else:
+                raise IncidentFeedRegistryConflictError(
+                    "synthetic conflicting current authority"
+                )
         self.records[record.entry.incident_id] = record
         if self.raise_after_put is not None:
             failure = self.raise_after_put
@@ -484,7 +490,16 @@ def test_pipeline_full_retry_is_idempotent() -> None:
     assert index.calls == 2
 
 
-def test_pipeline_replaces_active_record_with_resolved_successor() -> None:
+@pytest.mark.parametrize(
+    "resolved_updated_at",
+    [
+        NOW,
+        NOW - timedelta(minutes=1),
+    ],
+)
+def test_pipeline_recovers_projection_with_nonadvancing_resolved_update_time(
+    resolved_updated_at,
+) -> None:
     base = _active_fixture()
     active = _bundle_fixture(
         lifecycle="active",
@@ -493,7 +508,7 @@ def test_pipeline_replaces_active_record_with_resolved_successor() -> None:
     )
     resolved = _bundle_fixture(
         lifecycle="resolved",
-        updated_at=NOW + timedelta(minutes=1),
+        updated_at=resolved_updated_at,
         base=base.receipt,
     )
     operations: list[str] = []
@@ -529,6 +544,53 @@ def test_pipeline_replaces_active_record_with_resolved_successor() -> None:
     assert resolved_result.feed_index_publication.index.active == ()
     assert resolved_result.feed_index_publication.index.recently_resolved == (
         resolved_result.registry_record.entry,
+    )
+
+
+def test_in_memory_registry_rejects_stale_replay_against_current_authority() -> None:
+    base = _active_fixture()
+    active = _bundle_fixture(
+        lifecycle="active",
+        updated_at=NOW,
+        base=base.receipt,
+    )
+    resolved = _bundle_fixture(
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(minutes=1),
+        base=base.receipt,
+    )
+    operations: list[str] = []
+    registry = _Registry(operations)
+    active_service, _writer, _registry, _index, _operations = _pipeline(
+        active,
+        operations=operations,
+        registry=registry,
+    )
+    resolved_service, *_ = _pipeline(
+        resolved,
+        operations=operations,
+        registry=registry,
+    )
+    active_result = active_service.publish(
+        active.receipt,
+        published_at=PUBLISHED_AT,
+    )
+    resolved_result = resolved_service.publish(
+        resolved.receipt,
+        published_at=PUBLISHED_AT + timedelta(minutes=1),
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="authoritative current occurrence",
+    ):
+        registry.put(
+            active_result.registry_record,
+            authority=resolved.current,
+        )
+
+    assert registry.records[resolved_result.pointer.incident_id] == (
+        resolved_result.registry_record
     )
 
 

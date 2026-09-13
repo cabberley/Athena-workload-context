@@ -25,6 +25,7 @@ from athena_context.enrichment.feed_pipeline import (
 from athena_context.enrichment.feed_registry import (
     FEED_V2_RESOLVED_RETENTION,
     MAX_FEED_V2_REGISTRY_RECORDS,
+    IncidentFeedRegistryAuthorityReaderPort,
     IncidentFeedRegistryCapacityError,
     IncidentFeedRegistryConflictError,
     IncidentFeedRegistryError,
@@ -63,6 +64,7 @@ __all__ = [
     "IncidentFeedIndexPublisherPort",
     "IncidentFeedIndexSnapshot",
     "IncidentFeedRegistryCapacityError",
+    "IncidentFeedRegistryAuthorityReaderPort",
     "IncidentFeedRegistryConflictError",
     "IncidentFeedRegistryError",
     "IncidentFeedRegistryIncompleteError",

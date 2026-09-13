@@ -152,6 +152,14 @@ the already published pointer bytes and retries only the index with a timestamp 
 than that winner. A same-timestamp CAS conflict also advances only the index timestamp within the
 bounded retry loop.
 
+Registry admission orders successors by exact signed v1 current-occurrence authority, not by
+`IncidentState.updatedAt`. The adapter validates the incoming record against that authority, then
+ETag-conditionally replaces a retained row that no longer matches it. This permits valid
+active-to-resolved successors whose state update time is equal to or lower than the prior row while
+still rejecting stale replays and non-equivalent records claiming the same current authority. The
+Table adapter directly re-reads the known v1 current head before and after its conditional write;
+it never discovers authority through Blob enumeration.
+
 The chain emits no notification. Runtime wiring may enqueue Notification v2 only after receiving
 the successful domain receipt, so pointer-only, registry-only, and failed-index states remain
 undiscoverable and silent.

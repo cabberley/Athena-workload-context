@@ -78,7 +78,8 @@ class _Registry:
     calls: int = 0
     prune_calls: int = 0
 
-    def put(self, record) -> None:
+    def put(self, record, *, authority) -> None:
+        del authority
         raise AssertionError(f"unexpected registry write: {record}")
 
     def list_records(self, *, as_of):

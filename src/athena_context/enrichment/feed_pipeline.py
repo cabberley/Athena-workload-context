@@ -305,7 +305,10 @@ class IncidentEnrichmentFeedPublicationService:
     ) -> None:
         failure: IncidentFeedRegistryError | None = None
         try:
-            self.registry.put(record)
+            self.registry.put(
+                record,
+                authority=current,
+            )
         except IncidentFeedRegistryError as exc:
             failure = exc
         try:
@@ -320,7 +323,13 @@ class IncidentEnrichmentFeedPublicationService:
             if item.entry.incident_id == record.entry.incident_id
         )
         if matches == (record,):
-            validate_incident_feed_registry_record_authority(record, current)
+            latest = self.current_incident_reader.read_current_incident_state(
+                incident_id=record.entry.incident_id
+            )
+            validate_incident_feed_registry_record_authority(
+                record,
+                latest,
+            )
             return
         if matches:
             raise IncidentFeedRegistryConflictError(
