@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
+import athena_context.enrichment.production as production
 from athena_context.contracts import IncidentNotificationEnvelopeV2
 from athena_context.enrichment import (
     Wc027EnrichmentFeedRuntime,
@@ -19,6 +20,8 @@ from athena_context.enrichment.production import (
     _BlobSource,
     _KeyAuthority,
     _MonitoringCollectorKey,
+    _SplitIncidentPresentationReader,
+    _WritableBlobSource,
 )
 from test_wc026_correlation_contract import NOW
 from test_wc027_enrichment_feed_pipeline import (
@@ -54,6 +57,30 @@ class _Correlation:
     def correlate(self, request):
         self._operations.append("correlate")
         return self._service.correlate(request)
+
+
+class _SignatureVerifier:
+    def __init__(self, *, valid: bool = True) -> None:
+        self.valid = valid
+        self.calls: list[tuple[bytes, str]] = []
+
+    def __call__(self, preimage: bytes, signature: str) -> bool:
+        self.calls.append((preimage, signature))
+        return self.valid
+
+
+class _Authority:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self.calls: list[str] = []
+
+    def read_current_incident_state(self, *, incident_id: str):
+        self.calls.append("current")
+        return self._delegate.read_current_incident_state(incident_id=incident_id)
+
+    def read_active_incident_index(self):
+        self.calls.append("active")
+        return self._delegate.read_active_incident_index()
 
 
 class _Enrichment:
@@ -111,6 +138,30 @@ class _MissingAuthority:
         return None
 
 
+class _ArtifactReaderProbe:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls: list[tuple[str, str]] = []
+
+    def read_current(self, request):
+        self.calls.append(("current", request.blob_name))
+        return SimpleNamespace(
+            blob_name=request.blob_name,
+            payload=b"{}",
+            payload_sha256="sha256:" + "1" * 64,
+            size_bytes=2,
+        )
+
+    def read(self, request):
+        self.calls.append(("version", request.blob_name))
+        return SimpleNamespace(
+            blob_name=request.blob_name,
+            payload=b"{}",
+            payload_sha256=request.expected_payload_sha256,
+            size_bytes=2,
+        )
+
+
 def _runtime(*, fail_feed_pointer_once: bool = False):
     fixture = _fixture()
     operations: list[str] = []
@@ -141,9 +192,15 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
             "/feed-pointer.json"
         )
     notification = _Notification(operations)
+    binding_verifier = _SignatureVerifier()
+    incident_authority = _Authority(fixture.publication_reader)
     runtime = Wc027EnrichmentFeedRuntime(
+        guidance_binding_key_id=(
+            fixture.guidance_binding.binding_attestation.key_vault_key_id
+        ),
+        guidance_binding_signature_verifier=binding_verifier,
         correlation=_Correlation(fixture.correlation_service, operations),
-        incident_authority=fixture.publication_reader,
+        incident_authority=incident_authority,
         enrichment_publication=_Enrichment(enrichment, operations),
         feed_publication=_Feed(feed, operations),
         notification_publication=notification,
@@ -157,13 +214,24 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
         index,
         notification,
         operations,
+        binding_verifier,
+        incident_authority,
     )
 
 
 def test_runtime_orders_correlation_enrichment_feed_then_notification() -> None:
-    fixture, runtime, _store, _writer, _registry, _index, notification, operations = (
-        _runtime()
-    )
+    (
+        fixture,
+        runtime,
+        _store,
+        _writer,
+        _registry,
+        _index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime()
 
     receipt = runtime.publish(
         fixture.guidance_binding,
@@ -177,9 +245,85 @@ def test_runtime_orders_correlation_enrichment_feed_then_notification() -> None:
     assert receipt.binding_id == fixture.guidance_binding.binding_id
 
 
+def test_runtime_rejects_invalid_outer_signature_before_any_authority_or_storage_call() -> None:
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        binding_verifier,
+        incident_authority,
+    ) = _runtime()
+    binding_verifier.valid = False
+
+    with pytest.raises(ValueError, match="binding signature is invalid"):
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=PUBLISHED_AT,
+        )
+
+    assert len(binding_verifier.calls) == 1
+    assert incident_authority.calls == []
+    assert operations == []
+    assert fixture.incident_reader.calls == []
+    assert fixture.authority_reader.calls == []
+    assert store.calls == []
+    assert writer.values == {}
+    assert registry.records == {}
+    assert index.calls == 0
+    assert notification.calls == 0
+
+
+def test_production_composition_rejects_outer_signature_before_other_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _fixture().guidance_binding
+    verifier = _SignatureVerifier(valid=False)
+    verifier_instance = SimpleNamespace(verify_preimage=verifier)
+    verifier_requests: list[object] = []
+
+    def fake_verifier(authority):
+        verifier_requests.append(authority)
+        return verifier_instance
+
+    monkeypatch.setattr(production, "_verifier", fake_verifier)
+    configuration = SimpleNamespace(
+        guidance_binding_key=SimpleNamespace(
+            key_vault_key_id=binding.binding_attestation.key_vault_key_id
+        )
+    )
+
+    with pytest.raises(ValueError, match="binding signature is invalid"):
+        production.build_wc027_enrichment_feed_runtime(
+            cast(Any, configuration),
+            binding=binding,
+            notification_outbox=cast(Any, object()),
+        )
+
+    assert verifier_requests == [configuration.guidance_binding_key]
+    assert len(verifier.calls) == 1
+
+
 def test_runtime_rejects_missing_authority_before_correlation_or_writes() -> None:
-    fixture, runtime, store, writer, registry, index, notification, operations = _runtime()
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        binding_verifier,
+        _incident_authority,
+    ) = _runtime()
     runtime = Wc027EnrichmentFeedRuntime(
+        guidance_binding_key_id=runtime.guidance_binding_key_id,
+        guidance_binding_signature_verifier=binding_verifier,
         correlation=runtime.correlation,
         incident_authority=_MissingAuthority(),
         enrichment_publication=runtime.enrichment_publication,
@@ -202,7 +346,18 @@ def test_runtime_rejects_missing_authority_before_correlation_or_writes() -> Non
 
 
 def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
-    fixture, runtime, store, writer, registry, index, notification, operations = _runtime()
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        binding_verifier,
+        _incident_authority,
+    ) = _runtime()
     stale_current = SimpleNamespace(
         state=fixture.publication_reader.current.state.model_copy(
             update={"updated_at": NOW}
@@ -211,6 +366,8 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
         pointer_sha256=fixture.publication_reader.current.pointer_sha256,
     )
     runtime = Wc027EnrichmentFeedRuntime(
+        guidance_binding_key_id=runtime.guidance_binding_key_id,
+        guidance_binding_signature_verifier=binding_verifier,
         correlation=runtime.correlation,
         incident_authority=SimpleNamespace(
             read_current_incident_state=lambda **_kwargs: stale_current,
@@ -236,7 +393,18 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
 
 
 def test_runtime_retry_recovers_partial_feed_without_early_notification() -> None:
-    fixture, runtime, store, writer, registry, index, notification, operations = _runtime()
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime()
     enrichment = runtime.enrichment_publication.publish(
         incident_publication=fixture.incident_publication,
         verified_report=fixture.verified_report,
@@ -287,15 +455,73 @@ def test_trigger_requires_exact_canonical_signed_binding_bytes() -> None:
         )
 
 
+def test_notification_reader_never_crosses_v1_and_v2_storage_boundaries() -> None:
+    lifecycle = _ArtifactReaderProbe("lifecycle")
+    enrichment_feed = _ArtifactReaderProbe("enrichment-feed")
+    reader = _SplitIncidentPresentationReader(
+        lifecycle_reader=cast(Any, lifecycle),
+        enrichment_feed_reader=cast(Any, enrichment_feed),
+    )
+    digest = "sha256:" + "1" * 64
+
+    reader.read_current(blob_name="incidents/active.json", maximum_bytes=10)
+    reader.read_current(blob_name="incidents/feed-v2.json", maximum_bytes=10)
+    reader.read_version(
+        blob_name="incidents/inc-0123456789ab/versions/" + "a" * 64 + "/state.json",
+        version_id="v1",
+        expected_payload_sha256=digest,
+        maximum_bytes=10,
+    )
+    reader.read_version(
+        blob_name=(
+            "incidents/inc-0123456789ab/versions/"
+            + "a" * 64
+            + "/enrichments/incident-enrichment-"
+            + "b" * 32
+            + "/manifest.json"
+        ),
+        version_id="v2",
+        expected_payload_sha256=digest,
+        maximum_bytes=10,
+    )
+
+    assert lifecycle.calls == [
+        ("current", "incidents/active.json"),
+        (
+            "version",
+            "incidents/inc-0123456789ab/versions/" + "a" * 64 + "/state.json",
+        ),
+    ]
+    assert enrichment_feed.calls == [
+        ("current", "incidents/feed-v2.json"),
+        (
+            "version",
+            "incidents/inc-0123456789ab/versions/"
+            + "a" * 64
+            + "/enrichments/incident-enrichment-"
+            + "b" * 32
+            + "/manifest.json",
+        ),
+    ]
+
+
 def test_production_configuration_rejects_identity_and_key_reuse() -> None:
     configuration = object.__new__(Wc027EnrichmentFeedProductionConfiguration)
-    identity_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 16)]
+    identity_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 18)]
+
+    def resource_id(index: int) -> str:
+        return (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourceGroups/athena/providers/Microsoft.ManagedIdentity/"
+            f"userAssignedIdentities/identity-{index}"
+        )
 
     def source(index: int, container: str) -> _BlobSource:
         return _BlobSource(
             endpoint=f"https://storage{index}.blob.core.windows.net",
             container=container,
             identity_client_id=identity_ids[index],
+            identity_resource_id=resource_id(index),
         )
 
     def key(index: int, identity_index: int) -> _KeyAuthority:
@@ -307,33 +533,52 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
             ),
             key_fingerprint="sha256:" + f"{index:x}" * 64,
             identity_client_id=identity_ids[identity_index],
+            identity_resource_id=resource_id(identity_index),
         )
 
     values = {
         "broker_identity_client_id": identity_ids[0],
-        "incident_assets": source(1, "incident-assets"),
-        "incident_writer_identity_client_id": identity_ids[2],
-        "registry_identity_client_id": identity_ids[3],
-        "monitoring_source": source(4, "monitoring"),
-        "change_source": source(5, "changes"),
-        "context_authority_source": source(6, "authority"),
-        "monitoring_intent_source": source(7, "intent"),
-        "guidance_authority_source": source(8, "guidance-authority"),
+        "broker_identity_resource_id": resource_id(0),
+        "incident_lifecycle_assets": source(1, "incident-assets"),
+        "enrichment_feed_assets": _WritableBlobSource(
+            endpoint="https://storage2.blob.core.windows.net",
+            container="wc027-enrichment-feed-v2",
+            reader_identity_client_id=identity_ids[2],
+            reader_identity_resource_id=resource_id(2),
+            writer_identity_client_id=identity_ids[3],
+            writer_identity_resource_id=resource_id(3),
+        ),
+        "registry_identity_client_id": identity_ids[4],
+        "registry_identity_resource_id": resource_id(4),
+        "monitoring_source": source(5, "monitoring"),
+        "change_source": source(6, "changes"),
+        "context_authority_source": source(7, "authority"),
+        "monitoring_intent_source": source(8, "intent"),
+        "guidance_authority_source": source(9, "guidance-authority"),
         "monitoring_collector_key": _MonitoringCollectorKey(
-            authority=key(1, 9),
+            authority=key(1, 10),
             activated_at=NOW,
             expires_at=None,
         ),
-        "change_key": key(2, 9),
-        "monitoring_intent_key": key(3, 9),
-        "incident_key": key(4, 9),
-        "correlation_binding_key": key(5, 9),
-        "guidance_binding_key": key(6, 9),
-        "report_key": key(7, 10),
-        "guidance_key": key(8, 11),
-        "enrichment_key": key(9, 12),
-        "feed_key": key(10, 13),
-        "notification_key": key(11, 14),
+        "change_key": key(2, 10),
+        "monitoring_intent_key": key(3, 10),
+        "incident_key": key(4, 10),
+        "correlation_binding_key": key(5, 10),
+        "guidance_binding_key": key(6, 10),
+        "report_key": key(7, 11),
+        "guidance_key": key(8, 12),
+        "enrichment_key": key(9, 13),
+        "feed_key": key(10, 14),
+        "notification_key": key(11, 15),
+        "binding_evidence_id": "00000000-0000-0000-0000-000000000099",
+        "attached_identity_resource_ids": tuple(
+            resource_id(index) for index in range(16)
+        ),
+        "rbac_resource_ids": (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "providers/Microsoft.Authorization/roleDefinitions/"
+            "00000000-0000-0000-0000-000000000098",
+        ),
     }
     for name, value in values.items():
         object.__setattr__(configuration, name, value)
@@ -342,16 +587,38 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
 
     object.__setattr__(
         configuration,
-        "incident_writer_identity_client_id",
-        configuration.incident_assets.identity_client_id,
+        "enrichment_feed_assets",
+        _WritableBlobSource(
+            endpoint=configuration.enrichment_feed_assets.endpoint,
+            container=configuration.enrichment_feed_assets.container,
+            reader_identity_client_id=(
+                configuration.enrichment_feed_assets.reader_identity_client_id
+            ),
+            reader_identity_resource_id=(
+                configuration.enrichment_feed_assets.reader_identity_resource_id
+            ),
+            writer_identity_client_id=(
+                configuration.incident_lifecycle_assets.identity_client_id
+            ),
+            writer_identity_resource_id=(
+                configuration.incident_lifecycle_assets.identity_resource_id
+            ),
+        ),
     )
     with pytest.raises(ValueError, match="I/O managed identities"):
         configuration._validate_separation()
 
     object.__setattr__(
         configuration,
-        "incident_writer_identity_client_id",
-        identity_ids[2],
+        "enrichment_feed_assets",
+        _WritableBlobSource(
+            endpoint="https://storage2.blob.core.windows.net",
+            container="wc027-enrichment-feed-v2",
+            reader_identity_client_id=identity_ids[2],
+            reader_identity_resource_id=resource_id(2),
+            writer_identity_client_id=identity_ids[3],
+            writer_identity_resource_id=resource_id(3),
+        ),
     )
     object.__setattr__(
         configuration,
@@ -360,7 +627,8 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
             key_id=configuration.feed_key.key_id,
             key_vault_key_id=configuration.feed_key.key_vault_key_id,
             key_fingerprint=configuration.feed_key.key_fingerprint,
-            identity_client_id=identity_ids[14],
+            identity_client_id=identity_ids[15],
+            identity_resource_id=resource_id(15),
         ),
     )
     with pytest.raises(ValueError, match="key IDs"):

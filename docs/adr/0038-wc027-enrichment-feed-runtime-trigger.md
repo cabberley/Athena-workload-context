@@ -31,10 +31,13 @@ The binding is the narrowest existing contract that carries:
 - the exact version-pinned guidance authority; and
 - the signed guidance selection and evaluation time.
 
-The worker does not trust the queued report as a reusable verified result. It creates one
-production `CorrelationService`, rereads every exact version-pinned correlation input, verifies
-the configured authorities, and recomputes the report synchronously. The same service instance
-then supplies the process-local verification receipt to
+The worker first verifies the outer binding signature against the exact pinned
+guidance-binding key. An invalid signature is rejected before correlation, lifecycle authority,
+versioned Blob, or unrelated Key Vault access. It does not trust the queued report as a reusable
+verified result. After that outer verification, it creates one production `CorrelationService`,
+rereads every exact version-pinned correlation input, verifies the configured authorities, and
+recomputes the report synchronously. The same service instance then supplies the process-local
+verification receipt to
 `IncidentEnrichmentPublicationService`.
 
 Before publication, the worker independently reads the signed v1 current occurrence and active
@@ -54,14 +57,19 @@ and Service Bus duplicate detection. Missing current authority is retried. Stale
 non-canonical, or untrusted bindings fail closed.
 
 The deployment uses separate managed identities for the four correlation source readers, the
-incident reader, enrichment/feed writer, feed registry writer, public-key reader, broker, and each
-report, guidance, enrichment, feed, and notification signer. The five producer signing keys and
-identities must be pairwise distinct. Storage, Table, Key Vault, Service Bus, and Container Apps
-traffic remains on the existing private endpoint/DNS boundary.
+v1 incident reader, v2 producer reader, v2 writer, feed registry writer, verification-only key
+reader, broker, and each report, guidance, enrichment, feed, and notification signer. Enrichment
+and feed-v2 assets live in a distinct private container. Reader and writer assignments explicitly
+deny the `Blob.List` sub-operation, the writer role has no delete action, and the v1 container is
+read-only. The five producer signing keys and identities must be pairwise distinct. Storage,
+Table, Key Vault, Service Bus, and Container Apps traffic remains on the existing private
+endpoint/DNS boundary.
 
 `wc027FeedV2ProducerReady` remains false by default. Setting it true also requires the exact
 deployed `Microsoft.App/jobs` resource ID, the deployed configuration digest, the WC-016 runtime,
-completed external source RBAC, and healthy retry/reconciliation evidence.
+an explicitly ready binding publisher, and matching deployment-derived identity/RBAC evidence.
+Because that publisher is not yet implemented, the current deployment contract constrains its
+readiness input to `false`; activation requires a later reviewed publisher integration.
 
 ## Consequences
 
@@ -91,6 +99,7 @@ completed external source RBAC, and healthy retry/reconciliation evidence.
 
 - Deterministic ordering tests prove correlation, enrichment, feed commit, then notification.
 - Missing and stale authority tests prove zero writes and zero notification.
+- Invalid outer signature tests prove zero correlation, authority, or storage calls.
 - Partial feed writes recover on retry.
 - Feed-index failure never reaches notification.
 - Bicep validation asserts sessions, duplicate detection, identity separation, scoped RBAC, and

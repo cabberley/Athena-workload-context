@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -11,6 +12,7 @@ from athena_context.contracts import (
     IncidentNotificationEnvelopeV2,
     PublishedGuidanceAuthorityBinding,
     UtcDateTime,
+    canonicalize_json,
 )
 from athena_context.correlation import VerifiedCorrelationReport
 from athena_context.enrichment.feed_pipeline import (
@@ -29,6 +31,7 @@ MAX_WC027_ENRICHMENT_TRIGGER_BYTES = 12 * 1024 * 1024
 WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION = (
     "athena.wc027PublishedGuidanceAuthorityBinding.v2"
 )
+SignatureVerifier = Callable[[bytes, str], bool]
 
 
 class CorrelationRuntimePort(Protocol):
@@ -93,6 +96,8 @@ class Wc027EnrichmentFeedRuntimeReceipt:
 
 @dataclass(frozen=True, slots=True)
 class Wc027EnrichmentFeedRuntime:
+    guidance_binding_key_id: str
+    guidance_binding_signature_verifier: SignatureVerifier
     correlation: CorrelationRuntimePort
     incident_authority: IncidentPublicationAuthorityReaderPort
     enrichment_publication: IncidentEnrichmentPublicationPort
@@ -111,6 +116,11 @@ class Wc027EnrichmentFeedRuntime:
             )
         binding = PublishedGuidanceAuthorityBinding.model_validate_json(
             binding.canonical_bytes()
+        )
+        verify_wc027_guidance_binding_signature(
+            binding,
+            trusted_key_id=self.guidance_binding_key_id,
+            signature_verifier=self.guidance_binding_signature_verifier,
         )
         _require_canonical_timestamp(published_at)
         request = binding.incident_bound_request
@@ -177,6 +187,37 @@ def parse_wc027_enrichment_trigger(
     return binding
 
 
+def verify_wc027_guidance_binding_signature(
+    binding: PublishedGuidanceAuthorityBinding,
+    *,
+    trusted_key_id: str,
+    signature_verifier: SignatureVerifier,
+) -> None:
+    if type(binding) is not PublishedGuidanceAuthorityBinding:
+        raise TypeError("binding must be an exact PublishedGuidanceAuthorityBinding")
+    if type(trusted_key_id) is not str or not trusted_key_id:
+        raise ValueError("guidance binding trusted key ID is invalid")
+    preimage = binding.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "binding_id",
+            "binding_digest",
+            "binding_attestation",
+        },
+    )
+    if (
+        binding.binding_attestation.key_vault_key_id != trusted_key_id
+        or signature_verifier(
+            canonicalize_json(preimage).encode("utf-8"),
+            binding.binding_attestation.detached_signature,
+        )
+        is not True
+    ):
+        raise ValueError("guidance authority binding signature is invalid")
+
+
 def validate_wc027_enrichment_broker_metadata(
     message: object,
     binding: PublishedGuidanceAuthorityBinding,
@@ -236,4 +277,5 @@ __all__ = [
     "parse_wc027_enrichment_trigger",
     "utc_now_millisecond",
     "validate_wc027_enrichment_broker_metadata",
+    "verify_wc027_guidance_binding_signature",
 ]

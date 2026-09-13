@@ -262,6 +262,12 @@ param wc027EnrichmentFeedProducerConfigurationDigest string = ''
 @description('Exact non-secret runtime configuration JSON deployed to the WC-027 producer Job.')
 param wc027EnrichmentFeedProducerConfigurationJson string = ''
 
+@description('Explicit confirmation that the separately governed PublishedGuidanceAuthorityBinding.v2 publisher is deployed and ready. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
+@allowed([
+  false
+])
+param wc027PublisherReady bool = false
+
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
 
@@ -339,6 +345,57 @@ var wc027ConfigurationDigestInvalidCharacters = replace(replace(replace(replace(
 var wc027ConfigurationDigestValid = length(wc027EnrichmentFeedProducerConfigurationDigest) == 71 && wc027EnrichmentFeedProducerConfigurationDigest == toLower(
   wc027EnrichmentFeedProducerConfigurationDigest
 ) && empty(wc027ConfigurationDigestInvalidCharacters)
+var wc027ParsedConfiguration = json(
+  empty(wc027EnrichmentFeedProducerConfigurationJson)
+    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]}}'
+    : wc027EnrichmentFeedProducerConfigurationJson
+)
+var wc027AttachedIdentityResourceIds = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? map(items(wc027ProducerJob!.identity.userAssignedIdentities), attachedIdentity => toLower(attachedIdentity.key))
+  : []
+var wc027ExpectedIdentityResourceIds = map(
+  wc027ParsedConfiguration.deploymentBinding.attachedIdentityResourceIds,
+  expectedIdentityResourceId => toLower(expectedIdentityResourceId)
+)
+var wc027ConfiguredIdentityResourceIds = wc027FeedV2ProducerReady && !empty(wc027EnrichmentFeedProducerConfigurationJson)
+  ? map([
+      wc027ParsedConfiguration.serviceBus.brokerIdentityResourceId
+      wc027ParsedConfiguration.incidentLifecycleAssets.identityResourceId
+      wc027ParsedConfiguration.enrichmentFeedAssets.readerIdentityResourceId
+      wc027ParsedConfiguration.enrichmentFeedAssets.writerIdentityResourceId
+      wc027ParsedConfiguration.feedRegistry.identityResourceId
+      wc027ParsedConfiguration.correlationSources.monitoring.identityResourceId
+      wc027ParsedConfiguration.correlationSources.change.identityResourceId
+      wc027ParsedConfiguration.correlationSources.contextAuthority.identityResourceId
+      wc027ParsedConfiguration.correlationSources.monitoringIntent.identityResourceId
+      wc027ParsedConfiguration.guidanceAuthoritySource.identityResourceId
+      wc027ParsedConfiguration.monitoringCollectorKey.identityResourceId
+      wc027ParsedConfiguration.keys.incident.identityResourceId
+      wc027ParsedConfiguration.keys.correlationBinding.identityResourceId
+      wc027ParsedConfiguration.keys.guidanceBinding.identityResourceId
+      wc027ParsedConfiguration.keys.change.identityResourceId
+      wc027ParsedConfiguration.keys.monitoringIntent.identityResourceId
+      wc027ParsedConfiguration.keys.report.identityResourceId
+      wc027ParsedConfiguration.keys.guidance.identityResourceId
+      wc027ParsedConfiguration.keys.enrichment.identityResourceId
+      wc027ParsedConfiguration.keys.feed.identityResourceId
+      wc027ParsedConfiguration.keys.notification.identityResourceId
+    ], configuredIdentityResourceId => toLower(configuredIdentityResourceId))
+  : []
+var wc027DistinctConfiguredIdentityResourceIds = union(
+  wc027ConfiguredIdentityResourceIds,
+  wc027ConfiguredIdentityResourceIds
+)
+var wc027ConfigurationIdentitiesMatchBinding = !empty(wc027ExpectedIdentityResourceIds) && length(
+  wc027ExpectedIdentityResourceIds
+) == length(wc027DistinctConfiguredIdentityResourceIds) && length(
+  union(wc027ExpectedIdentityResourceIds, wc027DistinctConfiguredIdentityResourceIds)
+) == length(wc027ExpectedIdentityResourceIds)
+var wc027RbacResourceIds = wc027ParsedConfiguration.deploymentBinding.rbacResourceIds
+var wc027RbacEvidenceMatchesConfiguration = !empty(wc027RbacResourceIds) && guid(
+  join(wc027RbacResourceIds, '|')
+) == wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
+var wc027ProducerIdentitiesMatchExactly = !empty(wc027ExpectedIdentityResourceIds) && length(wc027AttachedIdentityResourceIds) == length(wc027ExpectedIdentityResourceIds) && length(union(wc027AttachedIdentityResourceIds, wc027ExpectedIdentityResourceIds)) == length(wc027ExpectedIdentityResourceIds)
 var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
   toLower(wc027EnrichmentFeedProducerJobResourceId),
   '/subscriptions/'
@@ -356,9 +413,25 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
             ? fail('WC-027 producer Job does not contain the exact activation configuration')
             : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
               ? fail('WC-027 producer Job configuration does not match the activation input')
-              : wc027FeedV2ProducerReady && !validatedWc016RuntimeEnabled
-                ? fail('WC-027 Notification v2 requires the deployed WC-016 runtime and notification outbox')
-                : wc027FeedV2ProducerReady
+              : wc027FeedV2ProducerReady && !wc027PublisherReady
+                ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
+                : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
+                  ? fail('WC-027 Notification v2 requires deployment-derived RBAC binding evidence')
+                  : wc027FeedV2ProducerReady && !wc027RbacEvidenceMatchesConfiguration
+                    ? fail('WC-027 runtime configuration RBAC resources do not match its binding evidence')
+                  : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.bindingEvidenceDigest != wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
+                      ? fail('WC-027 producer Job RBAC binding evidence tag does not match its deployed configuration')
+                      : wc027FeedV2ProducerReady && !wc027ConfigurationIdentitiesMatchBinding
+                        ? fail('WC-027 runtime configuration identities do not exactly match its deployment binding')
+                        : wc027FeedV2ProducerReady && !wc027ProducerIdentitiesMatchExactly
+                          ? fail('WC-027 producer Job attached user-assigned identities do not exactly match the expected identity resource IDs')
+                          : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[0].name != 'AZURE_CLIENT_ID'
+                            ? fail('WC-027 producer Job does not expose its derived broker client ID')
+                            : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[0].value != wc027ParsedConfiguration.serviceBus.brokerIdentityClientId
+                              ? fail('WC-027 producer Job broker identity does not match its deployed configuration')
+                              : wc027FeedV2ProducerReady && !validatedWc016RuntimeEnabled
+                                ? fail('WC-027 Notification v2 requires the deployed WC-016 runtime and notification outbox')
+                                : wc027FeedV2ProducerReady && wc027PublisherReady
 var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
   ? acceptanceImageRegistryServer
