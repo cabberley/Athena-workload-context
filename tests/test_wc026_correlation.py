@@ -514,6 +514,15 @@ def test_public_service_rejects_draft_preview_requests() -> None:
         service.correlate(request)
 
 
+def test_production_service_rejects_legacy_unsigned_request() -> None:
+    request = _request()
+    service = _test_service(request)
+    object.__setattr__(service, "_require_signed_monitoring_intent", True)
+
+    with pytest.raises(ValueError, match="signed monitoring intent"):
+        service.correlate(request)
+
+
 @pytest.mark.parametrize(
     ("score", "expected"),
     [

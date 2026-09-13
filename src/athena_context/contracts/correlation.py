@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from ipaddress import ip_address
 from types import MappingProxyType
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -20,10 +20,22 @@ from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDa
 from athena_context.contracts.monitoring import MonitoringEvidenceHandoff
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
-MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION = (
+LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
+    Literal["athena.wc026MonitoringEvidenceBundle.v1"]
+] = (
     "athena.wc026MonitoringEvidenceBundle.v1"
 )
-CORRELATION_REQUEST_SCHEMA_VERSION = "athena.wc026CorrelationRequest.v2"
+MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
+    Literal["athena.wc028MonitoringEvidenceBundle.v2"]
+] = (
+    "athena.wc028MonitoringEvidenceBundle.v2"
+)
+LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+    Literal["athena.wc026CorrelationRequest.v2"]
+] = "athena.wc026CorrelationRequest.v2"
+CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+    Literal["athena.wc028CorrelationRequest.v3"]
+] = "athena.wc028CorrelationRequest.v3"
 CORRELATION_REPORT_SCHEMA_VERSION = "athena.wc026CorrelationReport.v1"
 CORRELATION_ALGORITHM_ID = "athena.wc026.correlation.v1"
 CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
@@ -944,9 +956,10 @@ class EvidenceCoverage(_StrictCorrelationModel):
 
 
 class MonitoringEvidenceBundle(_StrictCorrelationModel):
-    schema_version: Literal["athena.wc026MonitoringEvidenceBundle.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc026MonitoringEvidenceBundle.v1",
+        "athena.wc028MonitoringEvidenceBundle.v2",
+    ] = Field(alias="schemaVersion")
     workload_id: str = Field(
         alias="workloadId",
         min_length=1,
@@ -1017,7 +1030,28 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             raise ValueError(
                 "coverage must account for every expected monitoring query scope"
             )
-        if self.monitoring_intent_reference is not None:
+        if self.schema_version == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION:
+            if (
+                self.monitoring_intent_reference is not None
+                or any(
+                    item.control_provenance is not None
+                    or item.query_execution_digest is not None
+                    for item in self.observations
+                )
+                or any(
+                    item.control_provenance is not None
+                    or item.query_execution_digests is not None
+                    for item in self.coverage
+                )
+            ):
+                raise ValueError(
+                    "legacy monitoring bundle cannot contain WC028 provenance fields"
+                )
+        else:
+            if self.monitoring_intent_reference is None:
+                raise ValueError(
+                    "WC028 monitoring bundle requires signed intent references"
+                )
             if any(
                 item.control_provenance is None for item in self.observations
             ) or any(item.control_provenance is None for item in self.coverage):
@@ -1660,9 +1694,10 @@ class CorrelationEvidenceInventory(_StrictCorrelationModel):
 class CorrelationRequest(_StrictCorrelationModel):
     """Untrusted wire envelope that must pass the later verification adapter."""
 
-    schema_version: Literal["athena.wc026CorrelationRequest.v2"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc026CorrelationRequest.v2",
+        "athena.wc028CorrelationRequest.v3",
+    ] = Field(alias="schemaVersion")
     request_id: str = Field(alias="requestId")
     algorithm_id: Literal["athena.wc026.correlation.v1"] = Field(alias="algorithmId")
     rule_catalog_digest: Sha256Digest = Field(alias="ruleCatalogDigest")
@@ -1694,6 +1729,28 @@ class CorrelationRequest(_StrictCorrelationModel):
 
     @model_validator(mode="after")
     def validate_request(self) -> CorrelationRequest:
+        if self.schema_version == LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION:
+            if (
+                self.monitoring_bundle.schema_version
+                != LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest
+                is not None
+                or self.evidence_inventory.monitoring_control_provenance_digest
+                is not None
+            ):
+                raise ValueError(
+                    "legacy correlation request cannot contain WC028 provenance fields"
+                )
+        elif (
+            self.monitoring_bundle.schema_version
+            != MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            or self.evidence_inventory.monitoring_intent_asset_reference_digest
+            is None
+            or self.evidence_inventory.monitoring_control_provenance_digest is None
+        ):
+            raise ValueError(
+                "WC028 correlation request requires the WC028 evidence bundle and inventory"
+            )
         if not (
             self.issued_at <= self.trusted_as_of <= self.expires_at
             and self.expires_at - self.issued_at <= timedelta(minutes=15)
@@ -3643,6 +3700,8 @@ __all__ = [
     "CORRELATION_REPORT_SCHEMA_VERSION",
     "CORRELATION_REQUIRED_CAPS",
     "CORRELATION_REQUEST_SCHEMA_VERSION",
+    "LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION",
+    "LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "BindingMode",
     "ConfidenceCap",

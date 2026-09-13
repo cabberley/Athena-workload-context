@@ -43,13 +43,17 @@ The boundary:
   backward-compatible draft inspection, but production activation cannot convert missing
   telemetry into healthy evidence;
 - validates every observation interval, coverage interval, and normalized Resource Graph change
-  against `trustedAsOf`, and bounds the delay from collection to trusted evaluation to 20 minutes;
+  against `trustedAsOf`, reapplies each source's reviewed freshness limit at that time, and bounds
+  the delay from collection to trusted evaluation to 20 minutes;
 - persists the immutable intent and attestation Blob references with the monitoring bundle,
   includes them in the correlation evidence inventory, and records digest-bound `controlId`,
   `controlDigest`, and `sourceClausePath` provenance on every observation and coverage record;
 - requires the production correlation verifier to re-read the version-pinned intent and
   attestation, verify the detached signature and active-context binding, and resolve every
   persisted control provenance tuple before evaluating any hypothesis;
+- requires confidence matchers to use the complete coverage record containing the scored
+  observation's own query-execution digest; complete coverage for another execution cannot
+  upgrade partial evidence;
 - keeps monitoring-owned evidence resources, such as a Connection Monitor resource, in a signed
   `evidenceResourceIds` scope distinct from workload dependency-path coverage resources;
 - normalizes into the existing WC-026 observation, coverage, change-artifact, incident-transition,
@@ -79,11 +83,13 @@ intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health con
 required freshness bound. Version 1 assets are rejected rather than silently treating unbound
 coverage or unbounded health events as activation eligible.
 
-The shared WC-026 bundle and request schema identifiers remain unchanged for compatibility with
-previously persisted evidence. Their new provenance and query-execution fields are optional when
-parsing legacy artifacts. WC-028 always emits them, and the production `CorrelationService` fails
-closed when the signed intent references or resolvable provenance are absent. Legacy unsigned
-fixtures remain usable only through the non-production verification harness.
+The new wire contracts are `athena.wc028MonitoringEvidenceBundle.v2` and
+`athena.wc028CorrelationRequest.v3`. The legacy
+`athena.wc026MonitoringEvidenceBundle.v1` and `athena.wc026CorrelationRequest.v2` variants remain
+parseable, but they reject the new WC-028 fields rather than changing an existing strict schema in
+place. WC-028 always emits the new pair. The production `CorrelationService` fails closed for the
+legacy unsigned variant, while the explicitly non-production compatibility harness can continue
+to evaluate previously persisted WC-026 fixtures.
 
 ## Consequences
 
@@ -98,6 +104,8 @@ fixtures remain usable only through the non-production verification harness.
 - Activation-eligible intent using `treatAsHealthy`, uncovered or multiply covered query
   observations, excessive collection-to-trust delay, and unresolved signed control provenance all
   fail closed.
+- Query and change evidence that was fresh at collection but exceeds its source-specific age at
+  `trustedAsOf` fails before persistence.
 - No Azure resource, RBAC assignment, query deployment, alert rule, or connection monitor is
   created by this slice.
 - A later slice must implement the identity-isolated Azure acquisition and atomic persistence port,

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_REQUEST_SCHEMA_VERSION,
+    MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidenceArtifact,
@@ -51,6 +52,7 @@ from athena_context.contracts import (
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
 from athena_context.eventing.change_ingestion import (
+    MAX_CHANGE_EVIDENCE_AGE,
     ChangeEvidenceArtifactSigner,
     build_change_evidence_artifact,
     normalize_resource_graph_change,
@@ -758,6 +760,7 @@ def _require_log_query(
     record: _LogQueryCollectionRecord,
     *,
     collected_at: datetime,
+    trusted_as_of: datetime,
     required_table: str,
 ) -> LogQueryMonitoringSignal:
     if not isinstance(control.signal, LogQueryMonitoringSignal):
@@ -794,7 +797,10 @@ def _require_log_query(
         (record.observed_end - record.observed_start).total_seconds()
         != signal.evaluation_window_seconds
         or record.observed_end > collected_at
+        or record.observed_end > trusted_as_of
         or (collected_at - record.observed_end).total_seconds()
+        > signal.evaluation_window_seconds + signal.frequency_seconds
+        or (trusted_as_of - record.observed_end).total_seconds()
         > signal.evaluation_window_seconds + signal.frequency_seconds
     ):
         raise MonitoringCollectionError(
@@ -904,11 +910,13 @@ def _heartbeat_observation(
     control: PublishedMonitoringIntentControl,
     intent_digest: str,
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> GuestSignalObservation:
     signal = _require_log_query(
         control,
         record,
         collected_at=collected_at,
+        trusted_as_of=trusted_as_of,
         required_table="Heartbeat",
     )
     (resource_id,) = _require_resources(control, record.resource_id)
@@ -955,11 +963,13 @@ def _endpoint_observation(
     intent_digest: str,
     context: PublishedRuntimeContextBinding,
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> EndpointHealthObservation:
     signal = _require_log_query(
         control,
         record,
         collected_at=collected_at,
+        trusted_as_of=trusted_as_of,
         required_table="VMConnection",
     )
     subject_id = _canonical_resource_id(record.subject_resource_id)
@@ -1089,8 +1099,25 @@ def _validate_coverage_query_binding(
     records_by_execution: Mapping[str, _LogQueryCollectionRecord],
     *,
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> None:
     if isinstance(control.signal, ResourceHealthMonitoringSignal):
+        resource_health_signal = control.signal
+        if (
+            coverage.observed_end > collected_at
+            or coverage.observed_end > trusted_as_of
+            or (collected_at - coverage.observed_start).total_seconds()
+            > resource_health_signal.maximum_event_age_seconds
+            or (collected_at - coverage.observed_end).total_seconds()
+            > resource_health_signal.maximum_event_age_seconds
+            or (trusted_as_of - coverage.observed_start).total_seconds()
+            > resource_health_signal.maximum_event_age_seconds
+            or (trusted_as_of - coverage.observed_end).total_seconds()
+            > resource_health_signal.maximum_event_age_seconds
+        ):
+            raise MonitoringCollectionError(
+                "resource-health coverage is outside the reviewed freshness limit"
+            )
         return
     if not isinstance(control.signal, LogQueryMonitoringSignal):
         raise MonitoringCollectionError("Activity Log controls cannot declare monitoring coverage")
@@ -1108,9 +1135,12 @@ def _validate_coverage_query_binding(
         )
     if (
         coverage.observed_end > collected_at
+        or coverage.observed_end > trusted_as_of
         or (coverage.observed_end - coverage.observed_start).total_seconds()
         <= 0
         or (collected_at - coverage.observed_end).total_seconds()
+        > signal.evaluation_window_seconds + signal.frequency_seconds
+        or (trusted_as_of - coverage.observed_end).total_seconds()
         > signal.evaluation_window_seconds + signal.frequency_seconds
     ):
         raise MonitoringCollectionError("coverage is outside its reviewed freshness window")
@@ -1180,11 +1210,13 @@ def _connection_monitor_observation(
     intent_digest: str,
     context: PublishedRuntimeContextBinding,
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> ConnectionMonitorObservation:
     _require_log_query(
         control,
         record,
         collected_at=collected_at,
+        trusted_as_of=trusted_as_of,
         required_table="NWConnectionMonitorTestResult",
     )
     (monitor_id,) = _require_evidence_resources(
@@ -1305,11 +1337,13 @@ def _network_flow_observation(
     artifacts: tuple[ChangeEvidenceArtifact, ...],
     deny_introducing_evidence_ids: frozenset[str],
     collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> NetworkFlowObservation:
     _require_log_query(
         control,
         record,
         collected_at=collected_at,
+        trusted_as_of=trusted_as_of,
         required_table="NTANetAnalytics",
     )
     _validate_attribution_evidence(record)
@@ -1655,6 +1689,15 @@ class MonitoringCollectionTransaction:
                 scope=change_scope,
                 received_at=batch.collected_at,
             )
+            if (
+                evidence.occurred_at > trusted_as_of
+                or evidence.received_at > trusted_as_of
+                or trusted_as_of - evidence.occurred_at
+                > MAX_CHANGE_EVIDENCE_AGE
+            ):
+                raise MonitoringCollectionError(
+                    "resource change is outside its trustedAsOf freshness limit"
+                )
             control = selected_controls[change_record.source_record_id]
             _require_resources(control, evidence.target_resource_id)
             if (
@@ -1662,8 +1705,6 @@ class MonitoringCollectionTransaction:
                 != _canonical_resource_id(change_record.target_resource_id)
                 or evidence.correlation_id != change_record.correlation_id
                 or evidence.occurred_at != change_record.occurred_at
-                or evidence.occurred_at > trusted_as_of
-                or evidence.received_at > trusted_as_of
                 or evidence.operation_name != change_record.operation_name.casefold()
                 or evidence.result != change_record.result_type.casefold()
             ):
@@ -1713,6 +1754,7 @@ class MonitoringCollectionTransaction:
                     control,
                     monitoring_intent.intent_digest,
                     batch.collected_at,
+                    trusted_as_of,
                 )
             elif isinstance(collection_record, VmConnectionHealthRecord):
                 observation = _endpoint_observation(
@@ -1721,6 +1763,7 @@ class MonitoringCollectionTransaction:
                     monitoring_intent.intent_digest,
                     context_binding,
                     batch.collected_at,
+                    trusted_as_of,
                 )
             elif isinstance(collection_record, ConnectionMonitorRecord):
                 observation = _connection_monitor_observation(
@@ -1729,6 +1772,7 @@ class MonitoringCollectionTransaction:
                     monitoring_intent.intent_digest,
                     context_binding,
                     batch.collected_at,
+                    trusted_as_of,
                 )
             elif isinstance(collection_record, NetworkWatcherFlowRecord):
                 observation = _network_flow_observation(
@@ -1739,6 +1783,7 @@ class MonitoringCollectionTransaction:
                     artifacts,
                     deny_introducing_evidence_ids,
                     batch.collected_at,
+                    trusted_as_of,
                 )
             elif isinstance(collection_record, ResourceHealthRecord):
                 observation = _resource_health_observation(
@@ -1767,6 +1812,7 @@ class MonitoringCollectionTransaction:
                 coverage_controls[coverage_record.source_record_id],
                 records_by_execution,
                 collected_at=batch.collected_at,
+                trusted_as_of=trusted_as_of,
             )
         coverage_counts = dict.fromkeys(records_by_execution, 0)
         for coverage_record in batch.coverage:
@@ -1836,7 +1882,7 @@ class MonitoringCollectionTransaction:
             )
         )
         bundle = MonitoringEvidenceBundle(
-            schemaVersion="athena.wc026MonitoringEvidenceBundle.v1",
+            schemaVersion=MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
             workloadId=monitoring_intent.workload_id,
             monitoringContractDigest=collector_contract_digest,
             monitoringIntentReference=_monitoring_intent_evidence_reference(

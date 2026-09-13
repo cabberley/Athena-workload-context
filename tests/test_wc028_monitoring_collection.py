@@ -9,13 +9,20 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import athena_context.correlation.engine as correlation_engine
 from athena_context.contracts import (
+    CORRELATION_REQUEST_SCHEMA_VERSION,
+    LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION,
+    LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidencePersistenceHandoff,
+    EndpointHealthObservation,
     LogQueryMonitoringSignal,
     MonitoringControlProvenance,
     MonitoringEvidenceAttestation,
+    MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
     MonitoringIntentScope,
     PublishedMonitoringIntent,
@@ -885,6 +892,11 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
 
     assert commit.calls == 1
     assert prepared.intent_digest
+    assert (
+        prepared.monitoring_bundle.schema_version
+        == MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+    )
+    assert request.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
     assert prepared.monitoring_bundle.monitoring_intent_reference is not None
     query_observation_digests = {
         item.query_execution_digest
@@ -1548,6 +1560,57 @@ def test_every_query_observation_requires_exactly_one_compatible_coverage() -> N
         )
 
 
+def test_confidence_matcher_rejects_unrelated_complete_query_coverage() -> None:
+    _, _, request, _ = _execute(direct_attribution=True)
+    endpoint = next(
+        item
+        for item in request.monitoring_bundle.observations
+        if isinstance(item, EndpointHealthObservation) and item.status == "unhealthy"
+    )
+    exact = next(
+        item
+        for item in request.monitoring_bundle.coverage
+        if item.query_execution_digests == (endpoint.query_execution_digest,)
+    )
+    healthy_endpoint = next(
+        item
+        for item in request.monitoring_bundle.observations
+        if isinstance(item, EndpointHealthObservation) and item.status == "healthy"
+    )
+    partial_exact = exact.model_copy(
+        update={"status": "partial", "detail": "synthetic partial result"}
+    )
+    unrelated_complete = exact.model_copy(
+        update={
+            "coverage_id": "coverage-" + "f" * 32,
+            "coverage_digest": "sha256:" + "f" * 64,
+            "query_execution_digests": (
+                healthy_endpoint.query_execution_digest,
+            ),
+        }
+    )
+    coverage = tuple(
+        item
+        for item in request.monitoring_bundle.coverage
+        if item.coverage_id != exact.coverage_id
+    ) + (partial_exact, unrelated_complete)
+    forged_request = request.model_copy(
+        update={
+            "monitoring_bundle": request.monitoring_bundle.model_copy(
+                update={"coverage": coverage}
+            )
+        }
+    )
+
+    assert (
+        correlation_engine._matching_endpoint_coverage(
+            forged_request,
+            endpoint,
+        )
+        is None
+    )
+
+
 def test_v1_collection_batch_is_rejected_after_query_binding_upgrade() -> None:
     context, intent, controls = _authority()
     batch = _batch(controls).model_copy(
@@ -1827,6 +1890,82 @@ def test_collection_to_trusted_as_of_delay_is_bounded() -> None:
             trusted_as_of=NOW
             + timedelta(seconds=MAX_COLLECTION_TRUST_DELAY_SECONDS + 1),
         )
+
+
+def test_query_freshness_is_reapplied_at_trusted_as_of() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls, direct_attribution=False)
+    current_heartbeat = next(
+        item
+        for item in batch.records
+        if item.source_record_id == "heartbeat-unhealthy"
+    )
+    without_change = batch.model_copy(
+        update={
+            "records": (
+                current_heartbeat,
+                *(
+                    item
+                    for item in batch.records
+                    if not isinstance(item, ResourceChangeRecord)
+                    and item is not current_heartbeat
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(MonitoringCollectionError, match="evaluation window"):
+        _transaction().prepare(
+            without_change,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=20),
+        )
+
+
+def test_resource_graph_freshness_is_reapplied_at_trusted_as_of() -> None:
+    context, intent, controls = _authority()
+
+    with pytest.raises(MonitoringCollectionError, match="trustedAsOf freshness limit"):
+        _transaction().prepare(
+            _batch(controls),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=20),
+        )
+
+
+def test_legacy_schema_versions_reject_wc028_wire_fields() -> None:
+    prepared, _, request, _ = _execute(direct_attribution=True)
+    legacy_bundle_payload = prepared.monitoring_bundle.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    legacy_bundle_payload["schemaVersion"] = (
+        LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+    )
+    with pytest.raises(ValidationError, match="legacy monitoring bundle"):
+        MonitoringEvidenceBundle.model_validate(legacy_bundle_payload)
+
+    legacy_request_payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    legacy_request_payload["schemaVersion"] = LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION
+    with pytest.raises(ValidationError, match="legacy correlation request"):
+        type(request).model_validate(legacy_request_payload)
 
 
 class _IntentAssetReader:

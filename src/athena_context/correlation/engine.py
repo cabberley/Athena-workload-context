@@ -8,6 +8,7 @@ from typing import cast
 from athena_context.contracts.change_ingestion import ChangeEvidenceArtifact
 from athena_context.contracts.common import compute_artifact_digest, sha256_hex
 from athena_context.contracts.correlation import (
+    LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ConfidenceCap,
     ConfidenceCapCode,
     ConfidenceLevel,
@@ -1470,9 +1471,8 @@ def _observation_hypothesis(
     family = citations[observation.observation_id].family
     if not _has_complete_coverage(
         request,
-        family=family,
+        observation=observation,
         path=path,
-        resource_id=observation.subject_resource_id,
     ):
         caps.append(_cap("ambiguousObservationWindow"))
         missing.append(
@@ -1868,6 +1868,7 @@ def _matching_flow_coverage(
             for item in request.monitoring_bundle.coverage
             if item.family == "networkFlow"
             and item.status == "complete"
+            and _coverage_binds_query_observation(request, item, flow)
             and item.scope.path_id == flow.path_id
             and item.scope.direction == flow.direction
             and item.scope.five_tuple_digest == flow.five_tuple_digest
@@ -1892,6 +1893,7 @@ def _matching_monitor_coverage(
             for item in request.monitoring_bundle.coverage
             if item.family == "connectionMonitor"
             and item.status == "complete"
+            and _coverage_binds_query_observation(request, item, monitor)
             and item.scope.path_id == monitor.path_id
             and item.scope.direction == monitor.direction
             and item.scope.five_tuple_digest == monitor.five_tuple_digest
@@ -1922,6 +1924,7 @@ def _matching_endpoint_coverage(
             for item in request.monitoring_bundle.coverage
             if item.family == "endpointHealth"
             and item.status == "complete"
+            and _coverage_binds_query_observation(request, item, endpoint)
             and item.scope.path_id == endpoint.path_id
             and {
                 endpoint.subject_resource_id,
@@ -1956,18 +1959,55 @@ def _has_complete_nsg_coverage(
 def _has_complete_coverage(
     request: CorrelationRequest,
     *,
-    family: EvidenceFamily,
+    observation: (
+        GuestSignalObservation
+        | EndpointHealthObservation
+        | PlatformHealthObservation
+    ),
     path: DependencyPath | None,
-    resource_id: str,
 ) -> bool:
+    family = (
+        "guest"
+        if isinstance(observation, GuestSignalObservation)
+        else "endpointHealth"
+        if isinstance(observation, EndpointHealthObservation)
+        else "platformHealth"
+    )
     return any(
         item.family == family
         and item.status == "complete"
-        and resource_id in item.scope.resource_ids
+        and _coverage_binds_query_observation(request, item, observation)
+        and observation.subject_resource_id in item.scope.resource_ids
         and (path is None or item.scope.path_id in {None, path.path_id})
         and item.coverage_start <= request.incident_anchor.observed_start
         and item.coverage_end >= request.incident_anchor.observed_end
         for item in request.monitoring_bundle.coverage
+    )
+
+
+def _coverage_binds_query_observation(
+    request: CorrelationRequest,
+    coverage: EvidenceCoverage,
+    observation: (
+        GuestSignalObservation
+        | NetworkFlowObservation
+        | ConnectionMonitorObservation
+        | EndpointHealthObservation
+        | PlatformHealthObservation
+    ),
+) -> bool:
+    if (
+        request.monitoring_bundle.schema_version
+        == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+    ):
+        return True
+    if isinstance(observation, PlatformHealthObservation):
+        return True
+    return (
+        observation.query_execution_digest is not None
+        and coverage.query_execution_digests is not None
+        and observation.query_execution_digest
+        in coverage.query_execution_digests
     )
 
 
