@@ -898,6 +898,7 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
     )
     assert request.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
     assert prepared.monitoring_bundle.monitoring_intent_reference is not None
+    assert prepared.monitoring_bundle.collected_at == NOW
     query_observation_digests = {
         item.query_execution_digest
         for item in prepared.monitoring_bundle.observations
@@ -2057,6 +2058,50 @@ def test_downstream_verification_rereads_signed_intent_and_resolves_controls() -
             reader=reader,
             verifier=verifier,
         )
+
+
+def test_downstream_verification_rejects_reissued_stale_source_evidence() -> None:
+    _, intent, _ = _authority()
+    reference, attestation = _intent_assets(intent)
+    _, _, request, _ = _execute(direct_attribution=True)
+    trusted_as_of = NOW + timedelta(minutes=20)
+    payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"request_id", "request_digest"},
+    )
+    payload.update(
+        {
+            "issuedAt": trusted_as_of - timedelta(minutes=1),
+            "trustedAsOf": trusted_as_of,
+            "expiresAt": trusted_as_of + timedelta(minutes=5),
+        }
+    )
+    request_digest = compute_artifact_digest(_json_value(payload))
+    reissued_request = type(request).model_validate(
+        {
+            **payload,
+            "requestId": f"request-{request_digest.removeprefix('sha256:')[:32]}",
+            "requestDigest": request_digest,
+        }
+    )
+    service = _test_service(reissued_request)
+    object.__setattr__(
+        service,
+        "monitoring_intent_reader",
+        _IntentAssetReader(reference, intent, attestation),
+    )
+    object.__setattr__(
+        service,
+        "monitoring_intent_verifier",
+        _IntentAssetVerifier(),
+    )
+    object.__setattr__(service, "_require_signed_monitoring_intent", True)
+
+    assert reissued_request.trusted_as_of == trusted_as_of
+    with pytest.raises(ValueError, match="query-derived evidence exceeds"):
+        service.correlate(reissued_request)
 
 
 def test_preparation_is_deterministic_for_input_order() -> None:

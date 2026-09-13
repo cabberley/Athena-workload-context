@@ -1888,6 +1888,7 @@ class MonitoringCollectionTransaction:
             monitoringIntentReference=_monitoring_intent_evidence_reference(
                 monitoring_intent_reference
             ),
+            collectedAt=batch.collected_at,
             observedStart=observed_start,
             observedEnd=observed_end,
             observations=observations,

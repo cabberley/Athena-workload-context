@@ -50,7 +50,12 @@ The boundary:
   `controlDigest`, and `sourceClausePath` provenance on every observation and coverage record;
 - requires the production correlation verifier to re-read the version-pinned intent and
   attestation, verify the detached signature and active-context binding, and resolve every
-  persisted control provenance tuple before evaluating any hypothesis;
+  persisted control provenance tuple before evaluating any hypothesis. The verifier also uses
+  the bundle's immutable `collectedAt` and the reverified control metadata to reapply each query
+  evaluation-window-plus-frequency limit, Resource Health maximum event age, the 15-minute
+  change-evidence limit, and the 20-minute collection delay against the request's
+  `trustedAsOf`; recomputing the unkeyed request digest with a later trust time cannot refresh
+  persisted evidence;
 - requires confidence matchers to use the complete coverage record containing the scored
   observation's own query-execution digest; complete coverage for another execution cannot
   upgrade partial evidence;
@@ -131,4 +136,7 @@ to evaluate previously persisted WC-026 fixtures.
   compatible coverage.
 - Production verification re-reads the immutable signed monitoring intent and attestation and
   rejects unresolved control provenance.
+- Production verification rejects a caller-reissued request whose `trustedAsOf` is moved forward
+  and whose request digest is recomputed when the persisted source evidence is no longer fresh
+  under the reverified signed control limits.
 - Stable bundle and change-artifact bytes under input reordering.

@@ -7,7 +7,7 @@ import hmac
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from athena_context.artifacts import ArtifactReadRequest
@@ -31,6 +31,7 @@ from athena_context.contracts.correlation import (
     CorrelationReport,
     CorrelationRequest,
     EndpointHealthObservation,
+    EvidenceCoverage,
     GuestSignalObservation,
     MonitoringEvidenceBundle,
     NetworkFlowObservation,
@@ -50,9 +51,11 @@ from athena_context.contracts.monitoring import (
     verify_monitoring_evidence_handoff_attestation,
 )
 from athena_context.contracts.monitoring_intent import (
+    LogQueryMonitoringSignal,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
+    ResourceHealthMonitoringSignal,
     validate_monitoring_intent_activation_eligible,
     validate_published_monitoring_intent_assets,
 )
@@ -63,7 +66,12 @@ from athena_context.correlation.rules import (
     assert_catalog_digest,
     assert_contract_compatibility,
 )
-from athena_context.eventing.change_ingestion import KeyVaultChangeEvidenceSigner
+from athena_context.eventing.change_ingestion import (
+    MAX_CHANGE_EVIDENCE_AGE,
+    KeyVaultChangeEvidenceSigner,
+)
+
+_MAX_COLLECTION_TRUST_DELAY = timedelta(minutes=20)
 
 type HealthObservation = (
     GuestSignalObservation | EndpointHealthObservation | PlatformHealthObservation
@@ -237,7 +245,7 @@ def _verify_signed_monitoring_intent(
     *,
     reader: ImmutableArtifactReader | None,
     verifier: MonitoringIntentAssetVerifier | None,
-) -> None:
+) -> PublishedMonitoringIntent:
     evidence_reference = request.monitoring_bundle.monitoring_intent_reference
     if evidence_reference is None or reader is None or verifier is None:
         raise ValueError(
@@ -296,6 +304,78 @@ def _verify_signed_monitoring_intent(
             raise ValueError(
                 "monitoring evidence control provenance does not resolve in signed intent"
             )
+    return intent
+
+
+def _verify_request_source_freshness(
+    request: CorrelationRequest,
+    intent: PublishedMonitoringIntent,
+) -> None:
+    collected_at = request.monitoring_bundle.collected_at
+    if (
+        collected_at is None
+        or collected_at > request.trusted_as_of
+        or request.trusted_as_of - collected_at > _MAX_COLLECTION_TRUST_DELAY
+    ):
+        raise ValueError("monitoring collection exceeds the trustedAsOf delay bound")
+    controls = {item.control_id: item for item in intent.controls}
+    for item in (
+        *request.monitoring_bundle.observations,
+        *request.monitoring_bundle.coverage,
+    ):
+        provenance = item.control_provenance
+        if provenance is None:
+            raise ValueError("monitoring evidence lacks signed control provenance")
+        signal = controls[provenance.control_id].signal
+        if isinstance(item, EvidenceCoverage):
+            observed_start = item.coverage_start
+            observed_end = item.coverage_end
+            is_query_observation = False
+        else:
+            observed_start = item.observed_start
+            observed_end = item.observed_end
+            is_query_observation = item.query_execution_digest is not None
+        if isinstance(signal, LogQueryMonitoringSignal):
+            maximum_age = timedelta(
+                seconds=signal.evaluation_window_seconds
+                + signal.frequency_seconds
+            )
+            if (
+                observed_end > request.trusted_as_of
+                or request.trusted_as_of - observed_end > maximum_age
+                or (
+                    is_query_observation
+                    and observed_end - observed_start
+                    != timedelta(seconds=signal.evaluation_window_seconds)
+                )
+            ):
+                raise ValueError(
+                    "query-derived evidence exceeds its trustedAsOf freshness limit"
+                )
+        elif isinstance(signal, ResourceHealthMonitoringSignal):
+            maximum_age = timedelta(seconds=signal.maximum_event_age_seconds)
+            if (
+                observed_end > request.trusted_as_of
+                or request.trusted_as_of - observed_start > maximum_age
+                or request.trusted_as_of - observed_end > maximum_age
+            ):
+                raise ValueError(
+                    "Resource Health evidence exceeds its trustedAsOf freshness limit"
+                )
+        else:
+            raise ValueError(
+                "monitoring evidence references an unsupported signed control signal"
+            )
+    if any(
+        artifact.evidence.occurred_at > request.trusted_as_of
+        or artifact.evidence.received_at > request.trusted_as_of
+        or request.trusted_as_of - artifact.evidence.occurred_at
+        > MAX_CHANGE_EVIDENCE_AGE
+        for artifact in request.change_artifacts
+    ):
+        raise ValueError(
+            "change evidence exceeds its trustedAsOf freshness limit"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,11 +425,12 @@ class _CorrelationVerificationService:
         if persisted_bundle != request.monitoring_bundle:
             raise ValueError("monitoring bundle does not match the immutable Blob")
         if self.require_signed_monitoring_intent:
-            _verify_signed_monitoring_intent(
+            verified_intent = _verify_signed_monitoring_intent(
                 request,
                 reader=self.monitoring_intent_reader,
                 verifier=self.monitoring_intent_verifier,
             )
+            _verify_request_source_freshness(request, verified_intent)
         _verify_canonical_incident_anchor(request)
         _verify_network_rule_parents(request)
         if (

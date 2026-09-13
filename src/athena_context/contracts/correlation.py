@@ -973,6 +973,7 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
         default=None,
         alias="monitoringIntentReference",
     )
+    collected_at: UtcDateTime | None = Field(default=None, alias="collectedAt")
     observed_start: UtcDateTime = Field(alias="observedStart")
     observed_end: UtcDateTime = Field(alias="observedEnd")
     observations: tuple[MonitoringObservation, ...] = Field(max_length=1000)
@@ -1033,6 +1034,7 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
         if self.schema_version == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION:
             if (
                 self.monitoring_intent_reference is not None
+                or self.collected_at is not None
                 or any(
                     item.control_provenance is not None
                     or item.query_execution_digest is not None
@@ -1048,9 +1050,9 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     "legacy monitoring bundle cannot contain WC028 provenance fields"
                 )
         else:
-            if self.monitoring_intent_reference is None:
+            if self.monitoring_intent_reference is None or self.collected_at is None:
                 raise ValueError(
-                    "WC028 monitoring bundle requires signed intent references"
+                    "WC028 monitoring bundle requires signed intent references and collectedAt"
                 )
             if any(
                 item.control_provenance is None for item in self.observations
