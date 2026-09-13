@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TextIO
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_CHANGES = 5000
@@ -84,6 +84,10 @@ class RbacPolicy:
     separation_rules: tuple[SeparationRule, ...]
 
 
+type PreflightKind = Literal["rbac", "what-if"]
+type PreflightOutputFormat = Literal["json", "text"]
+
+
 def _normalized(value: str) -> str:
     return value.strip().casefold()
 
@@ -151,7 +155,12 @@ def _require_string(
     field_name: str,
     maximum_length: int = 4096,
 ) -> str:
-    if type(value) is not str or not value.strip() or len(value) > maximum_length:
+    if (
+        type(value) is not str
+        or not value.strip()
+        or len(value) > maximum_length
+        or not value.isprintable()
+    ):
         raise PreflightInputError(f"{field_name} must be a bounded string")
     return value.strip()
 
@@ -194,7 +203,12 @@ def _validate_json_shape(value: object) -> None:
         if depth > MAX_JSON_DEPTH or nodes > MAX_JSON_NODES:
             raise PreflightInputError("JSON structure exceeds depth or node bounds")
         if isinstance(item, dict):
-            if any(type(key) is not str or len(key) > 4096 for key in item):
+            if any(
+                type(key) is not str
+                or len(key) > 4096
+                or not key.isprintable()
+                for key in item
+            ):
                 raise PreflightInputError("JSON object keys are invalid")
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
@@ -659,6 +673,10 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 field_name="forbiddenScopePrefixes",
                 maximum_items=MAX_POLICY_ITEMS,
             )
+            if not role_names or not scope_prefixes:
+                raise PreflightInputError(
+                    "separation rule requires forbidden roles and scope prefixes"
+                )
             rules.append(
                 SeparationRule(
                     principal_id=_normalized(
@@ -714,9 +732,14 @@ def evaluate_role_assignments(
     document: object,
     *,
     policy_document: object | None = None,
+    require_separation_rules: bool = False,
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
     policy = _parse_policy(policy_document)
+    if require_separation_rules and not policy.separation_rules:
+        raise PreflightInputError(
+            "RBAC policy requires at least one separation rule"
+        )
     violations: list[PreflightViolation] = []
     for raw_assignment in _role_assignments(document):
         assignment = _mapping(
@@ -816,20 +839,117 @@ def evaluate_role_assignments(
     return tuple(violations)
 
 
-def _render_result(
+def render_preflight_json(
     *,
-    kind: str,
+    kind: PreflightKind,
     violations: tuple[PreflightViolation, ...],
 ) -> str:
+    ordered_violations = sorted(
+        violations,
+        key=lambda item: (item.code, item.subject.casefold(), item.detail),
+    )
     return json.dumps(
         {
             "kind": kind,
-            "safe": not violations,
-            "violations": [asdict(item) for item in violations],
+            "safe": not ordered_violations,
+            "violations": [asdict(item) for item in ordered_violations],
         },
         sort_keys=True,
         separators=(",", ":"),
+    ) + "\n"
+
+
+def render_preflight_text(
+    *,
+    kind: PreflightKind,
+    violations: tuple[PreflightViolation, ...],
+) -> str:
+    ordered_violations = sorted(
+        violations,
+        key=lambda item: (item.code, item.subject.casefold(), item.detail),
     )
+    lines = [
+        f"WC-029 preflight: {'SAFE' if not ordered_violations else 'BLOCKED'}",
+        f"Check: {kind}",
+        f"Blockers: {len(ordered_violations)}",
+    ]
+    lines.extend(
+        f"- {_escaped_text(item.code)}"
+        f" | {_escaped_text(item.subject)}"
+        f" | {_escaped_text(item.detail)}"
+        for item in ordered_violations
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _escaped_text(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)[1:-1]
+
+
+def run_preflight_check(
+    *,
+    kind: PreflightKind,
+    input_path: Path,
+    output_format: PreflightOutputFormat,
+    stdout: TextIO,
+    stderr: TextIO,
+    allowed_change_ids: frozenset[str] = frozenset(),
+    policy_path: Path | None = None,
+    require_rbac_policy: bool = False,
+) -> int:
+    """Run one offline preflight check without adding policy or Azure I/O."""
+
+    try:
+        document = load_json_file(input_path)
+        if kind == "what-if":
+            violations = evaluate_what_if(
+                document,
+                allowed_change_ids=allowed_change_ids,
+            )
+        elif kind == "rbac":
+            if require_rbac_policy and policy_path is None:
+                raise PreflightInputError("reviewed RBAC policy is required")
+            policy_document = (
+                None
+                if policy_path is None
+                else load_json_file(policy_path, maximum_bytes=1024 * 1024)
+            )
+            violations = evaluate_role_assignments(
+                document,
+                policy_document=policy_document,
+                require_separation_rules=require_rbac_policy,
+            )
+        else:
+            raise ValueError(f"unsupported preflight kind: {kind}")
+    except PreflightInputError as exc:
+        if output_format == "json":
+            stderr.write(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "kind": kind,
+                        "safe": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        elif output_format == "text":
+            stderr.write(
+                f"WC-029 preflight {kind} failed: {_escaped_text(str(exc))}\n"
+            )
+        else:
+            raise ValueError(f"unsupported output format: {output_format}") from None
+        return 3
+
+    if output_format == "json":
+        stdout.write(render_preflight_json(kind=kind, violations=violations))
+    elif output_format == "text":
+        stdout.write(render_preflight_text(kind=kind, violations=violations))
+    else:
+        raise ValueError(f"unsupported output format: {output_format}")
+    return 0 if not violations else 2
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -845,43 +965,42 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         metavar="RESOURCE_ID",
     )
+    what_if.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+    )
     rbac = subparsers.add_parser("rbac")
     rbac.add_argument("input", type=Path)
     rbac.add_argument("--policy", type=Path)
+    rbac.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> int:
     args = _parser().parse_args(argv)
-    try:
-        document = load_json_file(args.input)
-        if args.command == "what-if":
-            violations = evaluate_what_if(
-                document,
-                allowed_change_ids=frozenset(args.allow_change),
-            )
-        else:
-            policy = (
-                None
-                if args.policy is None
-                else load_json_file(args.policy, maximum_bytes=1024 * 1024)
-            )
-            violations = evaluate_role_assignments(
-                document,
-                policy_document=policy,
-            )
-    except PreflightInputError as exc:
-        print(
-            json.dumps(
-                {"safe": False, "error": str(exc)},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-        return 3
-    print(_render_result(kind=args.command, violations=violations))
-    return 0 if not violations else 2
+    output = stdout if stdout is not None else sys.stdout
+    errors = stderr if stderr is not None else sys.stderr
+    return run_preflight_check(
+        kind=args.command,
+        input_path=args.input,
+        allowed_change_ids=frozenset(
+            args.allow_change if args.command == "what-if" else ()
+        ),
+        policy_path=args.policy if args.command == "rbac" else None,
+        output_format=args.format,
+        stdout=output,
+        stderr=errors,
+    )
 
 
 if __name__ == "__main__":

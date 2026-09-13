@@ -142,6 +142,27 @@ artifact. Run `az deployment sub validate` and `az deployment sub what-if` separ
 subscription-scope root. Save raw JSON before review. AMPLS bootstrap, when genuinely required,
 uses `az deployment group` only through its guarded wrapper.
 
+Evaluate each saved full-resource what-if artifact with the repository CLI. Repeat
+`--allow-change` for every exact reviewed `Create` or `Modify` resource ID for that root; omit it
+when the only acceptable result is `NoChange`.
+
+```powershell
+$PreflightJson = & athena-context wc029-preflight what-if `
+  .\evidence\wc013.what-if.json `
+  --allow-change '/subscriptions/.../providers/Microsoft.App/containerApps/athena-presentation' `
+  --format json
+$PreflightExitCode = $LASTEXITCODE
+$PreflightJson | Set-Content -Encoding utf8 .\evidence\wc013.preflight.json
+if ($PreflightExitCode -ne 0) {
+  throw "WC-029 what-if preflight blocked deployment with exit code $PreflightExitCode"
+}
+```
+
+The command reads only the saved JSON file. It does not authenticate to Azure, submit a
+deployment, or modify resources. Exit `2` means the policy blocked the saved plan; exit `3` means
+the evidence could not be safely evaluated. Either result stops the runbook. Use the default text
+format for an operator-readable summary and retain `--format json` output as release evidence.
+
 The checked-in WC-029 artifact is preparation-only: it validates the existing baseline and leaves
 Dependency Agent and Network Watcher Agent deployment disabled. See
 [WC-029 monitoring infrastructure preparation](wc029-monitoring-infrastructure-preparation.md)
@@ -176,6 +197,21 @@ az role assignment list `
   --include-inherited `
   --all `
   --output json
+```
+
+After collecting all reviewed assignments into the bounded
+`.\evidence\role-assignments.json` array, run the offline RBAC gate with the reviewed policy:
+
+```powershell
+$RbacPreflightJson = & athena-context wc029-preflight rbac `
+  .\evidence\role-assignments.json `
+  --policy .\evidence\reviewed-rbac-policy.json `
+  --format json
+$RbacPreflightExitCode = $LASTEXITCODE
+$RbacPreflightJson | Set-Content -Encoding utf8 .\evidence\rbac.preflight.json
+if ($RbacPreflightExitCode -ne 0) {
+  throw "WC-029 RBAC preflight blocked deployment with exit code $RbacPreflightExitCode"
+}
 ```
 
 Required separation:

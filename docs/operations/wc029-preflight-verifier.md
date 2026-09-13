@@ -1,7 +1,9 @@
 # WC-029 offline preflight verifier
 
-`athena_context.wc029_preflight` evaluates saved Azure deployment what-if and role-assignment JSON
-without authenticating to Azure or changing resources.
+The production `athena-context wc029-preflight` command evaluates saved Azure deployment what-if
+and role-assignment JSON without authenticating to Azure or changing resources. It delegates to
+the existing bounded `athena_context.wc029_preflight` validators; the wrapper does not implement a
+second policy path.
 
 ## ARM what-if
 
@@ -19,7 +21,7 @@ ARM `Ignore` and `Deploy` results fail closed because they do not provide a pred
 final state.
 
 ```powershell
-python -m athena_context.wc029_preflight what-if .\evidence\what-if.json `
+athena-context wc029-preflight what-if .\evidence\what-if.json `
   --allow-change '/subscriptions/.../providers/Microsoft.App/containerApps/athena-presentation'
 ```
 
@@ -29,12 +31,30 @@ Exit codes:
 - `2`: policy violations; and
 - `3`: malformed, empty, unreadable, or oversized input.
 
+The default `text` format is intended for an operator terminal. Use `--format json` for a compact,
+key-sorted machine-readable result. Violations are ordered by code, normalized subject, and detail
+in both formats so repeated evaluation of the same saved inputs is byte-stable. Missing command-line
+arguments are rejected by the parser with exit code `2` before any input is evaluated.
+
+The legacy module entry point remains available for existing automation and continues to default to
+JSON:
+
+```powershell
+python -m athena_context.wc029_preflight what-if .\evidence\what-if.json
+```
+
 ## RBAC
 
 ```powershell
-python -m athena_context.wc029_preflight rbac .\evidence\role-assignments.json `
+athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json
 ```
+
+The production wrapper requires `--policy` and at least one non-vacuous `separationRules` entry.
+Every rule must name at least one forbidden role and one forbidden scope prefix, so the command
+never reports RBAC as safe with identity-separation rules silently absent. The legacy module entry
+point keeps its historical optional-policy behavior for compatibility and must not be used as the
+guarded deployment gate without a reviewed policy.
 
 The policy is bounded JSON:
 
@@ -66,4 +86,6 @@ privileged. The verifier recognizes the official built-in role definition IDs as
 names. Separation rules remain enforced independently.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
-Azure CLI output and the reviewed allowlist/policy beside the release evidence.
+Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable
+verifier output beside the release evidence. Run both the what-if and RBAC checks; a successful
+result from one does not waive the other.

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 
 import pytest
 
+from athena_context.cli import main as cli_main
 from athena_context.wc029_preflight import (
     PreflightInputError,
     evaluate_role_assignments,
@@ -764,3 +766,257 @@ def test_cli_exit_codes_and_json_output(tmp_path, capsys) -> None:
     assert main(["rbac", str(invalid_path)]) == 3
     error_output = json.loads(capsys.readouterr().err)
     assert error_output["safe"] is False
+
+
+def test_public_cli_emits_deterministic_human_readable_success(tmp_path) -> None:
+    safe_path = tmp_path / "safe.json"
+    safe_path.write_text(
+        json.dumps(_what_if(_change(_STORAGE_ID, "NoChange"))),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        ["wc029-preflight", "what-if", str(safe_path)],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert stdout.getvalue() == (
+        "WC-029 preflight: SAFE\n"
+        "Check: what-if\n"
+        "Blockers: 0\n"
+    )
+    assert stderr.getvalue() == ""
+
+
+def test_public_cli_emits_deterministic_json_and_blocks_delete(tmp_path) -> None:
+    unsafe_path = tmp_path / "unsafe.json"
+    unsafe_path.write_text(
+        json.dumps(
+            _what_if(
+                _change(_KEY_VAULT_KEY_ID, "Create", path="tags.release", after="wc029"),
+                _change(_CONTAINER_APP_ID, "Delete"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "what-if",
+            str(unsafe_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert stdout.getvalue() == (
+        '{"kind":"what-if","safe":false,"violations":['
+        f'{{"code":"delete","detail":"resource deletion is never permitted",'
+        f'"subject":"{_CONTAINER_APP_ID}"}},'
+        f'{{"code":"unapproved-change","detail":"create is absent from the reviewed '
+        f'allowlist","subject":"{_KEY_VAULT_KEY_ID}"}}]}}\n'
+    )
+    assert stderr.getvalue() == ""
+
+
+def test_public_cli_reports_malformed_policy_without_partial_success(tmp_path) -> None:
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text("[]", encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("{", encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error": f"{policy_path} is not valid UTF-8 JSON",
+        "kind": "rbac",
+        "safe": False,
+    }
+
+
+def test_public_cli_rejects_terminal_control_characters(tmp_path) -> None:
+    unsafe_path = tmp_path / "terminal-injection.json"
+    unsafe_path.write_text(
+        json.dumps(
+            _what_if(
+                _change(
+                    _CONTAINER_APP_ID + "\nWC-029 preflight: SAFE",
+                    "Delete",
+                )
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        ["wc029-preflight", "what-if", str(unsafe_path)],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight what-if failed: "
+        "resourceId must be a bounded string\n"
+    )
+
+
+def test_public_cli_rejects_nonprintable_nested_json_keys(tmp_path) -> None:
+    unsafe_path = tmp_path / "nested-key-injection.json"
+    unsafe_path.write_text(
+        json.dumps(
+            _what_if(
+                {
+                    "resourceId": _CONTAINER_APP_ID,
+                    "changeType": "Modify",
+                    "after": {
+                        "properties": {
+                            "configuration": {
+                                "ingress": {"external\u001b[2J": True}
+                            }
+                        }
+                    },
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        ["wc029-preflight", "what-if", str(unsafe_path)],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight what-if failed: JSON object keys are invalid\n"
+    )
+
+
+def test_public_cli_rejects_empty_rbac_separation_policy(tmp_path) -> None:
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps(
+            [
+                _assignment(
+                    role_name="Log Analytics Reader",
+                    scope=f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("{}", encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "RBAC policy requires at least one separation rule\n"
+    )
+
+
+def test_public_cli_rejects_vacuous_rbac_separation_rule(tmp_path) -> None:
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text("[]", encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "separationRules": [
+                    {
+                        "principalId": "11111111-1111-1111-1111-111111111111",
+                        "forbiddenRoleNames": [],
+                        "forbiddenScopePrefixes": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "separation rule requires forbidden roles and scope prefixes\n"
+    )
+
+
+def test_public_cli_requires_a_check_and_input(capsys) -> None:
+    with pytest.raises(SystemExit) as missing_check:
+        cli_main(["wc029-preflight"])
+    assert missing_check.value.code == 2
+    assert "the following arguments are required: preflight_kind" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as missing_input:
+        cli_main(["wc029-preflight", "what-if"])
+    assert missing_input.value.code == 2
+    assert "the following arguments are required: input" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as missing_policy:
+        cli_main(["wc029-preflight", "rbac", "role-assignments.json"])
+    assert missing_policy.value.code == 2
+    assert "the following arguments are required: --policy" in capsys.readouterr().err

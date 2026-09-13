@@ -95,6 +95,7 @@ from athena_context.wc013_collector_controller import (
 from athena_context.wc013_evidence_collector import (
     run_wc013_evidence_collector_job,
 )
+from athena_context.wc029_preflight import run_preflight_check
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -427,6 +428,45 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=range(1, 16),
         default=10,
+    )
+    preflight_parser = subparsers.add_parser(
+        "wc029-preflight",
+        help="evaluate saved WC-029 deployment and RBAC evidence offline",
+        description=(
+            "Evaluate one saved WC-029 ARM what-if or RBAC artifact without "
+            "authenticating to Azure or changing resources."
+        ),
+    )
+    preflight_subparsers = preflight_parser.add_subparsers(
+        dest="preflight_kind",
+        required=True,
+    )
+    what_if_parser = preflight_subparsers.add_parser(
+        "what-if",
+        help="evaluate saved ARM what-if JSON",
+    )
+    what_if_parser.add_argument("input", type=Path)
+    what_if_parser.add_argument(
+        "--allow-change",
+        action="append",
+        default=[],
+        metavar="RESOURCE_ID",
+    )
+    what_if_parser.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="text",
+    )
+    rbac_parser = preflight_subparsers.add_parser(
+        "rbac",
+        help="evaluate saved role-assignment JSON",
+    )
+    rbac_parser.add_argument("input", type=Path)
+    rbac_parser.add_argument("--policy", required=True, type=Path)
+    rbac_parser.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="text",
     )
     return parser
 
@@ -1018,6 +1058,21 @@ def main(
                 f"WC-025 change history query processed {history_count} change record(s)\n"
             )
             return 0
+        if args.command == "wc029-preflight":
+            return run_preflight_check(
+                kind=args.preflight_kind,
+                input_path=args.input,
+                allowed_change_ids=frozenset(
+                    args.allow_change if args.preflight_kind == "what-if" else ()
+                ),
+                policy_path=(
+                    args.policy if args.preflight_kind == "rbac" else None
+                ),
+                require_rbac_policy=args.preflight_kind == "rbac",
+                output_format=args.format,
+                stdout=output,
+                stderr=errors,
+            )
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
