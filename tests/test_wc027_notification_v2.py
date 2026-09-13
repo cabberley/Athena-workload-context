@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -13,17 +14,21 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import ValidationError
 
 from athena_context.contracts import (
+    ActiveIncidentIndex,
+    ActiveIncidentIndexAttestation,
     IncidentEnrichmentFeedPointer,
     IncidentEnrichmentManifest,
     IncidentFeedIndexAttestationV2,
     IncidentNotificationEnvelopeV2,
     IncidentNotificationV2,
     build_incident_feed_index_v2,
+    canonicalize_json,
     compute_artifact_digest,
     sha256_hex,
 )
 from athena_context.eventing.notification_v2 import (
     NotificationV2PublicationService,
+    NotificationV2SourceNotReadyError,
     NotificationV2SourceVerifier,
     NotificationV2Trust,
     render_teams_notification_v2,
@@ -33,6 +38,7 @@ from athena_context.eventing.runtime import (
     _dispatch_notification_message,
     _validate_notification_broker_metadata,
     run_incident_orchestrator_worker,
+    run_notification_dispatcher_worker,
 )
 from test_presentation_asset_gateway import _feed_v2_gateway_fixture
 from test_wc016_eventing import (
@@ -130,6 +136,57 @@ def _service():
     fixture["notification_key_id"] = notification_key_id
     fixture["notification_public"] = notification_public
     return fixture, service, outbox
+
+
+def _refresh_active_authority(
+    fixture: dict[str, Any],
+    *,
+    published_at: datetime,
+) -> ActiveIncidentIndex:
+    active_index = ActiveIncidentIndex.model_validate_json(
+        fixture["reader"].content["incidents/active.json"]
+    )
+    index_seed = canonicalize_json(
+        {
+            "incidents": [
+                entry.model_dump(mode="json", by_alias=True)
+                for entry in active_index.incidents
+            ],
+            "keyId": active_index.key_id,
+            "keyFingerprint": active_index.key_fingerprint,
+            "publishedAt": published_at,
+        }
+    )
+    refreshed = ActiveIncidentIndex(
+        schemaVersion="athena.activeIncidentIndex.v1",
+        incidents=active_index.incidents,
+        indexAttestationPath=(
+            "./incidents/index-attestations/"
+            + sha256_hex(index_seed).removeprefix("sha256:")
+            + ".json"
+        ),
+        keyId=active_index.key_id,
+        keyFingerprint=active_index.key_fingerprint,
+        publishedAt=published_at,
+    )
+    signature = _Signer(fixture["lifecycle_private"]).sign_preimage(
+        refreshed.canonical_bytes()
+    )
+    signature = base64.urlsafe_b64encode(base64.b64decode(signature)).decode(
+        "ascii"
+    ).rstrip("=")
+    attestation = ActiveIncidentIndexAttestation(
+        schemaVersion="athena.activeIncidentIndexAttestation.v1",
+        indexDigest=sha256_hex(refreshed.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=active_index.key_id,
+        detachedSignature=signature,
+    )
+    fixture["reader"].content["incidents/active.json"] = refreshed.canonical_bytes()
+    fixture["reader"].content[
+        refreshed.index_attestation_path.removeprefix("./")
+    ] = attestation.canonical_bytes()
+    return refreshed
 
 
 def test_notification_v2_binds_verified_assets_and_incident_deep_link() -> None:
@@ -331,6 +388,103 @@ def test_notification_v2_outbox_preserves_order_and_dispatch_is_idempotent() -> 
     assert store.state == "delivered"
 
 
+def test_dispatcher_renews_the_session_lock_during_delivery() -> None:
+    message = object()
+
+    class _Context:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def __enter__(self) -> object:
+            return self.value
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.session = object()
+
+        def receive_messages(self, **_kwargs: object) -> list[object]:
+            return [message]
+
+    class _Client:
+        def __init__(self, receiver: _Receiver) -> None:
+            self.receiver = receiver
+
+        def get_queue_receiver(self, **_kwargs: object) -> _Context:
+            return _Context(self.receiver)
+
+    class _LockRenewer(_Context):
+        def __init__(self) -> None:
+            super().__init__(self)
+            self.registrations: list[tuple[object, object, int]] = []
+            self.active = False
+            self.closed = False
+
+        def __enter__(self) -> _LockRenewer:
+            self.active = True
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.active = False
+            self.closed = True
+
+        def register(
+            self,
+            receiver: object,
+            session: object,
+            *,
+            max_lock_renewal_duration: int,
+        ) -> None:
+            self.registrations.append(
+                (receiver, session, max_lock_renewal_duration)
+            )
+
+    receiver = _Receiver()
+    lock_renewer = _LockRenewer()
+
+    def dispatch_while_locked(**_kwargs: object) -> bool:
+        assert lock_renewer.active
+        return True
+
+    with (
+        patch("azure.identity.ManagedIdentityCredential"),
+        patch(
+            "azure.servicebus.AutoLockRenewer",
+            return_value=lock_renewer,
+        ) as auto_lock_renewer,
+        patch(
+            "azure.servicebus.ServiceBusClient",
+            return_value=_Context(_Client(receiver)),
+        ),
+        patch("athena_context.eventing.runtime.AzureTableNotificationDeliveryStore"),
+        patch(
+            "athena_context.eventing.runtime._dispatch_notification_message",
+            side_effect=dispatch_while_locked,
+        ) as dispatch,
+    ):
+        assert run_notification_dispatcher_worker(
+            fully_qualified_namespace="synthetic.servicebus.windows.net",
+            notification_queue_name="notifications",
+            managed_identity_client_id="00000000-0000-0000-0000-000000000001",
+            webhook_url=(
+                "https://synthetic.logic.azure.com/workflows/test"
+                "?api-version=2019-05-01"
+            ),
+            notification_state_table_endpoint=(
+                "https://synthetic.table.core.windows.net"
+            ),
+            notification_state_table_name="NotificationState",
+            notification_state_partition_key="synthetic",
+        )
+
+    assert lock_renewer.registrations == [(receiver, receiver.session, 300)]
+    assert lock_renewer.closed
+    auto_lock_renewer.assert_called_once_with(max_workers=1)
+    dispatch.assert_called_once()
+
+
 def test_transient_server_failure_resets_delivery_for_retry() -> None:
     fixture, service, _outbox = _service()
     envelope = service.publish(
@@ -443,12 +597,41 @@ def test_deployed_orchestrator_path_uses_v2_without_enqueuing_v1() -> None:
     class _Receiver:
         def __init__(self) -> None:
             self.completed = 0
+            self.abandoned = 0
+            self.session = object()
 
         def receive_messages(self, **_kwargs: object) -> list[object]:
             return [message]
 
         def complete_message(self, _message: object) -> None:
             self.completed += 1
+
+        def abandon_message(self, _message: object) -> None:
+            self.abandoned += 1
+
+    class _LockRenewer(_Context):
+        def __init__(self) -> None:
+            super().__init__(self)
+            self.registrations: list[tuple[object, object, int]] = []
+            self.active = False
+
+        def __enter__(self) -> _LockRenewer:
+            self.active = True
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.active = False
+
+        def register(
+            self,
+            receiver: object,
+            session: object,
+            *,
+            max_lock_renewal_duration: int,
+        ) -> None:
+            self.registrations.append(
+                (receiver, session, max_lock_renewal_duration)
+            )
 
     class _Client:
         def __init__(self, receiver: _Receiver) -> None:
@@ -463,20 +646,29 @@ def test_deployed_orchestrator_path_uses_v2_without_enqueuing_v1() -> None:
 
     receiver = _Receiver()
     client = _Client(receiver)
+    lock_renewer = _LockRenewer()
     published: list[tuple[str, object]] = []
-    publication_service = SimpleNamespace(
-        publish=lambda *, incident_id, verified_at: published.append(
-            (incident_id, verified_at)
-        )
-    )
+    publish_attempts = 0
+
+    def publish(*, incident_id: str, verified_at: object) -> None:
+        nonlocal publish_attempts
+        assert lock_renewer.active
+        publish_attempts += 1
+        if publish_attempts == 1:
+            raise NotificationV2SourceNotReadyError("synthetic feed lag")
+        published.append((incident_id, verified_at))
+
+    publication_service = SimpleNamespace(publish=publish)
     fixture, _service_instance, _outbox = _service()
 
     def reassess(*_args: object, **kwargs: object) -> tuple[object, object]:
+        assert lock_renewer.active
         assert kwargs["notifications"] is None
         return fixture["state"], object()
 
     with (
         patch("azure.identity.ManagedIdentityCredential"),
+        patch("azure.servicebus.AutoLockRenewer", return_value=lock_renewer),
         patch("azure.servicebus.ServiceBusClient", return_value=_Context(client)),
         patch("athena_context.eventing.runtime.KeyVaultRsaSigner"),
         patch("athena_context.eventing.runtime.AzureBlobIncidentAssetPublisher"),
@@ -485,6 +677,7 @@ def test_deployed_orchestrator_path_uses_v2_without_enqueuing_v1() -> None:
             "athena_context.eventing.runtime.run_incident_reassessment",
             side_effect=reassess,
         ),
+        patch("athena_context.eventing.runtime.sleep") as retry_wait,
         patch("athena_context.eventing.runtime._now_utc_millisecond", return_value=NOW),
     ):
         assert run_incident_orchestrator_worker(
@@ -505,6 +698,9 @@ def test_deployed_orchestrator_path_uses_v2_without_enqueuing_v1() -> None:
         )
 
     assert receiver.completed == 1
+    assert receiver.abandoned == 0
+    assert lock_renewer.registrations == [(receiver, receiver.session, 300)]
+    retry_wait.assert_called_once_with(30)
     assert published == [(fixture["state"].incident_id, NOW)]
 
 
@@ -603,6 +799,71 @@ def test_dispatch_revalidates_current_lifecycle_before_posting() -> None:
     request.assert_not_called()
     assert receiver.dead_letter_reasons == ["AthenaNotificationRejected"]
     assert store.state is None
+
+
+def test_dispatch_retries_when_feed_v2_has_not_caught_up() -> None:
+    fixture, service, _outbox = _service()
+    envelope = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=fixture["feed_index"].published_at,
+    )
+    refreshed_active = _refresh_active_authority(
+        fixture,
+        published_at=fixture["feed_index"].published_at + timedelta(minutes=16),
+    )
+    message = SimpleNamespace(
+        body=envelope.canonical_bytes(),
+        content_type="application/json",
+        message_id=envelope.notification.notification_id,
+        session_id=envelope.notification.incident_id,
+        application_properties={
+            "schemaVersion": "athena.wc027IncidentNotificationEnvelope.v2",
+            "lifecycle": envelope.notification.lifecycle,
+            "transitionId": envelope.notification.transition_id,
+            "stateResultDigest": envelope.notification.state_result_digest,
+        },
+    )
+    receiver = _NotificationReceiver()
+    store = _NotificationStore()
+    verification_attempts = 0
+
+    def verify_current(*_args: object, **_kwargs: object) -> None:
+        nonlocal verification_attempts
+        verification_attempts += 1
+        service.verify_current(*_args, **_kwargs)
+
+    source_verifier = SimpleNamespace(verify_current=verify_current)
+
+    with (
+        patch("athena_context.eventing.runtime.urlopen") as request,
+        patch("athena_context.eventing.runtime.sleep") as retry_wait,
+    ):
+        assert not _dispatch_notification_message(
+            message=message,
+            receiver=receiver,
+            credential=SimpleNamespace(
+                get_token=lambda _scope: SimpleNamespace(token="synthetic-token")
+            ),
+            webhook_url=(
+                "https://synthetic.logic.azure.com/workflows/test"
+                "?api-version=2019-05-01"
+            ),
+            delivery_store=store,
+            trusted_notification_v2_key_id=service.notification_key_id,
+            notification_v2_signature_verifier=(
+                service.notification_signature_verifier
+            ),
+            notification_v2_source_verifier=source_verifier,
+            now=refreshed_active.published_at,
+        )
+
+    request.assert_not_called()
+    assert receiver.completed == 0
+    assert receiver.abandoned == 1
+    assert receiver.dead_letter_reasons == []
+    assert store.state is None
+    assert verification_attempts == 6
+    assert retry_wait.call_count == 5
 
 
 def test_resolved_teams_rendering_remains_non_remediating() -> None:
@@ -708,6 +969,25 @@ def test_feed_refresh_keeps_stable_notification_identity() -> None:
         refreshed.index_attestation_path.removeprefix("./")
     ] = attestation.canonical_bytes()
 
+    service.verify_current(
+        original.notification,
+        verified_at=refreshed_at,
+    )
+    immutable_authority_substitutions = (
+        {"lifecycle": "resolved"},
+        {"occurrence_digest": "sha256:" + "0" * 64},
+        {
+            "guidance_asset": original.notification.guidance_asset.model_copy(
+                update={"guidance_digest": "sha256:" + "0" * 64}
+            )
+        },
+    )
+    for substitution in immutable_authority_substitutions:
+        with pytest.raises(ValueError, match="current verified lifecycle"):
+            service.verify_current(
+                original.notification.model_copy(update=substitution),
+                verified_at=refreshed_at,
+            )
     replay = service.publish(
         incident_id=fixture["state"].incident_id,
         verified_at=refreshed_at,
@@ -721,6 +1001,21 @@ def test_feed_refresh_keeps_stable_notification_identity() -> None:
         replay.notification.notification_digest
         != original.notification.notification_digest
     )
+
+
+def test_feed_lag_is_retryable_after_v1_authority_advances() -> None:
+    fixture, service, _outbox = _service()
+    current = fixture["feed_index"]
+    refreshed_active = _refresh_active_authority(
+        fixture,
+        published_at=current.published_at + timedelta(minutes=16),
+    )
+
+    with pytest.raises(NotificationV2SourceNotReadyError, match="caught up"):
+        service.publish(
+            incident_id=fixture["state"].incident_id,
+            verified_at=refreshed_active.published_at,
+        )
 
 
 def test_manifest_state_version_reference_must_match_feed_pointer() -> None:

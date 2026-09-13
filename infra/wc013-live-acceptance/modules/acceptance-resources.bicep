@@ -813,25 +813,25 @@ resource incidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@20
       storageBlobDataReaderRoleDefinitionId
     )
   }
+  dependsOn: [
+    replayStorage
+  ]
+}
 
-  resource notificationIncidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
-    name: guid(
-      incidentAssetContainer.id,
-      notificationDispatcherPrincipalId,
+resource notificationIncidentAssetBlobDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (wc016RuntimeEnabled) {
+  name: guid(
+    incidentAssetContainer.id,
+    notificationDispatcherPrincipalId,
+    storageBlobDataReaderRoleDefinitionId
+  )
+  scope: incidentAssetContainer
+  properties: {
+    principalId: notificationDispatcherPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
       storageBlobDataReaderRoleDefinitionId
     )
-    scope: incidentAssetContainer
-    properties: {
-      principalId: notificationDispatcherPrincipalId
-      principalType: 'ServicePrincipal'
-      roleDefinitionId: subscriptionResourceId(
-        'Microsoft.Authorization/roleDefinitions',
-        storageBlobDataReaderRoleDefinitionId
-      )
-    }
-    dependsOn: [
-      replayStorage
-    ]
   }
   dependsOn: [
     replayStorage

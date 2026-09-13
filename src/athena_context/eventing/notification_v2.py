@@ -56,11 +56,16 @@ from athena_context.presentation_assets import (
     MAX_INCIDENT_STATE_BYTES,
     MAX_PRESENTATION_ATTESTATION_BYTES,
     PresentationAssetReaderPort,
+    PresentationAssetUnavailableError,
 )
 
 SignatureVerifier = Callable[[bytes, str], bool]
 _MAX_FEED_AGE = timedelta(minutes=15)
 _MAX_CLOCK_SKEW = timedelta(minutes=1)
+
+
+class NotificationV2SourceNotReadyError(RuntimeError):
+    """The signed feed has not caught up to the current v1 occurrence yet."""
 
 
 class NotificationV2OutboxPort(Protocol):
@@ -132,34 +137,48 @@ class NotificationV2SourceVerifier:
         )
         self._verify_active_index(active_index, active_attestation, verified_at=verified_at)
 
-        feed_index = self._read_current_model(
-            "incidents/feed-v2.json",
-            MAX_INCIDENT_FEED_V2_BYTES,
-            IncidentFeedIndexV2,
-        )
-        feed_attestation = self._read_current_model(
-            feed_index.index_attestation_path.removeprefix("./"),
-            MAX_PRESENTATION_ATTESTATION_BYTES,
-            IncidentFeedIndexAttestationV2,
-        )
+        try:
+            feed_index = self._read_current_model(
+                "incidents/feed-v2.json",
+                MAX_INCIDENT_FEED_V2_BYTES,
+                IncidentFeedIndexV2,
+            )
+            feed_attestation = self._read_current_model(
+                feed_index.index_attestation_path.removeprefix("./"),
+                MAX_PRESENTATION_ATTESTATION_BYTES,
+                IncidentFeedIndexAttestationV2,
+            )
+        except PresentationAssetUnavailableError as exc:
+            raise NotificationV2SourceNotReadyError(
+                "incident feed v2 is not published yet"
+            ) from exc
+        active_index_digest = sha256_hex(active_index.canonical_bytes())
         validate_incident_feed_index_assets(
             feed_index,
             feed_attestation,
             trusted_key_id=self.trust.feed_key_id,
             trusted_key_fingerprint=self.trust.feed_key_fingerprint,
-            expected_source_active_index_digest=sha256_hex(
-                active_index.canonical_bytes()
-            ),
-            not_older_than=verified_at - _MAX_FEED_AGE,
+            expected_source_active_index_digest=feed_index.source_active_index_digest,
+            not_older_than=feed_index.published_at,
             signature_verifier=self.trust.feed_signature_verifier,
         )
         if feed_index.published_at > verified_at + _MAX_CLOCK_SKEW:
             raise ValueError("incident feed v2 is from the future")
+        if feed_index.source_active_index_digest != active_index_digest:
+            raise NotificationV2SourceNotReadyError(
+                "incident feed v2 has not caught up to current v1 authority"
+            )
+        if feed_index.published_at < verified_at - _MAX_FEED_AGE:
+            raise ValueError("incident feed v2 is stale")
         entries = tuple(
             item
             for item in (*feed_index.active, *feed_index.recently_resolved)
             if item.incident_id == incident_id
         )
+        if not entries:
+            raise NotificationV2SourceNotReadyError(
+                "incident is not available in the current verified feed v2"
+            )
         if len(entries) != 1:
             raise ValueError("incident is not uniquely discoverable in verified feed v2")
         entry = entries[0]
@@ -254,7 +273,21 @@ class NotificationV2SourceVerifier:
             incident_id=notification.incident_id,
             verified_at=verified_at,
         )
-        if expected.canonical_bytes() != notification.canonical_bytes():
+        if (
+            expected.notification_id != notification.notification_id
+            or expected.incident_id != notification.incident_id
+            or expected.transition_id != notification.transition_id
+            or expected.lifecycle != notification.lifecycle
+            or expected.state_result_digest != notification.state_result_digest
+            or expected.occurrence_digest != notification.occurrence_digest
+            or expected.feed_pointer_reference != notification.feed_pointer_reference
+            or expected.feed_pointer_attestation_reference
+            != notification.feed_pointer_attestation_reference
+            or expected.enrichment_asset != notification.enrichment_asset
+            or expected.guidance_asset != notification.guidance_asset
+            or expected.presentation_url != notification.presentation_url
+            or expected.message != notification.message
+        ):
             raise ValueError(
                 "notification v2 no longer matches the current verified lifecycle"
             )
@@ -689,6 +722,7 @@ def _json_value(value: object) -> object:
 __all__ = [
     "NotificationV2OutboxPort",
     "NotificationV2PublicationService",
+    "NotificationV2SourceNotReadyError",
     "NotificationV2SourceVerifier",
     "NotificationV2Trust",
     "render_teams_notification_v2",

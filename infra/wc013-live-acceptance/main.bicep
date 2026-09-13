@@ -250,6 +250,9 @@ param incidentNotificationSigningKeyFingerprint string
 @description('Activates WC-016 queues and Jobs only after the deployed incident key public material is pinned in both presentation verification layers.')
 param wc016RuntimeEnabled bool = false
 
+@description('Enables WC-027 notification v2 only after its separate enrichment/feed-v2 producer is deployed and healthy.')
+param wc027FeedV2ProducerReady bool = false
+
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
 
@@ -836,6 +839,7 @@ module wc016Runtime '../wc016-event-reassessment/main.bicep' = if (validatedWc01
     signingKeyId: incidentSigningKeyId
     signingKeyFingerprint: signingKeyFingerprint
     notificationV2ConfigurationJson: notificationV2ConfigurationJson
+    notificationV2ProducerReady: wc027FeedV2ProducerReady
     teamsConnectionName: 'teams'
     teamsNotifierWorkflowName: 'athena-wc016-teams-notifier'
     tags: resourceTags

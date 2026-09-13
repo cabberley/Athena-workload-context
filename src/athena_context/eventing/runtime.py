@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path
+from time import sleep
 from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
@@ -44,6 +45,7 @@ from athena_context.eventing.detector import (
 )
 from athena_context.eventing.notification_v2 import (
     NotificationV2PublicationService,
+    NotificationV2SourceNotReadyError,
     NotificationV2SourceVerifier,
     NotificationV2Trust,
     verify_notification_v2_envelope,
@@ -61,8 +63,10 @@ _MONITOR_EVENT_CLAUSES = {
     "loadBalancerFailure": "wc016-load-balancer-operational-state",
 }
 _LOGIC_APPS_SCOPE = "https://management.azure.com/.default"
-_MAX_NOTIFICATION_V2_DELIVERY_AGE = timedelta(minutes=15)
 _MAX_NOTIFICATION_V2_CLOCK_SKEW = timedelta(minutes=1)
+_SERVICE_BUS_SESSION_LOCK_RENEWAL_SECONDS = 300
+_SOURCE_RETRY_ATTEMPTS = 6
+_SOURCE_RETRY_DELAY_SECONDS = 30
 ServiceBusApplicationProperty = int | float | bytes | bool | str | UUID
 
 
@@ -618,6 +622,17 @@ def _service_bus_message(
     )
 
 
+def _retry_notification_v2_source(operation: Callable[[], None]) -> None:
+    for attempt in range(_SOURCE_RETRY_ATTEMPTS):
+        try:
+            operation()
+            return
+        except NotificationV2SourceNotReadyError:
+            if attempt == _SOURCE_RETRY_ATTEMPTS - 1:
+                raise
+            sleep(_SOURCE_RETRY_DELAY_SECONDS)
+
+
 def run_notification_dispatcher_worker(
     *,
     fully_qualified_namespace: str,
@@ -640,6 +655,7 @@ def run_notification_dispatcher_worker(
     from azure.identity import ManagedIdentityCredential
     from azure.servicebus import (
         NEXT_AVAILABLE_SESSION,
+        AutoLockRenewer,
         ServiceBusClient,
     )
 
@@ -718,6 +734,7 @@ def run_notification_dispatcher_worker(
         managed_identity_client_id=managed_identity_client_id,
     )
     with (
+        AutoLockRenewer(max_workers=1) as lock_renewer,
         ServiceBusClient(
             fully_qualified_namespace=fully_qualified_namespace,
             credential=credential,
@@ -729,6 +746,14 @@ def run_notification_dispatcher_worker(
             max_wait_time=max_wait_time_seconds,
         ) as receiver,
     ):
+        session = receiver.session
+        if session is None:
+            raise RuntimeError("notification dispatcher requires a locked Service Bus session")
+        lock_renewer.register(
+            receiver,
+            session,
+            max_lock_renewal_duration=_SERVICE_BUS_SESSION_LOCK_RENEWAL_SECONDS,
+        )
         messages = receiver.receive_messages(
             max_message_count=1,
             max_wait_time=max_wait_time_seconds,
@@ -775,23 +800,23 @@ def _dispatch_notification_message(
         )
         _validate_notification_broker_metadata(message, notification)
         if isinstance(notification, IncidentNotificationV2):
-            delivery_now = _now_utc_millisecond() if now is None else now
-            if (
-                notification.feed_published_at < (
-                    delivery_now - _MAX_NOTIFICATION_V2_DELIVERY_AGE
-                )
-                or notification.feed_published_at > (
-                    delivery_now + _MAX_NOTIFICATION_V2_CLOCK_SKEW
-                )
-                or notification_v2_source_verifier is None
-            ):
+            if notification_v2_source_verifier is None:
                 raise ValueError(
-                    "notification v2 is stale or current-source verification is absent"
+                    "notification v2 current-source verification is absent"
                 )
-            notification_v2_source_verifier.verify_current(
-                notification,
-                verified_at=delivery_now,
-            )
+
+            def verify_current_source() -> None:
+                delivery_now = _now_utc_millisecond() if now is None else now
+                if notification.feed_published_at > (
+                    delivery_now + _MAX_NOTIFICATION_V2_CLOCK_SKEW
+                ):
+                    raise ValueError("notification v2 is future-dated")
+                notification_v2_source_verifier.verify_current(
+                    notification,
+                    verified_at=delivery_now,
+                )
+
+            _retry_notification_v2_source(verify_current_source)
         access_token = credential.get_token(_LOGIC_APPS_SCOPE).token
         claim = delivery_store.acquire(
             notification_id=notification.notification_id,
@@ -886,6 +911,9 @@ def _dispatch_notification_message(
             raise RuntimeError("notification delivered transition lost its dispatch lease")
         receiver.complete_message(message)
         return True
+    except NotificationV2SourceNotReadyError:
+        receiver.abandon_message(message)
+        return False
     except (ValidationError, ValueError):
         receiver.dead_letter_message(
             message,
@@ -1023,6 +1051,7 @@ def run_incident_orchestrator_worker(
     from azure.identity import ManagedIdentityCredential
     from azure.servicebus import (
         NEXT_AVAILABLE_SESSION,
+        AutoLockRenewer,
         ServiceBusClient,
     )
 
@@ -1069,6 +1098,7 @@ def run_incident_orchestrator_worker(
     )
     credential = ManagedIdentityCredential(client_id=managed_identity_client_id)
     with (
+        AutoLockRenewer(max_workers=1) as lock_renewer,
         ServiceBusClient(
             fully_qualified_namespace=fully_qualified_namespace,
             credential=credential,
@@ -1081,6 +1111,14 @@ def run_incident_orchestrator_worker(
         ) as receiver,
         client.get_queue_sender(queue_name=notification_queue_name) as notification_sender,
     ):
+        session = receiver.session
+        if session is None:
+            raise RuntimeError("incident orchestrator requires a locked Service Bus session")
+        lock_renewer.register(
+            receiver,
+            session,
+            max_lock_renewal_duration=_SERVICE_BUS_SESSION_LOCK_RENEWAL_SECONDS,
+        )
         messages = receiver.receive_messages(
             max_message_count=1,
             max_wait_time=max_wait_time_seconds,
@@ -1153,12 +1191,18 @@ def run_incident_orchestrator_worker(
                 result is not None
                 and notification_v2_publication_service is not None
             ):
-                notification_v2_publication_service.publish(
-                    incident_id=result[0].incident_id,
-                    verified_at=now,
-                )
+                def publish_notification_v2() -> None:
+                    notification_v2_publication_service.publish(
+                        incident_id=result[0].incident_id,
+                        verified_at=_now_utc_millisecond(),
+                    )
+
+                _retry_notification_v2_source(publish_notification_v2)
             receiver.complete_message(message)
             return True
+        except NotificationV2SourceNotReadyError:
+            receiver.abandon_message(message)
+            return False
         except ValidationError, ValueError:
             receiver.dead_letter_message(
                 message,

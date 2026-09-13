@@ -32,6 +32,7 @@ from athena_context.eventing.normalization import (
 from athena_context.eventing.notification_v2 import (
     NotificationV2OutboxPort,
     NotificationV2PublicationService,
+    NotificationV2SourceNotReadyError,
     NotificationV2SourceVerifier,
     NotificationV2Trust,
     render_teams_notification_v2,
@@ -88,6 +89,7 @@ __all__ = [
     "ManagedIdentityResourceGraphChangeHistoryClient",
     "NotificationV2OutboxPort",
     "NotificationV2PublicationService",
+    "NotificationV2SourceNotReadyError",
     "NotificationV2SourceVerifier",
     "NotificationV2Trust",
     "NotificationV2KeyAuthority",

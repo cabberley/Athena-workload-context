@@ -103,6 +103,23 @@ Entries are sorted by incident ID and bind the exact immutable pointer digest. A
 are written before the aggregate compare-and-swap, so a losing concurrent publication cannot
 invalidate the winning feed. A resolution removes only its own entry.
 
+WC-016 does not deploy the WC-027 enrichment and `incidents/feed-v2.json` producer. The
+`wc016-incident-feed-heartbeat` command refreshes only the signed v1 active incident index. V2
+notification activation therefore depends on the separately governed WC-027 producer publishing
+the exact occurrence enrichment pointer and then a signed feed-v2 index bound to the winning v1
+active-index digest. The orchestrator and dispatcher must not synthesize feed-v2 data, claim that
+guidance exists, or downgrade to a successful v1 guidance notification while that producer is
+absent or lagging. Missing feed-v2 assets, an older source-active-index digest, or an occurrence not
+yet present in the feed are a retryable source-not-ready condition: the reassessment or queued
+notification is retried in place at 30-second intervals while the Service Bus session remains
+locked by `AutoLockRenewer`. This preserves per-incident ordering and avoids consuming a delivery
+attempt for routine producer lag. If the bounded in-process retry window expires, the message is
+abandoned for a later broker delivery rather than explicitly dead-lettered as invalid. Invalid
+signatures and immutable lifecycle, occurrence, or guidance substitutions still fail closed.
+Keep `wc027FeedV2ProducerReady=false` until deployment evidence confirms that producer and its
+reconciliation path are healthy; in that state the orchestrator and dispatcher remain on v1 and do
+not pretend the feed-v2 data exists.
+
 Notification messages use a deterministic SHA-256 ID from transition ID plus lifecycle and use the
 incident ID as the Service Bus session. Publication succeeds before notification enqueue. The
 signed state includes that exact transition ID. If enqueue fails after publication, retry reads and

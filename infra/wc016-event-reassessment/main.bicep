@@ -120,6 +120,9 @@ param signingKeyFingerprint string
 @maxLength(16384)
 param notificationV2ConfigurationJson string
 
+@description('Enables notification v2 only after the separately governed WC-027 feed-v2 producer is deployed and healthy.')
+param notificationV2ProducerReady bool = false
+
 @description('Existing authorized Microsoft Teams API connection name.')
 param teamsConnectionName string
 
@@ -248,7 +251,7 @@ resource teamsNotifier 'Microsoft.Logic/workflows@2019-05-01' = {
               properties: {
                 notificationId: {
                   type: 'string'
-                  pattern: '^notify-[a-f0-9]{64}$'
+                  pattern: '^notify(?:-v2)?-[a-f0-9]{64}$'
                 }
                 message: {
                   type: 'string'
@@ -534,10 +537,6 @@ resource detectorJob 'Microsoft.App/jobs@2025-01-01' = {
               value: approvedResourceRolesJson
             }
             {
-              name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
-              value: notificationV2ConfigurationJson
-            }
-            {
               name: 'ATHENA_WC016_APPROVED_ALERT_RULES_JSON'
               value: approvedAlertRulesJson
             }
@@ -631,16 +630,26 @@ resource orchestratorJob 'Microsoft.App/jobs@2025-01-01' = {
             '--signing-key-fingerprint'
             signingKeyFingerprint
           ]
-          env: [
-            {
-              name: 'AZURE_CLIENT_ID'
-              value: orchestratorIdentityClientId
-            }
-            {
-              name: 'ATHENA_WC016_APPROVED_RESOURCE_ROLES_JSON'
-              value: approvedResourceRolesJson
-            }
-          ]
+          env: concat(
+            [
+              {
+                name: 'AZURE_CLIENT_ID'
+                value: orchestratorIdentityClientId
+              }
+              {
+                name: 'ATHENA_WC016_APPROVED_RESOURCE_ROLES_JSON'
+                value: approvedResourceRolesJson
+              }
+            ],
+            notificationV2ProducerReady
+              ? [
+                  {
+                    name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
+                    value: notificationV2ConfigurationJson
+                  }
+                ]
+              : []
+          )
           resources: jobResources
         }
       ]
@@ -744,7 +753,7 @@ resource notificationJob 'Microsoft.App/jobs@2025-01-01' = {
     environmentId: managedEnvironmentResourceId
     configuration: {
       triggerType: 'Event'
-      replicaTimeout: 180
+      replicaTimeout: 300
       replicaRetryLimit: 2
       secrets: [
         {
@@ -810,20 +819,26 @@ resource notificationJob 'Microsoft.App/jobs@2025-01-01' = {
             '--presentation-url'
             presentationUrl
           ]
-          env: [
-            {
-              name: 'AZURE_CLIENT_ID'
-              value: notificationIdentityClientId
-            }
-            {
-              name: 'ATHENA_WC016_TEAMS_WEBHOOK_URL'
-              secretRef: 'teams-webhook-url'
-            }
-            {
-              name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
-              value: notificationV2ConfigurationJson
-            }
-          ]
+          env: concat(
+            [
+              {
+                name: 'AZURE_CLIENT_ID'
+                value: notificationIdentityClientId
+              }
+              {
+                name: 'ATHENA_WC016_TEAMS_WEBHOOK_URL'
+                secretRef: 'teams-webhook-url'
+              }
+            ],
+            notificationV2ProducerReady
+              ? [
+                  {
+                    name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
+                    value: notificationV2ConfigurationJson
+                  }
+                ]
+              : []
+          )
           resources: jobResources
         }
       ]

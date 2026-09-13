@@ -6,6 +6,7 @@ RUNTIME_BICEP = ROOT / "infra" / "wc016-event-reassessment" / "main.bicep"
 ROOT_BICEP = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 PARAMETERS = ROOT / ".azure" / "wc013.parameters.json"
 CLEANUP_SCRIPT = ROOT / "scripts" / "audit-remove-wc016-legacy-runtime.ps1"
+OPERATIONS = ROOT / "docs" / "operations" / "wc016-event-reassessment.md"
 WC016_LOCK = ROOT / "requirements-wc016.lock"
 WC016_DOCKERFILES = (
     ROOT / "apps" / "signal-detector" / "Dockerfile",
@@ -126,12 +127,19 @@ def test_wc016_runtime_has_four_managed_identity_jobs_without_raw_normalizer() -
     assert "openAuthenticationPolicies" in source
     assert "notificationIdentityPrincipalId" in source
     assert "'notificationId'" in source
-    assert "'^notify-[a-f0-9]{64}$'" in source
+    assert "'^notify(?:-v2)?-[a-f0-9]{64}$'" in source
     assert "param notificationStateTableEndpoint string" in source
     assert "param notificationStateTableName string" in source
     assert "param notificationStatePartitionKey string" in source
+    detector_job = _resource_block(source, "detectorJob")
+    orchestrator_job = _resource_block(source, "orchestratorJob")
     notification_job = _resource_block(source, "notificationJob")
     heartbeat_job = _resource_block(source, "heartbeatJob")
+    assert "ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON" not in detector_job
+    assert "ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON" in orchestrator_job
+    assert "ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON" in notification_job
+    assert "notificationV2ProducerReady" in orchestrator_job
+    assert "notificationV2ProducerReady" in notification_job
     assert "orchestratorIdentityResourceId" in heartbeat_job
     assert "detectorIdentityResourceId" not in heartbeat_job
     assert "notificationIdentityResourceId" not in heartbeat_job
@@ -161,6 +169,7 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
 
     assert "module wc016Runtime '../wc016-event-reassessment/main.bicep'" in source
     assert "param wc016RuntimeEnabled bool = false" in source
+    assert "param wc027FeedV2ProducerReady bool = false" in source
     assert "param wc016LegacyCleanupConfirmed bool = false" in source
     assert "= if (validatedWc016RuntimeEnabled)" in source
     assert "wc016RuntimeEnabled && !wc016LegacyCleanupConfirmed" in source
@@ -272,6 +281,36 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
         "if (wc016RuntimeEnabled)"
         in resources
     )
+    assert (
+        "\nresource notificationIncidentAssetBlobDataReader "
+        "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
+        "if (wc016RuntimeEnabled)"
+        in resources
+    )
+    assert "\n  resource notificationIncidentAssetBlobDataReader " not in resources
+    notification_blob_reader = _resource_block(
+        resources,
+        "notificationIncidentAssetBlobDataReader",
+    )
+    assert "scope: incidentAssetContainer" in notification_blob_reader
+    assert "principalId: notificationDispatcherPrincipalId" in notification_blob_reader
+    assert "storageBlobDataReaderRoleDefinitionId" in notification_blob_reader
+
+
+def test_wc027_notification_v2_documents_external_feed_producer_dependency() -> None:
+    source = RUNTIME_BICEP.read_text(encoding="utf-8")
+    operations = OPERATIONS.read_text(encoding="utf-8")
+    heartbeat_job = _resource_block(source, "heartbeatJob")
+
+    assert "'wc016-incident-feed-heartbeat'" in heartbeat_job
+    assert "ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON" not in heartbeat_job
+    assert (
+        "WC-016 does not deploy the WC-027 enrichment and `incidents/feed-v2.json` producer."
+        in operations
+    )
+    assert "wc027FeedV2ProducerReady=false" in operations
+    assert "must not synthesize feed-v2 data" in operations
+    assert "retryable source-not-ready condition" in operations
 
 
 def test_wc016_deployment_parameters_use_published_image_digests() -> None:
