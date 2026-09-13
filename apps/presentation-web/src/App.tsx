@@ -99,8 +99,12 @@ function App({
           setIncidentUnavailable(false)
           if (verifiedGuidance) {
             const guidancePublishedAt = Date.parse(verifiedGuidance.publishedAt)
+            const allGuidance = [
+              ...verifiedGuidance.active,
+              ...verifiedGuidance.recentlyResolved,
+            ]
             const nextBindings = Object.fromEntries(
-              Object.values(verifiedGuidance.guidanceByIncidentId).map((guidance) => [
+              allGuidance.map((guidance) => [
                 guidance.incidentId,
                 guidance.stateResultDigest,
               ]),
@@ -228,13 +232,16 @@ function App({
         <IncidentPanel
           incidents={incidentFeed?.incidents ?? null}
           unavailable={incidentUnavailable}
-          guidanceByIncidentId={guidanceFeed?.guidanceByIncidentId ?? {}}
+          guidanceByIncidentId={Object.fromEntries(
+            (guidanceFeed?.active ?? []).map((guidance) => [
+              guidance.incidentId,
+              guidance,
+            ]),
+          )}
           guidanceUnavailable={guidanceUnavailable}
         />
         <RecentlyResolvedGuidance
-          guidance={Object.values(
-            guidanceFeed?.guidanceByIncidentId ?? {},
-          ).filter((item) => item.lifecycle === 'resolved')}
+          guidance={guidanceFeed?.recentlyResolved ?? []}
         />
         <section className="trust-strip" aria-labelledby="trust-heading">
           <div>

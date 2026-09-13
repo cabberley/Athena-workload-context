@@ -130,6 +130,8 @@ export interface VerifiedIncident {
   publishedAt: string
   keyFingerprint: Sha256Digest
   occurrence?: {
+    transitionId: string
+    publishedAt: string
     statePath: string
     stateVersion?: string
     stateSha256: Sha256Digest
@@ -374,6 +376,8 @@ const loadVerifiedIncidentEntry = async (
     publishedAt: pointer.publishedAt,
     keyFingerprint: key.fingerprint,
     occurrence: {
+      transitionId: state.transitionId,
+      publishedAt: pointer.publishedAt,
       statePath: removeRelativePrefix(pointer.statePath),
       stateSha256: pointer.stateSha256,
       attestationPath: removeRelativePrefix(pointer.attestationPath),
@@ -471,6 +475,8 @@ export const verifyIncidentOccurrenceAssets = async (
     publishedAt: pointer.publishedAt,
     keyFingerprint: key.fingerprint,
     occurrence: {
+      transitionId: state.transitionId,
+      publishedAt: pointer.publishedAt,
       statePath: expected.stateReference.name,
       stateVersion: expected.stateReference.version,
       stateSha256: expected.stateReference.contentDigest,

@@ -226,25 +226,25 @@ const guidanceFixture = (
     guidanceDigest:
       'sha256:5555555555555555555555555555555555555555555555555555555555555555',
   }
+  const verifiedGuidance = {
+    status: 'verified' as const,
+    incidentId: 'inc-123456789abc',
+    lifecycle,
+    stateResultDigest:
+      'sha256:2222222222222222222222222222222222222222222222222222222222222222' as const,
+    feedPublishedAt: '2026-09-04T03:41:01Z',
+    enrichmentId: `incident-enrichment-${'8'.repeat(32)}`,
+    incident: incidentFixture(
+      'loadBalancerFailure',
+      '2026-09-04T03:40:03Z',
+      lifecycle,
+    ).incidents[0]!,
+    guidance,
+  }
   return {
     publishedAt: '2026-09-04T03:41:01Z',
-    guidanceByIncidentId: {
-      'inc-123456789abc': {
-        status: 'verified',
-        incidentId: 'inc-123456789abc',
-        lifecycle,
-        stateResultDigest:
-          'sha256:2222222222222222222222222222222222222222222222222222222222222222',
-        feedPublishedAt: '2026-09-04T03:41:01Z',
-        enrichmentId: `incident-enrichment-${'8'.repeat(32)}`,
-        incident: incidentFixture(
-          'loadBalancerFailure',
-          '2026-09-04T03:40:03Z',
-          lifecycle,
-        ).incidents[0]!,
-        guidance,
-      },
-    },
+    active: lifecycle === 'active' ? [verifiedGuidance] : [],
+    recentlyResolved: lifecycle === 'resolved' ? [verifiedGuidance] : [],
   }
 }
 

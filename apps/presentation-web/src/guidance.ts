@@ -239,7 +239,8 @@ export interface VerifiedOperatorGuidance {
 
 export interface VerifiedOperatorGuidanceFeed {
   publishedAt: string
-  guidanceByIncidentId: Readonly<Record<string, VerifiedOperatorGuidance>>
+  active: VerifiedOperatorGuidance[]
+  recentlyResolved: VerifiedOperatorGuidance[]
 }
 
 export interface GuidanceTrustAnchor {
@@ -316,11 +317,14 @@ export const loadVerifiedOperatorGuidanceFeed = async (
     fetchImpl,
     timeoutMs,
   )
-  const index = parseFeedIndex(await requireCanonicalAsset(
-    feedIndex,
-    MAX_FEED_BYTES,
-    'incident feed v2 index',
-  ))
+  const index = await parseFeedIndex(
+    await requireCanonicalAsset(
+      feedIndex,
+      MAX_FEED_BYTES,
+      'incident feed v2 index',
+    ),
+    cryptoProvider,
+  )
   const feedIndexAttestation = await fetchBoundedJsonAsset(
     resolveSameOriginAssetUrl(index.indexAttestationPath, applicationRoot, origin),
     MAX_ATTESTATION_BYTES,
@@ -388,8 +392,9 @@ export const loadVerifiedOperatorGuidanceFeed = async (
       'Incident feed v2 active set does not match verified v1 authority.',
     )
   }
-  const verifiedEntries = await Promise.all(
-    [...index.active, ...index.recentlyResolved].map(async (entry) => {
+  const verifyEntry = async (
+    entry: ParsedFeedEntry,
+  ): Promise<VerifiedOperatorGuidance> => {
       const [feedPointer, feedPointerAttestation] = await Promise.all([
         fetchVersionedReference(
           entry.feedPointerReference,
@@ -568,13 +573,15 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         anchors,
         cryptoProvider,
       )
-    }),
-  )
+  }
+  const [active, recentlyResolved] = await Promise.all([
+    Promise.all(index.active.map(verifyEntry)),
+    Promise.all(index.recentlyResolved.map(verifyEntry)),
+  ])
   return {
     publishedAt: index.publishedAt,
-    guidanceByIncidentId: Object.fromEntries(
-      verifiedEntries.map((guidance) => [guidance.incidentId, guidance]),
-    ),
+    active,
+    recentlyResolved,
   }
 }
 
@@ -589,12 +596,13 @@ const verifyFeedIndex = async (
   if (!incidentFeed.sourceIndexDigest) {
     throw new VerificationError('Verified v1 index provenance is unavailable.')
   }
-  const index = parseFeedIndex(
+  const index = await parseFeedIndex(
     await requireCanonicalAsset(
       feedIndex,
       MAX_FEED_BYTES,
       'incident feed v2 index',
     ),
+    cryptoProvider,
   )
   const indexAttestation = parseAttestation(
     feedIndexAttestation,
@@ -1008,6 +1016,8 @@ const requireSameVerifiedOccurrence = (
     authoritative.state.lifecycle !== candidate.state.lifecycle ||
     authoritative.state.resultDigest !== candidate.state.resultDigest ||
     authoritative.state.updatedAt !== candidate.state.updatedAt ||
+    expected.transitionId !== actual.transitionId ||
+    expected.publishedAt !== actual.publishedAt ||
     expected.statePath !== actual.statePath ||
     expected.stateSha256 !== actual.stateSha256 ||
     expected.attestationPath !== actual.attestationPath ||
@@ -1023,50 +1033,54 @@ const requireSameVerifiedOccurrence = (
   }
 }
 
-const requireOccurrenceBinding = async (
+export const requireOccurrenceBinding = async (
   pointer: ParsedFeedPointer,
   incident: VerifiedIncident,
   cryptoProvider: Crypto,
 ): Promise<void> => {
   const occurrence = incident.occurrence
-  const occurrenceDigest = occurrence
-    ? await sha256Digest(
-        canonicalizeJson({
-          schemaVersion: 'athena.incidentOccurrenceReceipt.v1',
-          incidentId: incident.state.incidentId,
-          transitionId: incident.state.transitionId,
-          stateResultDigest: incident.state.resultDigest,
-          stateReference: {
-            name: occurrence.statePath,
-            version: occurrence.stateVersion ?? '',
-            contentDigest: occurrence.stateSha256,
-          },
-          stateAttestationReference: {
-            name: occurrence.attestationPath,
-            version: occurrence.attestationVersion ?? '',
-            contentDigest: occurrence.attestationSha256,
-          },
-          pointerReference: {
-            name: occurrence.pointerPath,
-            version: occurrence.pointerVersion ?? '',
-            contentDigest: occurrence.pointerSha256,
-          },
-          pointerAttestationReference: {
-            name: occurrence.pointerAttestationPath,
-            version: occurrence.pointerAttestationVersion ?? '',
-            contentDigest: occurrence.pointerAttestationSha256,
-          },
-          publishedAt: incident.publishedAt,
-        }),
-        cryptoProvider,
-      )
-    : null
   if (
     !occurrence ||
     occurrence.stateVersion === undefined ||
     occurrence.attestationVersion === undefined ||
     occurrence.pointerVersion === undefined ||
-    occurrence.pointerAttestationVersion === undefined ||
+    occurrence.pointerAttestationVersion === undefined
+  ) {
+    throw new VerificationError('Incident guidance is not bound to the verified v1 occurrence.')
+  }
+  const occurrenceDigest = await sha256Digest(
+    canonicalizeJson({
+      schemaVersion: 'athena.incidentOccurrenceReceipt.v1',
+      incidentId: incident.state.incidentId,
+      transitionId: occurrence.transitionId,
+      stateResultDigest: incident.state.resultDigest,
+      stateReference: {
+        name: occurrence.statePath,
+        version: occurrence.stateVersion,
+        contentDigest: occurrence.stateSha256,
+      },
+      stateAttestationReference: {
+        name: occurrence.attestationPath,
+        version: occurrence.attestationVersion,
+        contentDigest: occurrence.attestationSha256,
+      },
+      pointerReference: {
+        name: occurrence.pointerPath,
+        version: occurrence.pointerVersion,
+        contentDigest: occurrence.pointerSha256,
+      },
+      pointerAttestationReference: {
+        name: occurrence.pointerAttestationPath,
+        version: occurrence.pointerAttestationVersion,
+        contentDigest: occurrence.pointerAttestationSha256,
+      },
+      publishedAt: occurrence.publishedAt,
+    }),
+    cryptoProvider,
+  )
+  if (
+    occurrence.transitionId !== incident.state.transitionId ||
+    occurrence.publishedAt !== incident.publishedAt ||
     pointer.sourceStateReference.name !== occurrence.statePath ||
     pointer.sourceStateReference.version !== occurrence.stateVersion ||
     pointer.sourceStateReference.contentDigest !== occurrence.stateSha256 ||
@@ -1386,9 +1400,10 @@ const parsePublishedReportAttestation = async (
   }
 }
 
-const parseFeedIndex = (
+export const parseFeedIndex = async (
   record: Record<string, JsonValue>,
-): {
+  cryptoProvider: Crypto = globalThis.crypto,
+): Promise<{
   active: ParsedFeedEntry[]
   recentlyResolved: ParsedFeedEntry[]
   sourceActiveIndexDigest: Sha256Digest
@@ -1396,7 +1411,7 @@ const parseFeedIndex = (
   keyId: string
   keyFingerprint: Sha256Digest
   publishedAt: string
-} => {
+}> => {
   requireExactKeys(record, [
     'schemaVersion',
     'active',
@@ -1427,6 +1442,8 @@ const parseFeedIndex = (
         record.omittedResolvedCount < 1)) ||
     !isDigest(record.sourceActiveIndexDigest) ||
     typeof record.keyId !== 'string' ||
+    record.keyId.length < 1 ||
+    record.keyId.length > 512 ||
     !isDigest(record.keyFingerprint) ||
     typeof record.indexAttestationPath !== 'string' ||
     !/^\.[/]incidents[/]feed-v2-index-attestations[/][a-f0-9]{64}[.]json$/.test(
@@ -1439,16 +1456,17 @@ const parseFeedIndex = (
   const active = record.active.map(parseFeedEntry)
   const resolved = record.recentlyResolved.map(parseFeedEntry)
   const activeIds = active.map((entry) => entry.incidentId)
-  const resolvedKeys = resolved.map(
-    (entry) => `${entry.updatedAt}\0${entry.incidentId}\0${entry.stateResultDigest}`,
-  )
-  const expectedResolvedKeys = [...resolvedKeys].sort((left, right) => {
-    const [leftUpdatedAt, leftId, leftDigest] = left.split('\0')
-    const [rightUpdatedAt, rightId, rightDigest] = right.split('\0')
+  const resolvedIsOrdered = resolved.every((entry, index) => {
+    if (index === 0) return true
+    const previous = resolved[index - 1]!
+    const previousTime = Date.parse(previous.updatedAt)
+    const currentTime = Date.parse(entry.updatedAt)
     return (
-      rightUpdatedAt!.localeCompare(leftUpdatedAt!) ||
-      leftId!.localeCompare(rightId!) ||
-      leftDigest!.localeCompare(rightDigest!)
+      previousTime > currentTime ||
+      (previousTime === currentTime &&
+        (previous.incidentId < entry.incidentId ||
+          (previous.incidentId === entry.incidentId &&
+            previous.stateResultDigest < entry.stateResultDigest)))
     )
   })
   const omittedResolvedCount =
@@ -1462,7 +1480,7 @@ const parseFeedIndex = (
     resolved.some((entry) => entry.lifecycle !== 'resolved') ||
     new Set(resolved.map((entry) => entry.incidentId)).size !== resolved.length ||
     resolved.some((entry) => activeIds.includes(entry.incidentId)) ||
-    resolvedKeys.join('\0') !== expectedResolvedKeys.join('\0') ||
+    !resolvedIsOrdered ||
     Date.parse(record.resolvedRetentionStart as string) >
       Date.parse(record.publishedAt as string) ||
     active.some(
@@ -1488,6 +1506,34 @@ const parseFeedIndex = (
   ) {
     throw new VerificationError(
       'Incident feed v2 lifecycle entries are not deterministic.',
+    )
+  }
+  const versionPayload: Record<string, JsonValue> = {
+    active: record.active,
+    recentlyResolved: record.recentlyResolved,
+    resolvedRetentionStart: record.resolvedRetentionStart,
+    resolvedHistoryTruncated: record.resolvedHistoryTruncated,
+    resolvedHistoryTotalCount: record.resolvedHistoryTotalCount,
+    sourceActiveIndexDigest: record.sourceActiveIndexDigest,
+    keyId: record.keyId,
+    keyFingerprint: record.keyFingerprint,
+    publishedAt: record.publishedAt,
+  }
+  if (record.omittedResolvedCount !== undefined) {
+    versionPayload.omittedResolvedCount = record.omittedResolvedCount
+  }
+  const versionDigest = await sha256Digest(
+    canonicalizeJson(versionPayload),
+    cryptoProvider,
+  )
+  if (
+    record.indexAttestationPath !==
+    `./incidents/feed-v2-index-attestations/${versionDigest.slice(
+      'sha256:'.length,
+    )}.json`
+  ) {
+    throw new VerificationError(
+      'Incident feed v2 index attestation path is not digest-bound.',
     )
   }
   return {
@@ -1520,15 +1566,34 @@ const parseFeedEntry = (value: unknown): ParsedFeedEntry => {
   ) {
     throw new VerificationError('Incident feed v2 entry schema is invalid.')
   }
+  const feedPointerReference = parseReference(record.feedPointerReference)
+  const feedPointerAttestationReference = parseReference(
+    record.feedPointerAttestationReference,
+  )
+  const prefix = `incidents/${record.incidentId}/versions/${record.stateResultDigest.slice(
+    'sha256:'.length,
+  )}/enrichments/`
+  if (
+    feedPointerReference.version.length > 64 ||
+    feedPointerAttestationReference.version.length > 64 ||
+    !new RegExp(
+      `^${prefix}incident-enrichment-[a-f0-9]{32}/feed-pointer[.]json$`,
+    ).test(feedPointerReference.name) ||
+    feedPointerAttestationReference.name !==
+      feedPointerReference.name.replace(
+        /[/]feed-pointer[.]json$/,
+        '/feed-pointer-attestation.json',
+      )
+  ) {
+    throw new VerificationError('Incident feed v2 entry pointer binding is invalid.')
+  }
   return {
     incidentId: record.incidentId,
     lifecycle: record.lifecycle,
     stateResultDigest: record.stateResultDigest,
     updatedAt: record.updatedAt,
-    feedPointerReference: parseReference(record.feedPointerReference),
-    feedPointerAttestationReference: parseReference(
-      record.feedPointerAttestationReference,
-    ),
+    feedPointerReference,
+    feedPointerAttestationReference,
   }
 }
 
