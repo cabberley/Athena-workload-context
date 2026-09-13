@@ -476,9 +476,11 @@ describe('standalone Athena presentation', () => {
   })
 
   it('renders independently verified recently resolved guidance when v1 active is empty', async () => {
+    const resolvedGuidance = guidanceFixture('Confirmed', 'resolved')
+    const resolvedIncidentId = resolvedGuidance.recentlyResolved[0]!.incidentId
     const guidanceLoader = vi
       .fn()
-      .mockResolvedValue(guidanceFixture('Confirmed', 'resolved'))
+      .mockResolvedValue(resolvedGuidance)
     render(
       <App
         loader={() => createLiveVerifiedLifecycle()}
@@ -508,11 +510,11 @@ describe('standalone Athena presentation', () => {
     expect(resolvedHeading).toBeInTheDocument()
     expect(resolvedHeading).toHaveAttribute(
       'id',
-      `incident-${guidanceFixture('Confirmed', 'resolved').incidentId}`,
+      `incident-${resolvedIncidentId}`,
     )
     expect(
       document.getElementById(
-        `resolved-${guidanceFixture('Confirmed', 'resolved').incidentId}`,
+        `resolved-${resolvedIncidentId}`,
       ),
     ).not.toBeInTheDocument()
     expect(
