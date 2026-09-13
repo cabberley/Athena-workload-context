@@ -502,11 +502,19 @@ describe('standalone Athena presentation', () => {
         name: /1 verified recently resolved incident/i,
       }),
     ).toBeInTheDocument()
+    const resolvedHeading = screen.getByRole('heading', {
+      name: /resolved incident: azure load balancer failure/i,
+    })
+    expect(resolvedHeading).toBeInTheDocument()
+    expect(resolvedHeading).toHaveAttribute(
+      'id',
+      `incident-${guidanceFixture('Confirmed', 'resolved').incidentId}`,
+    )
     expect(
-      screen.getByRole('heading', {
-        name: /resolved incident: azure load balancer failure/i,
-      }),
-    ).toBeInTheDocument()
+      document.getElementById(
+        `resolved-${guidanceFixture('Confirmed', 'resolved').incidentId}`,
+      ),
+    ).not.toBeInTheDocument()
     expect(
       screen.getByRole('heading', {
         name: /incident-specific operator guidance/i,

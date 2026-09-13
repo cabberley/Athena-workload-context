@@ -515,9 +515,9 @@ const RecentlyResolvedGuidance = ({
         <article
           key={verified.incidentId}
           className="incident-entry incident-resolved"
-          aria-labelledby={`resolved-${verified.incidentId}`}
+          aria-labelledby={`incident-${verified.incidentId}`}
         >
-          <h3 id={`resolved-${verified.incidentId}`}>
+          <h3 id={`incident-${verified.incidentId}`}>
             Resolved incident: {scenarioLabel(verified.incident.state.scenario)}
           </h3>
           <p role="status">{verified.incident.state.findings[0]!.summary}</p>

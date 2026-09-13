@@ -14,12 +14,17 @@ from pydantic import ValidationError
 
 from athena_context.contracts import (
     IncidentEnrichmentFeedPointer,
+    IncidentEnrichmentManifest,
+    IncidentFeedIndexAttestationV2,
     IncidentNotificationEnvelopeV2,
     IncidentNotificationV2,
+    build_incident_feed_index_v2,
     compute_artifact_digest,
+    sha256_hex,
 )
 from athena_context.eventing.notification_v2 import (
     NotificationV2PublicationService,
+    NotificationV2SourceVerifier,
     NotificationV2Trust,
     render_teams_notification_v2,
 )
@@ -27,9 +32,14 @@ from athena_context.eventing.runtime import (
     AzureServiceBusNotificationOutbox,
     _dispatch_notification_message,
     _validate_notification_broker_metadata,
+    run_incident_orchestrator_worker,
 )
 from test_presentation_asset_gateway import _feed_v2_gateway_fixture
 from test_wc016_eventing import (
+    NOW,
+    ROLES,
+    _detector_request,
+    _notification_message,
     _NotificationReceiver,
     _NotificationResponse,
     _NotificationStore,
@@ -78,6 +88,12 @@ def _verifier(public_key: rsa.RSAPublicKey):
 def _service():
     fixture = _feed_v2_gateway_fixture()
     outbox = _Outbox()
+    notification_private = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    notification_public = notification_private.public_key()
+    notification_key_id = "synthetic-key://notification"
     feed_trust = fixture["feed_trust"]
     report_trust = fixture["app"]._incident_report_trust
     assert report_trust is not None
@@ -105,12 +121,14 @@ def _service():
                 fixture["enrichment_trust"].public_key
             ),
         ),
-        notification_key_id=feed_trust.key_id,
-        notification_signer=_Signer(fixture["feed_private"]),
-        notification_signature_verifier=_verifier(feed_trust.public_key),
+        notification_key_id=notification_key_id,
+        notification_signer=_Signer(notification_private),
+        notification_signature_verifier=_verifier(notification_public),
         presentation_base_url="https://athena.synthetic.example",
         outbox=outbox,
     )
+    fixture["notification_key_id"] = notification_key_id
+    fixture["notification_public"] = notification_public
     return fixture, service, outbox
 
 
@@ -277,7 +295,7 @@ def test_notification_v2_outbox_preserves_order_and_dispatch_is_idempotent() -> 
     store = _NotificationStore()
     first_receiver = _NotificationReceiver()
     replay_receiver = _NotificationReceiver()
-    verifier = _verifier(fixture["feed_trust"].public_key)
+    verifier = _verifier(fixture["notification_public"])
     arguments = {
         "credential": SimpleNamespace(
             get_token=lambda _scope: SimpleNamespace(token="synthetic-token")
@@ -287,8 +305,10 @@ def test_notification_v2_outbox_preserves_order_and_dispatch_is_idempotent() -> 
             "paths/invoke?api-version=2019-05-01"
         ),
         "delivery_store": store,
-        "trusted_notification_v2_key_id": fixture["feed_trust"].key_id,
+        "trusted_notification_v2_key_id": fixture["notification_key_id"],
         "notification_v2_signature_verifier": verifier,
+        "notification_v2_source_verifier": service,
+        "now": fixture["feed_index"].published_at,
     }
     with patch(
         "athena_context.eventing.runtime.urlopen",
@@ -355,15 +375,234 @@ def test_transient_server_failure_resets_delivery_for_retry() -> None:
                 "paths/invoke?api-version=2019-05-01"
             ),
             delivery_store=store,
-            trusted_notification_v2_key_id=fixture["feed_trust"].key_id,
+            trusted_notification_v2_key_id=fixture["notification_key_id"],
             notification_v2_signature_verifier=_verifier(
-                fixture["feed_trust"].public_key
+                fixture["notification_public"]
             ),
+            notification_v2_source_verifier=service,
+            now=fixture["feed_index"].published_at,
         )
 
     assert store.state == "reserved"
     assert receiver.abandoned == 1
     assert receiver.dead_letter_reasons == []
+
+
+def test_v2_enabled_dispatch_rejects_unsigned_v1_without_delivery() -> None:
+    _notification, message = _notification_message()
+    receiver = _NotificationReceiver()
+    store = _NotificationStore()
+
+    with patch("athena_context.eventing.runtime.urlopen") as request:
+        assert not _dispatch_notification_message(
+            message=message,
+            receiver=receiver,
+            credential=SimpleNamespace(
+                get_token=lambda _scope: SimpleNamespace(token="synthetic-token")
+            ),
+            webhook_url=(
+                "https://example.logic.azure.com/workflows/synthetic/triggers/manual/"
+                "paths/invoke?api-version=2019-05-01"
+            ),
+            delivery_store=store,
+            trusted_notification_v2_key_id="synthetic-key://notification",
+            notification_v2_signature_verifier=lambda _payload, _signature: True,
+            notification_v2_source_verifier=SimpleNamespace(
+                verify_current=lambda _notification, verified_at: None
+            ),
+        )
+
+    request.assert_not_called()
+    assert receiver.dead_letter_reasons == ["AthenaNotificationRejected"]
+
+
+def test_deployed_orchestrator_path_uses_v2_without_enqueuing_v1() -> None:
+    request = _detector_request(next(iter(ROLES)), healthy=False)
+    message = SimpleNamespace(
+        body=request.canonical_bytes(),
+        content_type="application/json",
+        message_id=request.idempotency_key,
+        session_id=request.incident_id,
+        application_properties={
+            "schemaVersion": "athena.incidentReassessmentRequest.v1",
+            "scenario": request.scenario,
+            "lifecycle": request.lifecycle,
+        },
+    )
+
+    class _Context:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def __enter__(self) -> object:
+            return self.value
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.completed = 0
+
+        def receive_messages(self, **_kwargs: object) -> list[object]:
+            return [message]
+
+        def complete_message(self, _message: object) -> None:
+            self.completed += 1
+
+    class _Client:
+        def __init__(self, receiver: _Receiver) -> None:
+            self.receiver = receiver
+            self.sender = SimpleNamespace()
+
+        def get_queue_receiver(self, **_kwargs: object) -> _Context:
+            return _Context(self.receiver)
+
+        def get_queue_sender(self, **_kwargs: object) -> _Context:
+            return _Context(self.sender)
+
+    receiver = _Receiver()
+    client = _Client(receiver)
+    published: list[tuple[str, object]] = []
+    publication_service = SimpleNamespace(
+        publish=lambda *, incident_id, verified_at: published.append(
+            (incident_id, verified_at)
+        )
+    )
+    fixture, _service_instance, _outbox = _service()
+
+    def reassess(*_args: object, **kwargs: object) -> tuple[object, object]:
+        assert kwargs["notifications"] is None
+        return fixture["state"], object()
+
+    with (
+        patch("azure.identity.ManagedIdentityCredential"),
+        patch("azure.servicebus.ServiceBusClient", return_value=_Context(client)),
+        patch("athena_context.eventing.runtime.KeyVaultRsaSigner"),
+        patch("athena_context.eventing.runtime.AzureBlobIncidentAssetPublisher"),
+        patch("athena_context.eventing.runtime.ApprovedLiveReassessmentAdapter"),
+        patch(
+            "athena_context.eventing.runtime.run_incident_reassessment",
+            side_effect=reassess,
+        ),
+        patch("athena_context.eventing.runtime._now_utc_millisecond", return_value=NOW),
+    ):
+        assert run_incident_orchestrator_worker(
+            fully_qualified_namespace="synthetic.servicebus.windows.net",
+            reassessment_queue_name="reassessment",
+            notification_queue_name="notifications",
+            managed_identity_client_id="00000000-0000-0000-0000-000000000001",
+            approved_resource_roles=ROLES,
+            blob_endpoint="https://synthetic.blob.core.windows.net",
+            presentation_url="https://athena.synthetic.example",
+            key_vault_key_id=(
+                "https://synthetic.vault.azure.net/keys/lifecycle/"
+                "0123456789abcdef0123456789abcdef"
+            ),
+            signing_key_id="synthetic-key://lifecycle",
+            signing_key_fingerprint="sha256:" + "1" * 64,
+            notification_v2_publication_service=publication_service,
+        )
+
+    assert receiver.completed == 1
+    assert published == [(fixture["state"].incident_id, NOW)]
+
+
+def test_dispatch_rejects_stale_v2_before_reserving_or_posting() -> None:
+    fixture, service, _outbox = _service()
+    envelope = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=fixture["feed_index"].published_at,
+    )
+    message = SimpleNamespace(
+        body=envelope.canonical_bytes(),
+        content_type="application/json",
+        message_id=envelope.notification.notification_id,
+        session_id=envelope.notification.incident_id,
+        application_properties={
+            "schemaVersion": "athena.wc027IncidentNotificationEnvelope.v2",
+            "lifecycle": envelope.notification.lifecycle,
+            "transitionId": envelope.notification.transition_id,
+            "stateResultDigest": envelope.notification.state_result_digest,
+        },
+    )
+    receiver = _NotificationReceiver()
+    store = _NotificationStore()
+
+    with patch("athena_context.eventing.runtime.urlopen") as request:
+        assert not _dispatch_notification_message(
+            message=message,
+            receiver=receiver,
+            credential=SimpleNamespace(
+                get_token=lambda _scope: SimpleNamespace(token="synthetic-token")
+            ),
+            webhook_url=(
+                "https://example.logic.azure.com/workflows/synthetic/triggers/manual/"
+                "paths/invoke?api-version=2019-05-01"
+            ),
+            delivery_store=store,
+            trusted_notification_v2_key_id=fixture["notification_key_id"],
+            notification_v2_signature_verifier=_verifier(
+                fixture["notification_public"]
+            ),
+            notification_v2_source_verifier=service,
+            now=fixture["feed_index"].published_at + timedelta(minutes=16),
+        )
+
+    request.assert_not_called()
+    assert receiver.dead_letter_reasons == ["AthenaNotificationRejected"]
+    assert store.state is None
+
+
+def test_dispatch_revalidates_current_lifecycle_before_posting() -> None:
+    fixture, service, _outbox = _service()
+    envelope = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=fixture["feed_index"].published_at,
+    )
+    message = SimpleNamespace(
+        body=envelope.canonical_bytes(),
+        content_type="application/json",
+        message_id=envelope.notification.notification_id,
+        session_id=envelope.notification.incident_id,
+        application_properties={
+            "schemaVersion": "athena.wc027IncidentNotificationEnvelope.v2",
+            "lifecycle": envelope.notification.lifecycle,
+            "transitionId": envelope.notification.transition_id,
+            "stateResultDigest": envelope.notification.state_result_digest,
+        },
+    )
+    receiver = _NotificationReceiver()
+    store = _NotificationStore()
+    source_verifier = SimpleNamespace(
+        verify_current=lambda _notification, verified_at: (_ for _ in ()).throw(
+            ValueError("notification no longer matches resolved current state")
+        )
+    )
+
+    with patch("athena_context.eventing.runtime.urlopen") as request:
+        assert not _dispatch_notification_message(
+            message=message,
+            receiver=receiver,
+            credential=SimpleNamespace(
+                get_token=lambda _scope: SimpleNamespace(token="synthetic-token")
+            ),
+            webhook_url=(
+                "https://example.logic.azure.com/workflows/synthetic/triggers/manual/"
+                "paths/invoke?api-version=2019-05-01"
+            ),
+            delivery_store=store,
+            trusted_notification_v2_key_id=fixture["notification_key_id"],
+            notification_v2_signature_verifier=_verifier(
+                fixture["notification_public"]
+            ),
+            notification_v2_source_verifier=source_verifier,
+            now=fixture["feed_index"].published_at,
+        )
+
+    request.assert_not_called()
+    assert receiver.dead_letter_reasons == ["AthenaNotificationRejected"]
+    assert store.state is None
 
 
 def test_resolved_teams_rendering_remains_non_remediating() -> None:
@@ -390,3 +629,151 @@ def test_resolved_teams_rendering_remains_non_remediating() -> None:
     assert "incident RESOLVED" in message
     assert "did not perform remediation" in message
     assert "Review verified guidance:" in message
+
+
+def test_notification_signing_authority_must_not_reuse_a_source_key() -> None:
+    fixture = _feed_v2_gateway_fixture()
+    feed_trust = fixture["feed_trust"]
+    report_trust = fixture["app"]._incident_report_trust
+    assert report_trust is not None
+
+    with pytest.raises(ValueError, match="distinct from source authorities"):
+        NotificationV2PublicationService(
+            reader=fixture["reader"],
+            trust=NotificationV2Trust(
+                lifecycle_key_id=fixture["lifecycle_trust"].key_id,
+                lifecycle_key_fingerprint=(
+                    fixture["lifecycle_trust"].key_fingerprint
+                ),
+                lifecycle_signature_verifier=_verifier(
+                    fixture["lifecycle_trust"].public_key
+                ),
+                feed_key_id=feed_trust.key_id,
+                feed_key_fingerprint=feed_trust.key_fingerprint,
+                feed_signature_verifier=_verifier(feed_trust.public_key),
+                report_key_id=report_trust.key_id,
+                report_signature_verifier=_verifier(report_trust.public_key),
+                guidance_key_id=fixture["guidance_trust"].key_id,
+                guidance_signature_verifier=_verifier(
+                    fixture["guidance_trust"].public_key
+                ),
+                enrichment_key_id=fixture["enrichment_trust"].key_id,
+                enrichment_signature_verifier=_verifier(
+                    fixture["enrichment_trust"].public_key
+                ),
+            ),
+            notification_key_id=feed_trust.key_id,
+            notification_signer=_Signer(fixture["feed_private"]),
+            notification_signature_verifier=_verifier(feed_trust.public_key),
+            presentation_base_url="https://athena.synthetic.example",
+            outbox=_Outbox(),
+        )
+
+
+def test_feed_refresh_keeps_stable_notification_identity() -> None:
+    fixture, service, _outbox = _service()
+    original = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=fixture["feed_index"].published_at,
+    )
+    current = fixture["feed_index"]
+    refreshed_at = current.published_at + timedelta(minutes=1)
+    refreshed = build_incident_feed_index_v2(
+        active=current.active,
+        recently_resolved=current.recently_resolved,
+        resolved_retention_start=current.resolved_retention_start,
+        resolved_history_truncated=current.resolved_history_truncated,
+        resolved_history_total_count=current.resolved_history_total_count,
+        omitted_resolved_count=current.omitted_resolved_count,
+        source_active_index_digest=current.source_active_index_digest,
+        key_id=current.key_id,
+        key_fingerprint=current.key_fingerprint,
+        published_at=refreshed_at,
+    )
+    signature = _Signer(fixture["feed_private"]).sign_preimage(
+        refreshed.canonical_bytes()
+    )
+    signature = base64.urlsafe_b64encode(base64.b64decode(signature)).decode(
+        "ascii"
+    ).rstrip("=")
+    attestation = IncidentFeedIndexAttestationV2(
+        schemaVersion="athena.wc027IncidentFeedIndexAttestation.v2",
+        indexDigest=sha256_hex(refreshed.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=fixture["feed_trust"].key_id,
+        detachedSignature=signature,
+    )
+    fixture["reader"].content["incidents/feed-v2.json"] = refreshed.canonical_bytes()
+    fixture["reader"].content[
+        refreshed.index_attestation_path.removeprefix("./")
+    ] = attestation.canonical_bytes()
+
+    replay = service.publish(
+        incident_id=fixture["state"].incident_id,
+        verified_at=refreshed_at,
+    )
+
+    assert (
+        replay.notification.notification_id
+        == original.notification.notification_id
+    )
+    assert (
+        replay.notification.notification_digest
+        != original.notification.notification_digest
+    )
+
+
+def test_manifest_state_version_reference_must_match_feed_pointer() -> None:
+    fixture, service, _outbox = _service()
+    reference = fixture["feed_entry"].feed_pointer_reference
+    feed_pointer = IncidentEnrichmentFeedPointer.model_validate_json(
+        fixture["reader"].versioned_content[(reference.name, reference.version)]
+    )
+    manifest_reference = feed_pointer.enrichment_asset.manifest_reference
+    manifest = IncidentEnrichmentManifest.model_validate_json(
+        fixture["reader"].versioned_content[
+            (manifest_reference.name, manifest_reference.version)
+        ]
+    )
+    mismatched = manifest.model_copy(
+        update={
+            "incident_state_reference": (
+                manifest.incident_state_reference.model_copy(
+                    update={"version": "different-version"}
+                )
+            )
+        }
+    )
+    original_read = NotificationV2SourceVerifier._read_version_model
+
+    def read_model(
+        verifier: NotificationV2SourceVerifier,
+        source_reference: object,
+        maximum_bytes: int,
+        model_type: type[object],
+    ) -> object:
+        if model_type is IncidentEnrichmentManifest:
+            return mismatched
+        return original_read(
+            verifier,
+            source_reference,
+            maximum_bytes,
+            model_type,
+        )
+
+    with (
+        patch(
+            "athena_context.eventing.notification_v2."
+            "validate_incident_enrichment_assets"
+        ),
+        patch.object(
+            NotificationV2SourceVerifier,
+            "_read_version_model",
+            new=read_model,
+        ),
+        pytest.raises(ValueError, match="enrichment, report, or guidance"),
+    ):
+        service.publish(
+            incident_id=fixture["state"].incident_id,
+            verified_at=fixture["feed_index"].published_at,
+        )

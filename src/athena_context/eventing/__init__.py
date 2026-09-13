@@ -32,6 +32,7 @@ from athena_context.eventing.normalization import (
 from athena_context.eventing.notification_v2 import (
     NotificationV2OutboxPort,
     NotificationV2PublicationService,
+    NotificationV2SourceVerifier,
     NotificationV2Trust,
     render_teams_notification_v2,
     verify_notification_v2_envelope,
@@ -46,6 +47,8 @@ from athena_context.eventing.routing import (
 )
 from athena_context.eventing.runtime import (
     ApprovedLiveReassessmentAdapter,
+    NotificationV2KeyAuthority,
+    NotificationV2RuntimeConfiguration,
     run_incident_feed_heartbeat,
     run_incident_orchestrator_worker,
     run_notification_dispatcher_worker,
@@ -85,7 +88,10 @@ __all__ = [
     "ManagedIdentityResourceGraphChangeHistoryClient",
     "NotificationV2OutboxPort",
     "NotificationV2PublicationService",
+    "NotificationV2SourceVerifier",
     "NotificationV2Trust",
+    "NotificationV2KeyAuthority",
+    "NotificationV2RuntimeConfiguration",
     "render_teams_notification_v2",
     "verify_notification_v2_envelope",
 ]

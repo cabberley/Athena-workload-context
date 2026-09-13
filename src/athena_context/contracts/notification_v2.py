@@ -19,6 +19,24 @@ from athena_context.contracts.operational_phase import VersionPinnedBlobReferenc
 MAX_INCIDENT_NOTIFICATION_V2_BYTES = 16 * 1024
 
 
+def _notification_identity_digest(notification: IncidentNotificationV2) -> Sha256Digest:
+    return compute_artifact_digest(
+        {
+            "schemaVersion": "athena.wc027IncidentNotificationIdentity.v1",
+            "incidentId": notification.incident_id,
+            "transitionId": notification.transition_id,
+            "lifecycle": notification.lifecycle,
+            "stateResultDigest": notification.state_result_digest,
+            "occurrenceDigest": notification.occurrence_digest,
+            "guidanceAsset": notification.guidance_asset.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+        }
+    )
+
+
 class _StrictNotificationV2Model(AthenaBaseModel):
     model_config = ConfigDict(
         alias_generator=None,
@@ -98,8 +116,11 @@ class IncidentNotificationV2(_StrictNotificationV2Model):
         expected = compute_artifact_digest(preimage)
         if self.notification_digest != expected:
             raise ValueError("notificationDigest does not bind notification v2")
-        if self.notification_id != f"notify-v2-{expected.removeprefix('sha256:')}":
-            raise ValueError("notificationId is not digest-bound")
+        identity_digest = _notification_identity_digest(self)
+        if self.notification_id != (
+            f"notify-v2-{identity_digest.removeprefix('sha256:')}"
+        ):
+            raise ValueError("notificationId is not occurrence and guidance bound")
         if len(self.canonical_bytes()) > MAX_INCIDENT_NOTIFICATION_V2_BYTES:
             raise ValueError("notification v2 exceeds its byte budget")
         return self

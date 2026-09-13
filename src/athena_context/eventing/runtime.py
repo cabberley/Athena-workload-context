@@ -18,6 +18,8 @@ from pydantic import ValidationError
 
 from athena_context.azure_adapters import (
     AzureBlobIncidentAssetPublisher,
+    AzureBlobIncidentAssetReader,
+    KeyVaultRsaPublicKeyVerifier,
     KeyVaultRsaSigner,
     production_managed_identity_credential,
 )
@@ -40,7 +42,12 @@ from athena_context.eventing.detector import (
     read_approved_signal,
     validate_approved_resource_roles,
 )
-from athena_context.eventing.notification_v2 import verify_notification_v2_envelope
+from athena_context.eventing.notification_v2 import (
+    NotificationV2PublicationService,
+    NotificationV2SourceVerifier,
+    NotificationV2Trust,
+    verify_notification_v2_envelope,
+)
 from athena_context.eventing.orchestrator import (
     NotificationOutboxPort,
     ScopedReassessmentPort,
@@ -54,7 +61,52 @@ _MONITOR_EVENT_CLAUSES = {
     "loadBalancerFailure": "wc016-load-balancer-operational-state",
 }
 _LOGIC_APPS_SCOPE = "https://management.azure.com/.default"
+_MAX_NOTIFICATION_V2_DELIVERY_AGE = timedelta(minutes=15)
+_MAX_NOTIFICATION_V2_CLOCK_SKEW = timedelta(minutes=1)
 ServiceBusApplicationProperty = int | float | bytes | bool | str | UUID
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationV2KeyAuthority:
+    key_vault_key_id: str
+    key_id: str
+    key_fingerprint: str
+
+    def __post_init__(self) -> None:
+        TrustedKeyAnchor.from_key_vault_key_id(
+            self.key_vault_key_id,
+            public_key_fingerprint=self.key_fingerprint,
+        )
+        if type(self.key_id) is not str or not self.key_id:
+            raise ValueError("notification v2 logical key ID is required")
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationV2RuntimeConfiguration:
+    lifecycle: NotificationV2KeyAuthority
+    feed: NotificationV2KeyAuthority
+    report: NotificationV2KeyAuthority
+    guidance: NotificationV2KeyAuthority
+    enrichment: NotificationV2KeyAuthority
+    notification: NotificationV2KeyAuthority
+
+    def __post_init__(self) -> None:
+        authorities = (
+            self.lifecycle,
+            self.feed,
+            self.report,
+            self.guidance,
+            self.enrichment,
+            self.notification,
+        )
+        if (
+            len({item.key_vault_key_id for item in authorities}) != len(authorities)
+            or len({item.key_id for item in authorities}) != len(authorities)
+            or len({item.key_fingerprint for item in authorities}) != len(authorities)
+        ):
+            raise ValueError(
+                "notification v2 source and signing authorities must use distinct keys"
+            )
 
 
 @dataclass(frozen=True)
@@ -575,10 +627,14 @@ def run_notification_dispatcher_worker(
     notification_state_table_endpoint: str,
     notification_state_table_name: str,
     notification_state_partition_key: str,
+    incident_asset_blob_endpoint: str | None = None,
+    presentation_url: str | None = None,
+    notification_v2_configuration: NotificationV2RuntimeConfiguration | None = None,
     trusted_notification_v2_key_id: str | None = None,
     trusted_notification_v2_key_fingerprint: str | None = None,
     notification_v2_public_key_path: Path | None = None,
     notification_v2_signature_verifier: Callable[[bytes, str], bool] | None = None,
+    notification_v2_source_verifier: NotificationV2SourceVerifier | None = None,
     max_wait_time_seconds: int = 30,
 ) -> bool:
     from azure.identity import ManagedIdentityCredential
@@ -587,23 +643,56 @@ def run_notification_dispatcher_worker(
         ServiceBusClient,
     )
 
-    v2_configuration = (
+    legacy_v2_configuration = (
         trusted_notification_v2_key_id,
         trusted_notification_v2_key_fingerprint,
         notification_v2_public_key_path,
     )
-    if any(value is not None for value in v2_configuration) and any(
-        value is None for value in v2_configuration
+    if notification_v2_configuration is not None and any(
+        value is not None for value in legacy_v2_configuration
+    ):
+        raise ValueError("notification v2 trust configuration is ambiguous")
+    if any(value is not None for value in legacy_v2_configuration) and any(
+        value is None for value in legacy_v2_configuration
     ):
         raise ValueError("notification v2 trust configuration must be complete")
     if notification_v2_signature_verifier is None and all(
-        value is not None for value in v2_configuration
+        value is not None for value in legacy_v2_configuration
     ):
         assert trusted_notification_v2_key_fingerprint is not None
         assert notification_v2_public_key_path is not None
         notification_v2_signature_verifier = _load_notification_v2_verifier(
             notification_v2_public_key_path,
             expected_fingerprint=trusted_notification_v2_key_fingerprint,
+        )
+    if notification_v2_configuration is not None:
+        if incident_asset_blob_endpoint is None or presentation_url is None:
+            raise ValueError(
+                "notification v2 delivery requires incident assets and presentation URL"
+            )
+        trusted_notification_v2_key_id = (
+            notification_v2_configuration.notification.key_id
+        )
+        notification_verifier = _key_vault_public_verifier(
+            notification_v2_configuration.notification,
+            managed_identity_client_id=managed_identity_client_id,
+        )
+        notification_v2_signature_verifier = notification_verifier.verify_preimage
+        notification_v2_source_verifier = _build_notification_v2_source_verifier(
+            configuration=notification_v2_configuration,
+            blob_endpoint=incident_asset_blob_endpoint,
+            managed_identity_client_id=managed_identity_client_id,
+            presentation_base_url=presentation_url,
+        )
+    if (
+        trusted_notification_v2_key_id is not None
+        and (
+            notification_v2_signature_verifier is None
+            or notification_v2_source_verifier is None
+        )
+    ):
+        raise ValueError(
+            "notification v2 delivery requires signature and current-source verification"
         )
     parsed_webhook = urlsplit(webhook_url)
     query = parse_qs(parsed_webhook.query, keep_blank_values=True)
@@ -657,6 +746,7 @@ def run_notification_dispatcher_worker(
             notification_v2_signature_verifier=(
                 notification_v2_signature_verifier
             ),
+            notification_v2_source_verifier=notification_v2_source_verifier,
         )
 
 
@@ -669,6 +759,8 @@ def _dispatch_notification_message(
     delivery_store: NotificationDeliveryStorePort,
     trusted_notification_v2_key_id: str | None = None,
     notification_v2_signature_verifier: Callable[[bytes, str], bool] | None = None,
+    notification_v2_source_verifier: NotificationV2SourceVerifier | None = None,
+    now: datetime | None = None,
 ) -> bool:
     try:
         body = _message_body(message)
@@ -682,6 +774,24 @@ def _dispatch_notification_message(
             ),
         )
         _validate_notification_broker_metadata(message, notification)
+        if isinstance(notification, IncidentNotificationV2):
+            delivery_now = _now_utc_millisecond() if now is None else now
+            if (
+                notification.feed_published_at < (
+                    delivery_now - _MAX_NOTIFICATION_V2_DELIVERY_AGE
+                )
+                or notification.feed_published_at > (
+                    delivery_now + _MAX_NOTIFICATION_V2_CLOCK_SKEW
+                )
+                or notification_v2_source_verifier is None
+            ):
+                raise ValueError(
+                    "notification v2 is stale or current-source verification is absent"
+                )
+            notification_v2_source_verifier.verify_current(
+                notification,
+                verified_at=delivery_now,
+            )
         access_token = credential.get_token(_LOGIC_APPS_SCOPE).token
         claim = delivery_store.acquire(
             notification_id=notification.notification_id,
@@ -905,6 +1015,8 @@ def run_incident_orchestrator_worker(
     key_vault_key_id: str,
     signing_key_id: str,
     signing_key_fingerprint: str,
+    notification_v2_configuration: NotificationV2RuntimeConfiguration | None = None,
+    notification_v2_publication_service: NotificationV2PublicationService | None = None,
     metric_window_minutes: int = 5,
     max_wait_time_seconds: int = 30,
 ) -> bool:
@@ -935,6 +1047,11 @@ def run_incident_orchestrator_worker(
         trusted_key_anchor=trusted_key,
         managed_identity_client_id=managed_identity_client_id,
     )
+    if (
+        notification_v2_configuration is not None
+        and notification_v2_publication_service is not None
+    ):
+        raise ValueError("notification v2 publication configuration is ambiguous")
     publisher = AzureBlobIncidentAssetPublisher(
         blob_endpoint=blob_endpoint,
         container_name="incident-assets",
@@ -979,7 +1096,43 @@ def run_incident_orchestrator_worker(
             _validate_reassessment_broker_metadata(message, request)
             now = _now_utc_millisecond()
             _validate_reassessment_age(request, now=now)
-            run_incident_reassessment(
+            notification_outbox = AzureServiceBusNotificationOutbox(
+                notification_sender
+            )
+            if notification_v2_configuration is not None:
+                notification_signer = KeyVaultRsaSigner(
+                    trusted_key_anchor=_key_anchor(
+                        notification_v2_configuration.notification
+                    ),
+                    managed_identity_client_id=managed_identity_client_id,
+                )
+                notification_verifier = _key_vault_public_verifier(
+                    notification_v2_configuration.notification,
+                    managed_identity_client_id=managed_identity_client_id,
+                )
+                notification_v2_publication_service = (
+                    NotificationV2PublicationService(
+                        reader=AzureBlobIncidentAssetReader(
+                            blob_endpoint=blob_endpoint,
+                            container_name="incident-assets",
+                            managed_identity_client_id=managed_identity_client_id,
+                        ),
+                        trust=_build_notification_v2_trust(
+                            notification_v2_configuration,
+                            managed_identity_client_id=managed_identity_client_id,
+                        ),
+                        presentation_base_url=presentation_url,
+                        notification_key_id=(
+                            notification_v2_configuration.notification.key_id
+                        ),
+                        notification_signer=notification_signer,
+                        notification_signature_verifier=(
+                            notification_verifier.verify_preimage
+                        ),
+                        outbox=notification_outbox,
+                    )
+                )
+            result = run_incident_reassessment(
                 request,
                 detected_at=request.trigger_event.observed_at,
                 updated_at=request.trigger_event.received_at,
@@ -990,8 +1143,20 @@ def run_incident_orchestrator_worker(
                 reassessment=reassessment,
                 signer=signer,
                 publisher=publisher,
-                notifications=AzureServiceBusNotificationOutbox(notification_sender),
+                notifications=(
+                    None
+                    if notification_v2_publication_service is not None
+                    else notification_outbox
+                ),
             )
+            if (
+                result is not None
+                and notification_v2_publication_service is not None
+            ):
+                notification_v2_publication_service.publish(
+                    incident_id=result[0].incident_id,
+                    verified_at=now,
+                )
             receiver.complete_message(message)
             return True
         except ValidationError, ValueError:
@@ -1122,6 +1287,8 @@ def _decode_notification(
         raise ValueError("notification body must be an object")
     schema_version = decoded.get("schemaVersion")
     if schema_version == "athena.incidentNotification.v1":
+        if trusted_notification_v2_key_id is not None:
+            raise ValueError("unsigned notification v1 is disabled when v2 is enabled")
         return IncidentNotification.model_validate(decoded)
     if schema_version != "athena.wc027IncidentNotificationEnvelope.v2":
         raise ValueError("notification schema version is unsupported")
@@ -1138,10 +1305,92 @@ def _decode_notification(
     )
 
 
+def _key_anchor(authority: NotificationV2KeyAuthority) -> TrustedKeyAnchor:
+    return TrustedKeyAnchor.from_key_vault_key_id(
+        authority.key_vault_key_id,
+        public_key_fingerprint=authority.key_fingerprint,
+    )
+
+
+def _key_vault_public_verifier(
+    authority: NotificationV2KeyAuthority,
+    *,
+    managed_identity_client_id: str,
+) -> KeyVaultRsaPublicKeyVerifier:
+    return KeyVaultRsaPublicKeyVerifier(
+        trusted_key_anchor=_key_anchor(authority),
+        managed_identity_client_id=managed_identity_client_id,
+    )
+
+
+def _build_notification_v2_trust(
+    configuration: NotificationV2RuntimeConfiguration,
+    *,
+    managed_identity_client_id: str,
+) -> NotificationV2Trust:
+    lifecycle = _key_vault_public_verifier(
+        configuration.lifecycle,
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    feed = _key_vault_public_verifier(
+        configuration.feed,
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    report = _key_vault_public_verifier(
+        configuration.report,
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    guidance = _key_vault_public_verifier(
+        configuration.guidance,
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    enrichment = _key_vault_public_verifier(
+        configuration.enrichment,
+        managed_identity_client_id=managed_identity_client_id,
+    )
+    return NotificationV2Trust(
+        lifecycle_key_id=configuration.lifecycle.key_id,
+        lifecycle_key_fingerprint=configuration.lifecycle.key_fingerprint,
+        lifecycle_signature_verifier=lifecycle.verify_preimage,
+        feed_key_id=configuration.feed.key_id,
+        feed_key_fingerprint=configuration.feed.key_fingerprint,
+        feed_signature_verifier=feed.verify_preimage,
+        report_key_id=configuration.report.key_id,
+        report_signature_verifier=report.verify_preimage,
+        guidance_key_id=configuration.guidance.key_id,
+        guidance_signature_verifier=guidance.verify_preimage,
+        enrichment_key_id=configuration.enrichment.key_id,
+        enrichment_signature_verifier=enrichment.verify_preimage,
+    )
+
+
+def _build_notification_v2_source_verifier(
+    *,
+    configuration: NotificationV2RuntimeConfiguration,
+    blob_endpoint: str,
+    managed_identity_client_id: str,
+    presentation_base_url: str,
+) -> NotificationV2SourceVerifier:
+    return NotificationV2SourceVerifier(
+        reader=AzureBlobIncidentAssetReader(
+            blob_endpoint=blob_endpoint,
+            container_name="incident-assets",
+            managed_identity_client_id=managed_identity_client_id,
+        ),
+        trust=_build_notification_v2_trust(
+            configuration,
+            managed_identity_client_id=managed_identity_client_id,
+        ),
+        presentation_base_url=presentation_base_url,
+    )
+
+
 __all__ = [
     "ApprovedLiveReassessmentAdapter",
     "AzureServiceBusNotificationOutbox",
     "AzureTableNotificationDeliveryStore",
+    "NotificationV2KeyAuthority",
+    "NotificationV2RuntimeConfiguration",
     "run_incident_orchestrator_worker",
     "run_notification_dispatcher_worker",
 ]

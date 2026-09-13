@@ -20,6 +20,8 @@ from athena_context.contracts.eventing import WorkloadRole
 from athena_context.contracts.presentation import ArgusPresentationPhase
 from athena_context.eventing import (
     ChangeIngestionError,
+    NotificationV2KeyAuthority,
+    NotificationV2RuntimeConfiguration,
     SignalDetectionError,
     run_event_grid_change_ingestion_worker,
     run_event_grid_dead_letter_purge_worker,
@@ -300,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     incident_parser.add_argument("--key-vault-key-id", required=True)
     incident_parser.add_argument("--signing-key-id", required=True)
     incident_parser.add_argument("--signing-key-fingerprint", required=True)
+    incident_parser.add_argument("--notification-v2-config-json")
     heartbeat_parser = subparsers.add_parser(
         "wc016-incident-feed-heartbeat",
         help="publish a signed feed heartbeat after independently verifying live health",
@@ -339,12 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--notification-state-partition-key",
         required=True,
     )
-    notification_parser.add_argument("--notification-v2-key-id")
-    notification_parser.add_argument("--notification-v2-key-fingerprint")
-    notification_parser.add_argument(
-        "--notification-v2-public-key",
-        type=Path,
-    )
+    notification_parser.add_argument("--incident-asset-blob-endpoint")
+    notification_parser.add_argument("--presentation-url")
+    notification_parser.add_argument("--notification-v2-config-json")
     change_event_parser = subparsers.add_parser(
         "wc025-change-event-ingester",
         help="normalize only approved resource-group Event Grid changes into signed evidence",
@@ -511,6 +511,53 @@ def _load_approved_change_scope(
         return ApprovedChangeScope.model_validate(normalized)
     except ValueError as exc:
         raise ValueError("approved change scope is invalid") from exc
+
+
+def _load_notification_v2_runtime_configuration(
+    inline_json: str | None,
+) -> NotificationV2RuntimeConfiguration | None:
+    environment_json = os.environ.get("ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON")
+    if inline_json is None and environment_json is None:
+        return None
+    value = _load_json_configuration(
+        path=None,
+        inline_json=inline_json,
+        label="notification v2 runtime configuration",
+        environment_name="ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON",
+    )
+    authority_names = {
+        "lifecycle",
+        "feed",
+        "report",
+        "guidance",
+        "enrichment",
+        "notification",
+    }
+    if not isinstance(value, dict) or set(value) != authority_names:
+        raise ValueError("notification v2 runtime configuration is invalid")
+
+    def authority(name: str) -> NotificationV2KeyAuthority:
+        raw = value.get(name)
+        if not isinstance(raw, dict) or set(raw) != {
+            "keyVaultKeyId",
+            "keyId",
+            "keyFingerprint",
+        }:
+            raise ValueError("notification v2 key authority is invalid")
+        return NotificationV2KeyAuthority(
+            key_vault_key_id=raw["keyVaultKeyId"],
+            key_id=raw["keyId"],
+            key_fingerprint=raw["keyFingerprint"],
+        )
+
+    return NotificationV2RuntimeConfiguration(
+        lifecycle=authority("lifecycle"),
+        feed=authority("feed"),
+        report=authority("report"),
+        guidance=authority("guidance"),
+        enrichment=authority("enrichment"),
+        notification=authority("notification"),
+    )
 
 
 def _write_exclusive_json_file(path: Path, content: str, *, message: str) -> None:
@@ -808,6 +855,11 @@ def main(
                 key_vault_key_id=args.key_vault_key_id,
                 signing_key_id=args.signing_key_id,
                 signing_key_fingerprint=args.signing_key_fingerprint,
+                notification_v2_configuration=(
+                    _load_notification_v2_runtime_configuration(
+                        args.notification_v2_config_json
+                    )
+                ),
                 metric_window_minutes=args.metric_window_minutes,
             )
             output.write(
@@ -847,11 +899,13 @@ def main(
                 notification_state_table_endpoint=(args.notification_state_table_endpoint),
                 notification_state_table_name=args.notification_state_table_name,
                 notification_state_partition_key=(args.notification_state_partition_key),
-                trusted_notification_v2_key_id=args.notification_v2_key_id,
-                trusted_notification_v2_key_fingerprint=(
-                    args.notification_v2_key_fingerprint
+                incident_asset_blob_endpoint=args.incident_asset_blob_endpoint,
+                presentation_url=args.presentation_url,
+                notification_v2_configuration=(
+                    _load_notification_v2_runtime_configuration(
+                        args.notification_v2_config_json
+                    )
                 ),
-                notification_v2_public_key_path=args.notification_v2_public_key,
             )
             output.write(
                 "WC-016 notification delivered\n"

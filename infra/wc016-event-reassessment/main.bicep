@@ -115,6 +115,11 @@ param signingKeyId string
 @maxLength(71)
 param signingKeyFingerprint string
 
+@description('Bounded JSON containing six distinct versioned WC-027 source and notification key authorities.')
+@minLength(1)
+@maxLength(16384)
+param notificationV2ConfigurationJson string
+
 @description('Existing authorized Microsoft Teams API connection name.')
 param teamsConnectionName string
 
@@ -529,6 +534,10 @@ resource detectorJob 'Microsoft.App/jobs@2025-01-01' = {
               value: approvedResourceRolesJson
             }
             {
+              name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
+              value: notificationV2ConfigurationJson
+            }
+            {
               name: 'ATHENA_WC016_APPROVED_ALERT_RULES_JSON'
               value: approvedAlertRulesJson
             }
@@ -796,6 +805,10 @@ resource notificationJob 'Microsoft.App/jobs@2025-01-01' = {
             notificationStateTableName
             '--notification-state-partition-key'
             notificationStatePartitionKey
+            '--incident-asset-blob-endpoint'
+            incidentAssetBlobEndpoint
+            '--presentation-url'
+            presentationUrl
           ]
           env: [
             {
@@ -805,6 +818,10 @@ resource notificationJob 'Microsoft.App/jobs@2025-01-01' = {
             {
               name: 'ATHENA_WC016_TEAMS_WEBHOOK_URL'
               secretRef: 'teams-webhook-url'
+            }
+            {
+              name: 'ATHENA_WC027_NOTIFICATION_V2_CONFIG_JSON'
+              value: notificationV2ConfigurationJson
             }
           ]
           resources: jobResources

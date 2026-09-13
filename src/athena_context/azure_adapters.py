@@ -24,7 +24,9 @@ from azure.identity import DefaultAzureCredential
 from azure.keyvault.keys import KeyClient
 from azure.keyvault.keys.crypto import CryptographyClient, SignatureAlgorithm
 from azure.storage.blob import BlobServiceClient, BlobType, ContentSettings
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from athena_context.artifacts import (
     MAX_ARTIFACT_PAYLOAD_BYTES,
@@ -218,6 +220,68 @@ class KeyVaultRsaSigner:
                 signature,
             ).is_valid
         )
+
+
+class KeyVaultRsaPublicKeyVerifier:
+    """Verify RS256 locally from one exact Key Vault public key version."""
+
+    def __init__(
+        self,
+        *,
+        trusted_key_anchor: TrustedKeyAnchor,
+        managed_identity_client_id: str,
+    ) -> None:
+        vault_url = trusted_key_anchor.key_vault_key_id.split("/keys/", maxsplit=1)[0]
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
+        key = KeyClient(vault_url=vault_url, credential=credential).get_key(
+            trusted_key_anchor.key_name,
+            trusted_key_anchor.key_version,
+        )
+        if (
+            str(key.id) != trusted_key_anchor.key_vault_key_id
+            or key.properties.enabled is False
+        ):
+            raise ValueError("Key Vault verification key is not the pinned enabled version")
+        key_material = cast(Any, key.key)
+        modulus = key_material.n
+        exponent = key_material.e
+        if not isinstance(modulus, bytes | bytearray) or not isinstance(
+            exponent,
+            bytes | bytearray,
+        ):
+            raise ValueError("Key Vault verification key is not RSA")
+        public_key = rsa.RSAPublicNumbers(
+            e=int.from_bytes(exponent, "big"),
+            n=int.from_bytes(modulus, "big"),
+        ).public_key()
+        encoded = public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        if sha256_hex(encoded) != trusted_key_anchor.public_key_fingerprint:
+            raise ValueError("Key Vault verification key fingerprint does not match")
+        self._public_key = public_key
+
+    def verify_preimage(
+        self,
+        canonical_preimage: bytes,
+        detached_signature: str,
+    ) -> bool:
+        try:
+            signature = base64.urlsafe_b64decode(
+                detached_signature + "=" * (-len(detached_signature) % 4)
+            )
+            self._public_key.verify(
+                signature,
+                canonical_preimage,
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        except (InvalidSignature, TypeError, ValueError):
+            return False
+        return True
 
 
 class KeyVaultTrustedKeyResolver:
@@ -1861,6 +1925,7 @@ __all__ = [
     "AzureTableAttemptReplayGuard",
     "DefaultAzureCredentialTrustedIngestionSigner",
     "KeyVaultRsaSigner",
+    "KeyVaultRsaPublicKeyVerifier",
     "KeyVaultTrustedKeyResolver",
     "production_managed_identity_credential",
 ]

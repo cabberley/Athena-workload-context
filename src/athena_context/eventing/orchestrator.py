@@ -127,7 +127,7 @@ def run_incident_reassessment(
     reassessment: ScopedReassessmentPort,
     signer: PresentationSigner,
     publisher: IncidentAssetPublisherPort,
-    notifications: NotificationOutboxPort,
+    notifications: NotificationOutboxPort | None,
 ) -> tuple[IncidentState, IncidentPublicationReceipt] | None:
     result = reassessment.reassess(request)
     if result.request_id != request.request_id:
@@ -193,7 +193,7 @@ def run_incident_reassessment(
                 latest.state,
                 presentation_url=presentation_url,
             )
-            if message is not None:
+            if message is not None and notifications is not None:
                 notifications.enqueue(
                     incident_id=latest.state.incident_id,
                     lifecycle=latest.state.lifecycle,
@@ -238,7 +238,7 @@ def run_incident_reassessment(
     )
     receipt = publisher.publish_incident(publication)
     message = notification_message(state, presentation_url=presentation_url)
-    if message is not None:
+    if message is not None and notifications is not None:
         notifications.enqueue(
             incident_id=state.incident_id,
             lifecycle=state.lifecycle,

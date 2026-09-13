@@ -101,29 +101,23 @@ class NotificationV2Trust:
 
 
 @dataclass(frozen=True, slots=True)
-class NotificationV2PublicationService:
+class NotificationV2SourceVerifier:
     reader: PresentationAssetReaderPort
     trust: NotificationV2Trust
-    notification_key_id: str
-    notification_signer: PresentationSigner
-    notification_signature_verifier: SignatureVerifier
     presentation_base_url: str
-    outbox: NotificationV2OutboxPort
 
     def __post_init__(self) -> None:
         _incident_presentation_url(
             self.presentation_base_url,
             incident_id="inc-000000000000",
         )
-        if not self.notification_key_id:
-            raise ValueError("notification v2 signing key ID is required")
 
-    def publish(
+    def build(
         self,
         *,
         incident_id: str,
         verified_at: datetime,
-    ) -> IncidentNotificationEnvelopeV2:
+    ) -> IncidentNotificationV2:
         if type(verified_at) is not datetime:
             raise TypeError("verified_at must be a datetime")
         active_index = self._read_current_model(
@@ -190,7 +184,7 @@ class NotificationV2PublicationService:
             feed_pointer,
             active_index=active_index,
         )
-        manifest, guidance = self._verify_enrichment(feed_pointer)
+        manifest, guidance = self._verify_enrichment(feed_pointer, state=state)
         if (
             entry.lifecycle != state.lifecycle
             or entry.state_result_digest != state.result_digest
@@ -229,36 +223,41 @@ class NotificationV2PublicationService:
             "noAutoRemediation": True,
         }
         notification_digest = compute_artifact_digest(_json_value(payload))
-        notification = IncidentNotificationV2.model_validate(
+        identity_digest = compute_artifact_digest(
+            {
+                "schemaVersion": "athena.wc027IncidentNotificationIdentity.v1",
+                "incidentId": state.incident_id,
+                "transitionId": state.transition_id,
+                "lifecycle": state.lifecycle,
+                "stateResultDigest": state.result_digest,
+                "occurrenceDigest": occurrence.occurrence_digest,
+                "guidanceAsset": _json_value(manifest.guidance_asset),
+            }
+        )
+        return IncidentNotificationV2.model_validate(
             {
                 **payload,
                 "notificationId": (
-                    f"notify-v2-{notification_digest.removeprefix('sha256:')}"
+                    f"notify-v2-{identity_digest.removeprefix('sha256:')}"
                 ),
                 "notificationDigest": notification_digest,
             }
         )
-        notification_bytes = notification.canonical_bytes()
-        signature = _base64url_signature(
-            self.notification_signer.sign_preimage(notification_bytes)
+
+    def verify_current(
+        self,
+        notification: IncidentNotificationV2,
+        *,
+        verified_at: datetime,
+    ) -> None:
+        expected = self.build(
+            incident_id=notification.incident_id,
+            verified_at=verified_at,
         )
-        if self.notification_signature_verifier(notification_bytes, signature) is not True:
-            raise ValueError("notification v2 signer failed immediate verification")
-        envelope = IncidentNotificationEnvelopeV2(
-            schemaVersion="athena.wc027IncidentNotificationEnvelope.v2",
-            notification=notification,
-            attestation=IncidentNotificationV2Attestation(
-                schemaVersion="athena.wc027IncidentNotificationAttestation.v2",
-                notificationId=notification.notification_id,
-                notificationDigest=notification.notification_digest,
-                signatureAlgorithm="RS256",
-                keyVaultKeyId=self.notification_key_id,
-                signedPreimageDigest=sha256_hex(notification_bytes),
-                detachedSignature=signature,
-            ),
-        )
-        self.outbox.enqueue_v2(envelope)
-        return envelope
+        if expected.canonical_bytes() != notification.canonical_bytes():
+            raise ValueError(
+                "notification v2 no longer matches the current verified lifecycle"
+            )
 
     def _verify_active_index(
         self,
@@ -369,6 +368,8 @@ class NotificationV2PublicationService:
     def _verify_enrichment(
         self,
         feed_pointer: IncidentEnrichmentFeedPointer,
+        *,
+        state: IncidentState,
     ) -> tuple[IncidentEnrichmentManifest, IncidentGuidance]:
         enrichment = feed_pointer.enrichment_asset
         manifest = self._read_version_model(
@@ -419,7 +420,17 @@ class NotificationV2PublicationService:
         )
         statement = report_attestation.statement
         if (
-            report_asset.report_content_digest != sha256_hex(report.canonical_bytes())
+            manifest.incident_state_reference
+            != feed_pointer.source_state_reference
+            or manifest.incident_state_attestation_reference
+            != feed_pointer.source_state_attestation_reference
+            or manifest.incident_transition_id != state.transition_id
+            or statement.incident_state_reference
+            != feed_pointer.source_state_reference
+            or statement.incident_state_attestation_reference
+            != feed_pointer.source_state_attestation_reference
+            or statement.incident_transition_id != state.transition_id
+            or report_asset.report_content_digest != sha256_hex(report.canonical_bytes())
             or report_asset.attestation_reference.content_digest
             != sha256_hex(report_attestation.canonical_bytes())
             or report_attestation.key_vault_key_id != self.trust.report_key_id
@@ -457,9 +468,12 @@ class NotificationV2PublicationService:
             or statement.report_id != report.report_id
             or statement.report_digest != report.report_digest
             or statement.incident_id != manifest.incident_id
+            or statement.incident_revision != manifest.incident_revision
             or statement.incident_state_result_digest
             != manifest.incident_state_result_digest
             or guidance.source_binding.incident_id != manifest.incident_id
+            or guidance.source_binding.incident_revision
+            != manifest.incident_revision
             or guidance.source_binding.incident_state_digest
             != manifest.incident_state_result_digest
             or guidance.source_binding.correlation_report_id != report.report_id
@@ -518,6 +532,63 @@ class NotificationV2PublicationService:
         ):
             raise ValueError("version-pinned notification source asset is invalid")
         return value
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationV2PublicationService(NotificationV2SourceVerifier):
+    notification_key_id: str
+    notification_signer: PresentationSigner
+    notification_signature_verifier: SignatureVerifier
+    outbox: NotificationV2OutboxPort
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        source_key_ids = (
+            self.trust.lifecycle_key_id,
+            self.trust.feed_key_id,
+            self.trust.report_key_id,
+            self.trust.guidance_key_id,
+            self.trust.enrichment_key_id,
+        )
+        if (
+            not self.notification_key_id
+            or self.notification_key_id in source_key_ids
+        ):
+            raise ValueError(
+                "notification v2 signing authority must be distinct from source authorities"
+            )
+
+    def publish(
+        self,
+        *,
+        incident_id: str,
+        verified_at: datetime,
+    ) -> IncidentNotificationEnvelopeV2:
+        notification = self.build(
+            incident_id=incident_id,
+            verified_at=verified_at,
+        )
+        notification_bytes = notification.canonical_bytes()
+        signature = _base64url_signature(
+            self.notification_signer.sign_preimage(notification_bytes)
+        )
+        if self.notification_signature_verifier(notification_bytes, signature) is not True:
+            raise ValueError("notification v2 signer failed immediate verification")
+        envelope = IncidentNotificationEnvelopeV2(
+            schemaVersion="athena.wc027IncidentNotificationEnvelope.v2",
+            notification=notification,
+            attestation=IncidentNotificationV2Attestation(
+                schemaVersion="athena.wc027IncidentNotificationAttestation.v2",
+                notificationId=notification.notification_id,
+                notificationDigest=notification.notification_digest,
+                signatureAlgorithm="RS256",
+                keyVaultKeyId=self.notification_key_id,
+                signedPreimageDigest=sha256_hex(notification_bytes),
+                detachedSignature=signature,
+            ),
+        )
+        self.outbox.enqueue_v2(envelope)
+        return envelope
 
 
 def render_teams_notification_v2(
@@ -618,6 +689,7 @@ def _json_value(value: object) -> object:
 __all__ = [
     "NotificationV2OutboxPort",
     "NotificationV2PublicationService",
+    "NotificationV2SourceVerifier",
     "NotificationV2Trust",
     "render_teams_notification_v2",
     "verify_notification_v2_envelope",
