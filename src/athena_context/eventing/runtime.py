@@ -7,6 +7,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
+from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
@@ -28,6 +29,10 @@ from athena_context.contracts.eventing import (
     VerifiedReassessmentResult,
     WorkloadRole,
 )
+from athena_context.contracts.notification_v2 import (
+    IncidentNotificationEnvelopeV2,
+    IncidentNotificationV2,
+)
 from athena_context.eventing.detector import (
     ArmJsonReaderPort,
     ManagedIdentityArmJsonReader,
@@ -35,6 +40,7 @@ from athena_context.eventing.detector import (
     read_approved_signal,
     validate_approved_resource_roles,
 )
+from athena_context.eventing.notification_v2 import verify_notification_v2_envelope
 from athena_context.eventing.orchestrator import (
     NotificationOutboxPort,
     ScopedReassessmentPort,
@@ -250,6 +256,28 @@ class AzureServiceBusNotificationOutbox(NotificationOutboxPort):
                     "schemaVersion": "athena.incidentNotification.v1",
                     "lifecycle": lifecycle,
                     "transitionId": transition_id,
+                },
+            )
+        )
+
+    def enqueue_v2(self, envelope: IncidentNotificationEnvelopeV2) -> None:
+        envelope = IncidentNotificationEnvelopeV2.model_validate_json(
+            envelope.model_dump_json(by_alias=True)
+        )
+        notification = envelope.notification
+        self._sender.send_messages(
+            self._message_factory(
+                envelope.canonical_bytes(),
+                content_type="application/json",
+                message_id=notification.notification_id,
+                session_id=notification.incident_id,
+                application_properties={
+                    "schemaVersion": (
+                        "athena.wc027IncidentNotificationEnvelope.v2"
+                    ),
+                    "lifecycle": notification.lifecycle,
+                    "transitionId": notification.transition_id,
+                    "stateResultDigest": notification.state_result_digest,
                 },
             )
         )
@@ -547,6 +575,10 @@ def run_notification_dispatcher_worker(
     notification_state_table_endpoint: str,
     notification_state_table_name: str,
     notification_state_partition_key: str,
+    trusted_notification_v2_key_id: str | None = None,
+    trusted_notification_v2_key_fingerprint: str | None = None,
+    notification_v2_public_key_path: Path | None = None,
+    notification_v2_signature_verifier: Callable[[bytes, str], bool] | None = None,
     max_wait_time_seconds: int = 30,
 ) -> bool:
     from azure.identity import ManagedIdentityCredential
@@ -555,6 +587,24 @@ def run_notification_dispatcher_worker(
         ServiceBusClient,
     )
 
+    v2_configuration = (
+        trusted_notification_v2_key_id,
+        trusted_notification_v2_key_fingerprint,
+        notification_v2_public_key_path,
+    )
+    if any(value is not None for value in v2_configuration) and any(
+        value is None for value in v2_configuration
+    ):
+        raise ValueError("notification v2 trust configuration must be complete")
+    if notification_v2_signature_verifier is None and all(
+        value is not None for value in v2_configuration
+    ):
+        assert trusted_notification_v2_key_fingerprint is not None
+        assert notification_v2_public_key_path is not None
+        notification_v2_signature_verifier = _load_notification_v2_verifier(
+            notification_v2_public_key_path,
+            expected_fingerprint=trusted_notification_v2_key_fingerprint,
+        )
     parsed_webhook = urlsplit(webhook_url)
     query = parse_qs(parsed_webhook.query, keep_blank_values=True)
     if (
@@ -603,6 +653,10 @@ def run_notification_dispatcher_worker(
             credential=credential,
             webhook_url=webhook_url,
             delivery_store=delivery_store,
+            trusted_notification_v2_key_id=trusted_notification_v2_key_id,
+            notification_v2_signature_verifier=(
+                notification_v2_signature_verifier
+            ),
         )
 
 
@@ -613,12 +667,20 @@ def _dispatch_notification_message(
     credential: Any,
     webhook_url: str,
     delivery_store: NotificationDeliveryStorePort,
+    trusted_notification_v2_key_id: str | None = None,
+    notification_v2_signature_verifier: Callable[[bytes, str], bool] | None = None,
 ) -> bool:
     try:
         body = _message_body(message)
         if not 1 <= len(body) <= 16 * 1024:
             raise ValueError("notification is outside its byte bound")
-        notification = IncidentNotification.model_validate_json(body)
+        notification = _decode_notification(
+            body,
+            trusted_notification_v2_key_id=trusted_notification_v2_key_id,
+            notification_v2_signature_verifier=(
+                notification_v2_signature_verifier
+            ),
+        )
         _validate_notification_broker_metadata(message, notification)
         access_token = credential.get_token(_LOGIC_APPS_SCOPE).token
         claim = delivery_store.acquire(
@@ -674,7 +736,7 @@ def _dispatch_notification_message(
                 if not 200 <= response.status < 300:
                     raise RuntimeError("notification webhook returned non-success")
         except HTTPError as exc:
-            if exc.code in {408, 429}:
+            if _notification_http_error_is_retryable(exc.code):
                 if not delivery_store.reset_for_retry(
                     notification_id=notification.notification_id,
                     etag=dispatching_etag,
@@ -725,6 +787,49 @@ def _dispatch_notification_message(
 
 def _notification_http_error_is_permanent(status_code: int) -> bool:
     return 400 <= status_code < 500 and status_code not in {408, 429}
+
+
+def _notification_http_error_is_retryable(status_code: int) -> bool:
+    return status_code in {408, 429} or 500 <= status_code < 600
+
+
+def _load_notification_v2_verifier(
+    path: Path,
+    *,
+    expected_fingerprint: str,
+) -> Callable[[bytes, str], bool]:
+    import base64
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    public_key = serialization.load_pem_public_key(path.read_bytes())
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise ValueError("notification v2 public key must be RSA")
+    encoded = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    if sha256_hex(encoded) != expected_fingerprint:
+        raise ValueError("notification v2 public key fingerprint does not match")
+
+    def verify(payload: bytes, signature: str) -> bool:
+        try:
+            decoded = base64.urlsafe_b64decode(
+                signature + "=" * ((-len(signature)) % 4)
+            )
+            public_key.verify(
+                decoded,
+                payload,
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        except (InvalidSignature, ValueError):
+            return False
+        return True
+
+    return verify
 
 
 def run_incident_feed_heartbeat(
@@ -975,9 +1080,22 @@ def _validate_reassessment_broker_metadata(
 
 def _validate_notification_broker_metadata(
     message: object,
-    notification: IncidentNotification,
+    notification: IncidentNotification | IncidentNotificationV2,
 ) -> None:
     properties = _application_properties(message)
+    if isinstance(notification, IncidentNotificationV2):
+        expected_properties = {
+            "schemaVersion": "athena.wc027IncidentNotificationEnvelope.v2",
+            "lifecycle": notification.lifecycle,
+            "transitionId": notification.transition_id,
+            "stateResultDigest": notification.state_result_digest,
+        }
+    else:
+        expected_properties = {
+            "schemaVersion": "athena.incidentNotification.v1",
+            "lifecycle": notification.lifecycle,
+            "transitionId": notification.transition_id,
+        }
     if (
         _broker_text(getattr(message, "content_type", None), label="content type")
         != "application/json"
@@ -985,14 +1103,39 @@ def _validate_notification_broker_metadata(
         != notification.notification_id
         or _broker_text(getattr(message, "session_id", None), label="session ID")
         != notification.incident_id
-        or properties
-        != {
-            "schemaVersion": "athena.incidentNotification.v1",
-            "lifecycle": notification.lifecycle,
-            "transitionId": notification.transition_id,
-        }
+        or properties != expected_properties
     ):
         raise ValueError("notification broker metadata failed exact validation")
+
+
+def _decode_notification(
+    body: bytes,
+    *,
+    trusted_notification_v2_key_id: str | None,
+    notification_v2_signature_verifier: Callable[[bytes, str], bool] | None,
+) -> IncidentNotification | IncidentNotificationV2:
+    try:
+        decoded = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("notification body is invalid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("notification body must be an object")
+    schema_version = decoded.get("schemaVersion")
+    if schema_version == "athena.incidentNotification.v1":
+        return IncidentNotification.model_validate(decoded)
+    if schema_version != "athena.wc027IncidentNotificationEnvelope.v2":
+        raise ValueError("notification schema version is unsupported")
+    if (
+        trusted_notification_v2_key_id is None
+        or notification_v2_signature_verifier is None
+    ):
+        raise ValueError("notification v2 trust is not configured")
+    envelope = IncidentNotificationEnvelopeV2.model_validate(decoded)
+    return verify_notification_v2_envelope(
+        envelope,
+        trusted_key_id=trusted_notification_v2_key_id,
+        signature_verifier=notification_v2_signature_verifier,
+    )
 
 
 __all__ = [

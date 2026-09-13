@@ -339,6 +339,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--notification-state-partition-key",
         required=True,
     )
+    notification_parser.add_argument("--notification-v2-key-id")
+    notification_parser.add_argument("--notification-v2-key-fingerprint")
+    notification_parser.add_argument(
+        "--notification-v2-public-key",
+        type=Path,
+    )
     change_event_parser = subparsers.add_parser(
         "wc025-change-event-ingester",
         help="normalize only approved resource-group Event Grid changes into signed evidence",
@@ -841,6 +847,11 @@ def main(
                 notification_state_table_endpoint=(args.notification_state_table_endpoint),
                 notification_state_table_name=args.notification_state_table_name,
                 notification_state_partition_key=(args.notification_state_partition_key),
+                trusted_notification_v2_key_id=args.notification_v2_key_id,
+                trusted_notification_v2_key_fingerprint=(
+                    args.notification_v2_key_fingerprint
+                ),
+                notification_v2_public_key_path=args.notification_v2_public_key,
             )
             output.write(
                 "WC-016 notification delivered\n"
