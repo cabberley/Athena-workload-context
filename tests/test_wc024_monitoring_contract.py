@@ -14,6 +14,8 @@ from pydantic import ValidationError
 from athena_context.contracts import (
     MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
+    MonitoringAcquisitionExchange,
+    MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
@@ -22,8 +24,10 @@ from athena_context.contracts import (
     VersionPinnedBlobReference,
     canonicalize_json,
     compute_artifact_digest,
+    monitoring_acquisition_receipt_preimage,
     monitoring_handoff_preimage,
     sha256_hex,
+    verify_monitoring_acquisition_receipt_attestation,
     verify_monitoring_evidence_handoff_attestation,
 )
 
@@ -319,12 +323,29 @@ def test_collector_contract_is_exact_generic_and_deterministic() -> None:
     assert contract.connection_monitor_mode == "capabilityOnly"
 
 
+def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
+    payload = _collector_contract().model_dump(mode="python", by_alias=True)
+    payload.update(
+        {
+            "schemaVersion": "athena.wc028MonitoringCollectorContract.v3",
+            "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
+        }
+    )
+
+    contract = MonitoringCollectorContract(**payload)
+
+    assert (
+        contract.handoff_schema_version
+        == "athena.wc028MonitoringEvidenceHandoff.v2"
+    )
+
+
 def test_collector_contract_bicep_output_matches_the_production_contract() -> None:
     source = COLLECTOR_CONTRACT_MODULE.read_text(encoding="utf-8")
     output_fields = set(
         re.findall(
             r"^  (?P<field>[a-zA-Z][a-zA-Z0-9]*):",
-            source.split("output collectorContract object = {", maxsplit=1)[1].split(
+            source.split("var collectorContract = {", maxsplit=1)[1].split(
                 "\n}", maxsplit=1
             )[0],
             flags=re.MULTILINE,
@@ -341,6 +362,9 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     assert MonitoringCollectorContract(**bicep_output) == _collector_contract()
     for operation in _collector_contract().allowed_read_operations:
         assert f"'{operation}'" in source
+    assert "output collectorContract object = collectorContract" in source
+    assert "athena.wc028MonitoringCollectorContract.v3" in source
+    assert "athena.wc028MonitoringEvidenceHandoff.v2" in source
 
 
 @pytest.mark.parametrize(
@@ -384,6 +408,58 @@ def test_signed_handoff_rejects_changed_reference_or_attestation_binding() -> No
 
     with pytest.raises(ValidationError):
         MonitoringEvidenceHandoff(**payload)
+
+
+def test_reviewed_collector_contract_must_authorize_handoff_version() -> None:
+    payload = _handoff_payload()
+    payload["schemaVersion"] = "athena.wc028MonitoringEvidenceHandoff.v2"
+    payload["acquisitionReceiptDigest"] = "sha256:" + "f" * 64
+    evidence = payload["evidence"]
+    assert isinstance(evidence, VersionPinnedBlobReference)
+    handoff = MonitoringEvidenceHandoff(
+        **payload,
+        collectorAttestation=MonitoringEvidenceAttestation(
+            signatureAlgorithm="RS256",
+            trustAnchorRef=REVIEWED_SIGNING_KEY_URI,
+            signedPreimageDigest=compute_artifact_digest(
+                monitoring_handoff_preimage(
+                    {
+                        **payload,
+                        "evidence": evidence.model_dump(
+                            mode="json",
+                            by_alias=True,
+                        ),
+                    }
+                )
+            ),
+            signature=base64.b64encode(b"synthetic-signature").decode("ascii"),
+        ),
+    )
+    _, contract, anchor, record = _trusted_signed_handoff()
+
+    with pytest.raises(ValueError, match="schema is not authorized"):
+        verify_monitoring_evidence_handoff_attestation(
+            handoff,
+            as_of=handoff.observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            reviewed_collector_contract=contract,
+        )
+    with pytest.raises(ValueError, match="full reviewed collector contract"):
+        verify_monitoring_evidence_handoff_attestation(
+            handoff,
+            as_of=handoff.observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            expected_collector_contract_digest=contract.compute_artifact_digest_value(),
+            reviewed_maximum_evidence_age_seconds=(
+                contract.maximum_evidence_age_seconds
+            ),
+            reviewed_signing_key_resource_id=contract.signing_key_resource_id,
+            expected_handoff_schema_version=(
+                "athena.wc028MonitoringEvidenceHandoff.v2"
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -459,6 +535,143 @@ def _trusted_signed_handoff() -> tuple[
     return signed_handoff, _collector_contract(), anchor, record
 
 
+def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    reader_identity = (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.ManagedIdentity/"
+        "userAssignedIdentities/synthetic-monitoring-reader"
+    )
+    context_identity = (
+        f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.ManagedIdentity/"
+        "userAssignedIdentities/synthetic-athena-context"
+    )
+    deployment_digest = compute_artifact_digest(
+        {
+            "monitoringReaderIdentityId": reader_identity.casefold(),
+            "athenaContextIdentityId": context_identity.casefold(),
+            "monitoringReaderHasReadOnlyWorkloadAccess": True,
+            "athenaContextHasWorkloadReader": False,
+            "readOnly": True,
+        }
+    )
+    authority_digest = "sha256:" + "c" * 64
+    collector_digest = _collector_contract().compute_artifact_digest_value()
+    observed_at = datetime(2026, 9, 6, 6, 0, tzinfo=UTC)
+    exchange = MonitoringAcquisitionExchange(
+        sequence=1,
+        source="ipFlowVerify",
+        requestDigest="sha256:" + "d" * 64,
+        resultDigest="sha256:" + "e" * 64,
+        requestedAt=observed_at,
+        receivedAt=observed_at,
+        checkedAt=observed_at,
+    )
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v1",
+        "authenticatedPrincipalId": reader_identity,
+        "athenaContextIdentityId": context_identity,
+        "deploymentIdentityContractDigest": deployment_digest,
+        "acquisitionAuthorityDigest": authority_digest,
+        "collectorContractDigest": collector_digest,
+        "intentId": "monitoring-intent-" + "1" * 32,
+        "intentDigest": "sha256:" + "2" * 64,
+        "contextBindingDigest": "sha256:" + "3" * 64,
+        "collectionBatchDigest": "sha256:" + "4" * 64,
+        "normalizedEvidenceDigest": "sha256:" + "5" * 64,
+        "executionStartedAt": observed_at,
+        "executionCompletedAt": observed_at,
+        "receiptIssuedAt": observed_at,
+        "exchanges": [exchange.model_dump(mode="json", by_alias=True)],
+    }
+    receipt_digest = compute_artifact_digest(payload)
+    signed_payload = {
+        **payload,
+        "receiptId": (
+            "monitoring-acquisition-receipt-"
+            f"{receipt_digest.removeprefix('sha256:')[:32]}"
+        ),
+        "receiptDigest": receipt_digest,
+    }
+    preimage = monitoring_acquisition_receipt_preimage(signed_payload)
+    signature = base64.b64encode(
+        private_key.sign(
+            canonicalize_json(preimage).encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    ).decode("ascii")
+    receipt = MonitoringAcquisitionReceipt(
+        **{**signed_payload, "exchanges": (exchange,)},
+        collectorAttestation=MonitoringEvidenceAttestation(
+            signatureAlgorithm="RS256",
+            trustAnchorRef=REVIEWED_SIGNING_KEY_URI,
+            signedPreimageDigest=compute_artifact_digest(preimage),
+            signature=signature,
+        ),
+    )
+    public_key = private_key.public_key()
+    anchor = TrustedKeyAnchor.from_key_vault_key_id(
+        REVIEWED_SIGNING_KEY_URI,
+        public_key_fingerprint=sha256_hex(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ),
+    )
+    record = TrustedKeyRecord(
+        anchor=anchor,
+        public_key=public_key,
+        enabled=True,
+        activated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    verify_monitoring_acquisition_receipt_attestation(
+        receipt,
+        as_of=observed_at,
+        trusted_key_anchor=anchor,
+        key_resolver=lambda _anchor: record,
+        expected_acquisition_authority_digest=authority_digest,
+        expected_authenticated_principal_id=reader_identity,
+        expected_athena_context_identity_id=context_identity,
+        expected_deployment_identity_contract_digest=deployment_digest,
+        expected_collector_contract_digest=collector_digest,
+        expected_receipt_signing_key_id=REVIEWED_SIGNING_KEY_URI,
+        maximum_receipt_age_seconds=600,
+    )
+    with pytest.raises(ValueError, match="deployed acquisition identity separation"):
+        verify_monitoring_acquisition_receipt_attestation(
+            receipt,
+            as_of=observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            expected_acquisition_authority_digest=authority_digest,
+            expected_authenticated_principal_id=context_identity,
+            expected_athena_context_identity_id=context_identity,
+            expected_deployment_identity_contract_digest=deployment_digest,
+            expected_collector_contract_digest=collector_digest,
+            expected_receipt_signing_key_id=REVIEWED_SIGNING_KEY_URI,
+            maximum_receipt_age_seconds=600,
+        )
+    with pytest.raises(ValueError, match="signing key is not authority-approved"):
+        verify_monitoring_acquisition_receipt_attestation(
+            receipt,
+            as_of=observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            expected_acquisition_authority_digest=authority_digest,
+            expected_authenticated_principal_id=reader_identity,
+            expected_athena_context_identity_id=context_identity,
+            expected_deployment_identity_contract_digest=deployment_digest,
+            expected_collector_contract_digest=collector_digest,
+            expected_receipt_signing_key_id=(
+                "https://athenademomonkv.vault.azure.net/keys/other/"
+                "0123456789abcdef0123456789abcdef"
+            ),
+            maximum_receipt_age_seconds=600,
+        )
+
+
 def test_signed_handoff_requires_the_exact_active_collector_key() -> None:
     signed_handoff, contract, anchor, record = _trusted_signed_handoff()
 
@@ -477,6 +690,7 @@ def test_signed_handoff_requires_the_exact_active_collector_key() -> None:
             expected_collector_contract_digest="sha256:" + "b" * 64,
             reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
             reviewed_signing_key_resource_id=contract.signing_key_resource_id,
+            expected_handoff_schema_version=MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
             trusted_key_anchor=anchor,
             key_resolver=lambda _: record,
         )
@@ -535,6 +749,7 @@ def test_signed_handoff_binds_reviewed_signing_key_to_trusted_anchor() -> None:
             expected_collector_contract_digest=signed_handoff.collector_contract_digest,
             reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
             reviewed_signing_key_resource_id=other_key_uri,
+            expected_handoff_schema_version=MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
             trusted_key_anchor=anchor,
             key_resolver=lambda _: record,
         )
@@ -593,12 +808,38 @@ def test_signed_handoff_rejects_key_retired_or_expired_at_trusted_as_of() -> Non
 def test_signed_handoff_requires_trusted_as_of_and_reviewed_freshness() -> None:
     signed_handoff, contract, anchor, record = _trusted_signed_handoff()
 
+    with pytest.raises(ValueError, match="reviewed handoff schema"):
+        verify_monitoring_evidence_handoff_attestation(
+            signed_handoff,
+            as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+            expected_collector_contract_digest=signed_handoff.collector_contract_digest,
+            reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+            reviewed_signing_key_resource_id=contract.signing_key_resource_id,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _: record,
+        )
+
+    with pytest.raises(ValueError, match="reviewed schema"):
+        verify_monitoring_evidence_handoff_attestation(
+            signed_handoff,
+            as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
+            expected_collector_contract_digest=signed_handoff.collector_contract_digest,
+            reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
+            reviewed_signing_key_resource_id=contract.signing_key_resource_id,
+            expected_handoff_schema_version=(
+                "athena.wc028MonitoringEvidenceHandoff.v2"
+            ),
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _: record,
+        )
+
     verify_monitoring_evidence_handoff_attestation(
         signed_handoff,
         as_of=datetime(2026, 9, 6, 6, 10, tzinfo=UTC),
         expected_collector_contract_digest=signed_handoff.collector_contract_digest,
         reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
         reviewed_signing_key_resource_id=contract.signing_key_resource_id,
+        expected_handoff_schema_version=MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
         trusted_key_anchor=anchor,
         key_resolver=lambda _: record,
     )

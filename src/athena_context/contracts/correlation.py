@@ -17,7 +17,11 @@ from athena_context.contracts.change_ingestion import (
 from athena_context.contracts.common import compute_artifact_digest, sha256_hex
 from athena_context.contracts.eventing import IncidentState, IncidentStateAttestation
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
-from athena_context.contracts.monitoring import MonitoringEvidenceHandoff
+from athena_context.contracts.monitoring import (
+    MonitoringAcquisitionExchange,
+    MonitoringAcquisitionReceipt,
+    MonitoringEvidenceHandoff,
+)
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
 LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
@@ -30,6 +34,9 @@ MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
 ] = (
     "athena.wc028MonitoringEvidenceBundle.v2"
 )
+MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
+    Literal["athena.wc028MonitoringEvidenceBundle.v3"]
+] = "athena.wc028MonitoringEvidenceBundle.v3"
 LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
     Literal["athena.wc026CorrelationRequest.v2"]
 ] = "athena.wc026CorrelationRequest.v2"
@@ -955,10 +962,35 @@ class EvidenceCoverage(_StrictCorrelationModel):
         return self
 
 
+class MonitoringAcquisitionEvidenceManifest(_StrictCorrelationModel):
+    """Immutable digest manifest independently binding persisted acquisition evidence."""
+
+    schema_version: Literal[
+        "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
+    ] = Field(alias="schemaVersion")
+    collection_batch_digest: Sha256Digest = Field(alias="collectionBatchDigest")
+    normalized_evidence_digest: Sha256Digest = Field(
+        alias="normalizedEvidenceDigest"
+    )
+    exchanges: tuple[MonitoringAcquisitionExchange, ...] = Field(
+        min_length=1,
+        max_length=32,
+    )
+    manifest_digest: Sha256Digest = Field(alias="manifestDigest")
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> MonitoringAcquisitionEvidenceManifest:
+        expected = _expected_digest(self, excluded_fields={"manifest_digest"})
+        if self.manifest_digest != expected:
+            raise ValueError("manifestDigest does not bind acquisition evidence")
+        return self
+
+
 class MonitoringEvidenceBundle(_StrictCorrelationModel):
     schema_version: Literal[
         "athena.wc026MonitoringEvidenceBundle.v1",
         "athena.wc028MonitoringEvidenceBundle.v2",
+        "athena.wc028MonitoringEvidenceBundle.v3",
     ] = Field(alias="schemaVersion")
     workload_id: str = Field(
         alias="workloadId",
@@ -974,6 +1006,14 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
         alias="monitoringIntentReference",
     )
     collected_at: UtcDateTime | None = Field(default=None, alias="collectedAt")
+    acquisition_receipt: MonitoringAcquisitionReceipt | None = Field(
+        default=None,
+        alias="acquisitionReceipt",
+    )
+    acquisition_manifest: MonitoringAcquisitionEvidenceManifest | None = Field(
+        default=None,
+        alias="acquisitionManifest",
+    )
     observed_start: UtcDateTime = Field(alias="observedStart")
     observed_end: UtcDateTime = Field(alias="observedEnd")
     observations: tuple[MonitoringObservation, ...] = Field(max_length=1000)
@@ -983,6 +1023,40 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
         min_length=1,
         max_length=100,
     )
+
+    def compute_normalized_evidence_digest_value(self) -> Sha256Digest:
+        """Bind the normalized evidence independently of receipt-bearing envelope fields."""
+
+        return compute_artifact_digest(
+            {
+                "schemaVersion": "athena.wc028NormalizedMonitoringEvidence.v1",
+                "workloadId": self.workload_id,
+                "monitoringContractDigest": self.monitoring_contract_digest,
+                "monitoringIntentReference": (
+                    None
+                    if self.monitoring_intent_reference is None
+                    else self.monitoring_intent_reference.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                ),
+                "collectedAt": self.collected_at,
+                "observedStart": self.observed_start,
+                "observedEnd": self.observed_end,
+                "observations": [
+                    item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for item in self.observations
+                ],
+                "coverage": [
+                    item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for item in self.coverage
+                ],
+                "expectedCoverageScopeDigests": (
+                    list(self.expected_coverage_scope_digests)
+                ),
+            }
+        )
 
     @model_validator(mode="after")
     def validate_bundle(self) -> MonitoringEvidenceBundle:
@@ -1035,6 +1109,8 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             if (
                 self.monitoring_intent_reference is not None
                 or self.collected_at is not None
+                or self.acquisition_receipt is not None
+                or self.acquisition_manifest is not None
                 or any(
                     item.control_provenance is not None
                     or item.query_execution_digest is not None
@@ -1059,6 +1135,48 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             ) or any(item.control_provenance is None for item in self.coverage):
                 raise ValueError(
                     "signed monitoring evidence requires resolvable control provenance"
+                )
+            if (
+                self.schema_version
+                == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            ):
+                if self.acquisition_receipt is None:
+                    raise ValueError(
+                        "acquisition evidence bundle requires signed acquisition provenance"
+                    )
+                if self.acquisition_manifest is None:
+                    raise ValueError(
+                        "acquisition evidence bundle requires an immutable digest manifest"
+                    )
+                if (
+                    self.acquisition_receipt.collector_contract_digest
+                    != self.monitoring_contract_digest
+                    or self.acquisition_receipt.execution_started_at != self.collected_at
+                    or self.acquisition_receipt.execution_completed_at
+                    > self.acquisition_receipt.receipt_issued_at
+                    or self.monitoring_intent_reference is None
+                    or self.acquisition_receipt.intent_id
+                    != self.monitoring_intent_reference.intent_id
+                    or self.acquisition_receipt.intent_digest
+                    != self.monitoring_intent_reference.intent_digest
+                    or self.acquisition_receipt.collection_batch_digest
+                    != self.acquisition_manifest.collection_batch_digest
+                    or self.acquisition_receipt.normalized_evidence_digest
+                    != self.acquisition_manifest.normalized_evidence_digest
+                    or self.acquisition_receipt.normalized_evidence_digest
+                    != self.compute_normalized_evidence_digest_value()
+                    or self.acquisition_receipt.exchanges
+                    != self.acquisition_manifest.exchanges
+                ):
+                    raise ValueError(
+                        "acquisition receipt does not bind the monitoring bundle"
+                    )
+            elif (
+                self.acquisition_receipt is not None
+                or self.acquisition_manifest is not None
+            ):
+                raise ValueError(
+                    "WC028 v2 monitoring bundle cannot contain acquisition provenance"
                 )
             query_observations = tuple(
                 item
@@ -1745,7 +1863,10 @@ class CorrelationRequest(_StrictCorrelationModel):
                 )
         elif (
             self.monitoring_bundle.schema_version
-            != MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            not in {
+                MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            }
             or self.evidence_inventory.monitoring_intent_asset_reference_digest
             is None
             or self.evidence_inventory.monitoring_control_provenance_digest is None
@@ -1795,6 +1916,36 @@ class CorrelationRequest(_StrictCorrelationModel):
             != self.monitoring_handoff.collector_contract_digest
         ):
             raise ValueError("monitoring bundle is not bound to the exact handoff")
+        receipt = self.monitoring_bundle.acquisition_receipt
+        if receipt is not None:
+            intent_reference = self.monitoring_bundle.monitoring_intent_reference
+            acquisition_manifest = self.monitoring_bundle.acquisition_manifest
+            if (
+                self.monitoring_handoff.acquisition_receipt_digest
+                != receipt.receipt_digest
+                or intent_reference is None
+                or acquisition_manifest is None
+                or receipt.intent_id != intent_reference.intent_id
+                or receipt.intent_digest != intent_reference.intent_digest
+                or receipt.context_binding_digest != self.context_binding.binding_digest
+                or receipt.collection_batch_digest
+                != acquisition_manifest.collection_batch_digest
+                or receipt.normalized_evidence_digest
+                != acquisition_manifest.normalized_evidence_digest
+                or receipt.normalized_evidence_digest
+                != self.monitoring_bundle.compute_normalized_evidence_digest_value()
+                or receipt.exchanges != acquisition_manifest.exchanges
+            ):
+                raise ValueError(
+                    "monitoring evidence does not bind the acquisition receipt"
+                )
+        elif (
+            self.monitoring_handoff.acquisition_receipt_digest is not None
+            or self.monitoring_bundle.acquisition_manifest is not None
+        ):
+            raise ValueError(
+                "monitoring handoff cannot claim absent acquisition provenance"
+            )
         change_digests = tuple(
             sha256_hex(artifact.canonical_bytes())
             for artifact in self.change_artifacts
@@ -3704,6 +3855,7 @@ __all__ = [
     "CORRELATION_REQUEST_SCHEMA_VERSION",
     "LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION",
     "LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
+    "MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "BindingMode",
     "ConfidenceCap",
@@ -3741,6 +3893,7 @@ __all__ = [
     "MissingCorrelationEvidence",
     "MissingEvidenceCode",
     "MonitoringControlProvenance",
+    "MonitoringAcquisitionEvidenceManifest",
     "MonitoringEvidenceBundle",
     "MonitoringEvidenceFamily",
     "MonitoringIntentEvidenceReference",

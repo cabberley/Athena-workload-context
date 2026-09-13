@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_REQUEST_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
@@ -29,6 +30,8 @@ from athena_context.contracts import (
     GuestSignalObservation,
     IncidentHealthTransition,
     LogQueryMonitoringSignal,
+    MonitoringAcquisitionEvidenceManifest,
+    MonitoringAcquisitionReceipt,
     MonitoringControlProvenance,
     MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
@@ -1618,6 +1621,7 @@ class MonitoringCollectionTransaction:
         collector_contract_digest: str,
         change_scope: ApprovedChangeScope,
         trusted_as_of: datetime,
+        acquisition_receipt: MonitoringAcquisitionReceipt | None = None,
     ) -> PreparedMonitoringCollection:
         if type(batch) is not MonitoringCollectionBatch:
             raise TypeError("collection transaction requires an exact batch")
@@ -1652,6 +1656,32 @@ class MonitoringCollectionTransaction:
             )
         if _DIGEST_PATTERN.fullmatch(collector_contract_digest) is None:
             raise MonitoringCollectionError("collector contract digest is invalid")
+        if acquisition_receipt is not None:
+            if type(acquisition_receipt) is not MonitoringAcquisitionReceipt:
+                raise TypeError("collection requires an exact acquisition receipt")
+            try:
+                acquisition_receipt = MonitoringAcquisitionReceipt.model_validate_json(
+                    acquisition_receipt.model_dump_json(by_alias=True)
+                )
+            except ValidationError as exc:
+                raise MonitoringCollectionError(
+                    "collection acquisition receipt failed strict revalidation"
+                ) from exc
+            if (
+                acquisition_receipt.collector_contract_digest
+                != collector_contract_digest
+                or acquisition_receipt.execution_started_at != batch.collected_at
+                or acquisition_receipt.receipt_issued_at > trusted_as_of
+                or acquisition_receipt.intent_id != monitoring_intent.intent_id
+                or acquisition_receipt.intent_digest != monitoring_intent.intent_digest
+                or acquisition_receipt.context_binding_digest
+                != context_binding.binding_digest
+                or acquisition_receipt.collection_batch_digest
+                != sha256_hex(batch.canonical_bytes())
+            ):
+                raise MonitoringCollectionError(
+                    "collection acquisition receipt does not bind its trusted execution"
+                )
         validate_published_monitoring_intent_assets(
             monitoring_intent_reference,
             monitoring_intent,
@@ -1679,6 +1709,10 @@ class MonitoringCollectionTransaction:
 
         normalized_changes: list[tuple[NormalizedChangeEvidence, bool]] = []
         change_records = [item for item in batch.records if isinstance(item, ResourceChangeRecord)]
+        if acquisition_receipt is not None and change_records:
+            raise MonitoringCollectionError(
+                "receipt-bearing collection cannot persist changes outside required coverage"
+            )
         for change_record in change_records:
             _validate_activity_log_control(
                 change_record,
@@ -1814,6 +1848,18 @@ class MonitoringCollectionTransaction:
                 collected_at=batch.collected_at,
                 trusted_as_of=trusted_as_of,
             )
+        if acquisition_receipt is not None:
+            receipt_coverage_ids = {
+                f"coverage-{item.request_digest.removeprefix('sha256:')[:32]}"
+                for item in acquisition_receipt.exchanges
+                if item.source in {"logAnalytics", "resourceHealth"}
+            }
+            if receipt_coverage_ids != {
+                item.source_record_id for item in batch.coverage
+            }:
+                raise MonitoringCollectionError(
+                    "acquisition receipt does not exactly bind collection coverage"
+                )
         coverage_counts = dict.fromkeys(records_by_execution, 0)
         for coverage_record in batch.coverage:
             for digest in coverage_record.query_execution_digests:
@@ -1881,14 +1927,46 @@ class MonitoringCollectionTransaction:
                 *(item.coverage_end for item in coverage),
             )
         )
+        acquisition_manifest = None
+        if acquisition_receipt is not None:
+            manifest_payload = {
+                "schemaVersion": (
+                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
+                ),
+                "collectionBatchDigest": acquisition_receipt.collection_batch_digest,
+                "normalizedEvidenceDigest": (
+                    acquisition_receipt.normalized_evidence_digest
+                ),
+                "exchanges": [
+                    item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for item in acquisition_receipt.exchanges
+                ],
+            }
+            acquisition_manifest = MonitoringAcquisitionEvidenceManifest(
+                schemaVersion=(
+                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
+                ),
+                collectionBatchDigest=acquisition_receipt.collection_batch_digest,
+                normalizedEvidenceDigest=(
+                    acquisition_receipt.normalized_evidence_digest
+                ),
+                exchanges=acquisition_receipt.exchanges,
+                manifestDigest=compute_artifact_digest(manifest_payload),
+            )
         bundle = MonitoringEvidenceBundle(
-            schemaVersion=MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            schemaVersion=(
+                MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                if acquisition_receipt is not None
+                else MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            ),
             workloadId=monitoring_intent.workload_id,
             monitoringContractDigest=collector_contract_digest,
             monitoringIntentReference=_monitoring_intent_evidence_reference(
                 monitoring_intent_reference
             ),
             collectedAt=batch.collected_at,
+            acquisitionReceipt=acquisition_receipt,
+            acquisitionManifest=acquisition_manifest,
             observedStart=observed_start,
             observedEnd=observed_end,
             observations=observations,
@@ -1998,6 +2076,7 @@ class MonitoringCollectionTransaction:
         issued_at: datetime,
         trusted_as_of: datetime,
         expires_at: datetime,
+        acquisition_receipt: MonitoringAcquisitionReceipt | None = None,
     ) -> tuple[
         PreparedMonitoringCollection,
         CommittedMonitoringCollection,
@@ -2019,6 +2098,7 @@ class MonitoringCollectionTransaction:
             collector_contract_digest=collector_contract_digest,
             change_scope=change_scope,
             trusted_as_of=trusted_as_of,
+            acquisition_receipt=acquisition_receipt,
         )
         with commit_port.transaction(prepared) as committed:
             request = build_collected_correlation_request(
@@ -2179,6 +2259,15 @@ def build_collected_correlation_request(
         prepared.monitoring_bundle.canonical_bytes()
     ):
         raise MonitoringCollectionError("monitoring handoff does not reference the prepared bundle")
+    acquisition_receipt = prepared.monitoring_bundle.acquisition_receipt
+    if (
+        acquisition_receipt is not None
+        and committed.monitoring_handoff.acquisition_receipt_digest
+        != acquisition_receipt.receipt_digest
+    ):
+        raise MonitoringCollectionError(
+            "monitoring handoff does not reference the acquisition receipt"
+        )
     artifact_ids = tuple(item.evidence.evidence_id for item in prepared.change_artifacts)
     handoff_ids = tuple(item.evidence_id for item in committed.change_handoffs)
     if set(artifact_ids) != set(handoff_ids) or len(handoff_ids) != len(set(handoff_ids)):

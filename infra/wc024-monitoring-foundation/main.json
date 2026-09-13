@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9806382250234680749"
+      "templateHash": "13034900756409832607"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -3164,7 +3164,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "10423739166847973845"
+              "templateHash": "14303147688242808521"
             }
           },
           "parameters": {
@@ -3319,63 +3319,68 @@
             }
           },
           "variables": {
-            "validatedConnectionMonitorDeploymentMode": "[if(equals(parameters('connectionMonitorDeploymentMode'), 'capability-only'), parameters('connectionMonitorDeploymentMode'), fail('collector contracts require the generic Connection Monitor capability-only mode'))]"
+            "validatedConnectionMonitorDeploymentMode": "[if(equals(parameters('connectionMonitorDeploymentMode'), 'capability-only'), parameters('connectionMonitorDeploymentMode'), fail('collector contracts require the generic Connection Monitor capability-only mode'))]",
+            "collectorContract": {
+              "schemaVersion": "athena.wc024MonitoringCollectorContract.v2",
+              "collectorIdentityResourceId": "[parameters('collectorIdentityResourceId')]",
+              "collectorIdentityClientId": "[parameters('collectorIdentityClientId')]",
+              "monitoringResourceGroupId": "[parameters('monitoringResourceGroupId')]",
+              "workloadResourceGroupId": "[parameters('workloadResourceGroupId')]",
+              "workloadVirtualNetworkResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
+              "approvedVmNames": "[parameters('approvedVmNames')]",
+              "workspaceResourceId": "[parameters('workspaceResourceId')]",
+              "dataCollectionRuleResourceId": "[parameters('dataCollectionRuleResourceId')]",
+              "dataCollectionEndpointResourceId": "[parameters('dataCollectionEndpointResourceId')]",
+              "authorizationMode": "[parameters('authorizationMode')]",
+              "workspaceAccessControlMode": "[parameters('workspaceAccessControlMode')]",
+              "readerRoleDefinitionId": "[parameters('readerRoleDefinitionId')]",
+              "signalReaderRoleDefinitionId": "[parameters('signalReaderRoleDefinitionId')]",
+              "logAnalyticsDataReaderRoleDefinitionId": "[parameters('logAnalyticsDataReaderRoleDefinitionId')]",
+              "logAnalyticsAllowedTables": "[parameters('logAnalyticsAllowedTables')]",
+              "logAnalyticsAccessCondition": "[parameters('logAnalyticsAccessCondition')]",
+              "resourceReadScopeIds": "[parameters('resourceReadScopeIds')]",
+              "signalReadScopeIds": "[parameters('signalReadScopeIds')]",
+              "signalKinds": [
+                "heartbeat",
+                "perf",
+                "insightsMetrics",
+                "syslog",
+                "disk",
+                "guest",
+                "vnetFlow",
+                "trafficAnalytics"
+              ],
+              "allowedReadOperations": [
+                "Microsoft.OperationalInsights/workspaces/read",
+                "Microsoft.OperationalInsights/workspaces/query/read",
+                "Microsoft.OperationalInsights/workspaces/tables/data/read",
+                "Microsoft.Compute/virtualMachines/instanceView/read",
+                "Microsoft.Insights/Metrics/Read",
+                "Microsoft.Insights/dataCollectionRules/read",
+                "Microsoft.Insights/dataCollectionEndpoints/read",
+                "Microsoft.Insights/dataCollectionRuleAssociations/read",
+                "Microsoft.Insights/privateLinkScopes/read",
+                "Microsoft.Network/networkWatchers/flowLogs/read"
+              ],
+              "collectionMode": "isolatedSignedCollector",
+              "handoffSchemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
+              "maximumEvidenceAgeSeconds": "[parameters('maximumEvidenceAgeSeconds')]",
+              "connectionMonitorMode": "capabilityOnly",
+              "signingKeyResourceId": "[parameters('signingKeyResourceId')]",
+              "evidenceStorageAccountResourceId": "[parameters('evidenceStorageAccountResourceId')]",
+              "evidenceContainerName": "monitoring-evidence",
+              "connectionMonitorDeploymentMode": "[variables('validatedConnectionMonitorDeploymentMode')]"
+            }
           },
           "resources": [],
           "outputs": {
             "collectorContract": {
               "type": "object",
-              "value": {
-                "schemaVersion": "athena.wc024MonitoringCollectorContract.v2",
-                "collectorIdentityResourceId": "[parameters('collectorIdentityResourceId')]",
-                "collectorIdentityClientId": "[parameters('collectorIdentityClientId')]",
-                "monitoringResourceGroupId": "[parameters('monitoringResourceGroupId')]",
-                "workloadResourceGroupId": "[parameters('workloadResourceGroupId')]",
-                "workloadVirtualNetworkResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
-                "approvedVmNames": "[parameters('approvedVmNames')]",
-                "workspaceResourceId": "[parameters('workspaceResourceId')]",
-                "dataCollectionRuleResourceId": "[parameters('dataCollectionRuleResourceId')]",
-                "dataCollectionEndpointResourceId": "[parameters('dataCollectionEndpointResourceId')]",
-                "authorizationMode": "[parameters('authorizationMode')]",
-                "workspaceAccessControlMode": "[parameters('workspaceAccessControlMode')]",
-                "readerRoleDefinitionId": "[parameters('readerRoleDefinitionId')]",
-                "signalReaderRoleDefinitionId": "[parameters('signalReaderRoleDefinitionId')]",
-                "logAnalyticsDataReaderRoleDefinitionId": "[parameters('logAnalyticsDataReaderRoleDefinitionId')]",
-                "logAnalyticsAllowedTables": "[parameters('logAnalyticsAllowedTables')]",
-                "logAnalyticsAccessCondition": "[parameters('logAnalyticsAccessCondition')]",
-                "resourceReadScopeIds": "[parameters('resourceReadScopeIds')]",
-                "signalReadScopeIds": "[parameters('signalReadScopeIds')]",
-                "signalKinds": [
-                  "heartbeat",
-                  "perf",
-                  "insightsMetrics",
-                  "syslog",
-                  "disk",
-                  "guest",
-                  "vnetFlow",
-                  "trafficAnalytics"
-                ],
-                "allowedReadOperations": [
-                  "Microsoft.OperationalInsights/workspaces/read",
-                  "Microsoft.OperationalInsights/workspaces/query/read",
-                  "Microsoft.OperationalInsights/workspaces/tables/data/read",
-                  "Microsoft.Compute/virtualMachines/instanceView/read",
-                  "Microsoft.Insights/Metrics/Read",
-                  "Microsoft.Insights/dataCollectionRules/read",
-                  "Microsoft.Insights/dataCollectionEndpoints/read",
-                  "Microsoft.Insights/dataCollectionRuleAssociations/read",
-                  "Microsoft.Insights/privateLinkScopes/read",
-                  "Microsoft.Network/networkWatchers/flowLogs/read"
-                ],
-                "collectionMode": "isolatedSignedCollector",
-                "handoffSchemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
-                "maximumEvidenceAgeSeconds": "[parameters('maximumEvidenceAgeSeconds')]",
-                "connectionMonitorMode": "capabilityOnly",
-                "signingKeyResourceId": "[parameters('signingKeyResourceId')]",
-                "evidenceStorageAccountResourceId": "[parameters('evidenceStorageAccountResourceId')]",
-                "evidenceContainerName": "monitoring-evidence",
-                "connectionMonitorDeploymentMode": "[variables('validatedConnectionMonitorDeploymentMode')]"
-              }
+              "value": "[variables('collectorContract')]"
+            },
+            "acquisitionCollectorContract": {
+              "type": "object",
+              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v3', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2'))]"
             }
           }
         }
@@ -3398,6 +3403,10 @@
         "description": "Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs."
       },
       "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.collectorContract.value]"
+    },
+    "monitoringAcquisitionCollectorContract": {
+      "type": "object",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.acquisitionCollectorContract.value]"
     },
     "replacementMonitoringStorageAccountResourceId": {
       "type": "string",
