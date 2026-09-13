@@ -16,6 +16,7 @@ import type {
 const incidentFixture = (
   scenario: VerifiedIncident['state']['scenario'],
   updatedAt: string,
+  lifecycle: VerifiedIncident['state']['lifecycle'] = 'active',
 ): VerifiedIncidentFeed => ({
   publishedAt: updatedAt,
   keyFingerprint:
@@ -29,7 +30,7 @@ const incidentFixture = (
     incidentId: 'inc-123456789abc',
     transitionId: `wc016-${'1'.repeat(64)}`,
     scenario,
-    lifecycle: 'active',
+    lifecycle,
     workloadRole:
       scenario === 'singletonDatabaseFailure'
         ? 'database-primary'
@@ -62,6 +63,7 @@ const incidentFixture = (
 
 const guidanceFixture = (
   confidence: IncidentGuidance['legality']['confidence'] = 'Confirmed',
+  lifecycle: 'active' | 'resolved' = 'active',
 ): VerifiedOperatorGuidanceFeed => {
   const selectedRunbook = confidence === 'High' || confidence === 'Confirmed'
   const confirmed = confidence === 'Confirmed'
@@ -230,11 +232,16 @@ const guidanceFixture = (
       'inc-123456789abc': {
         status: 'verified',
         incidentId: 'inc-123456789abc',
-        lifecycle: 'active',
+        lifecycle,
         stateResultDigest:
           'sha256:2222222222222222222222222222222222222222222222222222222222222222',
         feedPublishedAt: '2026-09-04T03:41:01Z',
         enrichmentId: `incident-enrichment-${'8'.repeat(32)}`,
+        incident: incidentFixture(
+          'loadBalancerFailure',
+          '2026-09-04T03:40:03Z',
+          lifecycle,
+        ).incidents[0]!,
         guidance,
       },
     },
@@ -466,6 +473,45 @@ describe('standalone Athena presentation', () => {
       0,
     )
     expect((await axe(container)).violations).toHaveLength(0)
+  })
+
+  it('renders independently verified recently resolved guidance when v1 active is empty', async () => {
+    const guidanceLoader = vi
+      .fn()
+      .mockResolvedValue(guidanceFixture('Confirmed', 'resolved'))
+    render(
+      <App
+        loader={() => createLiveVerifiedLifecycle()}
+        incidentLoader={() =>
+          Promise.resolve({
+            incidents: [],
+            publishedAt: '2026-09-04T03:40:03Z',
+            keyFingerprint:
+              'sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964',
+            sourceIndexDigest:
+              'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+          })
+        }
+        guidanceLoader={guidanceLoader}
+      />,
+    )
+
+    await waitFor(() => expect(guidanceLoader).toHaveBeenCalled())
+    expect(
+      await screen.findByRole('heading', {
+        name: /1 verified recently resolved incident/i,
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', {
+        name: /resolved incident: azure load balancer failure/i,
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', {
+        name: /incident-specific operator guidance/i,
+      }),
+    ).toBeInTheDocument()
   })
 
   it('retains independently verified v1 incident data when v2 guidance fails closed', async () => {

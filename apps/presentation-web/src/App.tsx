@@ -84,7 +84,7 @@ function App({
         const verified = await incidentLoader()
         let verifiedGuidance: VerifiedOperatorGuidanceFeed | null = null
         let guidanceFailed = false
-        if (guidanceLoader && verified.incidents.length > 0) {
+        if (guidanceLoader) {
           try {
             verifiedGuidance = await guidanceLoader(verified)
           } catch {
@@ -124,9 +124,6 @@ function App({
           } else if (guidanceFailed) {
             setGuidanceFeed(null)
             setGuidanceUnavailable(true)
-          } else if (verified.incidents.length === 0) {
-            setGuidanceFeed(null)
-            setGuidanceUnavailable(false)
           }
         }
       } catch {
@@ -233,6 +230,11 @@ function App({
           unavailable={incidentUnavailable}
           guidanceByIncidentId={guidanceFeed?.guidanceByIncidentId ?? {}}
           guidanceUnavailable={guidanceUnavailable}
+        />
+        <RecentlyResolvedGuidance
+          guidance={Object.values(
+            guidanceFeed?.guidanceByIncidentId ?? {},
+          ).filter((item) => item.lifecycle === 'resolved')}
         />
         <section className="trust-strip" aria-labelledby="trust-heading">
           <div>
@@ -482,6 +484,40 @@ function App({
           : 'Presentation-only browser boundary. No Azure, Blob, ARM, MCP, or workload calls are made.'}
       </footer>
     </div>
+  )
+}
+
+const RecentlyResolvedGuidance = ({
+  guidance,
+}: {
+  guidance: VerifiedOperatorGuidance[]
+}) => {
+  if (guidance.length === 0) return null
+  return (
+    <section
+      className="incident-panel"
+      aria-labelledby="recently-resolved-heading"
+    >
+      <p className="status-kicker">Recent operational history</p>
+      <h2 id="recently-resolved-heading">
+        {guidance.length === 1
+          ? '1 verified recently resolved incident'
+          : `${guidance.length} verified recently resolved incidents`}
+      </h2>
+      {guidance.map((verified) => (
+        <article
+          key={verified.incidentId}
+          className="incident-entry incident-resolved"
+          aria-labelledby={`resolved-${verified.incidentId}`}
+        >
+          <h3 id={`resolved-${verified.incidentId}`}>
+            Resolved incident: {scenarioLabel(verified.incident.state.scenario)}
+          </h3>
+          <p role="status">{verified.incident.state.findings[0]!.summary}</p>
+          <OperatorGuidancePanel guidance={verified} />
+        </article>
+      ))}
+    </section>
   )
 }
 

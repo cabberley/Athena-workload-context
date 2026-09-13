@@ -343,6 +343,7 @@ class PresentationAssetGatewayApplication:
             "/runtime-manifest.json",
             "/incidents/active.json",
             "/trust/wc027-feed-public-key.jwk.json",
+            "/trust/wc027-report-public-key.jwk.json",
             "/trust/wc027-enrichment-public-key.jwk.json",
             "/trust/wc027-guidance-public-key.jwk.json",
         }:
@@ -360,6 +361,9 @@ class PresentationAssetGatewayApplication:
     def _wc027_public_key_asset(self, path: str) -> bytes | None:
         anchors = {
             "/trust/wc027-feed-public-key.jwk.json": self._incident_feed_v2_trust,
+            "/trust/wc027-report-public-key.jwk.json": (
+                self._incident_report_trust
+            ),
             "/trust/wc027-enrichment-public-key.jwk.json": (
                 self._incident_enrichment_trust
             ),

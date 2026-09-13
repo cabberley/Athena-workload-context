@@ -1,6 +1,11 @@
 import { canonicalizeJson, sha256Digest, type JsonValue } from './canonical'
 import { type Sha256Digest } from './contracts'
-import type { VerifiedIncident, VerifiedIncidentFeed } from './incidents'
+import {
+  verifyIncidentOccurrenceAssets,
+  type IncidentOccurrenceReference,
+  type VerifiedIncident,
+  type VerifiedIncidentFeed,
+} from './incidents'
 import {
   fetchBoundedJsonAsset,
   resolveSameOriginAssetUrl,
@@ -14,9 +19,12 @@ import {
 
 const MAX_FEED_BYTES = 128 * 1024
 const MAX_POINTER_BYTES = 16 * 1024
+const MAX_STATE_BYTES = 64 * 1024
 const MAX_MANIFEST_BYTES = 64 * 1024
 const MAX_GUIDANCE_BYTES = 64 * 1024
+const MAX_REPORT_BYTES = 8 * 1024 * 1024
 const MAX_ATTESTATION_BYTES = 16 * 1024
+const MAX_INCIDENT_ATTESTATION_BYTES = 24 * 1024
 const MAX_FEED_AGE_MS = 15 * 60_000
 const MAX_CLOCK_SKEW_MS = 60_000
 
@@ -225,6 +233,7 @@ export interface VerifiedOperatorGuidance {
   stateResultDigest: Sha256Digest
   feedPublishedAt: string
   enrichmentId: string
+  incident: VerifiedIncident
   guidance: IncidentGuidance
 }
 
@@ -241,6 +250,7 @@ export interface GuidanceTrustAnchor {
 
 export interface GuidanceTrustAnchors {
   feed: GuidanceTrustAnchor
+  report: GuidanceTrustAnchor
   enrichment: GuidanceTrustAnchor
   guidance: GuidanceTrustAnchor
 }
@@ -252,6 +262,8 @@ export interface IncidentGuidanceBundle {
   feedPointerAttestation: BoundedJsonAsset
   enrichmentManifest: BoundedJsonAsset
   enrichmentAttestation: BoundedJsonAsset
+  correlationReport: BoundedJsonAsset
+  correlationReportAttestation: BoundedJsonAsset
   guidance: BoundedJsonAsset
   guidanceAttestation: BoundedJsonAsset
 }
@@ -261,6 +273,8 @@ export interface GuidanceLoadOptions extends LoadPresentationOptions {
   anchors?: Omit<GuidanceTrustAnchors['feed'], 'publicKey'> & {
     enrichmentKeyId: string
     enrichmentFingerprint: Sha256Digest
+    reportKeyId: string
+    reportFingerprint: Sha256Digest
     guidanceKeyId: string
     guidanceFingerprint: Sha256Digest
   }
@@ -277,9 +291,6 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   incidentFeed: VerifiedIncidentFeed,
   options: GuidanceLoadOptions = {},
 ): Promise<VerifiedOperatorGuidanceFeed> => {
-  if (incidentFeed.incidents.length === 0) {
-    return { publishedAt: incidentFeed.publishedAt, guidanceByIncidentId: {} }
-  }
   if (!incidentFeed.sourceIndexDigest) {
     throw new VerificationError('Verified v1 index provenance is unavailable.')
   }
@@ -318,7 +329,9 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   )
   const keyAssets = await Promise.all(
     [
+      './trust/incident-public-key.jwk.json',
       './trust/wc027-feed-public-key.jwk.json',
+      './trust/wc027-report-public-key.jwk.json',
       './trust/wc027-enrichment-public-key.jwk.json',
       './trust/wc027-guidance-public-key.jwk.json',
     ].map((path) =>
@@ -330,14 +343,21 @@ export const loadVerifiedOperatorGuidanceFeed = async (
       ),
     ),
   )
-  const feedKey = keyAssets[0]!
-  const enrichmentKey = keyAssets[1]!
-  const guidanceKey = keyAssets[2]!
+  const lifecycleKey = keyAssets[0]!
+  const feedKey = keyAssets[1]!
+  const reportKey = keyAssets[2]!
+  const enrichmentKey = keyAssets[3]!
+  const guidanceKey = keyAssets[4]!
   const anchors: GuidanceTrustAnchors = {
     feed: {
       keyId: configured.keyId,
       fingerprint: configured.fingerprint,
       publicKey: feedKey.value,
+    },
+    report: {
+      keyId: configured.reportKeyId,
+      fingerprint: configured.reportFingerprint,
+      publicKey: reportKey.value,
     },
     enrichment: {
       keyId: configured.enrichmentKeyId,
@@ -350,16 +370,26 @@ export const loadVerifiedOperatorGuidanceFeed = async (
       publicKey: guidanceKey.value,
     },
   }
+  await verifyFeedIndex(
+    feedIndex,
+    feedIndexAttestation,
+    incidentFeed,
+    anchors.feed,
+    cryptoProvider,
+  )
+  const activeById = new Map(
+    incidentFeed.incidents.map((incident) => [incident.state.incidentId, incident]),
+  )
+  if (
+    index.active.length !== activeById.size ||
+    index.active.some((entry) => !activeById.has(entry.incidentId))
+  ) {
+    throw new VerificationError(
+      'Incident feed v2 active set does not match verified v1 authority.',
+    )
+  }
   const verifiedEntries = await Promise.all(
-    incidentFeed.incidents.map(async (incident) => {
-      const entry = index.active.find(
-        (candidate) => candidate.incidentId === incident.state.incidentId,
-      )
-      if (!entry) {
-        throw new VerificationError(
-          'Verified v2 enrichment is unavailable for an active v1 incident.',
-        )
-      }
+    [...index.active, ...index.recentlyResolved].map(async (entry) => {
       const [feedPointer, feedPointerAttestation] = await Promise.all([
         fetchVersionedReference(
           entry.feedPointerReference,
@@ -386,7 +416,46 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         ),
         cryptoProvider,
       )
-      const [enrichmentManifest, enrichmentAttestation] = await Promise.all([
+      const [
+        sourceState,
+        sourceStateAttestation,
+        sourcePointer,
+        sourcePointerAttestation,
+        enrichmentManifest,
+        enrichmentAttestation,
+      ] = await Promise.all([
+        fetchVersionedReference(
+          pointer.sourceStateReference,
+          MAX_STATE_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
+        fetchVersionedReference(
+          pointer.sourceStateAttestationReference,
+          MAX_INCIDENT_ATTESTATION_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
+        fetchVersionedReference(
+          pointer.sourcePointerReference,
+          MAX_POINTER_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
+        fetchVersionedReference(
+          pointer.sourcePointerAttestationReference,
+          MAX_INCIDENT_ATTESTATION_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
         fetchVersionedReference(
           pointer.enrichmentAsset.manifestReference,
           MAX_MANIFEST_BYTES,
@@ -404,6 +473,36 @@ export const loadVerifiedOperatorGuidanceFeed = async (
           timeoutMs,
         ),
       ])
+      const incident = await verifyIncidentOccurrenceAssets(
+        {
+          state: sourceState,
+          stateAttestation: sourceStateAttestation,
+          pointer: sourcePointer,
+          pointerAttestation: sourcePointerAttestation,
+        },
+        {
+          incidentId: entry.incidentId,
+          lifecycle: entry.lifecycle,
+          stateResultDigest: entry.stateResultDigest,
+          updatedAt: entry.updatedAt,
+          stateReference: pointer.sourceStateReference,
+          stateAttestationReference: pointer.sourceStateAttestationReference,
+          pointerReference: pointer.sourcePointerReference,
+          pointerAttestationReference:
+            pointer.sourcePointerAttestationReference,
+        },
+        lifecycleKey.value,
+        cryptoProvider,
+      )
+      const activeIncident = activeById.get(entry.incidentId)
+      if (entry.lifecycle === 'active') {
+        if (!activeIncident) {
+          throw new VerificationError(
+            'Verified v2 enrichment is unavailable for an active v1 incident.',
+          )
+        }
+        requireSameVerifiedOccurrence(activeIncident, incident)
+      }
       const manifest = await parseEnrichmentManifest(
         await requireCanonicalAsset(
           enrichmentManifest,
@@ -412,7 +511,28 @@ export const loadVerifiedOperatorGuidanceFeed = async (
         ),
         cryptoProvider,
       )
-      const [guidance, guidanceAttestation] = await Promise.all([
+      const [
+        correlationReport,
+        correlationReportAttestation,
+        guidance,
+        guidanceAttestation,
+      ] = await Promise.all([
+        fetchVersionedReference(
+          manifest.correlationReportAsset.reportReference,
+          MAX_REPORT_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
+        fetchVersionedReference(
+          manifest.correlationReportAsset.attestationReference,
+          MAX_ATTESTATION_BYTES,
+          applicationRoot,
+          origin,
+          fetchImpl,
+          timeoutMs,
+        ),
         fetchVersionedReference(
           manifest.guidanceAsset.guidanceReference,
           MAX_GUIDANCE_BYTES,
@@ -438,6 +558,8 @@ export const loadVerifiedOperatorGuidanceFeed = async (
           feedPointerAttestation,
           enrichmentManifest,
           enrichmentAttestation,
+          correlationReport,
+          correlationReportAttestation,
           guidance,
           guidanceAttestation,
         },
@@ -456,6 +578,59 @@ export const loadVerifiedOperatorGuidanceFeed = async (
   }
 }
 
+const verifyFeedIndex = async (
+  feedIndex: BoundedJsonAsset,
+  feedIndexAttestation: BoundedJsonAsset,
+  incidentFeed: VerifiedIncidentFeed,
+  anchor: GuidanceTrustAnchor,
+  cryptoProvider: Crypto,
+  nowMs = Date.now(),
+) => {
+  if (!incidentFeed.sourceIndexDigest) {
+    throw new VerificationError('Verified v1 index provenance is unavailable.')
+  }
+  const index = parseFeedIndex(
+    await requireCanonicalAsset(
+      feedIndex,
+      MAX_FEED_BYTES,
+      'incident feed v2 index',
+    ),
+  )
+  const indexAttestation = parseAttestation(
+    feedIndexAttestation,
+    MAX_ATTESTATION_BYTES,
+    'athena.wc027IncidentFeedIndexAttestation.v2',
+    [
+      'schemaVersion',
+      'indexDigest',
+      'signatureAlgorithm',
+      'keyVaultKeyId',
+      'detachedSignature',
+    ],
+  )
+  if (
+    index.sourceActiveIndexDigest !== incidentFeed.sourceIndexDigest ||
+    Date.parse(index.publishedAt) < Date.parse(incidentFeed.publishedAt) ||
+    nowMs - Date.parse(index.publishedAt) > MAX_FEED_AGE_MS ||
+    Date.parse(index.publishedAt) - nowMs > MAX_CLOCK_SKEW_MS ||
+    index.keyId !== anchor.keyId ||
+    index.keyFingerprint !== anchor.fingerprint ||
+    indexAttestation.digest !==
+      (await sha256Digest(feedIndex.bytes, cryptoProvider))
+  ) {
+    throw new VerificationError(
+      'Incident feed v2 is not bound to the verified v1 index.',
+    )
+  }
+  await verifySignature(
+    feedIndex.bytes,
+    indexAttestation.attestation,
+    anchor,
+    cryptoProvider,
+  )
+  return index
+}
+
 export const verifyIncidentGuidanceBundle = async (
   bundle: IncidentGuidanceBundle,
   incidentFeed: VerifiedIncidentFeed,
@@ -469,39 +644,20 @@ export const verifyIncidentGuidanceBundle = async (
       'Verified v1 occurrence metadata is required before guidance can be trusted.',
     )
   }
-  const indexRecord = await requireCanonicalAsset(
+  const index = await verifyFeedIndex(
     bundle.feedIndex,
-    MAX_FEED_BYTES,
-    'incident feed v2 index',
-  )
-  const index = parseFeedIndex(indexRecord)
-  const indexAttestation = parseAttestation(
     bundle.feedIndexAttestation,
-    MAX_ATTESTATION_BYTES,
-    'athena.wc027IncidentFeedIndexAttestation.v2',
-    ['schemaVersion', 'indexDigest', 'signatureAlgorithm', 'keyVaultKeyId', 'detachedSignature'],
-  )
-  if (
-    index.sourceActiveIndexDigest !== incidentFeed.sourceIndexDigest ||
-    Date.parse(index.publishedAt) < Date.parse(incidentFeed.publishedAt) ||
-    nowMs - Date.parse(index.publishedAt) > MAX_FEED_AGE_MS ||
-    Date.parse(index.publishedAt) - nowMs > MAX_CLOCK_SKEW_MS ||
-    index.keyId !== anchors.feed.keyId ||
-    index.keyFingerprint !== anchors.feed.fingerprint ||
-    indexAttestation.digest !== await sha256Digest(bundle.feedIndex.bytes, cryptoProvider)
-  ) {
-    throw new VerificationError('Incident feed v2 is not bound to the verified v1 index.')
-  }
-  await verifySignature(
-    bundle.feedIndex.bytes,
-    indexAttestation.attestation,
+    incidentFeed,
     anchors.feed,
     cryptoProvider,
+    nowMs,
   )
-  const entry = index.active.find((candidate) => candidate.incidentId === incident.state.incidentId)
+  const entry = [...index.active, ...index.recentlyResolved].find(
+    (candidate) => candidate.incidentId === incident.state.incidentId,
+  )
   if (
     !entry ||
-    entry.lifecycle !== 'active' ||
+    entry.lifecycle !== incident.state.lifecycle ||
     entry.stateResultDigest !== incident.state.resultDigest ||
     entry.updatedAt !== incident.state.updatedAt
   ) {
@@ -559,7 +715,7 @@ export const verifyIncidentGuidanceBundle = async (
     anchors.feed,
     cryptoProvider,
   )
-  requireOccurrenceBinding(pointer, incident)
+  await requireOccurrenceBinding(pointer, incident, cryptoProvider)
 
   const manifestRecord = await requireCanonicalAsset(
     bundle.enrichmentManifest,
@@ -606,6 +762,59 @@ export const verifyIncidentGuidanceBundle = async (
     cryptoProvider,
   )
 
+  const reportRecord = await requireCanonicalAsset(
+    bundle.correlationReport,
+    MAX_REPORT_BYTES,
+    'published correlation report',
+  )
+  const report = await parseCorrelationReport(reportRecord, cryptoProvider)
+  const reportAttestation = await parsePublishedReportAttestation(
+    await requireCanonicalAsset(
+      bundle.correlationReportAttestation,
+      MAX_ATTESTATION_BYTES,
+      'published correlation report attestation',
+    ),
+    cryptoProvider,
+  )
+  const reportContentDigest = await sha256Digest(
+    bundle.correlationReport.bytes,
+    cryptoProvider,
+  )
+  const statementBytes = reportAttestation.statementBytes
+  if (
+    manifest.correlationReportAsset.reportReference.contentDigest !==
+      reportContentDigest ||
+    manifest.correlationReportAsset.attestationReference.contentDigest !==
+      (await sha256Digest(
+        bundle.correlationReportAttestation.bytes,
+        cryptoProvider,
+      )) ||
+    reportAttestation.attestation.signedPreimageDigest !==
+      (await sha256Digest(statementBytes, cryptoProvider)) ||
+    report.reportId !== manifest.correlationReportAsset.reportId ||
+    report.reportDigest !== manifest.correlationReportAsset.reportDigest ||
+    reportContentDigest !==
+      manifest.correlationReportAsset.reportContentDigest ||
+    report.requestDigest !==
+      manifest.correlationReportAsset.correlationRequestDigest ||
+    report.transitionDigest !==
+      manifest.correlationReportAsset.correlationTransitionDigest ||
+    reportAttestation.statement.statementId !==
+      manifest.correlationReportAsset.publicationStatementId ||
+    reportAttestation.statement.statementDigest !==
+      manifest.correlationReportAsset.publicationStatementDigest
+  ) {
+    throw new VerificationError(
+      'Published correlation report does not match its verified enrichment.',
+    )
+  }
+  await verifySignature(
+    statementBytes,
+    reportAttestation.attestation,
+    anchors.report,
+    cryptoProvider,
+  )
+
   const guidanceRecord = await requireCanonicalAsset(
     bundle.guidance,
     MAX_GUIDANCE_BYTES,
@@ -627,6 +836,12 @@ export const verifyIncidentGuidanceBundle = async (
     ],
   )
   const guidanceBytesDigest = await sha256Digest(bundle.guidance.bytes, cryptoProvider)
+  assertGuidanceMatchesVerifiedOccurrence(
+    guidance,
+    manifest,
+    reportAttestation.statement,
+    incident,
+  )
   if (
     manifest.guidanceAsset.guidanceReference.contentDigest !== guidanceBytesDigest ||
     manifest.guidanceAsset.attestationReference.contentDigest !==
@@ -677,26 +892,197 @@ export const verifyIncidentGuidanceBundle = async (
     stateResultDigest: pointer.stateResultDigest,
     feedPublishedAt: index.publishedAt,
     enrichmentId: manifest.enrichmentId,
+    incident,
     guidance,
   }
 }
 
-const requireOccurrenceBinding = (
-  pointer: ParsedFeedPointer,
+export const assertGuidanceMatchesVerifiedOccurrence = (
+  guidance: IncidentGuidance,
+  manifest: ParsedEnrichmentManifest,
+  statement: ParsedPublishedReportStatement,
   incident: VerifiedIncident,
 ): void => {
   const occurrence = incident.occurrence
   if (
     !occurrence ||
+    occurrence.stateVersion === undefined ||
+    occurrence.attestationVersion === undefined ||
+    manifest.incidentId !== incident.state.incidentId ||
+    manifest.incidentTransitionId !== incident.state.transitionId ||
+    manifest.incidentStateResultDigest !== incident.state.resultDigest ||
+    statement.incidentId !== incident.state.incidentId ||
+    statement.incidentTransitionId !== incident.state.transitionId ||
+    statement.incidentStateResultDigest !== incident.state.resultDigest ||
+    !sameReference(manifest.incidentStateReference, {
+      name: occurrence.statePath,
+      version: occurrence.stateVersion,
+      contentDigest: occurrence.stateSha256,
+    }) ||
+    !sameReference(manifest.incidentStateAttestationReference, {
+      name: occurrence.attestationPath,
+      version: occurrence.attestationVersion,
+      contentDigest: occurrence.attestationSha256,
+    }) ||
+    !sameReference(
+      statement.incidentStateReference,
+      manifest.incidentStateReference,
+    ) ||
+    !sameReference(
+      statement.incidentStateAttestationReference,
+      manifest.incidentStateAttestationReference,
+    ) ||
+    statement.incidentRevision !== manifest.incidentRevision ||
+    statement.incidentTransitionId !== manifest.incidentTransitionId ||
+    statement.incidentSubjectId !== manifest.incidentSubjectId ||
+    statement.incidentSubjectDigest !== manifest.incidentSubjectDigest ||
+    statement.incidentBoundRequestId !== manifest.incidentBoundRequestId ||
+    statement.incidentBoundRequestDigest !==
+      manifest.incidentBoundRequestDigest ||
+    statement.incidentTransitionId !==
+      manifest.correlationReportAsset.incidentTransitionId ||
+    statement.incidentRevision !==
+      manifest.correlationReportAsset.incidentRevision ||
+    statement.incidentStateResultDigest !==
+      manifest.correlationReportAsset.incidentStateResultDigest ||
+    statement.incidentSubjectId !==
+      manifest.correlationReportAsset.incidentSubjectId ||
+    statement.incidentSubjectDigest !==
+      manifest.correlationReportAsset.incidentSubjectDigest ||
+    statement.incidentBoundRequestId !==
+      manifest.correlationReportAsset.incidentBoundRequestId ||
+    statement.incidentBoundRequestDigest !==
+      manifest.correlationReportAsset.incidentBoundRequestDigest ||
+    statement.correlationRequestDigest !==
+      manifest.correlationReportAsset.correlationRequestDigest ||
+    statement.correlationTransitionDigest !==
+      manifest.correlationReportAsset.correlationTransitionDigest ||
+    statement.reportId !== manifest.correlationReportAsset.reportId ||
+    statement.reportDigest !== manifest.correlationReportAsset.reportDigest ||
+    statement.reportContentDigest !==
+      manifest.correlationReportAsset.reportContentDigest ||
+    statement.authorityProofDigest !==
+      manifest.correlationReportAsset.authorityProofDigest ||
+    guidance.sourceBinding.incidentId !== statement.incidentId ||
+    guidance.sourceBinding.incidentRevision !== statement.incidentRevision ||
+    guidance.sourceBinding.incidentStateDigest !==
+      statement.incidentStateResultDigest ||
+    guidance.sourceBinding.incidentSubjectId !== statement.incidentSubjectId ||
+    guidance.sourceBinding.incidentSubjectDigest !==
+      statement.incidentSubjectDigest ||
+    guidance.sourceBinding.incidentBoundRequestId !==
+      statement.incidentBoundRequestId ||
+    guidance.sourceBinding.incidentBoundRequestDigest !==
+      statement.incidentBoundRequestDigest ||
+    guidance.sourceBinding.correlationReportId !== statement.reportId ||
+    guidance.sourceBinding.correlationReportDigest !== statement.reportDigest ||
+    guidance.sourceBinding.correlationRequestDigest !==
+      statement.correlationRequestDigest ||
+    guidance.sourceBinding.transitionDigest !==
+      statement.correlationTransitionDigest
+  ) {
+    throw new VerificationError(
+      'Incident guidance does not bind the independently verified occurrence.',
+    )
+  }
+}
+
+const sameReference = (
+  left: IncidentOccurrenceReference,
+  right: IncidentOccurrenceReference,
+): boolean =>
+  left.name === right.name &&
+  left.version === right.version &&
+  left.contentDigest === right.contentDigest
+
+const requireSameVerifiedOccurrence = (
+  authoritative: VerifiedIncident,
+  candidate: VerifiedIncident,
+): void => {
+  const expected = authoritative.occurrence
+  const actual = candidate.occurrence
+  if (
+    !expected ||
+    !actual ||
+    authoritative.state.incidentId !== candidate.state.incidentId ||
+    authoritative.state.lifecycle !== candidate.state.lifecycle ||
+    authoritative.state.resultDigest !== candidate.state.resultDigest ||
+    authoritative.state.updatedAt !== candidate.state.updatedAt ||
+    expected.statePath !== actual.statePath ||
+    expected.stateSha256 !== actual.stateSha256 ||
+    expected.attestationPath !== actual.attestationPath ||
+    expected.attestationSha256 !== actual.attestationSha256 ||
+    expected.pointerPath !== actual.pointerPath ||
+    expected.pointerSha256 !== actual.pointerSha256 ||
+    expected.pointerAttestationPath !== actual.pointerAttestationPath ||
+    expected.pointerAttestationSha256 !== actual.pointerAttestationSha256
+  ) {
+    throw new VerificationError(
+      'Incident feed v2 active occurrence does not match verified v1 authority.',
+    )
+  }
+}
+
+const requireOccurrenceBinding = async (
+  pointer: ParsedFeedPointer,
+  incident: VerifiedIncident,
+  cryptoProvider: Crypto,
+): Promise<void> => {
+  const occurrence = incident.occurrence
+  const occurrenceDigest = occurrence
+    ? await sha256Digest(
+        canonicalizeJson({
+          schemaVersion: 'athena.incidentOccurrenceReceipt.v1',
+          incidentId: incident.state.incidentId,
+          transitionId: incident.state.transitionId,
+          stateResultDigest: incident.state.resultDigest,
+          stateReference: {
+            name: occurrence.statePath,
+            version: occurrence.stateVersion ?? '',
+            contentDigest: occurrence.stateSha256,
+          },
+          stateAttestationReference: {
+            name: occurrence.attestationPath,
+            version: occurrence.attestationVersion ?? '',
+            contentDigest: occurrence.attestationSha256,
+          },
+          pointerReference: {
+            name: occurrence.pointerPath,
+            version: occurrence.pointerVersion ?? '',
+            contentDigest: occurrence.pointerSha256,
+          },
+          pointerAttestationReference: {
+            name: occurrence.pointerAttestationPath,
+            version: occurrence.pointerAttestationVersion ?? '',
+            contentDigest: occurrence.pointerAttestationSha256,
+          },
+          publishedAt: incident.publishedAt,
+        }),
+        cryptoProvider,
+      )
+    : null
+  if (
+    !occurrence ||
+    occurrence.stateVersion === undefined ||
+    occurrence.attestationVersion === undefined ||
+    occurrence.pointerVersion === undefined ||
+    occurrence.pointerAttestationVersion === undefined ||
     pointer.sourceStateReference.name !== occurrence.statePath ||
+    pointer.sourceStateReference.version !== occurrence.stateVersion ||
     pointer.sourceStateReference.contentDigest !== occurrence.stateSha256 ||
     pointer.sourceStateAttestationReference.name !== occurrence.attestationPath ||
+    pointer.sourceStateAttestationReference.version !==
+      occurrence.attestationVersion ||
     pointer.sourceStateAttestationReference.contentDigest !== occurrence.attestationSha256 ||
     pointer.sourcePointerReference.name !== occurrence.pointerPath ||
+    pointer.sourcePointerReference.version !== occurrence.pointerVersion ||
     pointer.sourcePointerReference.contentDigest !== occurrence.pointerSha256 ||
     pointer.sourcePointerAttestationReference.name !== occurrence.pointerAttestationPath ||
+    pointer.sourcePointerAttestationReference.version !==
+      occurrence.pointerAttestationVersion ||
     pointer.sourcePointerAttestationReference.contentDigest !==
-      occurrence.pointerAttestationSha256
+      occurrence.pointerAttestationSha256 ||
+    pointer.occurrenceDigest !== occurrenceDigest
   ) {
     throw new VerificationError('Incident guidance is not bound to the verified v1 occurrence.')
   }
@@ -737,9 +1123,10 @@ interface ParsedEnrichmentReference {
   attestationReference: VersionPinnedReference
 }
 
-interface ParsedEnrichmentManifest {
+export interface ParsedEnrichmentManifest {
   enrichmentId: string
   incidentId: string
+  incidentTransitionId: string
   incidentRevision: number
   incidentStateResultDigest: Sha256Digest
   incidentStateReference: VersionPinnedReference
@@ -749,10 +1136,23 @@ interface ParsedEnrichmentManifest {
   incidentBoundRequestId: string
   incidentBoundRequestDigest: Sha256Digest
   correlationReportAsset: {
+    incidentTransitionId: string
+    incidentRevision: number
+    incidentStateResultDigest: Sha256Digest
+    incidentSubjectId: string
+    incidentSubjectDigest: Sha256Digest
+    incidentBoundRequestId: string
+    incidentBoundRequestDigest: Sha256Digest
     reportId: string
     reportDigest: Sha256Digest
+    reportContentDigest: Sha256Digest
+    authorityProofDigest: Sha256Digest
     correlationRequestDigest: Sha256Digest
     correlationTransitionDigest: Sha256Digest
+    publicationStatementId: string
+    publicationStatementDigest: Sha256Digest
+    reportReference: VersionPinnedReference
+    attestationReference: VersionPinnedReference
   }
   guidanceAsset: {
     guidanceId: string
@@ -763,10 +1163,234 @@ interface ParsedEnrichmentManifest {
   manifestDigest: Sha256Digest
 }
 
+interface ParsedCorrelationReport {
+  reportId: string
+  requestDigest: Sha256Digest
+  transitionDigest: Sha256Digest
+  reportDigest: Sha256Digest
+}
+
+export interface ParsedPublishedReportStatement {
+  statementId: string
+  incidentId: string
+  incidentTransitionId: string
+  incidentRevision: number
+  incidentStateResultDigest: Sha256Digest
+  incidentStateReference: VersionPinnedReference
+  incidentStateAttestationReference: VersionPinnedReference
+  incidentSubjectId: string
+  incidentSubjectDigest: Sha256Digest
+  incidentBoundRequestId: string
+  incidentBoundRequestDigest: Sha256Digest
+  correlationRequestDigest: Sha256Digest
+  correlationTransitionDigest: Sha256Digest
+  reportId: string
+  reportDigest: Sha256Digest
+  reportContentDigest: Sha256Digest
+  authorityProofDigest: Sha256Digest
+  statementDigest: Sha256Digest
+}
+
+const parseCorrelationReport = async (
+  record: Record<string, JsonValue>,
+  cryptoProvider: Crypto,
+): Promise<ParsedCorrelationReport> => {
+  requireExactKeys(record, [
+    'schemaVersion',
+    'reportId',
+    'algorithmId',
+    'ruleCatalogDigest',
+    'asOf',
+    'bindingMode',
+    'contextBindingDigest',
+    'inputInventoryDigest',
+    'requestDigest',
+    'transitionDigest',
+    'incidentAnchorObservedStart',
+    'incidentAnchorObservedEnd',
+    'hypotheses',
+    'previewOnly',
+    'noAutoRemediation',
+    'reportDigest',
+  ])
+  if (
+    record.schemaVersion !== 'athena.wc026CorrelationReport.v1' ||
+    typeof record.reportId !== 'string' ||
+    !/^report-[a-f0-9]{32}$/.test(record.reportId) ||
+    record.algorithmId !== 'athena.wc026.correlation.v1' ||
+    !isDigest(record.ruleCatalogDigest) ||
+    !isTimestamp(record.asOf) ||
+    typeof record.bindingMode !== 'string' ||
+    !isDigest(record.contextBindingDigest) ||
+    !isDigest(record.inputInventoryDigest) ||
+    !isDigest(record.requestDigest) ||
+    !isDigest(record.transitionDigest) ||
+    !isTimestamp(record.incidentAnchorObservedStart) ||
+    !isTimestamp(record.incidentAnchorObservedEnd) ||
+    !Array.isArray(record.hypotheses) ||
+    record.hypotheses.length < 1 ||
+    typeof record.previewOnly !== 'boolean' ||
+    record.noAutoRemediation !== true ||
+    !isDigest(record.reportDigest)
+  ) {
+    throw new VerificationError('Published correlation report schema is invalid.')
+  }
+  await requireDigestBoundId(
+    record,
+    ['reportId', 'reportDigest'],
+    record.reportDigest,
+    'report-',
+    record.reportId,
+    cryptoProvider,
+  )
+  return {
+    reportId: record.reportId,
+    requestDigest: record.requestDigest,
+    transitionDigest: record.transitionDigest,
+    reportDigest: record.reportDigest,
+  }
+}
+
+const parsePublishedReportAttestation = async (
+  record: Record<string, JsonValue>,
+  cryptoProvider: Crypto,
+): Promise<{
+  statement: ParsedPublishedReportStatement
+  statementBytes: Uint8Array
+  attestation: ParsedAttestation
+}> => {
+  requireExactKeys(record, [
+    'schemaVersion',
+    'statement',
+    'signatureAlgorithm',
+    'keyVaultKeyId',
+    'signedPreimageDigest',
+    'detachedSignature',
+  ])
+  const statementRecord = requireRecord(record.statement)
+  requireExactKeys(statementRecord, [
+    'schemaVersion',
+    'statementId',
+    'purpose',
+    'incidentId',
+    'incidentTransitionId',
+    'incidentRevision',
+    'incidentStateResultDigest',
+    'incidentStateReference',
+    'incidentStateAttestationReference',
+    'incidentSubjectId',
+    'incidentSubjectDigest',
+    'incidentBoundRequestId',
+    'incidentBoundRequestDigest',
+    'correlationRequestDigest',
+    'correlationTransitionDigest',
+    'reportId',
+    'reportDigest',
+    'reportContentDigest',
+    'authorityProofDigest',
+    'noAutoRemediation',
+    'statementDigest',
+  ])
+  if (
+    record.schemaVersion !==
+      'athena.wc027PublishedCorrelationReportAttestation.v1' ||
+    record.signatureAlgorithm !== 'RS256' ||
+    typeof record.keyVaultKeyId !== 'string' ||
+    !isDigest(record.signedPreimageDigest) ||
+    typeof record.detachedSignature !== 'string' ||
+    !/^[A-Za-z0-9_-]+$/.test(record.detachedSignature) ||
+    statementRecord.schemaVersion !==
+      'athena.wc027PublishedCorrelationReportStatement.v1' ||
+    statementRecord.purpose !== 'athena.wc027.publish-correlation-report' ||
+    typeof statementRecord.statementId !== 'string' ||
+    !/^report-publication-[a-f0-9]{32}$/.test(
+      statementRecord.statementId,
+    ) ||
+    typeof statementRecord.incidentId !== 'string' ||
+    !INCIDENT_ID.test(statementRecord.incidentId) ||
+    typeof statementRecord.incidentTransitionId !== 'string' ||
+    !/^wc016-[a-f0-9]{64}$/.test(statementRecord.incidentTransitionId) ||
+    typeof statementRecord.incidentRevision !== 'number' ||
+    !Number.isInteger(statementRecord.incidentRevision) ||
+    statementRecord.incidentRevision < 1 ||
+    !isDigest(statementRecord.incidentStateResultDigest) ||
+    typeof statementRecord.incidentSubjectId !== 'string' ||
+    !/^incident-subject-[a-f0-9]{32}$/.test(
+      statementRecord.incidentSubjectId,
+    ) ||
+    !isDigest(statementRecord.incidentSubjectDigest) ||
+    typeof statementRecord.incidentBoundRequestId !== 'string' ||
+    !/^incident-bound-request-[a-f0-9]{32}$/.test(
+      statementRecord.incidentBoundRequestId,
+    ) ||
+    !isDigest(statementRecord.incidentBoundRequestDigest) ||
+    !isDigest(statementRecord.correlationRequestDigest) ||
+    !isDigest(statementRecord.correlationTransitionDigest) ||
+    typeof statementRecord.reportId !== 'string' ||
+    !/^report-[a-f0-9]{32}$/.test(statementRecord.reportId) ||
+    !isDigest(statementRecord.reportDigest) ||
+    !isDigest(statementRecord.reportContentDigest) ||
+    !isDigest(statementRecord.authorityProofDigest) ||
+    statementRecord.noAutoRemediation !== true ||
+    !isDigest(statementRecord.statementDigest)
+  ) {
+    throw new VerificationError(
+      'Published correlation report attestation schema is invalid.',
+    )
+  }
+  await requireDigestBoundId(
+    statementRecord,
+    ['statementId', 'statementDigest'],
+    statementRecord.statementDigest,
+    'report-publication-',
+    statementRecord.statementId,
+    cryptoProvider,
+  )
+  return {
+    statement: {
+      statementId: statementRecord.statementId,
+      incidentId: statementRecord.incidentId,
+      incidentTransitionId: statementRecord.incidentTransitionId,
+      incidentRevision: statementRecord.incidentRevision,
+      incidentStateResultDigest:
+        statementRecord.incidentStateResultDigest,
+      incidentStateReference: parseReference(
+        statementRecord.incidentStateReference,
+      ),
+      incidentStateAttestationReference: parseReference(
+        statementRecord.incidentStateAttestationReference,
+      ),
+      incidentSubjectId: statementRecord.incidentSubjectId,
+      incidentSubjectDigest: statementRecord.incidentSubjectDigest,
+      incidentBoundRequestId: statementRecord.incidentBoundRequestId,
+      incidentBoundRequestDigest:
+        statementRecord.incidentBoundRequestDigest,
+      correlationRequestDigest: statementRecord.correlationRequestDigest,
+      correlationTransitionDigest:
+        statementRecord.correlationTransitionDigest,
+      reportId: statementRecord.reportId,
+      reportDigest: statementRecord.reportDigest,
+      reportContentDigest: statementRecord.reportContentDigest,
+      authorityProofDigest: statementRecord.authorityProofDigest,
+      statementDigest: statementRecord.statementDigest,
+    },
+    statementBytes: new TextEncoder().encode(
+      `${canonicalizeJson(statementRecord)}\n`,
+    ),
+    attestation: {
+      signatureAlgorithm: 'RS256',
+      keyVaultKeyId: record.keyVaultKeyId,
+      signedPreimageDigest: record.signedPreimageDigest,
+      detachedSignature: record.detachedSignature,
+    },
+  }
+}
+
 const parseFeedIndex = (
   record: Record<string, JsonValue>,
 ): {
   active: ParsedFeedEntry[]
+  recentlyResolved: ParsedFeedEntry[]
   sourceActiveIndexDigest: Sha256Digest
   indexAttestationPath: string
   keyId: string
@@ -792,6 +1416,15 @@ const parseFeedIndex = (
     record.active.length > 64 ||
     !Array.isArray(record.recentlyResolved) ||
     record.recentlyResolved.length > 64 ||
+    !isTimestamp(record.resolvedRetentionStart) ||
+    typeof record.resolvedHistoryTruncated !== 'boolean' ||
+    typeof record.resolvedHistoryTotalCount !== 'number' ||
+    !Number.isInteger(record.resolvedHistoryTotalCount) ||
+    record.resolvedHistoryTotalCount < 0 ||
+    (record.omittedResolvedCount !== undefined &&
+      (typeof record.omittedResolvedCount !== 'number' ||
+        !Number.isInteger(record.omittedResolvedCount) ||
+        record.omittedResolvedCount < 1)) ||
     !isDigest(record.sourceActiveIndexDigest) ||
     typeof record.keyId !== 'string' ||
     !isDigest(record.keyFingerprint) ||
@@ -806,18 +1439,60 @@ const parseFeedIndex = (
   const active = record.active.map(parseFeedEntry)
   const resolved = record.recentlyResolved.map(parseFeedEntry)
   const activeIds = active.map((entry) => entry.incidentId)
+  const resolvedKeys = resolved.map(
+    (entry) => `${entry.updatedAt}\0${entry.incidentId}\0${entry.stateResultDigest}`,
+  )
+  const expectedResolvedKeys = [...resolvedKeys].sort((left, right) => {
+    const [leftUpdatedAt, leftId, leftDigest] = left.split('\0')
+    const [rightUpdatedAt, rightId, rightDigest] = right.split('\0')
+    return (
+      rightUpdatedAt!.localeCompare(leftUpdatedAt!) ||
+      leftId!.localeCompare(rightId!) ||
+      leftDigest!.localeCompare(rightDigest!)
+    )
+  })
+  const omittedResolvedCount =
+    typeof record.omittedResolvedCount === 'number'
+      ? record.omittedResolvedCount
+      : 0
   if (
     active.some((entry) => entry.lifecycle !== 'active') ||
     activeIds.join('\0') !== [...activeIds].sort().join('\0') ||
     new Set(activeIds).size !== activeIds.length ||
     resolved.some((entry) => entry.lifecycle !== 'resolved') ||
     new Set(resolved.map((entry) => entry.incidentId)).size !== resolved.length ||
-    resolved.some((entry) => activeIds.includes(entry.incidentId))
+    resolved.some((entry) => activeIds.includes(entry.incidentId)) ||
+    resolvedKeys.join('\0') !== expectedResolvedKeys.join('\0') ||
+    Date.parse(record.resolvedRetentionStart as string) >
+      Date.parse(record.publishedAt as string) ||
+    active.some(
+      (entry) =>
+        Date.parse(entry.updatedAt) > Date.parse(record.publishedAt as string),
+    ) ||
+    resolved.some(
+      (entry) =>
+        Date.parse(entry.updatedAt) <
+          Date.parse(record.resolvedRetentionStart as string) ||
+        Date.parse(entry.updatedAt) > Date.parse(record.publishedAt as string),
+    ) ||
+    record.resolvedHistoryTotalCount !==
+      resolved.length + omittedResolvedCount ||
+    record.resolvedHistoryTruncated !==
+      (record.omittedResolvedCount !== undefined) ||
+    record.resolvedHistoryTruncated !==
+      (record.resolvedHistoryTotalCount > resolved.length) ||
+    (record.resolvedHistoryTruncated &&
+      (resolved.length === 0 ||
+        Date.parse(record.resolvedRetentionStart as string) !==
+          Math.min(...resolved.map((entry) => Date.parse(entry.updatedAt)))))
   ) {
-    throw new VerificationError('Incident feed v2 active entries are not deterministic.')
+    throw new VerificationError(
+      'Incident feed v2 lifecycle entries are not deterministic.',
+    )
   }
   return {
     active,
+    recentlyResolved: resolved,
     sourceActiveIndexDigest: record.sourceActiveIndexDigest,
     indexAttestationPath: record.indexAttestationPath,
     keyId: record.keyId,
@@ -1085,6 +1760,7 @@ const parseEnrichmentManifest = async (
   return {
     enrichmentId: record.enrichmentId,
     incidentId: record.incidentId,
+    incidentTransitionId: record.incidentTransitionId as string,
     incidentRevision: record.incidentRevision as number,
     incidentStateResultDigest: record.incidentStateResultDigest,
     incidentStateReference: stateReference,
@@ -1094,10 +1770,23 @@ const parseEnrichmentManifest = async (
     incidentBoundRequestId: record.incidentBoundRequestId as string,
     incidentBoundRequestDigest: record.incidentBoundRequestDigest as Sha256Digest,
     correlationReportAsset: {
+      incidentTransitionId: report.incidentTransitionId,
+      incidentRevision: report.incidentRevision,
+      incidentStateResultDigest: report.incidentStateResultDigest,
+      incidentSubjectId: report.incidentSubjectId,
+      incidentSubjectDigest: report.incidentSubjectDigest,
+      incidentBoundRequestId: report.incidentBoundRequestId,
+      incidentBoundRequestDigest: report.incidentBoundRequestDigest,
       reportId: report.reportId,
       reportDigest: report.reportDigest,
+      reportContentDigest: report.reportContentDigest,
+      authorityProofDigest: report.authorityProofDigest,
       correlationRequestDigest: report.correlationRequestDigest,
       correlationTransitionDigest: report.correlationTransitionDigest,
+      publicationStatementId: report.publicationStatementId,
+      publicationStatementDigest: report.publicationStatementDigest,
+      reportReference: report.reportReference,
+      attestationReference: report.attestationReference,
     },
     guidanceAsset: {
       guidanceId: guidance.guidanceId,
@@ -1121,8 +1810,14 @@ const parseEnrichmentManifest = async (
     incidentBoundRequestDigest: Sha256Digest
     reportId: string
     reportDigest: Sha256Digest
+    reportContentDigest: Sha256Digest
+    authorityProofDigest: Sha256Digest
     correlationRequestDigest: Sha256Digest
     correlationTransitionDigest: Sha256Digest
+    publicationStatementId: string
+    publicationStatementDigest: Sha256Digest
+    reportReference: VersionPinnedReference
+    attestationReference: VersionPinnedReference
   }> {
     const record = requireRecord(value)
     requireExactKeys(record, [
@@ -1170,7 +1865,13 @@ const parseEnrichmentManifest = async (
       typeof record.reportId !== 'string' ||
       !/^report-[a-f0-9]{32}$/.test(record.reportId) ||
       !isDigest(record.reportDigest) ||
-      !isDigest(record.reportContentDigest)
+      !isDigest(record.reportContentDigest) ||
+      typeof record.publicationStatementId !== 'string' ||
+      !/^report-publication-[a-f0-9]{32}$/.test(
+        record.publicationStatementId,
+      ) ||
+      !isDigest(record.publicationStatementDigest) ||
+      !isDigest(record.authorityProofDigest)
     ) {
       throw new VerificationError('Published correlation report reference is invalid.')
     }
@@ -1212,8 +1913,14 @@ const parseEnrichmentManifest = async (
       incidentBoundRequestDigest: record.incidentBoundRequestDigest,
       reportId: record.reportId,
       reportDigest: record.reportDigest,
+      reportContentDigest: record.reportContentDigest,
+      authorityProofDigest: record.authorityProofDigest,
       correlationRequestDigest: record.correlationRequestDigest,
       correlationTransitionDigest: record.correlationTransitionDigest,
+      publicationStatementId: record.publicationStatementId,
+      publicationStatementDigest: record.publicationStatementDigest,
+      reportReference,
+      attestationReference,
     }
   }
 
@@ -2341,6 +3048,8 @@ const trustAnchorsFromEnvironment = (): NonNullable<GuidanceLoadOptions['anchors
   const values = {
     keyId: environment.VITE_WC027_FEED_KEY_ID,
     fingerprint: environment.VITE_WC027_FEED_KEY_FINGERPRINT,
+    reportKeyId: environment.VITE_WC027_REPORT_KEY_ID,
+    reportFingerprint: environment.VITE_WC027_REPORT_KEY_FINGERPRINT,
     enrichmentKeyId: environment.VITE_WC027_ENRICHMENT_KEY_ID,
     enrichmentFingerprint: environment.VITE_WC027_ENRICHMENT_KEY_FINGERPRINT,
     guidanceKeyId: environment.VITE_WC027_GUIDANCE_KEY_ID,
@@ -2349,6 +3058,8 @@ const trustAnchorsFromEnvironment = (): NonNullable<GuidanceLoadOptions['anchors
   if (
     !values.keyId ||
     !isDigest(values.fingerprint) ||
+    !values.reportKeyId ||
+    !isDigest(values.reportFingerprint) ||
     !values.enrichmentKeyId ||
     !isDigest(values.enrichmentFingerprint) ||
     !values.guidanceKeyId ||
@@ -2361,6 +3072,8 @@ const trustAnchorsFromEnvironment = (): NonNullable<GuidanceLoadOptions['anchors
   return {
     keyId: values.keyId,
     fingerprint: values.fingerprint,
+    reportKeyId: values.reportKeyId,
+    reportFingerprint: values.reportFingerprint,
     enrichmentKeyId: values.enrichmentKeyId,
     enrichmentFingerprint: values.enrichmentFingerprint,
     guidanceKeyId: values.guidanceKeyId,

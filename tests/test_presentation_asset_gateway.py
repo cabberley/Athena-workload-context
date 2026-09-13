@@ -886,6 +886,7 @@ def _feed_v2_gateway_fixture():
         "feed_index_attestation": feed_index_attestation,
         "feed_private": feed_private,
         "feed_trust": feed_trust,
+        "report_trust": report_trust,
         "enrichment_trust": enrichment_trust,
         "guidance_trust": guidance_trust,
         "lifecycle_private": lifecycle_private,
@@ -1184,6 +1185,7 @@ def test_gateway_serves_only_fully_verified_feed_v2_assets_by_exact_version() ->
     ("path", "trust_name"),
     [
         ("/trust/wc027-feed-public-key.jwk.json", "feed_trust"),
+        ("/trust/wc027-report-public-key.jwk.json", "report_trust"),
         ("/trust/wc027-enrichment-public-key.jwk.json", "enrichment_trust"),
         ("/trust/wc027-guidance-public-key.jwk.json", "guidance_trust"),
     ],

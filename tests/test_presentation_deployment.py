@@ -29,6 +29,7 @@ def test_presentation_image_is_reproducible_and_runs_unprivileged() -> None:
     )
     assert "npm ci --ignore-scripts --no-audit --fund=false" in dockerfile
     assert "ARG VITE_WC027_FEED_KEY_ID" in dockerfile
+    assert "VITE_WC027_REPORT_KEY_FINGERPRINT" in dockerfile
     assert "VITE_WC027_GUIDANCE_KEY_FINGERPRINT" in dockerfile
     assert "RUN npm run build" in dockerfile
     assert "COPY --from=build --chown=101:101 /app/dist" in dockerfile
@@ -61,7 +62,7 @@ def test_presentation_nginx_preserves_json_and_security_boundaries() -> None:
     assert "location = /runtime-manifest.json" in nginx
     assert "location ^~ /live/" in nginx
     assert "location ^~ /incidents/" in nginx
-    assert "wc027-(feed|enrichment|guidance)-public-key" in nginx
+    assert "wc027-(feed|report|enrichment|guidance)-public-key" in nginx
     assert nginx.count("proxy_pass http://127.0.0.1:8081") == 4
     assert 'proxy_set_header Authorization ""' in nginx
     assert 'proxy_set_header Cookie ""' in nginx

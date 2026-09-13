@@ -14,6 +14,7 @@ import {
   fetchBoundedJsonAsset,
   requireContentDigest,
   resolveSameOriginAssetUrl,
+  type BoundedJsonAsset,
   type LoadPresentationOptions,
 } from './runtime'
 
@@ -130,14 +131,42 @@ export interface VerifiedIncident {
   keyFingerprint: Sha256Digest
   occurrence?: {
     statePath: string
+    stateVersion?: string
     stateSha256: Sha256Digest
     attestationPath: string
+    attestationVersion?: string
     attestationSha256: Sha256Digest
     pointerPath: string
+    pointerVersion?: string
     pointerSha256: Sha256Digest
     pointerAttestationPath: string
+    pointerAttestationVersion?: string
     pointerAttestationSha256: Sha256Digest
   }
+}
+
+export interface IncidentOccurrenceReference {
+  name: string
+  version: string
+  contentDigest: Sha256Digest
+}
+
+export interface IncidentOccurrenceAssets {
+  state: BoundedJsonAsset
+  stateAttestation: BoundedJsonAsset
+  pointer: BoundedJsonAsset
+  pointerAttestation: BoundedJsonAsset
+}
+
+export interface IncidentOccurrenceExpectation {
+  incidentId: string
+  lifecycle: IncidentLifecycle
+  stateResultDigest: Sha256Digest
+  updatedAt: string
+  stateReference: IncidentOccurrenceReference
+  stateAttestationReference: IncidentOccurrenceReference
+  pointerReference: IncidentOccurrenceReference
+  pointerAttestationReference: IncidentOccurrenceReference
 }
 
 export interface VerifiedIncidentFeed {
@@ -356,6 +385,106 @@ const loadVerifiedIncidentEntry = async (
         pointerAttestationAsset.bytes,
         cryptoProvider,
       ),
+    },
+  }
+}
+
+export const verifyIncidentOccurrenceAssets = async (
+  assets: IncidentOccurrenceAssets,
+  expected: IncidentOccurrenceExpectation,
+  publicKeyValue: unknown,
+  cryptoProvider: Crypto = globalThis.crypto,
+): Promise<VerifiedIncident> => {
+  const key = parsePresentationPublicKey(publicKeyValue)
+  await Promise.all([
+    requireContentDigest(
+      assets.pointer.bytes,
+      expected.pointerReference.contentDigest,
+      cryptoProvider,
+      'incident pointer',
+    ),
+    requireContentDigest(
+      assets.pointerAttestation.bytes,
+      expected.pointerAttestationReference.contentDigest,
+      cryptoProvider,
+      'incident attestation',
+    ),
+    requireContentDigest(
+      assets.state.bytes,
+      expected.stateReference.contentDigest,
+      cryptoProvider,
+      'incident state',
+    ),
+    requireContentDigest(
+      assets.stateAttestation.bytes,
+      expected.stateAttestationReference.contentDigest,
+      cryptoProvider,
+      'incident attestation',
+    ),
+  ])
+  const pointer = parseIncidentPointer(assets.pointer.value)
+  const pointerAttestation = parseIncidentPointerAttestation(
+    assets.pointerAttestation.value,
+  )
+  const state = parseIncidentState(assets.state.value)
+  const attestation = parseIncidentAttestation(assets.stateAttestation.value)
+  const importedKey = await verifySignedBytes(
+    assets.pointer.bytes,
+    pointerAttestation.pointerDigest,
+    pointerAttestation.detachedSignature,
+    pointer.keyId,
+    pointer.keyFingerprint,
+    pointerAttestation.keyVaultKeyId,
+    key,
+    cryptoProvider,
+    'Incident pointer',
+  )
+  await verifyIncident(
+    pointer,
+    state,
+    attestation,
+    key,
+    cryptoProvider,
+    importedKey,
+  )
+  if (
+    pointer.incidentId !== expected.incidentId ||
+    state.incidentId !== expected.incidentId ||
+    state.lifecycle !== expected.lifecycle ||
+    state.resultDigest !== expected.stateResultDigest ||
+    state.updatedAt !== expected.updatedAt ||
+    removeRelativePrefix(pointer.statePath) !== expected.stateReference.name ||
+    pointer.stateSha256 !== expected.stateReference.contentDigest ||
+    removeRelativePrefix(pointer.attestationPath) !==
+      expected.stateAttestationReference.name ||
+    pointer.attestationSha256 !==
+      expected.stateAttestationReference.contentDigest ||
+    removeRelativePrefix(pointer.pointerAttestationPath) !==
+      expected.pointerAttestationReference.name
+  ) {
+    throw new VerificationError(
+      'Incident occurrence does not match its signed v2 references.',
+    )
+  }
+  return {
+    state,
+    publishedAt: pointer.publishedAt,
+    keyFingerprint: key.fingerprint,
+    occurrence: {
+      statePath: expected.stateReference.name,
+      stateVersion: expected.stateReference.version,
+      stateSha256: expected.stateReference.contentDigest,
+      attestationPath: expected.stateAttestationReference.name,
+      attestationVersion: expected.stateAttestationReference.version,
+      attestationSha256: expected.stateAttestationReference.contentDigest,
+      pointerPath: expected.pointerReference.name,
+      pointerVersion: expected.pointerReference.version,
+      pointerSha256: expected.pointerReference.contentDigest,
+      pointerAttestationPath: expected.pointerAttestationReference.name,
+      pointerAttestationVersion:
+        expected.pointerAttestationReference.version,
+      pointerAttestationSha256:
+        expected.pointerAttestationReference.contentDigest,
     },
   }
 }
