@@ -75,7 +75,9 @@ registry addition does not invalidate an already committed candidate, but no ent
 in that candidate can be older than its current v1 occurrence. If a signed concurrent winner fails
 that check, the publisher uses the winner's ETag to replace it with a verified candidate whose
 publication timestamp is at least one millisecond newer; it never treats the invalid winner's
-timestamp as authority.
+timestamp as authority. The publisher reads the signed v1 source again after per-entry occurrence
+validation and immediately before acceptance, so an active-set change during validation restarts
+the bounded publication attempt rather than accepting the older mirror.
 
 The registry keeps a reserved capacity metadata row in the same partition. New incident rows are
 created in one Azure Table transaction with an ETag-conditional retained-count increment. Expiry

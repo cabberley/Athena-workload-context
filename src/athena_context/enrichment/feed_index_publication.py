@@ -386,6 +386,9 @@ class IncidentFeedIndexPublicationService:
                     ),
                     current,
                 )
+            confirmed_source = self._read_source_authority()
+            if confirmed_source.payload_sha256 != latest_source.payload_sha256:
+                return False
         except (
             IncidentFeedRegistryConflictError,
             IncidentFeedRegistryIncompleteError,
