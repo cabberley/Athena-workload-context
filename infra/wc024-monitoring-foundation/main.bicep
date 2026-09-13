@@ -156,6 +156,7 @@ var resourceTags = union(tags, {
 })
 var legacyFlowLogStorageAccountName = 'athenahackathonflowwhtco'
 var workloadResourceGroupId = '${subscription().id}/resourceGroups/${workloadResourceGroupName}'
+var legacyFlowLogStorageAccountResourceId = '${workloadResourceGroupId}/providers/Microsoft.Storage/storageAccounts/${legacyFlowLogStorageAccountName}'
 var reviewedWorkloadVirtualNetworkResourceId = '${workloadResourceGroupId}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet'
 var reviewedWorkloadPrivateEndpointSubnetResourceId = '${reviewedWorkloadVirtualNetworkResourceId}/subnets/snet-paas-private-endpoints'
 var reviewedCollectorRuntimeVirtualNetworkResourceId = '${monitoringResourceGroup.id}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet'
@@ -449,6 +450,7 @@ module legacyFlowLogMigration 'modules/legacy-flow-log-migration.bicep' = {
     canonicalVnetFlowLogName: flowLogName
     workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
     replacementStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+    legacyFlowLogStorageAccountResourceId: legacyFlowLogStorageAccountResourceId
     legacyFlowLogNames: legacyFlowLogNames
     legacyFlowLogTargetResourceIds: legacyFlowLogTargetResourceIds
     canonicalVnetFlowLogCutoverConfirmed: canonicalVnetFlowLogCutoverConfirmed

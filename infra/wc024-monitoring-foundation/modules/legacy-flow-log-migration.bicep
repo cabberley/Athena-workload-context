@@ -12,6 +12,9 @@ param workloadVirtualNetworkResourceId string
 @description('Replacement monitoring storage account configured on disabled redundant flow logs.')
 param replacementStorageAccountResourceId string
 
+@description('Retained legacy storage account that every reviewed redundant flow log must currently use.')
+param legacyFlowLogStorageAccountResourceId string
+
 @description('Explicit reviewed names of redundant subnet or NIC flow logs to disable.')
 @maxLength(32)
 param legacyFlowLogNames array = []
@@ -23,7 +26,91 @@ param legacyFlowLogTargetResourceIds array = []
 @description('Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage.')
 param canonicalVnetFlowLogCutoverConfirmed bool = false
 
-var reviewedLegacyFlowLogMigrationAllowlist = []
+@description('Exact subscription approved for destructive WC-024 legacy flow-log cutover.')
+@allowed([
+  'a6add389-9978-47ac-ab1e-a09212e321d4'
+])
+param expectedSubscriptionId string = 'a6add389-9978-47ac-ab1e-a09212e321d4'
+
+var legacyFlowLogMigrationRequested = !empty(legacyFlowLogNames) || !empty(legacyFlowLogTargetResourceIds)
+var validatedMigrationSubscriptionId = !legacyFlowLogMigrationRequested || toLower(subscription().subscriptionId) == toLower(expectedSubscriptionId)
+  ? subscription().subscriptionId
+  : fail('WC-024 refuses destructive legacy flow-log migration outside subscription a6add389-9978-47ac-ab1e-a09212e321d4.')
+var workloadScopeId = '/subscriptions/${validatedMigrationSubscriptionId}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network'
+var reviewedLegacyFlowLogMigrationAllowlist = [
+  {
+    name: 'snet-data-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-data'
+  }
+  {
+    name: 'athena-hackathon-web-03-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-web-03-nic'
+  }
+  {
+    name: 'athena-hackathon-ecp-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-ecp-01-nic'
+  }
+  {
+    name: 'athena-hackathon-web-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-web-01-nic'
+  }
+  {
+    name: 'snet-management-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-management'
+  }
+  {
+    name: 'athena-hackathon-ecp-02-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-ecp-02-nic'
+  }
+  {
+    name: 'snet-client-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-client'
+  }
+  {
+    name: 'athena-hackathon-iris-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-iris-01-nic'
+  }
+  {
+    name: 'snet-middle-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-middle'
+  }
+  {
+    name: 'athena-hackathon-mid-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-mid-01-nic'
+  }
+  {
+    name: 'athena-hackathon-sqlvm-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-sqlvm-01-nic'
+  }
+  {
+    name: 'athena-hackathon-mid-02-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-mid-02-nic'
+  }
+  {
+    name: 'snet-web-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-web'
+  }
+  {
+    name: 'athena-hackathon-web-02-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-web-02-nic'
+  }
+  {
+    name: 'athena-hackathon-ecp-03-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-ecp-03-nic'
+  }
+  {
+    name: 'snet-appgw-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-appgw'
+  }
+  {
+    name: 'athena-hackathon-client-01-nic-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/networkInterfaces/athena-hackathon-client-01-nic'
+  }
+  {
+    name: 'snet-paas-private-endpoints-rg-athena-demo-workload-flowlog'
+    targetResourceId: '${workloadScopeId}/virtualNetworks/athena-hackathon-vnet/subnets/snet-paas-private-endpoints'
+  }
+]
 var requestedLegacyFlowLogMigrations = [
   for (flowLogName, index) in legacyFlowLogNames: {
     name: string(flowLogName)
@@ -56,9 +143,9 @@ resource legacyFlowLogs 'Microsoft.Network/networkWatchers/flowLogs@2024-10-01' 
     parent: networkWatcher
     name: legacyFlowLogMigration.name
     properties: {
-      targetResourceId: toLower(existingLegacyFlowLogs[index].properties.targetResourceId) == toLower(legacyFlowLogMigration.targetResourceId)
+      targetResourceId: toLower(existingLegacyFlowLogs[index].properties.targetResourceId) == toLower(legacyFlowLogMigration.targetResourceId) && toLower(existingLegacyFlowLogs[index].properties.storageId) == toLower(legacyFlowLogStorageAccountResourceId)
         ? legacyFlowLogMigration.targetResourceId
-        : fail('WC-024 refuses to disable a legacy flow log unless its existing target matches the reviewed allowlist.')
+        : fail('WC-024 refuses to disable a legacy flow log unless its existing target and storage account match the reviewed allowlist.')
       storageId: replacementStorageAccountResourceId
       enabled: false
       retentionPolicy: {

@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.46.1.21595",
-      "templateHash": "9619163693346661893"
+      "version": "0.47.16.16243",
+      "templateHash": "9806382250234680749"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -259,6 +259,7 @@
     "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-foundation', 'dataBoundary', 'customer', 'managedBy', 'bicep', 'autoRemediation', 'disabled'))]",
     "legacyFlowLogStorageAccountName": "athenahackathonflowwhtco",
     "workloadResourceGroupId": "[format('{0}/resourceGroups/{1}', subscription().id, parameters('workloadResourceGroupName'))]",
+    "legacyFlowLogStorageAccountResourceId": "[format('{0}/providers/Microsoft.Storage/storageAccounts/{1}', variables('workloadResourceGroupId'), variables('legacyFlowLogStorageAccountName'))]",
     "reviewedWorkloadVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-hackathon-vnet', variables('workloadResourceGroupId'))]",
     "reviewedWorkloadPrivateEndpointSubnetResourceId": "[format('{0}/subnets/snet-paas-private-endpoints', variables('reviewedWorkloadVirtualNetworkResourceId'))]",
     "reviewedCollectorRuntimeVirtualNetworkResourceId": "[format('{0}/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet', subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName')))]",
@@ -320,8 +321,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "4369675104337263051"
+              "version": "0.47.16.16243",
+              "templateHash": "12817270980753413314"
             }
           },
           "parameters": {
@@ -555,8 +556,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "6397905042430153369"
+              "version": "0.47.16.16243",
+              "templateHash": "17886717475082721944"
             }
           },
           "parameters": {
@@ -660,8 +661,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "6383098833510535370"
+              "version": "0.47.16.16243",
+              "templateHash": "10675200379595738102"
             }
           },
           "parameters": {
@@ -746,8 +747,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "17320524381455678"
+              "version": "0.47.16.16243",
+              "templateHash": "17028599297377017462"
             }
           },
           "parameters": {
@@ -848,8 +849,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "6567595471956446979"
+              "version": "0.47.16.16243",
+              "templateHash": "18251498067967347102"
             }
           },
           "parameters": {
@@ -943,8 +944,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "6567595471956446979"
+              "version": "0.47.16.16243",
+              "templateHash": "18251498067967347102"
             }
           },
           "parameters": {
@@ -1038,8 +1039,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "2404189933027721780"
+              "version": "0.47.16.16243",
+              "templateHash": "15648944633450849517"
             }
           },
           "parameters": {
@@ -1105,8 +1106,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "16200640404122625272"
+              "version": "0.47.16.16243",
+              "templateHash": "17892454804658408826"
             }
           },
           "parameters": {
@@ -1314,8 +1315,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "449272939311603736"
+              "version": "0.47.16.16243",
+              "templateHash": "12028447168836524437"
             }
           },
           "parameters": {
@@ -1532,8 +1533,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "4041444995268874517"
+              "version": "0.47.16.16243",
+              "templateHash": "2250143350264371867"
             }
           },
           "parameters": {
@@ -1842,8 +1843,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "13200925371298447078"
+              "version": "0.47.16.16243",
+              "templateHash": "13274190546913783468"
             }
           },
           "parameters": {
@@ -1955,8 +1956,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "13200925371298447078"
+              "version": "0.47.16.16243",
+              "templateHash": "13274190546913783468"
             }
           },
           "parameters": {
@@ -2068,8 +2069,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "1599032489780171083"
+              "version": "0.47.16.16243",
+              "templateHash": "7470580027314832123"
             }
           },
           "parameters": {
@@ -2146,8 +2147,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "577769006377817568"
+              "version": "0.47.16.16243",
+              "templateHash": "10522317729845480334"
             }
           },
           "parameters": {
@@ -2343,8 +2344,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "5041225840290691506"
+              "version": "0.47.16.16243",
+              "templateHash": "15597984433834407232"
             }
           },
           "parameters": {
@@ -2488,8 +2489,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "14580665417408480955"
+              "version": "0.47.16.16243",
+              "templateHash": "15580035303381340434"
             }
           },
           "parameters": {
@@ -2575,8 +2576,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "13232665487552878237"
+              "version": "0.47.16.16243",
+              "templateHash": "1322812408753627512"
             }
           },
           "parameters": {
@@ -2705,8 +2706,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "15752322013193089179"
+              "version": "0.47.16.16243",
+              "templateHash": "7250242578401041075"
             }
           },
           "parameters": {
@@ -2788,6 +2789,9 @@
           "replacementStorageAccountResourceId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
           },
+          "legacyFlowLogStorageAccountResourceId": {
+            "value": "[variables('legacyFlowLogStorageAccountResourceId')]"
+          },
           "legacyFlowLogNames": {
             "value": "[parameters('legacyFlowLogNames')]"
           },
@@ -2804,8 +2808,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "13925719048038281809"
+              "version": "0.47.16.16243",
+              "templateHash": "5421646249562906296"
             }
           },
           "parameters": {
@@ -2833,6 +2837,12 @@
                 "description": "Replacement monitoring storage account configured on disabled redundant flow logs."
               }
             },
+            "legacyFlowLogStorageAccountResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Retained legacy storage account that every reviewed redundant flow log must currently use."
+              }
+            },
             "legacyFlowLogNames": {
               "type": "array",
               "defaultValue": [],
@@ -2854,6 +2864,16 @@
               "defaultValue": false,
               "metadata": {
                 "description": "Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage."
+              }
+            },
+            "expectedSubscriptionId": {
+              "type": "string",
+              "defaultValue": "a6add389-9978-47ac-ab1e-a09212e321d4",
+              "allowedValues": [
+                "a6add389-9978-47ac-ab1e-a09212e321d4"
+              ],
+              "metadata": {
+                "description": "Exact subscription approved for destructive WC-024 legacy flow-log cutover."
               }
             }
           },
@@ -2878,7 +2898,83 @@
                 "input": "[format('{0}|{1}', toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].name), toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].targetResourceId))]"
               }
             ],
-            "reviewedLegacyFlowLogMigrationAllowlist": [],
+            "legacyFlowLogMigrationRequested": "[or(not(empty(parameters('legacyFlowLogNames'))), not(empty(parameters('legacyFlowLogTargetResourceIds'))))]",
+            "validatedMigrationSubscriptionId": "[if(or(not(variables('legacyFlowLogMigrationRequested')), equals(toLower(subscription().subscriptionId), toLower(parameters('expectedSubscriptionId')))), subscription().subscriptionId, fail('WC-024 refuses destructive legacy flow-log migration outside subscription a6add389-9978-47ac-ab1e-a09212e321d4.'))]",
+            "workloadScopeId": "[format('/subscriptions/{0}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network', variables('validatedMigrationSubscriptionId'))]",
+            "reviewedLegacyFlowLogMigrationAllowlist": [
+              {
+                "name": "snet-data-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-data', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-03-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-03-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-management-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-management', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-client-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-client', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-iris-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-iris-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-middle-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-middle', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-mid-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-mid-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-sqlvm-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-sqlvm-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-mid-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-mid-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-web-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-web', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-web-02-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-web-02-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-ecp-03-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-ecp-03-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-appgw-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-appgw', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "athena-hackathon-client-01-nic-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/networkInterfaces/athena-hackathon-client-01-nic', variables('workloadScopeId'))]"
+              },
+              {
+                "name": "snet-paas-private-endpoints-rg-athena-demo-workload-flowlog",
+                "targetResourceId": "[format('{0}/virtualNetworks/athena-hackathon-vnet/subnets/snet-paas-private-endpoints', variables('workloadScopeId'))]"
+              }
+            ],
             "unreviewedLegacyFlowLogMigrationPairs": "[filter(variables('requestedLegacyFlowLogMigrationPairs'), lambda('requestedPair', not(contains(variables('reviewedLegacyFlowLogMigrationPairs'), lambdaVariables('requestedPair')))))]",
             "legacyFlowLogMigrationIsValid": "[and(and(and(and(equals(length(parameters('legacyFlowLogNames')), length(parameters('legacyFlowLogTargetResourceIds'))), empty(variables('unreviewedLegacyFlowLogMigrationPairs'))), not(contains(map(parameters('legacyFlowLogNames'), lambda('flowLogName', toLower(string(lambdaVariables('flowLogName'))))), toLower(parameters('canonicalVnetFlowLogName'))))), not(contains(map(parameters('legacyFlowLogTargetResourceIds'), lambda('targetResourceId', toLower(string(lambdaVariables('targetResourceId'))))), toLower(parameters('workloadVirtualNetworkResourceId'))))), or(empty(parameters('legacyFlowLogNames')), parameters('canonicalVnetFlowLogCutoverConfirmed')))]",
             "validatedLegacyFlowLogMigrations": "[if(variables('legacyFlowLogMigrationIsValid'), variables('requestedLegacyFlowLogMigrations'), fail('legacy flow-log migration requires exact reviewed name/target allowlist entries, paired non-VNet targets, and explicit canonical VNet cutover confirmation'))]"
@@ -2893,7 +2989,7 @@
               "apiVersion": "2024-10-01",
               "name": "[format('{0}/{1}', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name)]",
               "properties": {
-                "targetResourceId": "[if(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').targetResourceId), toLower(variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId)), variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId, fail('WC-024 refuses to disable a legacy flow log unless its existing target matches the reviewed allowlist.'))]",
+                "targetResourceId": "[if(and(equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').targetResourceId), toLower(variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId)), equals(toLower(reference(resourceId('Microsoft.Network/networkWatchers/flowLogs', parameters('networkWatcherName'), variables('validatedLegacyFlowLogMigrations')[copyIndex()].name), '2024-10-01').storageId), toLower(parameters('legacyFlowLogStorageAccountResourceId')))), variables('validatedLegacyFlowLogMigrations')[copyIndex()].targetResourceId, fail('WC-024 refuses to disable a legacy flow log unless its existing target and storage account match the reviewed allowlist.'))]",
                 "storageId": "[parameters('replacementStorageAccountResourceId')]",
                 "enabled": false,
                 "retentionPolicy": {
@@ -2949,8 +3045,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "4823651825761740486"
+              "version": "0.47.16.16243",
+              "templateHash": "11237901168290807673"
             }
           },
           "parameters": {
@@ -3067,8 +3163,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.46.1.21595",
-              "templateHash": "15840254971182150037"
+              "version": "0.47.16.16243",
+              "templateHash": "10423739166847973845"
             }
           },
           "parameters": {

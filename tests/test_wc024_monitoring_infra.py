@@ -333,7 +333,9 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
     assert "legacyFlowLogNames" in MAIN
     assert "legacyFlowLogTargetResourceIds" in MAIN
     assert "reviewedLegacyFlowLogMigrationAllowlist" not in MAIN
-    assert "var reviewedLegacyFlowLogMigrationAllowlist = []" in LEGACY_FLOW_LOG_MIGRATION
+    assert "var reviewedLegacyFlowLogMigrationAllowlist = [" in LEGACY_FLOW_LOG_MIGRATION
+    assert LEGACY_FLOW_LOG_MIGRATION.count("targetResourceId: '${workloadScopeId}") == 18
+    assert "legacyFlowLogStorageAccountResourceId" in LEGACY_FLOW_LOG_MIGRATION
     assert "canonicalVnetFlowLogCutoverConfirmed" in MAIN
     assert "dependsOn: [\n    vnetFlowLog\n  ]" in MAIN
     assert "@maxLength(32)" in LEGACY_FLOW_LOG_MIGRATION
@@ -344,14 +346,49 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
     assert "unreviewedLegacyFlowLogMigrationPairs" in LEGACY_FLOW_LOG_MIGRATION
     assert "existingLegacyFlowLogs" in LEGACY_FLOW_LOG_MIGRATION
     assert "properties.targetResourceId" in LEGACY_FLOW_LOG_MIGRATION
-    assert "existing target matches the reviewed allowlist" in LEGACY_FLOW_LOG_MIGRATION
+    assert "existing target and storage account match the reviewed allowlist" in (
+        LEGACY_FLOW_LOG_MIGRATION
+    )
     assert "toLower(canonicalVnetFlowLogName)" in (
         LEGACY_FLOW_LOG_MIGRATION
     )
     assert "canonicalVnetFlowLogCutoverConfirmed" in LEGACY_FLOW_LOG_MIGRATION
+    assert "a6add389-9978-47ac-ab1e-a09212e321d4" in LEGACY_FLOW_LOG_MIGRATION
+    assert "validatedMigrationSubscriptionId" in LEGACY_FLOW_LOG_MIGRATION
+    assert "legacyFlowLogMigrationRequested" in LEGACY_FLOW_LOG_MIGRATION
+    assert "refuses destructive legacy flow-log migration outside subscription" in (
+        LEGACY_FLOW_LOG_MIGRATION
+    )
     assert "enabled: false" in LEGACY_FLOW_LOG_MIGRATION
     assert "storageId: replacementStorageAccountResourceId" in LEGACY_FLOW_LOG_MIGRATION
     assert "delete" not in LEGACY_FLOW_LOG_MIGRATION.lower()
+
+
+def test_wc024_legacy_flow_log_cutover_rejects_unapproved_subscription() -> None:
+    approved_subscription_id = "a6add389-9978-47ac-ab1e-a09212e321d4"
+
+    def cutover_subscription_is_valid(
+        subscription_id: str,
+        flow_log_names: list[str],
+        target_resource_ids: list[str],
+    ) -> bool:
+        migration_requested = bool(flow_log_names or target_resource_ids)
+        return not migration_requested or subscription_id.casefold() == (
+            approved_subscription_id.casefold()
+        )
+
+    assert cutover_subscription_is_valid(approved_subscription_id, ["legacy"], ["target"])
+    assert cutover_subscription_is_valid("00000000-0000-0000-0000-000000000000", [], [])
+    assert not cutover_subscription_is_valid(
+        "00000000-0000-0000-0000-000000000000",
+        ["legacy"],
+        ["target"],
+    )
+    assert not cutover_subscription_is_valid(
+        "00000000-0000-0000-0000-000000000000",
+        [],
+        ["target"],
+    )
 
 
 def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> None:
@@ -814,13 +851,54 @@ def _run_az_bicep(args: list[str], output_file: Path) -> None:
         )
 
 
+def _without_bicep_generator_metadata(value: object) -> object:
+    if isinstance(value, list):
+        return [_without_bicep_generator_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    cleaned: dict[str, object] = {}
+    for key, item in value.items():
+        if key == "metadata" and isinstance(item, dict):
+            cleaned[key] = {
+                metadata_key: _without_bicep_generator_metadata(metadata_value)
+                for metadata_key, metadata_value in item.items()
+                if metadata_key != "_generator"
+            }
+        else:
+            cleaned[key] = _without_bicep_generator_metadata(item)
+    return cleaned
+
+
 def _template_without_bicep_generator(path: Path) -> object:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, dict):
-        metadata = payload.get("metadata")
-        if isinstance(metadata, dict):
-            metadata.pop("_generator", None)
-    return payload
+    return _without_bicep_generator_metadata(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+
+
+def test_wc024_generator_metadata_normalization_is_recursive_and_only_metadata() -> None:
+    payload = {
+        "metadata": {"_generator": {"version": "0.46.1"}, "owner": "athena"},
+        "resources": [
+            {
+                "properties": {
+                    "template": {
+                        "metadata": {"_generator": {"version": "0.47.16"}},
+                        "semantic": "retained",
+                    }
+                }
+            }
+        ],
+        "_generator": "not metadata and therefore semantic",
+    }
+
+    assert _without_bicep_generator_metadata(payload) == {
+        "metadata": {"owner": "athena"},
+        "resources": [
+            {"properties": {"template": {"metadata": {}, "semantic": "retained"}}}
+        ],
+        "_generator": "not metadata and therefore semantic",
+    }
 
 
 def test_wc024_checked_in_generated_artifacts_match_current_bicep(tmp_path: Path) -> None:
