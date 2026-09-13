@@ -50,10 +50,23 @@ state digest and update time derived from its v1 pointer. An active registry row
 from v1 blocks publication until a verified resolved successor replaces it. This permits gradual
 bootstrap without ever publishing a partial active mirror.
 
-Resolved rows expire seven days after their authoritative state update. The Table adapter removes
-expired rows with ETag-conditional deletes and enforces a bounded retained-record count so expired
-history cannot permanently exhaust the registry. The complete retained set supplies the exact
-resolved total; only the newest 64 entries are exposed in the public index.
+Every active or retention-eligible resolved row must also match the incident's independently
+verified v1 `current.json` snapshot and its reconstructed `IncidentOccurrenceReceipt`. The
+producer compares lifecycle, state result digest, update time, occurrence digest, and all four
+version-pinned v1 source references. Missing, malformed, or mismatched current-occurrence
+authority blocks the complete v2 projection. This makes the signed v1 current occurrence—not the
+mutable Table row—the per-incident latest-occurrence authority and prevents a principal with
+registry-only write access from replaying an older, correctly signed resolved row. Protection
+against rollback by a principal that can also replace the signed v1 current head remains a
+separate storage-integrity concern.
+
+Resolved rows expire seven days after their authoritative state update. The producer reads expired
+rows into the bounded projection, validates them against current-occurrence authority, and only
+then passes the projection's opaque prune plan to the Table adapter for ETag-conditional deletes.
+The adapter does not accept raw records for cleanup. This order prevents an expired replay from
+being silently deleted before detection while ensuring expired history cannot permanently exhaust
+the bounded registry. The complete eligible set supplies the exact resolved total; only the newest
+64 entries are exposed in the public index.
 
 The registry keeps a reserved capacity metadata row in the same partition. New incident rows are
 created in one Azure Table transaction with an ETag-conditional retained-count increment. Expiry
