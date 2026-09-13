@@ -251,8 +251,13 @@ def _candidate_snapshot(
     records: tuple,
     published_at=PUBLISHED_AT,
     version: int = 99,
+    current_authorities: dict[str, object] | None = None,
 ) -> IncidentFeedIndexSnapshot:
-    service, _ = _service(source=source, records=records)
+    service, _ = _service(
+        source=source,
+        records=records,
+        current_authorities=current_authorities,
+    )
     index, attestation, _projection = service._build_candidate(
         source=source,
         published_at=published_at,
@@ -408,6 +413,64 @@ def test_publication_rejects_replayed_resolved_record_against_current_occurrence
         service.publish(published_at=PUBLISHED_AT)
 
     assert publisher.commits == []
+
+
+@pytest.mark.parametrize(
+    "winner_published_at",
+    (
+        PUBLISHED_AT,
+        PUBLISHED_AT + timedelta(seconds=1),
+    ),
+)
+def test_publication_replaces_invalid_same_source_winner(
+    winner_published_at,
+) -> None:
+    replayed = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=2),
+    )
+    latest = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=1),
+    )
+    source = _source(_active_index(()))
+    replayed_authority = {
+        replayed.entry.incident_id: _authority(
+            2,
+            lifecycle="resolved",
+            updated_at=replayed.entry.updated_at,
+        )
+    }
+    publisher = _Publisher()
+    publisher.current = _candidate_snapshot(
+        source=source,
+        records=(replayed,),
+        published_at=winner_published_at,
+        current_authorities=replayed_authority,
+    )
+    pointer_reader = _PointerReader([(replayed,), (latest,)])
+    service, _ = _service(
+        source=source,
+        records=(latest,),
+        publisher=publisher,
+        pointer_reader=pointer_reader,
+        current_authorities={
+            latest.entry.incident_id: _authority(
+                2,
+                lifecycle="resolved",
+                updated_at=latest.entry.updated_at,
+            )
+        },
+    )
+
+    receipt = service.publish(published_at=PUBLISHED_AT)
+
+    assert receipt.index.recently_resolved == (latest.entry,)
+    assert receipt.index.published_at > winner_published_at
+    assert len(publisher.commits) == 1
+    assert publisher.commits[0].expected_etag == '"etag-99"'
 
 
 def test_publication_prunes_only_after_verified_commit() -> None:
@@ -723,7 +786,7 @@ def test_winner_active_pointer_digest_must_match_v1_authority() -> None:
     )
 
     with pytest.raises(
-        IncidentFeedIndexPublicationConflictError,
+        IncidentFeedRegistryIncompleteError,
         match="does not match",
     ):
         service.publish(published_at=PUBLISHED_AT)

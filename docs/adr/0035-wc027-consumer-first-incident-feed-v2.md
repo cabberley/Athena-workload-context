@@ -72,7 +72,10 @@ The index publisher reads the current v1 occurrence for every retained registry 
 a candidate, revalidates every entry in a concurrent winner before accepting it, and performs
 expiry cleanup only after a verified index commit or verified-winner reconciliation. A concurrent
 registry addition does not invalidate an already committed candidate, but no entry already present
-in that candidate can be older than its current v1 occurrence.
+in that candidate can be older than its current v1 occurrence. If a signed concurrent winner fails
+that check, the publisher uses the winner's ETag to replace it with a verified candidate whose
+publication timestamp is at least one millisecond newer; it never treats the invalid winner's
+timestamp as authority.
 
 The registry keeps a reserved capacity metadata row in the same partition. New incident rows are
 created in one Azure Table transaction with an ETag-conditional retained-count increment. Expiry

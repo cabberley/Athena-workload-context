@@ -4,7 +4,7 @@ import base64
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
 from athena_context.artifacts import (
@@ -150,20 +150,6 @@ class IncidentFeedIndexPublicationService:
         _require_canonical_timestamp(published_at)
         for _attempt in range(MAX_FEED_V2_PUBLICATION_ATTEMPTS):
             source = self._read_source_authority()
-            if published_at < source.index.published_at:
-                winner = self.publisher.read_current()
-                if winner is not None:
-                    winner_pointers = self._verify_snapshot(winner)
-                    if (
-                        winner.index.source_active_index_digest == source.payload_sha256
-                        and winner.index.published_at >= source.index.published_at
-                    ):
-                        if self._winner_matches_current_authority(
-                            winner,
-                            pointers=winner_pointers,
-                        ):
-                            return self._receipt(winner)
-                        continue
             effective_published_at = max(published_at, source.index.published_at)
             candidate, attestation, projection = self._build_candidate(
                 source=source,
@@ -185,22 +171,34 @@ class IncidentFeedIndexPublicationService:
             source = fresh_source
             if current is not None:
                 assert current_pointers is not None
-                decision = self._classify_current(
-                    current=current,
-                    current_pointers=current_pointers,
-                    candidate=candidate,
-                    source=source,
-                )
-                if decision == "accept":
-                    if self._winner_matches_current_authority(
-                        current,
-                        pointers=current_pointers,
-                    ):
+                if not self._winner_matches_current_authority(
+                    current,
+                    pointers=current_pointers,
+                ):
+                    latest_source = self._read_source_authority()
+                    if latest_source.payload_sha256 != source.payload_sha256:
+                        continue
+                    repair_published_at = max(
+                        candidate.published_at,
+                        current.index.published_at + timedelta(milliseconds=1),
+                    )
+                    if repair_published_at != candidate.published_at:
+                        candidate, attestation, projection = self._build_candidate(
+                            source=source,
+                            published_at=repair_published_at,
+                        )
+                else:
+                    decision = self._classify_current(
+                        current=current,
+                        current_pointers=current_pointers,
+                        candidate=candidate,
+                        source=source,
+                    )
+                    if decision == "accept":
                         self.registry.prune_expired(projection.prune_plan)
                         return self._receipt(current)
-                    continue
-                if decision == "retry":
-                    continue
+                    if decision == "retry":
+                        continue
             try:
                 committed = self.publisher.compare_and_swap(
                     IncidentFeedIndexCommitRequest(
@@ -213,13 +211,16 @@ class IncidentFeedIndexPublicationService:
                 winner = self.publisher.read_current()
                 if winner is not None:
                     winner_pointers = self._verify_snapshot(winner)
+                    winner_is_authoritative = self._winner_matches_current_authority(
+                        winner,
+                        pointers=winner_pointers,
+                    )
                     if winner.index.canonical_bytes() == candidate.canonical_bytes():
-                        if self._winner_matches_current_authority(
-                            winner,
-                            pointers=winner_pointers,
-                        ):
+                        if winner_is_authoritative:
                             self.registry.prune_expired(projection.prune_plan)
                             return self._receipt(winner)
+                        continue
+                    if not winner_is_authoritative:
                         continue
                     decision = self._classify_current(
                         current=winner,
@@ -227,10 +228,7 @@ class IncidentFeedIndexPublicationService:
                         candidate=candidate,
                         source=source,
                     )
-                    if decision == "accept" and self._winner_matches_current_authority(
-                        winner,
-                        pointers=winner_pointers,
-                    ):
+                    if decision == "accept":
                         self.registry.prune_expired(projection.prune_plan)
                         return self._receipt(winner)
                 continue
