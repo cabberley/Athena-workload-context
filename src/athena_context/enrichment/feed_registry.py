@@ -358,7 +358,18 @@ def _require_current_authority(
     *,
     source_current_incidents: Mapping[str, CurrentIncidentStateSnapshot],
 ) -> tuple[CurrentIncidentStateSnapshot, IncidentOccurrenceReceipt]:
-    authority = source_current_incidents.get(record.entry.incident_id)
+    return validate_incident_feed_registry_record_authority(
+        record,
+        source_current_incidents.get(record.entry.incident_id),
+    )
+
+
+def validate_incident_feed_registry_record_authority(
+    record: IncidentFeedRegistryRecord,
+    authority: CurrentIncidentStateSnapshot | None,
+) -> tuple[CurrentIncidentStateSnapshot, IncidentOccurrenceReceipt]:
+    if type(record) is not IncidentFeedRegistryRecord:
+        raise TypeError("record must be an exact IncidentFeedRegistryRecord")
     if type(authority) is not CurrentIncidentStateSnapshot or authority.occurrence is None:
         raise IncidentFeedRegistryIncompleteError(
             "feed registry is missing authoritative current occurrence"
@@ -443,4 +454,5 @@ __all__ = [
     "IncidentFeedRegistryRecord",
     "build_incident_feed_registry_record",
     "project_incident_feed_registry",
+    "validate_incident_feed_registry_record_authority",
 ]

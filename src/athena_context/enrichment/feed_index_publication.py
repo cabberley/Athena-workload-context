@@ -27,13 +27,20 @@ from athena_context.contracts import (
     validate_incident_feed_index_assets,
 )
 from athena_context.enrichment.feed_registry import (
+    IncidentFeedRegistryConflictError,
     IncidentFeedRegistryIncompleteError,
     IncidentFeedRegistryPort,
+    IncidentFeedRegistryProjection,
     IncidentFeedRegistryRecord,
+    build_incident_feed_registry_record,
     project_incident_feed_registry,
+    validate_incident_feed_registry_record_authority,
 )
 from athena_context.presentation import PresentationSigner
-from athena_context.presentation_assets import ActiveIncidentIndexSnapshot
+from athena_context.presentation_assets import (
+    ActiveIncidentIndexSnapshot,
+    CurrentIncidentStateSnapshot,
+)
 
 FEED_V2_INDEX_BLOB_NAME = "incidents/feed-v2.json"
 MAX_FEED_V2_PUBLICATION_ATTEMPTS = 4
@@ -49,6 +56,14 @@ class IncidentFeedIndexPublicationConflictError(IncidentFeedIndexPublicationErro
 
 class VerifiedActiveIncidentIndexReaderPort(Protocol):
     def read_active_incident_index(self) -> ActiveIncidentIndexSnapshot | None: ...
+
+
+class VerifiedCurrentIncidentStateReaderPort(Protocol):
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +124,7 @@ class IncidentFeedIndexPublicationReceipt:
 @dataclass(frozen=True, slots=True)
 class IncidentFeedIndexPublicationService:
     active_index_reader: VerifiedActiveIncidentIndexReaderPort
+    current_incident_reader: VerifiedCurrentIncidentStateReaderPort
     registry: IncidentFeedRegistryPort
     pointer_reader: VersionPinnedArtifactReaderPort
     publisher: IncidentFeedIndexPublisherPort
@@ -149,12 +165,18 @@ class IncidentFeedIndexPublicationService:
                             return self._receipt(winner)
                         continue
             effective_published_at = max(published_at, source.index.published_at)
-            candidate, attestation = self._build_candidate(
+            candidate, attestation, projection = self._build_candidate(
                 source=source,
                 published_at=effective_published_at,
             )
             current = self.publisher.read_current()
-            current_pointers: dict[str, IncidentEnrichmentFeedPointer] | None = None
+            current_pointers: dict[
+                str,
+                tuple[
+                    IncidentEnrichmentFeedPointer,
+                    IncidentEnrichmentFeedPointerAttestation,
+                ],
+            ] | None = None
             if current is not None:
                 current_pointers = self._verify_snapshot(current)
             fresh_source = self._read_source_authority()
@@ -174,6 +196,7 @@ class IncidentFeedIndexPublicationService:
                         current,
                         pointers=current_pointers,
                     ):
+                        self.registry.prune_expired(projection.prune_plan)
                         return self._receipt(current)
                     continue
                 if decision == "retry":
@@ -195,6 +218,7 @@ class IncidentFeedIndexPublicationService:
                             winner,
                             pointers=winner_pointers,
                         ):
+                            self.registry.prune_expired(projection.prune_plan)
                             return self._receipt(winner)
                         continue
                     decision = self._classify_current(
@@ -207,6 +231,7 @@ class IncidentFeedIndexPublicationService:
                         winner,
                         pointers=winner_pointers,
                     ):
+                        self.registry.prune_expired(projection.prune_plan)
                         return self._receipt(winner)
                 continue
             committed_pointers = self._verify_snapshot(committed)
@@ -215,11 +240,12 @@ class IncidentFeedIndexPublicationService:
             latest_source = self._read_source_authority()
             if latest_source.payload_sha256 != candidate.source_active_index_digest:
                 continue
-            _validate_active_mirror(
-                candidate,
-                latest_source.index,
+            if not self._winner_matches_current_authority(
+                committed,
                 pointers=committed_pointers,
-            )
+            ):
+                continue
+            self.registry.prune_expired(projection.prune_plan)
             return self._receipt(committed)
         raise IncidentFeedIndexPublicationConflictError(
             "feed v2 publication did not converge within its bounded retry limit"
@@ -230,14 +256,14 @@ class IncidentFeedIndexPublicationService:
         *,
         source: ActiveIncidentIndexSnapshot,
         published_at: UtcDateTime,
-    ) -> tuple[IncidentFeedIndexV2, IncidentFeedIndexAttestationV2]:
-        records = self._read_verified_registry_records(published_at=published_at)
-        projection = project_incident_feed_registry(
-            records,
-            source_active_index=source.index,
-            as_of=published_at,
-            trusted_feed_key_id=self.feed_key_id,
-            feed_signature_verifier=self.signature_verifier,
+    ) -> tuple[
+        IncidentFeedIndexV2,
+        IncidentFeedIndexAttestationV2,
+        IncidentFeedRegistryProjection,
+    ]:
+        projection = self._project_registry(
+            source=source,
+            published_at=published_at,
         )
         index = build_incident_feed_index_v2(
             active=projection.active,
@@ -271,13 +297,19 @@ class IncidentFeedIndexPublicationService:
             not_older_than=source.index.published_at,
             signature_verifier=self.signature_verifier,
         )
-        return index, attestation
+        return index, attestation, projection
 
     def _classify_current(
         self,
         *,
         current: IncidentFeedIndexSnapshot,
-        current_pointers: dict[str, IncidentEnrichmentFeedPointer],
+        current_pointers: dict[
+            str,
+            tuple[
+                IncidentEnrichmentFeedPointer,
+                IncidentEnrichmentFeedPointerAttestation,
+            ],
+        ],
         candidate: IncidentFeedIndexV2,
         source: ActiveIncidentIndexSnapshot,
     ) -> Literal["accept", "replace", "retry"]:
@@ -323,7 +355,13 @@ class IncidentFeedIndexPublicationService:
         self,
         winner: IncidentFeedIndexSnapshot,
         *,
-        pointers: dict[str, IncidentEnrichmentFeedPointer],
+        pointers: dict[
+            str,
+            tuple[
+                IncidentEnrichmentFeedPointer,
+                IncidentEnrichmentFeedPointerAttestation,
+            ],
+        ],
     ) -> bool:
         latest_source = self._read_source_authority()
         if (
@@ -331,12 +369,57 @@ class IncidentFeedIndexPublicationService:
             or winner.index.published_at < latest_source.index.published_at
         ):
             return False
-        _validate_active_mirror(
-            winner.index,
-            latest_source.index,
-            pointers=pointers,
-        )
+        try:
+            _validate_active_mirror(
+                winner.index,
+                latest_source.index,
+                pointers=pointers,
+            )
+            for entry in (*winner.index.active, *winner.index.recently_resolved):
+                pointer, attestation = pointers[entry.incident_id]
+                current = self.current_incident_reader.read_current_incident_state(
+                    incident_id=entry.incident_id
+                )
+                validate_incident_feed_registry_record_authority(
+                    build_incident_feed_registry_record(
+                        entry,
+                        pointer,
+                        attestation,
+                    ),
+                    current,
+                )
+        except (
+            IncidentFeedRegistryConflictError,
+            IncidentFeedRegistryIncompleteError,
+        ):
+            return False
         return True
+
+    def _project_registry(
+        self,
+        *,
+        source: ActiveIncidentIndexSnapshot,
+        published_at: UtcDateTime,
+    ) -> IncidentFeedRegistryProjection:
+        records = self._read_verified_registry_records(published_at=published_at)
+        current_incidents: dict[str, CurrentIncidentStateSnapshot] = {}
+        for incident_id in sorted({record.entry.incident_id for record in records}):
+            current = self.current_incident_reader.read_current_incident_state(
+                incident_id=incident_id
+            )
+            if current is None:
+                raise IncidentFeedRegistryIncompleteError(
+                    "feed registry is missing authoritative current occurrence"
+                )
+            current_incidents[incident_id] = current
+        return project_incident_feed_registry(
+            records,
+            source_active_index=source.index,
+            source_current_incidents=current_incidents,
+            as_of=published_at,
+            trusted_feed_key_id=self.feed_key_id,
+            feed_signature_verifier=self.signature_verifier,
+        )
 
     def _read_verified_registry_records(
         self,
@@ -416,7 +499,13 @@ class IncidentFeedIndexPublicationService:
     def _verify_snapshot(
         self,
         snapshot: IncidentFeedIndexSnapshot,
-    ) -> dict[str, IncidentEnrichmentFeedPointer]:
+    ) -> dict[
+        str,
+        tuple[
+            IncidentEnrichmentFeedPointer,
+            IncidentEnrichmentFeedPointerAttestation,
+        ],
+    ]:
         validate_incident_feed_index_assets(
             snapshot.index,
             snapshot.attestation,
@@ -426,10 +515,15 @@ class IncidentFeedIndexPublicationService:
             not_older_than=snapshot.index.published_at,
             signature_verifier=self.signature_verifier,
         )
-        pointers: dict[str, IncidentEnrichmentFeedPointer] = {}
+        pointers: dict[
+            str,
+            tuple[
+                IncidentEnrichmentFeedPointer,
+                IncidentEnrichmentFeedPointerAttestation,
+            ],
+        ] = {}
         for entry in (*snapshot.index.active, *snapshot.index.recently_resolved):
-            pointer, _attestation = self._read_pointer_assets(entry)
-            pointers[entry.incident_id] = pointer
+            pointers[entry.incident_id] = self._read_pointer_assets(entry)
         return pointers
 
     def _read_source_authority(self) -> ActiveIncidentIndexSnapshot:
@@ -459,7 +553,14 @@ def _validate_active_mirror(
     index: IncidentFeedIndexV2,
     source: ActiveIncidentIndex,
     *,
-    pointers: dict[str, IncidentEnrichmentFeedPointer] | None = None,
+    pointers: dict[
+        str,
+        tuple[
+            IncidentEnrichmentFeedPointer,
+            IncidentEnrichmentFeedPointerAttestation,
+        ],
+    ]
+    | None = None,
 ) -> None:
     source_by_id = {entry.incident_id: entry for entry in source.incidents}
     if {entry.incident_id for entry in index.active} != set(source_by_id):
@@ -477,9 +578,9 @@ def _validate_active_mirror(
             or (
                 pointers is not None
                 and (
-                    pointers[entry.incident_id].source_pointer_reference.name
+                    pointers[entry.incident_id][0].source_pointer_reference.name
                     != source_entry.pointer_path.removeprefix("./")
-                    or pointers[entry.incident_id].source_pointer_reference.content_digest
+                    or pointers[entry.incident_id][0].source_pointer_reference.content_digest
                     != source_entry.pointer_sha256
                 )
             )
@@ -520,4 +621,5 @@ __all__ = [
     "IncidentFeedIndexPublisherPort",
     "IncidentFeedIndexSnapshot",
     "VerifiedActiveIncidentIndexReaderPort",
+    "VerifiedCurrentIncidentStateReaderPort",
 ]

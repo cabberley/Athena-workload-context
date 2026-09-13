@@ -68,6 +68,12 @@ being silently deleted before detection while ensuring expired history cannot pe
 the bounded registry. The complete eligible set supplies the exact resolved total; only the newest
 64 entries are exposed in the public index.
 
+The index publisher reads the current v1 occurrence for every retained registry row before signing
+a candidate, revalidates every entry in a concurrent winner before accepting it, and performs
+expiry cleanup only after a verified index commit or verified-winner reconciliation. A concurrent
+registry addition does not invalidate an already committed candidate, but no entry already present
+in that candidate can be older than its current v1 occurrence.
+
 The registry keeps a reserved capacity metadata row in the same partition. New incident rows are
 created in one Azure Table transaction with an ETag-conditional retained-count increment. Expiry
 cleanup similarly deletes bounded batches while conditionally decrementing the same row. A stale

@@ -25,6 +25,7 @@ from athena_context.enrichment import (
     IncidentFeedIndexPublicationConflictError,
     IncidentFeedIndexPublicationService,
     IncidentFeedIndexSnapshot,
+    IncidentFeedRegistryConflictError,
     IncidentFeedRegistryIncompleteError,
     build_incident_feed_registry_record,
 )
@@ -35,6 +36,7 @@ from test_wc027_feed_registry import (
     _KEY_ID,
     _SIGNATURE,
     _active_index,
+    _authority,
     _pointer_bundle,
     _record,
 )
@@ -63,9 +65,18 @@ class _ActiveReader:
 
 
 @dataclass
+class _CurrentReader:
+    snapshots: dict[str, object]
+
+    def read_current_incident_state(self, *, incident_id: str):
+        return self.snapshots.get(incident_id)
+
+
+@dataclass
 class _Registry:
     record_sets: list[tuple]
     calls: int = 0
+    prune_calls: int = 0
 
     def put(self, record) -> None:
         raise AssertionError(f"unexpected registry write: {record}")
@@ -75,6 +86,10 @@ class _Registry:
         value = self.record_sets[min(self.calls, len(self.record_sets) - 1)]
         self.calls += 1
         return value
+
+    def prune_expired(self, plan) -> None:
+        del plan
+        self.prune_calls += 1
 
 
 class _PointerReader:
@@ -195,13 +210,29 @@ def _service(
     sources: list[ActiveIncidentIndexSnapshot | None] | None = None,
     record_sets: list[tuple] | None = None,
     pointer_reader: _PointerReader | None = None,
+    current_authorities: dict[str, object] | None = None,
     verifier=_verify,
 ) -> tuple[IncidentFeedIndexPublicationService, _Publisher]:
     actual_publisher = publisher or _Publisher()
     actual_record_sets = record_sets or [records]
+    if current_authorities is None:
+        latest_records = {
+            record.entry.incident_id: record
+            for record_set in actual_record_sets
+            for record in record_set
+        }
+        current_authorities = {
+            incident_id: _authority(
+                int(incident_id.removeprefix("inc-"), 16),
+                lifecycle=record.entry.lifecycle,
+                updated_at=record.entry.updated_at,
+            )
+            for incident_id, record in latest_records.items()
+        }
     return (
         IncidentFeedIndexPublicationService(
             active_index_reader=_ActiveReader(sources or [source]),
+            current_incident_reader=_CurrentReader(current_authorities),
             registry=_Registry(actual_record_sets),
             pointer_reader=pointer_reader or _PointerReader(actual_record_sets),
             publisher=actual_publisher,
@@ -222,7 +253,7 @@ def _candidate_snapshot(
     version: int = 99,
 ) -> IncidentFeedIndexSnapshot:
     service, _ = _service(source=source, records=records)
-    index, attestation = service._build_candidate(
+    index, attestation, _projection = service._build_candidate(
         source=source,
         published_at=published_at,
     )
@@ -351,8 +382,52 @@ def test_publication_rejects_registry_references_to_missing_blob_versions() -> N
     assert publisher.commits == []
 
 
+def test_publication_rejects_replayed_resolved_record_against_current_occurrence() -> None:
+    replayed = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(hours=2),
+    )
+    source = _source(_active_index(()))
+    service, publisher = _service(
+        source=source,
+        records=(replayed,),
+        current_authorities={
+            replayed.entry.incident_id: _authority(
+                2,
+                lifecycle="resolved",
+                updated_at=NOW - timedelta(hours=1),
+            )
+        },
+    )
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="authoritative current occurrence",
+    ):
+        service.publish(published_at=PUBLISHED_AT)
+
+    assert publisher.commits == []
+
+
+def test_publication_prunes_only_after_verified_commit() -> None:
+    expired = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(days=8),
+    )
+    source = _source(_active_index(()))
+    service, _publisher = _service(source=source, records=(expired,))
+    registry = service.registry
+    assert isinstance(registry, _Registry)
+
+    service.publish(published_at=PUBLISHED_AT)
+
+    assert registry.prune_calls == 1
+
+
 def test_publication_rejects_pointer_and_generated_signature_failures() -> None:
-    entry, pointer, attestation = _pointer_bundle(1, lifecycle="active")
+    entry, pointer, attestation, _current = _pointer_bundle(1, lifecycle="active")
     bad_attestation = attestation.model_copy(update={"detached_signature": "AAAA"})
     bad_entry = entry.model_copy(
         update={
