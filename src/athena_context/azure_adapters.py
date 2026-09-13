@@ -287,6 +287,12 @@ class KeyVaultRsaPublicKeyVerifier:
             return False
         return True
 
+    @property
+    def public_key(self) -> rsa.RSAPublicKey:
+        """Return the already fingerprint-verified public key."""
+
+        return self._public_key
+
 
 class KeyVaultTrustedKeyResolver:
     """Resolve only one operator-pinned Key Vault key version and public key."""

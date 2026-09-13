@@ -253,6 +253,15 @@ param wc016RuntimeEnabled bool = false
 @description('Enables WC-027 notification v2 only after its separate enrichment/feed-v2 producer is deployed and healthy.')
 param wc027FeedV2ProducerReady bool = false
 
+@description('Exact deployed WC-027 enrichment/feed producer Job resource ID. Required before notification v2 can be enabled.')
+param wc027EnrichmentFeedProducerJobResourceId string = ''
+
+@description('SHA-256 digest of the exact runtime configuration deployed to the WC-027 producer Job.')
+param wc027EnrichmentFeedProducerConfigurationDigest string = ''
+
+@description('Exact non-secret runtime configuration JSON deployed to the WC-027 producer Job.')
+param wc027EnrichmentFeedProducerConfigurationJson string = ''
+
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
 
@@ -293,6 +302,63 @@ var validatedWc016RuntimeEnabled = wc016RuntimeEnabled && !wc016LegacyCleanupCon
   : wc016RuntimeEnabled && signingKeyFingerprint == rejectedIncidentFixtureFingerprint
     ? fail('WC-016 cannot be activated with the checked-in incident trust fixture; pin the deployed key first')
     : wc016RuntimeEnabled
+var wc027ProducerJobResourceIdRawSegments = split(
+  wc027EnrichmentFeedProducerJobResourceId,
+  '/'
+)
+var wc027ProducerJobResourceIdSegments = concat(
+  wc027ProducerJobResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027ProducerJobResourceIdValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027ProducerJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027ProducerJobResourceIdSegments[7]) == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8])
+var wc027ConfigurationDigestHex = replace(
+  wc027EnrichmentFeedProducerConfigurationDigest,
+  'sha256:',
+  ''
+)
+var wc027ConfigurationDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027ConfigurationDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027ConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027ConfigurationDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027ConfigurationDigestValid = length(wc027EnrichmentFeedProducerConfigurationDigest) == 71 && wc027EnrichmentFeedProducerConfigurationDigest == toLower(
+  wc027EnrichmentFeedProducerConfigurationDigest
+) && empty(wc027ConfigurationDigestInvalidCharacters)
+var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
+  toLower(wc027EnrichmentFeedProducerJobResourceId),
+  '/subscriptions/'
+)
+  ? fail('WC-027 Notification v2 cannot be enabled without the exact deployed producer Job resource ID')
+  : wc027FeedV2ProducerReady && !wc027ProducerJobResourceIdValid
+    ? fail('wc027EnrichmentFeedProducerJobResourceId must identify one Microsoft.App/jobs resource')
+    : wc027FeedV2ProducerReady && !wc027ConfigurationDigestValid
+      ? fail('WC-027 Notification v2 requires the exact deployed producer configuration digest')
+      : wc027FeedV2ProducerReady && empty(wc027EnrichmentFeedProducerConfigurationJson)
+        ? fail('WC-027 Notification v2 requires the exact deployed producer configuration JSON')
+        : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.runtimeConfigurationDigest != wc027EnrichmentFeedProducerConfigurationDigest
+          ? fail('WC-027 producer Job configuration digest tag does not match the activation input')
+          : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].name != 'ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON'
+            ? fail('WC-027 producer Job does not contain the exact activation configuration')
+            : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
+              ? fail('WC-027 producer Job configuration does not match the activation input')
+              : wc027FeedV2ProducerReady && !validatedWc016RuntimeEnabled
+                ? fail('WC-027 Notification v2 requires the deployed WC-016 runtime and notification outbox')
+                : wc027FeedV2ProducerReady
 var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
   ? acceptanceImageRegistryServer
@@ -451,6 +517,14 @@ resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01'
   name: foundationResourceGroupName
   location: location
   tags: resourceTags
+}
+
+resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid) {
+  name: wc027ProducerJobResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027ProducerJobResourceIdSegments[2],
+    wc027ProducerJobResourceIdSegments[4]
+  )
 }
 
 module collectorControllerIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
@@ -839,7 +913,7 @@ module wc016Runtime '../wc016-event-reassessment/main.bicep' = if (validatedWc01
     signingKeyId: incidentSigningKeyId
     signingKeyFingerprint: signingKeyFingerprint
     notificationV2ConfigurationJson: notificationV2ConfigurationJson
-    notificationV2ProducerReady: wc027FeedV2ProducerReady
+    notificationV2ProducerReady: validatedWc027FeedV2ProducerReady
     teamsConnectionName: 'teams'
     teamsNotifierWorkflowName: 'athena-wc016-teams-notifier'
     tags: resourceTags

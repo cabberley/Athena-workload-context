@@ -18,6 +18,11 @@ from athena_context.contracts import (
 )
 from athena_context.contracts.eventing import WorkloadRole
 from athena_context.contracts.presentation import ArgusPresentationPhase
+from athena_context.enrichment.production import (
+    load_wc027_enrichment_feed_configuration,
+    run_wc027_enrichment_feed_worker,
+    submit_wc027_enrichment_feed_trigger,
+)
 from athena_context.eventing import (
     ChangeIngestionError,
     NotificationV2KeyAuthority,
@@ -345,6 +350,32 @@ def build_parser() -> argparse.ArgumentParser:
     notification_parser.add_argument("--incident-asset-blob-endpoint")
     notification_parser.add_argument("--presentation-url")
     notification_parser.add_argument("--notification-v2-config-json")
+    wc027_submit_parser = subparsers.add_parser(
+        "wc027-enrichment-feed-submit",
+        help="enqueue one exact signed WC-027 guidance binding for enrichment",
+    )
+    wc027_submit_parser.add_argument("--binding", required=True, type=Path)
+    wc027_submit_parser.add_argument("--service-bus-namespace", required=True)
+    wc027_submit_parser.add_argument(
+        "--trigger-queue",
+        default="wc027-enrichment-feed-requests",
+    )
+    wc027_submit_parser.add_argument(
+        "--managed-identity-client-id",
+        required=True,
+    )
+    wc027_worker_parser = subparsers.add_parser(
+        "wc027-enrichment-feed-producer",
+        help="publish verified WC-027 enrichment/feed assets before Notification v2",
+    )
+    wc027_worker_parser.add_argument("--config", type=Path)
+    wc027_worker_parser.add_argument("--config-json")
+    wc027_worker_parser.add_argument(
+        "--max-wait-time-seconds",
+        type=int,
+        default=30,
+        choices=range(1, 301),
+    )
     change_event_parser = subparsers.add_parser(
         "wc025-change-event-ingester",
         help="normalize only approved resource-group Event Grid changes into signed evidence",
@@ -913,6 +944,36 @@ def main(
                 else "WC-016 notification queue was empty or rejected\n"
             )
             return 0
+        if args.command == "wc027-enrichment-feed-submit":
+            binding_id = submit_wc027_enrichment_feed_trigger(
+                binding_path=args.binding,
+                fully_qualified_namespace=args.service_bus_namespace,
+                queue_name=args.trigger_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+            )
+            output.write(f"WC-027 enrichment trigger queued: {binding_id}\n")
+            return 0
+        if args.command == "wc027-enrichment-feed-producer":
+            configuration_json = (
+                args.config_json
+                or os.environ.get(
+                    "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON"
+                )
+            )
+            configuration = load_wc027_enrichment_feed_configuration(
+                path=args.config,
+                environment_json=configuration_json,
+            )
+            processed = run_wc027_enrichment_feed_worker(
+                configuration=configuration,
+                max_wait_time_seconds=args.max_wait_time_seconds,
+            )
+            output.write(
+                "WC-027 enrichment, feed, and Notification v2 published\n"
+                if processed
+                else "WC-027 enrichment trigger queue was empty or deferred\n"
+            )
+            return 0
         if args.command == "wc025-change-event-ingester":
             event_count = run_event_grid_change_ingestion_worker(
                 fully_qualified_namespace=args.service_bus_namespace,
@@ -992,6 +1053,8 @@ def main(
             "wc016-incident-orchestrator",
             "wc016-incident-feed-heartbeat",
             "wc016-notification-dispatcher",
+            "wc027-enrichment-feed-submit",
+            "wc027-enrichment-feed-producer",
             "wc025-change-event-ingester",
             "wc025-change-dead-letter-purge",
             "wc025-change-history-query",
