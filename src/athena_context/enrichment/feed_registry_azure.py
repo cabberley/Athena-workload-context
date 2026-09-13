@@ -14,6 +14,8 @@ from azure.core.exceptions import (
     ResourceExistsError,
     ResourceModifiedError,
     ResourceNotFoundError,
+    ServiceRequestError,
+    ServiceResponseError,
 )
 from azure.data.tables import TableServiceClient, UpdateMode
 from pydantic import ValidationError
@@ -161,6 +163,10 @@ class AzureTableIncidentFeedRegistry:
                     "feed registry changed during conditional write"
                 ) from exc
             raise IncidentFeedRegistryError("feed registry write failed") from exc
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise IncidentFeedRegistryError(
+                "feed registry write outcome is uncertain"
+            ) from exc
 
     def list_records(
         self,

@@ -28,7 +28,8 @@ _ENRICHMENT_ASSET_PATH = re.compile(
     r"(?:"
     r"correlation-reports/report-[a-f0-9]{32}/(?:report|attestation)\.json"
     r"|guidance/incident-guidance-[a-f0-9]{32}/(?:guidance|attestation)\.json"
-    r"|enrichments/incident-enrichment-[a-f0-9]{32}/(?:manifest|attestation)\.json"
+    r"|enrichments/incident-enrichment-[a-f0-9]{32}/"
+    r"(?:manifest|attestation|feed-pointer|feed-pointer-attestation)\.json"
     r")$"
 )
 

@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import timedelta
 
 import pytest
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ServiceResponseError
 from pydantic import ValidationError
 
 from athena_context.contracts import (
@@ -31,6 +31,7 @@ from athena_context.enrichment import (
     AzureTableIncidentFeedRegistry,
     IncidentFeedRegistryCapacityError,
     IncidentFeedRegistryConflictError,
+    IncidentFeedRegistryError,
     IncidentFeedRegistryIncompleteError,
     IncidentFeedRegistryRecord,
     build_incident_feed_registry_record,
@@ -755,6 +756,29 @@ def test_azure_registry_is_idempotent_and_rejects_stale_updates() -> None:
         match="stale",
     ):
         registry.put(active)
+
+
+def test_azure_registry_surfaces_uncertain_response_as_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _Table()
+    registry = _azure_registry(table)
+    active = _record(1, lifecycle="active")
+    submit = table.submit_transaction
+
+    def submit_then_lose_response(operations) -> None:
+        submit(operations)
+        raise ServiceResponseError("synthetic response loss")
+
+    monkeypatch.setattr(table, "submit_transaction", submit_then_lose_response)
+
+    with pytest.raises(
+        IncidentFeedRegistryError,
+        match="outcome is uncertain",
+    ):
+        registry.put(active)
+
+    assert registry.list_records(as_of=NOW) == (active,)
 
 
 def test_azure_registry_prunes_expired_rows() -> None:

@@ -17,6 +17,11 @@ from athena_context.enrichment.feed_index_publication import (
     VerifiedActiveIncidentIndexReaderPort,
     VerifiedCurrentIncidentStateReaderPort,
 )
+from athena_context.enrichment.feed_pipeline import (
+    IncidentEnrichmentFeedPublicationReceipt,
+    IncidentEnrichmentFeedPublicationService,
+    IncidentFeedIndexPublicationPort,
+)
 from athena_context.enrichment.feed_registry import (
     FEED_V2_RESOLVED_RETENTION,
     MAX_FEED_V2_REGISTRY_RECORDS,
@@ -50,6 +55,7 @@ __all__ = [
     "MAX_FEED_V2_REGISTRY_RECORDS",
     "MAX_FEED_V2_PUBLICATION_ATTEMPTS",
     "IncidentFeedIndexCommitRequest",
+    "IncidentFeedIndexPublicationPort",
     "IncidentFeedIndexPublicationConflictError",
     "IncidentFeedIndexPublicationError",
     "IncidentFeedIndexPublicationReceipt",
@@ -63,6 +69,8 @@ __all__ = [
     "IncidentFeedRegistryPort",
     "IncidentFeedRegistryProjection",
     "IncidentFeedRegistryRecord",
+    "IncidentEnrichmentFeedPublicationReceipt",
+    "IncidentEnrichmentFeedPublicationService",
     "IncidentEnrichmentArtifactWriterPort",
     "IncidentEnrichmentPublicationReceipt",
     "IncidentEnrichmentPublicationService",
