@@ -353,9 +353,42 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
         LEGACY_FLOW_LOG_MIGRATION
     )
     assert "canonicalVnetFlowLogCutoverConfirmed" in LEGACY_FLOW_LOG_MIGRATION
+    assert "a6add389-9978-47ac-ab1e-a09212e321d4" in LEGACY_FLOW_LOG_MIGRATION
+    assert "validatedMigrationSubscriptionId" in LEGACY_FLOW_LOG_MIGRATION
+    assert "legacyFlowLogMigrationRequested" in LEGACY_FLOW_LOG_MIGRATION
+    assert "refuses destructive legacy flow-log migration outside subscription" in (
+        LEGACY_FLOW_LOG_MIGRATION
+    )
     assert "enabled: false" in LEGACY_FLOW_LOG_MIGRATION
     assert "storageId: replacementStorageAccountResourceId" in LEGACY_FLOW_LOG_MIGRATION
     assert "delete" not in LEGACY_FLOW_LOG_MIGRATION.lower()
+
+
+def test_wc024_legacy_flow_log_cutover_rejects_unapproved_subscription() -> None:
+    approved_subscription_id = "a6add389-9978-47ac-ab1e-a09212e321d4"
+
+    def cutover_subscription_is_valid(
+        subscription_id: str,
+        flow_log_names: list[str],
+        target_resource_ids: list[str],
+    ) -> bool:
+        migration_requested = bool(flow_log_names or target_resource_ids)
+        return not migration_requested or subscription_id.casefold() == (
+            approved_subscription_id.casefold()
+        )
+
+    assert cutover_subscription_is_valid(approved_subscription_id, ["legacy"], ["target"])
+    assert cutover_subscription_is_valid("00000000-0000-0000-0000-000000000000", [], [])
+    assert not cutover_subscription_is_valid(
+        "00000000-0000-0000-0000-000000000000",
+        ["legacy"],
+        ["target"],
+    )
+    assert not cutover_subscription_is_valid(
+        "00000000-0000-0000-0000-000000000000",
+        [],
+        ["target"],
+    )
 
 
 def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> None:

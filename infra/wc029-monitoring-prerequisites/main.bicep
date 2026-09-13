@@ -130,6 +130,7 @@ module dataCollectionCoverageValidation 'modules/data-collection-coverage-valida
   params: {
     location: location
     workspaceResourceId: workspaceResourceId
+    dataCollectionEndpointResourceId: dataCollectionEndpointResourceId
   }
 }
 

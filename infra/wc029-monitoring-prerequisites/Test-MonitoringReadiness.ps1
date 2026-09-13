@@ -28,6 +28,39 @@ function Assert-Ready {
     }
 }
 
+function Test-DcrDataCollectionEndpoint {
+    param(
+        [Parameter(Mandatory)][object] $DataCollectionRule,
+        [Parameter(Mandatory)][string] $ExpectedDataCollectionEndpointId
+    )
+
+    $endpointProperty = $DataCollectionRule.PSObject.Properties['dataCollectionEndpointId']
+    return $null -ne $endpointProperty -and $endpointProperty.Value -ieq $ExpectedDataCollectionEndpointId
+}
+
+function Test-DcrStreamFlowsUseExclusiveDestinations {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $DataFlows,
+        [Parameter(Mandatory)][string] $Stream,
+        [Parameter(Mandatory)][string[]] $ApprovedDestinationNames
+    )
+
+    $streamFlows = @($DataFlows | Where-Object { $Stream -cin @($_.streams) })
+    if ($streamFlows.Count -eq 0) {
+        return $false
+    }
+    foreach ($flow in $streamFlows) {
+        $flowDestinations = @($flow.destinations)
+        if (
+            $flowDestinations.Count -ne 1 -or
+            $flowDestinations[0] -notin $ApprovedDestinationNames
+        ) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-LifecycleRuleHasUnsafeDelete {
     param(
         [Parameter(Mandatory)][object] $Rule,
@@ -162,14 +195,9 @@ $approvedWorkspaceDestinationNames = @(
         ForEach-Object { $_.name }
 )
 Assert-Ready ($approvedWorkspaceDestinationNames.Count -gt 0) 'The adopted DCR has no destination bound to the reviewed monitoring workspace.'
+Assert-Ready (Test-DcrDataCollectionEndpoint -DataCollectionRule $dcr -ExpectedDataCollectionEndpointId $expectedDceId) 'The adopted DCR does not reference the exact approved data collection endpoint.'
 foreach ($stream in $requiredStreams) {
-    $approvedFlows = @(
-        $dcr.dataFlows | Where-Object {
-            $stream -cin @($_.streams) -and
-            @($_.destinations | Where-Object { $_ -cin $approvedWorkspaceDestinationNames }).Count -gt 0
-        }
-    )
-    Assert-Ready ($approvedFlows.Count -gt 0) "Required DCR stream $stream is not routed to the destination bound to the reviewed monitoring workspace."
+    Assert-Ready (Test-DcrStreamFlowsUseExclusiveDestinations -DataFlows @($dcr.dataFlows) -Stream $stream -ApprovedDestinationNames $approvedWorkspaceDestinationNames) "Required DCR stream $stream is missing or has a flow that is not routed exclusively to the approved workspace destination."
 }
 foreach ($counter in $requiredCounters) {
     Assert-Ready ($counter -cin $dcrCounters) "The adopted DCR is missing required counter $counter."

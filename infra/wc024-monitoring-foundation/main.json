@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "11925284674555287091"
+      "templateHash": "9806382250234680749"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -2809,7 +2809,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "1067561402081479159"
+              "templateHash": "5421646249562906296"
             }
           },
           "parameters": {
@@ -2865,6 +2865,16 @@
               "metadata": {
                 "description": "Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage."
               }
+            },
+            "expectedSubscriptionId": {
+              "type": "string",
+              "defaultValue": "a6add389-9978-47ac-ab1e-a09212e321d4",
+              "allowedValues": [
+                "a6add389-9978-47ac-ab1e-a09212e321d4"
+              ],
+              "metadata": {
+                "description": "Exact subscription approved for destructive WC-024 legacy flow-log cutover."
+              }
             }
           },
           "variables": {
@@ -2888,7 +2898,9 @@
                 "input": "[format('{0}|{1}', toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].name), toLower(variables('requestedLegacyFlowLogMigrations')[copyIndex('requestedLegacyFlowLogMigrationPairs')].targetResourceId))]"
               }
             ],
-            "workloadScopeId": "[format('{0}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network', subscription().id)]",
+            "legacyFlowLogMigrationRequested": "[or(not(empty(parameters('legacyFlowLogNames'))), not(empty(parameters('legacyFlowLogTargetResourceIds'))))]",
+            "validatedMigrationSubscriptionId": "[if(or(not(variables('legacyFlowLogMigrationRequested')), equals(toLower(subscription().subscriptionId), toLower(parameters('expectedSubscriptionId')))), subscription().subscriptionId, fail('WC-024 refuses destructive legacy flow-log migration outside subscription a6add389-9978-47ac-ab1e-a09212e321d4.'))]",
+            "workloadScopeId": "[format('/subscriptions/{0}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network', variables('validatedMigrationSubscriptionId'))]",
             "reviewedLegacyFlowLogMigrationAllowlist": [
               {
                 "name": "snet-data-rg-athena-demo-workload-flowlog",

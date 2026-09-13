@@ -70,29 +70,32 @@ def _required_streams_reach_workspace(
         for destination in destinations
         if destination["workspaceResourceId"].casefold() == workspace_resource_id.casefold()
     }
-    return all(
-        any(
-            stream in flow["streams"]
-            and bool(
-                approved_names.intersection(
-                    destination.casefold() for destination in flow["destinations"]
-                )
-            )
-            for flow in data_flows
-        )
-        for stream in (
-            "Microsoft-Perf",
-            "Microsoft-InsightsMetrics",
-            "Microsoft-Syslog",
-            "Custom-AthenaJson",
-        )
-    )
+    for stream in (
+        "Microsoft-Perf",
+        "Microsoft-InsightsMetrics",
+        "Microsoft-Syslog",
+        "Custom-AthenaJson",
+    ):
+        stream_flows = [
+            flow for flow in data_flows if stream in cast(list[str], flow["streams"])
+        ]
+        if not stream_flows:
+            return False
+        for flow in stream_flows:
+            flow_destinations = [
+                destination.casefold()
+                for destination in cast(list[str], flow["destinations"])
+            ]
+            if len(flow_destinations) != 1 or flow_destinations[0] not in approved_names:
+                return False
+    return True
 
 
 def test_wc029_requires_each_stream_to_reach_the_approved_workspace() -> None:
     approved_workspace = "/subscriptions/reviewed/workspaces/athena-hackathon-law"
     destinations = [
         {"name": "approved", "workspaceResourceId": approved_workspace},
+        {"name": "approved-alias", "workspaceResourceId": approved_workspace},
         {"name": "decoy", "workspaceResourceId": "/subscriptions/other/workspaces/x"},
     ]
     positive_flows: list[dict[str, object]] = [
@@ -106,27 +109,65 @@ def test_wc029_requires_each_stream_to_reach_the_approved_workspace() -> None:
             "destinations": ["approved"],
         }
     ]
-    adversarial_flows = [
-        {
-            "streams": [
-                "Microsoft-Perf",
-                "Microsoft-InsightsMetrics",
-                "Microsoft-Syslog",
-            ],
-            "destinations": ["approved"],
-        },
-        {"streams": ["Custom-AthenaJson"], "destinations": ["decoy"]},
-    ]
-
     assert _required_streams_reach_workspace(positive_flows, destinations, approved_workspace)
-    assert not _required_streams_reach_workspace(
-        adversarial_flows, destinations, approved_workspace
-    )
+    for adversarial_flows in (
+        [
+            {
+                "streams": [
+                    "Microsoft-Perf",
+                    "Microsoft-InsightsMetrics",
+                    "Microsoft-Syslog",
+                ],
+                "destinations": ["approved"],
+            },
+            {"streams": ["Custom-AthenaJson"], "destinations": ["decoy"]},
+        ],
+        [
+            {
+                "streams": [
+                    "Microsoft-Perf",
+                    "Microsoft-InsightsMetrics",
+                    "Microsoft-Syslog",
+                    "Custom-AthenaJson",
+                ],
+                "destinations": ["approved", "decoy"],
+            }
+        ],
+        [
+            {
+                "streams": [
+                    "Microsoft-Perf",
+                    "Microsoft-InsightsMetrics",
+                    "Microsoft-Syslog",
+                    "Custom-AthenaJson",
+                ],
+                "destinations": ["approved", "approved-alias"],
+            }
+        ],
+        [
+            {
+                "streams": [
+                    "Microsoft-Perf",
+                    "Microsoft-InsightsMetrics",
+                    "Microsoft-Syslog",
+                    "Custom-AthenaJson",
+                ],
+                "destinations": ["approved"],
+            },
+            {"streams": ["Microsoft-Perf"], "destinations": ["decoy"]},
+        ],
+    ):
+        assert not _required_streams_reach_workspace(
+            adversarial_flows, destinations, approved_workspace
+        )
     assert "approvedWorkspaceDestinationNames" in DCR
-    assert "streamsMissingApprovedWorkspaceFlow" in DCR
-    assert "contains(flow.streams, stream)" in DCR
-    assert "contains(approvedWorkspaceDestinationNames" in DCR
-    assert "empty(streamsMissingApprovedWorkspaceFlow)" in DCR
+    assert "streamsMissingExclusiveApprovedWorkspaceFlow" in DCR
+    assert "length(flow.?destinations ?? []) != 1" in DCR
+    assert "empty(filter(flow.?destinations ?? []" in DCR
+    assert "empty(streamsMissingExclusiveApprovedWorkspaceFlow)" in DCR
+    assert "Test-DcrStreamFlowsUseExclusiveDestinations" in READINESS
+    assert "$flowDestinations.Count -ne 1" in READINESS
+    assert "$flowDestinations[0] -notin $ApprovedDestinationNames" in READINESS
 
 
 def test_wc029_dereferences_dce_and_vm_insights_health_and_binding() -> None:
@@ -135,6 +176,10 @@ def test_wc029_dereferences_dce_and_vm_insights_health_and_binding() -> None:
     assert "toLower(dataCollectionEndpoint.location) == location" in GUEST
     assert "dataCollectionEndpoint.properties.provisioningState == 'Succeeded'" in GUEST
     assert "validatedDataCollectionEndpointResourceId" in GUEST
+    assert "dataCollectionEndpointResourceId: dataCollectionEndpointResourceId" in MAIN
+    assert "dataCollectionRule.properties.?dataCollectionEndpointId" in DCR
+    assert "dcrDataCollectionEndpointIsValid" in DCR
+    assert "Test-DcrDataCollectionEndpoint" in READINESS
     assert "$ama[0].publisher -eq 'Microsoft.Azure.Monitor'" in READINESS
     assert "$ama[0].typePropertiesType -eq 'AzureMonitorLinuxAgent'" in READINESS
     assert "toLower(vmInsightsSolution.location) == location" in DCR
@@ -153,6 +198,7 @@ def _monitoring_associations_are_valid(**overrides: object) -> bool:
         "dce_id": expected_dce_id,
         "dce_location": "australiaeast",
         "dce_provisioning_state": "Succeeded",
+        "dcr_data_collection_endpoint_id": expected_dce_id,
         "vm_location": "australiaeast",
         "ama_publisher": "Microsoft.Azure.Monitor",
         "ama_type": "AzureMonitorLinuxAgent",
@@ -168,6 +214,8 @@ def _monitoring_associations_are_valid(**overrides: object) -> bool:
         str(posture["dce_id"]).casefold() == expected_dce_id.casefold()
         and posture["dce_location"] == "australiaeast"
         and posture["dce_provisioning_state"] == "Succeeded"
+        and str(posture["dcr_data_collection_endpoint_id"]).casefold()
+        == expected_dce_id.casefold()
         and posture["vm_location"] == "australiaeast"
         and posture["ama_publisher"] == "Microsoft.Azure.Monitor"
         and posture["ama_type"] == "AzureMonitorLinuxAgent"
@@ -186,6 +234,11 @@ def _monitoring_associations_are_valid(**overrides: object) -> bool:
     [
         {"dce_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dce/decoy"},
         {"dce_provisioning_state": "Failed"},
+        {
+            "dcr_data_collection_endpoint_id": (
+                "/subscriptions/reviewed/providers/Microsoft.Insights/dce/decoy"
+            )
+        },
         {"ama_provisioning_state": "Failed"},
         {"dcr_association_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dcr/decoy"},
         {"dce_association_id": "/subscriptions/reviewed/providers/Microsoft.Insights/dce/decoy"},

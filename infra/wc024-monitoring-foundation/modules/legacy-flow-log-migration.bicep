@@ -26,7 +26,17 @@ param legacyFlowLogTargetResourceIds array = []
 @description('Must be true only after the canonical VNet flow log is confirmed enabled and writing to replacement storage.')
 param canonicalVnetFlowLogCutoverConfirmed bool = false
 
-var workloadScopeId = '${subscription().id}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network'
+@description('Exact subscription approved for destructive WC-024 legacy flow-log cutover.')
+@allowed([
+  'a6add389-9978-47ac-ab1e-a09212e321d4'
+])
+param expectedSubscriptionId string = 'a6add389-9978-47ac-ab1e-a09212e321d4'
+
+var legacyFlowLogMigrationRequested = !empty(legacyFlowLogNames) || !empty(legacyFlowLogTargetResourceIds)
+var validatedMigrationSubscriptionId = !legacyFlowLogMigrationRequested || toLower(subscription().subscriptionId) == toLower(expectedSubscriptionId)
+  ? subscription().subscriptionId
+  : fail('WC-024 refuses destructive legacy flow-log migration outside subscription a6add389-9978-47ac-ab1e-a09212e321d4.')
+var workloadScopeId = '/subscriptions/${validatedMigrationSubscriptionId}/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Network'
 var reviewedLegacyFlowLogMigrationAllowlist = [
   {
     name: 'snet-data-rg-athena-demo-workload-flowlog'
