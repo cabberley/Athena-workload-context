@@ -189,6 +189,14 @@ def test_published_monitoring_intent_round_trip_and_assets() -> None:
     )
 
 
+def test_v1_monitoring_intent_is_rejected_after_health_freshness_upgrade() -> None:
+    payload = _intent().model_dump(mode="python", by_alias=True)
+    payload["schemaVersion"] = "athena.wc028PublishedMonitoringIntent.v1"
+
+    with pytest.raises(ValidationError, match="wc028PublishedMonitoringIntent.v2"):
+        PublishedMonitoringIntent.model_validate(payload)
+
+
 def test_draft_context_and_stale_authority_are_rejected() -> None:
     with pytest.raises(TypeError, match="PublishedRuntimeContextBinding"):
         build_published_monitoring_intent(
@@ -465,6 +473,7 @@ def test_monitoring_signals_require_all_explicit_values() -> None:
     )
     assert ResourceHealthMonitoringSignal(
         signalKind="resourceHealth",
+        maximumEventAgeSeconds=900,
         eventStatuses=("Active", "Resolved"),
         currentStatuses=("Available",),
         previousStatuses=("Unavailable",),

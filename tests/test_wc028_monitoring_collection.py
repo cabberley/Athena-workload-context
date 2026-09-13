@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -17,6 +17,8 @@ from athena_context.contracts import (
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
     MonitoringIntentScope,
+    PublishedMonitoringIntentAssetReference,
+    PublishedMonitoringIntentAttestation,
     PublishedMonitoringIntentControl,
     ResourceHealthMonitoringSignal,
     VersionPinnedBlobReference,
@@ -37,6 +39,7 @@ from athena_context.monitoring_collection import (
     ResourceChangeRecord,
     ResourceHealthRecord,
     VmConnectionHealthRecord,
+    compute_monitoring_query_execution_digest,
 )
 from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import (
@@ -65,6 +68,11 @@ MONITORING_KEY_ID = (
     "https://synthetic-wc028.vault.azure.net/keys/"
     "monitoring-signing/0123456789abcdef0123456789abcdef"
 )
+INTENT_KEY_ID = (
+    "https://synthetic-wc028.vault.azure.net/keys/"
+    "monitoring-intent-signing/0123456789abcdef0123456789abcdef"
+)
+INTENT_SIGNATURE = "c3ludGhldGljLW1vbml0b3JpbmctaW50ZW50LXNpZ25hdHVyZQ"
 
 
 def _json_value(value: Any) -> Any:
@@ -79,13 +87,21 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _scope(resources: tuple[str, ...]) -> MonitoringIntentScope:
+def _scope(
+    resources: tuple[str, ...],
+    *,
+    evidence_resources: tuple[str, ...] = (),
+) -> MonitoringIntentScope:
     path = _dependency_path()
     payload: dict[str, object] = {
         "resourceIds": tuple(sorted(item.casefold() for item in resources)),
         "pathIds": (path.path_id,),
         "roleRefs": tuple(sorted((path.source_role_ref, path.target_role_ref))),
     }
+    if evidence_resources:
+        payload["evidenceResourceIds"] = tuple(
+            sorted(item.casefold() for item in evidence_resources)
+        )
     return MonitoringIntentScope(
         **payload,
         scopeDigest=compute_artifact_digest(_json_value(payload)),
@@ -112,6 +128,8 @@ def _control(
     source_clause: str,
     resources: tuple[str, ...],
     signal: object,
+    dry_run_only: bool = False,
+    evidence_resources: tuple[str, ...] = (),
 ) -> PublishedMonitoringIntentControl:
     payload: dict[str, object] = {
         "sourceClausePath": source_clause,
@@ -119,8 +137,8 @@ def _control(
         "severity": 1,
         "missingDataBehavior": "reviewRequired",
         "actionBehavior": "none",
-        "dryRunOnly": False,
-        "scope": _scope(resources),
+        "dryRunOnly": dry_run_only,
+        "scope": _scope(resources, evidence_resources=evidence_resources),
         "signal": signal,
     }
     digest = compute_artifact_digest(_json_value(payload))
@@ -131,7 +149,11 @@ def _control(
     )
 
 
-def _controls() -> dict[str, PublishedMonitoringIntentControl]:
+def _controls(
+    *,
+    dry_run_only: bool = False,
+    health_evidence_resources: tuple[str, ...] = (),
+) -> dict[str, PublishedMonitoringIntentControl]:
     path_resources = (
         WEB_ID,
         DB_ID,
@@ -142,6 +164,7 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "heartbeat": _control(
             source_clause="/controls/heartbeat",
             resources=(WEB_ID,),
+            dry_run_only=dry_run_only,
             signal=_query_signal(
                 "Heartbeat | summarize heartbeatCount=count()",
                 operator="lessThan",
@@ -151,6 +174,7 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "endpoint": _control(
             source_clause="/controls/vm-connection-health",
             resources=(WEB_ID, DB_ID),
+            dry_run_only=dry_run_only,
             signal=_query_signal(
                 "VMConnection | summarize failedConnectionCount=count()",
                 operator="greaterThan",
@@ -160,6 +184,8 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "monitor": _control(
             source_clause="/controls/connection-monitor",
             resources=(WEB_ID, DB_ID),
+            dry_run_only=dry_run_only,
+            evidence_resources=(MONITOR_ID,),
             signal=_query_signal(
                 "NWConnectionMonitorTestResult | summarize count()",
                 operator="greaterThan",
@@ -169,6 +195,7 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "flow": _control(
             source_clause="/controls/network-flow",
             resources=path_resources,
+            dry_run_only=dry_run_only,
             signal=_query_signal(
                 "NTANetAnalytics | summarize count()",
                 operator="greaterThan",
@@ -178,6 +205,7 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "change": _control(
             source_clause="/controls/activity-change",
             resources=(NSG_RULE_ID,),
+            dry_run_only=dry_run_only,
             signal=ActivityLogMonitoringSignal(
                 signalKind="activityLog",
                 categories=("Administrative",),
@@ -189,8 +217,11 @@ def _controls() -> dict[str, PublishedMonitoringIntentControl]:
         "health": _control(
             source_clause="/controls/resource-health",
             resources=(WEB_ID,),
+            dry_run_only=dry_run_only,
+            evidence_resources=health_evidence_resources,
             signal=ResourceHealthMonitoringSignal(
                 signalKind="resourceHealth",
+                maximumEventAgeSeconds=900,
                 eventStatuses=("Active", "Resolved"),
                 currentStatuses=("Available", "Unavailable"),
                 previousStatuses=("Available", "Unavailable"),
@@ -240,8 +271,15 @@ def _coverage_scope_digest(
     )
 
 
-def _authority() -> tuple[object, object, dict[str, PublishedMonitoringIntentControl]]:
-    controls = _controls()
+def _authority(
+    *,
+    dry_run_only: bool = False,
+    health_evidence_resources: tuple[str, ...] = (),
+) -> tuple[object, object, dict[str, PublishedMonitoringIntentControl]]:
+    controls = _controls(
+        dry_run_only=dry_run_only,
+        health_evidence_resources=health_evidence_resources,
+    )
     path = _dependency_path()
     tuple_digest = _five_tuple_digest()
     test_reference = "synthetic-web-db-test"
@@ -284,6 +322,97 @@ def _authority() -> tuple[object, object, dict[str, PublishedMonitoringIntentCon
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
     )
     return context, intent, controls
+
+
+def _intent_assets(intent) -> tuple[
+    PublishedMonitoringIntentAssetReference,
+    PublishedMonitoringIntentAttestation,
+]:
+    attestation = PublishedMonitoringIntentAttestation(
+        schemaVersion="athena.wc028PublishedMonitoringIntentAttestation.v1",
+        intentId=intent.intent_id,
+        intentDigest=intent.intent_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=INTENT_KEY_ID,
+        signedPreimageDigest=sha256_hex(intent.canonical_bytes()),
+        detachedSignature=INTENT_SIGNATURE,
+    )
+    prefix = f"monitoring-intent/{intent.intent_id}"
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028PublishedMonitoringIntentAssetReference.v1",
+        "intentId": intent.intent_id,
+        "intentDigest": intent.intent_digest,
+        "intentReference": VersionPinnedBlobReference(
+            name=f"{prefix}/intent.json",
+            version="2026-09-13T01:00:00.0000000Z",
+            contentDigest=sha256_hex(intent.canonical_bytes()),
+        ),
+        "attestationReference": VersionPinnedBlobReference(
+            name=f"{prefix}/attestation.json",
+            version="2026-09-13T01:00:01.0000000Z",
+            contentDigest=sha256_hex(attestation.canonical_bytes()),
+        ),
+    }
+    digest = compute_artifact_digest(_json_value(payload))
+    return (
+        PublishedMonitoringIntentAssetReference(
+            **payload,
+            referenceId=f"monitoring-intent-asset-{digest.removeprefix('sha256:')[:32]}",
+            referenceDigest=digest,
+        ),
+        attestation,
+    )
+
+
+def _query_execution_fields(
+    control: PublishedMonitoringIntentControl,
+    *,
+    source_record_id: str,
+    observed_start: datetime,
+    observed_end: datetime,
+) -> dict[str, object]:
+    signal = control.signal
+    assert isinstance(signal, LogQueryMonitoringSignal)
+    digest = compute_monitoring_query_execution_digest(
+        control_id=control.control_id,
+        source_record_id=source_record_id,
+        query_digest=signal.query_digest,
+        query_target_resource_id=signal.query_target_resource_id,
+        observed_start=observed_start,
+        observed_end=observed_end,
+        evaluation_window_seconds=signal.evaluation_window_seconds,
+        frequency_seconds=signal.frequency_seconds,
+    )
+    return {
+        "queryDigest": signal.query_digest,
+        "queryTargetResourceId": signal.query_target_resource_id,
+        "evaluationWindowSeconds": signal.evaluation_window_seconds,
+        "frequencySeconds": signal.frequency_seconds,
+        "queryExecutionDigest": digest,
+    }
+
+
+def _coverage_query_fields(
+    control: PublishedMonitoringIntentControl,
+    records: tuple[
+        AmaHeartbeatRecord
+        | VmConnectionHealthRecord
+        | ConnectionMonitorRecord
+        | NetworkWatcherFlowRecord,
+        ...,
+    ],
+) -> dict[str, object]:
+    signal = control.signal
+    assert isinstance(signal, LogQueryMonitoringSignal)
+    return {
+        "queryDigest": signal.query_digest,
+        "queryTargetResourceId": signal.query_target_resource_id,
+        "evaluationWindowSeconds": signal.evaluation_window_seconds,
+        "frequencySeconds": signal.frequency_seconds,
+        "queryExecutionDigests": tuple(
+            sorted(item.query_execution_digest for item in records)
+        ),
+    }
 
 
 def _change_record(control: PublishedMonitoringIntentControl) -> ResourceChangeRecord:
@@ -346,10 +475,12 @@ def _batch(
             resourceId=WEB_ID,
             observedStart=NOW - timedelta(minutes=10),
             observedEnd=NOW - timedelta(minutes=5),
-            queryDigest=controls["heartbeat"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["heartbeat"],
+                source_record_id="heartbeat-healthy",
+                observed_start=NOW - timedelta(minutes=10),
+                observed_end=NOW - timedelta(minutes=5),
+            ),
             heartbeatCount=1,
         ),
         AmaHeartbeatRecord(
@@ -359,10 +490,12 @@ def _batch(
             resourceId=WEB_ID,
             observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
-            queryDigest=controls["heartbeat"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["heartbeat"],
+                source_record_id="heartbeat-unhealthy",
+                observed_start=NOW - timedelta(minutes=5),
+                observed_end=NOW,
+            ),
             heartbeatCount=0,
         ),
         VmConnectionHealthRecord(
@@ -374,10 +507,12 @@ def _batch(
             pathId=path.path_id,
             observedStart=NOW - timedelta(minutes=10),
             observedEnd=NOW - timedelta(minutes=5),
-            queryDigest=controls["endpoint"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["endpoint"],
+                source_record_id="endpoint-healthy",
+                observed_start=NOW - timedelta(minutes=10),
+                observed_end=NOW - timedelta(minutes=5),
+            ),
             failedConnectionCount=0,
         ),
         VmConnectionHealthRecord(
@@ -389,10 +524,12 @@ def _batch(
             pathId=path.path_id,
             observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
-            queryDigest=controls["endpoint"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["endpoint"],
+                source_record_id="endpoint-unhealthy",
+                observed_start=NOW - timedelta(minutes=5),
+                observed_end=NOW,
+            ),
             failedConnectionCount=3,
         ),
         NetworkWatcherFlowRecord(
@@ -403,10 +540,12 @@ def _batch(
             pathId=path.path_id,
             observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
-            queryDigest=controls["flow"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["flow"],
+                source_record_id="flow-denied",
+                observed_start=NOW - timedelta(minutes=5),
+                observed_end=NOW,
+            ),
             decision="denied",
             direction="inbound",
             protocol="Tcp",
@@ -448,10 +587,12 @@ def _batch(
             pathId=path.path_id,
             observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
-            queryDigest=controls["monitor"].signal.query_digest,
-            queryTargetResourceId=WEB_ID,
-            evaluationWindowSeconds=300,
-            frequencySeconds=60,
+            **_query_execution_fields(
+                controls["monitor"],
+                source_record_id="connection-monitor-failed",
+                observed_start=NOW - timedelta(minutes=5),
+                observed_end=NOW,
+            ),
             monitorResourceId=MONITOR_ID,
             sourceResourceId=WEB_ID,
             destinationResourceId=DB_ID,
@@ -490,6 +631,7 @@ def _batch(
             reasonType="PlatformInitiated",
         ),
     )
+    records_by_id = {item.source_record_id: item for item in records}
     coverage = (
         MonitoringCoverageRecord(
             controlId=controls["flow"].control_id,
@@ -508,8 +650,12 @@ def _batch(
             pathId=path.path_id,
             direction="inbound",
             fiveTupleDigest=tuple_digest,
-            observedStart=NOW - timedelta(minutes=10),
+            observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
+            **_coverage_query_fields(
+                controls["flow"],
+                (records_by_id["flow-denied"],),
+            ),
             status="complete",
         ),
         MonitoringCoverageRecord(
@@ -522,8 +668,12 @@ def _batch(
             fiveTupleDigest=tuple_digest,
             endpointTestReference=test_reference,
             endpointTestDigest=test_digest,
-            observedStart=NOW - timedelta(minutes=10),
+            observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
+            **_coverage_query_fields(
+                controls["monitor"],
+                (records_by_id["connection-monitor-failed"],),
+            ),
             status="complete",
         ),
         MonitoringCoverageRecord(
@@ -532,13 +682,17 @@ def _batch(
             family="endpointHealth",
             resourceIds=tuple(sorted((WEB_ID.casefold(), DB_ID.casefold()))),
             pathId=path.path_id,
-            observedStart=NOW - timedelta(minutes=10),
+            observedStart=NOW - timedelta(minutes=5),
             observedEnd=NOW,
+            **_coverage_query_fields(
+                controls["endpoint"],
+                (records_by_id["endpoint-unhealthy"],),
+            ),
             status="complete",
         ),
     )
     return MonitoringCollectionBatch(
-        schemaVersion="athena.wc028MonitoringCollectionBatch.v1",
+        schemaVersion="athena.wc028MonitoringCollectionBatch.v2",
         collectedAt=NOW,
         incidentResourceId=WEB_ID,
         previousHealthSourceRecordId="endpoint-healthy",
@@ -624,10 +778,24 @@ class _CommitPort:
             self.calls += 1
 
 
-def _transaction() -> MonitoringCollectionTransaction:
+def _transaction(
+    *,
+    asset_loader: Callable[
+        [object],
+        tuple[
+            PublishedMonitoringIntentAssetReference,
+            PublishedMonitoringIntentAttestation,
+        ],
+    ] = _intent_assets,
+) -> MonitoringCollectionTransaction:
     return MonitoringCollectionTransaction(
         change_signer=_Signer(),
         change_signing_key_id=CHANGE_KEY_ID,
+        monitoring_intent_trusted_key_id=INTENT_KEY_ID,
+        monitoring_intent_signature_verifier=(
+            lambda _payload, signature: signature == INTENT_SIGNATURE
+        ),
+        monitoring_intent_asset_loader=asset_loader,
     )
 
 
@@ -693,6 +861,65 @@ def test_missing_direct_attribution_exposes_manual_investigation_evidence() -> N
     )
 
 
+def test_unattested_monitoring_intent_fails_before_transaction_commit() -> None:
+    context, intent, controls = _authority()
+    commit = _CommitPort()
+
+    def invalid_assets(
+        selected_intent: object,
+    ) -> tuple[
+        PublishedMonitoringIntentAssetReference,
+        PublishedMonitoringIntentAttestation,
+    ]:
+        reference, attestation = _intent_assets(selected_intent)
+        return reference, attestation.model_copy(
+            update={"detached_signature": "aW52YWxpZA"}
+        )
+
+    with pytest.raises(ValueError, match="assets"):
+        _transaction(asset_loader=invalid_assets).execute(
+            _batch(controls),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_signed_dry_run_intent_fails_before_transaction_commit() -> None:
+    context, intent, controls = _authority(dry_run_only=True)
+    commit = _CommitPort()
+
+    with pytest.raises(ValueError, match="dry-run-only"):
+        _transaction().execute(
+            _batch(controls),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
 def test_invalid_query_fails_before_transaction_commit() -> None:
     context, intent, controls = _authority()
     batch = _batch(controls)
@@ -744,7 +971,7 @@ def test_log_query_source_must_match_the_collector_record_kind() -> None:
     invalid = batch.model_copy(update={"records": records})
     commit = _CommitPort()
 
-    with pytest.raises(MonitoringCollectionError, match="record kind"):
+    with pytest.raises(MonitoringCollectionError, match="query execution"):
         _transaction().execute(
             invalid,
             monitoring_intent=intent,
@@ -781,6 +1008,88 @@ def test_resource_outside_published_control_scope_fails_before_commit() -> None:
     commit = _CommitPort()
 
     with pytest.raises(MonitoringCollectionError, match="scope"):
+        _transaction().execute(
+            invalid,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+@pytest.mark.parametrize(
+    "monitor_resource_id",
+    (
+        MONITOR_ID.replace("synthetic-web-db", "unreviewed-monitor"),
+        WEB_ID,
+    ),
+)
+def test_connection_monitor_resource_requires_signed_evidence_scope(
+    monitor_resource_id: str,
+) -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    records = tuple(
+        item.model_copy(update={"monitor_resource_id": monitor_resource_id})
+        if isinstance(item, ConnectionMonitorRecord)
+        else item
+        for item in batch.records
+    )
+    invalid = batch.model_copy(update={"records": records})
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="evidence scope"):
+        _transaction().execute(
+            invalid,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_evidence_resource_cannot_become_resource_health_incident_subject() -> None:
+    context, intent, controls = _authority(
+        health_evidence_resources=(MONITOR_ID,),
+    )
+    batch = _batch(controls)
+    records = tuple(
+        item.model_copy(update={"resource_id": MONITOR_ID})
+        if isinstance(item, ResourceHealthRecord)
+        else item
+        for item in batch.records
+    )
+    invalid = batch.model_copy(
+        update={
+            "incident_resource_id": MONITOR_ID,
+            "records": records,
+            "previous_health_source_record_id": "resource-health-resolved",
+            "current_health_source_record_ids": ("resource-health-active",),
+        }
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="control scope"):
         _transaction().execute(
             invalid,
             monitoring_intent=intent,
@@ -930,7 +1239,7 @@ def test_stale_query_and_invalid_request_window_do_not_commit() -> None:
     stale = batch.model_copy(update={"records": records})
     stale_commit = _CommitPort()
 
-    with pytest.raises(MonitoringCollectionError, match="evaluation window"):
+    with pytest.raises(MonitoringCollectionError, match="query execution"):
         _transaction().execute(
             stale,
             monitoring_intent=intent,
@@ -980,7 +1289,7 @@ def test_future_or_duplicate_coverage_is_rejected() -> None:
     future = batch.model_copy(update={"coverage": future_coverage})
     commit = _CommitPort()
 
-    with pytest.raises(MonitoringCollectionError, match="newer"):
+    with pytest.raises(MonitoringCollectionError, match="freshness"):
         _transaction().execute(
             future,
             monitoring_intent=intent,
@@ -1002,6 +1311,139 @@ def test_future_or_duplicate_coverage_is_rejected() -> None:
     payload["coverage"][1]["sourceRecordId"] = payload["coverage"][0]["sourceRecordId"]
     with pytest.raises(ValidationError, match="coverage sourceRecordId"):
         MonitoringCollectionBatch.model_validate(payload)
+
+
+def test_complete_coverage_cannot_extend_beyond_bound_query_executions() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    coverage = tuple(
+        item.model_copy(update={"observed_start": NOW - timedelta(minutes=10)})
+        if item.source_record_id == "coverage-flow"
+        else item
+        for item in batch.coverage
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="exact contiguous"):
+        _transaction().execute(
+            batch.model_copy(update={"coverage": coverage}),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_complete_coverage_requires_reviewed_execution_frequency() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    records_by_id = {item.source_record_id: item for item in batch.records}
+    coverage = tuple(
+        item.model_copy(
+            update={
+                "observed_start": NOW - timedelta(minutes=10),
+                "query_execution_digests": tuple(
+                    sorted(
+                        (
+                            records_by_id["endpoint-healthy"].query_execution_digest,
+                            records_by_id["endpoint-unhealthy"].query_execution_digest,
+                        )
+                    )
+                ),
+            }
+        )
+        if item.source_record_id == "coverage-endpoint"
+        else item
+        for item in batch.coverage
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="scheduled coverage"):
+        _transaction().execute(
+            batch.model_copy(update={"coverage": coverage}),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_complete_coverage_rejects_unknown_query_execution_digest() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    coverage = tuple(
+        item.model_copy(update={"query_execution_digests": ("sha256:" + "f" * 64,)})
+        if item.source_record_id == "coverage-flow"
+        else item
+        for item in batch.coverage
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="unknown query execution"):
+        _transaction().execute(
+            batch.model_copy(update={"coverage": coverage}),
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_v1_collection_batch_is_rejected_after_query_binding_upgrade() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls).model_copy(
+        update={"schema_version": "athena.wc028MonitoringCollectionBatch.v1"}
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="strict .* revalidation"):
+        _transaction().execute(
+            batch,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
 
 
 def test_coverage_family_must_match_published_query_source() -> None:
@@ -1165,6 +1607,81 @@ def test_resource_health_incident_must_report_available_to_adverse_transition() 
     assert resolved_commit.calls == 0
 
 
+def test_stale_resource_health_cannot_open_an_incident() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls)
+    records = tuple(
+        item.model_copy(
+            update={
+                "observed_start": NOW - timedelta(minutes=20),
+                "observed_end": NOW - timedelta(minutes=16),
+            }
+        )
+        if isinstance(item, ResourceHealthRecord)
+        and item.source_record_id == "resource-health-active"
+        else item
+        for item in batch.records
+    )
+    stale = batch.model_copy(
+        update={
+            "records": records,
+            "previous_health_source_record_id": "resource-health-resolved",
+            "current_health_source_record_ids": ("resource-health-active",),
+        }
+    )
+    commit = _CommitPort()
+
+    with pytest.raises(MonitoringCollectionError, match="freshness limit"):
+        _transaction().execute(
+            stale,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert commit.calls == 0
+
+
+def test_resource_health_freshness_is_rechecked_at_trusted_as_of() -> None:
+    context, intent, controls = _authority()
+    batch = _batch(controls).model_copy(
+        update={
+            "previous_health_source_record_id": "resource-health-resolved",
+            "current_health_source_record_ids": ("resource-health-active",),
+        }
+    )
+    commit = _CommitPort()
+    trusted_as_of = NOW + timedelta(minutes=15, seconds=1)
+
+    with pytest.raises(MonitoringCollectionError, match="freshness limit"):
+        _transaction().execute(
+            batch,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW + timedelta(minutes=1),
+            trusted_as_of=trusted_as_of,
+            expires_at=trusted_as_of,
+        )
+
+    assert commit.calls == 0
+
+
 def test_preparation_is_deterministic_for_input_order() -> None:
     context, intent, controls = _authority()
     batch = _batch(controls)
@@ -1182,6 +1699,7 @@ def test_preparation_is_deterministic_for_input_order() -> None:
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
         collector_contract_digest=DIGEST_C,
         change_scope=_scope_contract(),
+        trusted_as_of=NOW + timedelta(minutes=1),
     )
     actual = transaction.prepare(
         reversed_batch,
@@ -1190,6 +1708,7 @@ def test_preparation_is_deterministic_for_input_order() -> None:
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
         collector_contract_digest=DIGEST_C,
         change_scope=_scope_contract(),
+        trusted_as_of=NOW + timedelta(minutes=1),
     )
 
     assert actual.monitoring_bundle.canonical_bytes() == (

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
@@ -34,13 +35,16 @@ from athena_context.contracts import (
     NormalizedChangeEvidence,
     PlatformHealthObservation,
     PublishedMonitoringIntent,
+    PublishedMonitoringIntentAssetReference,
+    PublishedMonitoringIntentAttestation,
     PublishedMonitoringIntentControl,
     PublishedRuntimeContextBinding,
     ResourceHealthMonitoringSignal,
     VersionPinnedBlobReference,
     compute_artifact_digest,
     sha256_hex,
-    validate_published_monitoring_intent_context,
+    validate_monitoring_intent_activation_eligible,
+    validate_published_monitoring_intent_assets,
 )
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
@@ -50,7 +54,7 @@ from athena_context.eventing.change_ingestion import (
     normalize_resource_graph_change,
 )
 
-MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v1"
+MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
 MAX_MONITORING_COLLECTION_BYTES = 512 * 1024
 MAX_MONITORING_COLLECTION_RECORDS = 1000
 _DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -72,6 +76,33 @@ _CAUSAL_NSG_PROPERTY_PREFIXES = (
 
 class MonitoringCollectionError(RuntimeError):
     """Raised when a collection batch cannot be normalized without ambiguity."""
+
+
+def compute_monitoring_query_execution_digest(
+    *,
+    control_id: str,
+    source_record_id: str,
+    query_digest: str,
+    query_target_resource_id: str,
+    observed_start: datetime,
+    observed_end: datetime,
+    evaluation_window_seconds: int,
+    frequency_seconds: int,
+) -> str:
+    """Bind one collector result to the exact reviewed query execution coordinates."""
+
+    return compute_artifact_digest(
+        {
+            "controlId": control_id,
+            "sourceRecordId": source_record_id,
+            "queryDigest": query_digest,
+            "queryTargetResourceId": query_target_resource_id.casefold().rstrip("/"),
+            "observedStart": observed_start,
+            "observedEnd": observed_end,
+            "evaluationWindowSeconds": evaluation_window_seconds,
+            "frequencySeconds": frequency_seconds,
+        }
+    )
 
 
 class _StrictCollectionModel(AthenaBaseModel):
@@ -127,6 +158,7 @@ class _LogQueryCollectionRecord(_WindowedCollectionRecord):
         ge=60,
         le=3600,
     )
+    query_execution_digest: Sha256Digest = Field(alias="queryExecutionDigest")
 
     @model_validator(mode="after")
     def validate_query_window(self) -> _LogQueryCollectionRecord:
@@ -135,6 +167,18 @@ class _LogQueryCollectionRecord(_WindowedCollectionRecord):
             or self.evaluation_window_seconds % self.frequency_seconds != 0
         ):
             raise ValueError("query frequency must divide the evaluation window")
+        expected = compute_monitoring_query_execution_digest(
+            control_id=self.control_id,
+            source_record_id=self.source_record_id,
+            query_digest=self.query_digest,
+            query_target_resource_id=self.query_target_resource_id,
+            observed_start=self.observed_start,
+            observed_end=self.observed_end,
+            evaluation_window_seconds=self.evaluation_window_seconds,
+            frequency_seconds=self.frequency_seconds,
+        )
+        if self.query_execution_digest != expected:
+            raise ValueError("queryExecutionDigest does not bind exact query execution")
         return self
 
 
@@ -412,12 +456,61 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
         default=None,
         alias="endpointTestDigest",
     )
+    query_digest: Sha256Digest | None = Field(default=None, alias="queryDigest")
+    query_target_resource_id: str | None = Field(
+        default=None,
+        alias="queryTargetResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    evaluation_window_seconds: int | None = Field(
+        default=None,
+        alias="evaluationWindowSeconds",
+        ge=60,
+        le=86400,
+    )
+    frequency_seconds: int | None = Field(
+        default=None,
+        alias="frequencySeconds",
+        ge=60,
+        le=3600,
+    )
+    query_execution_digests: tuple[Sha256Digest, ...] = Field(
+        default=(),
+        alias="queryExecutionDigests",
+        max_length=1440,
+    )
     status: Literal["complete", "partial", "unavailable", "truncated"]
     detail: str | None = Field(default=None, min_length=1, max_length=500)
 
+    @model_validator(mode="after")
+    def validate_query_binding_shape(self) -> MonitoringCoverageRecord:
+        query_values = (
+            self.query_digest,
+            self.query_target_resource_id,
+            self.evaluation_window_seconds,
+            self.frequency_seconds,
+        )
+        if self.family == "platformHealth":
+            if any(value is not None for value in query_values) or self.query_execution_digests:
+                raise ValueError("platform health coverage cannot claim query execution")
+            return self
+        if any(value is None for value in query_values):
+            raise ValueError("query-derived coverage requires exact query execution binding")
+        if self.status == "complete" and not self.query_execution_digests:
+            raise ValueError("complete query coverage requires executed query digests")
+        if self.status == "unavailable" and self.query_execution_digests:
+            raise ValueError("unavailable query coverage cannot claim executed queries")
+        if (
+            self.query_execution_digests != tuple(sorted(self.query_execution_digests))
+            or len(self.query_execution_digests) != len(set(self.query_execution_digests))
+        ):
+            raise ValueError("queryExecutionDigests must be sorted unique values")
+        return self
+
 
 class MonitoringCollectionBatch(_StrictCollectionModel):
-    schema_version: Literal["athena.wc028MonitoringCollectionBatch.v1"] = Field(
+    schema_version: Literal["athena.wc028MonitoringCollectionBatch.v2"] = Field(
         alias="schemaVersion"
     )
     collected_at: UtcDateTime = Field(alias="collectedAt")
@@ -642,12 +735,23 @@ def _require_log_query(
             "collector record requires an exact published log-query control"
         )
     signal = control.signal
+    expected_execution_digest = compute_monitoring_query_execution_digest(
+        control_id=record.control_id,
+        source_record_id=record.source_record_id,
+        query_digest=record.query_digest,
+        query_target_resource_id=record.query_target_resource_id,
+        observed_start=record.observed_start,
+        observed_end=record.observed_end,
+        evaluation_window_seconds=record.evaluation_window_seconds,
+        frequency_seconds=record.frequency_seconds,
+    )
     if (
         signal.query_digest != record.query_digest
         or _canonical_resource_id(signal.query_target_resource_id)
         != _canonical_resource_id(record.query_target_resource_id)
         or signal.evaluation_window_seconds != record.evaluation_window_seconds
         or signal.frequency_seconds != record.frequency_seconds
+        or record.query_execution_digest != expected_execution_digest
     ):
         raise MonitoringCollectionError(
             "collector query execution does not match published monitoring intent"
@@ -718,6 +822,18 @@ def _require_resources(
     if not set(normalized).issubset(control.scope.resource_ids):
         raise MonitoringCollectionError(
             "collector record escapes the published monitoring control scope"
+        )
+    return normalized
+
+
+def _require_evidence_resources(
+    control: PublishedMonitoringIntentControl,
+    *resource_ids: str,
+) -> tuple[str, ...]:
+    normalized = tuple(_canonical_resource_id(item) for item in resource_ids)
+    if not set(normalized).issubset(control.scope.evidence_resource_ids or ()):
+        raise MonitoringCollectionError(
+            "collector evidence resource escapes the published evidence scope"
         )
     return normalized
 
@@ -867,6 +983,160 @@ def _tuple_payload(
     }
 
 
+def _record_matches_coverage_scope(
+    record: _LogQueryCollectionRecord,
+    coverage: MonitoringCoverageRecord,
+) -> bool:
+    resources = {_canonical_resource_id(item) for item in coverage.resource_ids}
+    if isinstance(record, AmaHeartbeatRecord):
+        return (
+            coverage.path_id is None
+            and coverage.direction is None
+            and coverage.five_tuple_digest is None
+            and resources == {_canonical_resource_id(record.resource_id)}
+        )
+    if isinstance(record, VmConnectionHealthRecord):
+        return (
+            coverage.path_id == record.path_id
+            and coverage.direction is None
+            and coverage.five_tuple_digest is None
+            and resources
+            == {
+                _canonical_resource_id(record.subject_resource_id),
+                *(_canonical_resource_id(item) for item in record.backend_resource_ids),
+            }
+        )
+    if not isinstance(record, (ConnectionMonitorRecord, NetworkWatcherFlowRecord)):
+        return False
+    source_id = _canonical_resource_id(record.source_resource_id)
+    destination_id = _canonical_resource_id(record.destination_resource_id)
+    tuple_digest = compute_artifact_digest(
+        _tuple_payload(
+            record,
+            source_resource_id=source_id,
+            destination_resource_id=destination_id,
+        )
+    )
+    if isinstance(record, ConnectionMonitorRecord):
+        return (
+            coverage.path_id == record.path_id
+            and coverage.direction == record.direction
+            and coverage.five_tuple_digest == tuple_digest
+            and coverage.endpoint_test_reference == record.test_configuration_reference
+            and coverage.endpoint_test_digest == record.test_configuration_digest
+            and resources == {source_id, destination_id}
+        )
+    if not isinstance(record, NetworkWatcherFlowRecord):
+        return False
+    expected_resources = {
+        _canonical_resource_id(record.subject_resource_id),
+        source_id,
+        destination_id,
+        _canonical_resource_id(record.enforcement_resource_id),
+    }
+    if record.rule_resource_id is not None:
+        expected_resources.add(_canonical_resource_id(record.rule_resource_id))
+    return (
+        coverage.path_id == record.path_id
+        and coverage.direction == record.direction
+        and coverage.five_tuple_digest == tuple_digest
+        and coverage.endpoint_test_reference is None
+        and coverage.endpoint_test_digest is None
+        and resources == expected_resources
+    )
+
+
+def _validate_coverage_query_binding(
+    coverage: MonitoringCoverageRecord,
+    control: PublishedMonitoringIntentControl,
+    records_by_execution: Mapping[str, _LogQueryCollectionRecord],
+    *,
+    collected_at: datetime,
+) -> None:
+    if isinstance(control.signal, ResourceHealthMonitoringSignal):
+        return
+    if not isinstance(control.signal, LogQueryMonitoringSignal):
+        raise MonitoringCollectionError("Activity Log controls cannot declare monitoring coverage")
+    signal = control.signal
+    if (
+        coverage.query_digest != signal.query_digest
+        or coverage.query_target_resource_id is None
+        or _canonical_resource_id(coverage.query_target_resource_id)
+        != _canonical_resource_id(signal.query_target_resource_id)
+        or coverage.evaluation_window_seconds != signal.evaluation_window_seconds
+        or coverage.frequency_seconds != signal.frequency_seconds
+    ):
+        raise MonitoringCollectionError(
+            "coverage query execution does not match published monitoring intent"
+        )
+    if (
+        coverage.observed_end > collected_at
+        or (coverage.observed_end - coverage.observed_start).total_seconds()
+        <= 0
+        or (collected_at - coverage.observed_end).total_seconds()
+        > signal.evaluation_window_seconds + signal.frequency_seconds
+    ):
+        raise MonitoringCollectionError("coverage is outside its reviewed freshness window")
+    if coverage.status == "unavailable":
+        if (
+            coverage.observed_end - coverage.observed_start
+        ).total_seconds() != signal.evaluation_window_seconds:
+            raise MonitoringCollectionError(
+                "unavailable coverage must use one reviewed evaluation window"
+            )
+        return
+    try:
+        executions = tuple(
+            records_by_execution[digest] for digest in coverage.query_execution_digests
+        )
+    except KeyError as exc:
+        raise MonitoringCollectionError(
+            "coverage references an unknown query execution"
+        ) from exc
+    if any(
+        record.control_id != coverage.control_id
+        or record.query_digest != coverage.query_digest
+        or record.query_target_resource_id.casefold().rstrip("/")
+        != coverage.query_target_resource_id.casefold().rstrip("/")
+        or record.evaluation_window_seconds != coverage.evaluation_window_seconds
+        or record.frequency_seconds != coverage.frequency_seconds
+        or not _record_matches_coverage_scope(record, coverage)
+        for record in executions
+    ):
+        raise MonitoringCollectionError(
+            "coverage does not bind exact query executions and scope"
+        )
+    ordered = tuple(
+        sorted(
+            executions,
+            key=lambda item: (
+                item.observed_start,
+                item.observed_end,
+                item.query_execution_digest,
+            ),
+        )
+    )
+    if (
+        not ordered
+        or ordered[0].observed_start != coverage.observed_start
+        or ordered[-1].observed_end != coverage.observed_end
+        or any(
+            (
+                current.observed_start - previous.observed_start
+            ).total_seconds()
+            != signal.frequency_seconds
+            or (
+                current.observed_end - previous.observed_end
+            ).total_seconds()
+            != signal.frequency_seconds
+            for previous, current in zip(ordered, ordered[1:], strict=False)
+        )
+    ):
+        raise MonitoringCollectionError(
+            "coverage query executions are not exact contiguous scheduled coverage"
+        )
+
+
 def _connection_monitor_observation(
     record: ConnectionMonitorRecord,
     control: PublishedMonitoringIntentControl,
@@ -879,6 +1149,10 @@ def _connection_monitor_observation(
         record,
         collected_at=collected_at,
         required_table="NWConnectionMonitorTestResult",
+    )
+    (monitor_id,) = _require_evidence_resources(
+        control,
+        record.monitor_resource_id,
     )
     source_id, destination_id = _require_resources(
         control,
@@ -913,7 +1187,7 @@ def _connection_monitor_observation(
         ),
         "summaryCode": f"network.connection-monitor-{record.status}",
         "pathId": record.path_id,
-        "monitorResourceId": _canonical_resource_id(record.monitor_resource_id),
+        "monitorResourceId": monitor_id,
         **tuple_payload,
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "status": record.status,
@@ -1087,6 +1361,8 @@ def _resource_health_observation(
     record: ResourceHealthRecord,
     control: PublishedMonitoringIntentControl,
     intent_digest: str,
+    collected_at: datetime,
+    trusted_as_of: datetime,
 ) -> PlatformHealthObservation:
     if not isinstance(control.signal, ResourceHealthMonitoringSignal):
         raise MonitoringCollectionError(
@@ -1101,6 +1377,21 @@ def _resource_health_observation(
     ):
         raise MonitoringCollectionError(
             "resource-health record does not match published event filters"
+        )
+    if (
+        record.observed_end > collected_at
+        or record.observed_end > trusted_as_of
+        or (collected_at - record.observed_start).total_seconds()
+        > signal.maximum_event_age_seconds
+        or (collected_at - record.observed_end).total_seconds()
+        > signal.maximum_event_age_seconds
+        or (trusted_as_of - record.observed_start).total_seconds()
+        > signal.maximum_event_age_seconds
+        or (trusted_as_of - record.observed_end).total_seconds()
+        > signal.maximum_event_age_seconds
+    ):
+        raise MonitoringCollectionError(
+            "resource-health record is outside the reviewed freshness limit"
         )
     (resource_id,) = _require_resources(control, record.resource_id)
     state_by_status = {
@@ -1223,9 +1514,23 @@ class MonitoringCollectionTransaction:
         *,
         change_signer: ChangeEvidenceArtifactSigner,
         change_signing_key_id: str,
+        monitoring_intent_trusted_key_id: str,
+        monitoring_intent_signature_verifier: Callable[[bytes, str], bool],
+        monitoring_intent_asset_loader: Callable[
+            [PublishedMonitoringIntent],
+            tuple[
+                PublishedMonitoringIntentAssetReference,
+                PublishedMonitoringIntentAttestation,
+            ],
+        ],
     ) -> None:
         self._change_signer = change_signer
         self._change_signing_key_id = change_signing_key_id
+        self._monitoring_intent_trusted_key_id = monitoring_intent_trusted_key_id
+        self._monitoring_intent_signature_verifier = (
+            monitoring_intent_signature_verifier
+        )
+        self._monitoring_intent_asset_loader = monitoring_intent_asset_loader
 
     def prepare(
         self,
@@ -1236,16 +1541,47 @@ class MonitoringCollectionTransaction:
         expected_active_context_authority_digest: str,
         collector_contract_digest: str,
         change_scope: ApprovedChangeScope,
+        trusted_as_of: datetime,
     ) -> PreparedMonitoringCollection:
         if type(batch) is not MonitoringCollectionBatch:
             raise TypeError("collection transaction requires an exact batch")
+        try:
+            batch = MonitoringCollectionBatch.model_validate_json(
+                batch.model_dump_json(by_alias=True)
+            )
+        except ValidationError as exc:
+            raise MonitoringCollectionError(
+                "collection batch failed strict query execution/schema revalidation"
+            ) from exc
         if type(monitoring_intent) is not PublishedMonitoringIntent:
             raise TypeError("collection transaction requires exact published intent")
+        monitoring_intent_reference, monitoring_intent_attestation = (
+            self._monitoring_intent_asset_loader(monitoring_intent)
+        )
+        if type(monitoring_intent_reference) is not PublishedMonitoringIntentAssetReference:
+            raise TypeError("collection transaction requires exact published intent reference")
+        if type(monitoring_intent_attestation) is not PublishedMonitoringIntentAttestation:
+            raise TypeError("collection transaction requires exact published intent attestation")
         if type(context_binding) is not PublishedRuntimeContextBinding:
             raise TypeError("collection transaction requires published runtime context")
+        if (
+            trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)
+            or trusted_as_of.microsecond % 1000
+            or trusted_as_of < batch.collected_at
+        ):
+            raise MonitoringCollectionError(
+                "collection trustedAsOf must be millisecond UTC at or after collectedAt"
+            )
         if _DIGEST_PATTERN.fullmatch(collector_contract_digest) is None:
             raise MonitoringCollectionError("collector contract digest is invalid")
-        validate_published_monitoring_intent_context(
+        validate_published_monitoring_intent_assets(
+            monitoring_intent_reference,
+            monitoring_intent,
+            monitoring_intent_attestation,
+            trusted_key_id=self._monitoring_intent_trusted_key_id,
+            signature_verifier=self._monitoring_intent_signature_verifier,
+        )
+        validate_monitoring_intent_activation_eligible(
             monitoring_intent,
             context_binding,
             expected_active_context_authority_digest=(expected_active_context_authority_digest),
@@ -1359,11 +1695,29 @@ class MonitoringCollectionTransaction:
                     collection_record,
                     control,
                     monitoring_intent.intent_digest,
+                    batch.collected_at,
+                    trusted_as_of,
                 )
             else:
                 raise MonitoringCollectionError("unsupported monitoring record")
             observations_by_source[collection_record.source_record_id] = observation
 
+        records_by_execution = {
+            item.query_execution_digest: item
+            for item in batch.records
+            if isinstance(item, _LogQueryCollectionRecord)
+        }
+        if len(records_by_execution) != sum(
+            isinstance(item, _LogQueryCollectionRecord) for item in batch.records
+        ):
+            raise MonitoringCollectionError("query execution digests must be unique")
+        for coverage_record in batch.coverage:
+            _validate_coverage_query_binding(
+                coverage_record,
+                coverage_controls[coverage_record.source_record_id],
+                records_by_execution,
+                collected_at=batch.collected_at,
+            )
         coverage_pairs = tuple(
             (
                 coverage_record,
@@ -1550,6 +1904,7 @@ class MonitoringCollectionTransaction:
             expected_active_context_authority_digest=(expected_active_context_authority_digest),
             collector_contract_digest=collector_contract_digest,
             change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
         )
         with commit_port.transaction(prepared) as committed:
             request = build_collected_correlation_request(
@@ -1803,4 +2158,5 @@ __all__ = [
     "ResourceHealthRecord",
     "VmConnectionHealthRecord",
     "build_collected_correlation_request",
+    "compute_monitoring_query_execution_digest",
 ]

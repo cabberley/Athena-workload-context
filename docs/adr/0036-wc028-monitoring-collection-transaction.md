@@ -22,7 +22,9 @@ Add an all-or-nothing monitoring collection preparation boundary.
 The boundary:
 
 - validates one exact `PublishedMonitoringIntent` against one exact
-  `PublishedRuntimeContextBinding`;
+  `PublishedRuntimeContextBinding`, but only after validating the intent's version-pinned asset
+  references, detached signature, trusted signing key, and activation eligibility; a structurally
+  valid or `dryRunOnly` intent is not executable;
 - accepts bounded, strict records for AMA heartbeat, VM Insights connection health, Network
   Watcher flow evidence, Connection Monitor, Resource Health, and paired Activity Log/Resource
   Graph changes;
@@ -32,6 +34,11 @@ The boundary:
 - rejects resources or dependency paths outside the control and published context;
 - binds each declared coverage family to the control's reviewed Azure source table so one
   collector cannot claim another collector's completeness;
+- binds query-derived coverage to exact query-execution digests, reviewed query digest and target,
+  evaluation window, and frequency. Complete coverage must be composed solely of bounded,
+  contiguous, fresh executions with an exact matching resource/path/tuple scope;
+- keeps monitoring-owned evidence resources, such as a Connection Monitor resource, in a signed
+  `evidenceResourceIds` scope distinct from workload dependency-path coverage resources;
 - normalizes into the existing WC-026 observation, coverage, change-artifact, incident-transition,
   evidence-inventory, and correlation-request contracts;
 - attributes a denied flow to an NSG rule change only when one successful, causal, pre-incident
@@ -50,7 +57,14 @@ owner of confidence and manual-investigation evidence.
 Incident construction preserves the selected adverse health state (`degraded`, `unhealthy`, or
 `unavailable`) and expands the anchor to the complete overlapping evidence interval required by
 the WC-026 verifier. A Resource Health incident anchor must be an active event that explicitly
-transitions from `Available`; a resolved event cannot open an incident.
+transitions from `Available`; a resolved event cannot open an incident. Resource Health event
+intervals must also remain within the control's reviewed `maximumEventAgeSeconds` at both
+collection time and the request's trusted evaluation time.
+
+The strengthened input contract is `athena.wc028MonitoringCollectionBatch.v2`, and monitoring
+intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health controls now carry a
+required freshness bound. Version 1 assets are rejected rather than silently treating unbound
+coverage or unbounded health events as activation eligible.
 
 ## Consequences
 
@@ -60,6 +74,8 @@ transitions from `Available`; a resolved event cannot open an incident.
   `effectiveRuleAttribution` manual-investigation evidence.
 - Invalid queries, filters, scope, paths, health transitions, coverage, or change pairing fail
   before the persistence port is called.
+- Unsigned, incorrectly signed, or dry-run-only monitoring intent fails before evidence
+  normalization or persistence.
 - No Azure resource, RBAC assignment, query deployment, alert rule, or connection monitor is
   created by this slice.
 - A later slice must implement the identity-isolated Azure acquisition and atomic persistence port,
