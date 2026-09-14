@@ -1477,6 +1477,28 @@ def test_rbac_name_only_allowance_matches_canonical_builtin_role_id() -> None:
     ) == ()
 
 
+def test_legacy_name_allowance_matches_id_only_builtin_assignment() -> None:
+    reader_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+    )
+    assignment = _assignment(
+        role_name=None,
+        role_id=reader_role_id,
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+    allowance = _assignment(
+        role_name="Reader",
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+
+    assert evaluate_role_assignments(
+        [assignment],
+        policy_document={"allowedBroadAssignments": [allowance]},
+    ) == ()
+
+
 def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"

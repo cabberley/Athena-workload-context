@@ -315,7 +315,6 @@ def _allowance_matches(
         and allowance.scope == assignment.scope
         and allowance.condition == assignment.condition
         and allowance.condition_version == assignment.condition_version
-        and allowance.role_name_supplied == assignment.role_name_supplied
         and (
             not allowance.role_definition_id
             or allowance.role_definition_id == assignment.role_definition_id
