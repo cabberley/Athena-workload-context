@@ -181,6 +181,10 @@ def _reject_ambiguous_object_pairs(
             raise PreflightInputError(
                 "JSON object key has ambiguous Unicode case folding"
             )
+        if _contains_non_ascii_case_alias(key):
+            raise PreflightInputError(
+                "JSON object key contains a non-ASCII case alias"
+            )
         result[key] = value
         casefolded_keys.add(casefolded)
     return result
@@ -189,6 +193,17 @@ def _reject_ambiguous_object_pairs(
 def _canonical_role_key(value: str) -> str:
     normalized = _normalized(value).rsplit("/", 1)[-1]
     return _ROLE_ID_TO_NAME.get(normalized, normalized)
+
+
+def _contains_non_ascii_case_alias(value: str) -> bool:
+    return any(
+        not character.isascii()
+        and (
+            character.lower().isascii()
+            or character.casefold().isascii()
+        )
+        for character in value
+    )
 
 
 def _canonical_role_id(value: str) -> str:
@@ -217,6 +232,10 @@ def _canonical_property_path(value: str) -> str:
     if normalized != value.casefold():
         raise PreflightInputError(
             "property path has ambiguous Unicode case folding"
+        )
+    if _contains_non_ascii_case_alias(value):
+        raise PreflightInputError(
+            "property path contains a non-ASCII case alias"
         )
     prefix = "<resource>."
     return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
@@ -376,6 +395,10 @@ def _validate_json_shape(value: object) -> None:
             if any(key.lower() != key.casefold() for key in item):
                 raise PreflightInputError(
                     "JSON object key has ambiguous Unicode case folding"
+                )
+            if any(_contains_non_ascii_case_alias(key) for key in item):
+                raise PreflightInputError(
+                    "JSON object key contains a non-ASCII case alias"
                 )
             if len(lowered_keys) != len(set(lowered_keys)):
                 raise PreflightInputError(
@@ -708,10 +731,21 @@ def _unsafe_property_violations(
             for raw_path, _, _ in candidates
         )
 
+    def ancestor_removed(target: str) -> bool:
+        return any(
+            property_change_type in {"delete", "remove"}
+            and (path := _canonical_property_path(raw_path)) != target
+            and target.startswith(path + ".")
+            for raw_path, _, property_change_type in delta_candidates
+        )
+
     if (
         resource_type == _STORAGE_ACCOUNT_TYPE
         and delta_touches("properties.allowsharedkeyaccess")
-        and not has_exact_evidence("properties.allowsharedkeyaccess")
+        and (
+            ancestor_removed("properties.allowsharedkeyaccess")
+            or not has_exact_evidence("properties.allowsharedkeyaccess")
+        )
     ):
         violations.append(
             PreflightViolation(
@@ -723,7 +757,10 @@ def _unsafe_property_violations(
     if (
         resource_type == _STORAGE_ACCOUNT_TYPE
         and delta_touches("properties.allowblobpublicaccess")
-        and not has_exact_evidence("properties.allowblobpublicaccess")
+        and (
+            ancestor_removed("properties.allowblobpublicaccess")
+            or not has_exact_evidence("properties.allowblobpublicaccess")
+        )
     ):
         violations.append(
             PreflightViolation(
@@ -735,7 +772,10 @@ def _unsafe_property_violations(
     if (
         resource_type == _STORAGE_CONTAINER_TYPE
         and delta_touches("properties.publicaccess")
-        and not has_exact_evidence("properties.publicaccess")
+        and (
+            ancestor_removed("properties.publicaccess")
+            or not has_exact_evidence("properties.publicaccess")
+        )
     ):
         violations.append(
             PreflightViolation(

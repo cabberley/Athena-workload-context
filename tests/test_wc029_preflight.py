@@ -832,6 +832,26 @@ def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:
             allowed_change_ids=frozenset({_STORAGE_ID}),
         )
 
+    kelvin_alias = _what_if(
+        {
+            "resourceId": _STORAGE_ID,
+            "changeType": "Create",
+            "after": {
+                "properties": {
+                    "allowShared\u212aeyAccess": False,
+                    "allowBlobPublicAccess": False,
+                    "publicNetworkAccess": "Disabled",
+                    "networkAcls": {"defaultAction": "Deny"},
+                }
+            },
+        }
+    )
+    with pytest.raises(PreflightInputError, match="non-ASCII case alias"):
+        evaluate_what_if(
+            kelvin_alias,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
 
 @pytest.mark.parametrize(
     ("path", "after", "code"),
@@ -1094,6 +1114,60 @@ def test_storage_ancestor_modify_requires_complete_protected_after_state() -> No
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "after", "expected_codes"),
+    [
+        (
+            _STORAGE_ID,
+            {
+                "properties": {
+                    "allowSharedKeyAccess": False,
+                    "allowBlobPublicAccess": False,
+                    "publicNetworkAccess": "Disabled",
+                    "networkAcls": {"defaultAction": "Deny"},
+                }
+            },
+            {
+                "public-data-plane-access",
+                "storage-public-blob-access",
+                "storage-shared-key-enabled",
+            },
+        ),
+        (
+            _STORAGE_CONTAINER_ID,
+            {"properties": {"publicAccess": "None"}},
+            {"storage-container-public-access"},
+        ),
+    ],
+)
+def test_ancestor_deletion_blocks_despite_separate_safe_after_payload(
+    resource_id: str,
+    after: dict[str, object],
+    expected_codes: set[str],
+) -> None:
+    document = _what_if(
+        {
+            "resourceId": resource_id,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties",
+                    "propertyChangeType": "Delete",
+                }
+            ],
+            "after": after,
+        }
+    )
+
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            document,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+    } == expected_codes
 
 
 @pytest.mark.parametrize(

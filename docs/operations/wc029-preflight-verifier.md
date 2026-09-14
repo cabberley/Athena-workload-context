@@ -30,7 +30,7 @@ resources were not resolved into the reviewed `changes` collection.
 Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
 one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
 names cannot impersonate structurally nested protected settings. Unicode characters whose case fold
-is ASCII-equivalent are rejected in JSON keys and textual property paths.
+or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
