@@ -68,98 +68,104 @@ athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json
 ```
 
-The production wrapper requires `--policy`, a non-empty `expectedPrincipalIds` array, an exact
-reviewed `expectedAssignments` inventory, and one non-vacuous `separationRules` entry for every
-expected principal. Every rule must name at least one forbidden role and one forbidden scope prefix.
-The saved role-assignment evidence must be a non-empty object containing independently attributable
-query results. For every expected managed identity, it must contain exactly one
-`subscription-descendants` query collected with `--all --include-groups` and one
-`subscription-ancestors` query collected with subscription scope,
-`--include-inherited --include-groups`. Every query carries the same canonical
-`subscriptionScope`. A flat assignment list or caller-asserted completeness flags are not accepted
-by the production gate.
+The production wrapper requires `--policy`, a reviewed target tenant/subscription/resource group,
+a non-empty `expectedPrincipalIds` array, separately reviewed `approvedAssignments`, and one
+non-vacuous `separationRules` entry for every expected principal. `expectedAssignments` is rejected
+in guarded mode: an observed inventory cannot prove its own completeness.
 
-Every assignment carries both the Azure role-assignment principal and the managed identity receiving
-effective access. `principalId` is the principal on the role assignment, `principalType` is
-`ServicePrincipal` or `Group`, and `effectivePrincipalId` is the reviewed managed identity. Direct
-managed-identity assignments use the same value for both IDs. Group-derived assignments use the
-group object ID as `principalId` and the managed-identity object ID as `effectivePrincipalId`.
-Evidence, `expectedAssignments`, and `allowedBroadAssignments` retain this association exactly.
+Guarded evidence contains three raw artifact families:
 
-For example, guarded evidence has this shape:
+1. `target` identifies the tenant, subscription, and resource-group scope.
+2. `hierarchy` contains the subscription's Resource Graph
+   `managementGroupAncestorsChain` plus ARM subscription, resource-group, and management-group
+   parent/path responses.
+3. `principals` contains, for every managed-identity service-principal object ID:
+   - the Graph service-principal response with both object `id` and client `appId`;
+   - a complete security-group membership result from
+     `servicePrincipals/{id}/getMemberGroups` with `securityEnabledOnly: true`, or every page of
+     `transitiveMemberOf`; and
+   - every page of the ARM role assignments API `2022-04-01` query at the target scope using
+     `atScope() and assignedTo('<service-principal-object-id>')`.
 
-```json
-{
-  "queries": [
-    {
-      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
-      "queryKind": "subscription-descendants",
-      "subscriptionScope": "/subscriptions/00000000-0000-0000-0000-000000000000",
-      "value": [
-        {
-          "principalId": "00000000-0000-0000-0000-000000000010",
-          "principalType": "Group",
-          "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
-          "roleDefinitionName": "Log Analytics Reader",
-          "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/73c42c96-874c-492b-b04d-ab87d138a893",
-          "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
-        }
-      ]
-    },
-    {
-      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
-      "queryKind": "subscription-ancestors",
-      "subscriptionScope": "/subscriptions/00000000-0000-0000-0000-000000000000",
-      "value": []
-    }
-  ]
-}
-```
+Every page records its request URL, HTTP status, values, and returned next link. The next link must
+match the following page exactly and the final page must have no next link. Missing pages, non-200
+responses including `403`/`404`, repeated pages, mixed subscriptions or tenants, and malformed
+request URLs fail closed.
 
-Generate this envelope with the dual-query collection procedure in
-`docs/operations/wc029-deployment-live-validation.md`; preserve each raw query result separately
-rather than flattening it before verification. The verifier validates query coverage and scope,
-derives and deduplicates their effective-assignment union, and only then compares that union with
-`expectedAssignments`.
+Initial Graph requests must use the unfiltered service-principal membership endpoint; a cursor or
+filter on the first page is rejected. Initial ARM role-assignment requests allow only
+`api-version=2022-04-01` and the exact `atScope() and assignedTo(...)` filter. Continuations must stay
+on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
+Cross-tenant parameters and caller-added selection filters are rejected.
 
-The normalized evidence inventory must match `expectedAssignments` exactly; policy entries,
-assignments for an unexpected effective principal, or a group assignment without its receiving
-identity fail closed. The legacy module entry point keeps its historical optional-policy and
-list-input behavior for compatibility and must not be used as the guarded deployment gate without a
-reviewed policy.
+The verifier derives the management-group path from ARM parent links, rejects missing, disconnected,
+or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the
+policy's reviewed `approvedManagementGroupAncestry`. A hierarchy change therefore requires a new
+human review rather than silently changing assignment inheritance.
+
+ARM supplies the assigned principal. The normalized policy and output preserve:
+
+- `assignedPrincipalId`;
+- `assignedPrincipalType`;
+- `effectivePrincipalId`; and
+- role ID, scope, condition, and condition version.
+
+A direct assignment requires `assignedPrincipalType: ServicePrincipal` and equality between the
+assigned and effective object IDs. A group-derived assignment requires
+`assignedPrincipalType: Group`, a distinct group object ID, and that ID's presence in the complete
+Graph transitive security-group set. The service-principal object ID must match Graph `id` and must
+not be the Graph `appId` client ID. Graph/ARM disagreement fails closed.
+
+The verifier derives the effective assignment set only from these ancestry, membership, and ARM
+artifacts, then compares it with separately reviewed `approvedAssignments`. The legacy module entry
+point keeps its historical optional-policy and list-input behavior for compatibility and must not be
+used as the guarded deployment gate.
+
+CLI-equivalent evidence is accepted only for an exact allowlisted argument grammar with scoped JSON
+output. Selection or output transforms such as `--role`, `--resource-group`, or `--query`, `--all`,
+equals-form overrides, duplicate flags, and alternate assignee forms fail closed.
 
 The policy is bounded JSON:
 
 ```json
 {
+  "target": {
+    "tenantId": "00000000-0000-0000-0000-000000000100",
+    "subscriptionId": "00000000-0000-0000-0000-000000000000",
+    "resourceGroupId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload",
+    "approvedManagementGroupAncestry": [
+      "/providers/Microsoft.Management/managementGroups/workloads",
+      "/providers/Microsoft.Management/managementGroups/tenant-root"
+    ]
+  },
   "expectedPrincipalIds": [
     "00000000-0000-0000-0000-000000000001",
     "00000000-0000-0000-0000-000000000002"
   ],
-  "expectedAssignments": [
+  "approvedAssignments": [
     {
-      "principalId": "00000000-0000-0000-0000-000000000001",
-      "principalType": "ServicePrincipal",
+      "assignedPrincipalId": "00000000-0000-0000-0000-000000000001",
+      "assignedPrincipalType": "ServicePrincipal",
       "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
     },
     {
-      "principalId": "00000000-0000-0000-0000-000000000002",
-      "principalType": "ServicePrincipal",
+      "assignedPrincipalId": "00000000-0000-0000-0000-000000000002",
+      "assignedPrincipalType": "ServicePrincipal",
       "effectivePrincipalId": "00000000-0000-0000-0000-000000000002",
       "roleDefinitionName": "Storage Blob Data Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
-      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Storage/storageAccounts/athena/blobServices/default/containers/evidence",
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload",
       "condition": "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'evidence'",
       "conditionVersion": "2.0"
     }
   ],
   "allowedBroadAssignments": [
     {
-      "principalId": "00000000-0000-0000-0000-000000000001",
-      "principalType": "ServicePrincipal",
+      "assignedPrincipalId": "00000000-0000-0000-0000-000000000001",
+      "assignedPrincipalType": "ServicePrincipal",
       "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
@@ -197,22 +203,19 @@ Broad `Owner`, `Contributor`, `Reader`, and `User Access Administrator` assignme
 resource-group, or management-group scope fail unless the exact principal, role, and scope tuple is
 reviewed in `allowedBroadAssignments`. `Role Based Access Control Administrator` is also treated as
 privileged. The verifier recognizes the official built-in role definition IDs as well as display
-names. Separation rules remain enforced independently. Because a subscription-scoped export does
-not carry a reviewed management-group lineage graph, an inherited management-group assignment is
-conservatively treated as an ancestor of every subscription-scoped forbidden prefix for that
-effective identity.
+names. Separation rules remain enforced independently. Management-group assignments are considered
+ancestors only when the assigned scope appears in the corroborated, reviewed hierarchy artifact.
 
 JSON object keys must be unique and cannot collide under case folding. Scope values are normalized
 without trailing slashes and structurally validated before allowance, broad-scope, and separation
 evaluation, so alternate or noncanonical ARM scope spellings cannot bypass the gate. Role definition
 IDs are likewise structurally checked before their built-in privilege is evaluated. Paginated
-object-form evidence containing a continuation link is rejected as incomplete. Allowances that
-supply both a role name and role ID must agree and must be present in `expectedAssignments`.
+evidence is accepted only when every next link is exhausted without a gap. Allowances that supply
+both a role name and role ID must agree and must be present in `approvedAssignments`.
 Authorization-affecting `condition` and `conditionVersion` fields must be supplied together and are
-included in exact inventory and allowance matching. Production evidence, expected assignments, and
-broad-assignment allowances require both `roleDefinitionName` and a canonical `roleDefinitionId`.
-They also require `principalType` and `effectivePrincipalId`; a `Group` row must name a distinct
-receiving identity, while a `ServicePrincipal` row must bind directly to the same identity.
+included in exact approval and allowance matching. Approved assignments and broad-assignment
+allowances require both `roleDefinitionName` and a canonical `roleDefinitionId`, plus
+`assignedPrincipalId`, `assignedPrincipalType`, and `effectivePrincipalId`.
 Recognized built-in role names must agree with their official IDs; name-only, ID-only, or spoofed-ID
 entries fail closed. Every production separation rule also requires reviewed
 `forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a
@@ -220,6 +223,7 @@ false display name cannot bypass separation. Oversized integer literals and othe
 are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
-Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable
-verifier output beside the release evidence. Run both the what-if and RBAC checks; a successful
-result from one does not waive the other.
+Resource Graph, ARM, and Graph responses or the explicitly attested CLI-equivalent collection,
+exact repeated `--allow-change` values, reviewed policy, and machine-readable verifier output beside
+the release evidence. Run both the what-if and RBAC checks; a successful result from one does not
+waive the other.

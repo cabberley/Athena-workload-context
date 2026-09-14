@@ -6,9 +6,10 @@ import math
 import re
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TextIO
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_CHANGES = 5000
@@ -58,10 +59,11 @@ _STORAGE_CONTAINER_TYPE = "microsoft.storage/storageaccounts/blobservices/contai
 _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
-_RBAC_QUERY_KINDS = frozenset(
+_ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
+_GRAPH_MEMBERSHIP_METHODS = frozenset(
     {
-        "subscription-ancestors",
-        "subscription-descendants",
+        "getmembergroups",
+        "transitivememberof",
     }
 )
 _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
@@ -101,6 +103,7 @@ class BroadAssignmentAllowance:
     role_name_supplied: bool
     effective_principal_id_supplied: bool = field(compare=False)
     principal_type_supplied: bool = field(compare=False)
+    assigned_principal_fields_supplied: bool = field(compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,21 +119,17 @@ class RbacAssignment:
     role_name_supplied: bool
     effective_principal_id_supplied: bool = field(compare=False)
     principal_type_supplied: bool = field(compare=False)
+    assigned_principal_fields_supplied: bool = field(compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class RbacCollection:
-    effective_principal_ids: frozenset[str]
-    query_keys: frozenset[tuple[str, str]]
+    tenant_id: str
+    subscription_id: str
     subscription_scope: str
-
-
-@dataclass(frozen=True, slots=True)
-class RbacEvidenceItem:
-    value: object
-    effective_principal_id: str | None
-    query_key: tuple[str, str] | None
-    subscription_scope: str | None
+    resource_group_scope: str
+    management_group_ancestry: tuple[str, ...]
+    effective_principal_ids: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +145,11 @@ class RbacPolicy:
     allowed_broad_assignments: frozenset[BroadAssignmentAllowance]
     separation_rules: tuple[SeparationRule, ...]
     expected_principal_ids: frozenset[str]
-    expected_assignments: frozenset[RbacAssignment]
+    approved_assignments: frozenset[RbacAssignment]
+    legacy_expected_assignments: frozenset[RbacAssignment]
+    target: RbacCollection | None
+    approved_assignments_supplied: bool = field(compare=False)
+    legacy_expected_assignments_supplied: bool = field(compare=False)
 
 
 type PreflightKind = Literal["rbac", "what-if"]
@@ -315,6 +318,49 @@ def _canonical_scope(value: str) -> str:
         if resource_pairs == 0:
             raise PreflightInputError("scope has an incomplete provider boundary")
     return canonical
+
+
+def _canonical_guid(value: object, *, field_name: str) -> str:
+    guid = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+            maximum_length=64,
+        )
+    )
+    if _GUID.fullmatch(guid) is None:
+        raise PreflightInputError(f"{field_name} must be a GUID")
+    return guid
+
+
+def _canonical_management_group_scope(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    scope = _canonical_scope(
+        _require_string(
+            value,
+            field_name=field_name,
+        )
+    )
+    if _MANAGEMENT_GROUP_SCOPE.fullmatch(scope) is None:
+        raise PreflightInputError(f"{field_name} must be a management-group scope")
+    return scope
+
+
+def _require_http_success(value: object, *, field_name: str) -> None:
+    if type(value) is not int:
+        raise PreflightInputError(f"{field_name} statusCode must be an integer")
+    if value != 200:
+        raise PreflightInputError(f"{field_name} returned HTTP {value}")
+
+
+def _resource_group_subscription_id(scope: str) -> str:
+    segments = scope.strip("/").split("/")
+    if len(segments) != 4 or segments[0] != "subscriptions" or segments[2] != "resourcegroups":
+        raise PreflightInputError("resourceGroupId must be a resource-group scope")
+    return segments[1]
 
 
 def _scope_contains(ancestor: str, descendant: str) -> bool:
@@ -1209,10 +1255,57 @@ def _parse_rbac_assignment(
     field_name: str,
 ) -> RbacAssignment:
     assignment = _mapping(value, field_name=field_name)
+    has_assigned_principal_id = _has_case_insensitive(
+        assignment,
+        "assignedPrincipalId",
+    )
+    has_assigned_principal_type = _has_case_insensitive(
+        assignment,
+        "assignedPrincipalType",
+    )
+    has_legacy_principal_id = _has_case_insensitive(
+        assignment,
+        "principalId",
+    )
+    has_legacy_principal_type = _has_case_insensitive(
+        assignment,
+        "principalType",
+    )
+    if has_assigned_principal_id or has_assigned_principal_type:
+        if (
+            not has_assigned_principal_id
+            or not has_assigned_principal_type
+            or has_legacy_principal_id
+            or has_legacy_principal_type
+        ):
+            raise PreflightInputError(
+                f"{field_name} must use one complete assigned-principal field set"
+            )
+        raw_principal_id = _get_case_insensitive(
+            assignment,
+            "assignedPrincipalId",
+        )
+        raw_principal_type = _get_case_insensitive(
+            assignment,
+            "assignedPrincipalType",
+        )
+        assigned_principal_fields_supplied = True
+    else:
+        raw_principal_id = _get_case_insensitive(
+            assignment,
+            "principalId",
+        )
+        raw_principal_type = _get_case_insensitive(
+            assignment,
+            "principalType",
+        )
+        assigned_principal_fields_supplied = False
     principal_id = _normalized(
         _require_string(
-            _get_case_insensitive(assignment, "principalId"),
-            field_name="principalId",
+            raw_principal_id,
+            field_name=(
+                "assignedPrincipalId" if assigned_principal_fields_supplied else "principalId"
+            ),
         )
     )
     raw_effective_principal_id = _get_case_insensitive(
@@ -1229,16 +1322,14 @@ def _parse_rbac_assignment(
             )
         )
     )
-    raw_principal_type = _get_case_insensitive(
-        assignment,
-        "principalType",
-    )
     if raw_principal_type is None:
         principal_type = ""
     else:
         principal_type_value = _require_string(
             raw_principal_type,
-            field_name="principalType",
+            field_name=(
+                "assignedPrincipalType" if assigned_principal_fields_supplied else "principalType"
+            ),
             maximum_length=64,
         )
         if not principal_type_value.isascii():
@@ -1327,6 +1418,97 @@ def _parse_rbac_assignment(
         role_name_supplied=raw_role_name is not None,
         effective_principal_id_supplied=raw_effective_principal_id is not None,
         principal_type_supplied=raw_principal_type is not None,
+        assigned_principal_fields_supplied=(assigned_principal_fields_supplied),
+    )
+
+
+def _parse_management_group_chain(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    chain: list[str] = []
+    seen: set[str] = set()
+    for item in _sequence(
+        value,
+        field_name=field_name,
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        scope = _canonical_management_group_scope(
+            item,
+            field_name="management-group ancestor",
+        )
+        if scope in seen:
+            raise PreflightInputError(f"{field_name} contains a duplicate or cyclic ancestor")
+        seen.add(scope)
+        chain.append(scope)
+    if not chain:
+        raise PreflightInputError(f"{field_name} must not be empty")
+    return tuple(chain)
+
+
+def _parse_policy_target(
+    value: object,
+    *,
+    expected_principal_ids: frozenset[str],
+) -> RbacCollection:
+    target = _mapping(value, field_name="RBAC policy target")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="target tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="target subscriptionId",
+    )
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    resource_group_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(target, "resourceGroupId"),
+            field_name="target resourceGroupId",
+        )
+    )
+    if (
+        _RESOURCE_GROUP_SCOPE.fullmatch(resource_group_scope) is None
+        or _resource_group_subscription_id(resource_group_scope) != subscription_id
+    ):
+        raise PreflightInputError("target resourceGroupId must belong to target subscriptionId")
+    ancestry = _parse_management_group_chain(
+        _get_case_insensitive(
+            target,
+            "approvedManagementGroupAncestry",
+        ),
+        field_name="approvedManagementGroupAncestry",
+    )
+    return RbacCollection(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        subscription_scope=subscription_scope,
+        resource_group_scope=resource_group_scope,
+        management_group_ancestry=ancestry,
+        effective_principal_ids=expected_principal_ids,
+    )
+
+
+def _assignment_key(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    str | None,
+    str | None,
+]:
+    return (
+        assignment.principal_id,
+        assignment.principal_type,
+        assignment.effective_principal_id,
+        assignment.role_definition_id,
+        assignment.scope,
+        assignment.condition,
+        assignment.condition_version,
     )
 
 
@@ -1336,7 +1518,11 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             allowed_broad_assignments=frozenset(),
             separation_rules=(),
             expected_principal_ids=frozenset(),
-            expected_assignments=frozenset(),
+            approved_assignments=frozenset(),
+            legacy_expected_assignments=frozenset(),
+            target=None,
+            approved_assignments_supplied=False,
+            legacy_expected_assignments_supplied=False,
         )
     _validate_json_shape(document)
     root = _mapping(document, field_name="RBAC policy")
@@ -1367,6 +1553,9 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 role_name_supplied=parsed_allowance.role_name_supplied,
                 effective_principal_id_supplied=(parsed_allowance.effective_principal_id_supplied),
                 principal_type_supplied=(parsed_allowance.principal_type_supplied),
+                assigned_principal_fields_supplied=(
+                    parsed_allowance.assigned_principal_fields_supplied
+                ),
             )
             if allowance in allowances:
                 raise PreflightInputError("allowedBroadAssignments contains a duplicate assignment")
@@ -1466,6 +1655,37 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             if principal_id in expected_principal_ids:
                 raise PreflightInputError("expectedPrincipalIds contains a duplicate principalId")
             expected_principal_ids.add(principal_id)
+    raw_approved_assignments = _get_case_insensitive(
+        root,
+        "approvedAssignments",
+    )
+    approved_assignments: set[RbacAssignment] = set()
+    approved_assignment_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    if raw_approved_assignments is not None:
+        for raw_assignment in _sequence(
+            raw_approved_assignments,
+            field_name="approvedAssignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            approved_assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="approved assignment",
+            )
+            key = _assignment_key(approved_assignment)
+            if key in approved_assignment_keys:
+                raise PreflightInputError("approvedAssignments contains a duplicate assignment")
+            approved_assignment_keys.add(key)
+            approved_assignments.add(approved_assignment)
     raw_expected_assignments = _get_case_insensitive(
         root,
         "expectedAssignments",
@@ -1488,7 +1708,18 @@ def _parse_policy(document: object | None) -> RbacPolicy:
         allowed_broad_assignments=frozenset(allowances),
         separation_rules=tuple(rules),
         expected_principal_ids=frozenset(expected_principal_ids),
-        expected_assignments=frozenset(expected_assignments),
+        approved_assignments=frozenset(approved_assignments),
+        legacy_expected_assignments=frozenset(expected_assignments),
+        target=(
+            None
+            if _get_case_insensitive(root, "target") is None
+            else _parse_policy_target(
+                _get_case_insensitive(root, "target"),
+                expected_principal_ids=frozenset(expected_principal_ids),
+            )
+        ),
+        approved_assignments_supplied=raw_approved_assignments is not None,
+        legacy_expected_assignments_supplied=(raw_expected_assignments is not None),
     )
 
 
@@ -1497,12 +1728,26 @@ def _validate_guarded_assignment_binding(
     *,
     field_name: str,
 ) -> None:
+    if not assignment.assigned_principal_fields_supplied:
+        raise PreflightInputError(
+            f"{field_name} requires assignedPrincipalId and assignedPrincipalType"
+        )
     if not assignment.effective_principal_id_supplied:
         raise PreflightInputError(f"{field_name} requires effectivePrincipalId")
     if not assignment.principal_type_supplied:
-        raise PreflightInputError(f"{field_name} requires principalType")
+        raise PreflightInputError(f"{field_name} requires assignedPrincipalType")
     if assignment.principal_type not in {"group", "serviceprincipal"}:
-        raise PreflightInputError(f"{field_name} principalType must be Group or ServicePrincipal")
+        raise PreflightInputError(
+            f"{field_name} assignedPrincipalType must be Group or ServicePrincipal"
+        )
+    _canonical_guid(
+        assignment.principal_id,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+    _canonical_guid(
+        assignment.effective_principal_id,
+        field_name=f"{field_name} effectivePrincipalId",
+    )
     if (
         assignment.principal_type == "group"
         and assignment.principal_id == assignment.effective_principal_id
@@ -1519,39 +1764,1092 @@ def _validate_guarded_assignment_binding(
         )
 
 
-def _parse_rbac_query_kind(value: object) -> str:
-    query_kind = _require_string(
+def _split_url(value: str, *, field_name: str) -> SplitResult:
+    try:
+        return urlsplit(value)
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} is not a valid URL") from exc
+
+
+def _paged_values(
+    value: object,
+    *,
+    field_name: str,
+    next_link_field: str,
+    maximum_items: int,
+    allowed_host: str,
+) -> tuple[list[object], tuple[str, ...]]:
+    pages = _sequence(
         value,
-        field_name="queryKind",
+        field_name=f"{field_name} pages",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    if not pages:
+        raise PreflightInputError(f"{field_name} pages must not be empty")
+    values: list[object] = []
+    expected_request_url: str | None = None
+    request_urls: list[str] = []
+    seen_request_urls: set[str] = set()
+    for index, raw_page in enumerate(pages):
+        page = _mapping(raw_page, field_name=f"{field_name} page")
+        request_url = _require_string(
+            _get_case_insensitive(page, "requestUrl"),
+            field_name=f"{field_name} requestUrl",
+        )
+        parts = _split_url(
+            request_url,
+            field_name=f"{field_name} requestUrl",
+        )
+        if parts.scheme.casefold() != "https" or parts.netloc.casefold() != allowed_host:
+            raise PreflightInputError(f"{field_name} requestUrl must use https://{allowed_host}")
+        if request_url in seen_request_urls:
+            raise PreflightInputError(f"{field_name} pagination contains a repeated requestUrl")
+        seen_request_urls.add(request_url)
+        if index > 0 and expected_request_url != request_url:
+            raise PreflightInputError(f"{field_name} pagination has a nextLink gap")
+        request_urls.append(request_url)
+        _require_http_success(
+            _get_case_insensitive(page, "statusCode"),
+            field_name=f"{field_name} page",
+        )
+        page_values = _sequence(
+            _get_case_insensitive(page, "value"),
+            field_name=f"{field_name} page value",
+            maximum_items=maximum_items,
+        )
+        if len(values) + len(page_values) > maximum_items:
+            raise PreflightInputError(f"{field_name} must contain at most {maximum_items} items")
+        values.extend(page_values)
+        raw_next_link = _get_case_insensitive(page, next_link_field)
+        expected_request_url = (
+            None
+            if raw_next_link is None
+            else _require_string(
+                raw_next_link,
+                field_name=f"{field_name} nextLink",
+            )
+        )
+        if index < len(pages) - 1 and expected_request_url is None:
+            raise PreflightInputError(f"{field_name} pagination ended before the supplied pages")
+    if expected_request_url is not None:
+        raise PreflightInputError(f"{field_name} pagination is incomplete")
+    return values, tuple(request_urls)
+
+
+def _parse_evidence_target(value: object) -> RbacCollection:
+    target = _mapping(value, field_name="RBAC evidence target")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="evidence target tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="evidence target subscriptionId",
+    )
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    resource_group_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(target, "resourceGroupId"),
+            field_name="evidence target resourceGroupId",
+        )
+    )
+    if (
+        _RESOURCE_GROUP_SCOPE.fullmatch(resource_group_scope) is None
+        or _resource_group_subscription_id(resource_group_scope) != subscription_id
+    ):
+        raise PreflightInputError("evidence target resourceGroupId must belong to subscriptionId")
+    return RbacCollection(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        subscription_scope=subscription_scope,
+        resource_group_scope=resource_group_scope,
+        management_group_ancestry=(),
+        effective_principal_ids=frozenset(),
+    )
+
+
+def _validate_arm_get_url(
+    value: object,
+    *,
+    expected_path: str,
+    expected_query: dict[str, str],
+    field_name: str,
+) -> None:
+    request_url = _require_string(
+        value,
+        field_name=field_name,
+    )
+    parts = _split_url(request_url, field_name=field_name)
+    if (
+        parts.scheme.casefold() != "https"
+        or parts.netloc.casefold() != "management.azure.com"
+        or unquote(parts.path).casefold() != expected_path.casefold()
+        or parts.fragment
+    ):
+        raise PreflightInputError(f"{field_name} is not canonical")
+    query = {
+        key.casefold(): values
+        for key, values in parse_qs(
+            parts.query,
+            keep_blank_values=True,
+        ).items()
+    }
+    normalized_expected = {
+        key.casefold(): [expected_value] for key, expected_value in expected_query.items()
+    }
+    if query != normalized_expected:
+        raise PreflightInputError(f"{field_name} is not canonical")
+
+
+def _derive_management_group_ancestry(
+    value: object,
+    *,
+    target: RbacCollection,
+) -> tuple[str, ...]:
+    hierarchy = _mapping(value, field_name="management-group hierarchy")
+    resource_graph = _mapping(
+        _get_case_insensitive(hierarchy, "resourceGraph"),
+        field_name="Resource Graph hierarchy evidence",
+    )
+    request = _mapping(
+        _get_case_insensitive(resource_graph, "request"),
+        field_name="Resource Graph hierarchy request",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(request, "tenantId"),
+            field_name="Resource Graph request tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy request crosses tenants")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(request, "subscriptionId"),
+            field_name="Resource Graph request subscriptionId",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy request targets another subscription")
+    query_text = _require_string(
+        _get_case_insensitive(request, "query"),
+        field_name="Resource Graph hierarchy query",
+    )
+    if "managementgroupancestorschain" not in query_text.casefold():
+        raise PreflightInputError(
+            "Resource Graph hierarchy query omits managementGroupAncestorsChain"
+        )
+    _require_http_success(
+        _get_case_insensitive(resource_graph, "statusCode"),
+        field_name="Resource Graph hierarchy evidence",
+    )
+    body = _mapping(
+        _get_case_insensitive(resource_graph, "body"),
+        field_name="Resource Graph hierarchy body",
+    )
+    if _get_case_insensitive(body, "skipToken") is not None:
+        raise PreflightInputError("Resource Graph hierarchy evidence is paginated or incomplete")
+    rows = _sequence(
+        _get_case_insensitive(body, "data"),
+        field_name="Resource Graph hierarchy data",
+        maximum_items=2,
+    )
+    if len(rows) != 1:
+        raise PreflightInputError("Resource Graph hierarchy evidence must contain one subscription")
+    row = _mapping(
+        rows[0],
+        field_name="Resource Graph subscription row",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(row, "tenantId"),
+            field_name="Resource Graph tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy evidence crosses tenants")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(row, "subscriptionId"),
+            field_name="Resource Graph subscriptionId",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy evidence targets another subscription")
+    properties = _mapping(
+        _get_case_insensitive(row, "properties"),
+        field_name="Resource Graph subscription properties",
+    )
+    resource_graph_chain: list[str] = []
+    resource_graph_seen: set[str] = set()
+    for raw_ancestor in _sequence(
+        _get_case_insensitive(
+            properties,
+            "managementGroupAncestorsChain",
+        ),
+        field_name="managementGroupAncestorsChain",
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        ancestor = _mapping(
+            raw_ancestor,
+            field_name="Resource Graph management-group ancestor",
+        )
+        name = _require_string(
+            _get_case_insensitive(ancestor, "name"),
+            field_name="Resource Graph management-group name",
+            maximum_length=256,
+        )
+        scope = _canonical_management_group_scope(
+            (f"/providers/Microsoft.Management/managementGroups/{name}"),
+            field_name="Resource Graph management-group ancestor",
+        )
+        if scope in resource_graph_seen:
+            raise PreflightInputError("Resource Graph management-group ancestry is cyclic")
+        resource_graph_seen.add(scope)
+        resource_graph_chain.append(scope)
+    if not resource_graph_chain:
+        raise PreflightInputError("Resource Graph managementGroupAncestorsChain is missing")
+
+    arm = _mapping(
+        _get_case_insensitive(hierarchy, "arm"),
+        field_name="ARM hierarchy evidence",
+    )
+    subscription_artifact = _mapping(
+        _get_case_insensitive(arm, "subscription"),
+        field_name="ARM subscription hierarchy evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(subscription_artifact, "statusCode"),
+        field_name="ARM subscription hierarchy evidence",
+    )
+    subscription_body = _mapping(
+        _get_case_insensitive(subscription_artifact, "body"),
+        field_name="ARM subscription hierarchy body",
+    )
+    subscription_properties = _mapping(
+        _get_case_insensitive(subscription_body, "properties"),
+        field_name="ARM subscription hierarchy properties",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(subscription_properties, "tenantId"),
+            field_name="ARM subscription tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("ARM subscription hierarchy evidence crosses tenants")
+    parent = _mapping(
+        _get_case_insensitive(subscription_properties, "parent"),
+        field_name="ARM subscription hierarchy parent",
+    )
+    leaf_management_group = _canonical_management_group_scope(
+        _get_case_insensitive(parent, "id"),
+        field_name="ARM subscription parent id",
+    )
+    expected_subscription_id = f"{leaf_management_group}/subscriptions/{target.subscription_id}"
+    if (
+        _canonical_scope(
+            _require_string(
+                _get_case_insensitive(subscription_body, "id"),
+                field_name="ARM subscription association id",
+            )
+        )
+        != expected_subscription_id
+        or _normalized(
+            _require_string(
+                _get_case_insensitive(subscription_body, "type"),
+                field_name="ARM subscription association type",
+                maximum_length=128,
+            )
+        )
+        != "microsoft.management/managementgroups/subscriptions"
+        or _canonical_guid(
+            _get_case_insensitive(subscription_body, "name"),
+            field_name="ARM subscription association name",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("ARM subscription hierarchy body is inconsistent")
+    _validate_arm_get_url(
+        _get_case_insensitive(subscription_artifact, "requestUrl"),
+        expected_path=expected_subscription_id,
+        expected_query={"api-version": "2020-05-01"},
+        field_name="ARM subscription hierarchy requestUrl",
+    )
+
+    resource_group_artifact = _mapping(
+        _get_case_insensitive(arm, "resourceGroup"),
+        field_name="ARM resource-group hierarchy evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(resource_group_artifact, "statusCode"),
+        field_name="ARM resource-group hierarchy evidence",
+    )
+    resource_group_body = _mapping(
+        _get_case_insensitive(resource_group_artifact, "body"),
+        field_name="ARM resource-group hierarchy body",
+    )
+    if (
+        _canonical_scope(
+            _require_string(
+                _get_case_insensitive(resource_group_body, "id"),
+                field_name="ARM resource-group id",
+            )
+        )
+        != target.resource_group_scope
+        or _normalized(
+            _require_string(
+                _get_case_insensitive(resource_group_body, "type"),
+                field_name="ARM resource-group type",
+                maximum_length=128,
+            )
+        )
+        != "microsoft.resources/resourcegroups"
+    ):
+        raise PreflightInputError("ARM resource-group hierarchy body is inconsistent")
+    _validate_arm_get_url(
+        _get_case_insensitive(resource_group_artifact, "requestUrl"),
+        expected_path=target.resource_group_scope,
+        expected_query={"api-version": "2021-04-01"},
+        field_name="ARM resource-group hierarchy requestUrl",
+    )
+
+    parent_by_management_group: dict[str, str | None] = {}
+    for raw_artifact in _sequence(
+        _get_case_insensitive(arm, "managementGroups"),
+        field_name="ARM managementGroups",
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        artifact = _mapping(
+            raw_artifact,
+            field_name="ARM management-group hierarchy evidence",
+        )
+        _require_http_success(
+            _get_case_insensitive(artifact, "statusCode"),
+            field_name="ARM management-group hierarchy evidence",
+        )
+        management_group = _mapping(
+            _get_case_insensitive(artifact, "body"),
+            field_name="ARM management-group hierarchy body",
+        )
+        management_group_id = _canonical_management_group_scope(
+            _get_case_insensitive(management_group, "id"),
+            field_name="ARM management-group id",
+        )
+        if (
+            _normalized(
+                _require_string(
+                    _get_case_insensitive(management_group, "type"),
+                    field_name="ARM management-group type",
+                    maximum_length=128,
+                )
+            )
+            != "microsoft.management/managementgroups"
+        ):
+            raise PreflightInputError("ARM management-group hierarchy body has the wrong type")
+        properties = _mapping(
+            _get_case_insensitive(management_group, "properties"),
+            field_name="ARM management-group properties",
+        )
+        if (
+            _canonical_guid(
+                _get_case_insensitive(properties, "tenantId"),
+                field_name="ARM management-group tenantId",
+            )
+            != target.tenant_id
+        ):
+            raise PreflightInputError("ARM management-group hierarchy evidence crosses tenants")
+        details = _mapping(
+            _get_case_insensitive(properties, "details"),
+            field_name="ARM management-group details",
+        )
+        if not _has_case_insensitive(details, "parent"):
+            raise PreflightInputError("ARM management-group hierarchy omits details.parent")
+        raw_parent = _get_case_insensitive(details, "parent")
+        parent_id = (
+            None
+            if raw_parent is None
+            else _canonical_management_group_scope(
+                _get_case_insensitive(
+                    _mapping(
+                        raw_parent,
+                        field_name="ARM management-group parent",
+                    ),
+                    "id",
+                ),
+                field_name="ARM management-group parent id",
+            )
+        )
+        if management_group_id in parent_by_management_group:
+            raise PreflightInputError("ARM management-group hierarchy contains a duplicate node")
+        parent_by_management_group[management_group_id] = parent_id
+        _validate_arm_get_url(
+            _get_case_insensitive(artifact, "requestUrl"),
+            expected_path=management_group_id,
+            expected_query={
+                "api-version": "2020-05-01",
+                "$expand": "path",
+            },
+            field_name="ARM management-group hierarchy requestUrl",
+        )
+    if not parent_by_management_group:
+        raise PreflightInputError("ARM management-group hierarchy evidence is missing")
+
+    arm_chain: list[str] = []
+    seen: set[str] = set()
+    current: str | None = leaf_management_group
+    while current is not None:
+        if current in seen:
+            raise PreflightInputError("ARM management-group hierarchy is cyclic")
+        seen.add(current)
+        if current not in parent_by_management_group:
+            raise PreflightInputError("ARM management-group hierarchy omits an ancestor")
+        arm_chain.append(current)
+        current = parent_by_management_group[current]
+    if seen != set(parent_by_management_group):
+        raise PreflightInputError("ARM management-group hierarchy contains disconnected nodes")
+    if tuple(resource_graph_chain) != tuple(arm_chain):
+        raise PreflightInputError("Resource Graph and ARM management-group hierarchies disagree")
+    return tuple(arm_chain)
+
+
+def _validate_graph_urls(
+    request_urls: tuple[str, ...],
+    *,
+    effective_principal_id: str,
+    method: str,
+) -> None:
+    expected_path = f"/v1.0/serviceprincipals/{effective_principal_id}/{method}"
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="Graph membership requestUrl",
+        )
+        path = unquote(parts.path).casefold()
+        if path != expected_path:
+            raise PreflightInputError(
+                "Graph membership requestUrl does not match the effective "
+                "service-principal object ID"
+            )
+        query = {
+            key.casefold(): values
+            for key, values in parse_qs(
+                parts.query,
+                keep_blank_values=True,
+            ).items()
+        }
+        if parts.fragment or (index == 0 and query):
+            raise PreflightInputError("initial Graph membership requestUrl must be unfiltered")
+        if index > 0 and (
+            not query
+            or not set(query).issubset({"$skiptoken", "$skip"})
+            or any(len(values) != 1 for values in query.values())
+        ):
+            raise PreflightInputError("Graph membership continuation URL is not canonical")
+
+
+def _parse_security_group_membership(
+    value: object,
+    *,
+    effective_principal_id: str,
+    target: RbacCollection,
+) -> frozenset[str]:
+    membership = _mapping(value, field_name="Graph group-membership evidence")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(membership, "tenantId"),
+            field_name="Graph group-membership tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Graph group-membership evidence crosses tenants")
+    raw_method = _require_string(
+        _get_case_insensitive(membership, "method"),
+        field_name="Graph membership method",
         maximum_length=64,
     )
-    if not query_kind.isascii():
-        raise PreflightInputError("queryKind must use ASCII")
-    normalized = _normalized(query_kind)
-    if normalized not in _RBAC_QUERY_KINDS:
-        raise PreflightInputError("queryKind is unsupported")
-    return normalized
+    if not raw_method.isascii():
+        raise PreflightInputError("Graph membership method must use ASCII")
+    method = _normalized(raw_method)
+    if method not in _GRAPH_MEMBERSHIP_METHODS:
+        raise PreflightInputError("Graph membership method is unsupported")
+    values, request_urls = _paged_values(
+        _get_case_insensitive(membership, "pages"),
+        field_name="Graph group-membership evidence",
+        next_link_field="@odata.nextLink",
+        maximum_items=MAX_ASSIGNMENTS,
+        allowed_host="graph.microsoft.com",
+    )
+    _validate_graph_urls(
+        request_urls,
+        effective_principal_id=effective_principal_id,
+        method=method,
+    )
+    groups: set[str] = set()
+    if method == "getmembergroups":
+        if _get_case_insensitive(membership, "securityEnabledOnly") is not True:
+            raise PreflightInputError("getMemberGroups evidence must set securityEnabledOnly true")
+        if len(request_urls) != 1:
+            raise PreflightInputError("getMemberGroups evidence must contain exactly one response")
+        for raw_group_id in values:
+            group_id = _canonical_guid(
+                raw_group_id,
+                field_name="Graph security-group id",
+            )
+            if group_id in groups:
+                raise PreflightInputError(
+                    "Graph group-membership evidence contains a duplicate group"
+                )
+            groups.add(group_id)
+    else:
+        for raw_item in values:
+            item = _mapping(
+                raw_item,
+                field_name="Graph transitiveMemberOf item",
+            )
+            object_type = _normalized(
+                _require_string(
+                    _get_case_insensitive(item, "@odata.type"),
+                    field_name="Graph transitiveMemberOf @odata.type",
+                    maximum_length=128,
+                )
+            )
+            object_id = _canonical_guid(
+                _get_case_insensitive(item, "id"),
+                field_name="Graph transitiveMemberOf id",
+            )
+            if object_type != "#microsoft.graph.group":
+                continue
+            security_enabled = _get_case_insensitive(
+                item,
+                "securityEnabled",
+            )
+            if type(security_enabled) is not bool:
+                raise PreflightInputError("Graph group membership omits securityEnabled")
+            if security_enabled:
+                if object_id in groups:
+                    raise PreflightInputError(
+                        "Graph group-membership evidence contains a duplicate group"
+                    )
+                groups.add(object_id)
+    return frozenset(groups)
 
 
-def _role_assignments(
+def _parse_service_principal(
+    value: object,
+    *,
+    effective_principal_id: str,
+    target: RbacCollection,
+) -> None:
+    service_principal = _mapping(
+        value,
+        field_name="Graph service-principal evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(service_principal, "statusCode"),
+        field_name="Graph service-principal evidence",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(service_principal, "tenantId"),
+            field_name="Graph service-principal tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Graph service-principal evidence crosses tenants")
+    object_id = _canonical_guid(
+        _get_case_insensitive(service_principal, "id"),
+        field_name="Graph service-principal object id",
+    )
+    client_id = _canonical_guid(
+        _get_case_insensitive(service_principal, "appId"),
+        field_name="Graph service-principal appId",
+    )
+    if object_id == client_id:
+        raise PreflightInputError("service-principal object ID and client ID must differ")
+    if effective_principal_id == client_id:
+        raise PreflightInputError("effectivePrincipalId is a client ID, not an object ID")
+    if effective_principal_id != object_id:
+        raise PreflightInputError(
+            "effectivePrincipalId does not match the service-principal object ID"
+        )
+
+
+def _validate_assigned_to_filter(
+    value: object,
+    *,
+    effective_principal_id: str,
+    field_name: str,
+) -> str:
+    filter_value = _require_string(
+        value,
+        field_name=field_name,
+    )
+    match = re.fullmatch(
+        rf"atScope\(\)\s+and\s+assignedTo\('({_GUID_PATTERN})'\)",
+        filter_value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise PreflightInputError(f"{field_name} must use atScope() and assignedTo(object-id)")
+    if match.group(1).casefold() != effective_principal_id:
+        raise PreflightInputError(f"{field_name} uses a different principal")
+    return filter_value
+
+
+def _validate_arm_role_assignment_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    effective_principal_id: str,
+) -> None:
+    expected_path = (
+        target.resource_group_scope + "/providers/microsoft.authorization/roleassignments"
+    )
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM role-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError("ARM role-assignment requestUrl uses the wrong scope")
+        query = {
+            key.casefold(): values
+            for key, values in parse_qs(
+                parts.query,
+                keep_blank_values=True,
+            ).items()
+        }
+        allowed_keys = {"api-version", "$filter"}
+        if index > 0:
+            allowed_keys.add("$skiptoken")
+        if (
+            parts.fragment
+            or set(query) - allowed_keys
+            or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
+            or len(query.get("$filter", [])) != 1
+            or (index == 0 and "$skiptoken" in query)
+            or (index > 0 and len(query.get("$skiptoken", [])) != 1)
+        ):
+            raise PreflightInputError("ARM role-assignment requestUrl is not canonical")
+        _validate_assigned_to_filter(
+            query["$filter"][0],
+            effective_principal_id=effective_principal_id,
+            field_name="ARM role-assignment requestUrl filter",
+        )
+
+
+def _parse_arm_role_assignment(
+    value: object,
+    *,
+    effective_principal_id: str,
+) -> RbacAssignment:
+    resource = _mapping(
+        value,
+        field_name="ARM role assignment",
+    )
+    resource_type = _normalized(
+        _require_string(
+            _get_case_insensitive(resource, "type"),
+            field_name="ARM role-assignment type",
+            maximum_length=128,
+        )
+    )
+    if resource_type != "microsoft.authorization/roleassignments":
+        raise PreflightInputError("ARM role-assignment resource has the wrong type")
+    resource_id = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(resource, "id"),
+            field_name="ARM role-assignment id",
+        )
+    )
+    marker = "/providers/microsoft.authorization/roleassignments/"
+    marker_index = resource_id.rfind(marker)
+    if marker_index < 0:
+        raise PreflightInputError("ARM role-assignment id is malformed")
+    assignment_name = resource_id[marker_index + len(marker) :]
+    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
+        raise PreflightInputError("ARM role-assignment id must end in an assignment GUID")
+    id_scope = resource_id[:marker_index] if marker_index > 0 else "/"
+    id_scope = _canonical_scope(id_scope)
+    properties = _mapping(
+        _get_case_insensitive(resource, "properties"),
+        field_name="ARM role-assignment properties",
+    )
+    property_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(properties, "scope"),
+            field_name="ARM role-assignment scope",
+        )
+    )
+    if property_scope != id_scope:
+        raise PreflightInputError("ARM role-assignment id and properties.scope disagree")
+    normalized_assignment: dict[str, object] = {
+        "principalId": _get_case_insensitive(properties, "principalId"),
+        "principalType": _get_case_insensitive(
+            properties,
+            "principalType",
+        ),
+        "effectivePrincipalId": effective_principal_id,
+        "roleDefinitionId": _get_case_insensitive(
+            properties,
+            "roleDefinitionId",
+        ),
+        "scope": property_scope,
+    }
+    for field_name in (
+        "roleDefinitionName",
+        "condition",
+        "conditionVersion",
+    ):
+        if _has_case_insensitive(properties, field_name):
+            normalized_assignment[field_name] = _get_case_insensitive(
+                properties,
+                field_name,
+            )
+    return _parse_rbac_assignment(
+        normalized_assignment,
+        field_name="ARM role assignment",
+    )
+
+
+def _validate_cli_arguments(
+    value: object,
+    *,
+    target: RbacCollection,
+    effective_principal_id: str,
+) -> None:
+    arguments = [
+        _require_string(
+            argument,
+            field_name="Azure CLI role-assignment argument",
+            maximum_length=4096,
+        )
+        for argument in _sequence(
+            value,
+            field_name="Azure CLI role-assignment arguments",
+            maximum_items=64,
+        )
+    ]
+    normalized = [argument.casefold() for argument in arguments]
+    if any(argument.startswith("--") and "=" in argument for argument in normalized):
+        raise PreflightInputError("Azure CLI role collection does not allow equals-form arguments")
+    switch_flags = {
+        "--include-groups",
+        "--include-inherited",
+        "--only-show-errors",
+    }
+    expected_values = {
+        "--subscription": target.subscription_id,
+        "--scope": target.resource_group_scope,
+        "--assignee-object-id": effective_principal_id,
+        "--output": "json",
+        "--fill-principal-name": "false",
+        "--fill-role-definition-name": "true",
+    }
+    required_flags = {
+        "--assignee-object-id",
+        "--include-groups",
+        "--include-inherited",
+        "--output",
+        "--scope",
+        "--subscription",
+    }
+    seen: set[str] = set()
+    index = 0
+    while index < len(arguments):
+        argument = normalized[index]
+        if argument in seen:
+            raise PreflightInputError(f"Azure CLI role collection repeats {argument}")
+        if argument in switch_flags:
+            seen.add(argument)
+            index += 1
+            continue
+        if argument not in expected_values:
+            raise PreflightInputError(
+                f"Azure CLI role collection contains unsupported argument {arguments[index]}"
+            )
+        if index + 1 >= len(arguments):
+            raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
+        seen.add(argument)
+        actual_value = arguments[index + 1]
+        if actual_value.startswith("--"):
+            raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
+        if argument == "--scope":
+            actual_value = _canonical_scope(actual_value)
+        else:
+            actual_value = _normalized(actual_value)
+        if actual_value != expected_values[argument]:
+            raise PreflightInputError(f"Azure CLI role collection uses the wrong {argument}")
+        index += 2
+    missing = sorted(required_flags - seen)
+    if missing:
+        raise PreflightInputError(
+            "Azure CLI role collection is missing required arguments: " + ", ".join(missing)
+        )
+
+
+def _validate_effective_assignment_principal(
+    assignment: RbacAssignment,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+) -> None:
+    assigned_principal_id = _canonical_guid(
+        assignment.principal_id,
+        field_name="assigned principal ID",
+    )
+    if assignment.principal_type == "serviceprincipal":
+        if assigned_principal_id != effective_principal_id:
+            raise PreflightInputError(
+                "direct ARM role assignment does not target the effective service principal"
+            )
+        return
+    if assignment.principal_type != "group":
+        raise PreflightInputError(
+            "effective role assignment principalType must be ServicePrincipal or Group"
+        )
+    if assigned_principal_id not in security_group_ids:
+        raise PreflightInputError("ARM group-derived assignment disagrees with Graph membership")
+
+
+def _scope_is_effective_for_target(
+    scope: str,
+    *,
+    collection: RbacCollection,
+) -> bool:
+    return (
+        scope
+        in {
+            "/",
+            collection.subscription_scope,
+            collection.resource_group_scope,
+        }
+        or scope in collection.management_group_ancestry
+    )
+
+
+def _parse_effective_role_assignments(
+    value: object,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    collection: RbacCollection,
+) -> list[RbacAssignment]:
+    evidence = _mapping(
+        value,
+        field_name="effective role-assignment evidence",
+    )
+    raw_method = _require_string(
+        _get_case_insensitive(evidence, "method"),
+        field_name="role-assignment collection method",
+        maximum_length=64,
+    )
+    if not raw_method.isascii():
+        raise PreflightInputError("role-assignment collection method must use ASCII")
+    method = _normalized(raw_method)
+    assignments: list[RbacAssignment] = []
+    if method == "arm":
+        api_version = _require_string(
+            _get_case_insensitive(evidence, "apiVersion"),
+            field_name="ARM role-assignment apiVersion",
+            maximum_length=64,
+        )
+        if api_version != _ARM_ROLE_ASSIGNMENTS_API_VERSION:
+            raise PreflightInputError("ARM role-assignment evidence requires apiVersion 2022-04-01")
+        scope = _canonical_scope(
+            _require_string(
+                _get_case_insensitive(evidence, "scope"),
+                field_name="ARM role-assignment request scope",
+            )
+        )
+        if scope != collection.resource_group_scope:
+            raise PreflightInputError("ARM role-assignment evidence uses the wrong target scope")
+        _validate_assigned_to_filter(
+            _get_case_insensitive(evidence, "filter"),
+            effective_principal_id=effective_principal_id,
+            field_name="ARM role-assignment filter",
+        )
+        raw_assignments, request_urls = _paged_values(
+            _get_case_insensitive(evidence, "pages"),
+            field_name="ARM role-assignment evidence",
+            next_link_field="nextLink",
+            maximum_items=MAX_ASSIGNMENTS,
+            allowed_host="management.azure.com",
+        )
+        _validate_arm_role_assignment_urls(
+            request_urls,
+            target=collection,
+            effective_principal_id=effective_principal_id,
+        )
+        assignments = [
+            _parse_arm_role_assignment(
+                assignment,
+                effective_principal_id=effective_principal_id,
+            )
+            for assignment in raw_assignments
+        ]
+    elif method == "azure-cli":
+        exit_code = _get_case_insensitive(evidence, "exitCode")
+        if type(exit_code) is not int or exit_code != 0:
+            raise PreflightInputError("Azure CLI role-assignment collection did not succeed")
+        _validate_cli_arguments(
+            _get_case_insensitive(evidence, "arguments"),
+            target=collection,
+            effective_principal_id=effective_principal_id,
+        )
+        for raw_assignment in _sequence(
+            _get_case_insensitive(evidence, "value"),
+            field_name="Azure CLI role assignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="Azure CLI role assignment",
+            )
+            if (
+                assignment.effective_principal_id_supplied
+                and assignment.effective_principal_id != effective_principal_id
+            ):
+                raise PreflightInputError(
+                    "Azure CLI assignment effectivePrincipalId disagrees with its collection"
+                )
+            assignments.append(
+                replace(
+                    assignment,
+                    effective_principal_id=effective_principal_id,
+                    effective_principal_id_supplied=True,
+                )
+            )
+    else:
+        raise PreflightInputError("role-assignment collection method must be arm or azure-cli")
+    unique_assignments: set[RbacAssignment] = set()
+    for assignment in assignments:
+        if not assignment.role_definition_id:
+            raise PreflightInputError("effective role assignment requires roleDefinitionId")
+        if not assignment.principal_type_supplied:
+            raise PreflightInputError("effective role assignment requires principalType")
+        _validate_effective_assignment_principal(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+        )
+        if not _scope_is_effective_for_target(
+            assignment.scope,
+            collection=collection,
+        ):
+            raise PreflightInputError(
+                "effective role assignment scope is outside the attested target ancestry"
+            )
+        if assignment in unique_assignments:
+            raise PreflightInputError(
+                "effective role-assignment evidence contains a duplicate assignment"
+            )
+        unique_assignments.add(assignment)
+    return assignments
+
+
+def _derive_guarded_role_assignments(
     document: object,
-) -> tuple[list[RbacEvidenceItem], RbacCollection | None]:
+    *,
+    policy: RbacPolicy,
+) -> tuple[list[RbacAssignment], RbacCollection]:
+    root = _mapping(document, field_name="guarded RBAC evidence")
+    if any(
+        _has_case_insensitive(root, legacy_name)
+        for legacy_name in ("value", "queries", "collection")
+    ):
+        raise PreflightInputError(
+            "guarded RBAC evidence requires raw target, hierarchy, and principal artifacts"
+        )
+    target = _parse_evidence_target(_get_case_insensitive(root, "target"))
+    if policy.target is None:
+        raise PreflightInputError("RBAC policy requires a reviewed target")
+    if (
+        target.tenant_id != policy.target.tenant_id
+        or target.subscription_id != policy.target.subscription_id
+        or target.resource_group_scope != policy.target.resource_group_scope
+    ):
+        raise PreflightInputError("RBAC evidence target does not match the reviewed policy target")
+    ancestry = _derive_management_group_ancestry(
+        _get_case_insensitive(root, "hierarchy"),
+        target=target,
+    )
+    if ancestry != policy.target.management_group_ancestry:
+        raise PreflightInputError("management-group hierarchy changed from the reviewed policy")
+    target = replace(
+        target,
+        management_group_ancestry=ancestry,
+    )
+    assignments: list[RbacAssignment] = []
+    effective_principal_ids: set[str] = set()
+    unique_assignment_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    for raw_principal in _sequence(
+        _get_case_insensitive(root, "principals"),
+        field_name="RBAC evidence principals",
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        principal = _mapping(
+            raw_principal,
+            field_name="RBAC evidence principal",
+        )
+        effective_principal_id = _canonical_guid(
+            _get_case_insensitive(principal, "effectivePrincipalId"),
+            field_name="effectivePrincipalId",
+        )
+        if effective_principal_id in effective_principal_ids:
+            raise PreflightInputError("RBAC evidence contains a duplicate effectivePrincipalId")
+        effective_principal_ids.add(effective_principal_id)
+        _parse_service_principal(
+            _get_case_insensitive(principal, "servicePrincipal"),
+            effective_principal_id=effective_principal_id,
+            target=target,
+        )
+        security_group_ids = _parse_security_group_membership(
+            _get_case_insensitive(principal, "groupMembership"),
+            effective_principal_id=effective_principal_id,
+            target=target,
+        )
+        for assignment in _parse_effective_role_assignments(
+            _get_case_insensitive(principal, "roleAssignments"),
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+            collection=target,
+        ):
+            key = _assignment_key(assignment)
+            if key in unique_assignment_keys:
+                raise PreflightInputError(
+                    "guarded RBAC evidence contains a duplicate effective assignment"
+                )
+            unique_assignment_keys.add(key)
+            assignments.append(assignment)
+    if not effective_principal_ids:
+        raise PreflightInputError("RBAC evidence principals must not be empty")
+    return (
+        assignments,
+        replace(
+            target,
+            effective_principal_ids=frozenset(effective_principal_ids),
+        ),
+    )
+
+
+def _role_assignments(document: object) -> list[object]:
     if isinstance(document, list):
-        return (
-            [
-                RbacEvidenceItem(
-                    value=assignment,
-                    effective_principal_id=None,
-                    query_key=None,
-                    subscription_scope=None,
-                )
-                for assignment in _sequence(
-                    document,
-                    field_name="role assignments",
-                    maximum_items=MAX_ASSIGNMENTS,
-                )
-            ],
-            None,
+        return _sequence(
+            document,
+            field_name="role assignments",
+            maximum_items=MAX_ASSIGNMENTS,
         )
     root = _mapping(document, field_name="role-assignment document")
     for key, value in root.items():
@@ -1559,92 +2857,10 @@ def _role_assignments(
             raise PreflightInputError(
                 "role-assignment evidence must not contain a continuation link"
             )
-    raw_queries = _get_case_insensitive(root, "queries")
-    if raw_queries is None:
-        return (
-            [
-                RbacEvidenceItem(
-                    value=assignment,
-                    effective_principal_id=None,
-                    query_key=None,
-                    subscription_scope=None,
-                )
-                for assignment in _sequence(
-                    _get_case_insensitive(root, "value"),
-                    field_name="value",
-                    maximum_items=MAX_ASSIGNMENTS,
-                )
-            ],
-            None,
-        )
-    if _has_case_insensitive(root, "value"):
-        raise PreflightInputError("role-assignment evidence contains mixed result envelopes")
-    query_keys: set[tuple[str, str]] = set()
-    effective_principal_ids: set[str] = set()
-    subscription_scopes: set[str] = set()
-    evidence_items: list[RbacEvidenceItem] = []
-    for raw_query in _sequence(
-        raw_queries,
-        field_name="queries",
-        maximum_items=MAX_POLICY_ITEMS * len(_RBAC_QUERY_KINDS),
-    ):
-        query = _mapping(raw_query, field_name="role-assignment query")
-        for key, value in query.items():
-            if (
-                key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
-                and value is not None
-            ):
-                raise PreflightInputError(
-                    "role-assignment query must not contain a continuation link"
-                )
-        effective_principal_id = _normalized(
-            _require_string(
-                _get_case_insensitive(query, "effectivePrincipalId"),
-                field_name="query effectivePrincipalId",
-            )
-        )
-        query_kind = _parse_rbac_query_kind(_get_case_insensitive(query, "queryKind"))
-        subscription_scope = _canonical_scope(
-            _require_string(
-                _get_case_insensitive(query, "subscriptionScope"),
-                field_name="subscriptionScope",
-            )
-        )
-        if _SUBSCRIPTION_SCOPE.fullmatch(subscription_scope) is None:
-            raise PreflightInputError("subscriptionScope must be a subscription scope")
-        query_key = (effective_principal_id, query_kind)
-        if query_key in query_keys:
-            raise PreflightInputError("role-assignment evidence contains a duplicate query")
-        query_keys.add(query_key)
-        effective_principal_ids.add(effective_principal_id)
-        subscription_scopes.add(subscription_scope)
-        raw_assignments = _sequence(
-            _get_case_insensitive(query, "value"),
-            field_name="query value",
-            maximum_items=MAX_ASSIGNMENTS,
-        )
-        if len(evidence_items) + len(raw_assignments) > MAX_ASSIGNMENTS:
-            raise PreflightInputError(
-                f"role assignments must contain at most {MAX_ASSIGNMENTS} items"
-            )
-        evidence_items.extend(
-            RbacEvidenceItem(
-                value=assignment,
-                effective_principal_id=effective_principal_id,
-                query_key=query_key,
-                subscription_scope=subscription_scope,
-            )
-            for assignment in raw_assignments
-        )
-    if len(subscription_scopes) != 1:
-        raise PreflightInputError("role-assignment queries must use one subscriptionScope")
-    return (
-        evidence_items,
-        RbacCollection(
-            effective_principal_ids=frozenset(effective_principal_ids),
-            query_keys=frozenset(query_keys),
-            subscription_scope=next(iter(subscription_scopes)),
-        ),
+    return _sequence(
+        _get_case_insensitive(root, "value"),
+        field_name="value",
+        maximum_items=MAX_ASSIGNMENTS,
     )
 
 
@@ -1656,200 +2872,140 @@ def evaluate_role_assignments(
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
     policy = _parse_policy(policy_document)
-    if require_separation_rules and not policy.separation_rules:
-        raise PreflightInputError("RBAC policy requires at least one separation rule")
-    if require_separation_rules and not policy.expected_principal_ids:
-        raise PreflightInputError("RBAC policy requires expectedPrincipalIds")
-    if require_separation_rules and not policy.expected_assignments:
-        raise PreflightInputError("RBAC policy requires expectedAssignments")
-    if require_separation_rules and any(
-        not assignment.role_definition_id for assignment in policy.expected_assignments
-    ):
-        raise PreflightInputError("expectedAssignments require roleDefinitionId")
-    if require_separation_rules and any(
-        not assignment.role_name_supplied for assignment in policy.expected_assignments
-    ):
-        raise PreflightInputError("expectedAssignments require roleDefinitionName")
     if require_separation_rules:
-        for assignment in policy.expected_assignments:
+        if not policy.separation_rules:
+            raise PreflightInputError("RBAC policy requires at least one separation rule")
+        if not policy.expected_principal_ids:
+            raise PreflightInputError("RBAC policy requires expectedPrincipalIds")
+        if policy.legacy_expected_assignments_supplied:
+            raise PreflightInputError(
+                "guarded RBAC policy must use approvedAssignments, not expectedAssignments"
+            )
+        if not policy.approved_assignments_supplied:
+            raise PreflightInputError("RBAC policy requires approvedAssignments")
+        if not policy.approved_assignments:
+            raise PreflightInputError("approvedAssignments must not be empty")
+        if policy.target is None:
+            raise PreflightInputError("RBAC policy requires a reviewed target")
+        for assignment in policy.approved_assignments:
+            if not assignment.role_definition_id:
+                raise PreflightInputError("approvedAssignments require roleDefinitionId")
+            if not assignment.role_name_supplied:
+                raise PreflightInputError("approvedAssignments require roleDefinitionName")
             _validate_guarded_assignment_binding(
                 assignment,
-                field_name="expectedAssignments",
+                field_name="approvedAssignments",
             )
-    if require_separation_rules and any(
-        not allowance.role_definition_id for allowance in policy.allowed_broad_assignments
-    ):
-        raise PreflightInputError("allowedBroadAssignments require roleDefinitionId")
-    if require_separation_rules and any(
-        not allowance.role_name_supplied for allowance in policy.allowed_broad_assignments
-    ):
-        raise PreflightInputError("allowedBroadAssignments require roleDefinitionName")
-    if require_separation_rules:
+            _canonical_guid(
+                assignment.principal_id,
+                field_name="approved assignedPrincipalId",
+            )
+            _canonical_guid(
+                assignment.effective_principal_id,
+                field_name="approved effectivePrincipalId",
+            )
+            if not _scope_is_effective_for_target(
+                assignment.scope,
+                collection=policy.target,
+            ):
+                raise PreflightInputError(
+                    "approvedAssignments scope is outside the reviewed target ancestry"
+                )
         for allowance in policy.allowed_broad_assignments:
+            if not allowance.role_definition_id:
+                raise PreflightInputError("allowedBroadAssignments require roleDefinitionId")
+            if not allowance.role_name_supplied:
+                raise PreflightInputError("allowedBroadAssignments require roleDefinitionName")
             _validate_guarded_assignment_binding(
                 allowance,
                 field_name="allowedBroadAssignments",
             )
-    rule_principal_ids = frozenset(rule.principal_id for rule in policy.separation_rules)
-    if require_separation_rules and rule_principal_ids != policy.expected_principal_ids:
-        raise PreflightInputError(
-            "separationRules principals must exactly match expectedPrincipalIds"
-        )
-    if require_separation_rules and any(
-        not rule.forbidden_role_ids for rule in policy.separation_rules
-    ):
-        raise PreflightInputError("separation rule requires forbiddenRoleDefinitionIds")
-    allowance_principal_ids = frozenset(
-        allowance.effective_principal_id for allowance in policy.allowed_broad_assignments
-    )
-    if require_separation_rules and not allowance_principal_ids.issubset(
-        policy.expected_principal_ids
-    ):
-        raise PreflightInputError("RBAC policy principals must be listed in expectedPrincipalIds")
-    expected_assignment_principal_ids = frozenset(
-        assignment.effective_principal_id for assignment in policy.expected_assignments
-    )
-    if (
-        require_separation_rules
-        and expected_assignment_principal_ids != policy.expected_principal_ids
-    ):
-        raise PreflightInputError(
-            "expectedAssignments principals must exactly match expectedPrincipalIds"
-        )
-    expected_allowances = frozenset(
-        BroadAssignmentAllowance(
-            principal_id=assignment.principal_id,
-            effective_principal_id=assignment.effective_principal_id,
-            principal_type=assignment.principal_type,
-            role_name=assignment.role_name,
-            role_definition_id=assignment.role_definition_id,
-            scope=assignment.scope,
-            condition=assignment.condition,
-            condition_version=assignment.condition_version,
-            role_name_supplied=assignment.role_name_supplied,
-            effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
-            principal_type_supplied=assignment.principal_type_supplied,
-        )
-        for assignment in policy.expected_assignments
-    )
-    if require_separation_rules and not all(
-        any(_allowance_matches(allowance, expected) for expected in expected_allowances)
-        for allowance in policy.allowed_broad_assignments
-    ):
-        raise PreflightInputError("allowedBroadAssignments must be listed in expectedAssignments")
-    raw_assignments, collection = _role_assignments(document)
-    if require_separation_rules and collection is None:
-        raise PreflightInputError("role-assignment evidence requires per-identity query results")
-    if (
-        require_separation_rules
-        and collection is not None
-        and collection.effective_principal_ids != policy.expected_principal_ids
-    ):
-        raise PreflightInputError(
-            "query effectivePrincipalIds must exactly match expectedPrincipalIds"
-        )
-    required_query_keys = frozenset(
-        (principal_id, query_kind)
-        for principal_id in policy.expected_principal_ids
-        for query_kind in _RBAC_QUERY_KINDS
-    )
-    if (
-        require_separation_rules
-        and collection is not None
-        and collection.query_keys != required_query_keys
-    ):
-        raise PreflightInputError(
-            "role-assignment evidence requires one ancestor and one "
-            "descendant query for every expectedPrincipalId"
-        )
-    if (
-        require_separation_rules
-        and collection is not None
-        and any(
-            assignment.scope != "/"
-            and _MANAGEMENT_GROUP_SCOPE.fullmatch(assignment.scope) is None
-            and not _scope_contains(
-                collection.subscription_scope,
-                assignment.scope,
+        rule_principal_ids = frozenset(rule.principal_id for rule in policy.separation_rules)
+        if rule_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "separationRules principals must exactly match expectedPrincipalIds"
             )
-            for assignment in policy.expected_assignments
+        if any(not rule.forbidden_role_ids for rule in policy.separation_rules):
+            raise PreflightInputError("separation rule requires forbiddenRoleDefinitionIds")
+        allowance_principal_ids = frozenset(
+            allowance.effective_principal_id for allowance in policy.allowed_broad_assignments
         )
-    ):
-        raise PreflightInputError("expectedAssignments scope is outside query subscriptionScope")
-    if require_separation_rules and not raw_assignments:
-        raise PreflightInputError("role-assignment evidence must not be empty")
-    assignments: list[RbacAssignment] = []
-    unique_assignments: set[RbacAssignment] = set()
-    assignments_by_query: dict[
-        tuple[str, str] | None,
-        set[RbacAssignment],
-    ] = {}
-    assignment_principal_ids: set[str] = set()
-    for evidence_item in raw_assignments:
-        assignment = _parse_rbac_assignment(
-            evidence_item.value,
-            field_name="role assignment",
+        if not allowance_principal_ids.issubset(policy.expected_principal_ids):
+            raise PreflightInputError(
+                "RBAC policy principals must be listed in expectedPrincipalIds"
+            )
+        approved_assignment_principal_ids = frozenset(
+            assignment.effective_principal_id for assignment in policy.approved_assignments
         )
-        if (
-            evidence_item.effective_principal_id is not None
-            and assignment.effective_principal_id != evidence_item.effective_principal_id
+        if approved_assignment_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "approvedAssignments principals must exactly match expectedPrincipalIds"
+            )
+        approved_assignment_keys = {
+            _assignment_key(assignment) for assignment in policy.approved_assignments
+        }
+        approved_allowances = tuple(
+            BroadAssignmentAllowance(
+                principal_id=assignment.principal_id,
+                effective_principal_id=(assignment.effective_principal_id),
+                principal_type=assignment.principal_type,
+                role_name=assignment.role_name,
+                role_definition_id=assignment.role_definition_id,
+                scope=assignment.scope,
+                condition=assignment.condition,
+                condition_version=assignment.condition_version,
+                role_name_supplied=assignment.role_name_supplied,
+                effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
+                principal_type_supplied=(assignment.principal_type_supplied),
+                assigned_principal_fields_supplied=(assignment.assigned_principal_fields_supplied),
+            )
+            for assignment in policy.approved_assignments
+        )
+        if not all(
+            any(_allowance_matches(allowance, approved) for approved in approved_allowances)
+            for allowance in policy.allowed_broad_assignments
         ):
             raise PreflightInputError(
-                "role assignment effectivePrincipalId does not match its query"
+                "allowedBroadAssignments must be listed in approvedAssignments"
             )
-        if evidence_item.query_key is not None and evidence_item.subscription_scope is not None:
-            query_kind = evidence_item.query_key[1]
-            if query_kind == "subscription-descendants" and not _scope_contains(
-                evidence_item.subscription_scope,
-                assignment.scope,
-            ):
+        observed_assignments, collection = _derive_guarded_role_assignments(
+            document,
+            policy=policy,
+        )
+        if not observed_assignments:
+            raise PreflightInputError("effective role-assignment evidence must not be empty")
+        if collection.effective_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "RBAC evidence effectivePrincipalIds must exactly match expectedPrincipalIds"
+            )
+        observed_assignment_keys = {
+            _assignment_key(assignment) for assignment in observed_assignments
+        }
+        if observed_assignment_keys != approved_assignment_keys:
+            raise PreflightInputError(
+                "derived effective assignments do not exactly match approvedAssignments"
+            )
+        approved_by_key = {
+            _assignment_key(assignment): assignment for assignment in policy.approved_assignments
+        }
+        assignments = [
+            approved_by_key[_assignment_key(assignment)] for assignment in observed_assignments
+        ]
+    else:
+        assignments = []
+        unique_assignments: set[RbacAssignment] = set()
+        for raw_assignment in _role_assignments(document):
+            assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="role assignment",
+            )
+            if assignment in unique_assignments:
                 raise PreflightInputError(
-                    "descendant query contains an assignment outside its subscriptionScope"
+                    "role-assignment evidence contains a duplicate assignment"
                 )
-            if query_kind == "subscription-ancestors" and not (
-                assignment.scope in {"/", evidence_item.subscription_scope}
-                or _MANAGEMENT_GROUP_SCOPE.fullmatch(assignment.scope) is not None
-            ):
-                raise PreflightInputError("ancestor query contains a descendant assignment")
-        query_assignments = assignments_by_query.setdefault(
-            evidence_item.query_key,
-            set(),
-        )
-        if assignment in query_assignments:
-            raise PreflightInputError("role-assignment query contains a duplicate assignment")
-        query_assignments.add(assignment)
-        if assignment not in unique_assignments:
-            assignments.append(assignment)
             unique_assignments.add(assignment)
-        assignment_principal_ids.add(assignment.effective_principal_id)
-    if require_separation_rules and any(
-        not assignment.role_definition_id for assignment in assignments
-    ):
-        raise PreflightInputError("role-assignment evidence requires roleDefinitionId")
-    if require_separation_rules and any(
-        not assignment.role_name_supplied for assignment in assignments
-    ):
-        raise PreflightInputError("role-assignment evidence requires roleDefinitionName")
-    if require_separation_rules:
-        for assignment in assignments:
-            _validate_guarded_assignment_binding(
-                assignment,
-                field_name="role-assignment evidence",
-            )
-    if require_separation_rules and not assignment_principal_ids.issubset(
-        policy.expected_principal_ids
-    ):
-        raise PreflightInputError(
-            "role assignment principal is not covered by expectedPrincipalIds"
-        )
-    if require_separation_rules and assignment_principal_ids != policy.expected_principal_ids:
-        raise PreflightInputError(
-            "role-assignment evidence does not cover every expectedPrincipalId"
-        )
-    if require_separation_rules and unique_assignments != policy.expected_assignments:
-        raise PreflightInputError(
-            "role-assignment evidence does not exactly match expectedAssignments"
-        )
+            assignments.append(assignment)
+
     violations: list[PreflightViolation] = []
     for assignment in assignments:
         assignment_principal_id = assignment.principal_id
@@ -1883,6 +3039,9 @@ def evaluate_role_assignments(
                     role_name_supplied=assignment.role_name_supplied,
                     effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
                     principal_type_supplied=(assignment.principal_type_supplied),
+                    assigned_principal_fields_supplied=(
+                        assignment.assigned_principal_fields_supplied
+                    ),
                 ),
             )
             for allowance in policy.allowed_broad_assignments

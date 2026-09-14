@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
+import uuid
 from io import StringIO
+from urllib.parse import urlencode
 
 import pytest
 
@@ -15,7 +18,12 @@ from athena_context.wc029_preflight import (
 )
 
 _SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
+_TENANT_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _RG_SCOPE = f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload"
+_SUBSCRIPTION_SCOPE = f"/subscriptions/{_SUBSCRIPTION_ID}"
+_MG_LEAF_SCOPE = "/providers/Microsoft.Management/managementGroups/synthetic-workloads"
+_MG_ROOT_SCOPE = "/providers/Microsoft.Management/managementGroups/synthetic-root"
+_MANAGEMENT_GROUP_ANCESTRY = [_MG_LEAF_SCOPE, _MG_ROOT_SCOPE]
 _CONTAINER_APP_ID = (
     f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/"
     "rg-athena-wc013-live/providers/Microsoft.App/containerApps/"
@@ -119,34 +127,213 @@ def _guarded_assignment(
     condition: str | None = None,
     condition_version: str | None = None,
 ) -> dict[str, str]:
-    return _assignment(
-        principal_id=principal_id,
-        effective_principal_id=(
+    value = {
+        "assignedPrincipalId": principal_id,
+        "assignedPrincipalType": principal_type,
+        "effectivePrincipalId": (
             principal_id if effective_principal_id is None else effective_principal_id
         ),
-        principal_type=principal_type,
-        role_name=role_name,
-        role_id=_TEST_ROLE_IDS[role_name.casefold()],
-        scope=scope,
-        condition=condition,
-        condition_version=condition_version,
+        "roleDefinitionName": role_name,
+        "roleDefinitionId": _TEST_ROLE_IDS[role_name.casefold()],
+        "scope": scope,
+    }
+    if condition is not None:
+        value["condition"] = condition
+    if condition_version is not None:
+        value["conditionVersion"] = condition_version
+    return value
+
+
+def _assignment_field(
+    assignment: dict[str, str],
+    assigned_name: str,
+    legacy_name: str,
+) -> str:
+    if assigned_name in assignment:
+        return assignment[assigned_name]
+    return assignment[legacy_name]
+
+
+def _client_id(principal_id: str) -> str:
+    return str(
+        uuid.UUID(
+            int=uuid.UUID(principal_id).int ^ (1 << 64),
+        )
     )
+
+
+def _raw_arm_assignment(
+    assignment: dict[str, str],
+    *,
+    index: int,
+) -> dict[str, object]:
+    scope = assignment["scope"]
+    assignment_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        (
+            f"{_assignment_field(assignment, 'effectivePrincipalId', 'principalId')}:"
+            f"{assignment.get('roleDefinitionId', '')}:{scope}:{index}"
+        ),
+    )
+    resource_id = (
+        f"/providers/Microsoft.Authorization/roleAssignments/{assignment_id}"
+        if scope == "/"
+        else (f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_id}")
+    )
+    properties: dict[str, object] = {
+        "principalId": _assignment_field(
+            assignment,
+            "assignedPrincipalId",
+            "principalId",
+        ),
+        "principalType": _assignment_field(
+            assignment,
+            "assignedPrincipalType",
+            "principalType",
+        ),
+        "roleDefinitionId": assignment.get("roleDefinitionId"),
+        "scope": scope,
+    }
+    for field_name in ("condition", "conditionVersion"):
+        if field_name in assignment:
+            properties[field_name] = assignment[field_name]
+    return {
+        "id": resource_id,
+        "type": "Microsoft.Authorization/roleAssignments",
+        "properties": properties,
+    }
+
+
+def _hierarchy_evidence() -> dict[str, object]:
+    subscription_association_id = f"{_MG_LEAF_SCOPE}/subscriptions/{_SUBSCRIPTION_ID}"
+    return {
+        "resourceGraph": {
+            "request": {
+                "tenantId": _TENANT_ID,
+                "subscriptionId": _SUBSCRIPTION_ID,
+                "query": (
+                    "ResourceContainers | where type =~ "
+                    "'microsoft.resources/subscriptions' | project "
+                    "tenantId, subscriptionId, "
+                    "properties.managementGroupAncestorsChain"
+                ),
+            },
+            "statusCode": 200,
+            "body": {
+                "data": [
+                    {
+                        "tenantId": _TENANT_ID,
+                        "subscriptionId": _SUBSCRIPTION_ID,
+                        "properties": {
+                            "managementGroupAncestorsChain": [
+                                {"name": scope.rsplit("/", 1)[-1]}
+                                for scope in (_MANAGEMENT_GROUP_ANCESTRY)
+                            ]
+                        },
+                    }
+                ],
+                "skipToken": None,
+            },
+        },
+        "arm": {
+            "subscription": {
+                "requestUrl": (
+                    "https://management.azure.com"
+                    f"{subscription_association_id}"
+                    "?api-version=2020-05-01"
+                ),
+                "statusCode": 200,
+                "body": {
+                    "id": subscription_association_id,
+                    "type": ("Microsoft.Management/managementGroups/subscriptions"),
+                    "name": _SUBSCRIPTION_ID,
+                    "properties": {
+                        "tenantId": _TENANT_ID,
+                        "parent": {"id": _MG_LEAF_SCOPE},
+                    },
+                },
+            },
+            "resourceGroup": {
+                "requestUrl": (f"https://management.azure.com{_RG_SCOPE}?api-version=2021-04-01"),
+                "statusCode": 200,
+                "body": {
+                    "id": _RG_SCOPE,
+                    "type": "Microsoft.Resources/resourceGroups",
+                },
+            },
+            "managementGroups": [
+                {
+                    "requestUrl": (
+                        "https://management.azure.com"
+                        f"{_MG_LEAF_SCOPE}?api-version=2020-05-01"
+                        "&%24expand=path"
+                    ),
+                    "statusCode": 200,
+                    "body": {
+                        "id": _MG_LEAF_SCOPE,
+                        "type": ("Microsoft.Management/managementGroups"),
+                        "properties": {
+                            "tenantId": _TENANT_ID,
+                            "details": {
+                                "parent": {"id": _MG_ROOT_SCOPE},
+                            },
+                        },
+                    },
+                },
+                {
+                    "requestUrl": (
+                        "https://management.azure.com"
+                        f"{_MG_ROOT_SCOPE}?api-version=2020-05-01"
+                        "&%24expand=path"
+                    ),
+                    "statusCode": 200,
+                    "body": {
+                        "id": _MG_ROOT_SCOPE,
+                        "type": ("Microsoft.Management/managementGroups"),
+                        "properties": {
+                            "tenantId": _TENANT_ID,
+                            "details": {"parent": None},
+                        },
+                    },
+                },
+            ],
+        },
+    }
+
+
+def _group_membership_evidence(
+    effective_principal_id: str,
+    group_ids: list[str],
+) -> dict[str, object]:
+    return {
+        "tenantId": _TENANT_ID,
+        "method": "getMemberGroups",
+        "securityEnabledOnly": True,
+        "pages": [
+            {
+                "requestUrl": (
+                    "https://graph.microsoft.com/v1.0/servicePrincipals/"
+                    f"{effective_principal_id}/getMemberGroups"
+                ),
+                "statusCode": 200,
+                "value": group_ids,
+                "@odata.nextLink": None,
+            }
+        ],
+    }
 
 
 def _guarded_evidence(
     assignments: list[dict[str, str]],
     *,
     effective_principal_ids: list[str] | None = None,
-    query_kinds: tuple[str, ...] = (
-        "subscription-descendants",
-        "subscription-ancestors",
-    ),
 ) -> dict[str, object]:
     assignment_principal_ids = list(
         dict.fromkeys(
-            assignment.get(
+            _assignment_field(
+                assignment,
                 "effectivePrincipalId",
-                assignment["principalId"],
+                "principalId",
             )
             for assignment in assignments
         )
@@ -162,51 +349,130 @@ def _guarded_evidence(
                 if principal_id not in effective_principal_ids
             ),
         ]
-    subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"
-    queries: list[dict[str, object]] = []
+    principals: list[dict[str, object]] = []
     for effective_principal_id in effective_principal_ids:
         identity_assignments = [
             assignment
             for assignment in assignments
-            if assignment.get(
+            if _assignment_field(
+                assignment,
                 "effectivePrincipalId",
-                assignment["principalId"],
+                "principalId",
             )
             == effective_principal_id
         ]
-        for query_kind in query_kinds:
-            if query_kind == "subscription-descendants":
-                query_assignments = [
-                    assignment
-                    for assignment in identity_assignments
-                    if assignment["scope"].casefold() == subscription_scope.casefold()
-                    or assignment["scope"]
-                    .casefold()
-                    .startswith(subscription_scope.casefold() + "/")
-                ]
-            elif query_kind == "subscription-ancestors":
-                query_assignments = [
-                    assignment
-                    for assignment in identity_assignments
-                    if assignment["scope"] == "/"
-                    or assignment["scope"].casefold() == subscription_scope.casefold()
-                    or assignment["scope"]
-                    .casefold()
-                    .startswith("/providers/microsoft.management/managementgroups/")
-                ]
-            else:
-                query_assignments = []
-            queries.append(
-                {
-                    "effectivePrincipalId": effective_principal_id,
-                    "queryKind": query_kind,
-                    "subscriptionScope": subscription_scope,
-                    "value": query_assignments,
-                }
+        group_ids = list(
+            dict.fromkeys(
+                _assignment_field(
+                    assignment,
+                    "assignedPrincipalId",
+                    "principalId",
+                )
+                for assignment in identity_assignments
+                if _assignment_field(
+                    assignment,
+                    "assignedPrincipalType",
+                    "principalType",
+                ).casefold()
+                == "group"
             )
+        )
+        assignment_filter = f"atScope() and assignedTo('{effective_principal_id}')"
+        request_query = urlencode(
+            {
+                "api-version": "2022-04-01",
+                "$filter": assignment_filter,
+            }
+        )
+        principals.append(
+            {
+                "effectivePrincipalId": effective_principal_id,
+                "servicePrincipal": {
+                    "statusCode": 200,
+                    "tenantId": _TENANT_ID,
+                    "id": effective_principal_id,
+                    "appId": _client_id(effective_principal_id),
+                },
+                "groupMembership": _group_membership_evidence(
+                    effective_principal_id,
+                    group_ids,
+                ),
+                "roleAssignments": {
+                    "method": "arm",
+                    "apiVersion": "2022-04-01",
+                    "scope": _RG_SCOPE,
+                    "filter": assignment_filter,
+                    "pages": [
+                        {
+                            "requestUrl": (
+                                f"https://management.azure.com{_RG_SCOPE}/"
+                                "providers/Microsoft.Authorization/"
+                                f"roleAssignments?{request_query}"
+                            ),
+                            "statusCode": 200,
+                            "value": [
+                                _raw_arm_assignment(
+                                    assignment,
+                                    index=index,
+                                )
+                                for index, assignment in enumerate(
+                                    identity_assignments,
+                                )
+                            ],
+                            "nextLink": None,
+                        }
+                    ],
+                },
+            }
+        )
     return {
-        "queries": queries,
+        "target": {
+            "tenantId": _TENANT_ID,
+            "subscriptionId": _SUBSCRIPTION_ID,
+            "resourceGroupId": _RG_SCOPE,
+        },
+        "hierarchy": _hierarchy_evidence(),
+        "principals": principals,
     }
+
+
+def _first_principal_artifact(
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    principals = evidence["principals"]
+    assert isinstance(principals, list)
+    principal = principals[0]
+    assert isinstance(principal, dict)
+    return principal
+
+
+def _cli_assignment(
+    assignment: dict[str, str],
+) -> dict[str, str]:
+    value = {
+        "principalId": _assignment_field(
+            assignment,
+            "assignedPrincipalId",
+            "principalId",
+        ),
+        "principalType": _assignment_field(
+            assignment,
+            "assignedPrincipalType",
+            "principalType",
+        ),
+        "effectivePrincipalId": _assignment_field(
+            assignment,
+            "effectivePrincipalId",
+            "principalId",
+        ),
+        "roleDefinitionName": assignment["roleDefinitionName"],
+        "roleDefinitionId": assignment["roleDefinitionId"],
+        "scope": assignment["scope"],
+    }
+    for field_name in ("condition", "conditionVersion"):
+        if field_name in assignment:
+            value[field_name] = assignment[field_name]
+    return value
 
 
 def _production_policy(
@@ -214,8 +480,14 @@ def _production_policy(
     expected_assignments: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     return {
+        "target": {
+            "tenantId": _TENANT_ID,
+            "subscriptionId": _SUBSCRIPTION_ID,
+            "resourceGroupId": _RG_SCOPE,
+            "approvedManagementGroupAncestry": (_MANAGEMENT_GROUP_ANCESTRY),
+        },
         "expectedPrincipalIds": list(principal_ids),
-        "expectedAssignments": (
+        "approvedAssignments": (
             expected_assignments
             if expected_assignments is not None
             else [_guarded_assignment(principal_id=principal_id) for principal_id in principal_ids]
@@ -1784,25 +2056,24 @@ def test_rbac_management_group_assignment_is_conservative_ancestor() -> None:
 
 def test_guarded_rbac_management_group_assignment_cannot_bypass_separation() -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
-    management_group_scope = "/providers/Microsoft.Management/managementGroups/synthetic-parent"
     assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="Reader",
-        scope=management_group_scope,
+        scope=_MG_LEAF_SCOPE,
     )
-    policy = {
-        "expectedPrincipalIds": [principal_id],
-        "expectedAssignments": [assignment],
-        "allowedBroadAssignments": [assignment],
-        "separationRules": [
-            {
-                "principalId": principal_id,
-                "forbiddenRoleNames": ["Reader"],
-                "forbiddenRoleDefinitionIds": [_TEST_ROLE_IDS["reader"]],
-                "forbiddenScopePrefixes": [_RG_SCOPE],
-            }
-        ],
-    }
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["allowedBroadAssignments"] = [assignment]
+    policy["separationRules"] = [
+        {
+            "principalId": principal_id,
+            "forbiddenRoleNames": ["Reader"],
+            "forbiddenRoleDefinitionIds": [_TEST_ROLE_IDS["reader"]],
+            "forbiddenScopePrefixes": [_RG_SCOPE],
+        }
+    ]
 
     violations = evaluate_role_assignments(
         _guarded_evidence(
@@ -2216,7 +2487,7 @@ def test_public_cli_accepts_complete_expected_principal_coverage(tmp_path) -> No
         _guarded_assignment(
             principal_id=principal_id,
             role_name="AcrPull",
-            scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+            scope=_RG_SCOPE,
         )
     ]
     assignments_path = tmp_path / "assignments.json"
@@ -2294,16 +2565,22 @@ def test_public_cli_rejects_empty_assignment_evidence(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: role-assignment evidence must not be empty\n"
+        "WC-029 preflight rbac failed: effective role-assignment evidence must not be empty\n"
     )
 
 
 def test_public_cli_requires_role_ids_in_guarded_inventory(tmp_path) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
-    assignment = _assignment(principal_id=principal_id)
+    assignment = _guarded_assignment(principal_id=principal_id)
+    assignment.pop("roleDefinitionId")
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy = _production_policy(
@@ -2330,34 +2607,34 @@ def test_public_cli_requires_role_ids_in_guarded_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: expectedAssignments require roleDefinitionId\n"
+        "WC-029 preflight rbac failed: approvedAssignments require roleDefinitionId\n"
     )
 
 
 def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
-    id_only_assignment = _assignment(
+    id_only_assignment = _guarded_assignment(
         principal_id=principal_id,
-        role_name=None,
-        role_id=(_ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"),
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
+        scope=_RG_SCOPE,
     )
+    id_only_assignment["roleDefinitionId"] = (
+        _ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"
+    )
+    id_only_assignment.pop("roleDefinitionName")
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([id_only_assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [id_only_assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
-    policy = {
-        "expectedPrincipalIds": [principal_id],
-        "expectedAssignments": [id_only_assignment],
-        "separationRules": [
-            {
-                "principalId": principal_id,
-                "forbiddenRoleNames": ["Log Analytics Reader"],
-                "forbiddenScopePrefixes": [_RG_SCOPE],
-            }
-        ],
-    }
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[id_only_assignment],
+    )
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     stdout = StringIO()
@@ -2378,7 +2655,7 @@ def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> Non
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: expectedAssignments require roleDefinitionName\n"
+        "WC-029 preflight rbac failed: approvedAssignments require roleDefinitionName\n"
     )
 
 
@@ -2387,7 +2664,12 @@ def test_public_cli_requires_separation_role_ids(tmp_path) -> None:
     assignment = _guarded_assignment(principal_id=principal_id)
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy = _production_policy(
@@ -2424,34 +2706,34 @@ def test_public_cli_requires_separation_role_ids(tmp_path) -> None:
 def test_separation_rule_matches_role_id_despite_false_display_name() -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     log_analytics_reader_id = _ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"
-    assignment = _assignment(
-        principal_id=principal_id,
-        effective_principal_id=principal_id,
-        principal_type="ServicePrincipal",
-        role_name="AcrPull",
-        role_id=log_analytics_reader_id,
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
-    )
-    policy = {
-        "expectedPrincipalIds": [principal_id],
-        "expectedAssignments": [assignment],
-        "separationRules": [
-            {
-                "principalId": principal_id,
-                "forbiddenRoleNames": ["Log Analytics Reader"],
-                "forbiddenRoleDefinitionIds": [
-                    log_analytics_reader_id,
-                ],
-                "forbiddenScopePrefixes": [_RG_SCOPE],
-            }
-        ],
+    approved_assignment = {
+        "assignedPrincipalId": principal_id,
+        "assignedPrincipalType": "ServicePrincipal",
+        "effectivePrincipalId": principal_id,
+        "roleDefinitionName": "AcrPull",
+        "roleDefinitionId": log_analytics_reader_id,
+        "scope": _RG_SCOPE,
     }
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[approved_assignment],
+    )
+    policy["separationRules"] = [
+        {
+            "principalId": principal_id,
+            "forbiddenRoleNames": ["Log Analytics Reader"],
+            "forbiddenRoleDefinitionIds": [
+                log_analytics_reader_id,
+            ],
+            "forbiddenScopePrefixes": [_RG_SCOPE],
+        }
+    ]
 
     assert {
         item.code
         for item in evaluate_role_assignments(
             _guarded_evidence(
-                [assignment],
+                [approved_assignment],
                 effective_principal_ids=[principal_id],
             ),
             policy_document=policy,
@@ -2468,22 +2750,22 @@ def test_group_derived_forbidden_role_binds_to_effective_identity() -> None:
         effective_principal_id=identity_principal_id,
         principal_type="Group",
         role_name="Log Analytics Reader",
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
+        scope=_RG_SCOPE,
     )
-    policy = {
-        "expectedPrincipalIds": [identity_principal_id],
-        "expectedAssignments": [assignment],
-        "separationRules": [
-            {
-                "principalId": identity_principal_id,
-                "forbiddenRoleNames": ["Log Analytics Reader"],
-                "forbiddenRoleDefinitionIds": [
-                    _TEST_ROLE_IDS["log analytics reader"],
-                ],
-                "forbiddenScopePrefixes": [_RG_SCOPE],
-            }
-        ],
-    }
+    policy = _production_policy(
+        identity_principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["separationRules"] = [
+        {
+            "principalId": identity_principal_id,
+            "forbiddenRoleNames": ["Log Analytics Reader"],
+            "forbiddenRoleDefinitionIds": [
+                _TEST_ROLE_IDS["log analytics reader"],
+            ],
+            "forbiddenScopePrefixes": [_RG_SCOPE],
+        }
+    ]
 
     violations = evaluate_role_assignments(
         _guarded_evidence(
@@ -2499,49 +2781,13 @@ def test_group_derived_forbidden_role_binds_to_effective_identity() -> None:
     assert f"via group {group_principal_id}" in violations[0].detail
 
 
-@pytest.mark.parametrize(
-    "query_kinds",
-    [
-        ("subscription-descendants",),
-        ("subscription-ancestors",),
-    ],
-)
-def test_guarded_rbac_rejects_incomplete_query_coverage(
-    query_kinds: tuple[str, ...],
-) -> None:
+def test_guarded_rbac_rejects_flat_or_self_asserted_inventory() -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="AcrPull",
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+        scope=_RG_SCOPE,
     )
-
-    with pytest.raises(
-        PreflightInputError,
-        match="requires one ancestor and one descendant query",
-    ):
-        evaluate_role_assignments(
-            _guarded_evidence(
-                [assignment],
-                effective_principal_ids=[principal_id],
-                query_kinds=query_kinds,
-            ),
-            policy_document=_production_policy(
-                principal_id,
-                expected_assignments=[assignment],
-            ),
-            require_separation_rules=True,
-        )
-
-
-def test_guarded_rbac_rejects_inventory_without_per_query_results() -> None:
-    principal_id = "11111111-1111-1111-1111-111111111111"
-    assignment = _guarded_assignment(
-        principal_id=principal_id,
-        role_name="AcrPull",
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
-    )
-
     for evidence in (
         [assignment],
         {
@@ -2556,7 +2802,7 @@ def test_guarded_rbac_rejects_inventory_without_per_query_results() -> None:
     ):
         with pytest.raises(
             PreflightInputError,
-            match="requires per-identity query results",
+            match="guarded RBAC evidence",
         ):
             evaluate_role_assignments(
                 evidence,
@@ -2568,29 +2814,41 @@ def test_guarded_rbac_rejects_inventory_without_per_query_results() -> None:
             )
 
 
-def test_guarded_rbac_rejects_assignment_in_wrong_query_direction() -> None:
+@pytest.mark.parametrize(
+    "evidence_kind",
+    ["arm", "graph"],
+)
+def test_guarded_rbac_rejects_pagination_gaps(
+    evidence_kind: str,
+) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="AcrPull",
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+        scope=_RG_SCOPE,
     )
     evidence = _guarded_evidence(
         [assignment],
         effective_principal_ids=[principal_id],
     )
-    queries = evidence["queries"]
-    assert isinstance(queries, list)
-    ancestor_query = next(
-        query
-        for query in queries
-        if isinstance(query, dict) and query["queryKind"] == "subscription-ancestors"
+    principal = _first_principal_artifact(evidence)
+    container_name = "roleAssignments" if evidence_kind == "arm" else "groupMembership"
+    container = principal[container_name]
+    assert isinstance(container, dict)
+    pages = container["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    next_link_name = "nextLink" if evidence_kind == "arm" else "@odata.nextLink"
+    page[next_link_name] = (
+        "https://management.azure.com/next"
+        if evidence_kind == "arm"
+        else "https://graph.microsoft.com/next"
     )
-    ancestor_query["value"] = [assignment]
 
     with pytest.raises(
         PreflightInputError,
-        match="ancestor query contains a descendant assignment",
+        match="pagination is incomplete",
     ):
         evaluate_role_assignments(
             evidence,
@@ -2602,43 +2860,597 @@ def test_guarded_rbac_rejects_assignment_in_wrong_query_direction() -> None:
         )
 
 
-def test_guarded_rbac_rejects_unassociated_group_assignment() -> None:
-    identity_principal_id = "11111111-1111-1111-1111-111111111111"
-    group_principal_id = "22222222-2222-2222-2222-222222222222"
-    assignment = _assignment(
-        principal_id=group_principal_id,
-        principal_type="Group",
-        role_name="Log Analytics Reader",
-        role_id=_TEST_ROLE_IDS["log analytics reader"],
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
+@pytest.mark.parametrize(
+    ("evidence_kind", "query_suffix", "message"),
+    [
+        (
+            "arm",
+            "&%24skipToken=synthetic",
+            "requestUrl is not canonical",
+        ),
+        (
+            "arm",
+            "&tenantId=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "requestUrl is not canonical",
+        ),
+        (
+            "graph",
+            "?%24skiptoken=synthetic",
+            "must be unfiltered",
+        ),
+        (
+            "graph",
+            "?%24filter=securityEnabled%20eq%20true",
+            "must be unfiltered",
+        ),
+    ],
+)
+def test_guarded_rbac_rejects_partial_initial_requests(
+    evidence_kind: str,
+    query_suffix: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
     )
-    policy = {
-        "expectedPrincipalIds": [identity_principal_id],
-        "expectedAssignments": [assignment],
-        "separationRules": [
-            {
-                "principalId": identity_principal_id,
-                "forbiddenRoleNames": ["Log Analytics Reader"],
-                "forbiddenRoleDefinitionIds": [
-                    _TEST_ROLE_IDS["log analytics reader"],
-                ],
-                "forbiddenScopePrefixes": [_RG_SCOPE],
-            }
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    container = principal["roleAssignments" if evidence_kind == "arm" else "groupMembership"]
+    assert isinstance(container, dict)
+    pages = container["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["requestUrl"] = str(page["requestUrl"]) + query_suffix
+
+    with pytest.raises(PreflightInputError, match=message):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_public_cli_reports_malformed_evidence_url(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    pages = role_assignments["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["requestUrl"] = "https://[invalid"
+    evidence_path = tmp_path / "rbac.json"
+    policy_path = tmp_path / "policy.json"
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    policy_path.write_text(
+        json.dumps(
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(evidence_path),
+            "--policy",
+            str(policy_path),
         ],
-    }
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert "is not a valid URL" in stderr.getvalue()
+
+
+def test_guarded_rbac_rejects_inconsistent_hierarchy_sources() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    hierarchy = evidence["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    resource_graph = hierarchy["resourceGraph"]
+    assert isinstance(resource_graph, dict)
+    body = resource_graph["body"]
+    assert isinstance(body, dict)
+    data = body["data"]
+    assert isinstance(data, list)
+    row = data[0]
+    assert isinstance(row, dict)
+    properties = row["properties"]
+    assert isinstance(properties, dict)
+    chain = properties["managementGroupAncestorsChain"]
+    assert isinstance(chain, list)
+    properties["managementGroupAncestorsChain"] = list(reversed(chain))
 
     with pytest.raises(
         PreflightInputError,
-        match="expectedAssignments requires effectivePrincipalId",
+        match="Resource Graph and ARM management-group hierarchies disagree",
     ):
         evaluate_role_assignments(
-            _guarded_evidence(
-                [assignment],
-                effective_principal_ids=[identity_principal_id],
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
             ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_cyclic_or_missing_arm_hierarchy() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    cyclic = _guarded_evidence([assignment])
+    hierarchy = cyclic["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    arm = hierarchy["arm"]
+    assert isinstance(arm, dict)
+    groups = arm["managementGroups"]
+    assert isinstance(groups, list)
+    root = groups[1]
+    assert isinstance(root, dict)
+    root_body = root["body"]
+    assert isinstance(root_body, dict)
+    root_properties = root_body["properties"]
+    assert isinstance(root_properties, dict)
+    root_details = root_properties["details"]
+    assert isinstance(root_details, dict)
+    root_details["parent"] = {"id": _MG_LEAF_SCOPE}
+    with pytest.raises(PreflightInputError, match="hierarchy is cyclic"):
+        evaluate_role_assignments(
+            cyclic,
             policy_document=policy,
             require_separation_rules=True,
         )
+
+    missing = _guarded_evidence([assignment])
+    hierarchy = missing["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    arm = hierarchy["arm"]
+    assert isinstance(arm, dict)
+    groups = arm["managementGroups"]
+    assert isinstance(groups, list)
+    groups.pop()
+    with pytest.raises(
+        PreflightInputError,
+        match="omits an ancestor",
+    ):
+        evaluate_role_assignments(
+            missing,
+            policy_document=policy,
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_cross_tenant_or_changed_hierarchy() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    cross_tenant = _guarded_evidence([assignment])
+    hierarchy = cross_tenant["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    arm = hierarchy["arm"]
+    assert isinstance(arm, dict)
+    groups = arm["managementGroups"]
+    assert isinstance(groups, list)
+    leaf = groups[0]
+    assert isinstance(leaf, dict)
+    leaf_body = leaf["body"]
+    assert isinstance(leaf_body, dict)
+    leaf_properties = leaf_body["properties"]
+    assert isinstance(leaf_properties, dict)
+    leaf_properties["tenantId"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    with pytest.raises(PreflightInputError, match="crosses tenants"):
+        evaluate_role_assignments(
+            cross_tenant,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+    changed_policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    target = changed_policy["target"]
+    assert isinstance(target, dict)
+    target["approvedManagementGroupAncestry"] = [
+        _MG_ROOT_SCOPE,
+        _MG_LEAF_SCOPE,
+    ]
+    with pytest.raises(
+        PreflightInputError,
+        match="hierarchy changed from the reviewed policy",
+    ):
+        evaluate_role_assignments(
+            _guarded_evidence([assignment]),
+            policy_document=changed_policy,
+            require_separation_rules=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("component", "status_code"),
+    [
+        ("servicePrincipal", 404),
+        ("groupMembership", 403),
+        ("roleAssignments", 404),
+        ("hierarchy", 403),
+    ],
+)
+def test_guarded_rbac_rejects_failed_evidence_requests(
+    component: str,
+    status_code: int,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    if component == "hierarchy":
+        hierarchy = evidence["hierarchy"]
+        assert isinstance(hierarchy, dict)
+        resource_graph = hierarchy["resourceGraph"]
+        assert isinstance(resource_graph, dict)
+        resource_graph["statusCode"] = status_code
+    else:
+        principal = _first_principal_artifact(evidence)
+        artifact = principal[component]
+        assert isinstance(artifact, dict)
+        if component == "servicePrincipal":
+            artifact["statusCode"] = status_code
+        else:
+            pages = artifact["pages"]
+            assert isinstance(pages, list)
+            page = pages[0]
+            assert isinstance(page, dict)
+            page["statusCode"] = status_code
+
+    with pytest.raises(PreflightInputError, match=f"HTTP {status_code}"):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_graph_arm_membership_disagreement() -> None:
+    identity_principal_id = "11111111-1111-1111-1111-111111111111"
+    group_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_principal_id,
+        effective_principal_id=identity_principal_id,
+        principal_type="Group",
+        role_name="Log Analytics Reader",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    membership = principal["groupMembership"]
+    assert isinstance(membership, dict)
+    pages = membership["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["value"] = []
+
+    with pytest.raises(
+        PreflightInputError,
+        match="disagrees with Graph membership",
+    ):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                identity_principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_direct_assignment_to_another_object() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    pages = role_assignments["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    values = page["value"]
+    assert isinstance(values, list)
+    raw_assignment = values[0]
+    assert isinstance(raw_assignment, dict)
+    properties = raw_assignment["properties"]
+    assert isinstance(properties, dict)
+    properties["principalId"] = "33333333-3333-3333-3333-333333333333"
+
+    with pytest.raises(
+        PreflightInputError,
+        match="does not target the effective service principal",
+    ):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_expected_assignments_as_completeness() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["expectedAssignments"] = policy.pop("approvedAssignments")
+
+    with pytest.raises(
+        PreflightInputError,
+        match="must use approvedAssignments, not expectedAssignments",
+    ):
+        evaluate_role_assignments(
+            _guarded_evidence([assignment]),
+            policy_document=policy,
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_client_id_as_effective_principal() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    service_principal = principal["servicePrincipal"]
+    assert isinstance(service_principal, dict)
+    principal["effectivePrincipalId"] = service_principal["appId"]
+
+    with pytest.raises(
+        PreflightInputError,
+        match="client ID, not an object ID",
+    ):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_accepts_paged_transitive_security_groups() -> None:
+    identity_principal_id = "11111111-1111-1111-1111-111111111111"
+    group_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_principal_id,
+        effective_principal_id=identity_principal_id,
+        principal_type="Group",
+        role_name="Log Analytics Reader",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    second_url = (
+        "https://graph.microsoft.com/v1.0/servicePrincipals/"
+        f"{identity_principal_id}/transitiveMemberOf?$skiptoken=synthetic"
+    )
+    principal["groupMembership"] = {
+        "tenantId": _TENANT_ID,
+        "method": "transitiveMemberOf",
+        "pages": [
+            {
+                "requestUrl": (
+                    "https://graph.microsoft.com/v1.0/servicePrincipals/"
+                    f"{identity_principal_id}/transitiveMemberOf"
+                ),
+                "statusCode": 200,
+                "value": [],
+                "@odata.nextLink": second_url,
+            },
+            {
+                "requestUrl": second_url,
+                "statusCode": 200,
+                "value": [
+                    {
+                        "@odata.type": "#microsoft.graph.group",
+                        "id": group_principal_id,
+                        "securityEnabled": True,
+                    }
+                ],
+                "@odata.nextLink": None,
+            },
+        ],
+    }
+    policy = _production_policy(
+        identity_principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["separationRules"] = [
+        {
+            "principalId": identity_principal_id,
+            "forbiddenRoleNames": ["Log Analytics Reader"],
+            "forbiddenRoleDefinitionIds": [
+                _TEST_ROLE_IDS["log analytics reader"],
+            ],
+            "forbiddenScopePrefixes": [_RG_SCOPE],
+        }
+    ]
+
+    assert {
+        item.code
+        for item in evaluate_role_assignments(
+            evidence,
+            policy_document=policy,
+            require_separation_rules=True,
+        )
+    } == {"identity-separation"}
+
+
+def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["roleAssignments"] = {
+        "method": "azure-cli",
+        "exitCode": 0,
+        "arguments": [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--scope",
+            _RG_SCOPE,
+            "--assignee-object-id",
+            principal_id,
+            "--include-inherited",
+            "--include-groups",
+            "--output",
+            "json",
+        ],
+        "value": [_cli_assignment(assignment)],
+    }
+    assert (
+        evaluate_role_assignments(
+            evidence,
+            policy_document=policy,
+            require_separation_rules=True,
+        )
+        == ()
+    )
+
+    for bad_arguments in (
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--scope",
+            _RG_SCOPE,
+            "--assignee-object-id",
+            principal_id,
+            "--include-inherited",
+            "--output",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--scope",
+            _RG_SCOPE,
+            "--assignee-object-id",
+            principal_id,
+            "--include-inherited",
+            "--include-groups",
+            "--all",
+            "--output",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--scope",
+            _RG_SCOPE,
+            "--assignee-object-id",
+            principal_id,
+            "--include-inherited",
+            "--include-groups",
+            "--output",
+            "json",
+            "--query",
+            "[?roleDefinitionName=='AcrPull']",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--scope",
+            _RG_SCOPE,
+            f"--scope={_SUBSCRIPTION_SCOPE}",
+            "--assignee-object-id",
+            principal_id,
+            "--include-inherited",
+            "--include-groups",
+            "--output",
+            "json",
+        ],
+    ):
+        invalid = copy.deepcopy(evidence)
+        invalid_principal = _first_principal_artifact(invalid)
+        role_assignments = invalid_principal["roleAssignments"]
+        assert isinstance(role_assignments, dict)
+        role_assignments["arguments"] = bad_arguments
+        with pytest.raises(PreflightInputError):
+            evaluate_role_assignments(
+                invalid,
+                policy_document=policy,
+                require_separation_rules=True,
+            )
 
 
 def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:
@@ -2686,65 +3498,6 @@ def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:
     )
 
 
-@pytest.mark.parametrize("continuation_key", ["nextLink", "@odata.nextLink"])
-def test_public_cli_rejects_paginated_assignment_evidence(
-    tmp_path,
-    continuation_key: str,
-) -> None:
-    principal_id = "11111111-1111-1111-1111-111111111111"
-    assignments = [
-        _guarded_assignment(
-            principal_id=principal_id,
-            role_name="AcrPull",
-            scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
-        )
-    ]
-    assignments_path = tmp_path / "assignments.json"
-    assignments_path.write_text(
-        json.dumps(
-            {
-                "value": assignments,
-                continuation_key: "https://management.azure.com/continuation",
-            }
-        ),
-        encoding="utf-8",
-    )
-    policy_path = tmp_path / "policy.json"
-    policy_path.write_text(
-        json.dumps(
-            _production_policy(
-                principal_id,
-                expected_assignments=assignments,
-            )
-        ),
-        encoding="utf-8",
-    )
-    stdout = StringIO()
-    stderr = StringIO()
-
-    exit_code = cli_main(
-        [
-            "wc029-preflight",
-            "rbac",
-            str(assignments_path),
-            "--policy",
-            str(policy_path),
-            "--format",
-            "json",
-        ],
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-    assert exit_code == 3
-    assert stdout.getvalue() == ""
-    assert json.loads(stderr.getvalue()) == {
-        "error": ("role-assignment evidence must not contain a continuation link"),
-        "kind": "rbac",
-        "safe": False,
-    }
-
-
 @pytest.mark.parametrize(
     ("assignments", "policy", "message"),
     [
@@ -2779,12 +3532,12 @@ def test_public_cli_rejects_paginated_assignment_evidence(
                     }
                 ],
             },
-            "RBAC policy requires expectedAssignments",
+            "RBAC policy requires approvedAssignments",
         ),
         (
             [_guarded_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
             _production_policy("22222222-2222-2222-2222-222222222222"),
-            "query effectivePrincipalIds must exactly match expectedPrincipalIds",
+            "RBAC evidence effectivePrincipalIds must exactly match expectedPrincipalIds",
         ),
         (
             [_guarded_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
@@ -2794,23 +3547,21 @@ def test_public_cli_rejects_paginated_assignment_evidence(
                     "22222222-2222-2222-2222-222222222222",
                 ),
             },
-            "role-assignment evidence does not cover every expectedPrincipalId",
+            "derived effective assignments do not exactly match approvedAssignments",
         ),
         (
             [_guarded_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
             {
-                "expectedPrincipalIds": [
+                **_production_policy(
                     "11111111-1111-1111-1111-111111111111",
-                ],
-                "expectedAssignments": [
-                    _guarded_assignment(
-                        principal_id="11111111-1111-1111-1111-111111111111",
-                    )
-                ],
+                ),
                 "separationRules": [
                     {
                         "principalId": "22222222-2222-2222-2222-222222222222",
                         "forbiddenRoleNames": ["Owner"],
+                        "forbiddenRoleDefinitionIds": [
+                            _TEST_ROLE_IDS["owner"],
+                        ],
                         "forbiddenScopePrefixes": [
                             f"/subscriptions/{_SUBSCRIPTION_ID}",
                         ],
@@ -2881,7 +3632,7 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
     safe_assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="AcrPull",
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+        scope=_RG_SCOPE,
     )
     omitted_owner = _guarded_assignment(
         principal_id=principal_id,
@@ -2928,7 +3679,7 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert json.loads(stderr.getvalue()) == {
-        "error": ("role-assignment evidence does not exactly match expectedAssignments"),
+        "error": ("derived effective assignments do not exactly match approvedAssignments"),
         "kind": "rbac",
         "safe": False,
     }
@@ -2943,10 +3694,7 @@ def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
     conditional_assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="Storage Blob Data Reader",
-        scope=(
-            f"{_RG_SCOPE}/providers/Microsoft.Storage/"
-            "storageAccounts/synthetic/blobServices/default/containers/evidence"
-        ),
+        scope=_RG_SCOPE,
         condition=condition,
         condition_version="2.0",
     )
@@ -3024,7 +3772,7 @@ def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert json.loads(stderr.getvalue()) == {
-        "error": ("role-assignment evidence does not exactly match expectedAssignments"),
+        "error": ("derived effective assignments do not exactly match approvedAssignments"),
         "kind": "rbac",
         "safe": False,
     }
@@ -3112,14 +3860,12 @@ def test_public_cli_requires_allowance_role_id_to_match_inventory(
         "Microsoft.Authorization/roleDefinitions/"
         "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     )
-    expected_assignment = _assignment(
+    expected_assignment = _guarded_assignment(
         principal_id=principal_id,
-        effective_principal_id=principal_id,
-        principal_type="ServicePrincipal",
         role_name="AcrPull",
-        role_id=expected_role_id,
-        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+        scope=_RG_SCOPE,
     )
+    expected_assignment["roleDefinitionId"] = expected_role_id
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
         json.dumps(
@@ -3135,14 +3881,10 @@ def test_public_cli_requires_allowance_role_id_to_match_inventory(
         expected_assignments=[expected_assignment],
     )
     policy["allowedBroadAssignments"] = [
-        _assignment(
-            principal_id=principal_id,
-            effective_principal_id=principal_id,
-            principal_type="ServicePrincipal",
-            role_name="AcrPull",
-            role_id=different_role_id,
-            scope=expected_assignment["scope"],
-        )
+        {
+            **expected_assignment,
+            "roleDefinitionId": different_role_id,
+        }
     ]
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
@@ -3165,7 +3907,7 @@ def test_public_cli_requires_allowance_role_id_to_match_inventory(
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
         "WC-029 preflight rbac failed: "
-        "allowedBroadAssignments must be listed in expectedAssignments\n"
+        "allowedBroadAssignments must be listed in approvedAssignments\n"
     )
 
 
