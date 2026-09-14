@@ -6,7 +6,7 @@ import math
 import re
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
@@ -35,9 +35,7 @@ _ROLE_ID_TO_NAME = {
     "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9": ("user access administrator"),
 }
 _BROAD_ROLE_IDS = frozenset(_ROLE_ID_TO_NAME)
-_ROLE_NAME_TO_ID = {
-    role_name: role_id for role_id, role_name in _ROLE_ID_TO_NAME.items()
-}
+_ROLE_NAME_TO_ID = {role_name: role_id for role_id, role_name in _ROLE_ID_TO_NAME.items()}
 _GUID_PATTERN = (
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}"
@@ -60,6 +58,23 @@ _STORAGE_CONTAINER_TYPE = "microsoft.storage/storageaccounts/blobservices/contai
 _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
+_RBAC_QUERY_KINDS = frozenset(
+    {
+        "subscription-ancestors",
+        "subscription-descendants",
+    }
+)
+_NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
+    {
+        "apiversion",
+        "etag",
+        "id",
+        "name",
+        "resourceid",
+        "systemdata",
+        "type",
+    }
+)
 
 
 class PreflightInputError(ValueError):
@@ -76,23 +91,46 @@ class PreflightViolation:
 @dataclass(frozen=True, slots=True)
 class BroadAssignmentAllowance:
     principal_id: str
+    effective_principal_id: str
+    principal_type: str
     role_name: str
     role_definition_id: str
     scope: str
     condition: str | None
     condition_version: str | None
     role_name_supplied: bool
+    effective_principal_id_supplied: bool = field(compare=False)
+    principal_type_supplied: bool = field(compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class RbacAssignment:
     principal_id: str
+    effective_principal_id: str
+    principal_type: str
     role_name: str
     role_definition_id: str
     scope: str
     condition: str | None
     condition_version: str | None
     role_name_supplied: bool
+    effective_principal_id_supplied: bool = field(compare=False)
+    principal_type_supplied: bool = field(compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RbacCollection:
+    effective_principal_ids: frozenset[str]
+    query_keys: frozenset[tuple[str, str]]
+    subscription_scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class RbacEvidenceItem:
+    value: object
+    effective_principal_id: str | None
+    query_key: tuple[str, str] | None
+    subscription_scope: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +196,7 @@ def _reject_json_constant(value: str) -> None:
 def _parse_json_integer(value: str) -> int:
     digits = value.removeprefix("-")
     if len(digits) > MAX_JSON_INTEGER_DIGITS:
-        raise PreflightInputError(
-            f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits"
-        )
+        raise PreflightInputError(f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits")
     try:
         return int(value)
     except ValueError as exc:
@@ -177,17 +213,11 @@ def _reject_ambiguous_object_pairs(
             raise PreflightInputError("JSON object contains a duplicate key")
         casefolded = key.casefold()
         if casefolded in casefolded_keys:
-            raise PreflightInputError(
-                "JSON object contains a case-insensitive key collision"
-            )
+            raise PreflightInputError("JSON object contains a case-insensitive key collision")
         if key.lower() != casefolded:
-            raise PreflightInputError(
-                "JSON object key has ambiguous Unicode case folding"
-            )
+            raise PreflightInputError("JSON object key has ambiguous Unicode case folding")
         if _contains_non_ascii_case_alias(key):
-            raise PreflightInputError(
-                "JSON object key contains a non-ASCII case alias"
-            )
+            raise PreflightInputError("JSON object key contains a non-ASCII case alias")
         result[key] = value
         casefolded_keys.add(casefolded)
     return result
@@ -200,11 +230,7 @@ def _canonical_role_key(value: str) -> str:
 
 def _contains_non_ascii_case_alias(value: str) -> bool:
     return any(
-        not character.isascii()
-        and (
-            character.lower().isascii()
-            or character.casefold().isascii()
-        )
+        not character.isascii() and (character.lower().isascii() or character.casefold().isascii())
         for character in value
     )
 
@@ -233,13 +259,9 @@ def _canonical_role_id(value: str) -> str:
 def _canonical_property_path(value: str) -> str:
     normalized = value.lower()
     if normalized != value.casefold():
-        raise PreflightInputError(
-            "property path has ambiguous Unicode case folding"
-        )
+        raise PreflightInputError("property path has ambiguous Unicode case folding")
     if _contains_non_ascii_case_alias(value):
-        raise PreflightInputError(
-            "property path contains a non-ASCII case alias"
-        )
+        raise PreflightInputError("property path contains a non-ASCII case alias")
     prefix = "<resource>."
     return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
 
@@ -257,10 +279,7 @@ def _canonical_scope(value: str) -> str:
         return canonical
     segments = canonical[1:].split("/")
     if any(
-        not segment
-        or segment in {".", ".."}
-        or segment != segment.strip()
-        for segment in segments
+        not segment or segment in {".", ".."} or segment != segment.strip() for segment in segments
     ):
         raise PreflightInputError("scope must be a canonical ARM scope")
     if segments[0] == "subscriptions":
@@ -299,11 +318,24 @@ def _canonical_scope(value: str) -> str:
 
 
 def _scope_contains(ancestor: str, descendant: str) -> bool:
-    return (
-        ancestor == "/"
-        or descendant == ancestor
-        or descendant.startswith(ancestor + "/")
-    )
+    return ancestor == "/" or descendant == ancestor or descendant.startswith(ancestor + "/")
+
+
+def _separation_scope_matches(
+    assignment_scope: str,
+    forbidden_scope_prefix: str,
+) -> bool:
+    if _scope_contains(
+        assignment_scope,
+        forbidden_scope_prefix,
+    ) or _scope_contains(
+        forbidden_scope_prefix,
+        assignment_scope,
+    ):
+        return True
+    return _MANAGEMENT_GROUP_SCOPE.fullmatch(
+        assignment_scope
+    ) is not None and forbidden_scope_prefix.startswith("/subscriptions/")
 
 
 def _allowance_matches(
@@ -312,6 +344,8 @@ def _allowance_matches(
 ) -> bool:
     return (
         allowance.principal_id == assignment.principal_id
+        and allowance.effective_principal_id == assignment.effective_principal_id
+        and (not allowance.principal_type or allowance.principal_type == assignment.principal_type)
         and allowance.role_name == assignment.role_name
         and allowance.scope == assignment.scope
         and allowance.condition == assignment.condition
@@ -388,25 +422,16 @@ def _validate_json_shape(value: object) -> None:
             raise PreflightInputError("JSON structure exceeds depth or node bounds")
         if isinstance(item, dict):
             if any(
-                type(key) is not str
-                or len(key) > 4096
-                or not key.isprintable()
-                for key in item
+                type(key) is not str or len(key) > 4096 or not key.isprintable() for key in item
             ):
                 raise PreflightInputError("JSON object keys are invalid")
             lowered_keys = [key.lower() for key in item]
             if any(key.lower() != key.casefold() for key in item):
-                raise PreflightInputError(
-                    "JSON object key has ambiguous Unicode case folding"
-                )
+                raise PreflightInputError("JSON object key has ambiguous Unicode case folding")
             if any(_contains_non_ascii_case_alias(key) for key in item):
-                raise PreflightInputError(
-                    "JSON object key contains a non-ASCII case alias"
-                )
+                raise PreflightInputError("JSON object key contains a non-ASCII case alias")
             if len(lowered_keys) != len(set(lowered_keys)):
-                raise PreflightInputError(
-                    "JSON object contains a case-insensitive key collision"
-                )
+                raise PreflightInputError("JSON object contains a case-insensitive key collision")
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             stack.extend((child, depth + 1) for child in item)
@@ -468,9 +493,7 @@ def _what_if_changes(
             root,
             "potentialChanges",
         ):
-            raise PreflightInputError(
-                "what-if document contains mixed result envelopes"
-            )
+            raise PreflightInputError("what-if document contains mixed result envelopes")
         container = _mapping(properties, field_name="properties")
     else:
         container = root
@@ -511,6 +534,66 @@ def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _property_child_path(parent: str, key: str) -> str:
+    escaped_key = key.replace("~", "~0").replace(".", "~1")
+    return f"{parent}.{escaped_key}"
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    return type(left) is type(right) and left == right
+
+
+def _derive_snapshot_delta(
+    before: object,
+    after: object,
+    *,
+    root: str = "<resource>",
+) -> list[tuple[str, object, str]]:
+    values: list[tuple[str, object, str]] = []
+    stack: list[tuple[object, object, str]] = [(before, after, root)]
+    while stack:
+        old_value, new_value, path = stack.pop()
+        if _json_values_equal(old_value, new_value):
+            continue
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            keys = sorted(set(old_value) | set(new_value))
+            for key in reversed(keys):
+                child_path = _property_child_path(path, key)
+                if key not in new_value:
+                    values.append((child_path, None, "delete"))
+                elif key not in old_value:
+                    child = new_value[key]
+                    values.append((child_path, child, "create"))
+                    if isinstance(child, (dict, list)):
+                        values.extend(
+                            _flatten_after(
+                                child,
+                                root=child_path,
+                            )
+                        )
+                else:
+                    stack.append(
+                        (
+                            old_value[key],
+                            new_value[key],
+                            child_path,
+                        )
+                    )
+            continue
+        values.append((path, new_value, "modify"))
+        if isinstance(new_value, (dict, list)):
+            values.extend(_flatten_after(new_value, root=path))
+    return values
+
+
+def _is_meaningful_delta_candidate(path: str, value: object) -> bool:
+    canonical = _canonical_property_path(path)
+    root = re.split(r"[.\[]", canonical, maxsplit=1)[0]
+    return root not in _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS and not (
+        canonical == "<resource>" and isinstance(value, (dict, list))
+    )
+
+
 def _walk_delta(
     items: list[dict[str, Any]],
 ) -> list[tuple[str, object, str]]:
@@ -548,10 +631,13 @@ def _walk_delta(
             "remove",
         }:
             raise PreflightInputError("delta propertyChangeType is unsupported")
+        before_supplied = _has_case_insensitive(item, "before")
+        after_supplied = _has_case_insensitive(item, "after")
+        before = _get_case_insensitive(item, "before")
         after = _get_case_insensitive(item, "after")
         if (
             property_change_type not in {"delete", "remove", "noeffect"}
-            and after is None
+            and not after_supplied
             and children is None
         ):
             raise PreflightInputError("delta item lacks inspectable after value or children")
@@ -566,10 +652,8 @@ def _walk_delta(
                 )
             ]
             if not child_items:
-                raise PreflightInputError(
-                    "delta item contains no inspectable children"
-                )
-        if property_change_type in {"delete", "remove"} or after is not None:
+                raise PreflightInputError("delta item contains no inspectable children")
+        if property_change_type in {"delete", "remove"}:
             values.append(
                 (
                     path,
@@ -577,11 +661,25 @@ def _walk_delta(
                     property_change_type,
                 )
             )
-        if (
-            property_change_type not in {"delete", "remove"}
-            and isinstance(after, (dict, list))
-        ):
-            values.extend(_flatten_after(after, root=path))
+        elif property_change_type != "noeffect" and after_supplied:
+            if before_supplied:
+                values.extend(
+                    _derive_snapshot_delta(
+                        before,
+                        after,
+                        root=path,
+                    )
+                )
+            else:
+                values.append(
+                    (
+                        path,
+                        after,
+                        property_change_type,
+                    )
+                )
+                if isinstance(after, (dict, list)):
+                    values.extend(_flatten_after(after, root=path))
         if child_items:
             stack.extend((child, path) for child in reversed(child_items))
     return values
@@ -600,7 +698,7 @@ def _flatten_after(
             stack.extend(
                 (
                     child,
-                    f"{path}.{key.replace('~', '~0').replace('.', '~1')}",
+                    _property_child_path(path, key),
                 )
                 for key, child in reversed(list(item.items()))
             )
@@ -627,9 +725,43 @@ def _unsafe_property_violations(
     )
     violations: list[PreflightViolation] = []
     delta = _delta_entries(change)
-    delta_candidates = _walk_delta(delta) if delta else []
-    candidates = list(delta_candidates)
+    declared_delta_candidates = _walk_delta(delta) if delta else []
+    before_payload_supplied = _has_case_insensitive(change, "before")
+    after_payload_supplied = _has_case_insensitive(change, "after")
+    before_payload = _get_case_insensitive(change, "before")
     after_payload = _get_case_insensitive(change, "after")
+    snapshot_delta_candidates: list[tuple[str, object, str]] = []
+    complete_snapshots = (
+        change_type == "modify" and before_payload_supplied and after_payload_supplied
+    )
+    if complete_snapshots:
+        if not isinstance(before_payload, dict) or not isinstance(
+            after_payload,
+            dict,
+        ):
+            raise PreflightInputError("Modify before and after snapshots must both be objects")
+        snapshot_delta_candidates = _derive_snapshot_delta(
+            before_payload,
+            after_payload,
+        )
+    effective_delta_candidates = (
+        snapshot_delta_candidates if complete_snapshots else declared_delta_candidates
+    )
+    if change_type == "modify" and not any(
+        _is_meaningful_delta_candidate(path, value) for path, value, _ in effective_delta_candidates
+    ):
+        violations.append(
+            PreflightViolation(
+                code="uninspectable-change",
+                subject=resource_id,
+                detail="Modify lacks a meaningful effective property delta",
+            )
+        )
+    delta_candidates = [
+        *declared_delta_candidates,
+        *snapshot_delta_candidates,
+    ]
+    candidates = list(delta_candidates)
     if isinstance(after_payload, (dict, list)):
         candidates.extend(_flatten_after(after_payload))
     if resource_type == _STORAGE_ACCOUNT_TYPE and change_type == "create":
@@ -675,16 +807,9 @@ def _unsafe_property_violations(
                 )
             )
     if resource_type == _CONTAINER_ENVIRONMENT_TYPE and change_type == "create":
-        values_by_path = {
-            _canonical_property_path(path): value
-            for path, value, _ in candidates
-        }
-        public_network = values_by_path.get(
-            "properties.publicnetworkaccess"
-        )
-        internal = values_by_path.get(
-            "properties.vnetconfiguration.internal"
-        )
+        values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
+        public_network = values_by_path.get("properties.publicnetworkaccess")
+        internal = values_by_path.get("properties.vnetconfiguration.internal")
         if (
             not isinstance(public_network, str)
             or _normalized(public_network) != "disabled"
@@ -721,18 +846,15 @@ def _unsafe_property_violations(
                 detail=("change lacks FullResourcePayloads or inspectable delta"),
             ),
         )
+
     def delta_touches(target: str) -> bool:
         return any(
-            (path := _canonical_property_path(raw_path)) == target
-            or target.startswith(path + ".")
+            (path := _canonical_property_path(raw_path)) == target or target.startswith(path + ".")
             for raw_path, _, _ in delta_candidates
         )
 
     def has_exact_evidence(target: str) -> bool:
-        return any(
-            _canonical_property_path(raw_path) == target
-            for raw_path, _, _ in candidates
-        )
+        return any(_canonical_property_path(raw_path) == target for raw_path, _, _ in candidates)
 
     def ancestor_removed(target: str) -> bool:
         return any(
@@ -790,8 +912,7 @@ def _unsafe_property_violations(
     if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
         network_acl_touched = any(
             (
-                (path := _canonical_property_path(raw_path))
-                == "properties.networkacls"
+                (path := _canonical_property_path(raw_path)) == "properties.networkacls"
                 or path.startswith("properties.networkacls.")
                 or "properties.networkacls".startswith(path + ".")
             )
@@ -800,8 +921,7 @@ def _unsafe_property_violations(
         if network_acl_touched:
             protected_parent_removed = any(
                 (
-                    (path := _canonical_property_path(raw_path))
-                    == "properties.networkacls"
+                    (path := _canonical_property_path(raw_path)) == "properties.networkacls"
                     or "properties.networkacls".startswith(path + ".")
                 )
                 and property_change_type in {"delete", "remove"}
@@ -835,9 +955,7 @@ def _unsafe_property_violations(
                 ]
                 complete_safe = complete_safe and bool(safe_values) and not unsafe_values
                 explicit_unsafe = explicit_unsafe or bool(unsafe_values)
-            if protected_parent_removed or (
-                not explicit_unsafe and not complete_safe
-            ):
+            if protected_parent_removed or (not explicit_unsafe and not complete_safe):
                 violations.append(
                     PreflightViolation(
                         code="public-data-plane-access",
@@ -893,9 +1011,7 @@ def _unsafe_property_violations(
             unsafe_container_network = removed
             if not removed and path == "properties.configuration.ingress.external":
                 if type(after) is not bool:
-                    raise PreflightInputError(
-                        "Container Apps ingress.external must be boolean"
-                    )
+                    raise PreflightInputError("Container Apps ingress.external must be boolean")
                 unsafe_container_network = after
             elif not removed and path == "properties.vnetconfiguration.internal":
                 if type(after) is not bool:
@@ -912,9 +1028,7 @@ def _unsafe_property_violations(
                     )
                 )
                 if public_network_access not in {"disabled", "enabled"}:
-                    raise PreflightInputError(
-                        "Container Apps publicNetworkAccess is unsupported"
-                    )
+                    raise PreflightInputError("Container Apps publicNetworkAccess is unsupported")
                 unsafe_container_network = public_network_access != "disabled"
             if unsafe_container_network:
                 violations.append(
@@ -924,14 +1038,9 @@ def _unsafe_property_violations(
                         detail=f"unsafe public Container Apps setting at {path}",
                     )
                 )
-        if (
-            resource_type == _STORAGE_ACCOUNT_TYPE
-            and path == "properties.allowsharedkeyaccess"
-        ):
+        if resource_type == _STORAGE_ACCOUNT_TYPE and path == "properties.allowsharedkeyaccess":
             if not removed and type(after) is not bool:
-                raise PreflightInputError(
-                    "allowSharedKeyAccess must be boolean"
-                )
+                raise PreflightInputError("allowSharedKeyAccess must be boolean")
             if removed or after is True:
                 violations.append(
                     PreflightViolation(
@@ -940,14 +1049,9 @@ def _unsafe_property_violations(
                         detail=f"shared-key access enabled at {path}",
                     )
                 )
-        if (
-            resource_type == _STORAGE_ACCOUNT_TYPE
-            and path == "properties.allowblobpublicaccess"
-        ):
+        if resource_type == _STORAGE_ACCOUNT_TYPE and path == "properties.allowblobpublicaccess":
             if not removed and type(after) is not bool:
-                raise PreflightInputError(
-                    "allowBlobPublicAccess must be boolean"
-                )
+                raise PreflightInputError("allowBlobPublicAccess must be boolean")
             if removed or after is True:
                 violations.append(
                     PreflightViolation(
@@ -956,14 +1060,10 @@ def _unsafe_property_violations(
                         detail=f"public blob access enabled at {path}",
                     )
                 )
-        if (
-            resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}
-            and path
-            in {
-                "properties.publicnetworkaccess",
-                "properties.networkacls.defaultaction",
-            }
-        ):
+        if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE} and path in {
+            "properties.publicnetworkaccess",
+            "properties.networkacls.defaultaction",
+        }:
             if removed:
                 unsafe_network_value = True
             else:
@@ -980,13 +1080,9 @@ def _unsafe_property_violations(
                     else {"allow", "deny"}
                 )
                 if value not in allowed_values:
-                    raise PreflightInputError(
-                        f"{path} has an unsupported value"
-                    )
+                    raise PreflightInputError(f"{path} has an unsupported value")
                 unsafe_network_value = value != (
-                    "disabled"
-                    if path == "properties.publicnetworkaccess"
-                    else "deny"
+                    "disabled" if path == "properties.publicnetworkaccess" else "deny"
                 )
             if unsafe_network_value:
                 violations.append(
@@ -996,10 +1092,7 @@ def _unsafe_property_violations(
                         detail=f"unsafe public data-plane setting at {path}",
                     )
                 )
-        if (
-            resource_type == _STORAGE_CONTAINER_TYPE
-            and path == "properties.publicaccess"
-        ):
+        if resource_type == _STORAGE_CONTAINER_TYPE and path == "properties.publicaccess":
             if removed:
                 public_access = ""
             else:
@@ -1011,9 +1104,7 @@ def _unsafe_property_violations(
                     )
                 )
                 if public_access not in {"none", "blob", "container"}:
-                    raise PreflightInputError(
-                        "publicAccess has an unsupported value"
-                    )
+                    raise PreflightInputError("publicAccess has an unsupported value")
             if removed or public_access != "none":
                 violations.append(
                     PreflightViolation(
@@ -1124,6 +1215,35 @@ def _parse_rbac_assignment(
             field_name="principalId",
         )
     )
+    raw_effective_principal_id = _get_case_insensitive(
+        assignment,
+        "effectivePrincipalId",
+    )
+    effective_principal_id = (
+        principal_id
+        if raw_effective_principal_id is None
+        else _normalized(
+            _require_string(
+                raw_effective_principal_id,
+                field_name="effectivePrincipalId",
+            )
+        )
+    )
+    raw_principal_type = _get_case_insensitive(
+        assignment,
+        "principalType",
+    )
+    if raw_principal_type is None:
+        principal_type = ""
+    else:
+        principal_type_value = _require_string(
+            raw_principal_type,
+            field_name="principalType",
+            maximum_length=64,
+        )
+        if not principal_type_value.isascii():
+            raise PreflightInputError("principalType must use ASCII")
+        principal_type = _normalized(principal_type_value)
     raw_role_name = _get_case_insensitive(
         assignment,
         "roleDefinitionName",
@@ -1159,18 +1279,13 @@ def _parse_rbac_assignment(
         and role_id
         and (
             (mapped_role_id is not None and role_name != mapped_role_id)
-            or (
-                expected_role_id is not None
-                and role_id != expected_role_id
-            )
+            or (expected_role_id is not None and role_id != expected_role_id)
         )
     ):
         raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
     canonical_role = role_name or mapped_role_id or role_id
     if not canonical_role:
-        raise PreflightInputError(
-            "role assignment requires roleDefinitionName or roleDefinitionId"
-        )
+        raise PreflightInputError("role assignment requires roleDefinitionName or roleDefinitionId")
     raw_condition = _get_case_insensitive(assignment, "condition")
     condition = (
         None
@@ -1194,11 +1309,11 @@ def _parse_rbac_assignment(
         )
     )
     if (condition is None) != (condition_version is None):
-        raise PreflightInputError(
-            "condition and conditionVersion must be supplied together"
-        )
+        raise PreflightInputError("condition and conditionVersion must be supplied together")
     return RbacAssignment(
         principal_id=principal_id,
+        effective_principal_id=effective_principal_id,
+        principal_type=principal_type,
         role_name=canonical_role,
         role_definition_id=role_id,
         scope=_canonical_scope(
@@ -1210,6 +1325,8 @@ def _parse_rbac_assignment(
         condition=condition,
         condition_version=condition_version,
         role_name_supplied=raw_role_name is not None,
+        effective_principal_id_supplied=raw_effective_principal_id is not None,
+        principal_type_supplied=raw_principal_type is not None,
     )
 
 
@@ -1240,17 +1357,19 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             )
             allowance = BroadAssignmentAllowance(
                 principal_id=parsed_allowance.principal_id,
+                effective_principal_id=(parsed_allowance.effective_principal_id),
+                principal_type=parsed_allowance.principal_type,
                 role_name=parsed_allowance.role_name,
                 role_definition_id=parsed_allowance.role_definition_id,
                 scope=parsed_allowance.scope,
                 condition=parsed_allowance.condition,
                 condition_version=parsed_allowance.condition_version,
                 role_name_supplied=parsed_allowance.role_name_supplied,
+                effective_principal_id_supplied=(parsed_allowance.effective_principal_id_supplied),
+                principal_type_supplied=(parsed_allowance.principal_type_supplied),
             )
             if allowance in allowances:
-                raise PreflightInputError(
-                    "allowedBroadAssignments contains a duplicate assignment"
-                )
+                raise PreflightInputError("allowedBroadAssignments contains a duplicate assignment")
             allowances.add(allowance)
     raw_rules = _get_case_insensitive(root, "separationRules")
     rules: list[SeparationRule] = []
@@ -1345,9 +1464,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 )
             )
             if principal_id in expected_principal_ids:
-                raise PreflightInputError(
-                    "expectedPrincipalIds contains a duplicate principalId"
-                )
+                raise PreflightInputError("expectedPrincipalIds contains a duplicate principalId")
             expected_principal_ids.add(principal_id)
     raw_expected_assignments = _get_case_insensitive(
         root,
@@ -1365,9 +1482,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 field_name="expected assignment",
             )
             if expected_assignment in expected_assignments:
-                raise PreflightInputError(
-                    "expectedAssignments contains a duplicate assignment"
-                )
+                raise PreflightInputError("expectedAssignments contains a duplicate assignment")
             expected_assignments.add(expected_assignment)
     return RbacPolicy(
         allowed_broad_assignments=frozenset(allowances),
@@ -1377,26 +1492,159 @@ def _parse_policy(document: object | None) -> RbacPolicy:
     )
 
 
-def _role_assignments(document: object) -> list[object]:
+def _validate_guarded_assignment_binding(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+    *,
+    field_name: str,
+) -> None:
+    if not assignment.effective_principal_id_supplied:
+        raise PreflightInputError(f"{field_name} requires effectivePrincipalId")
+    if not assignment.principal_type_supplied:
+        raise PreflightInputError(f"{field_name} requires principalType")
+    if assignment.principal_type not in {"group", "serviceprincipal"}:
+        raise PreflightInputError(f"{field_name} principalType must be Group or ServicePrincipal")
+    if (
+        assignment.principal_type == "group"
+        and assignment.principal_id == assignment.effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} group assignment requires a distinct effectivePrincipalId"
+        )
+    if (
+        assignment.principal_type == "serviceprincipal"
+        and assignment.principal_id != assignment.effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} ServicePrincipal assignment must target the same effectivePrincipalId"
+        )
+
+
+def _parse_rbac_query_kind(value: object) -> str:
+    query_kind = _require_string(
+        value,
+        field_name="queryKind",
+        maximum_length=64,
+    )
+    if not query_kind.isascii():
+        raise PreflightInputError("queryKind must use ASCII")
+    normalized = _normalized(query_kind)
+    if normalized not in _RBAC_QUERY_KINDS:
+        raise PreflightInputError("queryKind is unsupported")
+    return normalized
+
+
+def _role_assignments(
+    document: object,
+) -> tuple[list[RbacEvidenceItem], RbacCollection | None]:
     if isinstance(document, list):
-        return _sequence(
-            document,
-            field_name="role assignments",
-            maximum_items=MAX_ASSIGNMENTS,
+        return (
+            [
+                RbacEvidenceItem(
+                    value=assignment,
+                    effective_principal_id=None,
+                    query_key=None,
+                    subscription_scope=None,
+                )
+                for assignment in _sequence(
+                    document,
+                    field_name="role assignments",
+                    maximum_items=MAX_ASSIGNMENTS,
+                )
+            ],
+            None,
         )
     root = _mapping(document, field_name="role-assignment document")
     for key, value in root.items():
-        if (
-            key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
-            and value is not None
-        ):
+        if key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"} and value is not None:
             raise PreflightInputError(
                 "role-assignment evidence must not contain a continuation link"
             )
-    return _sequence(
-        _get_case_insensitive(root, "value"),
-        field_name="value",
-        maximum_items=MAX_ASSIGNMENTS,
+    raw_queries = _get_case_insensitive(root, "queries")
+    if raw_queries is None:
+        return (
+            [
+                RbacEvidenceItem(
+                    value=assignment,
+                    effective_principal_id=None,
+                    query_key=None,
+                    subscription_scope=None,
+                )
+                for assignment in _sequence(
+                    _get_case_insensitive(root, "value"),
+                    field_name="value",
+                    maximum_items=MAX_ASSIGNMENTS,
+                )
+            ],
+            None,
+        )
+    if _has_case_insensitive(root, "value"):
+        raise PreflightInputError("role-assignment evidence contains mixed result envelopes")
+    query_keys: set[tuple[str, str]] = set()
+    effective_principal_ids: set[str] = set()
+    subscription_scopes: set[str] = set()
+    evidence_items: list[RbacEvidenceItem] = []
+    for raw_query in _sequence(
+        raw_queries,
+        field_name="queries",
+        maximum_items=MAX_POLICY_ITEMS * len(_RBAC_QUERY_KINDS),
+    ):
+        query = _mapping(raw_query, field_name="role-assignment query")
+        for key, value in query.items():
+            if (
+                key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
+                and value is not None
+            ):
+                raise PreflightInputError(
+                    "role-assignment query must not contain a continuation link"
+                )
+        effective_principal_id = _normalized(
+            _require_string(
+                _get_case_insensitive(query, "effectivePrincipalId"),
+                field_name="query effectivePrincipalId",
+            )
+        )
+        query_kind = _parse_rbac_query_kind(_get_case_insensitive(query, "queryKind"))
+        subscription_scope = _canonical_scope(
+            _require_string(
+                _get_case_insensitive(query, "subscriptionScope"),
+                field_name="subscriptionScope",
+            )
+        )
+        if _SUBSCRIPTION_SCOPE.fullmatch(subscription_scope) is None:
+            raise PreflightInputError("subscriptionScope must be a subscription scope")
+        query_key = (effective_principal_id, query_kind)
+        if query_key in query_keys:
+            raise PreflightInputError("role-assignment evidence contains a duplicate query")
+        query_keys.add(query_key)
+        effective_principal_ids.add(effective_principal_id)
+        subscription_scopes.add(subscription_scope)
+        raw_assignments = _sequence(
+            _get_case_insensitive(query, "value"),
+            field_name="query value",
+            maximum_items=MAX_ASSIGNMENTS,
+        )
+        if len(evidence_items) + len(raw_assignments) > MAX_ASSIGNMENTS:
+            raise PreflightInputError(
+                f"role assignments must contain at most {MAX_ASSIGNMENTS} items"
+            )
+        evidence_items.extend(
+            RbacEvidenceItem(
+                value=assignment,
+                effective_principal_id=effective_principal_id,
+                query_key=query_key,
+                subscription_scope=subscription_scope,
+            )
+            for assignment in raw_assignments
+        )
+    if len(subscription_scopes) != 1:
+        raise PreflightInputError("role-assignment queries must use one subscriptionScope")
+    return (
+        evidence_items,
+        RbacCollection(
+            effective_principal_ids=frozenset(effective_principal_ids),
+            query_keys=frozenset(query_keys),
+            subscription_scope=next(iter(subscription_scopes)),
+        ),
     )
 
 
@@ -1409,73 +1657,57 @@ def evaluate_role_assignments(
     _validate_json_shape(document)
     policy = _parse_policy(policy_document)
     if require_separation_rules and not policy.separation_rules:
-        raise PreflightInputError(
-            "RBAC policy requires at least one separation rule"
-        )
+        raise PreflightInputError("RBAC policy requires at least one separation rule")
     if require_separation_rules and not policy.expected_principal_ids:
-        raise PreflightInputError(
-            "RBAC policy requires expectedPrincipalIds"
-        )
+        raise PreflightInputError("RBAC policy requires expectedPrincipalIds")
     if require_separation_rules and not policy.expected_assignments:
-        raise PreflightInputError(
-            "RBAC policy requires expectedAssignments"
-        )
+        raise PreflightInputError("RBAC policy requires expectedAssignments")
     if require_separation_rules and any(
-        not assignment.role_definition_id
-        for assignment in policy.expected_assignments
+        not assignment.role_definition_id for assignment in policy.expected_assignments
     ):
-        raise PreflightInputError(
-            "expectedAssignments require roleDefinitionId"
-        )
+        raise PreflightInputError("expectedAssignments require roleDefinitionId")
     if require_separation_rules and any(
-        not assignment.role_name_supplied
-        for assignment in policy.expected_assignments
+        not assignment.role_name_supplied for assignment in policy.expected_assignments
     ):
-        raise PreflightInputError(
-            "expectedAssignments require roleDefinitionName"
-        )
+        raise PreflightInputError("expectedAssignments require roleDefinitionName")
+    if require_separation_rules:
+        for assignment in policy.expected_assignments:
+            _validate_guarded_assignment_binding(
+                assignment,
+                field_name="expectedAssignments",
+            )
     if require_separation_rules and any(
-        not allowance.role_definition_id
-        for allowance in policy.allowed_broad_assignments
+        not allowance.role_definition_id for allowance in policy.allowed_broad_assignments
     ):
-        raise PreflightInputError(
-            "allowedBroadAssignments require roleDefinitionId"
-        )
+        raise PreflightInputError("allowedBroadAssignments require roleDefinitionId")
     if require_separation_rules and any(
-        not allowance.role_name_supplied
-        for allowance in policy.allowed_broad_assignments
+        not allowance.role_name_supplied for allowance in policy.allowed_broad_assignments
     ):
-        raise PreflightInputError(
-            "allowedBroadAssignments require roleDefinitionName"
-        )
-    rule_principal_ids = frozenset(
-        rule.principal_id for rule in policy.separation_rules
-    )
-    if (
-        require_separation_rules
-        and rule_principal_ids != policy.expected_principal_ids
-    ):
+        raise PreflightInputError("allowedBroadAssignments require roleDefinitionName")
+    if require_separation_rules:
+        for allowance in policy.allowed_broad_assignments:
+            _validate_guarded_assignment_binding(
+                allowance,
+                field_name="allowedBroadAssignments",
+            )
+    rule_principal_ids = frozenset(rule.principal_id for rule in policy.separation_rules)
+    if require_separation_rules and rule_principal_ids != policy.expected_principal_ids:
         raise PreflightInputError(
             "separationRules principals must exactly match expectedPrincipalIds"
         )
     if require_separation_rules and any(
         not rule.forbidden_role_ids for rule in policy.separation_rules
     ):
-        raise PreflightInputError(
-            "separation rule requires forbiddenRoleDefinitionIds"
-        )
+        raise PreflightInputError("separation rule requires forbiddenRoleDefinitionIds")
     allowance_principal_ids = frozenset(
-        allowance.principal_id for allowance in policy.allowed_broad_assignments
+        allowance.effective_principal_id for allowance in policy.allowed_broad_assignments
     )
-    if (
-        require_separation_rules
-        and not allowance_principal_ids.issubset(policy.expected_principal_ids)
+    if require_separation_rules and not allowance_principal_ids.issubset(
+        policy.expected_principal_ids
     ):
-        raise PreflightInputError(
-            "RBAC policy principals must be listed in expectedPrincipalIds"
-        )
+        raise PreflightInputError("RBAC policy principals must be listed in expectedPrincipalIds")
     expected_assignment_principal_ids = frozenset(
-        assignment.principal_id for assignment in policy.expected_assignments
+        assignment.effective_principal_id for assignment in policy.expected_assignments
     )
     if (
         require_separation_rules
@@ -1487,85 +1719,149 @@ def evaluate_role_assignments(
     expected_allowances = frozenset(
         BroadAssignmentAllowance(
             principal_id=assignment.principal_id,
+            effective_principal_id=assignment.effective_principal_id,
+            principal_type=assignment.principal_type,
             role_name=assignment.role_name,
             role_definition_id=assignment.role_definition_id,
             scope=assignment.scope,
             condition=assignment.condition,
             condition_version=assignment.condition_version,
             role_name_supplied=assignment.role_name_supplied,
+            effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
+            principal_type_supplied=assignment.principal_type_supplied,
         )
         for assignment in policy.expected_assignments
     )
+    if require_separation_rules and not all(
+        any(_allowance_matches(allowance, expected) for expected in expected_allowances)
+        for allowance in policy.allowed_broad_assignments
+    ):
+        raise PreflightInputError("allowedBroadAssignments must be listed in expectedAssignments")
+    raw_assignments, collection = _role_assignments(document)
+    if require_separation_rules and collection is None:
+        raise PreflightInputError("role-assignment evidence requires per-identity query results")
     if (
         require_separation_rules
-        and not all(
-            any(
-                _allowance_matches(allowance, expected)
-                for expected in expected_allowances
-            )
-            for allowance in policy.allowed_broad_assignments
-        )
+        and collection is not None
+        and collection.effective_principal_ids != policy.expected_principal_ids
     ):
         raise PreflightInputError(
-            "allowedBroadAssignments must be listed in expectedAssignments"
+            "query effectivePrincipalIds must exactly match expectedPrincipalIds"
         )
-    raw_assignments = _role_assignments(document)
+    required_query_keys = frozenset(
+        (principal_id, query_kind)
+        for principal_id in policy.expected_principal_ids
+        for query_kind in _RBAC_QUERY_KINDS
+    )
+    if (
+        require_separation_rules
+        and collection is not None
+        and collection.query_keys != required_query_keys
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence requires one ancestor and one "
+            "descendant query for every expectedPrincipalId"
+        )
+    if (
+        require_separation_rules
+        and collection is not None
+        and any(
+            assignment.scope != "/"
+            and _MANAGEMENT_GROUP_SCOPE.fullmatch(assignment.scope) is None
+            and not _scope_contains(
+                collection.subscription_scope,
+                assignment.scope,
+            )
+            for assignment in policy.expected_assignments
+        )
+    ):
+        raise PreflightInputError("expectedAssignments scope is outside query subscriptionScope")
     if require_separation_rules and not raw_assignments:
         raise PreflightInputError("role-assignment evidence must not be empty")
     assignments: list[RbacAssignment] = []
     unique_assignments: set[RbacAssignment] = set()
+    assignments_by_query: dict[
+        tuple[str, str] | None,
+        set[RbacAssignment],
+    ] = {}
     assignment_principal_ids: set[str] = set()
-    for raw_assignment in raw_assignments:
+    for evidence_item in raw_assignments:
         assignment = _parse_rbac_assignment(
-            raw_assignment,
+            evidence_item.value,
             field_name="role assignment",
         )
-        if assignment in unique_assignments:
+        if (
+            evidence_item.effective_principal_id is not None
+            and assignment.effective_principal_id != evidence_item.effective_principal_id
+        ):
             raise PreflightInputError(
-                "role-assignment evidence contains a duplicate assignment"
+                "role assignment effectivePrincipalId does not match its query"
             )
-        assignments.append(assignment)
-        unique_assignments.add(assignment)
-        assignment_principal_ids.add(assignment.principal_id)
+        if evidence_item.query_key is not None and evidence_item.subscription_scope is not None:
+            query_kind = evidence_item.query_key[1]
+            if query_kind == "subscription-descendants" and not _scope_contains(
+                evidence_item.subscription_scope,
+                assignment.scope,
+            ):
+                raise PreflightInputError(
+                    "descendant query contains an assignment outside its subscriptionScope"
+                )
+            if query_kind == "subscription-ancestors" and not (
+                assignment.scope in {"/", evidence_item.subscription_scope}
+                or _MANAGEMENT_GROUP_SCOPE.fullmatch(assignment.scope) is not None
+            ):
+                raise PreflightInputError("ancestor query contains a descendant assignment")
+        query_assignments = assignments_by_query.setdefault(
+            evidence_item.query_key,
+            set(),
+        )
+        if assignment in query_assignments:
+            raise PreflightInputError("role-assignment query contains a duplicate assignment")
+        query_assignments.add(assignment)
+        if assignment not in unique_assignments:
+            assignments.append(assignment)
+            unique_assignments.add(assignment)
+        assignment_principal_ids.add(assignment.effective_principal_id)
     if require_separation_rules and any(
         not assignment.role_definition_id for assignment in assignments
     ):
-        raise PreflightInputError(
-            "role-assignment evidence requires roleDefinitionId"
-        )
+        raise PreflightInputError("role-assignment evidence requires roleDefinitionId")
     if require_separation_rules and any(
         not assignment.role_name_supplied for assignment in assignments
     ):
-        raise PreflightInputError(
-            "role-assignment evidence requires roleDefinitionName"
-        )
-    if (
-        require_separation_rules
-        and not assignment_principal_ids.issubset(policy.expected_principal_ids)
+        raise PreflightInputError("role-assignment evidence requires roleDefinitionName")
+    if require_separation_rules:
+        for assignment in assignments:
+            _validate_guarded_assignment_binding(
+                assignment,
+                field_name="role-assignment evidence",
+            )
+    if require_separation_rules and not assignment_principal_ids.issubset(
+        policy.expected_principal_ids
     ):
         raise PreflightInputError(
             "role assignment principal is not covered by expectedPrincipalIds"
         )
-    if (
-        require_separation_rules
-        and assignment_principal_ids != policy.expected_principal_ids
-    ):
+    if require_separation_rules and assignment_principal_ids != policy.expected_principal_ids:
         raise PreflightInputError(
             "role-assignment evidence does not cover every expectedPrincipalId"
         )
-    if (
-        require_separation_rules
-        and unique_assignments != policy.expected_assignments
-    ):
+    if require_separation_rules and unique_assignments != policy.expected_assignments:
         raise PreflightInputError(
             "role-assignment evidence does not exactly match expectedAssignments"
         )
     violations: list[PreflightViolation] = []
     for assignment in assignments:
-        principal_id = assignment.principal_id
+        assignment_principal_id = assignment.principal_id
+        effective_principal_id = assignment.effective_principal_id
         canonical_role = assignment.role_name
         role_id = assignment.role_definition_id
         scope = assignment.scope
+        access_path = (
+            f"{canonical_role} via group {assignment_principal_id}"
+            if assignment.principal_type == "group"
+            else canonical_role
+        )
         broad_scope = (
             scope == "/"
             or _SUBSCRIPTION_SCOPE.fullmatch(scope) is not None
@@ -1576,13 +1872,17 @@ def evaluate_role_assignments(
             _allowance_matches(
                 allowance,
                 BroadAssignmentAllowance(
-                    principal_id=principal_id,
+                    principal_id=assignment_principal_id,
+                    effective_principal_id=effective_principal_id,
+                    principal_type=assignment.principal_type,
                     role_name=canonical_role,
                     role_definition_id=role_id,
                     scope=scope,
                     condition=assignment.condition,
                     condition_version=assignment.condition_version,
                     role_name_supplied=assignment.role_name_supplied,
+                    effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
+                    principal_type_supplied=(assignment.principal_type_supplied),
                 ),
             )
             for allowance in policy.allowed_broad_assignments
@@ -1595,27 +1895,27 @@ def evaluate_role_assignments(
             violations.append(
                 PreflightViolation(
                     code="broad-role-assignment",
-                    subject=principal_id,
-                    detail=(f"{canonical_role} at broad scope {scope}"),
+                    subject=effective_principal_id,
+                    detail=(f"{access_path} at broad scope {scope}"),
                 )
             )
         for rule in policy.separation_rules:
             if (
-                principal_id == rule.principal_id
+                effective_principal_id == rule.principal_id
                 and (
                     canonical_role in rule.forbidden_role_names
                     or role_id in rule.forbidden_role_ids
                 )
                 and any(
-                    _scope_contains(scope, prefix) or _scope_contains(prefix, scope)
+                    _separation_scope_matches(scope, prefix)
                     for prefix in rule.forbidden_scope_prefixes
                 )
             ):
                 violations.append(
                     PreflightViolation(
                         code="identity-separation",
-                        subject=principal_id,
-                        detail=(f"{canonical_role} is forbidden at scope {scope}"),
+                        subject=effective_principal_id,
+                        detail=(f"{access_path} is forbidden at scope {scope}"),
                     )
                 )
     return tuple(violations)
@@ -1630,15 +1930,18 @@ def render_preflight_json(
         violations,
         key=lambda item: (item.code, item.subject.casefold(), item.detail),
     )
-    return json.dumps(
-        {
-            "kind": kind,
-            "safe": not ordered_violations,
-            "violations": [asdict(item) for item in ordered_violations],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "\n"
+    return (
+        json.dumps(
+            {
+                "kind": kind,
+                "safe": not ordered_violations,
+                "violations": [asdict(item) for item in ordered_violations],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
 
 
 def render_preflight_text(
@@ -1718,9 +2021,7 @@ def run_preflight_check(
                 + "\n"
             )
         elif output_format == "text":
-            stderr.write(
-                f"WC-029 preflight {kind} failed: {_escaped_text(str(exc))}\n"
-            )
+            stderr.write(f"WC-029 preflight {kind} failed: {_escaped_text(str(exc))}\n")
         else:
             raise ValueError(f"unsupported output format: {output_format}") from None
         return 3
@@ -1775,9 +2076,7 @@ def main(
     return run_preflight_check(
         kind=args.command,
         input_path=args.input,
-        allowed_change_ids=frozenset(
-            args.allow_change if args.command == "what-if" else ()
-        ),
+        allowed_change_ids=frozenset(args.allow_change if args.command == "what-if" else ()),
         policy_path=args.policy if args.command == "rbac" else None,
         output_format=args.format,
         stdout=output,

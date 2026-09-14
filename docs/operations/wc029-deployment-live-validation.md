@@ -176,10 +176,10 @@ The gate fails on:
   or role assignments that are absent from the reviewed change set;
 - public Container Apps ingress or public data-plane access;
 - Storage shared-key access being enabled;
-- broad `Owner`, `Contributor`, or `User Access Administrator` assignment at subscription or
-  resource-group scope;
-- `Reader` at subscription/resource-group scope except the exact approved evidence identity on
-  `rg-athena-demo-workload`; or
+- broad `Owner`, `Contributor`, or `User Access Administrator` assignment at subscription,
+  resource-group, or management-group scope;
+- `Reader` at subscription/resource-group/management-group scope except the exact approved evidence
+  identity assignment; management-group roles still undergo descendant separation checks; or
 - overlap between context, evidence, presentation, collector, publication, and notification
   identities.
 
@@ -188,28 +188,104 @@ allowlist and rerun the gate.
 
 ## Phase 3: effective RBAC
 
-Record inherited and direct assignments for every managed identity:
+Record direct, descendant, inherited, and group-derived assignments for every managed identity.
+The `--all` query covers assignments under the subscription; the scoped `--include-inherited`
+query adds subscription, management-group, and root ancestors. Both queries use `--include-groups`.
+Keep the two raw query results separately attributable to the managed identity whose effective
+access was queried. The verifier derives and deduplicates their union:
 
 ```powershell
-az role assignment list `
-  --subscription $SubscriptionId `
-  --assignee-object-id '<principal-id>' `
-  --include-inherited `
-  --all `
-  --output json
+$EffectivePrincipalIds = @(
+  '<context-principal-id>',
+  '<evidence-principal-id>',
+  '<presentation-principal-id>',
+  '<collector-principal-id>',
+  '<publication-principal-id>',
+  '<notification-principal-id>'
+)
+
+$RoleAssignmentQueries = @()
+foreach ($EffectivePrincipalId in $EffectivePrincipalIds) {
+  $DescendantJson = & az role assignment list `
+    --subscription $SubscriptionId `
+    --assignee-object-id $EffectivePrincipalId `
+    --include-groups `
+    --all `
+    --fill-principal-name false `
+    --fill-role-definition-name true `
+    --output json
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to collect descendant RBAC for $EffectivePrincipalId"
+  }
+  $DescendantAssignments = @($DescendantJson | ConvertFrom-Json)
+  foreach ($Assignment in $DescendantAssignments) {
+    $Assignment | Add-Member `
+      -NotePropertyName effectivePrincipalId `
+      -NotePropertyValue $EffectivePrincipalId `
+      -Force
+  }
+  $RoleAssignmentQueries += [ordered]@{
+    effectivePrincipalId = $EffectivePrincipalId
+    queryKind = 'subscription-descendants'
+    subscriptionScope = "/subscriptions/$SubscriptionId"
+    value = @($DescendantAssignments)
+  }
+
+  $AncestorJson = & az role assignment list `
+    --subscription $SubscriptionId `
+    --assignee-object-id $EffectivePrincipalId `
+    --include-groups `
+    --include-inherited `
+    --scope "/subscriptions/$SubscriptionId" `
+    --fill-principal-name false `
+    --fill-role-definition-name true `
+    --output json
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to collect ancestor RBAC for $EffectivePrincipalId"
+  }
+  $AncestorAssignments = @($AncestorJson | ConvertFrom-Json)
+  foreach ($Assignment in $AncestorAssignments) {
+    $Assignment | Add-Member `
+      -NotePropertyName effectivePrincipalId `
+      -NotePropertyValue $EffectivePrincipalId `
+      -Force
+  }
+  $RoleAssignmentQueries += [ordered]@{
+    effectivePrincipalId = $EffectivePrincipalId
+    queryKind = 'subscription-ancestors'
+    subscriptionScope = "/subscriptions/$SubscriptionId"
+    value = @($AncestorAssignments)
+  }
+}
+
+$RoleAssignmentEvidence = [ordered]@{
+  queries = @($RoleAssignmentQueries)
+}
+$RoleAssignmentEvidence |
+  ConvertTo-Json -Depth 20 |
+  Set-Content -Encoding utf8 .\evidence\role-assignments.json
 ```
 
-After collecting all reviewed assignments into the bounded
-`.\evidence\role-assignments.json` array, list every queried identity in the reviewed policy's
-non-empty `expectedPrincipalIds` array, copy the complete reviewed assignment tuples into
-`expectedAssignments`, and provide one non-vacuous separation rule for each principal. The evidence,
-expected assignment inventory, expected-principal list, and policy principals must match exactly;
-an empty, partial, or changed assignment export fails closed. Use `--all` as shown and do not combine
-paginated API pages manually; object-form evidence with a continuation link is rejected as
-incomplete. Preserve `condition` and `conditionVersion` in both the evidence and reviewed inventory;
-removing or changing an authorization condition fails closed. Preserve each canonical
-`roleDefinitionId` in the reviewed inventory and any allowance; production mode rejects name-only
-or ID-only entries and conflicting built-in role pairs. Run the offline RBAC gate with that reviewed
+Only after both queries succeed for every identity may the reviewed inventory seed
+`expectedAssignments`. The verifier requires exactly one `subscription-descendants` and one
+`subscription-ancestors` result for every policy `expectedPrincipalId`, requires every query to use
+the same canonical subscription scope, validates each result against its declared query direction,
+and derives the deduplicated effective-assignment union before comparing it with
+`expectedAssignments`. A flat inventory or a summary that merely asserts completeness is rejected.
+
+Each direct row must retain `principalType: ServicePrincipal` and use the same `principalId` and
+`effectivePrincipalId`. Each group-derived row must retain `principalType: Group`, the group object
+ID in `principalId`, and the receiving managed identity in `effectivePrincipalId`. Copy every unique
+normalized tuple from the complete two-query union into `expectedAssignments` and provide one
+non-vacuous separation rule for each effective principal. The evidence, expected assignment
+inventory, query principals, expected-principal list, and policy principals must match exactly; an
+empty, partial, or changed query set or assignment export fails closed.
+
+Do not combine paginated API pages manually; object-form evidence with a continuation link is
+rejected as incomplete. Preserve `condition` and `conditionVersion` in both the evidence and reviewed
+inventory; removing or changing an authorization condition fails closed. Preserve each canonical
+`roleDefinitionId` in the reviewed inventory and any allowance; production mode rejects name-only or
+ID-only entries and conflicting built-in role pairs. Run the offline RBAC gate with that reviewed
 policy. Each separation rule must include the reviewed IDs in
 `forbiddenRoleDefinitionIds` as well as their display names:
 

@@ -31,6 +31,12 @@ Documents that mix root-level and `properties` result envelopes are rejected rat
 one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
 names cannot impersonate structurally nested protected settings. Unicode characters whose case fold
 or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths.
+Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
+missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
+and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
+both complete resource `before` and `after` snapshots are present, the verifier derives the actual
+changed leaves, ignores unchanged metadata, and applies the same protected-property checks to that
+derived delta.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
@@ -65,11 +71,62 @@ athena-context wc029-preflight rbac .\evidence\role-assignments.json `
 The production wrapper requires `--policy`, a non-empty `expectedPrincipalIds` array, an exact
 reviewed `expectedAssignments` inventory, and one non-vacuous `separationRules` entry for every
 expected principal. Every rule must name at least one forbidden role and one forbidden scope prefix.
-The saved role-assignment evidence must be non-empty and must match the normalized expected
-assignment inventory exactly; policy entries or assignments for an unexpected principal fail
-closed. This prevents a partial export or an unrelated syntactically valid rule from producing a
-safe result. The legacy module entry point keeps its historical optional-policy behavior for
-compatibility and must not be used as the guarded deployment gate without a reviewed policy.
+The saved role-assignment evidence must be a non-empty object containing independently attributable
+query results. For every expected managed identity, it must contain exactly one
+`subscription-descendants` query collected with `--all --include-groups` and one
+`subscription-ancestors` query collected with subscription scope,
+`--include-inherited --include-groups`. Every query carries the same canonical
+`subscriptionScope`. A flat assignment list or caller-asserted completeness flags are not accepted
+by the production gate.
+
+Every assignment carries both the Azure role-assignment principal and the managed identity receiving
+effective access. `principalId` is the principal on the role assignment, `principalType` is
+`ServicePrincipal` or `Group`, and `effectivePrincipalId` is the reviewed managed identity. Direct
+managed-identity assignments use the same value for both IDs. Group-derived assignments use the
+group object ID as `principalId` and the managed-identity object ID as `effectivePrincipalId`.
+Evidence, `expectedAssignments`, and `allowedBroadAssignments` retain this association exactly.
+
+For example, guarded evidence has this shape:
+
+```json
+{
+  "queries": [
+    {
+      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
+      "queryKind": "subscription-descendants",
+      "subscriptionScope": "/subscriptions/00000000-0000-0000-0000-000000000000",
+      "value": [
+        {
+          "principalId": "00000000-0000-0000-0000-000000000010",
+          "principalType": "Group",
+          "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
+          "roleDefinitionName": "Log Analytics Reader",
+          "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/73c42c96-874c-492b-b04d-ab87d138a893",
+          "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
+        }
+      ]
+    },
+    {
+      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
+      "queryKind": "subscription-ancestors",
+      "subscriptionScope": "/subscriptions/00000000-0000-0000-0000-000000000000",
+      "value": []
+    }
+  ]
+}
+```
+
+Generate this envelope with the dual-query collection procedure in
+`docs/operations/wc029-deployment-live-validation.md`; preserve each raw query result separately
+rather than flattening it before verification. The verifier validates query coverage and scope,
+derives and deduplicates their effective-assignment union, and only then compares that union with
+`expectedAssignments`.
+
+The normalized evidence inventory must match `expectedAssignments` exactly; policy entries,
+assignments for an unexpected effective principal, or a group assignment without its receiving
+identity fail closed. The legacy module entry point keeps its historical optional-policy and
+list-input behavior for compatibility and must not be used as the guarded deployment gate without a
+reviewed policy.
 
 The policy is bounded JSON:
 
@@ -82,12 +139,16 @@ The policy is bounded JSON:
   "expectedAssignments": [
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
+      "principalType": "ServicePrincipal",
+      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
     },
     {
       "principalId": "00000000-0000-0000-0000-000000000002",
+      "principalType": "ServicePrincipal",
+      "effectivePrincipalId": "00000000-0000-0000-0000-000000000002",
       "roleDefinitionName": "Storage Blob Data Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Storage/storageAccounts/athena/blobServices/default/containers/evidence",
@@ -98,6 +159,8 @@ The policy is bounded JSON:
   "allowedBroadAssignments": [
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
+      "principalType": "ServicePrincipal",
+      "effectivePrincipalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
@@ -134,7 +197,10 @@ Broad `Owner`, `Contributor`, `Reader`, and `User Access Administrator` assignme
 resource-group, or management-group scope fail unless the exact principal, role, and scope tuple is
 reviewed in `allowedBroadAssignments`. `Role Based Access Control Administrator` is also treated as
 privileged. The verifier recognizes the official built-in role definition IDs as well as display
-names. Separation rules remain enforced independently.
+names. Separation rules remain enforced independently. Because a subscription-scoped export does
+not carry a reviewed management-group lineage graph, an inherited management-group assignment is
+conservatively treated as an ancestor of every subscription-scoped forbidden prefix for that
+effective identity.
 
 JSON object keys must be unique and cannot collide under case folding. Scope values are normalized
 without trailing slashes and structurally validated before allowance, broad-scope, and separation
@@ -145,6 +211,8 @@ supply both a role name and role ID must agree and must be present in `expectedA
 Authorization-affecting `condition` and `conditionVersion` fields must be supplied together and are
 included in exact inventory and allowance matching. Production evidence, expected assignments, and
 broad-assignment allowances require both `roleDefinitionName` and a canonical `roleDefinitionId`.
+They also require `principalType` and `effectivePrincipalId`; a `Group` row must name a distinct
+receiving identity, while a `ServicePrincipal` row must bind directly to the same identity.
 Recognized built-in role names must agree with their official IDs; name-only, ID-only, or spoofed-ID
 entries fail closed. Every production separation rule also requires reviewed
 `forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a

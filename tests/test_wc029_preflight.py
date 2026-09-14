@@ -39,16 +39,14 @@ _KEY_VAULT_ID = (
 _STORAGE_CONTAINER_ID = f"{_STORAGE_ID}/blobServices/default/containers/evidence"
 _KEY_VAULT_KEY_ID = f"{_KEY_VAULT_ID}/keys/report-signing"
 _ROLE_DEFINITION_PREFIX = (
-    f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
-    "Microsoft.Authorization/roleDefinitions/"
+    f"/subscriptions/{_SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/"
 )
 _TEST_ROLE_IDS = {
     "owner": _ROLE_DEFINITION_PREFIX + "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
     "reader": _ROLE_DEFINITION_PREFIX + "acdd72a7-3385-48ef-bd42-f606fba81ae7",
     "acrpull": _ROLE_DEFINITION_PREFIX + "7f951dda-4ed3-4680-a7ca-43fe172d538d",
-    "storage blob data reader": (
-        _ROLE_DEFINITION_PREFIX + "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
-    ),
+    "log analytics reader": (_ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"),
+    "storage blob data reader": (_ROLE_DEFINITION_PREFIX + "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"),
 }
 
 
@@ -84,6 +82,8 @@ def _change(
 def _assignment(
     *,
     principal_id: str = "11111111-1111-1111-1111-111111111111",
+    effective_principal_id: str | None = None,
+    principal_type: str | None = None,
     role_name: str | None = "Reader",
     role_id: str | None = None,
     scope: str = _RG_SCOPE,
@@ -94,6 +94,10 @@ def _assignment(
         "principalId": principal_id,
         "scope": scope,
     }
+    if effective_principal_id is not None:
+        value["effectivePrincipalId"] = effective_principal_id
+    if principal_type is not None:
+        value["principalType"] = principal_type
     if role_name is not None:
         value["roleDefinitionName"] = role_name
     if role_id is not None:
@@ -108,6 +112,8 @@ def _assignment(
 def _guarded_assignment(
     *,
     principal_id: str = "11111111-1111-1111-1111-111111111111",
+    effective_principal_id: str | None = None,
+    principal_type: str = "ServicePrincipal",
     role_name: str = "Reader",
     scope: str = _RG_SCOPE,
     condition: str | None = None,
@@ -115,12 +121,92 @@ def _guarded_assignment(
 ) -> dict[str, str]:
     return _assignment(
         principal_id=principal_id,
+        effective_principal_id=(
+            principal_id if effective_principal_id is None else effective_principal_id
+        ),
+        principal_type=principal_type,
         role_name=role_name,
         role_id=_TEST_ROLE_IDS[role_name.casefold()],
         scope=scope,
         condition=condition,
         condition_version=condition_version,
     )
+
+
+def _guarded_evidence(
+    assignments: list[dict[str, str]],
+    *,
+    effective_principal_ids: list[str] | None = None,
+    query_kinds: tuple[str, ...] = (
+        "subscription-descendants",
+        "subscription-ancestors",
+    ),
+) -> dict[str, object]:
+    assignment_principal_ids = list(
+        dict.fromkeys(
+            assignment.get(
+                "effectivePrincipalId",
+                assignment["principalId"],
+            )
+            for assignment in assignments
+        )
+    )
+    if effective_principal_ids is None:
+        effective_principal_ids = assignment_principal_ids
+    else:
+        effective_principal_ids = [
+            *effective_principal_ids,
+            *(
+                principal_id
+                for principal_id in assignment_principal_ids
+                if principal_id not in effective_principal_ids
+            ),
+        ]
+    subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"
+    queries: list[dict[str, object]] = []
+    for effective_principal_id in effective_principal_ids:
+        identity_assignments = [
+            assignment
+            for assignment in assignments
+            if assignment.get(
+                "effectivePrincipalId",
+                assignment["principalId"],
+            )
+            == effective_principal_id
+        ]
+        for query_kind in query_kinds:
+            if query_kind == "subscription-descendants":
+                query_assignments = [
+                    assignment
+                    for assignment in identity_assignments
+                    if assignment["scope"].casefold() == subscription_scope.casefold()
+                    or assignment["scope"]
+                    .casefold()
+                    .startswith(subscription_scope.casefold() + "/")
+                ]
+            elif query_kind == "subscription-ancestors":
+                query_assignments = [
+                    assignment
+                    for assignment in identity_assignments
+                    if assignment["scope"] == "/"
+                    or assignment["scope"].casefold() == subscription_scope.casefold()
+                    or assignment["scope"]
+                    .casefold()
+                    .startswith("/providers/microsoft.management/managementgroups/")
+                ]
+            else:
+                query_assignments = []
+            queries.append(
+                {
+                    "effectivePrincipalId": effective_principal_id,
+                    "queryKind": query_kind,
+                    "subscriptionScope": subscription_scope,
+                    "value": query_assignments,
+                }
+            )
+    return {
+        "queries": queries,
+    }
 
 
 def _production_policy(
@@ -132,10 +218,7 @@ def _production_policy(
         "expectedAssignments": (
             expected_assignments
             if expected_assignments is not None
-            else [
-                _guarded_assignment(principal_id=principal_id)
-                for principal_id in principal_ids
-            ]
+            else [_guarded_assignment(principal_id=principal_id) for principal_id in principal_ids]
         ),
         "separationRules": [
             {
@@ -754,6 +837,146 @@ def test_what_if_rejects_resource_id_only_and_nested_unsafe_delta() -> None:
             malformed,
             allowed_change_ids=frozenset({_STORAGE_ID}),
         )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "after": {
+                "id": _CONTAINER_APP_ID,
+                "name": "athena-presentation",
+                "type": "Microsoft.App/containerApps",
+            },
+        },
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [],
+            "after": {
+                "properties": {
+                    "template": {"revisionSuffix": "synthetic"},
+                }
+            },
+        },
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "<resource>",
+                    "propertyChangeType": "Modify",
+                    "after": {
+                        "id": _CONTAINER_APP_ID,
+                        "name": "athena-presentation",
+                        "type": "Microsoft.App/containerApps",
+                    },
+                }
+            ],
+        },
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties.template.revisionSuffix",
+                    "propertyChangeType": "NoEffect",
+                    "before": "same",
+                    "after": "different",
+                }
+            ],
+        },
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties.template.revisionSuffix",
+                    "propertyChangeType": "Modify",
+                    "before": "same",
+                    "after": "same",
+                }
+            ],
+        },
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "before": {
+                "id": _CONTAINER_APP_ID,
+                "name": "athena-presentation-before",
+                "type": "Microsoft.App/containerApps",
+            },
+            "after": {
+                "id": _CONTAINER_APP_ID,
+                "name": "athena-presentation-after",
+                "type": "Microsoft.App/containerApps",
+            },
+        },
+    ],
+)
+def test_modify_requires_meaningful_effective_property_delta(
+    change: dict[str, object],
+) -> None:
+    violations = evaluate_what_if(
+        _what_if(change),
+        allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+    )
+
+    assert {item.code for item in violations} == {
+        "uninspectable-change",
+    }
+
+
+def test_modify_derives_and_validates_complete_snapshot_delta() -> None:
+    safe = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "before": {
+                "id": _CONTAINER_APP_ID,
+                "properties": {
+                    "template": {"revisionSuffix": "before"},
+                },
+            },
+            "after": {
+                "id": _CONTAINER_APP_ID,
+                "properties": {
+                    "template": {"revisionSuffix": "after"},
+                },
+            },
+        }
+    )
+    unsafe = _what_if(
+        {
+            "resourceId": _STORAGE_ID,
+            "changeType": "Modify",
+            "before": {
+                "id": _STORAGE_ID,
+                "properties": {"allowSharedKeyAccess": False},
+            },
+            "after": {
+                "id": _STORAGE_ID,
+                "properties": {"allowSharedKeyAccess": True},
+            },
+        }
+    )
+
+    assert (
+        evaluate_what_if(
+            safe,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+        == ()
+    )
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            unsafe,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+    } == {"storage-shared-key-enabled"}
 
 
 def test_what_if_rejects_empty_delta_children() -> None:
@@ -1383,9 +1606,7 @@ def test_rbac_rejects_noncanonical_or_incomplete_arm_scopes(
     scope: str,
 ) -> None:
     with pytest.raises(PreflightInputError, match="scope"):
-        evaluate_role_assignments(
-            [_assignment(role_name="Owner", scope=scope)]
-        )
+        evaluate_role_assignments([_assignment(role_name="Owner", scope=scope)])
 
 
 def test_rbac_trailing_slash_role_id_cannot_hide_privileged_role() -> None:
@@ -1400,9 +1621,9 @@ def test_rbac_trailing_slash_role_id_cannot_hide_privileged_role() -> None:
         scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
     )
 
-    assert {
-        item.code for item in evaluate_role_assignments([assignment])
-    } == {"broad-role-assignment"}
+    assert {item.code for item in evaluate_role_assignments([assignment])} == {
+        "broad-role-assignment"
+    }
 
     with pytest.raises(PreflightInputError, match="conflict"):
         evaluate_role_assignments(
@@ -1440,8 +1661,7 @@ def test_rbac_rejects_role_id_without_authorization_provider_boundary() -> None:
 
 def test_rbac_accepts_root_authorization_provider_role_id() -> None:
     owner_role_id = (
-        "/providers/Microsoft.Authorization/roleDefinitions/"
-        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+        "/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
     )
 
     assert {
@@ -1474,10 +1694,13 @@ def test_rbac_name_only_allowance_matches_canonical_builtin_role_id() -> None:
         scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
     )
 
-    assert evaluate_role_assignments(
-        [assignment],
-        policy_document={"allowedBroadAssignments": [allowance]},
-    ) == ()
+    assert (
+        evaluate_role_assignments(
+            [assignment],
+            policy_document={"allowedBroadAssignments": [allowance]},
+        )
+        == ()
+    )
 
 
 def test_legacy_name_allowance_matches_id_only_builtin_assignment() -> None:
@@ -1496,10 +1719,13 @@ def test_legacy_name_allowance_matches_id_only_builtin_assignment() -> None:
         scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
     )
 
-    assert evaluate_role_assignments(
-        [assignment],
-        policy_document={"allowedBroadAssignments": [allowance]},
-    ) == ()
+    assert (
+        evaluate_role_assignments(
+            [assignment],
+            policy_document={"allowedBroadAssignments": [allowance]},
+        )
+        == ()
+    )
 
 
 def test_rbac_separation_applies_to_ancestor_assignments() -> None:
@@ -1527,6 +1753,67 @@ def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     )
 
     assert "identity-separation" in {item.code for item in violations}
+
+
+def test_rbac_management_group_assignment_is_conservative_ancestor() -> None:
+    principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+    management_group_scope = "/providers/Microsoft.Management/managementGroups/synthetic-parent"
+    assignment = _assignment(
+        principal_id=principal_id,
+        role_name="Reader",
+        scope=management_group_scope,
+    )
+    policy = {
+        "allowedBroadAssignments": [assignment],
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["Reader"],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+
+    violations = evaluate_role_assignments(
+        [assignment],
+        policy_document=policy,
+    )
+
+    assert {item.code for item in violations} == {"identity-separation"}
+
+
+def test_guarded_rbac_management_group_assignment_cannot_bypass_separation() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    management_group_scope = "/providers/Microsoft.Management/managementGroups/synthetic-parent"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="Reader",
+        scope=management_group_scope,
+    )
+    policy = {
+        "expectedPrincipalIds": [principal_id],
+        "expectedAssignments": [assignment],
+        "allowedBroadAssignments": [assignment],
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["Reader"],
+                "forbiddenRoleDefinitionIds": [_TEST_ROLE_IDS["reader"]],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+
+    violations = evaluate_role_assignments(
+        _guarded_evidence(
+            [assignment],
+            effective_principal_ids=[principal_id],
+        ),
+        policy_document=policy,
+        require_separation_rules=True,
+    )
+
+    assert {item.code for item in violations} == {"identity-separation"}
 
 
 def test_rbac_id_only_assignments_match_named_separation_rules() -> None:
@@ -1592,10 +1879,7 @@ def test_rbac_rejects_builtin_role_name_with_unknown_role_id() -> None:
             [
                 _assignment(
                     role_name="Reader",
-                    role_id=(
-                        _ROLE_DEFINITION_PREFIX
-                        + "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-                    ),
+                    role_id=(_ROLE_DEFINITION_PREFIX + "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
                     scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
                 )
             ]
@@ -1661,10 +1945,7 @@ def test_json_parser_rejects_exact_duplicate_keys(tmp_path) -> None:
 @pytest.mark.parametrize(
     "content",
     [
-        (
-            '{"status":"Succeeded","\u017ftatus":"Failed",'
-            '"properties":{"changes":[]}}'
-        ),
+        ('{"status":"Succeeded","\u017ftatus":"Failed","properties":{"changes":[]}}'),
         (
             '[{"principalId":"11111111-1111-1111-1111-111111111111",'
             '"PRINCIPALID":"22222222-2222-2222-2222-222222222222",'
@@ -1731,11 +2012,7 @@ def test_public_cli_emits_deterministic_human_readable_success(tmp_path) -> None
     )
 
     assert exit_code == 0
-    assert stdout.getvalue() == (
-        "WC-029 preflight: SAFE\n"
-        "Check: what-if\n"
-        "Blockers: 0\n"
-    )
+    assert stdout.getvalue() == ("WC-029 preflight: SAFE\nCheck: what-if\nBlockers: 0\n")
     assert stderr.getvalue() == ""
 
 
@@ -1810,9 +2087,7 @@ def test_public_cli_reports_malformed_policy_without_partial_success(tmp_path) -
 def test_public_cli_reports_bounded_integer_error_without_traceback(tmp_path) -> None:
     unsafe_path = tmp_path / "oversized-integer.json"
     unsafe_path.write_text(
-        '{"status":"Succeeded","properties":{"changes":[]},"padding":'
-        + "9" * 5000
-        + "}",
+        '{"status":"Succeeded","properties":{"changes":[]},"padding":' + "9" * 5000 + "}",
         encoding="utf-8",
     )
     stdout = StringIO()
@@ -1864,8 +2139,7 @@ def test_public_cli_rejects_terminal_control_characters(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight what-if failed: "
-        "resourceId must be a bounded string\n"
+        "WC-029 preflight what-if failed: resourceId must be a bounded string\n"
     )
 
 
@@ -1878,11 +2152,7 @@ def test_public_cli_rejects_nonprintable_nested_json_keys(tmp_path) -> None:
                     "resourceId": _CONTAINER_APP_ID,
                     "changeType": "Modify",
                     "after": {
-                        "properties": {
-                            "configuration": {
-                                "ingress": {"external\u001b[2J": True}
-                            }
-                        }
+                        "properties": {"configuration": {"ingress": {"external\u001b[2J": True}}}
                     },
                 }
             )
@@ -1900,9 +2170,7 @@ def test_public_cli_rejects_nonprintable_nested_json_keys(tmp_path) -> None:
 
     assert exit_code == 3
     assert stdout.getvalue() == ""
-    assert stderr.getvalue() == (
-        "WC-029 preflight what-if failed: JSON object keys are invalid\n"
-    )
+    assert stderr.getvalue() == ("WC-029 preflight what-if failed: JSON object keys are invalid\n")
 
 
 def test_public_cli_rejects_empty_rbac_separation_policy(tmp_path) -> None:
@@ -1938,8 +2206,7 @@ def test_public_cli_rejects_empty_rbac_separation_policy(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "RBAC policy requires at least one separation rule\n"
+        "WC-029 preflight rbac failed: RBAC policy requires at least one separation rule\n"
     )
 
 
@@ -1949,15 +2216,17 @@ def test_public_cli_accepts_complete_expected_principal_coverage(tmp_path) -> No
         _guarded_assignment(
             principal_id=principal_id,
             role_name="AcrPull",
-            scope=(
-                f"{_RG_SCOPE}/providers/"
-                "Microsoft.ContainerRegistry/registries/synthetic"
-            ),
+            scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
         )
     ]
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps(assignments),
+        json.dumps(
+            _guarded_evidence(
+                assignments,
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy_path = tmp_path / "policy.json"
@@ -1986,18 +2255,22 @@ def test_public_cli_accepts_complete_expected_principal_coverage(tmp_path) -> No
     )
 
     assert exit_code == 0
-    assert stdout.getvalue() == (
-        "WC-029 preflight: SAFE\n"
-        "Check: rbac\n"
-        "Blockers: 0\n"
-    )
+    assert stdout.getvalue() == ("WC-029 preflight: SAFE\nCheck: rbac\nBlockers: 0\n")
     assert stderr.getvalue() == ""
 
 
 def test_public_cli_rejects_empty_assignment_evidence(tmp_path) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     assignments_path = tmp_path / "assignments.json"
-    assignments_path.write_text("[]", encoding="utf-8")
+    assignments_path.write_text(
+        json.dumps(
+            _guarded_evidence(
+                [],
+                effective_principal_ids=[principal_id],
+            )
+        ),
+        encoding="utf-8",
+    )
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(
         json.dumps(_production_policy(principal_id)),
@@ -2021,8 +2294,7 @@ def test_public_cli_rejects_empty_assignment_evidence(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "role-assignment evidence must not be empty\n"
+        "WC-029 preflight rbac failed: role-assignment evidence must not be empty\n"
     )
 
 
@@ -2058,8 +2330,7 @@ def test_public_cli_requires_role_ids_in_guarded_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "expectedAssignments require roleDefinitionId\n"
+        "WC-029 preflight rbac failed: expectedAssignments require roleDefinitionId\n"
     )
 
 
@@ -2068,14 +2339,8 @@ def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> Non
     id_only_assignment = _assignment(
         principal_id=principal_id,
         role_name=None,
-        role_id=(
-            _ROLE_DEFINITION_PREFIX
-            + "73c42c96-874c-492b-b04d-ab87d138a893"
-        ),
-        scope=(
-            f"{_RG_SCOPE}/providers/"
-            "Microsoft.OperationalInsights/workspaces/synthetic"
-        ),
+        role_id=(_ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"),
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
     )
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
@@ -2113,8 +2378,7 @@ def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> Non
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "expectedAssignments require roleDefinitionName\n"
+        "WC-029 preflight rbac failed: expectedAssignments require roleDefinitionName\n"
     )
 
 
@@ -2153,25 +2417,20 @@ def test_public_cli_requires_separation_role_ids(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "separation rule requires forbiddenRoleDefinitionIds\n"
+        "WC-029 preflight rbac failed: separation rule requires forbiddenRoleDefinitionIds\n"
     )
 
 
 def test_separation_rule_matches_role_id_despite_false_display_name() -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
-    log_analytics_reader_id = (
-        _ROLE_DEFINITION_PREFIX
-        + "73c42c96-874c-492b-b04d-ab87d138a893"
-    )
+    log_analytics_reader_id = _ROLE_DEFINITION_PREFIX + "73c42c96-874c-492b-b04d-ab87d138a893"
     assignment = _assignment(
         principal_id=principal_id,
+        effective_principal_id=principal_id,
+        principal_type="ServicePrincipal",
         role_name="AcrPull",
         role_id=log_analytics_reader_id,
-        scope=(
-            f"{_RG_SCOPE}/providers/"
-            "Microsoft.OperationalInsights/workspaces/synthetic"
-        ),
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
     )
     policy = {
         "expectedPrincipalIds": [principal_id],
@@ -2191,11 +2450,195 @@ def test_separation_rule_matches_role_id_despite_false_display_name() -> None:
     assert {
         item.code
         for item in evaluate_role_assignments(
-            [assignment],
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[principal_id],
+            ),
             policy_document=policy,
             require_separation_rules=True,
         )
     } == {"identity-separation"}
+
+
+def test_group_derived_forbidden_role_binds_to_effective_identity() -> None:
+    identity_principal_id = "11111111-1111-1111-1111-111111111111"
+    group_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_principal_id,
+        effective_principal_id=identity_principal_id,
+        principal_type="Group",
+        role_name="Log Analytics Reader",
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
+    )
+    policy = {
+        "expectedPrincipalIds": [identity_principal_id],
+        "expectedAssignments": [assignment],
+        "separationRules": [
+            {
+                "principalId": identity_principal_id,
+                "forbiddenRoleNames": ["Log Analytics Reader"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["log analytics reader"],
+                ],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+
+    violations = evaluate_role_assignments(
+        _guarded_evidence(
+            [assignment],
+            effective_principal_ids=[identity_principal_id],
+        ),
+        policy_document=policy,
+        require_separation_rules=True,
+    )
+
+    assert {item.code for item in violations} == {"identity-separation"}
+    assert violations[0].subject == identity_principal_id
+    assert f"via group {group_principal_id}" in violations[0].detail
+
+
+@pytest.mark.parametrize(
+    "query_kinds",
+    [
+        ("subscription-descendants",),
+        ("subscription-ancestors",),
+    ],
+)
+def test_guarded_rbac_rejects_incomplete_query_coverage(
+    query_kinds: tuple[str, ...],
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="requires one ancestor and one descendant query",
+    ):
+        evaluate_role_assignments(
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[principal_id],
+                query_kinds=query_kinds,
+            ),
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_inventory_without_per_query_results() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+    )
+
+    for evidence in (
+        [assignment],
+        {
+            "collection": {
+                "effectivePrincipalIds": [principal_id],
+                "includeGroups": True,
+                "includeInherited": True,
+                "allScopes": True,
+            },
+            "value": [assignment],
+        },
+    ):
+        with pytest.raises(
+            PreflightInputError,
+            match="requires per-identity query results",
+        ):
+            evaluate_role_assignments(
+                evidence,
+                policy_document=_production_policy(
+                    principal_id,
+                    expected_assignments=[assignment],
+                ),
+                require_separation_rules=True,
+            )
+
+
+def test_guarded_rbac_rejects_assignment_in_wrong_query_direction() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
+    )
+    evidence = _guarded_evidence(
+        [assignment],
+        effective_principal_ids=[principal_id],
+    )
+    queries = evidence["queries"]
+    assert isinstance(queries, list)
+    ancestor_query = next(
+        query
+        for query in queries
+        if isinstance(query, dict) and query["queryKind"] == "subscription-ancestors"
+    )
+    ancestor_query["value"] = [assignment]
+
+    with pytest.raises(
+        PreflightInputError,
+        match="ancestor query contains a descendant assignment",
+    ):
+        evaluate_role_assignments(
+            evidence,
+            policy_document=_production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+            require_separation_rules=True,
+        )
+
+
+def test_guarded_rbac_rejects_unassociated_group_assignment() -> None:
+    identity_principal_id = "11111111-1111-1111-1111-111111111111"
+    group_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _assignment(
+        principal_id=group_principal_id,
+        principal_type="Group",
+        role_name="Log Analytics Reader",
+        role_id=_TEST_ROLE_IDS["log analytics reader"],
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.OperationalInsights/workspaces/synthetic"),
+    )
+    policy = {
+        "expectedPrincipalIds": [identity_principal_id],
+        "expectedAssignments": [assignment],
+        "separationRules": [
+            {
+                "principalId": identity_principal_id,
+                "forbiddenRoleNames": ["Log Analytics Reader"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["log analytics reader"],
+                ],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="expectedAssignments requires effectivePrincipalId",
+    ):
+        evaluate_role_assignments(
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[identity_principal_id],
+            ),
+            policy_document=policy,
+            require_separation_rules=True,
+        )
 
 
 def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:
@@ -2239,8 +2682,7 @@ def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "allowedBroadAssignments require roleDefinitionId\n"
+        "WC-029 preflight rbac failed: allowedBroadAssignments require roleDefinitionId\n"
     )
 
 
@@ -2254,10 +2696,7 @@ def test_public_cli_rejects_paginated_assignment_evidence(
         _guarded_assignment(
             principal_id=principal_id,
             role_name="AcrPull",
-            scope=(
-                f"{_RG_SCOPE}/providers/"
-                "Microsoft.ContainerRegistry/registries/synthetic"
-            ),
+            scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
         )
     ]
     assignments_path = tmp_path / "assignments.json"
@@ -2300,9 +2739,7 @@ def test_public_cli_rejects_paginated_assignment_evidence(
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert json.loads(stderr.getvalue()) == {
-        "error": (
-            "role-assignment evidence must not contain a continuation link"
-        ),
+        "error": ("role-assignment evidence must not contain a continuation link"),
         "kind": "rbac",
         "safe": False,
     }
@@ -2347,7 +2784,7 @@ def test_public_cli_rejects_paginated_assignment_evidence(
         (
             [_guarded_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
             _production_policy("22222222-2222-2222-2222-222222222222"),
-            "role assignment principal is not covered by expectedPrincipalIds",
+            "query effectivePrincipalIds must exactly match expectedPrincipalIds",
         ),
         (
             [_guarded_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
@@ -2405,7 +2842,18 @@ def test_public_cli_rejects_incomplete_or_unmatched_principal_coverage(
     message: str,
 ) -> None:
     assignments_path = tmp_path / "assignments.json"
-    assignments_path.write_text(json.dumps(assignments), encoding="utf-8")
+    expected_principal_ids = policy.get("expectedPrincipalIds")
+    assignments_path.write_text(
+        json.dumps(
+            _guarded_evidence(
+                assignments,
+                effective_principal_ids=(
+                    expected_principal_ids if isinstance(expected_principal_ids, list) else None
+                ),
+            )
+        ),
+        encoding="utf-8",
+    )
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     stdout = StringIO()
@@ -2433,10 +2881,7 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
     safe_assignment = _guarded_assignment(
         principal_id=principal_id,
         role_name="AcrPull",
-        scope=(
-            f"{_RG_SCOPE}/providers/"
-            "Microsoft.ContainerRegistry/registries/synthetic"
-        ),
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
     )
     omitted_owner = _guarded_assignment(
         principal_id=principal_id,
@@ -2445,7 +2890,12 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
     )
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([safe_assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [safe_assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy_path = tmp_path / "policy.json"
@@ -2478,10 +2928,7 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert json.loads(stderr.getvalue()) == {
-        "error": (
-            "role-assignment evidence does not exactly match "
-            "expectedAssignments"
-        ),
+        "error": ("role-assignment evidence does not exactly match expectedAssignments"),
         "kind": "rbac",
         "safe": False,
     }
@@ -2505,7 +2952,12 @@ def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
     )
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([conditional_assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [conditional_assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy_path = tmp_path / "policy.json"
@@ -2539,13 +2991,16 @@ def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
 
     assignments_path.write_text(
         json.dumps(
-            [
-                _guarded_assignment(
-                    principal_id=principal_id,
-                    role_name="Storage Blob Data Reader",
-                    scope=conditional_assignment["scope"],
-                )
-            ]
+            _guarded_evidence(
+                [
+                    _guarded_assignment(
+                        principal_id=principal_id,
+                        role_name="Storage Blob Data Reader",
+                        scope=conditional_assignment["scope"],
+                    )
+                ],
+                effective_principal_ids=[principal_id],
+            )
         ),
         encoding="utf-8",
     )
@@ -2569,10 +3024,7 @@ def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert json.loads(stderr.getvalue()) == {
-        "error": (
-            "role-assignment evidence does not exactly match "
-            "expectedAssignments"
-        ),
+        "error": ("role-assignment evidence does not exactly match expectedAssignments"),
         "kind": "rbac",
         "safe": False,
     }
@@ -2642,8 +3094,7 @@ def test_public_cli_rejects_conflicting_allowance_role_name_and_id(
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "WC-029 preflight rbac failed: "
-        "roleDefinitionName and roleDefinitionId conflict\n"
+        "WC-029 preflight rbac failed: roleDefinitionName and roleDefinitionId conflict\n"
     )
 
 
@@ -2663,16 +3114,20 @@ def test_public_cli_requires_allowance_role_id_to_match_inventory(
     )
     expected_assignment = _assignment(
         principal_id=principal_id,
+        effective_principal_id=principal_id,
+        principal_type="ServicePrincipal",
         role_name="AcrPull",
         role_id=expected_role_id,
-        scope=(
-            f"{_RG_SCOPE}/providers/"
-            "Microsoft.ContainerRegistry/registries/synthetic"
-        ),
+        scope=(f"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"),
     )
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps([expected_assignment]),
+        json.dumps(
+            _guarded_evidence(
+                [expected_assignment],
+                effective_principal_ids=[principal_id],
+            )
+        ),
         encoding="utf-8",
     )
     policy = _production_policy(
@@ -2682,6 +3137,8 @@ def test_public_cli_requires_allowance_role_id_to_match_inventory(
     policy["allowedBroadAssignments"] = [
         _assignment(
             principal_id=principal_id,
+            effective_principal_id=principal_id,
+            principal_type="ServicePrincipal",
             role_name="AcrPull",
             role_id=different_role_id,
             scope=expected_assignment["scope"],
