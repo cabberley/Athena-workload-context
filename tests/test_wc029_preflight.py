@@ -797,6 +797,42 @@ def test_dotted_payload_keys_cannot_spoof_storage_protection() -> None:
     } == {"storage-protection-missing"}
 
 
+def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:
+    spoofed_payload = _what_if(
+        {
+            "resourceId": _STORAGE_ID,
+            "changeType": "Create",
+            "after": {
+                "propertie\u017f": {
+                    "allowSharedKeyAcce\u017f\u017f": False,
+                    "allowBlobPublicAcce\u017f\u017f": False,
+                    "publicNetworkAcce\u017f\u017f": "Disabled",
+                    "networkAcls": {"defaultAction": "Deny"},
+                }
+            },
+        }
+    )
+    with pytest.raises(PreflightInputError, match="ambiguous Unicode"):
+        evaluate_what_if(
+            spoofed_payload,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+    spoofed_delta = _what_if(
+        _change(
+            _STORAGE_ID,
+            "Modify",
+            path="propertie\u017f.allowSharedKeyAcce\u017f\u017f",
+            after=False,
+        )
+    )
+    with pytest.raises(PreflightInputError, match="ambiguous Unicode"):
+        evaluate_what_if(
+            spoofed_delta,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
 @pytest.mark.parametrize(
     ("path", "after", "code"),
     [
@@ -956,6 +992,49 @@ def test_what_if_network_acl_change_accepts_complete_private_after_state(
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "expected_codes"),
+    [
+        (
+            _STORAGE_ID,
+            {
+                "public-data-plane-access",
+                "storage-public-blob-access",
+                "storage-shared-key-enabled",
+            },
+        ),
+        (
+            _KEY_VAULT_ID,
+            {"public-data-plane-access"},
+        ),
+    ],
+)
+def test_what_if_rejects_protected_properties_ancestor_removal(
+    resource_id: str,
+    expected_codes: set[str],
+) -> None:
+    document = _what_if(
+        {
+            "resourceId": resource_id,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties",
+                    "propertyChangeType": "Delete",
+                }
+            ],
+        }
+    )
+
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            document,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+    } == expected_codes
 
 
 @pytest.mark.parametrize(

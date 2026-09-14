@@ -177,6 +177,10 @@ def _reject_ambiguous_object_pairs(
             raise PreflightInputError(
                 "JSON object contains a case-insensitive key collision"
             )
+        if key.lower() != casefolded:
+            raise PreflightInputError(
+                "JSON object key has ambiguous Unicode case folding"
+            )
         result[key] = value
         casefolded_keys.add(casefolded)
     return result
@@ -209,7 +213,11 @@ def _canonical_role_id(value: str) -> str:
 
 
 def _canonical_property_path(value: str) -> str:
-    normalized = value.casefold()
+    normalized = value.lower()
+    if normalized != value.casefold():
+        raise PreflightInputError(
+            "property path has ambiguous Unicode case folding"
+        )
     prefix = "<resource>."
     return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
 
@@ -294,8 +302,8 @@ def _allowance_matches(
 
 
 def _has_case_insensitive(mapping: dict[str, Any], name: str) -> bool:
-    expected = name.casefold()
-    return any(key.casefold() == expected for key in mapping)
+    expected = name.lower()
+    return any(key.lower() == expected for key in mapping)
 
 
 def _require_string(
@@ -364,8 +372,12 @@ def _validate_json_shape(value: object) -> None:
                 for key in item
             ):
                 raise PreflightInputError("JSON object keys are invalid")
-            casefolded_keys = [key.casefold() for key in item]
-            if len(casefolded_keys) != len(set(casefolded_keys)):
+            lowered_keys = [key.lower() for key in item]
+            if any(key.lower() != key.casefold() for key in item):
+                raise PreflightInputError(
+                    "JSON object key has ambiguous Unicode case folding"
+                )
+            if len(lowered_keys) != len(set(lowered_keys)):
                 raise PreflightInputError(
                     "JSON object contains a case-insensitive key collision"
                 )
@@ -402,9 +414,9 @@ def _sequence(
 
 
 def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
-    expected = name.casefold()
+    expected = name.lower()
     for key, value in mapping.items():
-        if key.casefold() == expected:
+        if key.lower() == expected:
             return value
     return None
 
@@ -683,16 +695,69 @@ def _unsafe_property_violations(
                 detail=("change lacks FullResourcePayloads or inspectable delta"),
             ),
         )
+    removed_delta_paths = [
+        _canonical_property_path(raw_path)
+        for raw_path, _, property_change_type in delta_candidates
+        if property_change_type in {"delete", "remove"}
+    ]
+
+    def ancestor_removed(target: str) -> bool:
+        return any(
+            removed_path != target
+            and target.startswith(removed_path + ".")
+            for removed_path in removed_delta_paths
+        )
+
+    if (
+        resource_type == _STORAGE_ACCOUNT_TYPE
+        and ancestor_removed("properties.allowsharedkeyaccess")
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-shared-key-enabled",
+                subject=resource_id,
+                detail="ancestor removal deletes shared-key protection",
+            )
+        )
+    if (
+        resource_type == _STORAGE_ACCOUNT_TYPE
+        and ancestor_removed("properties.allowblobpublicaccess")
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-public-blob-access",
+                subject=resource_id,
+                detail="ancestor removal deletes public-blob protection",
+            )
+        )
+    if (
+        resource_type == _STORAGE_CONTAINER_TYPE
+        and ancestor_removed("properties.publicaccess")
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-container-public-access",
+                subject=resource_id,
+                detail="ancestor removal deletes private-container protection",
+            )
+        )
     if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
         network_acl_touched = any(
-            (path := _canonical_property_path(raw_path))
-            == "properties.networkacls"
-            or path.startswith("properties.networkacls.")
+            (
+                (path := _canonical_property_path(raw_path))
+                == "properties.networkacls"
+                or path.startswith("properties.networkacls.")
+                or "properties.networkacls".startswith(path + ".")
+            )
             for raw_path, _, _ in delta_candidates
         )
         if network_acl_touched:
             protected_parent_removed = any(
-                _canonical_property_path(raw_path) == "properties.networkacls"
+                (
+                    (path := _canonical_property_path(raw_path))
+                    == "properties.networkacls"
+                    or "properties.networkacls".startswith(path + ".")
+                )
                 and property_change_type in {"delete", "remove"}
                 for raw_path, _, property_change_type in delta_candidates
             )
@@ -1252,7 +1317,7 @@ def _role_assignments(document: object) -> list[object]:
     root = _mapping(document, field_name="role-assignment document")
     for key, value in root.items():
         if (
-            key.casefold() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
+            key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
             and value is not None
         ):
             raise PreflightInputError(

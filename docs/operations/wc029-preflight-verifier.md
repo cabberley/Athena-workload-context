@@ -18,7 +18,7 @@ properties is treated as unsafe; child resources such as containers and keys are
 their own payloads. Blob containers must explicitly use `publicAccess: None`.
 Storage or Key Vault network ACL changes must include a complete after-state proving
 `publicNetworkAccess: Disabled` and `networkAcls.defaultAction: Deny`; deleting the ACL parent or
-providing only a partial child delta fails closed.
+any higher protected-property ancestor, or providing only a partial child delta, fails closed.
 Container Apps network values are type checked independently: ingress `external` must be boolean
 `false`, managed-environment `vnetConfiguration.internal` must be boolean `true`, and
 `publicNetworkAccess` must be `Disabled`. Unknown values and partial parent deltas fail closed.
@@ -28,7 +28,8 @@ final state. Any non-empty `potentialChanges` collection also blocks the gate be
 resources were not resolved into the reviewed `changes` collection.
 Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
 one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
-names cannot impersonate structurally nested protected settings.
+names cannot impersonate structurally nested protected settings. Unicode characters whose case fold
+is ASCII-equivalent are rejected in JSON keys and textual property paths.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
