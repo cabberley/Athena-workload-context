@@ -107,6 +107,7 @@ def _service(*, lifecycle_key_id: str | None = None):
         reader=fixture["reader"],
         trust=NotificationV2Trust(
             lifecycle_key_id=fixture["lifecycle_trust"].key_id,
+            lifecycle_key_vault_key_id=fixture["lifecycle_key_vault_key_id"],
             lifecycle_key_fingerprint=(
                 fixture["lifecycle_trust"].key_fingerprint
             ),
@@ -179,7 +180,7 @@ def _refresh_active_authority(
         schemaVersion="athena.activeIncidentIndexAttestation.v1",
         indexDigest=sha256_hex(refreshed.canonical_bytes()),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=active_index.key_id,
+        keyVaultKeyId=fixture["lifecycle_key_vault_key_id"],
         detachedSignature=signature,
     )
     fixture["reader"].content["incidents/active.json"] = refreshed.canonical_bytes()
@@ -229,6 +230,7 @@ def test_notification_v2_trusts_existing_wc016_lifecycle_logical_key_id() -> Non
 
     assert fixture["lifecycle_trust"].key_id == lifecycle_key_id
     assert service.trust.lifecycle_key_id == lifecycle_key_id
+    assert service.trust.lifecycle_key_vault_key_id != lifecycle_key_id
     assert envelope.notification.incident_id == fixture["state"].incident_id
     assert outbox.envelopes == [envelope]
 
@@ -920,6 +922,7 @@ def test_notification_signing_authority_must_not_reuse_a_source_key() -> None:
             reader=fixture["reader"],
             trust=NotificationV2Trust(
                 lifecycle_key_id=fixture["lifecycle_trust"].key_id,
+                lifecycle_key_vault_key_id=fixture["lifecycle_key_vault_key_id"],
                 lifecycle_key_fingerprint=(
                     fixture["lifecycle_trust"].key_fingerprint
                 ),

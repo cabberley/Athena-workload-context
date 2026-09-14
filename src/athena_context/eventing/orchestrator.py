@@ -47,6 +47,7 @@ def run_active_incident_index_heartbeat(
     signing_key_fingerprint: str,
     signer: PresentationSigner,
     publisher: IncidentAssetPublisherPort,
+    signing_key_vault_key_id: str | None = None,
 ) -> ActiveIncidentIndexSnapshot:
     if not observations:
         raise ValueError("incident feed heartbeat requires approved observations")
@@ -66,6 +67,7 @@ def run_active_incident_index_heartbeat(
         publication = build_active_incident_index_heartbeat(
             published_at=published_at,
             key_id=signing_key_id,
+            key_vault_key_id=signing_key_vault_key_id or signing_key_id,
             key_fingerprint=signing_key_fingerprint,
             signer=signer,
             active_index_snapshot=active_index_snapshot,
@@ -128,6 +130,7 @@ def run_incident_reassessment(
     signer: PresentationSigner,
     publisher: IncidentAssetPublisherPort,
     notifications: NotificationOutboxPort | None,
+    signing_key_vault_key_id: str | None = None,
 ) -> tuple[IncidentState, IncidentPublicationReceipt] | None:
     result = reassessment.reassess(request)
     if result.request_id != request.request_id:
@@ -226,12 +229,16 @@ def run_incident_reassessment(
         reasoning=result.reasoning,
         signer=signer,
         signing_key_id=signing_key_id,
+        signing_key_vault_key_id=(
+            signing_key_vault_key_id or signing_key_id
+        ),
     )
     publication = build_incident_publication(
         state,
         attestation,
         published_at=published_at,
         key_id=signing_key_id,
+        key_vault_key_id=signing_key_vault_key_id or signing_key_id,
         key_fingerprint=signing_key_fingerprint,
         signer=signer,
         active_index_snapshot=active_index_snapshot,

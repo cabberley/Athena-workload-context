@@ -52,6 +52,9 @@ param feedV2ReaderIdentityResourceId string
 @description('Feed registry Table writer identity resource ID.')
 param registryWriterIdentityResourceId string
 
+@description('Read-only identity resource ID for the current guidance-authority activation row.')
+param guidanceActivationReaderIdentityResourceId string
+
 @description('Trust/public-key reader identity resource ID used for Key Vault Reader and all verification keys.')
 param trustReaderIdentityResourceId string
 
@@ -107,6 +110,14 @@ param feedRegistryTableName string = 'Wc027FeedRegistry'
 @maxLength(256)
 param feedRegistryPartitionKey string
 
+@description('Guidance-authority activation Table name.')
+param guidanceActivationTableName string = 'Wc027GuidanceActivation'
+
+@description('Guidance-authority activation partition key.')
+@minLength(1)
+@maxLength(256)
+param guidanceActivationPartitionKey string = 'wc027-guidance-authority'
+
 @description('Existing storage account resource ID that hosts the correlation and guidance-authority evidence containers.')
 param correlationSourceStorageAccountResourceId string
 
@@ -155,6 +166,11 @@ param correlationBindingKeyResourceId string
 @description('Existing guidance-binding verification key ARM resource ID.')
 param guidanceBindingKeyResourceId string
 
+@description('Stable logical key ID embedded in signed guidance bindings and activations.')
+@minLength(1)
+@maxLength(512)
+param guidanceBindingLogicalKeyId string
+
 @description('Existing change-evidence verification key ARM resource ID.')
 param changeKeyResourceId string
 
@@ -166,6 +182,23 @@ param monitoringCollectorKeyResourceId string
 
 @description('Non-secret public-key fingerprints for every trust domain. Key IDs are derived from referenced versioned Key Vault resources.')
 param trustDomainMetadata object
+
+var runtimeTrustDomainFingerprints = [
+  trustDomainMetadata.monitoringCollector.keyFingerprint
+  trustDomainMetadata.change.keyFingerprint
+  trustDomainMetadata.monitoringIntent.keyFingerprint
+  trustDomainMetadata.incident.keyFingerprint
+  trustDomainMetadata.correlationBinding.keyFingerprint
+  trustDomainMetadata.guidanceBinding.keyFingerprint
+  trustDomainMetadata.report.keyFingerprint
+  trustDomainMetadata.guidance.keyFingerprint
+  trustDomainMetadata.enrichment.keyFingerprint
+  trustDomainMetadata.feed.keyFingerprint
+  trustDomainMetadata.notification.keyFingerprint
+]
+var validatedTrustDomainMetadata = length(union(runtimeTrustDomainFingerprints, runtimeTrustDomainFingerprints)) == length(runtimeTrustDomainFingerprints)
+  ? trustDomainMetadata
+  : fail('WC-027 trust-domain public key fingerprints must be distinct')
 
 @description('Reviewed non-secret monitoring collector contract object.')
 param monitoringCollectorContract object
@@ -191,6 +224,7 @@ var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -246,6 +280,11 @@ resource feedV2ReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@
 resource registryWriterIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(registryWriterIdentityResourceId, '/'))
   scope: resourceGroup(split(registryWriterIdentityResourceId, '/')[2], split(registryWriterIdentityResourceId, '/')[4])
+}
+
+resource guidanceActivationReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: last(split(guidanceActivationReaderIdentityResourceId, '/'))
+  scope: resourceGroup(split(guidanceActivationReaderIdentityResourceId, '/')[2], split(guidanceActivationReaderIdentityResourceId, '/')[4])
 }
 
 resource trustReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
@@ -314,6 +353,7 @@ var attachedIdentityResourceIds = [
   feedV2ProducerReaderIdentity.id
   feedV2WriterIdentity.id
   registryWriterIdentity.id
+  guidanceActivationReaderIdentity.id
   trustReaderIdentity.id
   monitoringReaderIdentity.id
   changeReaderIdentity.id
@@ -433,6 +473,12 @@ resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2025-06-0
 resource feedRegistry 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
   parent: tableService
   name: feedRegistryTableName
+  properties: {}
+}
+
+resource guidanceActivation 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
+  parent: tableService
+  name: guidanceActivationTableName
   properties: {}
 }
 
@@ -610,6 +656,19 @@ resource registryWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       storageTableDataContributorRoleDefinitionId
+    )
+  }
+}
+
+resource guidanceActivationReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, storageTableDataReaderRoleDefinitionId)
+  scope: guidanceActivation
+  properties: {
+    principalId: guidanceActivationReaderIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageTableDataReaderRoleDefinitionId
     )
   }
 }
@@ -865,6 +924,13 @@ var runtimeConfiguration = {
     identityClientId: registryWriterIdentity.properties.clientId
     identityResourceId: registryWriterIdentity.id
   }
+  guidanceActivation: {
+    tableEndpoint: replayStorage.properties.primaryEndpoints.table
+    tableName: guidanceActivation.name
+    partitionKey: guidanceActivationPartitionKey
+    identityClientId: guidanceActivationReaderIdentity.properties.clientId
+    identityResourceId: guidanceActivationReaderIdentity.id
+  }
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -907,7 +973,7 @@ var runtimeConfiguration = {
   monitoringCollectorKey: {
     keyId: monitoringCollectorKey.properties.keyUriWithVersion
     keyVaultKeyId: monitoringCollectorKey.properties.keyUriWithVersion
-    keyFingerprint: trustDomainMetadata.monitoringCollector.keyFingerprint
+    keyFingerprint: validatedTrustDomainMetadata.monitoringCollector.keyFingerprint
     identityClientId: trustReaderIdentity.properties.clientId
     identityResourceId: trustReaderIdentity.id
     activatedAt: monitoringCollectorKeyActivatedAt
@@ -917,70 +983,70 @@ var runtimeConfiguration = {
     incident: {
       keyId: 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
       keyVaultKeyId: incidentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.incident.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.incident.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     correlationBinding: {
       keyId: correlationBindingKey.properties.keyUriWithVersion
       keyVaultKeyId: correlationBindingKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.correlationBinding.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.correlationBinding.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     guidanceBinding: {
-      keyId: guidanceBindingKey.properties.keyUriWithVersion
+      keyId: guidanceBindingLogicalKeyId
       keyVaultKeyId: guidanceBindingKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.guidanceBinding.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.guidanceBinding.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     change: {
       keyId: changeKey.properties.keyUriWithVersion
       keyVaultKeyId: changeKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.change.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.change.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     monitoringIntent: {
       keyId: monitoringIntentKey.properties.keyUriWithVersion
       keyVaultKeyId: monitoringIntentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.monitoringIntent.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.monitoringIntent.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     report: {
       keyId: reportKey.properties.keyUriWithVersion
       keyVaultKeyId: reportKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.report.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.report.keyFingerprint
       identityClientId: reportSignerIdentity.properties.clientId
       identityResourceId: reportSignerIdentity.id
     }
     guidance: {
       keyId: guidanceKey.properties.keyUriWithVersion
       keyVaultKeyId: guidanceKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.guidance.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.guidance.keyFingerprint
       identityClientId: guidanceSignerIdentity.properties.clientId
       identityResourceId: guidanceSignerIdentity.id
     }
     enrichment: {
       keyId: enrichmentKey.properties.keyUriWithVersion
       keyVaultKeyId: enrichmentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.enrichment.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.enrichment.keyFingerprint
       identityClientId: enrichmentSignerIdentity.properties.clientId
       identityResourceId: enrichmentSignerIdentity.id
     }
     feed: {
       keyId: feedKey.properties.keyUriWithVersion
       keyVaultKeyId: feedKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.feed.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.feed.keyFingerprint
       identityClientId: feedSignerIdentity.properties.clientId
       identityResourceId: feedSignerIdentity.id
     }
     notification: {
       keyId: notificationKey.properties.keyUriWithVersion
       keyVaultKeyId: notificationKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.notification.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.notification.keyFingerprint
       identityClientId: notificationSignerIdentity.properties.clientId
       identityResourceId: notificationSignerIdentity.id
     }
@@ -1010,6 +1076,7 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
+  guidanceActivationReader.id
   incidentKeyVerifierRoleId
   extensionResourceId(incidentKey.id, 'Microsoft.Authorization/roleAssignments', guid(incidentKey.id, trustReaderIdentity.id, incidentKeyVerifierRoleId))
   correlationBindingKeyVerifierRoleId

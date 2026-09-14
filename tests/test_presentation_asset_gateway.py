@@ -315,6 +315,11 @@ def test_gateway_cli_defaults_to_the_bounded_private_sidecar_port() -> None:
             "11111111-1111-1111-1111-111111111111",
             "--incident-key-id",
             "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1",
+            "--incident-key-vault-key-id",
+            (
+                "https://synthetic.vault.azure.net/keys/"
+                "wc016-incident/0123456789abcdef0123456789abcdef"
+            ),
             "--incident-key-fingerprint",
             "sha256:" + "1" * 64,
             "--incident-public-key",
@@ -409,6 +414,7 @@ def test_gateway_serves_only_the_current_incident_pointer_allowlist() -> None:
         reader,
         incident_reader=reader,
         incident_key_id=key_id,
+        incident_key_vault_key_id=key_id,
         incident_key_fingerprint=fingerprint,
         incident_public_key=public_key,
     )
@@ -506,6 +512,10 @@ def _reference_with_attestation_digest(
 def _feed_v2_gateway_fixture(
     *,
     lifecycle_key_id: str | None = None,
+    lifecycle_key_vault_key_id: str = (
+        "https://synthetic.vault.azure.net/keys/"
+        "wc016-incident/0123456789abcdef0123456789abcdef"
+    ),
 ):
     lifecycle_private, lifecycle_trust = _trust("lifecycle")
     if lifecycle_key_id is not None:
@@ -522,7 +532,7 @@ def _feed_v2_gateway_fixture(
     state, unsigned_state_attestation = _incident_state()
     state_attestation = unsigned_state_attestation.model_copy(
         update={
-            "key_vault_key_id": lifecycle_trust.key_id,
+            "key_vault_key_id": lifecycle_key_vault_key_id,
             "detached_signature": _signature(
                 lifecycle_private,
                 incident_state_signature_preimage(state),
@@ -564,7 +574,7 @@ def _feed_v2_gateway_fixture(
             "athena.wc027PublishedGuidanceAuthorityBindingAttestation.v2"
         ),
         signatureAlgorithm="RS256",
-        keyVaultKeyId="synthetic-key://guidance-binding",
+        keyId="synthetic-key://guidance-binding",
         signedPreimageDigest=compute_artifact_digest(
             _json_value(binding_payload)
         ),
@@ -692,7 +702,7 @@ def _feed_v2_gateway_fixture(
         schemaVersion="athena.incidentFeedAttestation.v1",
         pointerDigest=sha256_hex(source_pointer.canonical_bytes()),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=lifecycle_trust.key_id,
+        keyVaultKeyId=lifecycle_key_vault_key_id,
         detachedSignature=_signature(
             lifecycle_private,
             source_pointer.canonical_bytes(),
@@ -782,7 +792,7 @@ def _feed_v2_gateway_fixture(
         schemaVersion="athena.activeIncidentIndexAttestation.v1",
         indexDigest=sha256_hex(active_index.canonical_bytes()),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=lifecycle_trust.key_id,
+        keyVaultKeyId=lifecycle_key_vault_key_id,
         detachedSignature=_signature(
             lifecycle_private,
             active_index.canonical_bytes(),
@@ -881,6 +891,7 @@ def _feed_v2_gateway_fixture(
         reader,
         incident_reader=reader,
         incident_key_id=lifecycle_trust.key_id,
+        incident_key_vault_key_id=lifecycle_key_vault_key_id,
         incident_key_fingerprint=lifecycle_trust.key_fingerprint,
         incident_public_key=lifecycle_trust.public_key,
         incident_feed_v2_trust=feed_trust,
@@ -900,6 +911,7 @@ def _feed_v2_gateway_fixture(
         "guidance_trust": guidance_trust,
         "lifecycle_private": lifecycle_private,
         "lifecycle_trust": lifecycle_trust,
+        "lifecycle_key_vault_key_id": lifecycle_key_vault_key_id,
         "feed_entry": feed_entry,
         "state": state,
         "guidance": guidance,
@@ -914,12 +926,13 @@ def _resolved_feed_v2_source_fixture():
     reader = fixture["reader"]
     lifecycle_private = fixture["lifecycle_private"]
     lifecycle_trust = fixture["lifecycle_trust"]
+    lifecycle_key_vault_key_id = fixture["lifecycle_key_vault_key_id"]
     feed_private = fixture["feed_private"]
     feed_trust = fixture["feed_trust"]
     state, unsigned_attestation = _incident_state(lifecycle="resolved")
     state_attestation = unsigned_attestation.model_copy(
         update={
-            "key_vault_key_id": lifecycle_trust.key_id,
+            "key_vault_key_id": lifecycle_key_vault_key_id,
             "detached_signature": _signature(
                 lifecycle_private,
                 incident_state_signature_preimage(state),
@@ -956,7 +969,7 @@ def _resolved_feed_v2_source_fixture():
         schemaVersion="athena.incidentFeedAttestation.v1",
         pointerDigest=sha256_hex(source_pointer.canonical_bytes()),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=lifecycle_trust.key_id,
+        keyVaultKeyId=lifecycle_key_vault_key_id,
         detachedSignature=_signature(
             lifecycle_private,
             source_pointer.canonical_bytes(),
@@ -1072,7 +1085,7 @@ def _resolved_feed_v2_source_fixture():
         schemaVersion="athena.activeIncidentIndexAttestation.v1",
         indexDigest=sha256_hex(active_index.canonical_bytes()),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=lifecycle_trust.key_id,
+        keyVaultKeyId=lifecycle_key_vault_key_id,
         detachedSignature=_signature(
             lifecycle_private,
             active_index.canonical_bytes(),
@@ -1342,6 +1355,7 @@ def test_v2_keys_must_be_separate_from_lifecycle_key() -> None:
             reader,
             incident_reader=reader,
             incident_key_id=lifecycle_trust.key_id,
+            incident_key_vault_key_id=lifecycle_trust.key_id,
             incident_key_fingerprint=(
                 lifecycle_trust.key_fingerprint
             ),

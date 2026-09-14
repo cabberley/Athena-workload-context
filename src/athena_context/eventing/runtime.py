@@ -1018,6 +1018,7 @@ def run_incident_feed_heartbeat(
         container_name="incident-assets",
         managed_identity_client_id=managed_identity_client_id,
         signing_key_id=signing_key_id,
+        signing_key_vault_key_id=key_vault_key_id,
         signing_key_fingerprint=signing_key_fingerprint,
         signature_verifier=signer.verify_preimage,
     )
@@ -1025,6 +1026,7 @@ def run_incident_feed_heartbeat(
         reassessment_observations,
         published_at=observed_at,
         signing_key_id=signing_key_id,
+        signing_key_vault_key_id=key_vault_key_id,
         signing_key_fingerprint=signing_key_fingerprint,
         signer=signer,
         publisher=publisher,
@@ -1086,6 +1088,7 @@ def run_incident_orchestrator_worker(
         container_name="incident-assets",
         managed_identity_client_id=managed_identity_client_id,
         signing_key_id=signing_key_id,
+        signing_key_vault_key_id=key_vault_key_id,
         signing_key_fingerprint=signing_key_fingerprint,
         signature_verifier=signer.verify_preimage,
     )
@@ -1177,6 +1180,7 @@ def run_incident_orchestrator_worker(
                 published_at=now,
                 presentation_url=presentation_url,
                 signing_key_id=signing_key_id,
+                signing_key_vault_key_id=key_vault_key_id,
                 signing_key_fingerprint=signing_key_fingerprint,
                 reassessment=reassessment,
                 signer=signer,
@@ -1394,6 +1398,7 @@ def _build_notification_v2_trust(
     )
     return NotificationV2Trust(
         lifecycle_key_id=configuration.lifecycle.key_id,
+        lifecycle_key_vault_key_id=configuration.lifecycle.key_vault_key_id,
         lifecycle_key_fingerprint=configuration.lifecycle.key_fingerprint,
         lifecycle_signature_verifier=lifecycle.verify_preimage,
         feed_key_id=configuration.feed.key_id,

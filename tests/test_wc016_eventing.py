@@ -775,6 +775,7 @@ def test_incident_publisher_returns_version_pinned_occurrence(
     )
     publisher = object.__new__(AzureBlobIncidentAssetPublisher)
     publisher._signing_key_id = INCIDENT_KEY_ID
+    publisher._signing_key_vault_key_id = INCIDENT_KEY_ID
     publisher._signing_key_fingerprint = INCIDENT_KEY_FINGERPRINT
 
     def upload(
@@ -863,12 +864,14 @@ def test_immutable_upload_requires_version_id() -> None:
 
 
 def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
+    logical_key_id = "synthetic-key://wc016/incidents-rs256-v1"
     _, state, attestation = _state_and_attestation(DB_ID, "deallocate", False)
     publication = build_incident_publication(
         state,
         attestation,
         published_at=NOW,
-        key_id=INCIDENT_KEY_ID,
+        key_id=logical_key_id,
+        key_vault_key_id=INCIDENT_KEY_ID,
         key_fingerprint=INCIDENT_KEY_FINGERPRINT,
         signer=_Signer(),
     )
@@ -927,7 +930,8 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
 
     publisher = object.__new__(AzureBlobIncidentAssetPublisher)
     publisher._container = _Container()
-    publisher._signing_key_id = INCIDENT_KEY_ID
+    publisher._signing_key_id = logical_key_id
+    publisher._signing_key_vault_key_id = INCIDENT_KEY_ID
     publisher._signing_key_fingerprint = INCIDENT_KEY_FINGERPRINT
     publisher._signature_verifier = lambda _payload, _signature: True
 
@@ -936,6 +940,8 @@ def test_incident_publisher_reads_bounded_trusted_current_state() -> None:
     assert snapshot is not None
     assert snapshot.state == state
     assert snapshot.pointer == publication.pointer
+    assert snapshot.pointer.key_id == logical_key_id
+    assert publication.pointer_attestation.key_vault_key_id == INCIDENT_KEY_ID
     assert snapshot.occurrence is not None
     assert requested_lengths == {
         publication.current_pointer_asset.blob_name: (
@@ -2337,6 +2343,8 @@ def test_cli_removed_raw_normalizer_and_requires_incident_trust_boundaries() -> 
             "--managed-identity-client-id",
             "11111111-1111-1111-1111-111111111111",
             "--incident-key-id",
+            INCIDENT_KEY_ID,
+            "--incident-key-vault-key-id",
             INCIDENT_KEY_ID,
             "--incident-key-fingerprint",
             INCIDENT_KEY_FINGERPRINT,

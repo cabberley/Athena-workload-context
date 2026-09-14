@@ -757,6 +757,7 @@ class AzureBlobIncidentAssetPublisher:
         container_name: str,
         managed_identity_client_id: str,
         signing_key_id: str,
+        signing_key_vault_key_id: str,
         signing_key_fingerprint: str,
         signature_verifier: Callable[[bytes, str], bool],
     ) -> None:
@@ -764,8 +765,12 @@ class AzureBlobIncidentAssetPublisher:
         _validate_container_name(container_name)
         if container_name != "incident-assets":
             raise ValueError("container_name must be exactly incident-assets")
-        if not signing_key_id or not re.fullmatch(
+        if (
+            not signing_key_id
+            or not signing_key_vault_key_id
+            or not re.fullmatch(
             r"sha256:[a-f0-9]{64}", signing_key_fingerprint
+            )
         ):
             raise ValueError("incident signing trust anchor is invalid")
         credential = production_managed_identity_credential(
@@ -780,6 +785,7 @@ class AzureBlobIncidentAssetPublisher:
         )
         self._container = service.get_container_client(container_name)
         self._signing_key_id = signing_key_id
+        self._signing_key_vault_key_id = signing_key_vault_key_id
         self._signing_key_fingerprint = signing_key_fingerprint
         self._signature_verifier = signature_verifier
 
@@ -839,7 +845,7 @@ class AzureBlobIncidentAssetPublisher:
         if (
             attestation_payload != attestation.canonical_bytes()
             or attestation.index_digest != sha256_hex(payload)
-            or attestation.key_vault_key_id != self._signing_key_id
+            or attestation.key_vault_key_id != self._signing_key_vault_key_id
             or not self._signature_verifier(
                 payload,
                 attestation.detached_signature,
@@ -938,7 +944,8 @@ class AzureBlobIncidentAssetPublisher:
             or
             pointer_attestation_payload != pointer_attestation.canonical_bytes()
             or pointer_attestation.pointer_digest != sha256_hex(pointer_payload)
-            or pointer_attestation.key_vault_key_id != self._signing_key_id
+            or pointer_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or not self._signature_verifier(
                 pointer_payload,
                 pointer_attestation.detached_signature,
@@ -951,7 +958,8 @@ class AzureBlobIncidentAssetPublisher:
             or state_attestation_payload != state_attestation.canonical_bytes()
             or pointer.attestation_sha256 != sha256_hex(state_attestation_payload)
             or state_attestation.result_digest != state.result_digest
-            or state_attestation.key_vault_key_id != self._signing_key_id
+            or state_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or not self._signature_verifier(
                 state_preimage,
                 state_attestation.detached_signature,
@@ -1006,9 +1014,13 @@ class AzureBlobIncidentAssetPublisher:
         if (
             request.pointer.key_id != self._signing_key_id
             or request.pointer.key_fingerprint != self._signing_key_fingerprint
+            or request.pointer_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or request.active_index.key_id != self._signing_key_id
             or request.active_index.key_fingerprint
             != self._signing_key_fingerprint
+            or request.active_index_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
         ):
             raise ValueError("incident publication trust anchor is invalid")
         build_incident_occurrence_receipt(
@@ -1085,6 +1097,8 @@ class AzureBlobIncidentAssetPublisher:
             request.active_index.key_id != self._signing_key_id
             or request.active_index.key_fingerprint
             != self._signing_key_fingerprint
+            or request.active_index_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
         ):
             raise ValueError("active incident index trust anchor is invalid")
         self._upload_immutable(request.active_index_attestation_asset)

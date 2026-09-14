@@ -54,16 +54,28 @@ param incidentAssetContainerName string
 @description('Logical incident key ID pinned by the gateway and browser.')
 param incidentSigningKeyId string
 
+@description('Exact versioned Key Vault key URI pinned for incident attestations.')
+param incidentSigningKeyVaultKeyId string
+
 @description('SHA-256 fingerprint of the separately pinned incident public key.')
 @minLength(71)
 @maxLength(71)
 param incidentSigningKeyFingerprint string
 
+@description('Resource ID of the dedicated presentation managed identity.')
+param presentationIdentityResourceId string
+
+@description('Client ID of the dedicated presentation managed identity.')
+param presentationIdentityClientId string
+
+@description('Principal ID of the dedicated presentation managed identity.')
+param presentationIdentityPrincipalId string
+
 @description('Resource tags applied to presentation resources.')
 param tags object = {}
 
 var presentationName = '${namePrefix}-presentation'
-var presentationIdentityName = '${namePrefix}-presentation-id'
+var presentationIdentityName = last(split(presentationIdentityResourceId, '/'))
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
@@ -120,19 +132,6 @@ var presentationTags = union(tags, {
   managedBy: 'bicep'
 })
 
-module presentationIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
-  name: 'wc013-presentation-pull-identity'
-  params: {
-    name: presentationIdentityName
-    location: location
-    enableTelemetry: false
-    isolationScope: 'Regional'
-    tags: union(presentationTags, {
-      identityPurpose: 'presentation-acr-pull-and-private-assets-reader'
-    })
-  }
-}
-
 module presentationImagePull './acr-pull-rbac.bicep' = {
   name: 'wc013-presentation-image-pull'
   scope: resourceGroup(
@@ -142,7 +141,7 @@ module presentationImagePull './acr-pull-rbac.bicep' = {
   params: {
     registryName: last(split(presentationImageRegistryResourceId, '/'))
     identityName: presentationIdentityName
-    identityPrincipalId: presentationIdentity.outputs.principalId
+    identityPrincipalId: presentationIdentityPrincipalId
   }
 }
 
@@ -171,13 +170,13 @@ module presentationApp 'br/public:avm/res/app/container-app:0.23.0' = {
     ]
     managedIdentities: {
       userAssignedResourceIds: [
-        presentationIdentity.outputs.resourceId
+        presentationIdentityResourceId
       ]
     }
     registries: [
       {
         server: presentationImageRegistryServer
-        identity: presentationIdentity.outputs.resourceId
+        identity: presentationIdentityResourceId
       }
     ]
     containers: [
@@ -232,19 +231,21 @@ module presentationApp 'br/public:avm/res/app/container-app:0.23.0' = {
           incidentAssetContainerName
           '--incident-key-id'
           incidentSigningKeyId
+          '--incident-key-vault-key-id'
+          incidentSigningKeyVaultKeyId
           '--incident-key-fingerprint'
           incidentSigningKeyFingerprint
           '--incident-public-key'
           '/opt/athena/wc016-incident-public-key.pem'
           '--managed-identity-client-id'
-          presentationIdentity.outputs.clientId
+          presentationIdentityClientId
           '--port'
           '8081'
         ]
         env: [
           {
             name: 'AZURE_CLIENT_ID'
-            value: presentationIdentity.outputs.clientId
+            value: presentationIdentityClientId
           }
         ]
         resources: {
@@ -301,10 +302,10 @@ output fqdn string = presentationApp.outputs.fqdn
 output httpsUrl string = 'https://${presentationApp.outputs.fqdn}'
 
 @description('Resource ID of the presentation AcrPull and presentation-assets Reader identity.')
-output identityResourceId string = presentationIdentity.outputs.resourceId
+output identityResourceId string = presentationIdentityResourceId
 
 @description('Client ID of the presentation AcrPull and presentation-assets Reader identity.')
-output identityClientId string = presentationIdentity.outputs.clientId
+output identityClientId string = presentationIdentityClientId
 
 @description('Principal ID of the presentation AcrPull and presentation-assets Reader identity.')
-output identityPrincipalId string = presentationIdentity.outputs.principalId
+output identityPrincipalId string = presentationIdentityPrincipalId

@@ -242,10 +242,7 @@ def _binding(
     attestation = PublishedGuidanceAuthorityBindingAttestation(
         schemaVersion=("athena.wc027PublishedGuidanceAuthorityBindingAttestation.v2"),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=(
-            "https://synthetic-wc027.vault.azure.net/keys/"
-            "guidance-binding/0123456789abcdef0123456789abcdef"
-        ),
+        keyId="synthetic-key://athena/wc027-guidance-binding-rs256-v2",
         signedPreimageDigest=compute_artifact_digest(_json_value(payload)),
         detachedSignature="c3ludGhldGlj",
     )
