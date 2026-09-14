@@ -76,7 +76,9 @@ The policy is bounded JSON:
     {
       "principalId": "00000000-0000-0000-0000-000000000002",
       "roleDefinitionName": "Log Analytics Reader",
-      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring"
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring",
+      "condition": "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'evidence'",
+      "conditionVersion": "2.0"
     }
   ],
   "allowedBroadAssignments": [
@@ -117,8 +119,9 @@ evaluation, so alternate or noncanonical ARM scope spellings cannot bypass the g
 IDs are likewise structurally checked before their built-in privilege is evaluated. Paginated
 object-form evidence containing a continuation link is rejected as incomplete. Allowances that
 supply both a role name and role ID must agree and must be present in `expectedAssignments`.
-Oversized integer literals and other parser failures are reported as malformed input with exit
-code `3`.
+Authorization-affecting `condition` and `conditionVersion` fields must be supplied together and are
+included in exact inventory and allowance matching. Oversized integer literals and other parser
+failures are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

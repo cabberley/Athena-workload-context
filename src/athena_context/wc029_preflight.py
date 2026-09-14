@@ -76,6 +76,8 @@ class BroadAssignmentAllowance:
     role_name: str
     role_definition_id: str
     scope: str
+    condition: str | None
+    condition_version: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,8 @@ class RbacAssignment:
     role_name: str
     role_definition_id: str
     scope: str
+    condition: str | None
+    condition_version: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +281,8 @@ def _allowance_matches(
         allowance.principal_id == assignment.principal_id
         and allowance.role_name == assignment.role_name
         and allowance.scope == assignment.scope
+        and allowance.condition == assignment.condition
+        and allowance.condition_version == assignment.condition_version
         and (
             not allowance.role_definition_id
             or allowance.role_definition_id == assignment.role_definition_id
@@ -654,13 +660,22 @@ def _unsafe_property_violations(
                 "properties.publicnetworkaccess",
                 "properties.networkacls.defaultaction",
             }
-            and (_enabled(after) or removed)
+            and (
+                removed
+                or not isinstance(after, str)
+                or _normalized(after)
+                != (
+                    "disabled"
+                    if path == "properties.publicnetworkaccess"
+                    else "deny"
+                )
+            )
         ):
             violations.append(
                 PreflightViolation(
                     code="public-data-plane-access",
                     subject=resource_id,
-                    detail=f"public data-plane access enabled at {path}",
+                    detail=f"unsafe public data-plane setting at {path}",
                 )
             )
         if (
@@ -796,6 +811,32 @@ def _parse_rbac_assignment(
         raise PreflightInputError(
             "role assignment requires roleDefinitionName or roleDefinitionId"
         )
+    raw_condition = _get_case_insensitive(assignment, "condition")
+    condition = (
+        None
+        if raw_condition is None
+        else _require_string(
+            raw_condition,
+            field_name="condition",
+        )
+    )
+    raw_condition_version = _get_case_insensitive(
+        assignment,
+        "conditionVersion",
+    )
+    condition_version = (
+        None
+        if raw_condition_version is None
+        else _require_string(
+            raw_condition_version,
+            field_name="conditionVersion",
+            maximum_length=64,
+        )
+    )
+    if (condition is None) != (condition_version is None):
+        raise PreflightInputError(
+            "condition and conditionVersion must be supplied together"
+        )
     return RbacAssignment(
         principal_id=principal_id,
         role_name=canonical_role,
@@ -806,6 +847,8 @@ def _parse_rbac_assignment(
                 field_name="scope",
             )
         ),
+        condition=condition,
+        condition_version=condition_version,
     )
 
 
@@ -839,6 +882,8 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 role_name=parsed_allowance.role_name,
                 role_definition_id=parsed_allowance.role_definition_id,
                 scope=parsed_allowance.scope,
+                condition=parsed_allowance.condition,
+                condition_version=parsed_allowance.condition_version,
             )
             if allowance in allowances:
                 raise PreflightInputError(
@@ -1027,6 +1072,8 @@ def evaluate_role_assignments(
             role_name=assignment.role_name,
             role_definition_id=assignment.role_definition_id,
             scope=assignment.scope,
+            condition=assignment.condition,
+            condition_version=assignment.condition_version,
         )
         for assignment in policy.expected_assignments
     )
@@ -1102,6 +1149,8 @@ def evaluate_role_assignments(
                     role_name=canonical_role,
                     role_definition_id=role_id,
                     scope=scope,
+                    condition=assignment.condition,
+                    condition_version=assignment.condition_version,
                 ),
             )
             for allowance in policy.allowed_broad_assignments

@@ -70,6 +70,8 @@ def _assignment(
     role_name: str | None = "Reader",
     role_id: str | None = None,
     scope: str = _RG_SCOPE,
+    condition: str | None = None,
+    condition_version: str | None = None,
 ) -> dict[str, str]:
     value = {
         "principalId": principal_id,
@@ -79,6 +81,10 @@ def _assignment(
         value["roleDefinitionName"] = role_name
     if role_id is not None:
         value["roleDefinitionId"] = role_id
+    if condition is not None:
+        value["condition"] = condition
+    if condition_version is not None:
+        value["conditionVersion"] = condition_version
     return value
 
 
@@ -512,6 +518,43 @@ def test_what_if_never_allows_unsafe_storage_settings(
     )
 
     assert code in {item.code for item in violations}
+
+
+@pytest.mark.parametrize("resource_id", [_STORAGE_ID, _KEY_VAULT_ID])
+def test_what_if_rejects_network_perimeter_without_perimeter_evidence(
+    resource_id: str,
+) -> None:
+    secured_by_perimeter = _what_if(
+        _change(
+            resource_id,
+            "Modify",
+            path="properties.publicNetworkAccess",
+            after="SecuredByPerimeter",
+        )
+    )
+    disabled = _what_if(
+        _change(
+            resource_id,
+            "Modify",
+            path="properties.publicNetworkAccess",
+            after="Disabled",
+        )
+    )
+
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            secured_by_perimeter,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+    } == {"public-data-plane-access"}
+    assert (
+        evaluate_what_if(
+            disabled,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+        == ()
+    )
 
 
 def test_what_if_rejects_removal_of_protective_storage_settings() -> None:
@@ -1515,6 +1558,109 @@ def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
         "kind": "rbac",
         "safe": False,
     }
+
+
+def test_public_cli_requires_exact_rbac_condition_inventory(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    condition = (
+        "@Resource[Microsoft.Storage/storageAccounts/"
+        "blobServices/containers:name] StringEquals 'evidence'"
+    )
+    conditional_assignment = _assignment(
+        principal_id=principal_id,
+        role_name="Storage Blob Data Reader",
+        scope=(
+            f"{_RG_SCOPE}/providers/Microsoft.Storage/"
+            "storageAccounts/synthetic/blobServices/default/containers/evidence"
+        ),
+        condition=condition,
+        condition_version="2.0",
+    )
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([conditional_assignment]),
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(
+            _production_policy(
+                principal_id,
+                expected_assignments=[conditional_assignment],
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    assert (
+        cli_main(
+            [
+                "wc029-preflight",
+                "rbac",
+                str(assignments_path),
+                "--policy",
+                str(policy_path),
+            ],
+            stdout=stdout,
+            stderr=stderr,
+        )
+        == 0
+    )
+    assert stderr.getvalue() == ""
+
+    assignments_path.write_text(
+        json.dumps(
+            [
+                _assignment(
+                    principal_id=principal_id,
+                    role_name="Storage Blob Data Reader",
+                    scope=conditional_assignment["scope"],
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error": (
+            "role-assignment evidence does not exactly match "
+            "expectedAssignments"
+        ),
+        "kind": "rbac",
+        "safe": False,
+    }
+
+
+def test_rbac_condition_and_version_must_be_supplied_together() -> None:
+    with pytest.raises(PreflightInputError, match="supplied together"):
+        evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="Storage Blob Data Reader",
+                    condition="@Resource[x:y] StringEquals 'z'",
+                )
+            ]
+        )
 
 
 def test_public_cli_rejects_conflicting_allowance_role_name_and_id(
