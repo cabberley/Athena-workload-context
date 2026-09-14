@@ -2038,6 +2038,61 @@ def test_public_cli_requires_role_ids_in_guarded_inventory(tmp_path) -> None:
     )
 
 
+def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    id_only_assignment = _assignment(
+        principal_id=principal_id,
+        role_name=None,
+        role_id=(
+            _ROLE_DEFINITION_PREFIX
+            + "73c42c96-874c-492b-b04d-ab87d138a893"
+        ),
+        scope=(
+            f"{_RG_SCOPE}/providers/"
+            "Microsoft.OperationalInsights/workspaces/synthetic"
+        ),
+    )
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([id_only_assignment]),
+        encoding="utf-8",
+    )
+    policy = {
+        "expectedPrincipalIds": [principal_id],
+        "expectedAssignments": [id_only_assignment],
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["Log Analytics Reader"],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "expectedAssignments require roleDefinitionName\n"
+    )
+
+
 def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     assignment = _guarded_assignment(

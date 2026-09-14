@@ -136,9 +136,10 @@ object-form evidence containing a continuation link is rejected as incomplete. A
 supply both a role name and role ID must agree and must be present in `expectedAssignments`.
 Authorization-affecting `condition` and `conditionVersion` fields must be supplied together and are
 included in exact inventory and allowance matching. Production evidence, expected assignments, and
-broad-assignment allowances require canonical `roleDefinitionId` values. Recognized built-in role
-names must agree with their official IDs; name-only or spoofed-ID entries fail closed. Oversized
-integer literals and other parser failures are reported as malformed input with exit code `3`.
+broad-assignment allowances require both `roleDefinitionName` and a canonical `roleDefinitionId`.
+Recognized built-in role names must agree with their official IDs; name-only, ID-only, or spoofed-ID
+entries fail closed so named separation rules cannot be bypassed. Oversized integer literals and
+other parser failures are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

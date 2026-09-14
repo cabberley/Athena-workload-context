@@ -81,6 +81,7 @@ class BroadAssignmentAllowance:
     scope: str
     condition: str | None
     condition_version: str | None
+    role_name_supplied: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,7 @@ class RbacAssignment:
     scope: str
     condition: str | None
     condition_version: str | None
+    role_name_supplied: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +315,7 @@ def _allowance_matches(
         and allowance.scope == assignment.scope
         and allowance.condition == assignment.condition
         and allowance.condition_version == assignment.condition_version
+        and allowance.role_name_supplied == assignment.role_name_supplied
         and (
             not allowance.role_definition_id
             or allowance.role_definition_id == assignment.role_definition_id
@@ -1206,6 +1209,7 @@ def _parse_rbac_assignment(
         ),
         condition=condition,
         condition_version=condition_version,
+        role_name_supplied=raw_role_name is not None,
     )
 
 
@@ -1241,6 +1245,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 scope=parsed_allowance.scope,
                 condition=parsed_allowance.condition,
                 condition_version=parsed_allowance.condition_version,
+                role_name_supplied=parsed_allowance.role_name_supplied,
             )
             if allowance in allowances:
                 raise PreflightInputError(
@@ -1401,11 +1406,25 @@ def evaluate_role_assignments(
             "expectedAssignments require roleDefinitionId"
         )
     if require_separation_rules and any(
+        not assignment.role_name_supplied
+        for assignment in policy.expected_assignments
+    ):
+        raise PreflightInputError(
+            "expectedAssignments require roleDefinitionName"
+        )
+    if require_separation_rules and any(
         not allowance.role_definition_id
         for allowance in policy.allowed_broad_assignments
     ):
         raise PreflightInputError(
             "allowedBroadAssignments require roleDefinitionId"
+        )
+    if require_separation_rules and any(
+        not allowance.role_name_supplied
+        for allowance in policy.allowed_broad_assignments
+    ):
+        raise PreflightInputError(
+            "allowedBroadAssignments require roleDefinitionName"
         )
     rule_principal_ids = frozenset(
         rule.principal_id for rule in policy.separation_rules
@@ -1445,6 +1464,7 @@ def evaluate_role_assignments(
             scope=assignment.scope,
             condition=assignment.condition,
             condition_version=assignment.condition_version,
+            role_name_supplied=assignment.role_name_supplied,
         )
         for assignment in policy.expected_assignments
     )
@@ -1484,6 +1504,12 @@ def evaluate_role_assignments(
     ):
         raise PreflightInputError(
             "role-assignment evidence requires roleDefinitionId"
+        )
+    if require_separation_rules and any(
+        not assignment.role_name_supplied for assignment in assignments
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence requires roleDefinitionName"
         )
     if (
         require_separation_rules
@@ -1528,6 +1554,7 @@ def evaluate_role_assignments(
                     scope=scope,
                     condition=assignment.condition,
                     condition_version=assignment.condition_version,
+                    role_name_supplied=assignment.role_name_supplied,
                 ),
             )
             for allowance in policy.allowed_broad_assignments
