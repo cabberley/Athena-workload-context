@@ -74,6 +74,7 @@ class PreflightViolation:
 class BroadAssignmentAllowance:
     principal_id: str
     role_name: str
+    role_definition_id: str
     scope: str
 
 
@@ -189,6 +190,7 @@ def _canonical_role_id(value: str) -> str:
     segments = canonical.strip("/").split("/")
     if (
         len(segments) < 4
+        or segments[-4] != "providers"
         or segments[-3] != "microsoft.authorization"
         or segments[-2] != "roledefinitions"
         or _GUID.fullmatch(segments[-1]) is None
@@ -264,6 +266,21 @@ def _scope_contains(ancestor: str, descendant: str) -> bool:
         ancestor == "/"
         or descendant == ancestor
         or descendant.startswith(ancestor + "/")
+    )
+
+
+def _allowance_matches(
+    allowance: BroadAssignmentAllowance,
+    assignment: BroadAssignmentAllowance,
+) -> bool:
+    return (
+        allowance.principal_id == assignment.principal_id
+        and allowance.role_name == assignment.role_name
+        and allowance.scope == assignment.scope
+        and (
+            not allowance.role_definition_id
+            or allowance.role_definition_id == assignment.role_definition_id
+        )
     )
 
 
@@ -820,6 +837,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             allowance = BroadAssignmentAllowance(
                 principal_id=parsed_allowance.principal_id,
                 role_name=parsed_allowance.role_name,
+                role_definition_id=parsed_allowance.role_definition_id,
                 scope=parsed_allowance.scope,
             )
             if allowance in allowances:
@@ -1007,13 +1025,20 @@ def evaluate_role_assignments(
         BroadAssignmentAllowance(
             principal_id=assignment.principal_id,
             role_name=assignment.role_name,
+            role_definition_id=assignment.role_definition_id,
             scope=assignment.scope,
         )
         for assignment in policy.expected_assignments
     )
     if (
         require_separation_rules
-        and not policy.allowed_broad_assignments.issubset(expected_allowances)
+        and not all(
+            any(
+                _allowance_matches(allowance, expected)
+                for expected in expected_allowances
+            )
+            for allowance in policy.allowed_broad_assignments
+        )
     ):
         raise PreflightInputError(
             "allowedBroadAssignments must be listed in expectedAssignments"
@@ -1069,13 +1094,17 @@ def evaluate_role_assignments(
             or _RESOURCE_GROUP_SCOPE.fullmatch(scope) is not None
             or _MANAGEMENT_GROUP_SCOPE.fullmatch(scope) is not None
         )
-        allowed = (
-            BroadAssignmentAllowance(
-                principal_id=principal_id,
-                role_name=canonical_role,
-                scope=scope,
+        allowed = any(
+            _allowance_matches(
+                allowance,
+                BroadAssignmentAllowance(
+                    principal_id=principal_id,
+                    role_name=canonical_role,
+                    role_definition_id=role_id,
+                    scope=scope,
+                ),
             )
-            in policy.allowed_broad_assignments
+            for allowance in policy.allowed_broad_assignments
         )
         if (
             (canonical_role in _BROAD_ROLES or role_id in _BROAD_ROLE_IDS)

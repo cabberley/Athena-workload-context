@@ -702,6 +702,70 @@ def test_rbac_trailing_slash_role_id_cannot_hide_privileged_role() -> None:
         )
 
 
+def test_rbac_rejects_role_id_without_authorization_provider_boundary() -> None:
+    malformed_role_id = (
+        "/providers/Contoso.Fake/things/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="Microsoft.Authorization role definition",
+    ):
+        evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="Owner",
+                    role_id=malformed_role_id,
+                    scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+                )
+            ]
+        )
+
+
+def test_rbac_accepts_root_authorization_provider_role_id() -> None:
+    owner_role_id = (
+        "/providers/Microsoft.Authorization/roleDefinitions/"
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    )
+
+    assert {
+        item.code
+        for item in evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="Owner",
+                    role_id=owner_role_id,
+                    scope="/",
+                )
+            ]
+        )
+    } == {"broad-role-assignment"}
+
+
+def test_rbac_name_only_allowance_matches_canonical_builtin_role_id() -> None:
+    owner_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    )
+    assignment = _assignment(
+        role_name="Owner",
+        role_id=owner_role_id,
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+    allowance = _assignment(
+        role_name="Owner",
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+
+    assert evaluate_role_assignments(
+        [assignment],
+        policy_document={"allowedBroadAssignments": [allowance]},
+    ) == ()
+
+
 def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"
@@ -1507,6 +1571,68 @@ def test_public_cli_rejects_conflicting_allowance_role_name_and_id(
     assert stderr.getvalue() == (
         "WC-029 preflight rbac failed: "
         "roleDefinitionName and roleDefinitionId conflict\n"
+    )
+
+
+def test_public_cli_requires_allowance_role_id_to_match_inventory(
+    tmp_path,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    expected_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
+    different_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    )
+    owner_assignment = _assignment(
+        principal_id=principal_id,
+        role_name="Owner",
+        role_id=expected_role_id,
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([owner_assignment]),
+        encoding="utf-8",
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[owner_assignment],
+    )
+    policy["allowedBroadAssignments"] = [
+        _assignment(
+            principal_id=principal_id,
+            role_name="Owner",
+            role_id=different_role_id,
+            scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+        )
+    ]
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "allowedBroadAssignments must be listed in expectedAssignments\n"
     )
 
 
