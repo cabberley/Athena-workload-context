@@ -665,8 +665,29 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "length(signalReaderRoleDefinition.properties.permissions) == 1" in (
         WORKLOAD_READER_RBAC
     )
-    assert "scope: flowLog" in NETWORK_WATCHER_READER_RBAC
-    assert "scope: networkWatcher" not in NETWORK_WATCHER_READER_RBAC
+    flow_log_assignment = NETWORK_WATCHER_READER_RBAC.split(
+        "resource collectorFlowLogReader",
+        maxsplit=1,
+    )[1].split("resource collectorIpFlowVerifier", maxsplit=1)[0]
+    assert "scope: flowLog" in flow_log_assignment
+    assert "roleDefinitionId: readerRoleDefinitionId" in flow_log_assignment
+    assert "scope: networkWatcher" not in flow_log_assignment
+    ip_flow_assignment = NETWORK_WATCHER_READER_RBAC.split(
+        "resource collectorIpFlowVerifier",
+        maxsplit=1,
+    )[1].split("output readerRoleDefinitionId", maxsplit=1)[0]
+    assert "scope: networkWatcher" in ip_flow_assignment
+    assert "roleDefinitionId: ipFlowVerifyRoleDefinition.id" in ip_flow_assignment
+    assert "roleDefinitionId: readerRoleDefinitionId" not in ip_flow_assignment
+    assert "Microsoft.Network/networkWatchers/ipFlowVerify/action" in (
+        NETWORK_WATCHER_READER_RBAC
+    )
+    assert "Microsoft.Network/networkWatchers/ipFlowVerify/read" in (
+        NETWORK_WATCHER_READER_RBAC
+    )
+    assert "assignableScopes: [\n      resourceGroup().id\n    ]" in (
+        NETWORK_WATCHER_READER_RBAC
+    )
     combined_rbac = READER_RBAC + WORKLOAD_READER_RBAC + NETWORK_WATCHER_READER_RBAC
     assert "Owner" not in combined_rbac
     assert "Contributor" not in combined_rbac
@@ -674,12 +695,13 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     for forbidden_identity in ("context", "presentation", "correlation", "mcp"):
         assert forbidden_identity not in combined_rbac.lower()
     assert "collectorIdentity.properties.principalId" in EVIDENCE_SEAMS
+    assert "collectorIdentity.properties.tenantId" in EVIDENCE_SEAMS
     assert "scope: monitoringEvidenceContainer" in EVIDENCE_SEAMS
     assert "scope: signingKey" in EVIDENCE_SEAMS
     assert "listKeys" not in EVIDENCE_SEAMS
 
 
-def test_wc024_uses_exact_resource_scopes_without_creating_a_custom_role() -> None:
+def test_wc024_uses_exact_resource_scopes_with_one_narrow_ip_flow_role() -> None:
     assert "workloadSubscriptionId" not in MAIN
     assert "networkWatcherSubscriptionId" not in MAIN
     assert "collectorRoleDefinitionGuid" not in MAIN
@@ -696,6 +718,9 @@ def test_wc024_uses_exact_resource_scopes_without_creating_a_custom_role() -> No
     assert "targetScope = 'resourceGroup'" in READER_RBAC
     assert "targetScope = 'resourceGroup'" in WORKLOAD_READER_RBAC
     assert "targetScope = 'resourceGroup'" in NETWORK_WATCHER_READER_RBAC
+    assert "ipFlowVerifyRoleDefinitionGuid = '3728cdf6-4efd-5282-bdfc-63b7872fd801'" in (
+        NETWORK_WATCHER_READER_RBAC
+    )
     assert "scope: resourceGroup(workloadResourceGroupName)" in MAIN
     assert "scope: resourceGroup(networkWatcherResourceGroupName)" in MAIN
     workload_assignment = MAIN.split(
@@ -728,6 +753,16 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     )
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v4" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringAcquisitionReceipt.v3" in COLLECTOR_CONTRACT
+    assert "ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "ipFlowVerifyScopeId: ipFlowVerifyScopeId" in COLLECTOR_CONTRACT
+    assert "ipFlowVerifyAllowedOperations: ipFlowVerifyAllowedOperations" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "collectorTenantId: collectorTenantId" in COLLECTOR_CONTRACT
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
     assert "'workspaceAndResourceContext'" in MAIN
     assert "'workspaceOnly'" in MAIN

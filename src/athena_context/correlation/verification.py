@@ -160,12 +160,6 @@ class TrustedMonitoringHandoffVerifier:
     trusted_key_anchor: TrustedKeyAnchor
     key_resolver: KeyVaultTrustedKeyResolver
     expected_acquisition_authority_digest: str | None = None
-    expected_authenticated_principal_id: str | None = None
-    expected_monitoring_reader_identity_id: str | None = None
-    expected_athena_context_identity_id: str | None = None
-    expected_athena_context_principal_id: str | None = None
-    expected_deployment_identity_contract_digest: str | None = None
-    expected_receipt_signing_key_id: str | None = None
     acquisition_receipt_maximum_age_seconds: int = 900
     receipt_trusted_key_anchor: TrustedKeyAnchor | None = None
     receipt_key_resolver: KeyVaultTrustedKeyResolver | None = None
@@ -204,22 +198,12 @@ class TrustedMonitoringHandoffVerifier:
         *,
         as_of: UtcDateTime,
     ) -> str:
-        if (
-            self.expected_acquisition_authority_digest is None
-            or self.expected_authenticated_principal_id is None
-            or self.expected_monitoring_reader_identity_id is None
-            or self.expected_athena_context_identity_id is None
-            or self.expected_athena_context_principal_id is None
-            or self.expected_deployment_identity_contract_digest is None
-            or self.expected_receipt_signing_key_id is None
-        ):
-            raise ValueError(
-                "production acquisition verification requires deployed identity policy"
-            )
+        if self.expected_acquisition_authority_digest is None:
+            raise ValueError("production acquisition verification requires deployed authority")
         receipt_anchor = self.receipt_trusted_key_anchor
         receipt_resolver = self.receipt_key_resolver
         if receipt_anchor is None or receipt_resolver is None:
-            if self.expected_receipt_signing_key_id.casefold().rstrip(
+            if self.reviewed_contract.signing_key_resource_id.casefold().rstrip(
                 "/"
             ) != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/"):
                 raise ValueError("distinct receipt signing key requires a dedicated trusted anchor")
@@ -230,18 +214,8 @@ class TrustedMonitoringHandoffVerifier:
             as_of=as_of,
             trusted_key_anchor=receipt_anchor,
             key_resolver=receipt_resolver,
+            reviewed_collector_contract=self.reviewed_contract,
             expected_acquisition_authority_digest=(self.expected_acquisition_authority_digest),
-            expected_authenticated_principal_id=(self.expected_authenticated_principal_id),
-            expected_monitoring_reader_identity_id=(self.expected_monitoring_reader_identity_id),
-            expected_athena_context_identity_id=(self.expected_athena_context_identity_id),
-            expected_athena_context_principal_id=(self.expected_athena_context_principal_id),
-            expected_deployment_identity_contract_digest=(
-                self.expected_deployment_identity_contract_digest
-            ),
-            expected_collector_contract_digest=(
-                self.reviewed_contract.compute_artifact_digest_value()
-            ),
-            expected_receipt_signing_key_id=self.expected_receipt_signing_key_id,
             maximum_receipt_age_seconds=(self.acquisition_receipt_maximum_age_seconds),
         )
         return receipt.receipt_digest

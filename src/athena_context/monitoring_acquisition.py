@@ -3,19 +3,26 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 
+import jwt
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from athena_context.azure_adapters import production_managed_identity_credential
 from athena_context.contracts import (
+    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     CorrelationRequest,
+    EvidenceCoverageScope,
     LogQueryMonitoringSignal,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
+    MonitoringCollectorContract,
+    MonitoringCredentialProof,
     MonitoringEvidenceAttestation,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
@@ -54,6 +61,20 @@ MAX_ACQUISITION_RESPONSE_BYTES = 256 * 1024
 MAX_ACQUISITION_WINDOW_SECONDS = 86400
 MAX_ACQUISITION_CALLS = 32
 EVENT_LOOKBACK_SECONDS = 900
+_ARM_SCOPE = "https://management.azure.com/.default"
+_ARM_AUDIENCES = (
+    "https://management.azure.com/",
+    "https://management.core.windows.net/",
+)
+_LOG_ANALYTICS_SCOPE = "https://api.loganalytics.io/.default"
+_LOG_ANALYTICS_AUDIENCES = (
+    "https://api.loganalytics.io",
+    "https://api.loganalytics.io/",
+)
+_MAX_ACCESS_TOKEN_BYTES = 32 * 1024
+_MAX_ACCESS_TOKEN_LIFETIME_SECONDS = 28 * 60 * 60
+_MIN_ARM_ACCESS_TOKEN_REMAINING_SECONDS = 30
+_COMPACT_JWT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 _READER_IDENTITY_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/"
     r"providers/microsoft\.managedidentity/userassignedidentities/[a-z0-9-_]{1,128}$"
@@ -153,6 +174,18 @@ type AcquisitionSource = Literal[
 ]
 
 
+def _credential_scope_for_source(source: AcquisitionSource) -> str:
+    return _LOG_ANALYTICS_SCOPE if source == "logAnalytics" else _ARM_SCOPE
+
+
+def _credential_audiences_for_scope(scope: str) -> tuple[str, ...]:
+    if scope == _ARM_SCOPE:
+        return _ARM_AUDIENCES
+    if scope == _LOG_ANALYTICS_SCOPE:
+        return _LOG_ANALYTICS_AUDIENCES
+    raise MonitoringAcquisitionError("monitoring source requested an unreviewed token scope")
+
+
 class MonitoringAcquisitionError(RuntimeError):
     """Raised when evidence cannot be acquired without weakening the reviewed boundary."""
 
@@ -170,12 +203,35 @@ class _StrictAcquisitionModel(AthenaBaseModel):
         return (self.canonical_json() + "\n").encode("utf-8")
 
 
+class MonitoringAcquisitionControlBinding(_StrictAcquisitionModel):
+    """Authority-reviewed one-to-one binding from a control to required coverage."""
+
+    control_id: str = Field(
+        alias="controlId",
+        pattern=r"^monitoring-control-[a-f0-9]{32}$",
+    )
+    control_digest: Sha256Digest = Field(alias="controlDigest")
+    scope_digest: Sha256Digest = Field(alias="scopeDigest")
+    coverage_scope: EvidenceCoverageScope = Field(alias="coverageScope")
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> MonitoringAcquisitionControlBinding:
+        if self.coverage_scope.query_scope_digest != self.control_digest:
+            raise ValueError("control binding coverage does not bind the control digest")
+        return self
+
+    @property
+    def coverage_scope_digest(self) -> Sha256Digest:
+        return self.coverage_scope.scope_digest
+
+
 class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     """Digest-pinned authorization for the read-only monitoring acquisition boundary."""
 
     schema_version: Literal[
         "athena.wc028MonitoringAcquisitionAuthority.v1",
         "athena.wc028MonitoringAcquisitionAuthority.v2",
+        "athena.wc028MonitoringAcquisitionAuthority.v3",
     ] = Field(alias="schemaVersion")
     authority_id: str = Field(
         alias="authorityId",
@@ -184,6 +240,14 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     monitoring_reader_identity_id: str = Field(alias="monitoringReaderIdentityId")
     monitoring_reader_principal_id: str | None = Field(
         default=None, alias="monitoringReaderPrincipalId"
+    )
+    monitoring_reader_client_id: str | None = Field(
+        default=None,
+        alias="monitoringReaderClientId",
+    )
+    monitoring_reader_tenant_id: str | None = Field(
+        default=None,
+        alias="monitoringReaderTenantId",
     )
     athena_context_identity_id: str = Field(alias="athenaContextIdentityId")
     athena_context_principal_id: str | None = Field(default=None, alias="athenaContextPrincipalId")
@@ -203,6 +267,26 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         alias="requiredControlIds",
         min_length=1,
         max_length=128,
+    )
+    required_control_bindings: tuple[MonitoringAcquisitionControlBinding, ...] | None = Field(
+        default=None,
+        alias="requiredControlBindings",
+        min_length=1,
+        max_length=100,
+    )
+    context_binding_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="contextBindingDigest",
+    )
+    required_coverage_scope_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="requiredCoverageScopeDigests",
+        min_length=1,
+        max_length=100,
+    )
+    control_selection_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="controlSelectionDigest",
     )
     max_rows: Literal[500] = Field(alias="maxRows")
     max_bytes: Literal[262144] = Field(alias="maxBytes")
@@ -243,7 +327,12 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     def validate_identity(cls, value: str) -> str:
         return _canonical_identity_id(value)
 
-    @field_validator("monitoring_reader_principal_id", "athena_context_principal_id")
+    @field_validator(
+        "monitoring_reader_principal_id",
+        "monitoring_reader_client_id",
+        "monitoring_reader_tenant_id",
+        "athena_context_principal_id",
+    )
     @classmethod
     def validate_principal(cls, value: str | None) -> str | None:
         if value is None:
@@ -261,6 +350,18 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     ) -> tuple[AcquisitionSource, ...]:
         if values != tuple(sorted(values)) or len(values) != len(set(values)):
             raise ValueError("acquisition sources must be sorted and unique")
+        return values
+
+    @field_validator("required_coverage_scope_digests")
+    @classmethod
+    def validate_coverage_scope_digests(
+        cls,
+        values: tuple[Sha256Digest, ...] | None,
+    ) -> tuple[Sha256Digest, ...] | None:
+        if values is None:
+            return None
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("required coverage scope digests must be sorted and unique")
         return values
 
     @field_validator("allowed_resource_ids")
@@ -301,13 +402,67 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             self.athena_context_principal_id,
             self.required_control_ids,
         )
+        credential_and_scope_fields = (
+            self.monitoring_reader_client_id,
+            self.monitoring_reader_tenant_id,
+            self.context_binding_digest,
+            self.required_coverage_scope_digests,
+            self.required_control_bindings,
+            self.control_selection_digest,
+        )
         if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1":
-            if any(item is not None for item in receipt_fields):
+            if any(item is not None for item in (*receipt_fields, *credential_and_scope_fields)):
                 raise ValueError("v1 acquisition authority cannot contain receipt policy")
-        elif any(item is None for item in receipt_fields):
-            raise ValueError("v2 acquisition authority requires receipt policy")
-        deployment_digest = compute_artifact_digest(
-            {
+        elif self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2":
+            if any(item is None for item in receipt_fields) or any(
+                item is not None for item in credential_and_scope_fields
+            ):
+                raise ValueError("v2 acquisition authority requires only legacy receipt policy")
+        elif any(item is None for item in (*receipt_fields, *credential_and_scope_fields)):
+            raise ValueError(
+                "v3 acquisition authority requires credential and runtime-scope policy"
+            )
+        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3":
+            required_control_ids = cast(tuple[str, ...], self.required_control_ids)
+            required_coverage = cast(
+                tuple[Sha256Digest, ...],
+                self.required_coverage_scope_digests,
+            )
+            bindings = cast(
+                tuple[MonitoringAcquisitionControlBinding, ...],
+                self.required_control_bindings,
+            )
+            binding_control_ids = tuple(item.control_id for item in bindings)
+            binding_coverage = tuple(sorted(item.coverage_scope_digest for item in bindings))
+            if (
+                bindings != tuple(sorted(bindings, key=lambda item: item.control_id))
+                or binding_control_ids != required_control_ids
+                or binding_coverage != required_coverage
+                or len(binding_coverage) != len(set(binding_coverage))
+            ):
+                raise ValueError(
+                    "required control bindings must exactly cover runtime coverage scopes"
+                )
+            expected_selection_digest = compute_artifact_digest(
+                {
+                    "contextBindingDigest": self.context_binding_digest,
+                    "requiredCoverageScopeDigests": list(required_coverage),
+                    "requiredControlBindings": [
+                        item.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
+                        for item in bindings
+                    ],
+                }
+            )
+            if self.control_selection_digest != expected_selection_digest:
+                raise ValueError(
+                    "controlSelectionDigest does not bind required controls and coverage"
+                )
+        if self.schema_version != "athena.wc028MonitoringAcquisitionAuthority.v1":
+            deployment_payload: dict[str, object] = {
                 "monitoringReaderIdentityId": self.monitoring_reader_identity_id,
                 "monitoringReaderPrincipalId": self.monitoring_reader_principal_id,
                 "athenaContextIdentityId": self.athena_context_identity_id,
@@ -318,12 +473,21 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 "athenaContextHasWorkloadReader": self.athena_context_has_workload_reader,
                 "readOnly": self.read_only,
             }
-        )
-        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2" and (
-            self.monitoring_reader_principal_id == self.athena_context_principal_id
-            or self.deployment_identity_contract_digest != deployment_digest
-        ):
-            raise ValueError("deploymentIdentityContractDigest does not bind identity separation")
+            if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3":
+                deployment_payload.update(
+                    {
+                        "monitoringReaderClientId": self.monitoring_reader_client_id,
+                        "monitoringReaderTenantId": self.monitoring_reader_tenant_id,
+                    }
+                )
+            deployment_digest = compute_artifact_digest(deployment_payload)
+            if (
+                self.monitoring_reader_principal_id == self.athena_context_principal_id
+                or self.deployment_identity_contract_digest != deployment_digest
+            ):
+                raise ValueError(
+                    "deploymentIdentityContractDigest does not bind identity separation"
+                )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -380,6 +544,38 @@ def _json_value(value: object) -> object:
     if isinstance(value, dict):
         return {key: _json_value(item) for key, item in value.items() if item is not None}
     return value
+
+
+def compute_monitoring_acquisition_control_selection_digest(
+    context_binding: PublishedRuntimeContextBinding,
+    bindings: tuple[MonitoringAcquisitionControlBinding, ...],
+) -> str:
+    """Bind the current context, required coverage, and exact selected controls."""
+
+    if type(context_binding) is not PublishedRuntimeContextBinding:
+        raise TypeError("control selection requires an exact published runtime context binding")
+    if (
+        not bindings
+        or bindings != tuple(sorted(bindings, key=lambda item: item.control_id))
+        or len({item.control_id for item in bindings}) != len(bindings)
+        or tuple(sorted(item.coverage_scope_digest for item in bindings))
+        != context_binding.required_coverage_scope_digests
+    ):
+        raise ValueError("control bindings must be sorted, unique, and exactly cover runtime scope")
+    return compute_artifact_digest(
+        {
+            "contextBindingDigest": context_binding.binding_digest,
+            "requiredCoverageScopeDigests": list(context_binding.required_coverage_scope_digests),
+            "requiredControlBindings": [
+                item.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for item in bindings
+            ],
+        }
+    )
 
 
 def _request_digest(model: _StrictAcquisitionModel) -> str:
@@ -952,40 +1148,395 @@ class ResourceHealthQueryResult(_AcquisitionResult):
 
 
 class MonitoringAcquisitionPort(Protocol):
-    """Read-only port implemented behind the dedicated monitoring evidence identity."""
+    """Bearer-token-only Azure source port; it cannot select or assert an identity."""
 
     def query_log_analytics(
         self,
         request: LogAnalyticsQueryRequest,
+        *,
+        access_token: str,
     ) -> LogAnalyticsQueryResult: ...
 
     def query_activity_log(
         self,
         request: ActivityLogQueryRequest,
+        *,
+        access_token: str,
     ) -> ActivityLogQueryResult: ...
 
     def query_resource_graph_changes(
         self,
         request: ResourceGraphChangeQueryRequest,
+        *,
+        access_token: str,
     ) -> ResourceGraphChangeQueryResult: ...
 
     def query_resource_health(
         self,
         request: ResourceHealthQueryRequest,
+        *,
+        access_token: str,
     ) -> ResourceHealthQueryResult: ...
 
     def query_ip_flow_verify(
         self,
         request: IpFlowVerifyRequest,
+        *,
+        access_token: str,
     ) -> IpFlowVerifyResult: ...
 
 
-class MonitoringAcquisitionRuntime(Protocol):
-    """Trusted collector runtime, not the source port or request caller."""
+class _AccessToken(Protocol):
+    token: str
+    expires_on: int
 
-    def authenticated_principal_id(self) -> str: ...
 
-    def utc_now(self) -> datetime: ...
+class _TokenCredential(Protocol):
+    def get_token(self, *scopes: str, **kwargs: Any) -> _AccessToken: ...
+
+
+def _system_utc_now() -> datetime:
+    value = datetime.now(UTC)
+    return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+
+def _verified_managed_identity_proof(
+    access_token: _AccessToken,
+    *,
+    reviewed_contract: MonitoringCollectorContract,
+    allowed_audiences: tuple[str, ...],
+    verified_at: datetime,
+) -> MonitoringCredentialProof:
+    token = access_token.token
+    if (
+        type(token) is not str
+        or not token
+        or token != token.strip()
+        or len(token.encode("ascii", errors="ignore")) > _MAX_ACCESS_TOKEN_BYTES
+        or _COMPACT_JWT_PATTERN.fullmatch(token) is None
+    ):
+        raise MonitoringAcquisitionError(
+            "managed identity returned an invalid bounded service access token"
+        )
+    expected_tenant_id = cast(str, reviewed_contract.collector_tenant_id).casefold()
+    expected_principal_id = cast(
+        str,
+        reviewed_contract.monitoring_reader_principal_id,
+    ).casefold()
+    expected_client_id = reviewed_contract.collector_identity_client_id.casefold()
+    try:
+        header = jwt.get_unverified_header(token)
+        unverified_claims = jwt.decode(
+            token,
+            options={"verify_signature": False},
+        )
+        issuer = unverified_claims.get("iss")
+        if not isinstance(issuer, str):
+            raise ValueError("ARM token issuer is missing")
+        allowed_issuers = {
+            f"https://login.microsoftonline.com/{expected_tenant_id}/v2.0",
+            f"https://sts.windows.net/{expected_tenant_id}/",
+        }
+        if issuer not in allowed_issuers:
+            raise ValueError("ARM token issuer does not match the reviewed tenant")
+        key_path = "discovery/v2.0/keys" if issuer.endswith("/v2.0") else "discovery/keys"
+        signing_key = (
+            jwt.PyJWKClient(
+                f"https://login.microsoftonline.com/{expected_tenant_id}/{key_path}",
+                cache_keys=True,
+            )
+            .get_signing_key_from_jwt(token)
+            .key
+        )
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=list(allowed_audiences),
+            issuer=issuer,
+            options={
+                "require": [
+                    "aud",
+                    "exp",
+                    "iat",
+                    "iss",
+                    "nbf",
+                    "oid",
+                    "sub",
+                    "tid",
+                ],
+                "verify_exp": False,
+                "verify_iat": False,
+                "verify_nbf": False,
+            },
+        )
+    except (jwt.PyJWTError, UnicodeError, ValueError, KeyError) as exc:
+        raise MonitoringAcquisitionError(
+            "managed identity service token cryptographic verification failed"
+        ) from exc
+    kid = header.get("kid")
+    audience = claims.get("aud")
+    subject = claims.get("sub")
+    principal_id = claims.get("oid")
+    tenant_id = claims.get("tid")
+    client_claims = tuple(
+        value for value in (claims.get("appid"), claims.get("azp")) if value is not None
+    )
+    timestamp_claims = tuple(claims.get(name) for name in ("iat", "nbf", "exp"))
+    if (
+        header.get("alg") != "RS256"
+        or header.get("typ") != "JWT"
+        or not isinstance(kid, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{8,256}", kid) is None
+        or not isinstance(audience, str)
+        or audience not in allowed_audiences
+        or not isinstance(subject, str)
+        or not isinstance(principal_id, str)
+        or not isinstance(tenant_id, str)
+        or not client_claims
+        or any(not isinstance(value, str) for value in client_claims)
+        or len({cast(str, value).casefold() for value in client_claims}) != 1
+        or any(type(value) is not int for value in timestamp_claims)
+    ):
+        raise MonitoringAcquisitionError("managed identity service token claims are invalid")
+    client_id = cast(str, client_claims[0]).casefold()
+    principal_id = principal_id.casefold()
+    tenant_id = tenant_id.casefold()
+    subject = subject.casefold()
+    if (
+        tenant_id != expected_tenant_id
+        or principal_id != expected_principal_id
+        or client_id != expected_client_id
+        or subject not in {expected_principal_id, expected_client_id}
+    ):
+        raise MonitoringAcquisitionError(
+            "managed identity service token does not match the reviewed collector identity"
+        )
+    issued_at = datetime.fromtimestamp(cast(int, claims["iat"]), tz=UTC)
+    not_before = datetime.fromtimestamp(cast(int, claims["nbf"]), tz=UTC)
+    expires_at = datetime.fromtimestamp(cast(int, claims["exp"]), tz=UTC)
+    if (
+        type(access_token.expires_on) is not int
+        or access_token.expires_on != cast(int, claims["exp"])
+        or not issued_at <= not_before <= verified_at < expires_at
+        or (expires_at - issued_at).total_seconds() > _MAX_ACCESS_TOKEN_LIFETIME_SECONDS
+        or (expires_at - verified_at).total_seconds() < _MIN_ARM_ACCESS_TOKEN_REMAINING_SECONDS
+    ):
+        raise MonitoringAcquisitionError(
+            "managed identity service token is outside its reviewed lifetime"
+        )
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringCredentialProof.v1",
+        "tenantId": tenant_id,
+        "principalId": principal_id,
+        "clientId": client_id,
+        "subject": subject,
+        "issuer": issuer,
+        "audience": audience,
+        "tokenHash": sha256_hex(token.encode("ascii")),
+        "keyId": kid,
+        "issuedAt": issued_at,
+        "notBefore": not_before,
+        "expiresAt": expires_at,
+        "verifiedAt": verified_at,
+    }
+    return MonitoringCredentialProof.model_validate(
+        {
+            **payload,
+            "proofDigest": compute_artifact_digest(_json_value(payload)),
+        }
+    )
+
+
+class CredentialBoundMonitoringAcquisitionAdapter:
+    """Use one verified managed-identity token for proof and every Azure source call."""
+
+    def __init__(
+        self,
+        *,
+        reviewed_collector_contract: MonitoringCollectorContract,
+        acquisition_port: MonitoringAcquisitionPort,
+        credential: _TokenCredential | None = None,
+        utc_now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if type(reviewed_collector_contract) is not MonitoringCollectorContract:
+            raise TypeError("credential-bound acquisition requires an exact collector contract")
+        self._reviewed_contract = MonitoringCollectorContract.model_validate_json(
+            reviewed_collector_contract.model_dump_json(by_alias=True)
+        )
+        if (
+            self._reviewed_contract.schema_version
+            != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+        ):
+            raise MonitoringAcquisitionError(
+                "credential-bound acquisition requires collector contract schema v4"
+            )
+        self._acquisition_port = acquisition_port
+        self._credential: _TokenCredential = cast(
+            _TokenCredential,
+            (
+                production_managed_identity_credential(
+                    managed_identity_client_id=(
+                        self._reviewed_contract.collector_identity_client_id
+                    )
+                )
+                if credential is None
+                else credential
+            ),
+        )
+        self._utc_now = _system_utc_now if utc_now is None else utc_now
+
+    @property
+    def reviewed_collector_contract(self) -> MonitoringCollectorContract:
+        return self._reviewed_contract
+
+    def _establish_session(
+        self,
+        *,
+        required_sources: tuple[AcquisitionSource, ...],
+    ) -> _CredentialBoundMonitoringAcquisitionSession:
+        if (
+            not required_sources
+            or required_sources != tuple(sorted(required_sources))
+            or len(required_sources) != len(set(required_sources))
+        ):
+            raise MonitoringAcquisitionError(
+                "credential session requires sorted unique acquisition sources"
+            )
+        verified_at = _trusted_runtime_time(self._utc_now())
+        required_scopes = tuple(
+            sorted({_credential_scope_for_source(source) for source in required_sources})
+        )
+        bound_tokens: list[_CredentialBoundToken] = []
+        try:
+            for scope in required_scopes:
+                access_token = self._credential.get_token(scope)
+                proof = _verified_managed_identity_proof(
+                    access_token,
+                    reviewed_contract=self._reviewed_contract,
+                    allowed_audiences=_credential_audiences_for_scope(scope),
+                    verified_at=verified_at,
+                )
+                bound_tokens.append(
+                    _CredentialBoundToken(
+                        scope=scope,
+                        access_token=access_token.token,
+                        credential_proof=proof,
+                    )
+                )
+        except MonitoringAcquisitionError:
+            raise
+        except Exception as exc:
+            raise MonitoringAcquisitionError(
+                "managed identity credential proof failed before Azure acquisition"
+            ) from exc
+        return _CredentialBoundMonitoringAcquisitionSession(
+            adapter=self,
+            bound_tokens=tuple(
+                sorted(
+                    bound_tokens,
+                    key=lambda item: (
+                        item.credential_proof.audience,
+                        item.credential_proof.proof_digest,
+                    ),
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialBoundToken:
+    scope: str
+    access_token: str = field(repr=False)
+    credential_proof: MonitoringCredentialProof
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialBoundMonitoringAcquisitionSession:
+    adapter: CredentialBoundMonitoringAcquisitionAdapter
+    bound_tokens: tuple[_CredentialBoundToken, ...] = field(repr=False)
+
+    def utc_now(self) -> datetime:
+        return _trusted_runtime_time(self.adapter._utc_now())
+
+    @property
+    def credential_proofs(self) -> tuple[MonitoringCredentialProof, ...]:
+        return tuple(item.credential_proof for item in self.bound_tokens)
+
+    @property
+    def verified_at(self) -> datetime:
+        verified_times = {item.credential_proof.verified_at for item in self.bound_tokens}
+        if len(verified_times) != 1:
+            raise MonitoringAcquisitionError(
+                "credential proofs do not share one collector-owned verification time"
+            )
+        return verified_times.pop()
+
+    def credential_proof_for_source(
+        self,
+        source: AcquisitionSource,
+    ) -> MonitoringCredentialProof:
+        scope = _credential_scope_for_source(source)
+        matches = tuple(item for item in self.bound_tokens if item.scope == scope)
+        if len(matches) != 1:
+            raise MonitoringAcquisitionError(
+                "credential session does not bind the required source audience"
+            )
+        return matches[0].credential_proof
+
+    def _access_token_for_source(self, source: AcquisitionSource) -> str:
+        scope = _credential_scope_for_source(source)
+        matches = tuple(item for item in self.bound_tokens if item.scope == scope)
+        if len(matches) != 1:
+            raise MonitoringAcquisitionError(
+                "credential session does not bind the required source audience"
+            )
+        return matches[0].access_token
+
+    def query_log_analytics(
+        self,
+        request: LogAnalyticsQueryRequest,
+    ) -> LogAnalyticsQueryResult:
+        return self.adapter._acquisition_port.query_log_analytics(
+            request,
+            access_token=self._access_token_for_source("logAnalytics"),
+        )
+
+    def query_activity_log(
+        self,
+        request: ActivityLogQueryRequest,
+    ) -> ActivityLogQueryResult:
+        return self.adapter._acquisition_port.query_activity_log(
+            request,
+            access_token=self._access_token_for_source("activityLog"),
+        )
+
+    def query_resource_graph_changes(
+        self,
+        request: ResourceGraphChangeQueryRequest,
+    ) -> ResourceGraphChangeQueryResult:
+        return self.adapter._acquisition_port.query_resource_graph_changes(
+            request,
+            access_token=self._access_token_for_source("resourceGraph"),
+        )
+
+    def query_resource_health(
+        self,
+        request: ResourceHealthQueryRequest,
+    ) -> ResourceHealthQueryResult:
+        return self.adapter._acquisition_port.query_resource_health(
+            request,
+            access_token=self._access_token_for_source("resourceHealth"),
+        )
+
+    def query_ip_flow_verify(
+        self,
+        request: IpFlowVerifyRequest,
+    ) -> IpFlowVerifyResult:
+        return self.adapter._acquisition_port.query_ip_flow_verify(
+            request,
+            access_token=self._access_token_for_source("ipFlowVerify"),
+        )
 
 
 class MonitoringAcquisitionReceiptSigner(Protocol):
@@ -994,7 +1545,7 @@ class MonitoringAcquisitionReceiptSigner(Protocol):
 
 @dataclass(slots=True)
 class _AcquisitionExecution:
-    runtime: MonitoringAcquisitionRuntime
+    session: _CredentialBoundMonitoringAcquisitionSession
     max_calls: int
     started_at: datetime
     exchanges: list[MonitoringAcquisitionExchange]
@@ -1011,15 +1562,20 @@ class _AcquisitionExecution:
                 "monitoring acquisition exceeded its total call budget"
             )
         requested_at = (
-            _trusted_runtime_time(self.runtime.utc_now())
+            self.session.utc_now()
             if requested_at_override is None
             else _trusted_runtime_time(requested_at_override)
         )
+        source = cast(AcquisitionSource, request.source)
+        credential_proof = self.session.credential_proof_for_source(source)
+        if requested_at >= credential_proof.expires_at:
+            raise MonitoringAcquisitionError(
+                "verified monitoring credential expired before Azure source I/O"
+            )
         result = operation(request)
-        received_at = _trusted_runtime_time(self.runtime.utc_now())
+        received_at = self.session.utc_now()
         if requested_at < self.started_at or received_at < requested_at:
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
-        source = cast(AcquisitionSource, request.source)
         checked_at = request.checked_at if isinstance(request, IpFlowVerifyRequest) else None
         if checked_at is not None and checked_at != requested_at:
             raise MonitoringAcquisitionError(
@@ -1034,6 +1590,7 @@ class _AcquisitionExecution:
                 requestedAt=requested_at,
                 receivedAt=received_at,
                 checkedAt=checked_at,
+                credentialProofDigest=credential_proof.proof_digest,
             )
         )
         return result
@@ -1068,6 +1625,67 @@ def _source_table(signal: LogQueryMonitoringSignal) -> str:
             "published log query does not use a supported reviewed source table"
         )
     return table
+
+
+def _control_binding_matches(
+    control: PublishedMonitoringIntentControl,
+    binding: MonitoringAcquisitionControlBinding,
+) -> bool:
+    scope = binding.coverage_scope
+    if (
+        binding.control_id != control.control_id
+        or binding.control_digest != control.control_digest
+        or binding.scope_digest != control.scope.scope_digest
+        or scope.query_scope_digest != control.control_digest
+        or scope.resource_ids != control.scope.resource_ids
+        or (scope.path_id is not None and scope.path_id not in control.scope.path_ids)
+    ):
+        return False
+    signal = control.signal
+    if isinstance(signal, LogQueryMonitoringSignal):
+        table = _source_table(signal)
+        if table == "Heartbeat":
+            return (
+                scope.path_id is None
+                and scope.direction is None
+                and scope.five_tuple_digest is None
+                and scope.endpoint_test_reference is None
+                and scope.endpoint_test_digest is None
+            )
+        if table == "VMConnection":
+            return (
+                scope.path_id is not None
+                and scope.direction is None
+                and scope.five_tuple_digest is None
+                and scope.endpoint_test_reference is None
+                and scope.endpoint_test_digest is None
+            )
+        if table == "NWConnectionMonitorTestResult":
+            return (
+                scope.path_id is not None
+                and scope.direction is not None
+                and scope.five_tuple_digest is not None
+                and scope.endpoint_test_reference is not None
+                and scope.endpoint_test_digest is not None
+            )
+        return (
+            table == "NTANetAnalytics"
+            and scope.path_id is not None
+            and scope.direction is not None
+            and scope.five_tuple_digest is not None
+            and scope.endpoint_test_reference is None
+            and scope.endpoint_test_digest is None
+        )
+    if isinstance(signal, ResourceHealthMonitoringSignal):
+        expected_path = control.scope.path_ids[0] if len(control.scope.path_ids) == 1 else None
+        return (
+            scope.path_id == expected_path
+            and scope.direction is None
+            and scope.five_tuple_digest is None
+            and scope.endpoint_test_reference is None
+            and scope.endpoint_test_digest is None
+        )
+    return False
 
 
 def _record_id(prefix: str, request_digest: str, row: AthenaBaseModel) -> str:
@@ -1375,9 +1993,10 @@ class MonitoringAcquisitionCoordinator:
     def __init__(
         self,
         *,
-        acquisition_port: MonitoringAcquisitionPort,
+        acquisition_adapter: CredentialBoundMonitoringAcquisitionAdapter,
         acquisition_authority: MonitoringAcquisitionAuthority,
         expected_acquisition_authority_digest: str,
+        expected_collector_contract_digest: str,
         monitoring_intent_trusted_key_id: str,
         monitoring_intent_signature_verifier: Callable[[bytes, str], bool],
         monitoring_intent_asset_loader: Callable[
@@ -1388,10 +2007,17 @@ class MonitoringAcquisitionCoordinator:
             ],
         ],
         collection_transaction: MonitoringCollectionTransaction,
-        runtime: MonitoringAcquisitionRuntime,
         receipt_signer: MonitoringAcquisitionReceiptSigner,
     ) -> None:
-        self._acquisition_port = acquisition_port
+        if type(acquisition_adapter) is not CredentialBoundMonitoringAcquisitionAdapter:
+            raise TypeError("production acquisition requires the exact credential-bound adapter")
+        self._acquisition_adapter = acquisition_adapter
+        self._collector_contract = acquisition_adapter.reviewed_collector_contract
+        self._collector_contract_digest = self._collector_contract.compute_artifact_digest_value()
+        if self._collector_contract_digest != expected_collector_contract_digest:
+            raise MonitoringAcquisitionError(
+                "monitoring collector contract is not the configured reviewed contract"
+            )
         try:
             self._acquisition_authority = MonitoringAcquisitionAuthority.model_validate_json(
                 acquisition_authority.model_dump_json(by_alias=True)
@@ -1406,10 +2032,30 @@ class MonitoringAcquisitionCoordinator:
             )
         if (
             self._acquisition_authority.schema_version
-            != "athena.wc028MonitoringAcquisitionAuthority.v2"
+            != "athena.wc028MonitoringAcquisitionAuthority.v3"
         ):
             raise MonitoringAcquisitionError(
-                "receipt-bearing acquisition requires authority schema v2"
+                "credential-bound acquisition requires authority schema v3"
+            )
+        if (
+            self._acquisition_authority.collector_contract_digest != self._collector_contract_digest
+            or self._acquisition_authority.monitoring_reader_identity_id
+            != self._collector_contract.collector_identity_resource_id.casefold().rstrip("/")
+            or self._acquisition_authority.monitoring_reader_principal_id
+            != self._collector_contract.monitoring_reader_principal_id
+            or self._acquisition_authority.monitoring_reader_client_id
+            != self._collector_contract.collector_identity_client_id
+            or self._acquisition_authority.monitoring_reader_tenant_id
+            != self._collector_contract.collector_tenant_id
+            or self._acquisition_authority.athena_context_identity_id
+            != cast(str, self._collector_contract.athena_context_identity_id).casefold().rstrip("/")
+            or self._acquisition_authority.athena_context_principal_id
+            != self._collector_contract.athena_context_principal_id
+            or self._acquisition_authority.receipt_signing_key_id
+            != self._collector_contract.signing_key_resource_id
+        ):
+            raise MonitoringAcquisitionError(
+                "acquisition authority does not bind the reviewed credential contract"
             )
         self._monitoring_reader_identity_id = (
             self._acquisition_authority.monitoring_reader_identity_id
@@ -1418,29 +2064,31 @@ class MonitoringAcquisitionCoordinator:
         self._monitoring_intent_signature_verifier = monitoring_intent_signature_verifier
         self._monitoring_intent_asset_loader = monitoring_intent_asset_loader
         self._collection_transaction = collection_transaction
-        self._runtime = runtime
         self._receipt_signer = receipt_signer
 
     def _build_receipt(
         self,
         *,
         execution: _AcquisitionExecution,
-        authenticated_principal_id: str,
         monitoring_intent: PublishedMonitoringIntent,
         context_binding: PublishedRuntimeContextBinding,
         collection_batch_digest: str,
         normalized_evidence_digest: str,
     ) -> MonitoringAcquisitionReceipt:
-        execution_completed_at = _trusted_runtime_time(self._runtime.utc_now())
-        receipt_issued_at = _trusted_runtime_time(self._runtime.utc_now())
+        execution_completed_at = execution.session.utc_now()
+        receipt_issued_at = execution.session.utc_now()
         if (
             execution_completed_at < execution.started_at
             or receipt_issued_at < execution_completed_at
         ):
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        credential_proofs = execution.session.credential_proofs
+        credential_proof = credential_proofs[0]
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v2",
-            "authenticatedPrincipalId": authenticated_principal_id,
+            "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+            "authenticatedPrincipalId": credential_proof.principal_id,
+            "authenticatedClientId": credential_proof.client_id,
+            "authenticatedTenantId": credential_proof.tenant_id,
             "monitoringReaderIdentityId": (
                 self._acquisition_authority.monitoring_reader_identity_id
             ),
@@ -1463,6 +2111,7 @@ class MonitoringAcquisitionCoordinator:
             "executionCompletedAt": execution_completed_at,
             "receiptIssuedAt": receipt_issued_at,
             "exchanges": tuple(execution.exchanges),
+            "credentialProofs": credential_proofs,
         }
         receipt_digest = compute_artifact_digest(_json_value(payload))
         signed_payload = {
@@ -1498,7 +2147,6 @@ class MonitoringAcquisitionCoordinator:
         context_binding: PublishedRuntimeContextBinding,
         expected_active_context_authority_digest: str,
         collected_at: datetime,
-        collector_contract_digest: str,
         change_scope: ApprovedChangeScope,
         commit_port: MonitoringCollectionCommitPort,
         incident_revision: int,
@@ -1511,41 +2159,42 @@ class MonitoringAcquisitionCoordinator:
         if type(context_binding) is not PublishedRuntimeContextBinding:
             raise TypeError("acquisition requires an exact PublishedRuntimeContextBinding")
         del collected_at
-        execution_started_at = _trusted_runtime_time(self._runtime.utc_now())
-        authenticated_principal_id = self._runtime.authenticated_principal_id().casefold()
-        if _GUID_PATTERN.fullmatch(authenticated_principal_id) is None:
-            raise MonitoringAcquisitionError(
-                "collector runtime returned an invalid authenticated principal ID"
+        controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
+        required_control_ids = set(
+            cast(
+                tuple[str, ...],
+                self._acquisition_authority.required_control_ids,
             )
-        if (
-            authenticated_principal_id != self._acquisition_authority.monitoring_reader_principal_id
-            or authenticated_principal_id == self._acquisition_authority.athena_context_principal_id
-        ):
-            raise MonitoringAcquisitionError(
-                "authenticated deployment identity violates acquisition separation"
-            )
-        collected_at = execution_started_at
-        execution = _AcquisitionExecution(
-            runtime=self._runtime,
-            max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
-            started_at=execution_started_at,
-            exchanges=[],
         )
-        if collector_contract_digest != self._acquisition_authority.collector_contract_digest:
+        if not required_control_ids.issubset(controls_by_id):
             raise MonitoringAcquisitionError(
-                "collector contract digest does not match acquisition authority"
+                "acquisition authority references an unknown required control"
             )
+        selected_controls = tuple(controls_by_id[item] for item in sorted(required_control_ids))
+        required_control_bindings = cast(
+            tuple[MonitoringAcquisitionControlBinding, ...],
+            self._acquisition_authority.required_control_bindings,
+        )
+        bindings_by_id = {item.control_id: item for item in required_control_bindings}
         if (
-            issued_at.utcoffset() != UTC.utcoffset(issued_at)
-            or trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)
-            or issued_at.microsecond % 1000
-            or trusted_as_of.microsecond % 1000
-            or not issued_at <= collected_at <= trusted_as_of
-            or (trusted_as_of - collected_at).total_seconds()
-            > self._acquisition_authority.max_freshness_seconds
+            self._acquisition_authority.context_binding_digest != context_binding.binding_digest
+            or self._acquisition_authority.required_coverage_scope_digests
+            != context_binding.required_coverage_scope_digests
+            or tuple(bindings_by_id) != tuple(control.control_id for control in selected_controls)
+            or any(
+                not _control_binding_matches(control, binding)
+                for control, binding in (
+                    (control, bindings_by_id[control.control_id]) for control in selected_controls
+                )
+            )
+            or self._acquisition_authority.control_selection_digest
+            != compute_monitoring_acquisition_control_selection_digest(
+                context_binding,
+                required_control_bindings,
+            )
         ):
             raise MonitoringAcquisitionError(
-                "collection time is outside the acquisition authority freshness bound"
+                "acquisition authority does not bind the current context and control selection"
             )
         try:
             intent_reference, intent_attestation = self._monitoring_intent_asset_loader(
@@ -1567,20 +2216,9 @@ class MonitoringAcquisitionCoordinator:
                 context_binding,
                 expected_active_context_authority_digest=(expected_active_context_authority_digest),
             )
-            controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
-            required_control_ids = set(
-                cast(
-                    tuple[str, ...],
-                    self._acquisition_authority.required_control_ids,
-                )
-            )
-            if not required_control_ids.issubset(controls_by_id):
-                raise MonitoringAcquisitionError(
-                    "acquisition authority references an unknown required control"
-                )
-            selected_controls = tuple(controls_by_id[item] for item in sorted(required_control_ids))
             authorized_resources = set(self._acquisition_authority.allowed_resource_ids)
             authorized_sources = set(self._acquisition_authority.allowed_sources)
+            selected_sources: set[AcquisitionSource] = set()
             for control in selected_controls:
                 required_resources = {
                     *control.scope.resource_ids,
@@ -1609,16 +2247,51 @@ class MonitoringAcquisitionCoordinator:
                     raise MonitoringAcquisitionError(
                         "published monitoring intent uses an unauthorized acquisition source"
                     )
+                selected_sources.update(required_sources)
         except (TypeError, ValueError) as exc:
             raise MonitoringAcquisitionError(
                 "monitoring intent authority is invalid before acquisition"
             ) from exc
 
+        session = self._acquisition_adapter._establish_session(
+            required_sources=tuple(sorted(selected_sources))
+        )
+        if any(
+            credential_proof.principal_id
+            != self._acquisition_authority.monitoring_reader_principal_id
+            or credential_proof.client_id != self._acquisition_authority.monitoring_reader_client_id
+            or credential_proof.tenant_id != self._acquisition_authority.monitoring_reader_tenant_id
+            or credential_proof.principal_id
+            == self._acquisition_authority.athena_context_principal_id
+            for credential_proof in session.credential_proofs
+        ):
+            raise MonitoringAcquisitionError(
+                "credential proof violates acquisition identity separation"
+            )
+        collected_at = session.verified_at
+        if (
+            issued_at.utcoffset() != UTC.utcoffset(issued_at)
+            or trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)
+            or issued_at.microsecond % 1000
+            or trusted_as_of.microsecond % 1000
+            or not issued_at <= collected_at <= trusted_as_of
+            or (trusted_as_of - collected_at).total_seconds()
+            > self._acquisition_authority.max_freshness_seconds
+        ):
+            raise MonitoringAcquisitionError(
+                "collection time is outside the acquisition authority freshness bound"
+            )
+        execution = _AcquisitionExecution(
+            session=session,
+            max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
+            started_at=collected_at,
+            exchanges=[],
+        )
+
         records: list[MonitoringCollectionRecord] = []
         coverage: list[MonitoringCoverageRecord] = []
         manual_reasons: list[str] = []
         attribution_changes: tuple[ResourceChangeRecord, ...] = ()
-        controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
         if any(
             isinstance(control.signal, ActivityLogMonitoringSignal)
             for control in monitoring_intent.controls
@@ -1746,13 +2419,12 @@ class MonitoringAcquisitionCoordinator:
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
             expected_active_context_authority_digest=(expected_active_context_authority_digest),
-            collector_contract_digest=collector_contract_digest,
+            collector_contract_digest=self._collector_contract_digest,
             change_scope=change_scope,
             trusted_as_of=trusted_as_of,
         )
         acquisition_receipt = self._build_receipt(
             execution=execution,
-            authenticated_principal_id=authenticated_principal_id,
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
             collection_batch_digest=sha256_hex(batch.canonical_bytes()),
@@ -1765,7 +2437,7 @@ class MonitoringAcquisitionCoordinator:
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
             expected_active_context_authority_digest=(expected_active_context_authority_digest),
-            collector_contract_digest=collector_contract_digest,
+            collector_contract_digest=self._collector_contract_digest,
             change_scope=change_scope,
             commit_port=commit_port,
             incident_revision=incident_revision,
@@ -1845,7 +2517,7 @@ class MonitoringAcquisitionCoordinator:
         for request in requests:
             result = execution.invoke(
                 request,
-                self._acquisition_port.query_log_analytics,
+                execution.session.query_log_analytics,
             )
             if type(result) is not LogAnalyticsQueryResult:
                 raise MonitoringAcquisitionError("log source returned an unexpected response type")
@@ -2240,7 +2912,7 @@ class MonitoringAcquisitionCoordinator:
                 "Traffic Analytics IP-to-resource mapping was ambiguous and no "
                 "causality was claimed",
             )
-        checked_at = _trusted_runtime_time(self._runtime.utc_now())
+        checked_at = execution.session.utc_now()
         verification_request = _build_request(
             IpFlowVerifyRequest,
             {
@@ -2271,7 +2943,7 @@ class MonitoringAcquisitionCoordinator:
         )
         verification = execution.invoke(
             verification_request,
-            self._acquisition_port.query_ip_flow_verify,
+            execution.session.query_ip_flow_verify,
             requested_at_override=checked_at,
         )
         if type(verification) is not IpFlowVerifyResult:
@@ -2411,7 +3083,7 @@ class MonitoringAcquisitionCoordinator:
         )
         activity = execution.invoke(
             activity_request,
-            self._acquisition_port.query_activity_log,
+            execution.session.query_activity_log,
         )
         if type(activity) is not ActivityLogQueryResult:
             raise MonitoringAcquisitionError(
@@ -2436,7 +3108,7 @@ class MonitoringAcquisitionCoordinator:
         )
         graph = execution.invoke(
             graph_request,
-            self._acquisition_port.query_resource_graph_changes,
+            execution.session.query_resource_graph_changes,
         )
         if type(graph) is not ResourceGraphChangeQueryResult:
             raise MonitoringAcquisitionError(
@@ -2561,7 +3233,7 @@ class MonitoringAcquisitionCoordinator:
         )
         result = execution.invoke(
             request,
-            self._acquisition_port.query_resource_health,
+            execution.session.query_resource_health,
         )
         if type(result) is not ResourceHealthQueryResult:
             raise MonitoringAcquisitionError(
@@ -2739,6 +3411,7 @@ __all__ = [
     "ActivityLogQueryResult",
     "ActivityLogRow",
     "ConnectionMonitorRow",
+    "CredentialBoundMonitoringAcquisitionAdapter",
     "EVENT_LOOKBACK_SECONDS",
     "HeartbeatRow",
     "IpFlowVerifyRequest",
@@ -2751,12 +3424,12 @@ __all__ = [
     "MAX_ACQUISITION_RESPONSE_BYTES",
     "MAX_ACQUISITION_ROWS",
     "MonitoringAcquisitionAuthority",
+    "MonitoringAcquisitionControlBinding",
     "MonitoringAcquisitionCoordinator",
     "MonitoringAcquisitionError",
     "MonitoringAcquisitionOutcome",
     "MonitoringAcquisitionPort",
     "MonitoringAcquisitionReceiptSigner",
-    "MonitoringAcquisitionRuntime",
     "ResourceGraphChangeQueryRequest",
     "ResourceGraphChangeQueryResult",
     "ResourceGraphChangeRow",
@@ -2765,4 +3438,5 @@ __all__ = [
     "ResourceHealthRow",
     "TrafficAnalyticsRow",
     "VmConnectionRow",
+    "compute_monitoring_acquisition_control_selection_digest",
 ]

@@ -793,7 +793,7 @@ class _CommitPort:
                 if bundle.acquisition_receipt is not None
                 else "athena.wc024MonitoringEvidenceHandoff.v1"
             ),
-            "collectorContractDigest": DIGEST_C,
+            "collectorContractDigest": bundle.monitoring_contract_digest,
             "collectionId": collection_id,
             "observedAt": NOW,
             "evidence": reference.model_dump(

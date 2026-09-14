@@ -480,6 +480,7 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
   params: {
     collectorIdentityResourceId: monitoringEvidenceSeams.outputs.collectorIdentityResourceId
     collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
+    collectorTenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
     monitoringResourceGroupId: monitoringResourceGroup.id
     workloadResourceGroupId: workloadResourceGroupId
     workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
@@ -494,6 +495,9 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
     signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
     logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
+    ipFlowVerifyRoleDefinitionId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleDefinitionId
+    ipFlowVerifyScopeId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyScopeId
+    ipFlowVerifyAllowedOperations: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyAllowedOperations
     logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
     logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
     resourceReadScopeIds: concat(

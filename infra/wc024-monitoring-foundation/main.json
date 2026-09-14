@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "4790619359031650486"
+      "templateHash": "5772878318930458946"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -1323,7 +1323,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "12028447168836524437"
+              "templateHash": "16997771631998750668"
             }
           },
           "parameters": {
@@ -1464,6 +1464,10 @@
             "collectorIdentityPrincipalId": {
               "type": "string",
               "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').principalId]"
+            },
+            "collectorIdentityTenantId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-monitoring-collector-id', parameters('namePrefix'))), '2024-11-30').tenantId]"
             },
             "keyVaultResourceId": {
               "type": "string",
@@ -2714,7 +2718,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "7250242578401041075"
+              "templateHash": "5014791689174897470"
             }
           },
           "parameters": {
@@ -2738,9 +2742,35 @@
             }
           },
           "variables": {
-            "readerRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')]"
+            "readerRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')]",
+            "ipFlowVerifyRoleDefinitionGuid": "3728cdf6-4efd-5282-bdfc-63b7872fd801",
+            "ipFlowVerifyAllowedOperations": [
+              "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+              "Microsoft.Network/networkWatchers/ipFlowVerify/read"
+            ]
           },
           "resources": [
+            {
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[variables('ipFlowVerifyRoleDefinitionGuid')]",
+              "properties": {
+                "roleName": "Athena WC-028 Network Watcher IP Flow Verify",
+                "description": "Run and read IP Flow Verify only at the exact reviewed Network Watcher.",
+                "type": "CustomRole",
+                "permissions": [
+                  {
+                    "actions": "[variables('ipFlowVerifyAllowedOperations')]",
+                    "notActions": [],
+                    "dataActions": [],
+                    "notDataActions": []
+                  }
+                ],
+                "assignableScopes": [
+                  "[resourceGroup().id]"
+                ]
+              }
+            },
             {
               "type": "Microsoft.Authorization/roleAssignments",
               "apiVersion": "2022-04-01",
@@ -2751,6 +2781,20 @@
                 "principalType": "ServicePrincipal",
                 "roleDefinitionId": "[variables('readerRoleDefinitionId')]"
               }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/networkWatchers', parameters('networkWatcherName'))]",
+              "name": "[guid(resourceId('Microsoft.Network/networkWatchers', parameters('networkWatcherName')), parameters('collectorPrincipalId'), resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid')))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid'))]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid'))]"
+              ]
             }
           ],
           "outputs": {
@@ -2763,6 +2807,18 @@
               "value": [
                 "[format('{0}/flowLogs/{1}', resourceId('Microsoft.Network/networkWatchers', parameters('networkWatcherName')), parameters('flowLogName'))]"
               ]
+            },
+            "ipFlowVerifyRoleDefinitionId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid'))]"
+            },
+            "ipFlowVerifyScopeId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/networkWatchers', parameters('networkWatcherName'))]"
+            },
+            "ipFlowVerifyAllowedOperations": {
+              "type": "array",
+              "value": "[variables('ipFlowVerifyAllowedOperations')]"
             }
           }
         }
@@ -3105,6 +3161,9 @@
           "collectorIdentityClientId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityClientId.value]"
           },
+          "collectorTenantId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value]"
+          },
           "monitoringResourceGroupId": {
             "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName'))]"
           },
@@ -3139,6 +3198,15 @@
           "logAnalyticsDataReaderRoleDefinitionId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsDataReaderRoleDefinitionId.value]"
           },
+          "ipFlowVerifyRoleDefinitionId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyRoleDefinitionId.value]"
+          },
+          "ipFlowVerifyScopeId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyScopeId.value]"
+          },
+          "ipFlowVerifyAllowedOperations": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyAllowedOperations.value]"
+          },
           "logAnalyticsAllowedTables": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value]"
           },
@@ -3171,7 +3239,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "14303147688242808521"
+              "templateHash": "12793421238153091352"
             }
           },
           "parameters": {
@@ -3185,6 +3253,12 @@
               "type": "string",
               "metadata": {
                 "description": "Client ID of the isolated monitoring evidence collector identity."
+              }
+            },
+            "collectorTenantId": {
+              "type": "string",
+              "metadata": {
+                "description": "Tenant ID that owns the isolated monitoring evidence collector identity."
               }
             },
             "monitoringResourceGroupId": {
@@ -3266,6 +3340,26 @@
               "type": "string",
               "metadata": {
                 "description": "Built-in Log Analytics Data Reader role definition resource ID."
+              }
+            },
+            "ipFlowVerifyRoleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact custom role definition resource ID for Network Watcher IP Flow Verify."
+              }
+            },
+            "ipFlowVerifyScopeId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact regional Network Watcher resource receiving the IP Flow Verify role assignment."
+              }
+            },
+            "ipFlowVerifyAllowedOperations": {
+              "type": "array",
+              "minLength": 2,
+              "maxLength": 2,
+              "metadata": {
+                "description": "Exact Network Watcher IP Flow Verify management-plane operation allowlist."
               }
             },
             "logAnalyticsAllowedTables": {
@@ -3387,7 +3481,7 @@
             },
             "acquisitionCollectorContract": {
               "type": "object",
-              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v3', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2'))]"
+              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v4', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v3', 'collectorTenantId', parameters('collectorTenantId'), 'ipFlowVerifyRoleDefinitionId', parameters('ipFlowVerifyRoleDefinitionId'), 'ipFlowVerifyScopeId', parameters('ipFlowVerifyScopeId'), 'ipFlowVerifyAllowedOperations', parameters('ipFlowVerifyAllowedOperations'), 'allowedReadOperations', concat(variables('collectorContract').allowedReadOperations, parameters('ipFlowVerifyAllowedOperations'))))]"
             }
           }
         }

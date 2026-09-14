@@ -113,5 +113,6 @@ resource collectorSigningKeyUser 'Microsoft.Authorization/roleAssignments@2022-0
 output collectorIdentityResourceId string = collectorIdentity.id
 output collectorIdentityClientId string = collectorIdentity.properties.clientId
 output collectorIdentityPrincipalId string = collectorIdentity.properties.principalId
+output collectorIdentityTenantId string = collectorIdentity.properties.tenantId
 output keyVaultResourceId string = signingKeyVault.id
 output signingKeyResourceId string = signingKey.properties.keyUriWithVersion

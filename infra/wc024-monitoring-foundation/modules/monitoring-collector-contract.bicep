@@ -6,6 +6,9 @@ param collectorIdentityResourceId string
 @description('Client ID of the isolated monitoring evidence collector identity.')
 param collectorIdentityClientId string
 
+@description('Tenant ID that owns the isolated monitoring evidence collector identity.')
+param collectorTenantId string
+
 @description('Resource ID of the monitoring-owned resource group.')
 param monitoringResourceGroupId string
 
@@ -50,6 +53,17 @@ param signalReaderRoleDefinitionId string
 
 @description('Built-in Log Analytics Data Reader role definition resource ID.')
 param logAnalyticsDataReaderRoleDefinitionId string
+
+@description('Exact custom role definition resource ID for Network Watcher IP Flow Verify.')
+param ipFlowVerifyRoleDefinitionId string
+
+@description('Exact regional Network Watcher resource receiving the IP Flow Verify role assignment.')
+param ipFlowVerifyScopeId string
+
+@description('Exact Network Watcher IP Flow Verify management-plane operation allowlist.')
+@minLength(2)
+@maxLength(2)
+param ipFlowVerifyAllowedOperations array
 
 @description('Exact Log Analytics table names permitted by the role-assignment condition.')
 @minLength(13)
@@ -142,6 +156,15 @@ var collectorContract = {
 output collectorContract object = collectorContract
 
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v3'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v4'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
+  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v3'
+  collectorTenantId: collectorTenantId
+  ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId
+  ipFlowVerifyScopeId: ipFlowVerifyScopeId
+  ipFlowVerifyAllowedOperations: ipFlowVerifyAllowedOperations
+  allowedReadOperations: concat(
+    collectorContract.allowedReadOperations,
+    ipFlowVerifyAllowedOperations
+  )
 })
