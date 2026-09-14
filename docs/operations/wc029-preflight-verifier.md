@@ -107,6 +107,10 @@ The policy is bounded JSON:
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
       "forbiddenRoleNames": ["Owner", "Contributor"],
+      "forbiddenRoleDefinitionIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c"
+      ],
       "forbiddenScopePrefixes": [
         "/subscriptions/00000000-0000-0000-0000-000000000000"
       ]
@@ -114,6 +118,10 @@ The policy is bounded JSON:
     {
       "principalId": "00000000-0000-0000-0000-000000000002",
       "forbiddenRoleNames": ["Reader", "Log Analytics Reader"],
+      "forbiddenRoleDefinitionIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/73c42c96-874c-492b-b04d-ab87d138a893"
+      ],
       "forbiddenScopePrefixes": [
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
       ]
@@ -138,8 +146,10 @@ Authorization-affecting `condition` and `conditionVersion` fields must be suppli
 included in exact inventory and allowance matching. Production evidence, expected assignments, and
 broad-assignment allowances require both `roleDefinitionName` and a canonical `roleDefinitionId`.
 Recognized built-in role names must agree with their official IDs; name-only, ID-only, or spoofed-ID
-entries fail closed so named separation rules cannot be bypassed. Oversized integer literals and
-other parser failures are reported as malformed input with exit code `3`.
+entries fail closed. Every production separation rule also requires reviewed
+`forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a
+false display name cannot bypass separation. Oversized integer literals and other parser failures
+are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

@@ -141,6 +141,9 @@ def _production_policy(
             {
                 "principalId": principal_id,
                 "forbiddenRoleNames": ["Owner"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["owner"],
+                ],
                 "forbiddenScopePrefixes": [
                     f"/subscriptions/{_SUBSCRIPTION_ID}",
                 ],
@@ -2113,6 +2116,86 @@ def test_public_cli_requires_role_names_for_separation_matching(tmp_path) -> Non
         "WC-029 preflight rbac failed: "
         "expectedAssignments require roleDefinitionName\n"
     )
+
+
+def test_public_cli_requires_separation_role_ids(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(principal_id=principal_id)
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([assignment]),
+        encoding="utf-8",
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    separation_rule = policy["separationRules"][0]
+    assert isinstance(separation_rule, dict)
+    separation_rule.pop("forbiddenRoleDefinitionIds")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "separation rule requires forbiddenRoleDefinitionIds\n"
+    )
+
+
+def test_separation_rule_matches_role_id_despite_false_display_name() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    log_analytics_reader_id = (
+        _ROLE_DEFINITION_PREFIX
+        + "73c42c96-874c-492b-b04d-ab87d138a893"
+    )
+    assignment = _assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        role_id=log_analytics_reader_id,
+        scope=(
+            f"{_RG_SCOPE}/providers/"
+            "Microsoft.OperationalInsights/workspaces/synthetic"
+        ),
+    )
+    policy = {
+        "expectedPrincipalIds": [principal_id],
+        "expectedAssignments": [assignment],
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["Log Analytics Reader"],
+                "forbiddenRoleDefinitionIds": [
+                    log_analytics_reader_id,
+                ],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ],
+    }
+
+    assert {
+        item.code
+        for item in evaluate_role_assignments(
+            [assignment],
+            policy_document=policy,
+            require_separation_rules=True,
+        )
+    } == {"identity-separation"}
 
 
 def test_public_cli_requires_role_ids_in_broad_allowances(tmp_path) -> None:

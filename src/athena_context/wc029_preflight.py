@@ -99,6 +99,7 @@ class RbacAssignment:
 class SeparationRule:
     principal_id: str
     forbidden_role_names: frozenset[str]
+    forbidden_role_ids: frozenset[str]
     forbidden_scope_prefixes: tuple[str, ...]
 
 
@@ -1270,6 +1271,19 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 field_name="forbiddenScopePrefixes",
                 maximum_items=MAX_POLICY_ITEMS,
             )
+            raw_role_ids = _get_case_insensitive(
+                item,
+                "forbiddenRoleDefinitionIds",
+            )
+            role_ids = (
+                []
+                if raw_role_ids is None
+                else _sequence(
+                    raw_role_ids,
+                    field_name="forbiddenRoleDefinitionIds",
+                    maximum_items=MAX_POLICY_ITEMS,
+                )
+            )
             if not role_names or not scope_prefixes:
                 raise PreflightInputError(
                     "separation rule requires forbidden roles and scope prefixes"
@@ -1290,6 +1304,15 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                             )
                         )
                         for role in role_names
+                    ),
+                    forbidden_role_ids=frozenset(
+                        _canonical_role_id(
+                            _require_string(
+                                role_id,
+                                field_name="forbidden roleDefinitionId",
+                            )
+                        )
+                        for role_id in role_ids
                     ),
                     forbidden_scope_prefixes=tuple(
                         sorted(
@@ -1435,6 +1458,12 @@ def evaluate_role_assignments(
         raise PreflightInputError(
             "separationRules principals must exactly match expectedPrincipalIds"
         )
+    if require_separation_rules and any(
+        not rule.forbidden_role_ids for rule in policy.separation_rules
+    ):
+        raise PreflightInputError(
+            "separation rule requires forbiddenRoleDefinitionIds"
+        )
     allowance_principal_ids = frozenset(
         allowance.principal_id for allowance in policy.allowed_broad_assignments
     )
@@ -1573,7 +1602,10 @@ def evaluate_role_assignments(
         for rule in policy.separation_rules:
             if (
                 principal_id == rule.principal_id
-                and canonical_role in rule.forbidden_role_names
+                and (
+                    canonical_role in rule.forbidden_role_names
+                    or role_id in rule.forbidden_role_ids
+                )
                 and any(
                     _scope_contains(scope, prefix) or _scope_contains(prefix, scope)
                     for prefix in rule.forbidden_scope_prefixes
