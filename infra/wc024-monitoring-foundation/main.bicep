@@ -83,6 +83,15 @@ param monitoringStorageAccountName string
 @maxLength(24)
 param monitoringCollectorKeyVaultName string
 
+@description('Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI.')
+param athenaContextIdentityResourceId string
+
+var athenaContextIdentitySegments = split(toLower(athenaContextIdentityResourceId), '/')
+resource athenaContextIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  scope: resourceGroup(athenaContextIdentitySegments[2], athenaContextIdentitySegments[4])
+  name: athenaContextIdentitySegments[8]
+}
+
 @description('Retention period for replacement flow-log and signed-evidence data.')
 @minValue(30)
 @maxValue(365)
@@ -502,7 +511,14 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
 
 @description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
 output monitoringCollectorContract object = collectorContract.outputs.collectorContract
-output monitoringAcquisitionCollectorContract object = collectorContract.outputs.acquisitionCollectorContract
+var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) ? true : fail('monitoring collector and Athena context identities must be physically separate UAMIs with distinct principal IDs')
+
+output monitoringAcquisitionCollectorContract object = union(collectorContract.outputs.acquisitionCollectorContract, {
+  monitoringReaderPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+  athenaContextIdentityId: athenaContextIdentity.id
+  athenaContextPrincipalId: athenaContextIdentity.properties.principalId
+  physicalIdentitySeparationEnforced: acquisitionIdentitySeparation
+})
 
 @description('Monitoring-owned replacement storage. It is separate from the retained legacy flow-log destination.')
 output replacementMonitoringStorageAccountResourceId string = monitoringStorage.outputs.storageAccountResourceId

@@ -69,7 +69,9 @@ from test_wc028_monitoring_collection import (
     _five_tuple_digest,
     _intent_assets,
     _scope_contract,
-    _transaction,
+)
+from test_wc028_monitoring_collection import (
+    _production_transaction as _transaction,
 )
 
 READER_ID = (
@@ -82,6 +84,8 @@ CONTEXT_ID = (
     "resourceGroups/rg-synthetic-athena/providers/Microsoft.ManagedIdentity/"
     "userAssignedIdentities/synthetic-athena-context"
 )
+READER_PRINCIPAL_ID = "11111111-1111-1111-1111-111111111111"
+CONTEXT_PRINCIPAL_ID = "22222222-2222-2222-2222-222222222222"
 OUT_OF_SCOPE_ID = (
     "/subscriptions/00000000-0000-0000-0000-000000000000/"
     "resourceGroups/rg-synthetic-other/providers/Microsoft.Compute/"
@@ -93,7 +97,7 @@ class _Runtime:
     def __init__(
         self,
         *,
-        principal_id: str = READER_ID,
+        principal_id: str = READER_PRINCIPAL_ID,
         now: datetime = NOW,
     ) -> None:
         self.principal_id = principal_id
@@ -137,9 +141,12 @@ def _aggregate_proof(
 def _acquisition_authority(
     *,
     reader_identity_id: str = READER_ID,
+    reader_principal_id: str = READER_PRINCIPAL_ID,
     context_identity_id: str = CONTEXT_ID,
+    context_principal_id: str = CONTEXT_PRINCIPAL_ID,
     max_freshness_seconds: int = 900,
     max_acquisition_calls: int = 32,
+    required_control_ids: tuple[str, ...] | None = None,
 ) -> MonitoringAcquisitionAuthority:
     allowed_sources = (
         "activityLog",
@@ -151,13 +158,20 @@ def _acquisition_authority(
     allowed_resources = tuple(
         sorted(item.casefold() for item in (WEB_ID, DB_ID, NSG_ID, NSG_RULE_ID, MONITOR_ID))
     )
+    if required_control_ids is None:
+        required_control_ids = tuple(
+            sorted(control.control_id for name, control in _controls().items() if name != "change")
+        )
     payload: dict[str, object] = {
         "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v2",
         "monitoringReaderIdentityId": reader_identity_id.casefold(),
+        "monitoringReaderPrincipalId": reader_principal_id,
         "athenaContextIdentityId": context_identity_id.casefold(),
+        "athenaContextPrincipalId": context_principal_id,
         "collectorContractDigest": DIGEST_C,
         "allowedSources": list(allowed_sources),
         "allowedResourceIds": list(allowed_resources),
+        "requiredControlIds": list(required_control_ids),
         "maxRows": MAX_ACQUISITION_ROWS,
         "maxBytes": MAX_ACQUISITION_RESPONSE_BYTES,
         "maxWindowSeconds": 86400,
@@ -171,7 +185,9 @@ def _acquisition_authority(
     payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": reader_identity_id.casefold(),
+            "monitoringReaderPrincipalId": reader_principal_id,
             "athenaContextIdentityId": context_identity_id.casefold(),
+            "athenaContextPrincipalId": context_principal_id,
             "monitoringReaderHasReadOnlyWorkloadAccess": True,
             "athenaContextHasWorkloadReader": False,
             "readOnly": True,
@@ -183,6 +199,7 @@ def _acquisition_authority(
             **payload,
             "allowedSources": allowed_sources,
             "allowedResourceIds": allowed_resources,
+            "requiredControlIds": required_control_ids,
         },
         authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
         authorityDigest=digest,
@@ -231,6 +248,37 @@ def _authority(controls=None, *, required_control_names: set[str] | None = None)
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
     )
     return context, intent, controls
+
+
+def _required_control_ids(context, controls) -> tuple[str, ...]:
+    required = set(context.required_coverage_scope_digests)
+    path = _dependency_path()
+    selected: list[str] = []
+    for name, control in controls.items():
+        if name == "change":
+            continue
+        coverage_kwargs: dict[str, object] = {}
+        if name == "monitor":
+            coverage_kwargs = {
+                "direction": "inbound",
+                "five_tuple_digest": _five_tuple_digest(),
+                "endpoint_test_reference": "synthetic-web-db-test",
+                "endpoint_test_digest": "sha256:" + "9" * 64,
+            }
+        elif name == "flow":
+            coverage_kwargs = {
+                "direction": "inbound",
+                "five_tuple_digest": _five_tuple_digest(),
+            }
+        digest = _coverage_scope_digest(
+            control=control,
+            resource_ids=control.scope.resource_ids,
+            path_id=None if name == "heartbeat" else path.path_id,
+            **coverage_kwargs,
+        )
+        if digest in required:
+            selected.append(control.control_id)
+    return tuple(sorted(selected))
 
 
 class _AcquisitionPort:
@@ -635,10 +683,12 @@ def _execute(
     collected_at: datetime = NOW,
     acquisition_authority: MonitoringAcquisitionAuthority | None = None,
 ):
-    context, intent, _ = _authority() if authority is None else authority
+    context, intent, controls = _authority() if authority is None else authority
     commit = _CommitPort()
     acquisition_authority = (
-        _acquisition_authority() if acquisition_authority is None else acquisition_authority
+        _acquisition_authority(required_control_ids=_required_control_ids(context, controls))
+        if acquisition_authority is None
+        else acquisition_authority
     )
     outcome = MonitoringAcquisitionCoordinator(
         acquisition_port=port,
@@ -737,7 +787,8 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         outcome.committed.monitoring_handoff.schema_version
         == "athena.wc028MonitoringEvidenceHandoff.v2"
     )
-    assert receipt.authenticated_principal_id == READER_ID.casefold()
+    assert receipt.authenticated_principal_id == READER_PRINCIPAL_ID
+    assert receipt.monitoring_reader_identity_id == READER_ID.casefold()
     assert receipt.acquisition_authority_digest == acquisition_authority.authority_digest
     assert receipt.collection_batch_digest == sha256_hex(outcome.batch.canonical_bytes())
     assert manifest.collection_batch_digest == receipt.collection_batch_digest
@@ -763,16 +814,10 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert isinstance(tampered_manifest, dict)
     tampered_manifest["collectionBatchDigest"] = "sha256:" + "f" * 64
     tampered_manifest["manifestDigest"] = compute_artifact_digest(
-        {
-            key: value
-            for key, value in tampered_manifest.items()
-            if key != "manifestDigest"
-        }
+        {key: value for key, value in tampered_manifest.items() if key != "manifestDigest"}
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
-        type(outcome.prepared.monitoring_bundle).model_validate_json(
-            json.dumps(tampered_bundle)
-        )
+        type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_bundle))
     tampered_evidence = outcome.prepared.monitoring_bundle.model_dump(
         mode="json",
         by_alias=True,
@@ -789,17 +834,13 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         }
     )
     tampered_observation["observationDigest"] = observation_digest
-    tampered_observation["observationId"] = (
-        f"obs-{observation_digest.removeprefix('sha256:')[:32]}"
-    )
+    tampered_observation["observationId"] = f"obs-{observation_digest.removeprefix('sha256:')[:32]}"
     tampered_evidence["observations"] = sorted(
         tampered_evidence["observations"],
         key=lambda item: item["observationId"],
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
-        type(outcome.prepared.monitoring_bundle).model_validate_json(
-            json.dumps(tampered_evidence)
-        )
+        type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_evidence))
 
 
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
@@ -1290,6 +1331,9 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
             "receipt_signing_key_id",
             "monitoring_reader_has_read_only_workload_access",
             "deployment_identity_contract_digest",
+            "monitoring_reader_principal_id",
+            "athena_context_principal_id",
+            "required_control_ids",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v1"
@@ -1336,7 +1380,7 @@ def test_deployment_identity_is_fail_closed_before_reads() -> None:
     ):
         _execute(
             port,
-            runtime=_Runtime(principal_id=CONTEXT_ID),
+            runtime=_Runtime(principal_id=CONTEXT_PRINCIPAL_ID),
         )
     assert port.requests == []
 
@@ -1426,13 +1470,15 @@ def test_future_aggregate_ingestion_proof_is_unavailable_not_healthy() -> None:
     assert "aggregate zero lacked positive raw-input" in current_guest_coverage.detail
 
 
-def test_executable_optional_control_cannot_select_incident() -> None:
+def test_optional_control_is_not_called_or_allowed_to_select_incident() -> None:
     authority = _authority(required_control_names={"heartbeat", "endpoint", "monitor", "flow"})
-    with pytest.raises(
-        MonitoringAcquisitionError,
-        match="must belong to required coverage scope",
-    ):
-        _execute(_AcquisitionPort(), authority=authority)
+    outcome, commit, _ = _execute(_AcquisitionPort(), authority=authority)
+
+    assert commit.calls == 1
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert all(item.source != "resourceHealth" for item in receipt.exchanges)
+    assert all(item.family != "platformHealth" for item in outcome.batch.coverage)
 
 
 def test_transaction_rejects_receipt_replay_with_altered_batch() -> None:
@@ -1463,6 +1509,52 @@ def test_transaction_rejects_receipt_replay_with_altered_batch() -> None:
             change_scope=_scope_contract(),
             trusted_as_of=NOW + timedelta(minutes=1),
             acquisition_receipt=receipt,
+        )
+
+
+def test_production_transaction_rejects_unsigned_direct_bypass() -> None:
+    outcome, _, intent = _execute(_AcquisitionPort())
+    context, _, _ = _authority()
+
+    with pytest.raises(MonitoringCollectionError, match="requires a signed acquisition receipt"):
+        _transaction().prepare(
+            outcome.batch,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=1),
+        )
+
+
+def test_production_transaction_rejects_forged_receipt_signature() -> None:
+    outcome, _, intent = _execute(_AcquisitionPort())
+    context, _, _ = _authority()
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    forged = receipt.model_copy(
+        update={
+            "collector_attestation": receipt.collector_attestation.model_copy(
+                update={"signature": base64.b64encode(b"forged").decode("ascii")}
+            )
+        }
+    )
+
+    with pytest.raises(MonitoringCollectionError, match="cryptographic verification failed"):
+        _transaction().prepare(
+            outcome.batch,
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collector_contract_digest=DIGEST_C,
+            change_scope=_scope_contract(),
+            trusted_as_of=NOW + timedelta(minutes=1),
+            acquisition_receipt=forged,
         )
 
 

@@ -35,7 +35,8 @@ The coordinator:
   non-reader identity, the collector contract, exact read-only source allowlist, resource
   allowlist, payload limits, freshness limit, total acquisition-call budget, receipt signing key,
   and a digest of the deployment identity-separation contract;
-- obtains the authenticated principal and execution clock from the collector runtime rather than
+- binds both managed-identity resource IDs and platform principal/object IDs, obtains the
+  authenticated principal and execution clock from the collector runtime rather than
   trusting source-port or request-caller identity/time claims, and rejects execution unless the
   platform-authenticated principal is the approved monitoring reader and is distinct from Athena's
   non-reader context identity;
@@ -77,10 +78,10 @@ The coordinator:
   and
 - constructs exactly one deterministically ordered `MonitoringCollectionBatch` after every
   applicable source succeeds, then invokes `MonitoringCollectionTransaction.execute` once.
-- rejects executable optional controls whose coverage is absent from
-  `requiredCoverageScopeDigests`, so records, observations, coverage, and incident selection remain
-  one governed unit; supporting Activity Log controls without their own required coverage are not
-  executed, so they cannot consume acquisition calls or confer direct attribution.
+- preselects only authority-pinned required controls before authorization, source calls, and call
+  budgeting, then requires those controls to satisfy exactly `requiredCoverageScopeDigests`; records,
+  observations, coverage, and incident selection therefore remain one governed unit. Supporting
+  Activity Log controls without their own required coverage are not executed.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -111,6 +112,8 @@ ambiguous incident transitions fail before the persistence transaction is entere
   receipt-bearing acquisition. Production handoff verification requires the reviewed collector
   contract to authorize the exact handoff schema version and the acquisition authority to pin the
   receipt signing key.
+- Production collection transactions require cryptographic receipt verification before persistence;
+  receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
 - This slice adds no Azure resource, RBAC assignment, diagnostic setting, alert, query deployment,
   or Connection Monitor mutation.
 

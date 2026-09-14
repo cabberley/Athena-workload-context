@@ -182,7 +182,11 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         pattern=r"^monitoring-acquisition-authority-[a-f0-9]{32}$",
     )
     monitoring_reader_identity_id: str = Field(alias="monitoringReaderIdentityId")
+    monitoring_reader_principal_id: str | None = Field(
+        default=None, alias="monitoringReaderPrincipalId"
+    )
     athena_context_identity_id: str = Field(alias="athenaContextIdentityId")
+    athena_context_principal_id: str | None = Field(default=None, alias="athenaContextPrincipalId")
     collector_contract_digest: Sha256Digest = Field(alias="collectorContractDigest")
     allowed_sources: tuple[AcquisitionSource, ...] = Field(
         alias="allowedSources",
@@ -193,6 +197,12 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         alias="allowedResourceIds",
         min_length=1,
         max_length=256,
+    )
+    required_control_ids: tuple[str, ...] | None = Field(
+        default=None,
+        alias="requiredControlIds",
+        min_length=1,
+        max_length=128,
     )
     max_rows: Literal[500] = Field(alias="maxRows")
     max_bytes: Literal[262144] = Field(alias="maxBytes")
@@ -233,6 +243,16 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     def validate_identity(cls, value: str) -> str:
         return _canonical_identity_id(value)
 
+    @field_validator("monitoring_reader_principal_id", "athena_context_principal_id")
+    @classmethod
+    def validate_principal(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.casefold()
+        if _GUID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("managed identity principal ID is invalid")
+        return normalized
+
     @field_validator("allowed_sources")
     @classmethod
     def validate_sources(
@@ -251,6 +271,21 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             raise ValueError("acquisition resource IDs must be unique")
         return normalized
 
+    @field_validator("required_control_ids")
+    @classmethod
+    def validate_control_ids(cls, values: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        if (
+            values != tuple(sorted(values))
+            or len(values) != len(set(values))
+            or any(
+                re.fullmatch(r"monitoring-control-[a-f0-9]{32}", value) is None for value in values
+            )
+        ):
+            raise ValueError("required control IDs must be sorted and unique")
+        return values
+
     @model_validator(mode="after")
     def validate_authority(self) -> MonitoringAcquisitionAuthority:
         if self.monitoring_reader_identity_id == self.athena_context_identity_id:
@@ -262,6 +297,9 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             self.receipt_signing_key_id,
             self.monitoring_reader_has_read_only_workload_access,
             self.deployment_identity_contract_digest,
+            self.monitoring_reader_principal_id,
+            self.athena_context_principal_id,
+            self.required_control_ids,
         )
         if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1":
             if any(item is not None for item in receipt_fields):
@@ -271,7 +309,9 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         deployment_digest = compute_artifact_digest(
             {
                 "monitoringReaderIdentityId": self.monitoring_reader_identity_id,
+                "monitoringReaderPrincipalId": self.monitoring_reader_principal_id,
                 "athenaContextIdentityId": self.athena_context_identity_id,
+                "athenaContextPrincipalId": self.athena_context_principal_id,
                 "monitoringReaderHasReadOnlyWorkloadAccess": (
                     self.monitoring_reader_has_read_only_workload_access
                 ),
@@ -279,9 +319,9 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 "readOnly": self.read_only,
             }
         )
-        if (
-            self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2"
-            and self.deployment_identity_contract_digest != deployment_digest
+        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2" and (
+            self.monitoring_reader_principal_id == self.athena_context_principal_id
+            or self.deployment_identity_contract_digest != deployment_digest
         ):
             raise ValueError("deploymentIdentityContractDigest does not bind identity separation")
         expected = compute_artifact_digest(
@@ -963,18 +1003,28 @@ class _AcquisitionExecution:
         self,
         request: RequestT,
         operation: Callable[[RequestT], ResultT],
+        *,
+        requested_at_override: datetime | None = None,
     ) -> ResultT:
         if len(self.exchanges) >= self.max_calls:
             raise MonitoringAcquisitionError(
                 "monitoring acquisition exceeded its total call budget"
             )
-        requested_at = _trusted_runtime_time(self.runtime.utc_now())
+        requested_at = (
+            _trusted_runtime_time(self.runtime.utc_now())
+            if requested_at_override is None
+            else _trusted_runtime_time(requested_at_override)
+        )
         result = operation(request)
         received_at = _trusted_runtime_time(self.runtime.utc_now())
         if requested_at < self.started_at or received_at < requested_at:
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
         source = cast(AcquisitionSource, request.source)
         checked_at = request.checked_at if isinstance(request, IpFlowVerifyRequest) else None
+        if checked_at is not None and checked_at != requested_at:
+            raise MonitoringAcquisitionError(
+                "IP Flow checkedAt must equal the collector-owned call start"
+            )
         self.exchanges.append(
             MonitoringAcquisitionExchange(
                 sequence=len(self.exchanges) + 1,
@@ -1389,9 +1439,13 @@ class MonitoringAcquisitionCoordinator:
         ):
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v1",
+            "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v2",
             "authenticatedPrincipalId": authenticated_principal_id,
+            "monitoringReaderIdentityId": (
+                self._acquisition_authority.monitoring_reader_identity_id
+            ),
             "athenaContextIdentityId": self._acquisition_authority.athena_context_identity_id,
+            "athenaContextPrincipalId": (self._acquisition_authority.athena_context_principal_id),
             "deploymentIdentityContractDigest": (
                 cast(
                     str,
@@ -1458,12 +1512,14 @@ class MonitoringAcquisitionCoordinator:
             raise TypeError("acquisition requires an exact PublishedRuntimeContextBinding")
         del collected_at
         execution_started_at = _trusted_runtime_time(self._runtime.utc_now())
-        authenticated_principal_id = _canonical_identity_id(
-            self._runtime.authenticated_principal_id()
-        )
+        authenticated_principal_id = self._runtime.authenticated_principal_id().casefold()
+        if _GUID_PATTERN.fullmatch(authenticated_principal_id) is None:
+            raise MonitoringAcquisitionError(
+                "collector runtime returned an invalid authenticated principal ID"
+            )
         if (
-            authenticated_principal_id != self._acquisition_authority.monitoring_reader_identity_id
-            or authenticated_principal_id == self._acquisition_authority.athena_context_identity_id
+            authenticated_principal_id != self._acquisition_authority.monitoring_reader_principal_id
+            or authenticated_principal_id == self._acquisition_authority.athena_context_principal_id
         ):
             raise MonitoringAcquisitionError(
                 "authenticated deployment identity violates acquisition separation"
@@ -1511,9 +1567,21 @@ class MonitoringAcquisitionCoordinator:
                 context_binding,
                 expected_active_context_authority_digest=(expected_active_context_authority_digest),
             )
+            controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
+            required_control_ids = set(
+                cast(
+                    tuple[str, ...],
+                    self._acquisition_authority.required_control_ids,
+                )
+            )
+            if not required_control_ids.issubset(controls_by_id):
+                raise MonitoringAcquisitionError(
+                    "acquisition authority references an unknown required control"
+                )
+            selected_controls = tuple(controls_by_id[item] for item in sorted(required_control_ids))
             authorized_resources = set(self._acquisition_authority.allowed_resource_ids)
             authorized_sources = set(self._acquisition_authority.allowed_sources)
-            for control in monitoring_intent.controls:
+            for control in selected_controls:
                 required_resources = {
                     *control.scope.resource_ids,
                     *(control.scope.evidence_resource_ids or ()),
@@ -1560,7 +1628,7 @@ class MonitoringAcquisitionCoordinator:
             )
 
         try:
-            for control in monitoring_intent.controls:
+            for control in selected_controls:
                 if isinstance(control.signal, LogQueryMonitoringSignal):
                     new_records, new_coverage, reasons = self._acquire_log_control(
                         control,
@@ -1612,6 +1680,15 @@ class MonitoringAcquisitionCoordinator:
                 "executable monitoring controls must belong to required coverage scope"
             )
         required_control_ids = {item.control_id for item in selected_coverage}
+        if required_control_ids != set(
+            cast(
+                tuple[str, ...],
+                self._acquisition_authority.required_control_ids,
+            )
+        ):
+            raise MonitoringAcquisitionError(
+                "required controls and required coverage scope are not bound as one unit"
+            )
         unit_records: list[MonitoringCollectionRecord] = []
         for item in records:
             if isinstance(item, ResourceChangeRecord):
@@ -1664,13 +1741,11 @@ class MonitoringAcquisitionCoordinator:
                 )
             ),
         )
-        preliminary = self._collection_transaction.prepare(
+        preliminary = self._collection_transaction._prepare_receipt_candidate(
             batch,
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
-            expected_active_context_authority_digest=(
-                expected_active_context_authority_digest
-            ),
+            expected_active_context_authority_digest=(expected_active_context_authority_digest),
             collector_contract_digest=collector_contract_digest,
             change_scope=change_scope,
             trusted_as_of=trusted_as_of,
@@ -2197,6 +2272,7 @@ class MonitoringAcquisitionCoordinator:
         verification = execution.invoke(
             verification_request,
             self._acquisition_port.query_ip_flow_verify,
+            requested_at_override=checked_at,
         )
         if type(verification) is not IpFlowVerifyResult:
             raise MonitoringAcquisitionError("IP Flow Verify returned an unexpected response type")

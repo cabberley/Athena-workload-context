@@ -509,10 +509,9 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
             raise ValueError("complete query coverage requires executed query digests")
         if self.status == "unavailable" and self.query_execution_digests:
             raise ValueError("unavailable query coverage cannot claim executed queries")
-        if (
-            self.query_execution_digests != tuple(sorted(self.query_execution_digests))
-            or len(self.query_execution_digests) != len(set(self.query_execution_digests))
-        ):
+        if self.query_execution_digests != tuple(sorted(self.query_execution_digests)) or len(
+            self.query_execution_digests
+        ) != len(set(self.query_execution_digests)):
             raise ValueError("queryExecutionDigests must be sorted unique values")
         return self
 
@@ -903,9 +902,7 @@ def _validate_record_window(
     trusted_as_of: datetime,
 ) -> None:
     if record.observed_end > collected_at or record.observed_end > trusted_as_of:
-        raise MonitoringCollectionError(
-            "collector record is newer than collectedAt or trustedAsOf"
-        )
+        raise MonitoringCollectionError("collector record is newer than collectedAt or trustedAsOf")
 
 
 def _heartbeat_observation(
@@ -1139,8 +1136,7 @@ def _validate_coverage_query_binding(
     if (
         coverage.observed_end > collected_at
         or coverage.observed_end > trusted_as_of
-        or (coverage.observed_end - coverage.observed_start).total_seconds()
-        <= 0
+        or (coverage.observed_end - coverage.observed_start).total_seconds() <= 0
         or (collected_at - coverage.observed_end).total_seconds()
         > signal.evaluation_window_seconds + signal.frequency_seconds
         or (trusted_as_of - coverage.observed_end).total_seconds()
@@ -1160,9 +1156,7 @@ def _validate_coverage_query_binding(
             records_by_execution[digest] for digest in coverage.query_execution_digests
         )
     except KeyError as exc:
-        raise MonitoringCollectionError(
-            "coverage references an unknown query execution"
-        ) from exc
+        raise MonitoringCollectionError("coverage references an unknown query execution") from exc
     if any(
         record.control_id != coverage.control_id
         or record.query_digest != coverage.query_digest
@@ -1173,9 +1167,7 @@ def _validate_coverage_query_binding(
         or not _record_matches_coverage_scope(record, coverage)
         for record in executions
     ):
-        raise MonitoringCollectionError(
-            "coverage does not bind exact query executions and scope"
-        )
+        raise MonitoringCollectionError("coverage does not bind exact query executions and scope")
     ordered = tuple(
         sorted(
             executions,
@@ -1191,13 +1183,9 @@ def _validate_coverage_query_binding(
         or ordered[0].observed_start != coverage.observed_start
         or ordered[-1].observed_end != coverage.observed_end
         or any(
-            (
-                current.observed_start - previous.observed_start
-            ).total_seconds()
+            (current.observed_start - previous.observed_start).total_seconds()
             != signal.frequency_seconds
-            or (
-                current.observed_end - previous.observed_end
-            ).total_seconds()
+            or (current.observed_end - previous.observed_end).total_seconds()
             != signal.frequency_seconds
             for previous, current in zip(ordered, ordered[1:], strict=False)
         )
@@ -1459,14 +1447,11 @@ def _resource_health_observation(
     if (
         record.observed_end > collected_at
         or record.observed_end > trusted_as_of
-        or (collected_at - record.observed_start).total_seconds()
-        > signal.maximum_event_age_seconds
-        or (collected_at - record.observed_end).total_seconds()
-        > signal.maximum_event_age_seconds
+        or (collected_at - record.observed_start).total_seconds() > signal.maximum_event_age_seconds
+        or (collected_at - record.observed_end).total_seconds() > signal.maximum_event_age_seconds
         or (trusted_as_of - record.observed_start).total_seconds()
         > signal.maximum_event_age_seconds
-        or (trusted_as_of - record.observed_end).total_seconds()
-        > signal.maximum_event_age_seconds
+        or (trusted_as_of - record.observed_end).total_seconds() > signal.maximum_event_age_seconds
     ):
         raise MonitoringCollectionError(
             "resource-health record is outside the reviewed freshness limit"
@@ -1585,8 +1570,8 @@ def _validate_request_window(
         raise MonitoringCollectionError("correlation request window is invalid")
 
 
-class MonitoringCollectionTransaction:
-    """Prepare one all-or-nothing normalized evidence transaction for persistence."""
+class _MonitoringCollectionTransactionCore:
+    """Internal normalization core shared with explicit test compatibility code."""
 
     def __init__(
         self,
@@ -1606,9 +1591,7 @@ class MonitoringCollectionTransaction:
         self._change_signer = change_signer
         self._change_signing_key_id = change_signing_key_id
         self._monitoring_intent_trusted_key_id = monitoring_intent_trusted_key_id
-        self._monitoring_intent_signature_verifier = (
-            monitoring_intent_signature_verifier
-        )
+        self._monitoring_intent_signature_verifier = monitoring_intent_signature_verifier
         self._monitoring_intent_asset_loader = monitoring_intent_asset_loader
 
     def prepare(
@@ -1668,14 +1651,12 @@ class MonitoringCollectionTransaction:
                     "collection acquisition receipt failed strict revalidation"
                 ) from exc
             if (
-                acquisition_receipt.collector_contract_digest
-                != collector_contract_digest
+                acquisition_receipt.collector_contract_digest != collector_contract_digest
                 or acquisition_receipt.execution_started_at != batch.collected_at
                 or acquisition_receipt.receipt_issued_at > trusted_as_of
                 or acquisition_receipt.intent_id != monitoring_intent.intent_id
                 or acquisition_receipt.intent_digest != monitoring_intent.intent_digest
-                or acquisition_receipt.context_binding_digest
-                != context_binding.binding_digest
+                or acquisition_receipt.context_binding_digest != context_binding.binding_digest
                 or acquisition_receipt.collection_batch_digest
                 != sha256_hex(batch.canonical_bytes())
             ):
@@ -1726,8 +1707,7 @@ class MonitoringCollectionTransaction:
             if (
                 evidence.occurred_at > trusted_as_of
                 or evidence.received_at > trusted_as_of
-                or trusted_as_of - evidence.occurred_at
-                > MAX_CHANGE_EVIDENCE_AGE
+                or trusted_as_of - evidence.occurred_at > MAX_CHANGE_EVIDENCE_AGE
             ):
                 raise MonitoringCollectionError(
                     "resource change is outside its trustedAsOf freshness limit"
@@ -1854,9 +1834,7 @@ class MonitoringCollectionTransaction:
                 for item in acquisition_receipt.exchanges
                 if item.source in {"logAnalytics", "resourceHealth"}
             }
-            if receipt_coverage_ids != {
-                item.source_record_id for item in batch.coverage
-            }:
+            if receipt_coverage_ids != {item.source_record_id for item in batch.coverage}:
                 raise MonitoringCollectionError(
                     "acquisition receipt does not exactly bind collection coverage"
                 )
@@ -1930,26 +1908,18 @@ class MonitoringCollectionTransaction:
         acquisition_manifest = None
         if acquisition_receipt is not None:
             manifest_payload = {
-                "schemaVersion": (
-                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
-                ),
+                "schemaVersion": ("athena.wc028MonitoringAcquisitionEvidenceManifest.v1"),
                 "collectionBatchDigest": acquisition_receipt.collection_batch_digest,
-                "normalizedEvidenceDigest": (
-                    acquisition_receipt.normalized_evidence_digest
-                ),
+                "normalizedEvidenceDigest": (acquisition_receipt.normalized_evidence_digest),
                 "exchanges": [
                     item.model_dump(mode="json", by_alias=True, exclude_none=True)
                     for item in acquisition_receipt.exchanges
                 ],
             }
             acquisition_manifest = MonitoringAcquisitionEvidenceManifest(
-                schemaVersion=(
-                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
-                ),
+                schemaVersion=("athena.wc028MonitoringAcquisitionEvidenceManifest.v1"),
                 collectionBatchDigest=acquisition_receipt.collection_batch_digest,
-                normalizedEvidenceDigest=(
-                    acquisition_receipt.normalized_evidence_digest
-                ),
+                normalizedEvidenceDigest=(acquisition_receipt.normalized_evidence_digest),
                 exchanges=acquisition_receipt.exchanges,
                 manifestDigest=compute_artifact_digest(manifest_payload),
             )
@@ -2111,6 +2081,93 @@ class MonitoringCollectionTransaction:
                 expires_at=expires_at,
             )
         return prepared, committed, request
+
+
+class MonitoringCollectionTransaction(_MonitoringCollectionTransactionCore):
+    """Production transaction that requires a trusted acquisition receipt."""
+
+    def __init__(
+        self,
+        *,
+        acquisition_receipt_verifier: Callable[[MonitoringAcquisitionReceipt, datetime], None],
+        change_signer: ChangeEvidenceArtifactSigner,
+        change_signing_key_id: str,
+        monitoring_intent_trusted_key_id: str,
+        monitoring_intent_signature_verifier: Callable[[bytes, str], bool],
+        monitoring_intent_asset_loader: Callable[
+            [PublishedMonitoringIntent],
+            tuple[
+                PublishedMonitoringIntentAssetReference,
+                PublishedMonitoringIntentAttestation,
+            ],
+        ],
+    ) -> None:
+        super().__init__(
+            change_signer=change_signer,
+            change_signing_key_id=change_signing_key_id,
+            monitoring_intent_trusted_key_id=monitoring_intent_trusted_key_id,
+            monitoring_intent_signature_verifier=monitoring_intent_signature_verifier,
+            monitoring_intent_asset_loader=monitoring_intent_asset_loader,
+        )
+        self._acquisition_receipt_verifier = acquisition_receipt_verifier
+
+    def _prepare_receipt_candidate(
+        self,
+        batch: MonitoringCollectionBatch,
+        *,
+        monitoring_intent: PublishedMonitoringIntent,
+        context_binding: PublishedRuntimeContextBinding,
+        expected_active_context_authority_digest: str,
+        collector_contract_digest: str,
+        change_scope: ApprovedChangeScope,
+        trusted_as_of: datetime,
+    ) -> PreparedMonitoringCollection:
+        """Normalize a candidate only so its digest can be bound into the receipt."""
+
+        return super().prepare(
+            batch,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            expected_active_context_authority_digest=(expected_active_context_authority_digest),
+            collector_contract_digest=collector_contract_digest,
+            change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
+        )
+
+    def prepare(
+        self,
+        batch: MonitoringCollectionBatch,
+        *,
+        monitoring_intent: PublishedMonitoringIntent,
+        context_binding: PublishedRuntimeContextBinding,
+        expected_active_context_authority_digest: str,
+        collector_contract_digest: str,
+        change_scope: ApprovedChangeScope,
+        trusted_as_of: datetime,
+        acquisition_receipt: MonitoringAcquisitionReceipt | None = None,
+    ) -> PreparedMonitoringCollection:
+        if acquisition_receipt is None:
+            raise MonitoringCollectionError(
+                "production collection requires a signed acquisition receipt"
+            )
+        if type(acquisition_receipt) is not MonitoringAcquisitionReceipt:
+            raise TypeError("collection requires an exact acquisition receipt")
+        try:
+            self._acquisition_receipt_verifier(acquisition_receipt, trusted_as_of)
+        except (TypeError, ValueError) as exc:
+            raise MonitoringCollectionError(
+                "collection acquisition receipt cryptographic verification failed"
+            ) from exc
+        return super().prepare(
+            batch,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            expected_active_context_authority_digest=(expected_active_context_authority_digest),
+            collector_contract_digest=collector_contract_digest,
+            change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
+            acquisition_receipt=acquisition_receipt,
+        )
 
 
 def _observation_family(observation: MonitoringObservation) -> EvidenceFamily:
@@ -2304,9 +2361,7 @@ def build_collected_correlation_request(
                 "controlDigest": control_digest,
                 "sourceClausePath": source_clause_path,
             }
-            for control_id, control_digest, source_clause_path in sorted(
-                control_provenance
-            )
+            for control_id, control_digest, source_clause_path in sorted(control_provenance)
         ]
     )
     source_references: tuple[VersionPinnedBlobReference, ...] = tuple(

@@ -161,7 +161,9 @@ class TrustedMonitoringHandoffVerifier:
     key_resolver: KeyVaultTrustedKeyResolver
     expected_acquisition_authority_digest: str | None = None
     expected_authenticated_principal_id: str | None = None
+    expected_monitoring_reader_identity_id: str | None = None
     expected_athena_context_identity_id: str | None = None
+    expected_athena_context_principal_id: str | None = None
     expected_deployment_identity_contract_digest: str | None = None
     expected_receipt_signing_key_id: str | None = None
     acquisition_receipt_maximum_age_seconds: int = 900
@@ -173,19 +175,13 @@ class TrustedMonitoringHandoffVerifier:
             raise TypeError(
                 "production monitoring verification requires KeyVaultTrustedKeyResolver"
             )
-        if (self.receipt_trusted_key_anchor is None) != (
-            self.receipt_key_resolver is None
-        ):
-            raise TypeError(
-                "receipt key anchor and resolver must be configured together"
-            )
+        if (self.receipt_trusted_key_anchor is None) != (self.receipt_key_resolver is None):
+            raise TypeError("receipt key anchor and resolver must be configured together")
         if (
             self.receipt_key_resolver is not None
             and type(self.receipt_key_resolver) is not KeyVaultTrustedKeyResolver
         ):
-            raise TypeError(
-                "production receipt verification requires KeyVaultTrustedKeyResolver"
-            )
+            raise TypeError("production receipt verification requires KeyVaultTrustedKeyResolver")
 
     def verify(
         self,
@@ -211,7 +207,9 @@ class TrustedMonitoringHandoffVerifier:
         if (
             self.expected_acquisition_authority_digest is None
             or self.expected_authenticated_principal_id is None
+            or self.expected_monitoring_reader_identity_id is None
             or self.expected_athena_context_identity_id is None
+            or self.expected_athena_context_principal_id is None
             or self.expected_deployment_identity_contract_digest is None
             or self.expected_receipt_signing_key_id is None
         ):
@@ -221,13 +219,10 @@ class TrustedMonitoringHandoffVerifier:
         receipt_anchor = self.receipt_trusted_key_anchor
         receipt_resolver = self.receipt_key_resolver
         if receipt_anchor is None or receipt_resolver is None:
-            if (
-                self.expected_receipt_signing_key_id.casefold().rstrip("/")
-                != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/")
-            ):
-                raise ValueError(
-                    "distinct receipt signing key requires a dedicated trusted anchor"
-                )
+            if self.expected_receipt_signing_key_id.casefold().rstrip(
+                "/"
+            ) != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/"):
+                raise ValueError("distinct receipt signing key requires a dedicated trusted anchor")
             receipt_anchor = self.trusted_key_anchor
             receipt_resolver = self.key_resolver
         verify_monitoring_acquisition_receipt_attestation(
@@ -235,15 +230,11 @@ class TrustedMonitoringHandoffVerifier:
             as_of=as_of,
             trusted_key_anchor=receipt_anchor,
             key_resolver=receipt_resolver,
-            expected_acquisition_authority_digest=(
-                self.expected_acquisition_authority_digest
-            ),
-            expected_authenticated_principal_id=(
-                self.expected_authenticated_principal_id
-            ),
-            expected_athena_context_identity_id=(
-                self.expected_athena_context_identity_id
-            ),
+            expected_acquisition_authority_digest=(self.expected_acquisition_authority_digest),
+            expected_authenticated_principal_id=(self.expected_authenticated_principal_id),
+            expected_monitoring_reader_identity_id=(self.expected_monitoring_reader_identity_id),
+            expected_athena_context_identity_id=(self.expected_athena_context_identity_id),
+            expected_athena_context_principal_id=(self.expected_athena_context_principal_id),
             expected_deployment_identity_contract_digest=(
                 self.expected_deployment_identity_contract_digest
             ),
@@ -251,9 +242,7 @@ class TrustedMonitoringHandoffVerifier:
                 self.reviewed_contract.compute_artifact_digest_value()
             ),
             expected_receipt_signing_key_id=self.expected_receipt_signing_key_id,
-            maximum_receipt_age_seconds=(
-                self.acquisition_receipt_maximum_age_seconds
-            ),
+            maximum_receipt_age_seconds=(self.acquisition_receipt_maximum_age_seconds),
         )
         return receipt.receipt_digest
 
@@ -301,13 +290,9 @@ class TrustedMonitoringIntentAssetVerifier:
 
     def __post_init__(self) -> None:
         if type(self.signer) is not KeyVaultRsaSigner:
-            raise TypeError(
-                "production monitoring intent verification requires KeyVaultRsaSigner"
-            )
+            raise TypeError("production monitoring intent verification requires KeyVaultRsaSigner")
         if self.signer.trusted_key_anchor.key_vault_key_id != self.trusted_key_id:
-            raise ValueError(
-                "monitoring intent verifier key does not match the trusted key"
-            )
+            raise ValueError("monitoring intent verifier key does not match the trusted key")
 
     def verify(
         self,
@@ -333,23 +318,16 @@ def _verify_signed_monitoring_intent(
 ) -> PublishedMonitoringIntent:
     evidence_reference = request.monitoring_bundle.monitoring_intent_reference
     if evidence_reference is None or reader is None or verifier is None:
-        raise ValueError(
-            "production correlation requires signed monitoring intent assets"
-        )
+        raise ValueError("production correlation requires signed monitoring intent assets")
     intent_bytes = reader.read(evidence_reference.intent_reference)
     attestation_bytes = reader.read(evidence_reference.attestation_reference)
     if (
         sha256_hex(intent_bytes) != evidence_reference.intent_reference.content_digest
-        or sha256_hex(attestation_bytes)
-        != evidence_reference.attestation_reference.content_digest
+        or sha256_hex(attestation_bytes) != evidence_reference.attestation_reference.content_digest
     ):
-        raise ValueError(
-            "monitoring intent Blob bytes do not match immutable references"
-        )
+        raise ValueError("monitoring intent Blob bytes do not match immutable references")
     intent = PublishedMonitoringIntent.model_validate_json(intent_bytes)
-    attestation = PublishedMonitoringIntentAttestation.model_validate_json(
-        attestation_bytes
-    )
+    attestation = PublishedMonitoringIntentAttestation.model_validate_json(attestation_bytes)
     reference = PublishedMonitoringIntentAssetReference(
         schemaVersion="athena.wc028PublishedMonitoringIntentAssetReference.v1",
         referenceId=evidence_reference.asset_reference_id,
@@ -377,9 +355,7 @@ def _verify_signed_monitoring_intent(
     ):
         provenance = item.control_provenance
         if provenance is None:
-            raise ValueError(
-                "monitoring evidence lacks signed control provenance"
-            )
+            raise ValueError("monitoring evidence lacks signed control provenance")
         control = controls.get(provenance.control_id)
         if (
             control is None
@@ -422,8 +398,7 @@ def _verify_request_source_freshness(
             is_query_observation = item.query_execution_digest is not None
         if isinstance(signal, LogQueryMonitoringSignal):
             maximum_age = timedelta(
-                seconds=signal.evaluation_window_seconds
-                + signal.frequency_seconds
+                seconds=signal.evaluation_window_seconds + signal.frequency_seconds
             )
             if (
                 observed_end > request.trusted_as_of
@@ -434,9 +409,7 @@ def _verify_request_source_freshness(
                     != timedelta(seconds=signal.evaluation_window_seconds)
                 )
             ):
-                raise ValueError(
-                    "query-derived evidence exceeds its trustedAsOf freshness limit"
-                )
+                raise ValueError("query-derived evidence exceeds its trustedAsOf freshness limit")
         elif isinstance(signal, ResourceHealthMonitoringSignal):
             maximum_age = timedelta(seconds=signal.maximum_event_age_seconds)
             if (
@@ -444,23 +417,16 @@ def _verify_request_source_freshness(
                 or request.trusted_as_of - observed_start > maximum_age
                 or request.trusted_as_of - observed_end > maximum_age
             ):
-                raise ValueError(
-                    "Resource Health evidence exceeds its trustedAsOf freshness limit"
-                )
+                raise ValueError("Resource Health evidence exceeds its trustedAsOf freshness limit")
         else:
-            raise ValueError(
-                "monitoring evidence references an unsupported signed control signal"
-            )
+            raise ValueError("monitoring evidence references an unsupported signed control signal")
     if any(
         artifact.evidence.occurred_at > request.trusted_as_of
         or artifact.evidence.received_at > request.trusted_as_of
-        or request.trusted_as_of - artifact.evidence.occurred_at
-        > MAX_CHANGE_EVIDENCE_AGE
+        or request.trusted_as_of - artifact.evidence.occurred_at > MAX_CHANGE_EVIDENCE_AGE
         for artifact in request.change_artifacts
     ):
-        raise ValueError(
-            "change evidence exceeds its trustedAsOf freshness limit"
-        )
+        raise ValueError("change evidence exceeds its trustedAsOf freshness limit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,16 +608,9 @@ class CorrelationService:
 
     def __post_init__(self) -> None:
         if type(self.monitoring_intent_reader) is not AzureBlobCorrelationArtifactReader:
-            raise TypeError(
-                "production correlation requires monitoring intent artifact reader"
-            )
-        if (
-            type(self.monitoring_intent_verifier)
-            is not TrustedMonitoringIntentAssetVerifier
-        ):
-            raise TypeError(
-                "production correlation requires TrustedMonitoringIntentAssetVerifier"
-            )
+            raise TypeError("production correlation requires monitoring intent artifact reader")
+        if type(self.monitoring_intent_verifier) is not TrustedMonitoringIntentAssetVerifier:
+            raise TypeError("production correlation requires TrustedMonitoringIntentAssetVerifier")
         readers = (
             self.monitoring_reader,
             self.change_reader,
@@ -695,8 +654,7 @@ class CorrelationService:
         if not isinstance(request.context_binding, PublishedRuntimeContextBinding):
             raise ValueError("production correlation requires published runtime context")
         if self._require_signed_monitoring_intent and (
-            self.monitoring_intent_reader is None
-            or self.monitoring_intent_verifier is None
+            self.monitoring_intent_reader is None or self.monitoring_intent_verifier is None
         ):
             raise ValueError(
                 "production correlation requires signed monitoring intent verification"

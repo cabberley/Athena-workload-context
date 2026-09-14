@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "13034900756409832607"
+      "templateHash": "4790619359031650486"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -141,6 +141,12 @@
         "description": "Globally unique Key Vault name for the isolated monitoring collector signing key."
       }
     },
+    "athenaContextIdentityResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI."
+      }
+    },
     "retentionDays": {
       "type": "int",
       "defaultValue": 30,
@@ -256,6 +262,7 @@
     }
   },
   "variables": {
+    "athenaContextIdentitySegments": "[split(toLower(parameters('athenaContextIdentityResourceId')), '/')]",
     "resourceTags": "[union(parameters('tags'), createObject('component', 'wc024-monitoring-foundation', 'dataBoundary', 'customer', 'managedBy', 'bicep', 'autoRemediation', 'disabled'))]",
     "legacyFlowLogStorageAccountName": "athenahackathonflowwhtco",
     "workloadResourceGroupId": "[format('{0}/resourceGroups/{1}', subscription().id, parameters('workloadResourceGroupName'))]",
@@ -3406,7 +3413,7 @@
     },
     "monitoringAcquisitionCollectorContract": {
       "type": "object",
-      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.acquisitionCollectorContract.value]"
+      "value": "[union(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.acquisitionCollectorContract.value, createObject('monitoringReaderPrincipalId', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value, 'athenaContextIdentityId', extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), 'athenaContextPrincipalId', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId, 'physicalIdentitySeparationEnforced', if(and(not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value), toLower(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId)))), true(), fail('monitoring collector and Athena context identities must be physically separate UAMIs with distinct principal IDs'))))]"
     },
     "replacementMonitoringStorageAccountResourceId": {
       "type": "string",

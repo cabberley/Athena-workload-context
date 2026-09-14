@@ -27,6 +27,7 @@ param collectorRuntimeSubnetResourceId = '/subscriptions/00000000-0000-0000-0000
 param collectorPrivateEndpointSubnetResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.Network/virtualNetworks/athena-demo-monitoring-collector-vnet/subnets/private-endpoints'
 param monitoringStorageAccountName = 'athenademomonstore'
 param monitoringCollectorKeyVaultName = 'athenademomonkv'
+param athenaContextIdentityResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-context/providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-demo-context'
 param retentionDays = 30
 param maximumEvidenceAgeSeconds = 600
 param connectionMonitorDeploymentEnabled = false

@@ -39,10 +39,7 @@ COLLECTOR_CONTRACT_MODULE = (
     / "monitoring-collector-contract.bicep"
 )
 MONITORING_FOUNDATION_MAIN = (
-    Path(__file__).parents[1]
-    / "infra"
-    / "wc024-monitoring-foundation"
-    / "main.bicep"
+    Path(__file__).parents[1] / "infra" / "wc024-monitoring-foundation" / "main.bicep"
 )
 
 
@@ -114,8 +111,7 @@ LOG_ANALYTICS_ACCESS_CONDITION = (
     + "))"
 )
 SIGNAL_READ_SCOPE_IDS = tuple(
-    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Compute/"
-    f"virtualMachines/{vm_name}"
+    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Compute/virtualMachines/{vm_name}"
     for vm_name in REVIEWED_VM_NAMES
 )
 RESOURCE_READ_SCOPE_IDS = (
@@ -165,13 +161,24 @@ def test_bicep_and_python_share_one_canonical_vm_allowlist() -> None:
         "var reviewedApprovedVmNames = [",
         maxsplit=1,
     )[1].split("]", maxsplit=1)[0]
-    bicep_names = tuple(
-        line.strip().strip("'")
-        for line in block.splitlines()
-        if line.strip()
-    )
+    bicep_names = tuple(line.strip().strip("'") for line in block.splitlines() if line.strip())
 
     assert bicep_names == REVIEWED_VM_NAMES
+
+
+def test_acquisition_contract_resolves_and_separates_actual_context_uami() -> None:
+    source = MONITORING_FOUNDATION_MAIN.read_text(encoding="utf-8")
+
+    assert "param athenaContextIdentityResourceId string" in source
+    assert (
+        "resource athenaContextIdentity "
+        "'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing"
+    ) in source
+    assert "collectorIdentityResourceId) != toLower(athenaContextIdentity.id)" in source
+    assert (
+        "collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId)"
+    ) in source
+    assert "physicalIdentitySeparationEnforced: acquisitionIdentitySeparation" in source
     assert "? reviewedApprovedVmNames" in source
 
 
@@ -185,16 +192,12 @@ def test_workload_vnet_id_is_canonicalized_before_digesting() -> None:
         canonical.workload_virtual_network_resource_id.upper()
     )
 
-    normalized = MonitoringCollectorContract.model_validate_json(
-        json.dumps(uppercase_payload)
-    )
+    normalized = MonitoringCollectorContract.model_validate_json(json.dumps(uppercase_payload))
 
     assert normalized.workload_virtual_network_resource_id == (
         canonical.workload_virtual_network_resource_id
     )
-    assert normalized.compute_artifact_digest_value() == (
-        canonical.compute_artifact_digest_value()
-    )
+    assert normalized.compute_artifact_digest_value() == (canonical.compute_artifact_digest_value())
 
 
 def _collector_contract() -> MonitoringCollectorContract:
@@ -235,9 +238,7 @@ def _collector_contract() -> MonitoringCollectorContract:
         workspaceAccessControlMode="workspaceAndResourceContext",
         readerRoleDefinitionId=READER_ROLE_DEFINITION_ID,
         signalReaderRoleDefinitionId=SIGNAL_READER_ROLE_DEFINITION_ID,
-        logAnalyticsDataReaderRoleDefinitionId=(
-            LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_ID
-        ),
+        logAnalyticsDataReaderRoleDefinitionId=(LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_ID),
         logAnalyticsAllowedTables=REVIEWED_LOG_TABLES,
         logAnalyticsAccessCondition=LOG_ANALYTICS_ACCESS_CONDITION,
         resourceReadScopeIds=RESOURCE_READ_SCOPE_IDS,
@@ -329,15 +330,19 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
         {
             "schemaVersion": "athena.wc028MonitoringCollectorContract.v3",
             "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
+            "monitoringReaderPrincipalId": "11111111-1111-1111-1111-111111111111",
+            "athenaContextIdentityId": (
+                f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/"
+                "Microsoft.ManagedIdentity/userAssignedIdentities/synthetic-athena-context"
+            ),
+            "athenaContextPrincipalId": "22222222-2222-2222-2222-222222222222",
+            "physicalIdentitySeparationEnforced": True,
         }
     )
 
     contract = MonitoringCollectorContract(**payload)
 
-    assert (
-        contract.handoff_schema_version
-        == "athena.wc028MonitoringEvidenceHandoff.v2"
-    )
+    assert contract.handoff_schema_version == "athena.wc028MonitoringEvidenceHandoff.v2"
 
 
 def test_collector_contract_bicep_output_matches_the_production_contract() -> None:
@@ -345,18 +350,12 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     output_fields = set(
         re.findall(
             r"^  (?P<field>[a-zA-Z][a-zA-Z0-9]*):",
-            source.split("var collectorContract = {", maxsplit=1)[1].split(
-                "\n}", maxsplit=1
-            )[0],
+            source.split("var collectorContract = {", maxsplit=1)[1].split("\n}", maxsplit=1)[0],
             flags=re.MULTILINE,
         )
     )
-    expected_fields = {
-        field.alias
-        for field in MonitoringCollectorContract.model_fields.values()
-        if field.alias is not None
-    }
-    bicep_output = _collector_contract().model_dump(by_alias=True)
+    bicep_output = _collector_contract().model_dump(by_alias=True, exclude_none=True)
+    expected_fields = set(bicep_output)
 
     assert output_fields == expected_fields == set(bicep_output)
     assert MonitoringCollectorContract(**bicep_output) == _collector_contract()
@@ -452,13 +451,9 @@ def test_reviewed_collector_contract_must_authorize_handoff_version() -> None:
             trusted_key_anchor=anchor,
             key_resolver=lambda _anchor: record,
             expected_collector_contract_digest=contract.compute_artifact_digest_value(),
-            reviewed_maximum_evidence_age_seconds=(
-                contract.maximum_evidence_age_seconds
-            ),
+            reviewed_maximum_evidence_age_seconds=(contract.maximum_evidence_age_seconds),
             reviewed_signing_key_resource_id=contract.signing_key_resource_id,
-            expected_handoff_schema_version=(
-                "athena.wc028MonitoringEvidenceHandoff.v2"
-            ),
+            expected_handoff_schema_version=("athena.wc028MonitoringEvidenceHandoff.v2"),
         )
 
 
@@ -545,10 +540,14 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.ManagedIdentity/"
         "userAssignedIdentities/synthetic-athena-context"
     )
+    reader_principal = "11111111-1111-1111-1111-111111111111"
+    context_principal = "22222222-2222-2222-2222-222222222222"
     deployment_digest = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": reader_identity.casefold(),
+            "monitoringReaderPrincipalId": reader_principal,
             "athenaContextIdentityId": context_identity.casefold(),
+            "athenaContextPrincipalId": context_principal,
             "monitoringReaderHasReadOnlyWorkloadAccess": True,
             "athenaContextHasWorkloadReader": False,
             "readOnly": True,
@@ -567,9 +566,11 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         checkedAt=observed_at,
     )
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v1",
-        "authenticatedPrincipalId": reader_identity,
+        "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v2",
+        "authenticatedPrincipalId": reader_principal,
+        "monitoringReaderIdentityId": reader_identity,
         "athenaContextIdentityId": context_identity,
+        "athenaContextPrincipalId": context_principal,
         "deploymentIdentityContractDigest": deployment_digest,
         "acquisitionAuthorityDigest": authority_digest,
         "collectorContractDigest": collector_digest,
@@ -587,8 +588,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
     signed_payload = {
         **payload,
         "receiptId": (
-            "monitoring-acquisition-receipt-"
-            f"{receipt_digest.removeprefix('sha256:')[:32]}"
+            f"monitoring-acquisition-receipt-{receipt_digest.removeprefix('sha256:')[:32]}"
         ),
         "receiptDigest": receipt_digest,
     }
@@ -632,8 +632,10 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         trusted_key_anchor=anchor,
         key_resolver=lambda _anchor: record,
         expected_acquisition_authority_digest=authority_digest,
-        expected_authenticated_principal_id=reader_identity,
+        expected_authenticated_principal_id=reader_principal,
+        expected_monitoring_reader_identity_id=reader_identity,
         expected_athena_context_identity_id=context_identity,
+        expected_athena_context_principal_id=context_principal,
         expected_deployment_identity_contract_digest=deployment_digest,
         expected_collector_contract_digest=collector_digest,
         expected_receipt_signing_key_id=REVIEWED_SIGNING_KEY_URI,
@@ -646,8 +648,10 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             trusted_key_anchor=anchor,
             key_resolver=lambda _anchor: record,
             expected_acquisition_authority_digest=authority_digest,
-            expected_authenticated_principal_id=context_identity,
+            expected_authenticated_principal_id=context_principal,
+            expected_monitoring_reader_identity_id=context_identity,
             expected_athena_context_identity_id=context_identity,
+            expected_athena_context_principal_id=context_principal,
             expected_deployment_identity_contract_digest=deployment_digest,
             expected_collector_contract_digest=collector_digest,
             expected_receipt_signing_key_id=REVIEWED_SIGNING_KEY_URI,
@@ -660,14 +664,69 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             trusted_key_anchor=anchor,
             key_resolver=lambda _anchor: record,
             expected_acquisition_authority_digest=authority_digest,
-            expected_authenticated_principal_id=reader_identity,
+            expected_authenticated_principal_id=reader_principal,
+            expected_monitoring_reader_identity_id=reader_identity,
             expected_athena_context_identity_id=context_identity,
+            expected_athena_context_principal_id=context_principal,
             expected_deployment_identity_contract_digest=deployment_digest,
             expected_collector_contract_digest=collector_digest,
             expected_receipt_signing_key_id=(
                 "https://athenademomonkv.vault.azure.net/keys/other/"
                 "0123456789abcdef0123456789abcdef"
             ),
+            maximum_receipt_age_seconds=600,
+        )
+
+    legacy_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"monitoringReaderIdentityId", "athenaContextPrincipalId"}
+    }
+    legacy_payload.update(
+        {
+            "schemaVersion": "athena.wc028MonitoringAcquisitionReceipt.v1",
+            "authenticatedPrincipalId": reader_identity,
+        }
+    )
+    legacy_digest = compute_artifact_digest(legacy_payload)
+    legacy_signed_payload = {
+        **legacy_payload,
+        "receiptId": (
+            f"monitoring-acquisition-receipt-{legacy_digest.removeprefix('sha256:')[:32]}"
+        ),
+        "receiptDigest": legacy_digest,
+    }
+    legacy_preimage = monitoring_acquisition_receipt_preimage(legacy_signed_payload)
+    legacy_receipt = MonitoringAcquisitionReceipt(
+        **{**legacy_signed_payload, "exchanges": (exchange,)},
+        collectorAttestation=MonitoringEvidenceAttestation(
+            signatureAlgorithm="RS256",
+            trustAnchorRef=REVIEWED_SIGNING_KEY_URI,
+            signedPreimageDigest=compute_artifact_digest(legacy_preimage),
+            signature=base64.b64encode(
+                private_key.sign(
+                    canonicalize_json(legacy_preimage).encode("utf-8"),
+                    padding.PKCS1v15(),
+                    hashes.SHA256(),
+                )
+            ).decode("ascii"),
+        ),
+    )
+    assert legacy_receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v1"
+    with pytest.raises(ValueError, match="requires acquisition receipt v2"):
+        verify_monitoring_acquisition_receipt_attestation(
+            legacy_receipt,
+            as_of=observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            expected_acquisition_authority_digest=authority_digest,
+            expected_authenticated_principal_id=reader_principal,
+            expected_monitoring_reader_identity_id=reader_identity,
+            expected_athena_context_identity_id=context_identity,
+            expected_athena_context_principal_id=context_principal,
+            expected_deployment_identity_contract_digest=deployment_digest,
+            expected_collector_contract_digest=collector_digest,
+            expected_receipt_signing_key_id=REVIEWED_SIGNING_KEY_URI,
             maximum_receipt_age_seconds=600,
         )
 
@@ -709,8 +768,7 @@ def test_signed_handoff_requires_the_exact_active_collector_key() -> None:
         )
 
     wrong_record_anchor = TrustedKeyAnchor.from_key_vault_key_id(
-        "https://athenademomonkv.vault.azure.net/keys/another-key/"
-        "0123456789abcdef0123456789abcdef",
+        "https://athenademomonkv.vault.azure.net/keys/another-key/0123456789abcdef0123456789abcdef",
         public_key_fingerprint=anchor.public_key_fingerprint,
     )
     wrong_record = TrustedKeyRecord(
@@ -826,9 +884,7 @@ def test_signed_handoff_requires_trusted_as_of_and_reviewed_freshness() -> None:
             expected_collector_contract_digest=signed_handoff.collector_contract_digest,
             reviewed_maximum_evidence_age_seconds=contract.maximum_evidence_age_seconds,
             reviewed_signing_key_resource_id=contract.signing_key_resource_id,
-            expected_handoff_schema_version=(
-                "athena.wc028MonitoringEvidenceHandoff.v2"
-            ),
+            expected_handoff_schema_version=("athena.wc028MonitoringEvidenceHandoff.v2"),
             trusted_key_anchor=anchor,
             key_resolver=lambda _: record,
         )

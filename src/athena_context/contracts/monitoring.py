@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import re
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
 
 from cryptography.exceptions import InvalidSignature
@@ -20,21 +20,13 @@ from athena_context.contracts.models import (
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
-MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
-    "athena.wc024MonitoringCollectorContract.v2"
-)
+MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION = "athena.wc024MonitoringCollectorContract.v2"
 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v3"
 )
-MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = (
-    "athena.wc024MonitoringEvidenceHandoff.v1"
-)
-MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
-    "athena.wc028MonitoringAcquisitionReceipt.v1"
-)
-MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = (
-    "athena.wc028MonitoringEvidenceHandoff.v2"
-)
+MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = "athena.wc024MonitoringEvidenceHandoff.v1"
+MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v2"
+MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
 
 type MonitoringSignalKind = Literal[
     "heartbeat",
@@ -86,9 +78,7 @@ _KEY_VAULT_KEY_ID_PATTERN = re.compile(
 )
 _READER_ROLE_DEFINITION_GUID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
 _SIGNAL_READER_ROLE_DEFINITION_GUID = "2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
-_LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = (
-    "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
-)
+_LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
 _REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
 _REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
 _REVIEWED_MONITORING_RESOURCE_GROUP = "rg-athena-demo-monitoring"
@@ -228,6 +218,24 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=128,
     )
+    monitoring_reader_principal_id: str | None = Field(
+        default=None,
+        alias="monitoringReaderPrincipalId",
+    )
+    athena_context_identity_id: str | None = Field(
+        default=None,
+        alias="athenaContextIdentityId",
+        min_length=1,
+        max_length=2048,
+    )
+    athena_context_principal_id: str | None = Field(
+        default=None,
+        alias="athenaContextPrincipalId",
+    )
+    physical_identity_separation_enforced: Literal[True] | None = Field(
+        default=None,
+        alias="physicalIdentitySeparationEnforced",
+    )
     monitoring_resource_group_id: str = Field(
         alias="monitoringResourceGroupId",
         min_length=1,
@@ -263,9 +271,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
-    authorization_mode: Literal[
-        "conditionedWorkspacePlusExactResourceContext"
-    ] = Field(
+    authorization_mode: Literal["conditionedWorkspacePlusExactResourceContext"] = Field(
         alias="authorizationMode"
     )
     workspace_access_control_mode: Literal[
@@ -317,9 +323,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
-    evidence_container_name: Literal["monitoring-evidence"] = Field(
-        alias="evidenceContainerName"
-    )
+    evidence_container_name: Literal["monitoring-evidence"] = Field(alias="evidenceContainerName")
     signal_kinds: tuple[MonitoringSignalKind, ...] = Field(
         alias="signalKinds",
         min_length=len(_EXPECTED_SIGNALS),
@@ -340,9 +344,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         ge=60,
         le=900,
     )
-    connection_monitor_mode: Literal["capabilityOnly"] = Field(
-        alias="connectionMonitorMode"
-    )
+    connection_monitor_mode: Literal["capabilityOnly"] = Field(alias="connectionMonitorMode")
     connection_monitor_deployment_mode: Literal["capability-only"] = Field(
         alias="connectionMonitorDeploymentMode"
     )
@@ -350,15 +352,12 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     @field_validator("workload_virtual_network_resource_id")
     @classmethod
     def canonicalize_workload_vnet_id(cls, value: str) -> str:
-        subscription_id, resource_group, provider, resource_types = (
-            _parse_arm_resource_id(value)
-        )
+        subscription_id, resource_group, provider, resource_types = _parse_arm_resource_id(value)
         if (
             resource_group == _REVIEWED_WORKLOAD_RESOURCE_GROUP
             and provider == "microsoft.network"
             and resource_types == ("virtualnetworks",)
-            and value.rsplit("/", 1)[-1].casefold()
-            == _REVIEWED_WORKLOAD_VNET_NAME
+            and value.rsplit("/", 1)[-1].casefold() == _REVIEWED_WORKLOAD_VNET_NAME
         ):
             return (
                 f"/subscriptions/{subscription_id}/resourceGroups/"
@@ -372,27 +371,18 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     def require_complete_generic_monitoring_allowlist(self) -> MonitoringCollectorContract:
         if (
             self.schema_version == MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION
-            and self.handoff_schema_version
-            != MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION
+            and self.handoff_schema_version != MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION
         ) or (
-            self.schema_version
-            == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
-            and self.handoff_schema_version
-            != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
+            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and self.handoff_schema_version != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
         ):
-            raise ValueError(
-                "collector contract version does not authorize its handoff schema"
-            )
+            raise ValueError("collector contract version does not authorize its handoff schema")
         if self.signal_kinds != _EXPECTED_SIGNALS:
             raise ValueError("monitoring signals must use the complete reviewed generic allowlist")
         if self.allowed_read_operations != _EXPECTED_READ_OPERATIONS:
-            raise ValueError(
-                "monitoring read operations must use the complete reviewed allowlist"
-            )
+            raise ValueError("monitoring read operations must use the complete reviewed allowlist")
         if self.log_analytics_allowed_tables != _EXPECTED_LOG_TABLES:
-            raise ValueError(
-                "Log Analytics tables must use the complete reviewed allowlist"
-            )
+            raise ValueError("Log Analytics tables must use the complete reviewed allowlist")
         normalized_condition = "".join(self.log_analytics_access_condition.split())
         expected_condition = "".join(_EXPECTED_LOG_ANALYTICS_ACCESS_CONDITION.split())
         if normalized_condition != expected_condition:
@@ -400,6 +390,29 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 "Log Analytics access condition must restrict data reads to the "
                 "reviewed table allowlist"
             )
+        acquisition_identity_fields = (
+            self.monitoring_reader_principal_id,
+            self.athena_context_identity_id,
+            self.athena_context_principal_id,
+            self.physical_identity_separation_enforced,
+        )
+        if self.schema_version == MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            if any(item is not None for item in acquisition_identity_fields):
+                raise ValueError("WC-024 collector contract cannot contain acquisition identities")
+        elif any(item is None for item in acquisition_identity_fields):
+            raise ValueError("WC-028 collector contract requires physical identity separation")
+        else:
+            try:
+                reader_principal = UUID(cast(str, self.monitoring_reader_principal_id))
+                context_principal = UUID(cast(str, self.athena_context_principal_id))
+            except ValueError as exc:
+                raise ValueError("collector principal IDs must be UUIDs") from exc
+            if (
+                reader_principal == context_principal
+                or self.collector_identity_resource_id.casefold().rstrip("/")
+                == cast(str, self.athena_context_identity_id).casefold().rstrip("/")
+            ):
+                raise ValueError("collector and Athena context identities must be separate")
         try:
             UUID(self.collector_identity_client_id)
         except ValueError as exc:
@@ -532,9 +545,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         if tuple(scope.casefold() for scope in self.resource_read_scope_ids) != tuple(
             scope.casefold() for scope in expected_resource_read_scope_ids
         ):
-            raise ValueError(
-                "Reader scopes must match the exact reviewed monitoring resources"
-            )
+            raise ValueError("Reader scopes must match the exact reviewed monitoring resources")
 
         resource_bindings = (
             (
@@ -629,7 +640,11 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
         if self.requested_at > self.received_at:
             raise ValueError("acquisition exchange receipt times are reversed")
         if self.source == "ipFlowVerify":
-            if self.checked_at is None or self.checked_at > self.received_at:
+            if (
+                self.checked_at is None
+                or self.checked_at < self.requested_at
+                or self.checked_at > self.received_at
+            ):
                 raise ValueError("IP Flow receipt requires a collector-bounded checkedAt")
         elif self.checked_at is not None:
             raise ValueError("only IP Flow receipt entries may contain checkedAt")
@@ -639,9 +654,10 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
 class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
     """Immutable collector-signed provenance for one bounded acquisition execution."""
 
-    schema_version: Literal["athena.wc028MonitoringAcquisitionReceipt.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc028MonitoringAcquisitionReceipt.v1",
+        "athena.wc028MonitoringAcquisitionReceipt.v2",
+    ] = Field(alias="schemaVersion")
     receipt_id: str = Field(
         alias="receiptId",
         pattern=r"^monitoring-acquisition-receipt-[a-f0-9]{32}$",
@@ -651,10 +667,21 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
+    monitoring_reader_identity_id: str | None = Field(
+        default=None,
+        alias="monitoringReaderIdentityId",
+        min_length=1,
+        max_length=2048,
+    )
     athena_context_identity_id: str = Field(
         alias="athenaContextIdentityId",
         min_length=1,
         max_length=2048,
+    )
+    athena_context_principal_id: str | None = Field(
+        default=None,
+        alias="athenaContextPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
     deployment_identity_contract_digest: str = Field(
         alias="deploymentIdentityContractDigest",
@@ -693,23 +720,35 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         max_length=32,
     )
     receipt_digest: str = Field(alias="receiptDigest", pattern=_DIGEST_PATTERN)
-    collector_attestation: MonitoringEvidenceAttestation = Field(
-        alias="collectorAttestation"
-    )
+    collector_attestation: MonitoringEvidenceAttestation = Field(alias="collectorAttestation")
 
     @model_validator(mode="after")
     def validate_receipt(self) -> MonitoringAcquisitionReceipt:
-        if self.authenticated_principal_id.casefold().rstrip("/") == (
-            self.athena_context_identity_id.casefold().rstrip("/")
+        if self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v1":
+            if (
+                self.monitoring_reader_identity_id is not None
+                or self.athena_context_principal_id is not None
+            ):
+                raise ValueError("v1 acquisition receipt cannot contain v2 identity bindings")
+        elif (
+            self.monitoring_reader_identity_id is None
+            or self.athena_context_principal_id is None
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                self.authenticated_principal_id,
+            )
+            is None
+        ):
+            raise ValueError("v2 acquisition receipt requires resource and principal identities")
+        if self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v2" and (
+            cast(str, self.monitoring_reader_identity_id).casefold().rstrip("/")
+            == self.athena_context_identity_id.casefold().rstrip("/")
+            or self.authenticated_principal_id == self.athena_context_principal_id
         ):
             raise ValueError(
                 "acquisition principal must be separate from the Athena context identity"
             )
-        if not (
-            self.execution_started_at
-            <= self.execution_completed_at
-            <= self.receipt_issued_at
-        ):
+        if not (self.execution_started_at <= self.execution_completed_at <= self.receipt_issued_at):
             raise ValueError("acquisition receipt times are reversed")
         if tuple(item.sequence for item in self.exchanges) != tuple(
             range(1, len(self.exchanges) + 1)
@@ -748,13 +787,10 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
             f"monitoring-acquisition-receipt-{expected.removeprefix('sha256:')[:32]}"
         ):
             raise ValueError("receiptId is not digest-bound")
-        if (
-            self.collector_attestation.signed_preimage_digest
-            != compute_artifact_digest(monitoring_acquisition_receipt_preimage(self))
+        if self.collector_attestation.signed_preimage_digest != compute_artifact_digest(
+            monitoring_acquisition_receipt_preimage(self)
         ):
-            raise ValueError(
-                "acquisition receipt attestation does not bind the exact receipt"
-            )
+            raise ValueError("acquisition receipt attestation does not bind the exact receipt")
         return self
 
 
@@ -764,9 +800,7 @@ class MonitoringEvidenceHandoff(_StrictMonitoringContract):
     schema_version: Literal[
         "athena.wc024MonitoringEvidenceHandoff.v1",
         "athena.wc028MonitoringEvidenceHandoff.v2",
-    ] = Field(
-        alias="schemaVersion"
-    )
+    ] = Field(alias="schemaVersion")
     collector_contract_digest: str = Field(
         alias="collectorContractDigest",
         pattern=_DIGEST_PATTERN,
@@ -779,9 +813,7 @@ class MonitoringEvidenceHandoff(_StrictMonitoringContract):
         pattern=_DIGEST_PATTERN,
     )
     evidence: VersionPinnedBlobReference
-    collector_attestation: MonitoringEvidenceAttestation = Field(
-        alias="collectorAttestation"
-    )
+    collector_attestation: MonitoringEvidenceAttestation = Field(alias="collectorAttestation")
 
     @model_validator(mode="after")
     def bind_exact_evidence_and_attestation(self) -> MonitoringEvidenceHandoff:
@@ -798,9 +830,8 @@ class MonitoringEvidenceHandoff(_StrictMonitoringContract):
             and self.acquisition_receipt_digest is None
         ):
             raise ValueError("WC028 monitoring handoff requires acquisition provenance")
-        if (
-            self.collector_attestation.signed_preimage_digest
-            != compute_artifact_digest(monitoring_handoff_preimage(self))
+        if self.collector_attestation.signed_preimage_digest != compute_artifact_digest(
+            monitoring_handoff_preimage(self)
         ):
             raise ValueError(
                 "monitoring handoff attestation does not bind the exact evidence reference"
@@ -843,7 +874,7 @@ def monitoring_acquisition_receipt_preimage(
     else:
         payload = receipt
     return {
-        "domain": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+        "domain": payload["schemaVersion"],
         "receipt": payload,
     }
 
@@ -949,17 +980,12 @@ def verify_monitoring_evidence_handoff_attestation(
         raise ValueError("monitoring handoff does not bind the expected collector contract")
     if reviewed_collector_contract is None:
         if expected_handoff_schema_version is None:
-            raise ValueError(
-                "digest-only verification requires the reviewed handoff schema"
-            )
+            raise ValueError("digest-only verification requires the reviewed handoff schema")
         if handoff.schema_version != expected_handoff_schema_version:
-            raise ValueError(
-                "monitoring handoff schema does not match the reviewed schema"
-            )
+            raise ValueError("monitoring handoff schema does not match the reviewed schema")
     if (
         reviewed_collector_contract is not None
-        and handoff.schema_version
-        != reviewed_collector_contract.handoff_schema_version
+        and handoff.schema_version != reviewed_collector_contract.handoff_schema_version
     ):
         raise ValueError(
             "monitoring handoff schema is not authorized by the reviewed collector contract"
@@ -1010,7 +1036,9 @@ def verify_monitoring_acquisition_receipt_attestation(
     key_resolver: TrustedKeyResolver,
     expected_acquisition_authority_digest: str,
     expected_authenticated_principal_id: str,
+    expected_monitoring_reader_identity_id: str,
     expected_athena_context_identity_id: str,
+    expected_athena_context_principal_id: str,
     expected_deployment_identity_contract_digest: str,
     expected_collector_contract_digest: str,
     expected_receipt_signing_key_id: str,
@@ -1023,41 +1051,51 @@ def verify_monitoring_acquisition_receipt_attestation(
         60 <= maximum_receipt_age_seconds <= 3600
     ):
         raise ValueError("acquisition receipt maximum age is invalid")
+    if (
+        receipt.schema_version != "athena.wc028MonitoringAcquisitionReceipt.v2"
+        or receipt.monitoring_reader_identity_id is None
+        or receipt.athena_context_principal_id is None
+    ):
+        raise ValueError("production verification requires acquisition receipt v2")
     deployment_digest = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": (
-                expected_authenticated_principal_id.casefold().rstrip("/")
+                expected_monitoring_reader_identity_id.casefold().rstrip("/")
             ),
-            "athenaContextIdentityId": (
-                expected_athena_context_identity_id.casefold().rstrip("/")
-            ),
+            "monitoringReaderPrincipalId": expected_authenticated_principal_id.casefold(),
+            "athenaContextIdentityId": (expected_athena_context_identity_id.casefold().rstrip("/")),
+            "athenaContextPrincipalId": expected_athena_context_principal_id.casefold(),
             "monitoringReaderHasReadOnlyWorkloadAccess": True,
             "athenaContextHasWorkloadReader": False,
             "readOnly": True,
         }
     )
     if (
-        expected_authenticated_principal_id.casefold().rstrip("/")
+        expected_monitoring_reader_identity_id.casefold().rstrip("/")
         == expected_athena_context_identity_id.casefold().rstrip("/")
+        or expected_authenticated_principal_id.casefold()
+        == expected_athena_context_principal_id.casefold()
         or expected_deployment_identity_contract_digest != deployment_digest
     ):
         raise ValueError("deployed acquisition identity separation is invalid")
     if (
-        receipt.acquisition_authority_digest
-        != expected_acquisition_authority_digest
+        receipt.acquisition_authority_digest != expected_acquisition_authority_digest
         or receipt.collector_contract_digest != expected_collector_contract_digest
         or receipt.deployment_identity_contract_digest
         != expected_deployment_identity_contract_digest
         or receipt.authenticated_principal_id.casefold().rstrip("/")
         != expected_authenticated_principal_id.casefold().rstrip("/")
+        or receipt.monitoring_reader_identity_id.casefold().rstrip("/")
+        != expected_monitoring_reader_identity_id.casefold().rstrip("/")
         or receipt.athena_context_identity_id.casefold().rstrip("/")
         != expected_athena_context_identity_id.casefold().rstrip("/")
+        or receipt.athena_context_principal_id.casefold()
+        != expected_athena_context_principal_id.casefold()
     ):
         raise ValueError("acquisition receipt does not match deployed acquisition authority")
     if (
         expected_receipt_signing_key_id != trusted_key_anchor.key_vault_key_id
-        or receipt.collector_attestation.trust_anchor_ref
-        != expected_receipt_signing_key_id
+        or receipt.collector_attestation.trust_anchor_ref != expected_receipt_signing_key_id
     ):
         raise ValueError("acquisition receipt signing key is not authority-approved")
     if receipt.receipt_issued_at > as_of:
@@ -1082,9 +1120,7 @@ def verify_monitoring_acquisition_receipt_attestation(
         )
         record.public_key.verify(
             signature,
-            canonicalize_json(
-                monitoring_acquisition_receipt_preimage(receipt)
-            ).encode("utf-8"),
+            canonicalize_json(monitoring_acquisition_receipt_preimage(receipt)).encode("utf-8"),
             padding.PKCS1v15(),
             hashes.SHA256(),
         )
