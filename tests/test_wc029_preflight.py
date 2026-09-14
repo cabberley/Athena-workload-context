@@ -557,6 +557,83 @@ def test_what_if_rejects_network_perimeter_without_perimeter_evidence(
     )
 
 
+@pytest.mark.parametrize("resource_id", [_STORAGE_ID, _KEY_VAULT_ID])
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {
+            "path": "properties.networkAcls",
+            "propertyChangeType": "Delete",
+        },
+        {
+            "path": "properties.networkAcls",
+            "propertyChangeType": "Modify",
+            "after": {"defaultAction": "Allow"},
+        },
+        {
+            "path": "properties.networkAcls.ipRules",
+            "propertyChangeType": "Modify",
+            "after": [{"value": "203.0.113.10"}],
+        },
+    ],
+)
+def test_what_if_network_acl_changes_require_complete_private_evidence(
+    resource_id: str,
+    delta: dict[str, object],
+) -> None:
+    document = _what_if(
+        {
+            "resourceId": resource_id,
+            "changeType": "Modify",
+            "delta": [delta],
+        }
+    )
+
+    assert "public-data-plane-access" in {
+        item.code
+        for item in evaluate_what_if(
+            document,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+    }
+
+
+@pytest.mark.parametrize("resource_id", [_STORAGE_ID, _KEY_VAULT_ID])
+def test_what_if_network_acl_change_accepts_complete_private_after_state(
+    resource_id: str,
+) -> None:
+    document = _what_if(
+        {
+            "resourceId": resource_id,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties.networkAcls.ipRules",
+                    "propertyChangeType": "Modify",
+                    "after": [],
+                }
+            ],
+            "after": {
+                "properties": {
+                    "publicNetworkAccess": "Disabled",
+                    "networkAcls": {
+                        "defaultAction": "Deny",
+                        "ipRules": [],
+                    },
+                }
+            },
+        }
+    )
+
+    assert (
+        evaluate_what_if(
+            document,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+        == ()
+    )
+
+
 def test_what_if_rejects_removal_of_protective_storage_settings() -> None:
     document = _what_if(
         {

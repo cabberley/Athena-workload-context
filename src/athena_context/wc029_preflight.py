@@ -489,6 +489,11 @@ def _walk_delta(
                 property_change_type,
             )
         )
+        if (
+            property_change_type not in {"delete", "remove"}
+            and isinstance(after, (dict, list))
+        ):
+            values.extend(_flatten_after(after, root=path))
         if children is not None:
             child_items = [
                 _mapping(child, field_name="delta child")
@@ -504,9 +509,11 @@ def _walk_delta(
 
 def _flatten_after(
     value: object,
+    *,
+    root: str = "<resource>",
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
-    stack: list[tuple[object, str]] = [(value, "<resource>")]
+    stack: list[tuple[object, str]] = [(value, root)]
     while stack:
         item, path = stack.pop()
         if isinstance(item, dict):
@@ -540,7 +547,8 @@ def _unsafe_property_violations(
     )
     violations: list[PreflightViolation] = []
     delta = _delta_entries(change)
-    candidates = _walk_delta(delta) if delta else []
+    delta_candidates = _walk_delta(delta) if delta else []
+    candidates = list(delta_candidates)
     after_payload = _get_case_insensitive(change, "after")
     if isinstance(after_payload, (dict, list)):
         candidates.extend(_flatten_after(after_payload))
@@ -607,6 +615,60 @@ def _unsafe_property_violations(
                 detail=("change lacks FullResourcePayloads or inspectable delta"),
             ),
         )
+    if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
+        network_acl_touched = any(
+            (path := _canonical_property_path(raw_path))
+            == "properties.networkacls"
+            or path.startswith("properties.networkacls.")
+            for raw_path, _, _ in delta_candidates
+        )
+        if network_acl_touched:
+            protected_parent_removed = any(
+                _canonical_property_path(raw_path) == "properties.networkacls"
+                and property_change_type in {"delete", "remove"}
+                for raw_path, _, property_change_type in delta_candidates
+            )
+            protected_values = {
+                "properties.publicnetworkaccess": "disabled",
+                "properties.networkacls.defaultaction": "deny",
+            }
+            explicit_unsafe = False
+            complete_safe = True
+            for protected_path, expected_value in protected_values.items():
+                matching = [
+                    (after, property_change_type)
+                    for raw_path, after, property_change_type in candidates
+                    if _canonical_property_path(raw_path) == protected_path
+                ]
+                safe_values = [
+                    after
+                    for after, property_change_type in matching
+                    if property_change_type not in {"delete", "remove"}
+                    and isinstance(after, str)
+                    and _normalized(after) == expected_value
+                ]
+                unsafe_values = [
+                    after
+                    for after, property_change_type in matching
+                    if property_change_type in {"delete", "remove"}
+                    or not isinstance(after, str)
+                    or _normalized(after) != expected_value
+                ]
+                complete_safe = complete_safe and bool(safe_values) and not unsafe_values
+                explicit_unsafe = explicit_unsafe or bool(unsafe_values)
+            if protected_parent_removed or (
+                not explicit_unsafe and not complete_safe
+            ):
+                violations.append(
+                    PreflightViolation(
+                        code="public-data-plane-access",
+                        subject=resource_id,
+                        detail=(
+                            "network ACL protection was removed or lacks explicit "
+                            "publicNetworkAccess Disabled and defaultAction Deny"
+                        ),
+                    )
+                )
     for raw_path, after, property_change_type in candidates:
         path = _canonical_property_path(raw_path)
         removed = property_change_type in {"delete", "remove"}
