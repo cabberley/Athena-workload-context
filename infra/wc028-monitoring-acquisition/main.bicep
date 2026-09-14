@@ -170,7 +170,6 @@ module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
   params: {
     collectorPrincipalId: collectorIdentity.properties.principalId
     workloadResourceGroupResourceId: workloadResourceGroupResourceId
-    networkWatcherResourceId: networkWatcherResourceId
     changeEvidenceStorageAccountResourceId: changeEvidenceStorageAccountResourceId
     changeEvidenceContainerResourceId: validatedChangeEvidenceContainerResourceId
   }

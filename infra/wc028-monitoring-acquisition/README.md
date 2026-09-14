@@ -33,7 +33,7 @@ bounded bytes and SHA-256 digest are identical.
 
 `acquisitionRuntimeConfigurationJson` uses
 `athena.wc028MonitoringAcquisitionJobConfiguration.v1`. It embeds the exact signed monitoring
-intent and references, published runtime binding, acquisition authority v2, collector contract v3,
+intent and references, published runtime binding, acquisition authority v3, collector contract v4,
 and approved change scope. It also binds:
 
 - the WC-024 collector resource, client, and principal identities;
@@ -42,6 +42,11 @@ and approved change scope. It also binds:
 - the Log Analytics workspace and Network Watcher;
 - the monitoring-intent and collector signing-key trust anchors; and
 - the active-context and acquisition-authority digests.
+
+The runtime delegates managed-identity acquisition to the hardened credential-bound adapter. That
+adapter obtains and cryptographically verifies the required ARM and Log Analytics audience tokens,
+passes each verified bearer token only to its matching source call, and binds the resulting
+credential proofs into acquisition receipt v3.
 
 For `Heartbeat` and `VMConnection`, a signed query may return a second result table to prove that a
 zero aggregate came from positive input and complete ingestion. The table must contain exactly one
@@ -59,12 +64,12 @@ The deployment adds only:
 
 - `AcrPull` on the existing registry;
 - Activity Log and Resource Graph change-history reads at the approved workload resource group;
-- the IP Flow Verify diagnostic action on the exact Network Watcher; and
 - known-Blob read/write data actions on the exact WC-025 `change-evidence` container.
 
 It adds no built-in Reader, Contributor, Owner, list, delete, diagnostic-setting, alert-rule, or
 Connection Monitor mutation permission. Existing WC-024 grants continue to authorize the
-collector's narrow monitoring reads, monitoring evidence writes, and signing-key use.
+collector's narrow monitoring reads, exact Network Watcher IP Flow Verify action, monitoring
+evidence writes, and signing-key use.
 
 ## Local validation
 

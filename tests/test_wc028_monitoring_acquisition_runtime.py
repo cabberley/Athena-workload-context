@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import unquote
 
-import jwt
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -30,7 +29,6 @@ from athena_context.contracts import (
     sha256_hex,
 )
 from athena_context.monitoring_acquisition_runtime import (
-    AzureManagedIdentityAcquisitionRuntime,
     AzureManagedIdentityJsonTransport,
     AzureMonitoringAcquisitionPort,
     MonitoringAcquisitionJobError,
@@ -47,6 +45,7 @@ from athena_context.monitoring_acquisition_runtime import (
 NOW = datetime(2026, 9, 14, 5, 30, tzinfo=UTC)
 SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111"
 CLIENT_ID = "22222222-2222-2222-2222-222222222222"
+TENANT_ID = "33333333-3333-3333-3333-333333333333"
 COLLECTOR_PRINCIPAL_ID = "44444444-4444-4444-4444-444444444444"
 CONTEXT_PRINCIPAL_ID = "55555555-5555-5555-5555-555555555555"
 COLLECTOR_ID = (
@@ -81,6 +80,11 @@ NETWORK_WATCHER_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/"
     "providers/Microsoft.Network/networkWatchers/NetworkWatcher_australiaeast"
 )
+IP_FLOW_ROLE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/"
+    "providers/Microsoft.Authorization/roleDefinitions/"
+    "3728cdf6-4efd-5282-bdfc-63b7872fd801"
+)
 VM_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload/"
     "providers/Microsoft.Compute/virtualMachines/vm-web-01"
@@ -106,6 +110,7 @@ INTENT_KEY_ID = (
 DIGEST_A = f"sha256:{'a' * 64}"
 DIGEST_B = f"sha256:{'b' * 64}"
 DIGEST_C = f"sha256:{'c' * 64}"
+ACCESS_TOKEN = "synthetic-verified-token"
 
 
 def _iso(value: datetime) -> str:
@@ -123,12 +128,10 @@ def _configuration_payload() -> dict[str, object]:
         "evidenceBlobEndpoint": "https://athenamonitoring.blob.core.windows.net",
         "evidenceContainerName": "monitoring-evidence",
         "changeEvidenceStorageAccountResourceId": CHANGE_EVIDENCE_STORAGE_ID,
-        "changeEvidenceBlobEndpoint": (
-            "https://athenachangeevidence.blob.core.windows.net"
-        ),
+        "changeEvidenceBlobEndpoint": ("https://athenachangeevidence.blob.core.windows.net"),
         "changeEvidenceContainerName": "change-evidence",
         "workspaceResourceId": WORKSPACE_ID,
-        "workspaceCustomerId": "33333333-3333-3333-3333-333333333333",
+        "workspaceCustomerId": TENANT_ID,
         "networkWatcherResourceId": NETWORK_WATCHER_ID,
         "monitoringIntentTrustedKey": {
             "keyVaultKeyId": INTENT_KEY_ID,
@@ -143,20 +146,29 @@ def _configuration_payload() -> dict[str, object]:
         "monitoringIntent": {"schemaVersion": "synthetic"},
         "monitoringIntentReference": {"schemaVersion": "synthetic"},
         "monitoringIntentAttestation": {"schemaVersion": "synthetic"},
-        "contextBinding": {"schemaVersion": "synthetic"},
+        "contextBinding": {
+            "schemaVersion": "synthetic",
+            "bindingDigest": DIGEST_A,
+            "requiredCoverageScopeDigests": [DIGEST_B],
+        },
         "acquisitionAuthority": {
-            "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v2",
+            "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v3",
             "monitoringReaderIdentityId": COLLECTOR_ID,
             "monitoringReaderPrincipalId": COLLECTOR_PRINCIPAL_ID,
+            "monitoringReaderClientId": CLIENT_ID,
+            "monitoringReaderTenantId": TENANT_ID,
             "athenaContextIdentityId": CONTEXT_ID,
             "athenaContextPrincipalId": CONTEXT_PRINCIPAL_ID,
             "receiptSigningKeyId": COLLECTOR_KEY_ID,
+            "contextBindingDigest": DIGEST_A,
+            "requiredCoverageScopeDigests": [DIGEST_B],
             "authorityDigest": DIGEST_C,
         },
         "monitoringCollectorContract": {
-            "schemaVersion": "athena.wc028MonitoringCollectorContract.v3",
+            "schemaVersion": "athena.wc028MonitoringCollectorContract.v4",
             "collectorIdentityClientId": CLIENT_ID,
             "collectorIdentityResourceId": COLLECTOR_ID,
+            "collectorTenantId": TENANT_ID,
             "monitoringReaderPrincipalId": COLLECTOR_PRINCIPAL_ID,
             "athenaContextIdentityId": CONTEXT_ID,
             "athenaContextPrincipalId": CONTEXT_PRINCIPAL_ID,
@@ -166,7 +178,14 @@ def _configuration_payload() -> dict[str, object]:
             "evidenceStorageAccountResourceId": EVIDENCE_STORAGE_ID,
             "evidenceContainerName": "monitoring-evidence",
             "signingKeyResourceId": COLLECTOR_KEY_ID,
+            "ipFlowVerifyRoleDefinitionId": IP_FLOW_ROLE_ID,
+            "ipFlowVerifyScopeId": NETWORK_WATCHER_ID,
+            "ipFlowVerifyAllowedOperations": [
+                "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+                "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+            ],
             "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
+            "acquisitionReceiptSchemaVersion": ("athena.wc028MonitoringAcquisitionReceipt.v3"),
         },
         "approvedChangeScope": {"schemaVersion": "synthetic"},
         "expectedActiveContextAuthorityDigest": DIGEST_A,
@@ -210,9 +229,7 @@ def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
     authority = cast(dict[str, object], substituted_identity["acquisitionAuthority"])
     authority["monitoringReaderIdentityId"] = CONTEXT_ID
     with pytest.raises(ValidationError, match="acquisition reader identity"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            substituted_identity
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_identity)
 
     substituted_storage = _configuration_payload()
     contract = cast(
@@ -221,27 +238,19 @@ def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
     )
     contract["evidenceStorageAccountResourceId"] = SOURCE_STORAGE_ID
     with pytest.raises(ValidationError, match="collector contract evidence storage"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            substituted_storage
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_storage)
 
     substituted_endpoint = _configuration_payload()
-    substituted_endpoint["evidenceBlobEndpoint"] = (
-        "https://unreviewedaccount.blob.core.windows.net"
-    )
+    substituted_endpoint["evidenceBlobEndpoint"] = "https://unreviewedaccount.blob.core.windows.net"
     with pytest.raises(ValidationError, match="reviewed storage account"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            substituted_endpoint
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_endpoint)
 
     substituted_change_endpoint = _configuration_payload()
     substituted_change_endpoint["changeEvidenceBlobEndpoint"] = (
         "https://unreviewedchange.blob.core.windows.net"
     )
     with pytest.raises(ValidationError, match="change evidence Blob endpoint"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            substituted_change_endpoint
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_change_endpoint)
 
     downgraded_contract = _configuration_payload()
     contract = cast(
@@ -251,9 +260,7 @@ def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
     contract["schemaVersion"] = "athena.wc024MonitoringCollectorContract.v2"
     contract["handoffSchemaVersion"] = "athena.wc024MonitoringEvidenceHandoff.v1"
     with pytest.raises(ValidationError, match="collector contract schema"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            downgraded_contract
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(downgraded_contract)
 
 
 def test_configuration_rejects_deployment_binding_substitution(
@@ -265,9 +272,7 @@ def test_configuration_rejects_deployment_binding_substitution(
     )
 
     with pytest.raises(ValidationError, match="DEPLOYED_COLLECTOR"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
-            _configuration_payload()
-        )
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(_configuration_payload())
 
 
 def test_configuration_loader_is_bounded_and_unambiguous(tmp_path: Path) -> None:
@@ -313,22 +318,32 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
     configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
         _configuration_payload()
     )
+    context_binding = SimpleNamespace(
+        binding_digest=DIGEST_A,
+        required_coverage_scope_digests=(DIGEST_B,),
+    )
     authority = SimpleNamespace(
-        schema_version="athena.wc028MonitoringAcquisitionAuthority.v2",
+        schema_version="athena.wc028MonitoringAcquisitionAuthority.v3",
         authority_digest=DIGEST_C,
         monitoring_reader_identity_id=COLLECTOR_ID.casefold(),
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
+        monitoring_reader_client_id=CLIENT_ID,
+        monitoring_reader_tenant_id=TENANT_ID,
         athena_context_identity_id=CONTEXT_ID.casefold(),
         athena_context_principal_id=CONTEXT_PRINCIPAL_ID,
         collector_contract_digest=DIGEST_B,
+        context_binding_digest=DIGEST_A,
+        required_coverage_scope_digests=(DIGEST_B,),
         max_freshness_seconds=600,
         receipt_signing_key_id=COLLECTOR_KEY_ID,
     )
     contract = SimpleNamespace(
-        schema_version="athena.wc028MonitoringCollectorContract.v3",
+        schema_version="athena.wc028MonitoringCollectorContract.v4",
         handoff_schema_version="athena.wc028MonitoringEvidenceHandoff.v2",
+        acquisition_receipt_schema_version=("athena.wc028MonitoringAcquisitionReceipt.v3"),
         collector_identity_resource_id=COLLECTOR_ID.casefold(),
         collector_identity_client_id=CLIENT_ID,
+        collector_tenant_id=TENANT_ID,
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
         athena_context_identity_id=CONTEXT_ID.casefold(),
         athena_context_principal_id=CONTEXT_PRINCIPAL_ID,
@@ -338,6 +353,7 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
         evidence_storage_account_resource_id=EVIDENCE_STORAGE_ID.casefold(),
         evidence_container_name="monitoring-evidence",
         signing_key_resource_id=COLLECTOR_KEY_ID,
+        ip_flow_verify_scope_id=NETWORK_WATCHER_ID.casefold(),
         maximum_evidence_age_seconds=600,
         compute_artifact_digest_value=lambda: DIGEST_C,
     )
@@ -347,6 +363,7 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
             acquisition_authority=cast(Any, authority),
             configuration=configuration,
             collector_contract=cast(Any, contract),
+            context_binding=cast(Any, context_binding),
         )
 
     authority.collector_contract_digest = DIGEST_C
@@ -356,6 +373,7 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
             acquisition_authority=cast(Any, authority),
             configuration=configuration,
             collector_contract=cast(Any, contract),
+            context_binding=cast(Any, context_binding),
         )
 
     authority.max_freshness_seconds = 600
@@ -365,6 +383,7 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
             acquisition_authority=cast(Any, authority),
             configuration=configuration,
             collector_contract=cast(Any, contract),
+            context_binding=cast(Any, context_binding),
         )
 
 
@@ -376,12 +395,6 @@ def test_receipt_verifier_reuses_hardened_identity_and_key_policy(
     )
     authority = SimpleNamespace(
         authority_digest=DIGEST_C,
-        monitoring_reader_identity_id=COLLECTOR_ID.casefold(),
-        monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
-        athena_context_identity_id=CONTEXT_ID.casefold(),
-        athena_context_principal_id=CONTEXT_PRINCIPAL_ID,
-        deployment_identity_contract_digest=DIGEST_A,
-        receipt_signing_key_id=COLLECTOR_KEY_ID,
         max_freshness_seconds=600,
     )
     contract = SimpleNamespace(
@@ -414,14 +427,8 @@ def test_receipt_verifier_reuses_hardened_identity_and_key_policy(
     assert captured["as_of"] == NOW
     assert captured["trusted_key_anchor"] == configuration.collector_signing_key.anchor
     assert captured["key_resolver"] is resolver
+    assert captured["reviewed_collector_contract"] is contract
     assert captured["expected_acquisition_authority_digest"] == DIGEST_C
-    assert captured["expected_authenticated_principal_id"] == COLLECTOR_PRINCIPAL_ID
-    assert captured["expected_monitoring_reader_identity_id"] == COLLECTOR_ID.casefold()
-    assert captured["expected_athena_context_identity_id"] == CONTEXT_ID.casefold()
-    assert captured["expected_athena_context_principal_id"] == CONTEXT_PRINCIPAL_ID
-    assert captured["expected_deployment_identity_contract_digest"] == DIGEST_A
-    assert captured["expected_collector_contract_digest"] == DIGEST_B
-    assert captured["expected_receipt_signing_key_id"] == COLLECTOR_KEY_ID
     assert captured["maximum_receipt_age_seconds"] == 300
 
 
@@ -434,13 +441,18 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     monitoring_intent = object()
     intent_reference = object()
     intent_attestation = object()
-    context_binding = object()
+    context_binding = SimpleNamespace(
+        binding_digest=DIGEST_A,
+        required_coverage_scope_digests=(DIGEST_B,),
+    )
     change_scope = object()
     collector_contract = SimpleNamespace(
-        schema_version="athena.wc028MonitoringCollectorContract.v3",
+        schema_version="athena.wc028MonitoringCollectorContract.v4",
         handoff_schema_version="athena.wc028MonitoringEvidenceHandoff.v2",
+        acquisition_receipt_schema_version=("athena.wc028MonitoringAcquisitionReceipt.v3"),
         collector_identity_resource_id=COLLECTOR_ID.casefold(),
         collector_identity_client_id=CLIENT_ID,
+        collector_tenant_id=TENANT_ID,
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
         athena_context_identity_id=CONTEXT_ID.casefold(),
         athena_context_principal_id=CONTEXT_PRINCIPAL_ID,
@@ -449,17 +461,22 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         evidence_storage_account_resource_id=EVIDENCE_STORAGE_ID.casefold(),
         evidence_container_name="monitoring-evidence",
         signing_key_resource_id=COLLECTOR_KEY_ID,
+        ip_flow_verify_scope_id=NETWORK_WATCHER_ID.casefold(),
         maximum_evidence_age_seconds=600,
         compute_artifact_digest_value=lambda: DIGEST_B,
     )
     acquisition_authority = SimpleNamespace(
-        schema_version="athena.wc028MonitoringAcquisitionAuthority.v2",
+        schema_version="athena.wc028MonitoringAcquisitionAuthority.v3",
         authority_digest=DIGEST_C,
         monitoring_reader_identity_id=COLLECTOR_ID.casefold(),
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
+        monitoring_reader_client_id=CLIENT_ID,
+        monitoring_reader_tenant_id=TENANT_ID,
         athena_context_identity_id=CONTEXT_ID.casefold(),
         athena_context_principal_id=CONTEXT_PRINCIPAL_ID,
         collector_contract_digest=DIGEST_B,
+        context_binding_digest=DIGEST_A,
+        required_coverage_scope_digests=(DIGEST_B,),
         allowed_resource_ids=(
             WORKSPACE_ID.casefold(),
             VM_ID.casefold(),
@@ -483,6 +500,7 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     key_resolver = cast(Any, lambda _anchor: None)
     transaction = object()
     commit_port = object()
+    acquisition_adapter = object()
     outcome = cast(Any, SimpleNamespace(committed=object(), correlation_request=object()))
 
     monkeypatch.setattr(
@@ -539,17 +557,10 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         build_transaction,
     )
 
-    class _Runtime:
-        def __init__(self, **kwargs: object) -> None:
-            captured["runtime"] = kwargs
-
-        def utc_now(self) -> datetime:
-            return NOW
-
     monkeypatch.setattr(
         runtime_module,
-        "AzureManagedIdentityAcquisitionRuntime",
-        _Runtime,
+        "_utc_now_milliseconds",
+        lambda: NOW,
     )
     monkeypatch.setattr(
         runtime_module,
@@ -560,6 +571,16 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         runtime_module,
         "AzureMonitoringAcquisitionPort",
         lambda **kwargs: captured.setdefault("port", kwargs),
+    )
+
+    def build_acquisition_adapter(**kwargs: object) -> object:
+        captured["adapter"] = kwargs
+        return acquisition_adapter
+
+    monkeypatch.setattr(
+        runtime_module,
+        "CredentialBoundMonitoringAcquisitionAdapter",
+        build_acquisition_adapter,
     )
 
     stores: list[tuple[dict[str, object], object]] = []
@@ -599,19 +620,20 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         _Coordinator,
     )
 
-    assert runtime_module.run_wc028_monitoring_acquisition_job(
-        configuration=configuration
-    ) is outcome
+    assert (
+        runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration) is outcome
+    )
 
     transaction_arguments = cast(dict[str, object], captured["transaction"])
     assert callable(transaction_arguments["acquisition_receipt_verifier"])
     coordinator_arguments = cast(dict[str, object], captured["coordinator"])
     assert coordinator_arguments["collection_transaction"] is transaction
     assert coordinator_arguments["receipt_signer"] is not None
-    runtime_arguments = cast(dict[str, object], captured["runtime"])
-    assert runtime_arguments["collector_identity_resource_id"] == (
-        COLLECTOR_ID.casefold()
-    )
+    assert coordinator_arguments["acquisition_adapter"] is acquisition_adapter
+    assert coordinator_arguments["expected_collector_contract_digest"] == DIGEST_B
+    adapter_arguments = cast(dict[str, object], captured["adapter"])
+    assert adapter_arguments["reviewed_collector_contract"] is collector_contract
+    assert adapter_arguments["acquisition_port"] is captured["port"]
     commit_arguments = cast(dict[str, object], captured["commit"])
     assert commit_arguments["key_resolver"] is key_resolver
     assert commit_arguments["reviewed_collector_contract"] is collector_contract
@@ -623,63 +645,8 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     assert commit_arguments["change_writer"] is stores[1][1]
     execute_arguments = cast(dict[str, object], captured["execute"])
     assert execute_arguments["commit_port"] is commit_port
-    assert execute_arguments["collector_contract_digest"] == DIGEST_B
+    assert "collector_contract_digest" not in execute_arguments
     assert execute_arguments["trusted_as_of"] == NOW + timedelta(seconds=60)
-
-
-class _TokenProvider:
-    def __init__(self, claims: dict[str, object]) -> None:
-        self._token = jwt.encode(claims, key="", algorithm="none")
-        self.calls: list[str] = []
-
-    def get_token(self, scope: str) -> str:
-        self.calls.append(scope)
-        return self._token
-
-
-def test_runtime_uses_azure_token_provenance_not_configured_identity() -> None:
-    provider = _TokenProvider(
-        {
-            "appid": CLIENT_ID,
-            "oid": COLLECTOR_PRINCIPAL_ID,
-            "xms_mirid": COLLECTOR_ID,
-        }
-    )
-    runtime = AzureManagedIdentityAcquisitionRuntime(
-        managed_identity_client_id=CLIENT_ID,
-        collector_identity_resource_id=COLLECTOR_ID,
-        token_provider=provider,
-    )
-
-    assert runtime.authenticated_principal_id() == COLLECTOR_PRINCIPAL_ID
-    assert provider.calls == ["https://management.azure.com/.default"]
-
-    missing_provenance = AzureManagedIdentityAcquisitionRuntime(
-        managed_identity_client_id=CLIENT_ID,
-        collector_identity_resource_id=COLLECTOR_ID,
-        token_provider=_TokenProvider(
-            {
-                "appid": CLIENT_ID,
-                "xms_mirid": COLLECTOR_ID,
-            }
-        ),
-    )
-    with pytest.raises(MonitoringAcquisitionJobError, match="does not prove"):
-        missing_provenance.authenticated_principal_id()
-
-    substituted_resource = AzureManagedIdentityAcquisitionRuntime(
-        managed_identity_client_id=CLIENT_ID,
-        collector_identity_resource_id=COLLECTOR_ID,
-        token_provider=_TokenProvider(
-            {
-                "appid": CLIENT_ID,
-                "oid": COLLECTOR_PRINCIPAL_ID,
-                "xms_mirid": CONTEXT_ID,
-            }
-        ),
-    )
-    with pytest.raises(MonitoringAcquisitionJobError, match="does not match"):
-        substituted_resource.authenticated_principal_id()
 
 
 class _HttpResponse:
@@ -706,43 +673,38 @@ def test_transport_uses_managed_identity_bearer_token(
         captured.append((request, timeout))
         return _HttpResponse()
 
-    token_provider = SimpleNamespace(get_token=lambda scope: f"token-for-{scope}")
     monkeypatch.setattr(runtime_module, "urlopen", open_request)
     transport = AzureManagedIdentityJsonTransport(
-        managed_identity_client_id=CLIENT_ID,
         timeout_seconds=17,
         retry_limit=0,
-        token_provider=cast(Any, token_provider),
     )
 
     assert transport.request_json(
         method="GET",
         url="https://management.azure.com/subscriptions?api-version=2022-12-01",
-        scope="https://management.azure.com/.default",
+        access_token="synthetic-verified-token",
     ) == ({}, 2)
     request, timeout = captured[0]
-    assert request.get_header("Authorization") == (
-        "Bearer token-for-https://management.azure.com/.default"
-    )
+    authorization = request.get_header("Authorization")
+    assert isinstance(authorization, str)
+    assert authorization.startswith("Bearer ")
+    assert len(authorization) == len("Bearer ") + len(ACCESS_TOKEN)
     assert timeout == 17
 
 
 def test_transport_rejects_untrusted_hosts_and_nonstandard_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token_provider = SimpleNamespace(get_token=lambda _scope: "synthetic-token")
     transport = AzureManagedIdentityJsonTransport(
-        managed_identity_client_id=CLIENT_ID,
         timeout_seconds=10,
         retry_limit=0,
-        token_provider=cast(Any, token_provider),
     )
 
     with pytest.raises(MonitoringAcquisitionJobError, match="not allowlisted"):
         transport.request_json(
             method="GET",
             url="https://unreviewed.example.invalid/query",
-            scope="https://management.azure.com/.default",
+            access_token="synthetic-verified-token",
         )
 
     monkeypatch.setattr(
@@ -754,7 +716,7 @@ def test_transport_rejects_untrusted_hosts_and_nonstandard_json(
         transport.request_json(
             method="GET",
             url="https://management.azure.com/subscriptions?api-version=2022-12-01",
-            scope="https://management.azure.com/.default",
+            access_token="synthetic-verified-token",
         )
 
     monkeypatch.setattr(
@@ -766,7 +728,7 @@ def test_transport_rejects_untrusted_hosts_and_nonstandard_json(
         transport.request_json(
             method="GET",
             url="https://management.azure.com/subscriptions?api-version=2022-12-01",
-            scope="https://management.azure.com/.default",
+            access_token="synthetic-verified-token",
         )
 
 
@@ -822,13 +784,19 @@ def test_adapter_rejects_identity_and_workspace_before_source_query() -> None:
         "queryTargetResourceId": WORKSPACE_ID,
     }
     with pytest.raises(MonitoringAcquisitionJobError, match="another monitoring identity"):
-        _port(transport).query_log_analytics(_Request(request))
+        _port(transport).query_log_analytics(
+            _Request(request),
+            access_token=ACCESS_TOKEN,
+        )
     assert transport.calls == 0
 
     request["monitoringReaderIdentityId"] = COLLECTOR_ID
     request["queryTargetResourceId"] = NETWORK_WATCHER_ID
     with pytest.raises(MonitoringAcquisitionJobError, match="reviewed workspace"):
-        _port(transport).query_log_analytics(_Request(request))
+        _port(transport).query_log_analytics(
+            _Request(request),
+            access_token=ACCESS_TOKEN,
+        )
     assert transport.calls == 0
 
     with pytest.raises(MonitoringAcquisitionJobError, match="resource allowlist"):
@@ -841,7 +809,8 @@ def test_adapter_rejects_identity_and_workspace_before_source_query() -> None:
                         "resourceIds": [SOURCE_STORAGE_ID],
                     }
                 ),
-            )
+            ),
+            access_token=ACCESS_TOKEN,
         )
     assert transport.calls == 0
 
@@ -881,13 +850,14 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
                     "requestDigest": DIGEST_A,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert result.source_identity_id == COLLECTOR_ID.casefold()
     assert result.rows[0].resource_id == VM_ID.casefold()
     assert result.rows[0].heartbeat_count == 3
-    assert transport.calls[0]["scope"] == "https://api.loganalytics.io/.default"
+    assert transport.calls[0]["access_token"] == ACCESS_TOKEN
     assert cast(dict[str, object], transport.calls[0]["body"])["timespan"] == (
         f"{_iso(start)}/{_iso(NOW)}"
     )
@@ -925,7 +895,8 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
                     "requestDigest": DIGEST_A,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert proof_result.rows[0].heartbeat_count == 0
@@ -944,10 +915,7 @@ def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> N
                 {
                     "category": {"value": "Administrative"},
                     "operationName": {
-                        "value": (
-                            "Microsoft.Network/networkSecurityGroups/"
-                            "securityRules/write"
-                        )
+                        "value": ("Microsoft.Network/networkSecurityGroups/securityRules/write")
                     },
                     "status": {"value": "Succeeded"},
                     "level": "Informational",
@@ -985,15 +953,14 @@ def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> N
                     "requestDigest": DIGEST_A,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert activity_result.rows[0].target_resource_id == NSG_RULE_ID.casefold()
     assert activity_result.rows[0].correlation_id == CORRELATION_ID
     assert activity_result.rows[0].occurred_at.microsecond == 979000
-    assert NSG_RULE_ID.casefold() in unquote(
-        cast(str, activity_transport.calls[0]["url"])
-    )
+    assert NSG_RULE_ID.casefold() in unquote(cast(str, activity_transport.calls[0]["url"]))
 
     graph_change = {
         "properties": {
@@ -1001,9 +968,7 @@ def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> N
             "changeAttributes": {
                 "correlationId": CORRELATION_ID,
                 "timestamp": azure_occurred_at,
-                "operation": (
-                    "Microsoft.Network/networkSecurityGroups/securityRules/write"
-                ),
+                "operation": ("Microsoft.Network/networkSecurityGroups/securityRules/write"),
             },
             "changes": {
                 "properties.access": {
@@ -1039,7 +1004,8 @@ def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> N
                     "requestDigest": DIGEST_B,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert graph_result.rows[0].target_resource_id == NSG_RULE_ID.casefold()
@@ -1049,15 +1015,16 @@ def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> N
         graph_result.rows[0].change["properties"],
     )
     assert normalized_properties["targetResourceId"] == NSG_RULE_ID
+    assert (
+        cast(
+            dict[str, object],
+            normalized_properties["changeAttributes"],
+        )["correlationId"]
+        == CORRELATION_ID
+    )
     assert cast(
         dict[str, object],
-        normalized_properties["changeAttributes"],
-    )["correlationId"] == CORRELATION_ID
-    assert cast(
-        dict[str, object],
-        cast(dict[str, object], normalized_properties["changes"])[
-            "properties.access"
-        ],
+        cast(dict[str, object], normalized_properties["changes"])["properties.access"],
     ) == {
         "newValue": "Deny",
         "previousValue": "Allow",
@@ -1089,7 +1056,7 @@ def test_resource_health_and_ip_flow_adapters_keep_source_uncertainty() -> None:
                         "reasonType": "Unplanned",
                         "healthEventCause": "PlatformInitiated",
                     }
-                }
+                },
             ]
         },
         {
@@ -1123,7 +1090,8 @@ def test_resource_health_and_ip_flow_adapters_keep_source_uncertainty() -> None:
                     "requestDigest": DIGEST_A,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert health_result.rows[0].event_status == "Active"
@@ -1149,9 +1117,7 @@ def test_resource_health_and_ip_flow_adapters_keep_source_uncertainty() -> None:
             ]
         }
     )
-    recently_resolved_result = _port(
-        cast(Any, recently_resolved_health)
-    ).query_resource_health(
+    recently_resolved_result = _port(cast(Any, recently_resolved_health)).query_resource_health(
         cast(
             Any,
             _Request(
@@ -1176,7 +1142,8 @@ def test_resource_health_and_ip_flow_adapters_keep_source_uncertainty() -> None:
                     "requestDigest": DIGEST_A,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
     assert recently_resolved_result.rows[0].event_status == "Resolved"
     assert recently_resolved_result.rows[0].previous_status == "Unavailable"
@@ -1199,7 +1166,8 @@ def test_resource_health_and_ip_flow_adapters_keep_source_uncertainty() -> None:
                     "requestDigest": DIGEST_B,
                 }
             ),
-        )
+        ),
+        access_token=ACCESS_TOKEN,
     )
 
     assert flow_result.access == "Deny"
@@ -1237,9 +1205,7 @@ def test_traffic_coverage_digest_preserves_source_and_destination_roles() -> Non
     )
 
     assert descriptor is not None
-    assert descriptor["resourceIds"] == tuple(
-        sorted((BACKEND_VM_ID.casefold(), VM_ID.casefold()))
-    )
+    assert descriptor["resourceIds"] == tuple(sorted((BACKEND_VM_ID.casefold(), VM_ID.casefold())))
     assert descriptor["fiveTupleDigest"] == compute_artifact_digest(
         {
             "direction": "outbound",
@@ -1284,7 +1250,8 @@ def test_ip_flow_rejects_unsupported_protocol_before_azure_call() -> None:
                     "direction": "inbound",
                     "protocol": "Icmp",
                 }
-            )
+            ),
+            access_token=ACCESS_TOKEN,
         )
     assert transport.calls == 0
 
@@ -1428,9 +1395,7 @@ def test_commit_port_fails_closed_on_immutable_collision() -> None:
     )
     with (
         pytest.raises(MonitoringAcquisitionJobError, match="already exists"),
-        _commit_port(_Writer(collide=True)).transaction(
-            cast(Any, prepared)
-        ),
+        _commit_port(_Writer(collide=True)).transaction(cast(Any, prepared)),
     ):
         pass
 
@@ -1457,9 +1422,7 @@ def test_commit_port_recovers_only_an_identical_immutable_retry() -> None:
 def test_commit_port_keeps_change_artifacts_in_the_wc025_storage_domain() -> None:
     monitoring_writer = _Writer()
     change_writer = _Writer()
-    evidence_id = (
-        "chg-" + hashlib.sha256(DIGEST_A.encode("utf-8")).hexdigest()[:12]
-    )
+    evidence_id = "chg-" + hashlib.sha256(DIGEST_A.encode("utf-8")).hexdigest()[:12]
     artifact = SimpleNamespace(
         evidence=SimpleNamespace(
             evidence_id=evidence_id,
@@ -1475,9 +1438,7 @@ def test_commit_port_keeps_change_artifacts_in_the_wc025_storage_domain() -> Non
     )._write_change_artifact(artifact)
 
     assert monitoring_writer.requests == []
-    assert change_writer.requests[0].blob_name == (
-        f"change-evidence/{'a' * 64}/evidence.json"
-    )
+    assert change_writer.requests[0].blob_name == (f"change-evidence/{'a' * 64}/evidence.json")
     assert handoff.evidence_id == evidence_id
 
 
@@ -1489,9 +1450,7 @@ def test_cli_runs_wc028_job_and_reports_exact_handoffs(
         committed=SimpleNamespace(
             monitoring_handoff=SimpleNamespace(collection_id="wc024-aaaaaaaaaaaa")
         ),
-        correlation_request=SimpleNamespace(
-            request_id="request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        ),
+        correlation_request=SimpleNamespace(request_id="request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     )
     monkeypatch.setattr(
         cli,

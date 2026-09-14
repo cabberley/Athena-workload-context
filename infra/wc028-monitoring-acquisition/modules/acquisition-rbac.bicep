@@ -6,9 +6,6 @@ param collectorPrincipalId string
 @description('Exact workload resource group whose Activity Log and Resource Graph change history may be read.')
 param workloadResourceGroupResourceId string
 
-@description('Exact existing Network Watcher resource used only for IP Flow Verify.')
-param networkWatcherResourceId string
-
 @description('Existing WC-025 change-evidence storage account resource ID.')
 param changeEvidenceStorageAccountResourceId string
 
@@ -23,14 +20,6 @@ var workloadResourceGroupName = length(workloadSegments) == 5 && startsWith(
 ) && !empty(workloadSegments[4])
   ? workloadSegments[4]
   : fail('workloadResourceGroupResourceId must be one resource group in the deployment subscription')
-var networkWatcherSegments = split(toLower(networkWatcherResourceId), '/')
-var networkWatcherResourceGroupName = length(networkWatcherSegments) == 9 && startsWith(
-  toLower(networkWatcherResourceId),
-  '${subscriptionPrefix}resourcegroups/'
-) && networkWatcherSegments[5] == 'providers' && networkWatcherSegments[6] == 'microsoft.network' && networkWatcherSegments[7] == 'networkwatchers' && !empty(networkWatcherSegments[8])
-  ? networkWatcherSegments[4]
-  : fail('networkWatcherResourceId must be one exact Network Watcher in the deployment subscription')
-var networkWatcherName = networkWatcherSegments[8]
 var changeStorageSegments = split(toLower(changeEvidenceStorageAccountResourceId), '/')
 var changeStorageResourceGroupName = length(changeStorageSegments) == 9 && startsWith(
   toLower(changeEvidenceStorageAccountResourceId),
@@ -42,15 +31,6 @@ var changeStorageAccountName = changeStorageSegments[8]
 
 resource workloadResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
   name: workloadResourceGroupName
-}
-
-resource networkWatcherResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
-  name: networkWatcherResourceGroupName
-}
-
-resource networkWatcher 'Microsoft.Network/networkWatchers@2024-10-01' existing = {
-  name: networkWatcherName
-  scope: networkWatcherResourceGroup
 }
 
 resource changeStorageResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
@@ -77,11 +57,6 @@ var validatedWorkloadResourceGroupId = toLower(workloadResourceGroup.id) == toLo
 )
   ? workloadResourceGroup.id
   : fail('workloadResourceGroupResourceId does not resolve to the reviewed resource group')
-var validatedNetworkWatcherResourceId = toLower(networkWatcher.id) == toLower(
-  networkWatcherResourceId
-)
-  ? networkWatcher.id
-  : fail('networkWatcherResourceId does not resolve to the reviewed Network Watcher')
 var validatedChangeEvidenceContainerResourceId = toLower(
   changeEvidenceStorage.id
 ) == toLower(changeEvidenceStorageAccountResourceId) && toLower(
@@ -114,32 +89,6 @@ resource boundedAcquisitionReaderRole 'Microsoft.Authorization/roleDefinitions@2
     ]
     assignableScopes: [
       validatedWorkloadResourceGroupId
-    ]
-  }
-}
-
-resource ipFlowVerifyRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(
-    subscription().id,
-    'athena-wc028-ip-flow-verify',
-    validatedNetworkWatcherResourceId
-  )
-  properties: {
-    roleName: 'Athena WC028 IP Flow Verifier'
-    description: 'Run only the read-only IP Flow Verify diagnostic on the reviewed Network Watcher.'
-    type: 'CustomRole'
-    permissions: [
-      {
-        actions: [
-          'Microsoft.Network/networkWatchers/ipFlowVerify/action'
-        ]
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-    assignableScopes: [
-      networkWatcherResourceGroup.id
     ]
   }
 }
@@ -180,17 +129,6 @@ module collectorBoundedAcquisitionReader 'workload-reader-assignment.bicep' = {
   }
 }
 
-module collectorIpFlowVerifier 'ip-flow-assignment.bicep' = {
-  name: 'wc028-ip-flow-assignment'
-  scope: networkWatcherResourceGroup
-  params: {
-    principalId: collectorPrincipalId
-    roleDefinitionId: ipFlowVerifyRole.id
-    networkWatcherName: networkWatcher.name
-    expectedNetworkWatcherResourceId: validatedNetworkWatcherResourceId
-  }
-}
-
 module collectorChangeEvidenceWriter 'change-evidence-writer-assignment.bicep' = {
   name: 'wc028-change-evidence-writer-assignment'
   scope: changeStorageResourceGroup
@@ -203,5 +141,4 @@ module collectorChangeEvidenceWriter 'change-evidence-writer-assignment.bicep' =
 }
 
 output boundedAcquisitionReaderRoleDefinitionId string = boundedAcquisitionReaderRole.id
-output ipFlowVerifyRoleDefinitionId string = ipFlowVerifyRole.id
 output createOnlyChangeEvidenceRoleDefinitionId string = createOnlyChangeEvidenceRole.id

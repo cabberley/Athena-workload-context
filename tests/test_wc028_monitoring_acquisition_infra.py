@@ -66,6 +66,7 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
         "Microsoft.Insights/metricAlerts",
         "Microsoft.Insights/scheduledQueryRules",
         "Microsoft.Network/networkWatchers/connectionMonitors",
+        "Microsoft.Network/networkWatchers/ipFlowVerify/action",
         "Storage Blob Data Owner",
         "Storage Blob Data Contributor",
         "Owner",
@@ -83,17 +84,15 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
         "Microsoft.Insights/eventtypes/values/read",
         "Microsoft.ResourceGraph/resources/read",
         "Microsoft.Resources/changes/read",
-        "Microsoft.Network/networkWatchers/ipFlowVerify/action",
         "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
         "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
         "changeEvidenceBlobService.properties.isVersioningEnabled == true",
     ):
         assert required_permission in source
 
-    assert source.count("Microsoft.Authorization/roleAssignments") == 4
+    assert source.count("Microsoft.Authorization/roleAssignments") == 3
     for role_name in (
         "boundedAcquisitionReaderRole",
-        "ipFlowVerifyRole",
         "createOnlyChangeEvidenceRole",
     ):
         assert (
@@ -107,5 +106,4 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
         "toLower(sourceAuthorityStorageAccountResourceId)"
     ) in source
     assert "scope: workloadResourceGroup" in source
-    assert "scope: networkWatcher" in source
     assert "scope: changeEvidenceContainer" in source
