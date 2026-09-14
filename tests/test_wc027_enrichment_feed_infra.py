@@ -390,6 +390,7 @@ def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() 
         in source
     )
     assert "wc027ConfigurationIdentitiesMatchBinding" in source
+    assert "wc027ParsedConfiguration.guidanceActivation.identityResourceId" in source
     assert "wc027RbacEvidenceMatchesConfiguration" in source
     assert "guid(" in source
     assert "join(wc027RbacResourceIds, '|')" in source

@@ -230,6 +230,23 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
 
     def _validate_separation(self) -> None:
         runtime = self.enrichment_runtime
+        assets = self.authority_assets
+        if (
+            assets.endpoint != runtime.guidance_authority_source.endpoint
+            or assets.container != runtime.guidance_authority_source.container
+        ):
+            raise ValueError(
+                "publisher authority assets do not match runtime guidance authority source"
+            )
+        if (
+            self.activation.endpoint != runtime.guidance_activation.endpoint
+            or self.activation.table_name != runtime.guidance_activation.table
+            or self.activation.partition_key
+            != runtime.guidance_activation.partition_key
+        ):
+            raise ValueError(
+                "publisher activation store does not match runtime guidance activation source"
+            )
         binding_trust = runtime.guidance_binding_key
         if (
             self.binding_signing_key.key_id != binding_trust.key_id
@@ -275,7 +292,6 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             raise ValueError(
                 "guidance authority signer identity must be distinct"
             )
-        assets = self.authority_assets
         publisher_identity_pairs = (
             (
                 self.broker_identity_client_id,
@@ -444,6 +460,7 @@ def build_wc027_guidance_authority_publisher(
             runtime.incident_lifecycle_assets.identity_client_id
         ),
         signing_key_id=runtime.incident_key.key_id,
+        signing_key_vault_key_id=runtime.incident_key.key_vault_key_id,
         signing_key_fingerprint=runtime.incident_key.key_fingerprint,
         signature_verifier=lifecycle_verifier.verify_preimage,
     )
@@ -452,6 +469,7 @@ def build_wc027_guidance_authority_publisher(
         request_key_id=configuration.request_key.key_id,
         request_signature_verifier=request_verifier.verify_preimage,
         incident_key_id=runtime.incident_key.key_id,
+        incident_key_vault_key_id=runtime.incident_key.key_vault_key_id,
         incident_signature_verifier=lifecycle_verifier.verify_preimage,
         correlation_binding_key_id=runtime.correlation_binding_key.key_id,
         correlation_binding_signature_verifier=(

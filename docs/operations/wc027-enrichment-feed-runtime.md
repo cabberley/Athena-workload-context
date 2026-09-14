@@ -118,14 +118,17 @@ publisher:
 - the `Wc027GuidanceActivation` Table;
 - one event-triggered Container Apps Job with distinct broker, authority reader/writer,
   activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
-- create/read/write-without-delete-or-list Blob RBAC, Table contributor RBAC, exact-key public-key
-  read/verify RBAC, and exact-key binding-sign RBAC; and
+- a create-only authority Blob identity plus a separate exact-version readback identity;
+- Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
+- exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
 - generated strict configuration in
   `ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON`.
 
 The request-signing key and binding-signing key are dedicated trust domains. Signed request,
 binding, and activation artifacts contain stable logical key IDs; the generated deployment
-configuration separately carries exact versioned Key Vault URIs.
+configuration separately carries exact versioned Key Vault URIs. Lifecycle pointer/index
+`keyId` checks use the logical lifecycle ID; lifecycle attestation verification uses the physical
+versioned Key Vault URI.
 
 Submit one canonical, already-signed publication request:
 
@@ -147,7 +150,9 @@ zero-option `noMatchingControl` authority.
 All correlation source readers and upstream authority keys remain separately governed resources.
 The module grants each configured reader only its exact container with `Blob.List` denied, and
 grants the trust-reader identity only exact-key read/verify data actions on the configured
-verification keys. Do not grant workload Reader to the producer identities.
+verification keys. Publisher authority and activation destinations are derived from the embedded
+runtime configuration, and startup fails closed if either location differs from the runtime read
+location. Do not grant workload Reader to the producer identities.
 
 The job must be attached to every identity named in the runtime configuration. The Bicep module
 rejects duplicate attached identity IDs/client IDs. Its image must be digest-pinned.

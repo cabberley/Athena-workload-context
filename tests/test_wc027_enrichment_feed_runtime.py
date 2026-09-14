@@ -335,7 +335,7 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "contextAuthority": source(7, "context-authority"),
             "monitoringIntent": source(8, "monitoring-intent"),
         },
-        "guidanceAuthoritySource": source(9, "guidance-authority"),
+        "guidanceAuthoritySource": source(9, "wc027-guidance-authority"),
         "guidanceActivation": {
             "tableEndpoint": "https://athenawc027.table.core.windows.net",
             "tableName": "Wc027GuidanceActivation",
@@ -505,6 +505,68 @@ def test_publisher_configuration_rejects_reused_managed_identity() -> None:
 
     with pytest.raises(ValueError, match="managed identities must be distinct"):
         Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    (
+        (
+            "authorityAssets",
+            "blobEndpoint",
+            "https://otherwc027.blob.core.windows.net",
+            "authority assets do not match",
+        ),
+        (
+            "authorityAssets",
+            "containerName",
+            "different-guidance-authority",
+            "authority assets do not match",
+        ),
+        (
+            "guidanceActivation",
+            "tableEndpoint",
+            "https://otherwc027.table.core.windows.net",
+            "activation store does not match",
+        ),
+        (
+            "guidanceActivation",
+            "tableName",
+            "OtherGuidanceActivation",
+            "activation store does not match",
+        ),
+        (
+            "guidanceActivation",
+            "partitionKey",
+            "other-guidance-authority",
+            "activation store does not match",
+        ),
+    ),
+)
+def test_publisher_configuration_rejects_runtime_store_drift(
+    section: str,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload[section][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_runtime_rejects_guidance_authority_storage_domain_reuse() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["guidanceAuthoritySource"]["containerName"] = payload[
+        "correlationSources"
+    ]["monitoring"]["containerName"]
+
+    with pytest.raises(ValueError, match="storage domains must be distinct"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
             json.dumps(payload)
         )
 

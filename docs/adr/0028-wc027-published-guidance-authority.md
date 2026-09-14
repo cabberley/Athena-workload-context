@@ -76,7 +76,15 @@ binding.
 Publication-request signing and guidance-binding signing are distinct from lifecycle,
 correlation-binding, report, guidance, enrichment, feed, and notification authorities. Stable
 logical `keyId` values appear in signed artifacts; exact versioned Key Vault URIs are deployment
-configuration only.
+configuration only. The lifecycle pointer and active-index `keyId` are checked against the
+configured logical lifecycle ID, while lifecycle attestations and cryptographic verification are
+checked against the separately configured versioned Key Vault URI.
+
+The publisher configuration is rejected unless its authority Blob endpoint/container and
+activation Table endpoint/name/partition exactly match the embedded feed runtime's read
+locations. The publisher deployment derives those destinations from that runtime configuration.
+Its authority writer has only Blob create permission, its activation writer has only Table entity
+read/add/update permission, and its binding signer has only exact-key sign permission.
 
 ## Consequences
 

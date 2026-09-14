@@ -145,6 +145,7 @@ class GuidanceAuthorityPublisher:
     request_key_id: str
     request_signature_verifier: SignatureVerifier
     incident_key_id: str
+    incident_key_vault_key_id: str
     incident_signature_verifier: SignatureVerifier
     correlation_binding_key_id: str
     correlation_binding_signature_verifier: SignatureVerifier
@@ -165,7 +166,10 @@ class GuidanceAuthorityPublisher:
             self.correlation_binding_key_id,
             self.binding_key_id,
         )
-        if any(type(item) is not str or not item for item in key_ids):
+        if any(
+            type(item) is not str or not item
+            for item in (*key_ids, self.incident_key_vault_key_id)
+        ):
             raise ValueError("guidance publisher key IDs must be non-empty strings")
         if len(set(key_ids)) != len(key_ids):
             raise ValueError("guidance publisher trust-domain key IDs must be distinct")
@@ -323,7 +327,7 @@ class GuidanceAuthorityPublisher:
             )
             is not True
             or subject.incident_state_attestation.key_vault_key_id
-            != self.incident_key_id
+            != self.incident_key_vault_key_id
             or subject.incident_state_attestation.result_digest
             != state.result_digest
             or self.incident_signature_verifier(
@@ -332,7 +336,7 @@ class GuidanceAuthorityPublisher:
             )
             is not True
             or subject.subject_attestation.key_vault_key_id
-            != self.incident_key_id
+            != self.incident_key_vault_key_id
             or self.incident_signature_verifier(
                 incident_correlation_subject_signature_preimage(subject),
                 subject.subject_attestation.detached_signature,

@@ -32,18 +32,11 @@ param bindingTrustReaderIdentityResourceId string
 @maxLength(16)
 param sourceIdentityResourceIds array
 
-param replayStorageAccountName string
+@description('Exact storage account resource ID hosting enrichmentRuntimeConfigurationJson.guidanceAuthoritySource.')
+param authorityStorageAccountResourceId string
 
-@allowed([
-  'wc027-guidance-authority'
-])
-param authorityContainerName string = 'wc027-guidance-authority'
-
-param activationTableName string = 'Wc027GuidanceActivation'
-
-@minLength(1)
-@maxLength(256)
-param activationPartitionKey string = 'wc027-guidance-authority'
+@description('Exact storage account resource ID hosting enrichmentRuntimeConfigurationJson.guidanceActivation.')
+param activationStorageAccountResourceId string
 
 param requestKeyResourceId string
 param bindingKeyResourceId string
@@ -81,9 +74,24 @@ var requestQueueName = 'wc027-guidance-authority-requests'
 var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
-var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
-var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
-var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
+var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
+var runtimeAuthorityAssets = parsedEnrichmentRuntimeConfiguration.guidanceAuthoritySource
+var runtimeActivation = parsedEnrichmentRuntimeConfiguration.guidanceActivation
+var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
+var activationStorageAccountName = last(split(activationStorageAccountResourceId, '/'))
+var expectedAuthorityBlobEndpoint = 'https://${toLower(authorityStorageAccountName)}.blob.${environment().suffixes.storage}'
+var expectedActivationTableEndpoint = 'https://${toLower(activationStorageAccountName)}.table.${environment().suffixes.storage}'
+var validatedAuthorityStorageAccountName = runtimeAuthorityAssets.blobEndpoint == expectedAuthorityBlobEndpoint
+  ? authorityStorageAccountName
+  : fail('authorityStorageAccountResourceId must exactly host the runtime guidanceAuthoritySource endpoint')
+var validatedActivationStorageAccountName = runtimeActivation.tableEndpoint == expectedActivationTableEndpoint
+  ? activationStorageAccountName
+  : fail('activationStorageAccountResourceId must exactly host the runtime guidanceActivation endpoint')
+var authorityContainerName = runtimeAuthorityAssets.containerName == 'wc027-guidance-authority'
+  ? runtimeAuthorityAssets.containerName
+  : fail('runtime guidanceAuthoritySource container must be wc027-guidance-authority')
+var activationTableName = runtimeActivation.tableName
+var activationPartitionKey = runtimeActivation.partitionKey
 
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
   name: last(split(registryResourceId, '/'))
@@ -224,88 +232,36 @@ resource requestSubmitters 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 }]
 
-resource replayStorage 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
-  name: replayStorageAccountName
-}
-
-resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' existing = {
-  parent: replayStorage
-  name: 'default'
-}
-
-resource authorityContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' = {
-  parent: blobService
-  name: authorityContainerName
-  properties: {
-    publicAccess: 'None'
+module authorityWriterRbac 'modules/blob-create-rbac.bicep' = {
+  name: 'wc027-guidance-authority-blob-create'
+  scope: resourceGroup(split(authorityStorageAccountResourceId, '/')[2], split(authorityStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: validatedAuthorityStorageAccountName
+    containerName: authorityContainerName
+    identityResourceId: authorityWriterIdentity.id
   }
 }
 
-resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2025-06-01' existing = {
-  parent: replayStorage
-  name: 'default'
-}
-
-resource activationTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
-  parent: tableService
-  name: activationTableName
-  properties: {}
-}
-
-resource authorityWriterRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(replayStorage.id, authorityContainerName, 'wc027-guidance-authority-writer')
-  properties: {
-    roleName: 'Athena WC027 Guidance Authority Blob Writer (${replayStorageAccountName}/${authorityContainerName})'
-    description: 'Create, read, and write immutable WC-027 guidance authority assets. No blob/container delete or list.'
-    type: 'CustomRole'
-    assignableScopes: [
-      resourceGroup().id
-    ]
-    permissions: [
-      {
-        actions: []
-        notActions: []
-        dataActions: [
-          'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
-          'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
-        ]
-        notDataActions: []
-      }
-    ]
+module authorityReaderRbac '../wc027-enrichment-feed-runtime/modules/blob-reader-rbac.bicep' = {
+  name: 'wc027-guidance-authority-blob-reader'
+  scope: resourceGroup(split(authorityStorageAccountResourceId, '/')[2], split(authorityStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: validatedAuthorityStorageAccountName
+    containerName: authorityContainerName
+    identityResourceId: authorityReaderIdentity.id
   }
+  dependsOn: [
+    authorityWriterRbac
+  ]
 }
 
-resource authorityWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(authorityContainer.id, authorityWriterIdentity.id, authorityWriterRole.id)
-  scope: authorityContainer
-  properties: {
-    principalId: authorityWriterIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: authorityWriterRole.id
-    conditionVersion: '2.0'
-    condition: '(!(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read\'} AND SubOperationMatches{\'Blob.List\'}))'
-  }
-}
-
-resource authorityReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(authorityContainer.id, authorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId)
-  scope: authorityContainer
-  properties: {
-    principalId: authorityReaderIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataReaderRoleDefinitionId)
-    conditionVersion: '2.0'
-    condition: '(!(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read\'} AND SubOperationMatches{\'Blob.List\'}))'
-  }
-}
-
-resource activationWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(activationTable.id, activationWriterIdentity.id, storageTableDataContributorRoleDefinitionId)
-  scope: activationTable
-  properties: {
-    principalId: activationWriterIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleDefinitionId)
+module activationWriterRbac 'modules/table-cas-rbac.bicep' = {
+  name: 'wc027-guidance-activation-table-cas'
+  scope: resourceGroup(split(activationStorageAccountResourceId, '/')[2], split(activationStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: validatedActivationStorageAccountName
+    tableName: activationTableName
+    identityResourceId: activationWriterIdentity.id
   }
 }
 
@@ -367,21 +323,32 @@ module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rba
   }
 }
 
-var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
 var requestKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(requestKeyResourceId, '/')[2]}/resourceGroups/${split(requestKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(requestKey.id, 'athena-wc027-key-verifier'))
 var bindingKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(bindingKeyResourceId, '/')[2]}/resourceGroups/${split(bindingKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(bindingKey.id, 'athena-wc027-key-verifier'))
+var authorityResourceGroupId = '/subscriptions/${split(authorityStorageAccountResourceId, '/')[2]}/resourceGroups/${split(authorityStorageAccountResourceId, '/')[4]}'
+var authorityContainerResourceId = '${authorityStorageAccountResourceId}/blobServices/default/containers/${authorityContainerName}'
+var authorityWriterRoleId = extensionResourceId(authorityResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(authorityContainerResourceId, 'athena-wc027-immutable-blob-creator'))
+var authorityWriterAssignmentId = extensionResourceId(authorityContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(authorityContainerResourceId, authorityWriterIdentity.id, authorityWriterRoleId))
+var authorityReaderAssignmentId = extensionResourceId(authorityContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(authorityContainerResourceId, authorityReaderIdentity.id, '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'))
+var activationResourceGroupId = '/subscriptions/${split(activationStorageAccountResourceId, '/')[2]}/resourceGroups/${split(activationStorageAccountResourceId, '/')[4]}'
+var activationTableResourceId = '${activationStorageAccountResourceId}/tableServices/default/tables/${activationTableName}'
+var activationWriterRoleId = extensionResourceId(activationResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(activationTableResourceId, 'athena-wc027-table-cas'))
+var activationWriterAssignmentId = extensionResourceId(activationTableResourceId, 'Microsoft.Authorization/roleAssignments', guid(activationTableResourceId, activationWriterIdentity.id, activationWriterRoleId))
+var bindingSignerRoleId = extensionResourceId('/subscriptions/${split(bindingKeyResourceId, '/')[2]}/resourceGroups/${split(bindingKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(bindingKey.id, 'athena-wc027-key-signer'))
 var coreRbacResourceIds = [
   requestReceiver.id
   triggerSender.id
-  authorityWriterRole.id
-  authorityWriter.id
-  authorityReader.id
-  activationWriter.id
+  authorityWriterRoleId
+  authorityWriterAssignmentId
+  authorityReaderAssignmentId
+  activationWriterRoleId
+  activationWriterAssignmentId
   requestKeyVerifierRoleId
   extensionResourceId(requestKey.id, 'Microsoft.Authorization/roleAssignments', guid(requestKey.id, requestTrustReaderIdentity.id, requestKeyVerifierRoleId))
   bindingKeyVerifierRoleId
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingTrustReaderIdentity.id, bindingKeyVerifierRoleId))
-  extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId))
+  bindingSignerRoleId
+  extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingSignerIdentity.id, bindingSignerRoleId))
   extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, '7f951dda-4ed3-4680-a7ca-43fe172d538d'))
 ]
 var submitterRbacResourceIds = map(requestSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(requestQueue.id, 'Microsoft.Authorization/roleAssignments', guid(requestQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
@@ -398,16 +365,16 @@ var publisherConfiguration = {
     brokerIdentityResourceId: brokerIdentity.id
   }
   authorityAssets: {
-    blobEndpoint: replayStorage.properties.primaryEndpoints.blob
-    containerName: authorityContainer.name
+    blobEndpoint: runtimeAuthorityAssets.blobEndpoint
+    containerName: authorityContainerName
     readerIdentityClientId: authorityReaderIdentity.properties.clientId
     readerIdentityResourceId: authorityReaderIdentity.id
     writerIdentityClientId: authorityWriterIdentity.properties.clientId
     writerIdentityResourceId: authorityWriterIdentity.id
   }
   guidanceActivation: {
-    tableEndpoint: replayStorage.properties.primaryEndpoints.table
-    tableName: activationTable.name
+    tableEndpoint: runtimeActivation.tableEndpoint
+    tableName: activationTableName
     partitionKey: activationPartitionKey
     identityClientId: activationWriterIdentity.properties.clientId
     identityResourceId: activationWriterIdentity.id
@@ -530,7 +497,7 @@ output deployedPublisherConfigurationDigest string = startsWith(publisherConfigu
 output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds
 output bindingEvidenceDigest string = bindingEvidenceDigest
 output requestQueueName string = requestQueue.name
-output authorityContainerName string = authorityContainer.name
-output activationTableName string = activationTable.name
+output authorityContainerName string = authorityContainerName
+output activationTableName string = activationTableName
 output bindingLogicalKeyId string = bindingLogicalKeyId
 output bindingKeyVaultKeyId string = bindingKey.properties.keyUriWithVersion

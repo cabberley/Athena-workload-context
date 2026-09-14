@@ -496,6 +496,7 @@ var wc027ConfiguredIdentityResourceIds = wc027FeedV2ProducerReady && !empty(wc02
       wc027ParsedConfiguration.correlationSources.contextAuthority.identityResourceId
       wc027ParsedConfiguration.correlationSources.monitoringIntent.identityResourceId
       wc027ParsedConfiguration.guidanceAuthoritySource.identityResourceId
+      wc027ParsedConfiguration.guidanceActivation.identityResourceId
       wc027ParsedConfiguration.monitoringCollectorKey.identityResourceId
       wc027ParsedConfiguration.keys.incident.identityResourceId
       wc027ParsedConfiguration.keys.correlationBinding.identityResourceId

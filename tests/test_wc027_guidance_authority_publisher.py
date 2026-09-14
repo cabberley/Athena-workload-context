@@ -26,6 +26,7 @@ from test_wc027_incident_enrichment_publication import (
 
 _REQUEST_KEY_ID = "synthetic-key://wc027/guidance-publication-request"
 _BINDING_KEY_ID = "synthetic-key://wc027/guidance-authority-binding"
+_INCIDENT_LOGICAL_KEY_ID = "synthetic-key://wc016/incidents-rs256-v1"
 
 
 def _json_value(value):
@@ -171,7 +172,7 @@ class _Trigger:
         self.calls.append((binding, time_to_live_seconds))
 
 
-def _publisher(*, verifier=None):
+def _publisher(*, verifier=None, incident_key_vault_key_id: str | None = None):
     fixture = _fixture()
     writer = _Writer()
     activation = _ActivationStore()
@@ -182,7 +183,9 @@ def _publisher(*, verifier=None):
     publisher = GuidanceAuthorityPublisher(
         request_key_id=_REQUEST_KEY_ID,
         request_signature_verifier=signature_verifier,
-        incident_key_id=(
+        incident_key_id=_INCIDENT_LOGICAL_KEY_ID,
+        incident_key_vault_key_id=incident_key_vault_key_id
+        or (
             fixture.guidance_binding.incident_bound_request.incident_subject
             .incident_state_attestation.key_vault_key_id
         ),
@@ -202,6 +205,25 @@ def _publisher(*, verifier=None):
         trigger=trigger,
     )
     return fixture, publisher, writer, activation, trigger, correlation, incident
+
+
+def test_publisher_accepts_distinct_logical_and_physical_lifecycle_key_ids() -> None:
+    fixture, publisher, writer, activation, trigger, _correlation, _incident = (
+        _publisher()
+    )
+    request = _request(fixture)
+
+    receipt = publisher.publish(request, now=request.evaluated_at)
+
+    assert publisher.incident_key_id == _INCIDENT_LOGICAL_KEY_ID
+    assert (
+        publisher.incident_key_vault_key_id
+        == request.incident_bound_request.incident_subject
+        .incident_state_attestation.key_vault_key_id
+    )
+    assert receipt.binding_reference.name in writer.payloads
+    assert activation.cas_calls == 1
+    assert len(trigger.calls) == 1
 
 
 def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> None:
@@ -234,6 +256,25 @@ def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> N
 def test_invalid_outer_signature_causes_zero_external_io() -> None:
     fixture, publisher, writer, activation, trigger, correlation, incident = _publisher(
         verifier=lambda _preimage, _signature: False
+    )
+    request = _request(fixture)
+
+    with pytest.raises(ValueError, match="nested authority signature"):
+        publisher.publish(request, now=request.evaluated_at)
+
+    assert writer.calls == []
+    assert activation.cas_calls == 0
+    assert trigger.calls == []
+    assert correlation.calls == 0
+    assert incident.calls == 0
+
+
+def test_mismatched_physical_lifecycle_key_causes_zero_external_io() -> None:
+    fixture, publisher, writer, activation, trigger, correlation, incident = _publisher(
+        incident_key_vault_key_id=(
+            "https://athena-wc027.vault.azure.net/keys/"
+            "different-lifecycle/00000000000000000000000000000000"
+        )
     )
     request = _request(fixture)
 

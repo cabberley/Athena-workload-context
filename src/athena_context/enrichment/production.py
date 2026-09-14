@@ -471,6 +471,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
             self.change_source,
             self.context_authority_source,
             self.monitoring_intent_source,
+            self.guidance_authority_source,
         )
         if len(
             {item.identity_client_id.casefold() for item in correlation_sources}
@@ -807,6 +808,7 @@ def build_wc027_enrichment_feed_runtime(
             configuration.incident_lifecycle_assets.identity_client_id
         ),
         signing_key_id=configuration.incident_key.key_id,
+        signing_key_vault_key_id=configuration.incident_key.key_vault_key_id,
         signing_key_fingerprint=configuration.incident_key.key_fingerprint,
         signature_verifier=lifecycle_verifier.verify_preimage,
     )
