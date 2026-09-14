@@ -401,7 +401,9 @@ def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
     return None
 
 
-def _what_if_changes(document: object) -> list[object]:
+def _what_if_changes(
+    document: object,
+) -> tuple[list[object], list[object]]:
     _validate_json_shape(document)
     root = _mapping(document, field_name="what-if document")
     status = _normalized(
@@ -417,10 +419,25 @@ def _what_if_changes(document: object) -> list[object]:
     properties = _get_case_insensitive(root, "properties")
     container = _mapping(properties, field_name="properties") if properties is not None else root
     changes = _get_case_insensitive(container, "changes")
-    return _sequence(
-        changes,
-        field_name="changes",
-        maximum_items=MAX_CHANGES,
+    potential_changes = _get_case_insensitive(
+        container,
+        "potentialChanges",
+    )
+    return (
+        _sequence(
+            changes,
+            field_name="changes",
+            maximum_items=MAX_CHANGES,
+        ),
+        (
+            []
+            if potential_changes is None
+            else _sequence(
+                potential_changes,
+                field_name="potentialChanges",
+                maximum_items=MAX_CHANGES,
+            )
+        ),
     )
 
 
@@ -762,7 +779,24 @@ def evaluate_what_if(
 ) -> tuple[PreflightViolation, ...]:
     normalized_allowlist = frozenset(_normalized(value) for value in allowed_change_ids)
     violations: list[PreflightViolation] = []
-    for raw_change in _what_if_changes(document):
+    changes, potential_changes = _what_if_changes(document)
+    for raw_change in potential_changes:
+        potential_change = _mapping(
+            raw_change,
+            field_name="potential change",
+        )
+        resource_id = _require_string(
+            _get_case_insensitive(potential_change, "resourceId"),
+            field_name="potential change resourceId",
+        )
+        violations.append(
+            PreflightViolation(
+                code="unpredictable-change",
+                subject=resource_id,
+                detail="ARM what-if reported an unresolved potential change",
+            )
+        )
+    for raw_change in changes:
         change = _mapping(raw_change, field_name="change")
         resource_id = _require_string(
             _get_case_insensitive(change, "resourceId"),

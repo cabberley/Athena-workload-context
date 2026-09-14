@@ -145,6 +145,43 @@ def test_what_if_requires_successful_complete_result() -> None:
         )
 
 
+def test_what_if_rejects_unresolved_potential_changes() -> None:
+    document = {
+        "status": "Succeeded",
+        "properties": {
+            "changes": [],
+            "potentialChanges": [
+                {
+                    "resourceId": _STORAGE_ID,
+                    "changeType": "Delete",
+                }
+            ],
+        },
+    }
+
+    violations = evaluate_what_if(document)
+
+    assert len(violations) == 1
+    assert violations[0].code == "unpredictable-change"
+    assert violations[0].subject == _STORAGE_ID
+
+
+def test_what_if_rejects_malformed_potential_changes() -> None:
+    document = {
+        "status": "Succeeded",
+        "properties": {
+            "changes": [],
+            "potentialChanges": [{"changeType": "Delete"}],
+        },
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="potential change resourceId",
+    ):
+        evaluate_what_if(document)
+
+
 @pytest.mark.parametrize(
     ("document", "code"),
     [
