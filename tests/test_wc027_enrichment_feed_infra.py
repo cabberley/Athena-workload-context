@@ -188,7 +188,7 @@ def test_wc027_runtime_configuration_is_derived_from_referenced_resources() -> N
         "containerName: incidentContainer.name",
         "containerName: feedV2Container.name",
         "containerName: monitoringSourceContainer.name",
-        "containerName: guidanceAuthoritySourceContainer.name",
+        "containerName: guidanceAuthoritySourceContainer.outputs.name",
         "tableName: feedRegistry.name",
         "tableName: guidanceActivation.name",
         "identityClientId: guidanceActivationReaderIdentity.properties.clientId",

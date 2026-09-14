@@ -94,6 +94,8 @@ correlation reader identities/storage domains, and reused producer signing keys 
   `Blob.List` denial (the producer never writes, deletes, or lists v1 lifecycle assets);
 - a separately authorized presentation/gateway reader on the v2 container, also denied listing;
 - feed registry Table contributor;
+- the empty private `wc027-guidance-authority` source container needed to establish the producer
+  reader boundary before the separately governed publisher receives create-only access;
 - Key Vault public-key reader;
 - one exact-key Crypto User assignment for each report, guidance, enrichment, feed, and
   notification signer; and
@@ -103,8 +105,20 @@ Supply the referenced resource IDs/names (user-assigned identities, replay stora
 correlation source storage account, Service Bus namespace, and Key Vault keys); the module derives
 every runtime value from them. Supply `runtimeConfigurationDigest` as the externally computed
 `sha256:<lowercase-hex>` digest of the module's generated `deployedRuntimeConfigurationJson` output.
-Record the `deployedRuntimeConfigurationDigest`, `attachedIdentityResourceIds`, and
-`bindingEvidenceDigest` outputs with the Job resource ID for the root readiness gate.
+Record the `producerImage`, `deployedRuntimeConfigurationDigest`,
+`attachedIdentityResourceIds`, `bindingEvidenceDigest`, exact queue IDs, and exact
+container/table IDs with the Job resource ID for the root readiness gate. The producer root
+creates no guidance-authority bytes and grants no authority writer role.
+
+For WC-029 deployment, do not deploy this root as an untracked side step. Use the governed
+foundation -> producer -> publisher -> live-acceptance sequence in
+[`wc029-deployment-live-validation.md`](wc029-deployment-live-validation.md). The orchestration
+tool binds this root to the exact WC-013 foundation outputs, verifies that its generated
+configuration digest hashes the deployed JSON, proves the referenced identities, versioned keys,
+feed/activation storage, and empty private guidance-authority container exist, and emits the only
+producer handoff accepted by the publisher and final WC-013 gate. The publisher root must consume
+the exact producer configuration, correlation-storage boundary, and guidance-binding key resource
+from that handoff rather than accepting independently selected replacements.
 
 ## Guidance-authority publisher
 
@@ -187,12 +201,16 @@ producer-runtime digest, attached identities, and deterministic RBAC binding evi
 To assert producer readiness, supply
 `wc027EnrichmentFeedProducerJobResourceId` with the exact deployed `Microsoft.App/jobs` resource
 ID, `wc027EnrichmentFeedProducerConfigurationDigest` and
-`wc027EnrichmentFeedProducerConfigurationJson` from the producer module output. The root
+`wc027EnrichmentFeedProducerConfigurationJson`, and
+`wc027EnrichmentFeedProducerImage` from the producer module output. The root
 deployment derives the expected attached identity resource IDs and RBAC evidence ID from that
 exact deployed configuration; it does not accept independent identity arrays or evidence values.
-It reads the existing Job and fails closed unless the deployed configuration value and digest
+It reads the existing Job and fails closed unless provisioning state, managed environment, image,
+single container, command, arguments, scaler, registry, deployed configuration value and digest
 tag, derived broker identity, exact attached user-assigned identities, and RBAC evidence tag all
-match, the publisher is ready, and the WC-016 runtime is enabled.
+match. Init containers, volumes, probes, secret-backed environment or registry/scaler
+authentication, workload profiles, alternate triggers, and unreviewed identity settings are
+rejected. The publisher must be ready and the WC-016 runtime must be enabled.
 
 ## Failure and retry
 

@@ -512,10 +512,15 @@ resource monitoringIntentSourceContainer 'Microsoft.Storage/storageAccounts/blob
   name: monitoringIntentSourceContainerName
 }
 
-resource guidanceAuthoritySourceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
-  parent: correlationSourceBlobService
-  name: guidanceAuthoritySourceContainerName
+module guidanceAuthoritySourceContainer 'modules/private-container.bicep' = {
+  name: 'wc027-guidance-authority-source-container'
+  scope: resourceGroup(split(correlationSourceStorageAccountResourceId, '/')[2], split(correlationSourceStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: correlationSourceStorage.name
+    containerName: guidanceAuthoritySourceContainerName
+  }
 }
+var guidanceAuthoritySourceContainerId = '${correlationSourceStorageAccountResourceId}/blobServices/default/containers/${guidanceAuthoritySourceContainerName}'
 
 resource feedV2WriterRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(replayStorage.id, feedV2ContainerName, 'wc027-feed-v2-writer')
@@ -585,7 +590,7 @@ module guidanceAuthoritySourceReader 'modules/blob-reader-rbac.bicep' = {
   scope: resourceGroup(split(correlationSourceStorageAccountResourceId, '/')[2], split(correlationSourceStorageAccountResourceId, '/')[4])
   params: {
     storageAccountName: correlationSourceStorage.name
-    containerName: guidanceAuthoritySourceContainer.name
+    containerName: guidanceAuthoritySourceContainer.outputs.name
     identityResourceId: guidanceAuthorityReaderIdentity.id
   }
 }
@@ -965,7 +970,7 @@ var runtimeConfiguration = {
   }
   guidanceAuthoritySource: {
     blobEndpoint: correlationSourceBlobEndpoint
-    containerName: guidanceAuthoritySourceContainer.name
+    containerName: guidanceAuthoritySourceContainer.outputs.name
     identityClientId: guidanceAuthorityReaderIdentity.properties.clientId
     identityResourceId: guidanceAuthorityReaderIdentity.id
   }
@@ -1074,7 +1079,7 @@ var coreRbacResourceIds = [
   extensionResourceId(changeSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(changeSourceContainer.id, changeReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(contextAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(contextAuthoritySourceContainer.id, contextAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
-  extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
+  extensionResourceId(guidanceAuthoritySourceContainerId, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainerId, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
   guidanceActivationReader.id
   incidentKeyVerifierRoleId
@@ -1193,6 +1198,9 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
 @description('Resource ID proving that the WC-027 producer Job/config was deployed.')
 output producerJobResourceId string = producerJob.id
 
+@description('Exact digest-pinned image deployed to the WC-027 producer Job.')
+output producerImage string = validatedProducerImage
+
 @description('Digest of the exact non-secret runtime configuration deployed to the Job.')
 output deployedRuntimeConfigurationDigest string = startsWith(runtimeConfigurationDigest, 'sha256:')
   ? runtimeConfigurationDigest
@@ -1213,8 +1221,29 @@ output feedV2WriterRoleDefinitionId string = feedV2WriterRole.id
 @description('Distinct private container isolating WC-027 enrichment and feed-v2 artifacts.')
 output feedV2ContainerName string = feedV2Container.name
 
+@description('Exact resource ID of the private WC-027 enrichment and feed-v2 container.')
+output feedV2ContainerResourceId string = feedV2Container.id
+
+@description('Exact resource ID of the WC-027 feed registry table.')
+output feedRegistryTableResourceId string = feedRegistry.id
+
+@description('Exact resource ID of the shared WC-027 guidance activation table.')
+output guidanceActivationTableResourceId string = guidanceActivation.id
+
+@description('Exact resource ID of the private WC-027 guidance-authority source container.')
+output guidanceAuthoritySourceContainerResourceId string = guidanceAuthoritySourceContainerId
+
 @description('Signed-binding trigger queue name.')
 output triggerQueueName string = triggerQueue.name
+
+@description('Exact resource ID of the signed-binding trigger queue.')
+output triggerQueueResourceId string = triggerQueue.id
+
+@description('Existing Notification v2 outbox queue name used by the producer.')
+output notificationQueueName string = notificationQueue.name
+
+@description('Exact resource ID of the existing Notification v2 outbox queue.')
+output notificationQueueResourceId string = notificationQueue.id
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName

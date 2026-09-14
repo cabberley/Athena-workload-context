@@ -40,7 +40,49 @@ Deploy and review each root independently:
 - `infra/wc024-monitoring-connectivity/main.bicep`
 - `infra/wc024-monitoring-foundation/main.bicep`
 - `infra/wc025-change-ingestion/main.bicep`
+- `infra/wc027-enrichment-feed-runtime/main.bicep`
+- `infra/wc027-guidance-authority-publisher/main.bicep`
 - `infra/wc029-monitoring-prerequisites/main.bicep` (preparation/readiness and explicitly gated guest extensions)
+
+WC-027 is not created by `infra/wc013-live-acceptance/main.bicep`. That root reads existing
+Container Apps Jobs only when its two WC-027 readiness flags are true. The governed deployment
+sequence is therefore:
+
+1. **Foundation**: deploy `infra/wc013-live-acceptance/main.bicep` with
+   `wc027FeedV2ProducerReady=false` and `wc027PublisherReady=false`. Capture the exact managed
+   environment, replay Storage, incident container, presentation identity and URL, private
+   Service Bus namespace/notification queue, and versioned WC-016/WC-027 signing-key outputs.
+2. **Producer**: deploy `infra/wc027-enrichment-feed-runtime/main.bicep` using a reviewed immutable
+   parameter artifact bound to those foundation outputs. Capture its exact Job resource ID,
+   digest-pinned image, generated configuration JSON and SHA-256 digest, attached identities,
+   RBAC evidence, exact queue IDs, and exact storage boundaries. This root also establishes the
+   empty private guidance-authority container so its read-only runtime boundary exists before any
+   publisher receives create permission.
+3. **Publisher**: deploy `infra/wc027-guidance-authority-publisher/main.bicep` with the exact
+   producer configuration JSON, digest, correlation-storage boundary, managed environment,
+   broker, source identities, and guidance-binding key resource from step 2. Capture its exact Job
+   resource ID, image, generated configuration JSON and SHA-256 digest, attached identities, RBAC
+   evidence, exact queue/container/table resource IDs, and versioned binding key.
+4. **Live-acceptance gate**: redeploy `infra/wc013-live-acceptance/main.bicep` with both readiness
+   flags true and only the exact producer and publisher handoffs from steps 2 and 3. The root then
+   reads both deployed Jobs and fails closed on image, command, scaler, registry, configuration,
+   identity, RBAC, embedded-runtime, or key-binding drift. Its
+   `wc016ApprovedConfiguration.wc027DeploymentReadiness` output must read back the exact accepted
+   Job IDs, images, configuration digests, embedded producer digest, and RBAC evidence.
+
+Use `scripts/wc029_deployment_orchestration.py` for these four stages. It creates immutable
+effective-parameter, full-payload what-if, plan, and deployment-handoff artifacts in an
+operator-selected evidence directory outside the repository. `plan` performs ARM validation and
+the repository zero-delete/public-exposure preflight. `apply` accepts only the unchanged reviewed
+plan digest, template, effective parameters, freshly repeated identical what-if, source commit,
+orchestrator/preflight implementation, and predecessor handoffs. It verifies that expected Jobs,
+identities, exact current key versions, and storage/authority resources exist before emitting the
+next handoff. Every handoff is bound to the exact source commit, subscription, deployment scope,
+plan digest, a deliberately narrowed exact stage-output schema, and an exact effective-parameter
+binding. The foundation handoff carries one canonical SHA-256 over every non-WC-027 effective
+parameter rather than an open-ended parameter object. Missing, extra, cross-scope, changed, or
+internally inconsistent handoffs and deployment outputs fail closed. Never call a later stage
+without the complete preceding handoff set.
 
 `bootstrap-ampls.bicep` is not a repeatable deployment root. It sets AMPLS access modes to
 `Open/Open` and is resource-group scoped. Verify an existing AMPLS read-only. A missing AMPLS may
@@ -135,6 +177,8 @@ Use scope-correct, reviewed parameters for every root:
 | WC-024 connectivity | Subscription | Reviewed copy of `main.example.bicepparam` |
 | WC-024 foundation | Subscription | Reviewed environment parameter artifact; examples are not deployable approval |
 | WC-025 change ingestion | Subscription | New reviewed parameter artifact containing the exact image, identities, resource allowlist, containers, and versioned signing key |
+| WC-027 enrichment/feed runtime | Resource group | Reviewed immutable producer artifact bound to the WC-013 foundation handoff, including exact identities, source containers, trust metadata, image, and expected generated-configuration digest |
+| WC-027 guidance-authority publisher | Resource group | Reviewed immutable publisher artifact; the orchestration tool injects the exact producer configuration/digest and derives the shared foundation, correlation storage, broker, activation store, source identities, and binding-key/trust handoffs |
 | WC-029 monitoring prerequisites | Subscription | `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam` with both extension gates false; enabling either requires a separately reviewed immutable copy |
 
 The release cannot proceed while any non-WC-013 root lacks its reviewed immutable parameter
@@ -192,6 +236,58 @@ Required separation:
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
 deployment name, what-if digest, and operator identity must be captured before execution.
+
+Run the four orchestration stages in order. Use a unique deployment name and a new evidence
+directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
+`apply`; the apply command rejects any changed byte.
+
+```powershell
+$Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
+
+python $Orchestrator plan --stage foundation <reviewed foundation arguments>
+python $Orchestrator apply --plan-manifest <reviewed foundation plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+python $Orchestrator plan --stage producer `
+  --foundation-handoff <foundation handoff> <reviewed producer arguments>
+python $Orchestrator apply --plan-manifest <reviewed producer plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+python $Orchestrator plan --stage publisher `
+  --foundation-handoff <foundation handoff> `
+  --producer-handoff <producer handoff> <reviewed publisher arguments>
+python $Orchestrator apply --plan-manifest <reviewed publisher plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+python $Orchestrator plan --stage live-acceptance `
+  --foundation-handoff <foundation handoff> `
+  --producer-handoff <producer handoff> `
+  --publisher-handoff <publisher handoff> <reviewed WC-013 arguments>
+python $Orchestrator apply --plan-manifest <reviewed live-acceptance plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+```
+
+Every `plan` command requires the fixed subscription, location, deployment name, reviewed
+parameter artifact, evidence directory, and explicit `--allow-change` entry for each approved
+create or modify. WC-027 resource-group stages additionally require
+`--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
+approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
+evidence bundle. The evidence directory must be outside the repository. Planning and apply both
+refuse a dirty working tree, duplicate allowlist entries, the wrong stage scope, or any missing or
+extra predecessor handoff.
+
+The two WC-027 roots derive their configuration JSON from live ARM resource references, which ARM
+what-if cannot fully resolve. Their reviewed digest parameters are therefore recomputed against
+the exact resolved deployment output immediately after create. A mismatch emits no handoff and
+blocks every later stage; reconcile the reviewed digest and repeat validate/what-if rather than
+continuing with the mis-tagged Job. Apply also rejects a non-succeeded deployment, missing required
+root output, mismatched queue/container/table/key output, unexpected Job identity, tag, command,
+scaler, registry, environment, init container, volume, secret, secret reference, or secret-backed
+authentication; a listed RBAC role that does not match its exact resource type; any effective
+broad inherited grant on a governed identity; any unreviewed effective assignment intersecting a
+governed WC-027 scope for any attached, submitter, or reader identity; any public/non-RBAC parent
+Key Vault behind an external trust key; and any final WC-013 readiness readback that differs from
+the two accepted WC-027 handoffs.
 
 After deployment:
 

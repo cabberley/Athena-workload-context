@@ -99,6 +99,9 @@ var validatedRequestKeyFingerprint = !contains(validatedRuntimeTrustDomainFinger
 var validatedBindingKeyFingerprint = bindingKeyFingerprint == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
   ? bindingKeyFingerprint
   : fail('publisher binding signer fingerprint must match runtime guidance trust')
+var validatedBindingLogicalKeyId = bindingLogicalKeyId == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyId
+  ? bindingLogicalKeyId
+  : fail('publisher binding logical key ID must match runtime guidance trust')
 var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
 var activationStorageAccountName = last(split(activationStorageAccountResourceId, '/'))
 var expectedAuthorityBlobEndpoint = 'https://${toLower(authorityStorageAccountName)}.blob.${environment().suffixes.storage}'
@@ -409,7 +412,7 @@ var publisherConfiguration = {
     identityResourceId: requestTrustReaderIdentity.id
   }
   bindingSigningKey: {
-    keyId: bindingLogicalKeyId
+    keyId: validatedBindingLogicalKeyId
     keyVaultKeyId: bindingKey.properties.keyUriWithVersion
     keyFingerprint: validatedBindingKeyFingerprint
     identityClientId: bindingSignerIdentity.properties.clientId
@@ -519,7 +522,12 @@ output deployedPublisherConfigurationDigest string = startsWith(publisherConfigu
 output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds
 output bindingEvidenceDigest string = bindingEvidenceDigest
 output requestQueueName string = requestQueue.name
+output requestQueueResourceId string = requestQueue.id
+output triggerQueueResourceId string = triggerQueue.id
 output authorityContainerName string = authorityContainerName
+output authorityContainerResourceId string = authorityContainerResourceId
 output activationTableName string = activationTableName
-output bindingLogicalKeyId string = bindingLogicalKeyId
+output activationTableResourceId string = activationTableResourceId
+output bindingLogicalKeyId string = validatedBindingLogicalKeyId
+output bindingKeyResourceId string = bindingKey.id
 output bindingKeyVaultKeyId string = bindingKey.properties.keyUriWithVersion
