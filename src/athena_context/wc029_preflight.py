@@ -16,6 +16,7 @@ MAX_ASSIGNMENTS = 10000
 MAX_POLICY_ITEMS = 512
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100000
+MAX_JSON_INTEGER_DIGITS = 1024
 
 _BROAD_ROLES = frozenset(
     {
@@ -82,6 +83,7 @@ class SeparationRule:
 class RbacPolicy:
     allowed_broad_assignments: frozenset[BroadAssignmentAllowance]
     separation_rules: tuple[SeparationRule, ...]
+    expected_principal_ids: frozenset[str]
 
 
 type PreflightKind = Literal["rbac", "what-if"]
@@ -128,6 +130,36 @@ def _reject_json_constant(value: str) -> None:
     raise PreflightInputError(f"invalid JSON constant: {value}")
 
 
+def _parse_json_integer(value: str) -> int:
+    digits = value.removeprefix("-")
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise PreflightInputError(
+            f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits"
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise PreflightInputError("JSON integer is invalid") from exc
+
+
+def _reject_ambiguous_object_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    casefolded_keys: set[str] = set()
+    for key, value in pairs:
+        if key in result:
+            raise PreflightInputError("JSON object contains a duplicate key")
+        casefolded = key.casefold()
+        if casefolded in casefolded_keys:
+            raise PreflightInputError(
+                "JSON object contains a case-insensitive key collision"
+            )
+        result[key] = value
+        casefolded_keys.add(casefolded)
+    return result
+
+
 def _canonical_role_key(value: str) -> str:
     normalized = _normalized(value).rsplit("/", 1)[-1]
     return _ROLE_ID_TO_NAME.get(normalized, normalized)
@@ -139,13 +171,19 @@ def _canonical_property_path(value: str) -> str:
     return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
 
 
+def _canonical_scope(value: str) -> str:
+    normalized = _normalized(value)
+    canonical = normalized.rstrip("/") or "/"
+    if not canonical.startswith("/") or "//" in canonical:
+        raise PreflightInputError("scope must be a canonical ARM scope")
+    return canonical
+
+
 def _scope_contains(ancestor: str, descendant: str) -> bool:
-    normalized_ancestor = ancestor.rstrip("/") or "/"
-    normalized_descendant = descendant.rstrip("/") or "/"
     return (
-        normalized_ancestor == "/"
-        or normalized_descendant == normalized_ancestor
-        or normalized_descendant.startswith(normalized_ancestor + "/")
+        ancestor == "/"
+        or descendant == ancestor
+        or descendant.startswith(ancestor + "/")
     )
 
 
@@ -182,14 +220,19 @@ def load_json_file(
         document = json.loads(
             path.read_text(encoding="utf-8"),
             parse_constant=_reject_json_constant,
+            parse_int=_parse_json_integer,
+            object_pairs_hook=_reject_ambiguous_object_pairs,
         )
         _validate_json_shape(document)
         return document
+    except PreflightInputError:
+        raise
     except (
         OSError,
         UnicodeDecodeError,
         json.JSONDecodeError,
         RecursionError,
+        ValueError,
     ) as exc:
         raise PreflightInputError(f"{path} is not valid UTF-8 JSON") from exc
 
@@ -210,6 +253,11 @@ def _validate_json_shape(value: object) -> None:
                 for key in item
             ):
                 raise PreflightInputError("JSON object keys are invalid")
+            casefolded_keys = [key.casefold() for key in item]
+            if len(casefolded_keys) != len(set(casefolded_keys)):
+                raise PreflightInputError(
+                    "JSON object contains a case-insensitive key collision"
+                )
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             stack.extend((child, depth + 1) for child in item)
@@ -608,6 +656,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
         return RbacPolicy(
             allowed_broad_assignments=frozenset(),
             separation_rules=(),
+            expected_principal_ids=frozenset(),
         )
     _validate_json_shape(document)
     root = _mapping(document, field_name="RBAC policy")
@@ -646,7 +695,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                             field_name=("roleDefinitionName or roleDefinitionId"),
                         )
                     ),
-                    scope=_normalized(
+                    scope=_canonical_scope(
                         _require_string(
                             _get_case_insensitive(item, "scope"),
                             field_name="scope",
@@ -696,7 +745,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                     ),
                     forbidden_scope_prefixes=tuple(
                         sorted(
-                            _normalized(
+                            _canonical_scope(
                                 _require_string(
                                     prefix,
                                     field_name="forbidden scope prefix",
@@ -707,9 +756,32 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                     ),
                 )
             )
+    raw_expected_principals = _get_case_insensitive(
+        root,
+        "expectedPrincipalIds",
+    )
+    expected_principal_ids: set[str] = set()
+    if raw_expected_principals is not None:
+        for raw_principal_id in _sequence(
+            raw_expected_principals,
+            field_name="expectedPrincipalIds",
+            maximum_items=MAX_POLICY_ITEMS,
+        ):
+            principal_id = _normalized(
+                _require_string(
+                    raw_principal_id,
+                    field_name="expected principalId",
+                )
+            )
+            if principal_id in expected_principal_ids:
+                raise PreflightInputError(
+                    "expectedPrincipalIds contains a duplicate principalId"
+                )
+            expected_principal_ids.add(principal_id)
     return RbacPolicy(
         allowed_broad_assignments=frozenset(allowances),
         separation_rules=tuple(rules),
+        expected_principal_ids=frozenset(expected_principal_ids),
     )
 
 
@@ -740,8 +812,36 @@ def evaluate_role_assignments(
         raise PreflightInputError(
             "RBAC policy requires at least one separation rule"
         )
+    if require_separation_rules and not policy.expected_principal_ids:
+        raise PreflightInputError(
+            "RBAC policy requires expectedPrincipalIds"
+        )
+    rule_principal_ids = frozenset(
+        rule.principal_id for rule in policy.separation_rules
+    )
+    if (
+        require_separation_rules
+        and rule_principal_ids != policy.expected_principal_ids
+    ):
+        raise PreflightInputError(
+            "separationRules principals must exactly match expectedPrincipalIds"
+        )
+    allowance_principal_ids = frozenset(
+        allowance.principal_id for allowance in policy.allowed_broad_assignments
+    )
+    if (
+        require_separation_rules
+        and not allowance_principal_ids.issubset(policy.expected_principal_ids)
+    ):
+        raise PreflightInputError(
+            "RBAC policy principals must be listed in expectedPrincipalIds"
+        )
+    raw_assignments = _role_assignments(document)
+    if require_separation_rules and not raw_assignments:
+        raise PreflightInputError("role-assignment evidence must not be empty")
     violations: list[PreflightViolation] = []
-    for raw_assignment in _role_assignments(document):
+    assignment_principal_ids: set[str] = set()
+    for raw_assignment in raw_assignments:
         assignment = _mapping(
             raw_assignment,
             field_name="role assignment",
@@ -752,6 +852,7 @@ def evaluate_role_assignments(
                 field_name="principalId",
             )
         )
+        assignment_principal_ids.add(principal_id)
         raw_role_name = _get_case_insensitive(
             assignment,
             "roleDefinitionName",
@@ -788,7 +889,7 @@ def evaluate_role_assignments(
             raise PreflightInputError(
                 "role assignment requires roleDefinitionName or roleDefinitionId"
             )
-        scope = _normalized(
+        scope = _canonical_scope(
             _require_string(
                 _get_case_insensitive(assignment, "scope"),
                 field_name="scope",
@@ -836,6 +937,20 @@ def evaluate_role_assignments(
                         detail=(f"{canonical_role} is forbidden at scope {scope}"),
                     )
                 )
+    if (
+        require_separation_rules
+        and not assignment_principal_ids.issubset(policy.expected_principal_ids)
+    ):
+        raise PreflightInputError(
+            "role assignment principal is not covered by expectedPrincipalIds"
+        )
+    if (
+        require_separation_rules
+        and assignment_principal_ids != policy.expected_principal_ids
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence does not cover every expectedPrincipalId"
+        )
     return tuple(violations)
 
 

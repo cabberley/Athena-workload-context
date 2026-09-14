@@ -50,16 +50,23 @@ athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json
 ```
 
-The production wrapper requires `--policy` and at least one non-vacuous `separationRules` entry.
-Every rule must name at least one forbidden role and one forbidden scope prefix, so the command
-never reports RBAC as safe with identity-separation rules silently absent. The legacy module entry
-point keeps its historical optional-policy behavior for compatibility and must not be used as the
-guarded deployment gate without a reviewed policy.
+The production wrapper requires `--policy`, a non-empty `expectedPrincipalIds` array, and one
+non-vacuous `separationRules` entry for every expected principal. Every rule must name at least one
+forbidden role and one forbidden scope prefix. The saved role-assignment evidence must be non-empty
+and must cover exactly the expected principals; policy entries or assignments for an unexpected
+principal fail closed. This prevents an incomplete export or an unrelated syntactically valid rule
+from producing a safe result. The legacy module entry point keeps its historical optional-policy
+behavior for compatibility and must not be used as the guarded deployment gate without a reviewed
+policy.
 
 The policy is bounded JSON:
 
 ```json
 {
+  "expectedPrincipalIds": [
+    "00000000-0000-0000-0000-000000000001",
+    "00000000-0000-0000-0000-000000000002"
+  ],
   "allowedBroadAssignments": [
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
@@ -84,6 +91,11 @@ resource-group, or management-group scope fail unless the exact principal, role,
 reviewed in `allowedBroadAssignments`. `Role Based Access Control Administrator` is also treated as
 privileged. The verifier recognizes the official built-in role definition IDs as well as display
 names. Separation rules remain enforced independently.
+
+JSON object keys must be unique and cannot collide under case folding. Scope values are normalized
+without trailing slashes before allowance, broad-scope, and separation evaluation, so alternate
+subscription or resource-group spellings cannot bypass the gate. Oversized integer literals and
+other parser failures are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

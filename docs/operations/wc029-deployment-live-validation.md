@@ -200,7 +200,10 @@ az role assignment list `
 ```
 
 After collecting all reviewed assignments into the bounded
-`.\evidence\role-assignments.json` array, run the offline RBAC gate with the reviewed policy:
+`.\evidence\role-assignments.json` array, list every queried identity in the reviewed policy's
+non-empty `expectedPrincipalIds` array and provide one non-vacuous separation rule for each.
+The evidence, expected-principal list, and policy principals must match exactly; an empty or partial
+assignment export fails closed. Run the offline RBAC gate with that reviewed policy:
 
 ```powershell
 $RbacPreflightJson = & athena-context wc029-preflight rbac `

@@ -82,6 +82,22 @@ def _assignment(
     return value
 
 
+def _production_policy(*principal_ids: str) -> dict[str, object]:
+    return {
+        "expectedPrincipalIds": list(principal_ids),
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["Owner"],
+                "forbiddenScopePrefixes": [
+                    f"/subscriptions/{_SUBSCRIPTION_ID}",
+                ],
+            }
+            for principal_id in principal_ids
+        ],
+    }
+
+
 def test_what_if_accepts_no_change_and_exact_allowlist() -> None:
     document = _what_if(
         _change(_STORAGE_ID, "NoChange"),
@@ -608,6 +624,24 @@ def test_rbac_rejects_privileged_roles_by_scope_and_id(
     }
 
 
+@pytest.mark.parametrize(
+    "scope",
+    [
+        f"/subscriptions/{_SUBSCRIPTION_ID}/",
+        f"{_RG_SCOPE}/",
+    ],
+)
+def test_rbac_trailing_slash_cannot_bypass_broad_scope_detection(
+    scope: str,
+) -> None:
+    assignment = _assignment(role_name="Owner", scope=scope)
+
+    violations = evaluate_role_assignments([assignment])
+
+    assert {item.code for item in violations} == {"broad-role-assignment"}
+    assert violations[0].detail.endswith(scope.rstrip("/").casefold())
+
+
 def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"
@@ -737,6 +771,43 @@ def test_inputs_are_strict_and_bounded(tmp_path) -> None:
         load_json_file(nested)
 
 
+def test_json_parser_rejects_exact_duplicate_keys(tmp_path) -> None:
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(
+        '{"status":"Succeeded","status":"Failed","properties":{"changes":[]}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PreflightInputError, match="duplicate key"):
+        load_json_file(duplicate)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            '{"status":"Succeeded","\u017ftatus":"Failed",'
+            '"properties":{"changes":[]}}'
+        ),
+        (
+            '[{"principalId":"11111111-1111-1111-1111-111111111111",'
+            '"PRINCIPALID":"22222222-2222-2222-2222-222222222222",'
+            '"roleDefinitionName":"AcrPull","scope":'
+            f'"{_RG_SCOPE}/providers/Microsoft.ContainerRegistry/registries/synthetic"}}]'
+        ),
+    ],
+)
+def test_json_parser_rejects_casefold_key_collisions(
+    tmp_path,
+    content: str,
+) -> None:
+    collision = tmp_path / "collision.json"
+    collision.write_text(content, encoding="utf-8")
+
+    with pytest.raises(PreflightInputError, match="case-insensitive key collision"):
+        load_json_file(collision)
+
+
 def test_cli_exit_codes_and_json_output(tmp_path, capsys) -> None:
     safe_path = tmp_path / "safe.json"
     safe_path.write_text(
@@ -860,6 +931,38 @@ def test_public_cli_reports_malformed_policy_without_partial_success(tmp_path) -
     }
 
 
+def test_public_cli_reports_bounded_integer_error_without_traceback(tmp_path) -> None:
+    unsafe_path = tmp_path / "oversized-integer.json"
+    unsafe_path.write_text(
+        '{"status":"Succeeded","properties":{"changes":[]},"padding":'
+        + "9" * 5000
+        + "}",
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "what-if",
+            str(unsafe_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error": "JSON integer exceeds 1024 digits",
+        "kind": "what-if",
+        "safe": False,
+    }
+
+
 def test_public_cli_rejects_terminal_control_characters(tmp_path) -> None:
     unsafe_path = tmp_path / "terminal-injection.json"
     unsafe_path.write_text(
@@ -962,6 +1065,182 @@ def test_public_cli_rejects_empty_rbac_separation_policy(tmp_path) -> None:
         "WC-029 preflight rbac failed: "
         "RBAC policy requires at least one separation rule\n"
     )
+
+
+def test_public_cli_accepts_complete_expected_principal_coverage(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps(
+            [
+                _assignment(
+                    principal_id=principal_id,
+                    role_name="AcrPull",
+                    scope=(
+                        f"{_RG_SCOPE}/providers/"
+                        "Microsoft.ContainerRegistry/registries/synthetic"
+                    ),
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(_production_policy(principal_id)),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert stdout.getvalue() == (
+        "WC-029 preflight: SAFE\n"
+        "Check: rbac\n"
+        "Blockers: 0\n"
+    )
+    assert stderr.getvalue() == ""
+
+
+def test_public_cli_rejects_empty_assignment_evidence(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text("[]", encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(_production_policy(principal_id)),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "role-assignment evidence must not be empty\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("assignments", "policy", "message"),
+    [
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            {
+                "separationRules": [
+                    {
+                        "principalId": "11111111-1111-1111-1111-111111111111",
+                        "forbiddenRoleNames": ["Owner"],
+                        "forbiddenScopePrefixes": [
+                            f"/subscriptions/{_SUBSCRIPTION_ID}",
+                        ],
+                    }
+                ],
+            },
+            "RBAC policy requires expectedPrincipalIds",
+        ),
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            _production_policy("22222222-2222-2222-2222-222222222222"),
+            "role assignment principal is not covered by expectedPrincipalIds",
+        ),
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            {
+                **_production_policy(
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222",
+                ),
+            },
+            "role-assignment evidence does not cover every expectedPrincipalId",
+        ),
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            {
+                "expectedPrincipalIds": [
+                    "11111111-1111-1111-1111-111111111111",
+                ],
+                "separationRules": [
+                    {
+                        "principalId": "22222222-2222-2222-2222-222222222222",
+                        "forbiddenRoleNames": ["Owner"],
+                        "forbiddenScopePrefixes": [
+                            f"/subscriptions/{_SUBSCRIPTION_ID}",
+                        ],
+                    }
+                ],
+            },
+            "separationRules principals must exactly match expectedPrincipalIds",
+        ),
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            {
+                **_production_policy(
+                    "11111111-1111-1111-1111-111111111111",
+                ),
+                "allowedBroadAssignments": [
+                    _assignment(
+                        principal_id="22222222-2222-2222-2222-222222222222",
+                    )
+                ],
+            },
+            "RBAC policy principals must be listed in expectedPrincipalIds",
+        ),
+    ],
+)
+def test_public_cli_rejects_incomplete_or_unmatched_principal_coverage(
+    tmp_path,
+    assignments: list[dict[str, str]],
+    policy: dict[str, object],
+    message: str,
+) -> None:
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(json.dumps(assignments), encoding="utf-8")
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == f"WC-029 preflight rbac failed: {message}\n"
 
 
 def test_public_cli_rejects_vacuous_rbac_separation_rule(tmp_path) -> None:
