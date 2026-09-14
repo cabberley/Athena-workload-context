@@ -93,9 +93,11 @@ privileged. The verifier recognizes the official built-in role definition IDs as
 names. Separation rules remain enforced independently.
 
 JSON object keys must be unique and cannot collide under case folding. Scope values are normalized
-without trailing slashes before allowance, broad-scope, and separation evaluation, so alternate
-subscription or resource-group spellings cannot bypass the gate. Oversized integer literals and
-other parser failures are reported as malformed input with exit code `3`.
+without trailing slashes and structurally validated before allowance, broad-scope, and separation
+evaluation, so alternate or noncanonical ARM scope spellings cannot bypass the gate. Role definition
+IDs are likewise structurally checked before their built-in privilege is evaluated. Paginated
+object-form evidence containing a continuation link is rejected as incomplete. Oversized integer
+literals and other parser failures are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

@@ -642,6 +642,55 @@ def test_rbac_trailing_slash_cannot_bypass_broad_scope_detection(
     assert violations[0].detail.endswith(scope.rstrip("/").casefold())
 
 
+@pytest.mark.parametrize(
+    "scope",
+    [
+        f"/subscriptions/{_SUBSCRIPTION_ID}/.",
+        f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/..",
+        f"/subscriptions/{_SUBSCRIPTION_ID}/notResourceGroups/synthetic",
+        (
+            f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/"
+            "synthetic/providers/Microsoft.Storage/storageAccounts"
+        ),
+    ],
+)
+def test_rbac_rejects_noncanonical_or_incomplete_arm_scopes(
+    scope: str,
+) -> None:
+    with pytest.raises(PreflightInputError, match="scope"):
+        evaluate_role_assignments(
+            [_assignment(role_name="Owner", scope=scope)]
+        )
+
+
+def test_rbac_trailing_slash_role_id_cannot_hide_privileged_role() -> None:
+    owner_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635/"
+    )
+    assignment = _assignment(
+        role_name=None,
+        role_id=owner_role_id,
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+
+    assert {
+        item.code for item in evaluate_role_assignments([assignment])
+    } == {"broad-role-assignment"}
+
+    with pytest.raises(PreflightInputError, match="conflict"):
+        evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="AcrPull",
+                    role_id=owner_role_id,
+                    scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+                )
+            ]
+        )
+
+
 def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     subscription_scope = f"/subscriptions/{_SUBSCRIPTION_ID}"
@@ -1144,6 +1193,64 @@ def test_public_cli_rejects_empty_assignment_evidence(tmp_path) -> None:
         "WC-029 preflight rbac failed: "
         "role-assignment evidence must not be empty\n"
     )
+
+
+@pytest.mark.parametrize("continuation_key", ["nextLink", "@odata.nextLink"])
+def test_public_cli_rejects_paginated_assignment_evidence(
+    tmp_path,
+    continuation_key: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps(
+            {
+                "value": [
+                    _assignment(
+                        principal_id=principal_id,
+                        role_name="AcrPull",
+                        scope=(
+                            f"{_RG_SCOPE}/providers/"
+                            "Microsoft.ContainerRegistry/registries/synthetic"
+                        ),
+                    )
+                ],
+                continuation_key: "https://management.azure.com/continuation",
+            }
+        ),
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(_production_policy(principal_id)),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error": (
+            "role-assignment evidence must not contain a continuation link"
+        ),
+        "kind": "rbac",
+        "safe": False,
+    }
 
 
 @pytest.mark.parametrize(

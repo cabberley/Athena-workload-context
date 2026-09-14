@@ -203,7 +203,9 @@ After collecting all reviewed assignments into the bounded
 `.\evidence\role-assignments.json` array, list every queried identity in the reviewed policy's
 non-empty `expectedPrincipalIds` array and provide one non-vacuous separation rule for each.
 The evidence, expected-principal list, and policy principals must match exactly; an empty or partial
-assignment export fails closed. Run the offline RBAC gate with that reviewed policy:
+assignment export fails closed. Use `--all` as shown and do not combine paginated API pages manually;
+object-form evidence with a continuation link is rejected as incomplete. Run the offline RBAC gate
+with that reviewed policy:
 
 ```powershell
 $RbacPreflightJson = & athena-context wc029-preflight rbac `

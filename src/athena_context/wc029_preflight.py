@@ -35,12 +35,17 @@ _ROLE_ID_TO_NAME = {
     "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9": ("user access administrator"),
 }
 _BROAD_ROLE_IDS = frozenset(_ROLE_ID_TO_NAME)
+_GUID_PATTERN = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_GUID = re.compile(rf"^{_GUID_PATTERN}$", re.IGNORECASE)
 _SUBSCRIPTION_SCOPE = re.compile(
-    r"^/subscriptions/[0-9a-f-]{36}$",
+    rf"^/subscriptions/{_GUID_PATTERN}$",
     re.IGNORECASE,
 )
 _RESOURCE_GROUP_SCOPE = re.compile(
-    r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[^/]+$",
+    rf"^/subscriptions/{_GUID_PATTERN}/resourcegroups/[^/]+$",
     re.IGNORECASE,
 )
 _MANAGEMENT_GROUP_SCOPE = re.compile(
@@ -165,6 +170,26 @@ def _canonical_role_key(value: str) -> str:
     return _ROLE_ID_TO_NAME.get(normalized, normalized)
 
 
+def _canonical_role_id(value: str) -> str:
+    normalized = _normalized(value)
+    if "/" not in normalized:
+        if _GUID.fullmatch(normalized) is None:
+            raise PreflightInputError("roleDefinitionId must end in a role GUID")
+        return normalized
+    canonical = _canonical_scope(normalized)
+    segments = canonical.strip("/").split("/")
+    if (
+        len(segments) < 4
+        or segments[-3] != "microsoft.authorization"
+        or segments[-2] != "roledefinitions"
+        or _GUID.fullmatch(segments[-1]) is None
+    ):
+        raise PreflightInputError(
+            "roleDefinitionId must identify a Microsoft.Authorization role definition"
+        )
+    return segments[-1]
+
+
 def _canonical_property_path(value: str) -> str:
     normalized = value.casefold()
     prefix = "<resource>."
@@ -174,8 +199,54 @@ def _canonical_property_path(value: str) -> str:
 def _canonical_scope(value: str) -> str:
     normalized = _normalized(value)
     canonical = normalized.rstrip("/") or "/"
-    if not canonical.startswith("/") or "//" in canonical:
+    if (
+        not canonical.startswith("/")
+        or "//" in canonical
+        or any(character in canonical for character in ("\\", "?", "#", "%"))
+    ):
         raise PreflightInputError("scope must be a canonical ARM scope")
+    if canonical == "/":
+        return canonical
+    segments = canonical[1:].split("/")
+    if any(
+        not segment
+        or segment in {".", ".."}
+        or segment != segment.strip()
+        for segment in segments
+    ):
+        raise PreflightInputError("scope must be a canonical ARM scope")
+    if segments[0] == "subscriptions":
+        if len(segments) < 2 or _GUID.fullmatch(segments[1]) is None:
+            raise PreflightInputError("scope must contain a valid subscription ID")
+        if len(segments) == 2:
+            return canonical
+        if segments[2] == "resourcegroups":
+            if len(segments) < 4:
+                raise PreflightInputError("resource-group scope is incomplete")
+            if len(segments) == 4:
+                return canonical
+            provider_index = 4
+        elif segments[2] == "providers":
+            provider_index = 2
+        else:
+            raise PreflightInputError("scope has an unsupported subscription boundary")
+    elif segments[0] == "providers":
+        provider_index = 0
+    else:
+        raise PreflightInputError("scope has an unsupported ARM boundary")
+    index = provider_index
+    while index < len(segments):
+        if segments[index] != "providers" or index + 3 >= len(segments):
+            raise PreflightInputError("scope has an incomplete provider boundary")
+        index += 2
+        resource_pairs = 0
+        while index < len(segments) and segments[index] != "providers":
+            if index + 1 >= len(segments) or segments[index + 1] == "providers":
+                raise PreflightInputError("scope has an incomplete resource boundary")
+            resource_pairs += 1
+            index += 2
+        if resource_pairs == 0:
+            raise PreflightInputError("scope has an incomplete provider boundary")
     return canonical
 
 
@@ -676,10 +747,32 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 item,
                 "roleDefinitionId",
             )
-            if role_value is None:
-                role_value = _get_case_insensitive(
-                    item,
-                    "roleDefinitionName",
+            role_name_value = _get_case_insensitive(
+                item,
+                "roleDefinitionName",
+            )
+            if role_value is None and role_name_value is None:
+                raise PreflightInputError(
+                    "broad assignment allowance requires "
+                    "roleDefinitionName or roleDefinitionId"
+                )
+            if role_value is not None:
+                allowance_role_id = _canonical_role_id(
+                    _require_string(
+                        role_value,
+                        field_name="roleDefinitionId",
+                    )
+                )
+                allowance_role = _ROLE_ID_TO_NAME.get(
+                    allowance_role_id,
+                    allowance_role_id,
+                )
+            else:
+                allowance_role = _canonical_role_key(
+                    _require_string(
+                        role_name_value,
+                        field_name="roleDefinitionName",
+                    )
                 )
             allowances.add(
                 BroadAssignmentAllowance(
@@ -689,12 +782,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                             field_name="principalId",
                         )
                     ),
-                    role_name=_canonical_role_key(
-                        _require_string(
-                            role_value,
-                            field_name=("roleDefinitionName or roleDefinitionId"),
-                        )
-                    ),
+                    role_name=allowance_role,
                     scope=_canonical_scope(
                         _require_string(
                             _get_case_insensitive(item, "scope"),
@@ -793,6 +881,14 @@ def _role_assignments(document: object) -> list[object]:
             maximum_items=MAX_ASSIGNMENTS,
         )
     root = _mapping(document, field_name="role-assignment document")
+    for key, value in root.items():
+        if (
+            key.casefold() in {"nextlink", "@odata.nextlink", "odata.nextlink"}
+            and value is not None
+        ):
+            raise PreflightInputError(
+                "role-assignment evidence must not contain a continuation link"
+            )
     return _sequence(
         _get_case_insensitive(root, "value"),
         field_name="value",
@@ -874,12 +970,12 @@ def evaluate_role_assignments(
         role_id = (
             ""
             if raw_role_id is None
-            else _normalized(
+            else _canonical_role_id(
                 _require_string(
                     raw_role_id,
                     field_name="roleDefinitionId",
                 )
-            ).rsplit("/", 1)[-1]
+            )
         )
         mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
         if role_name and mapped_role_id is not None and role_name != mapped_role_id:
