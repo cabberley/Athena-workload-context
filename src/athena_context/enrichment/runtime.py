@@ -21,6 +21,10 @@ from athena_context.enrichment.feed_pipeline import (
 from athena_context.enrichment.publication import (
     IncidentEnrichmentPublicationReceipt,
 )
+from athena_context.guidance.publication import (
+    GuidanceAuthorityActivationSnapshot,
+    verify_guidance_authority_activation,
+)
 from athena_context.presentation_assets import (
     ActiveIncidentIndexSnapshot,
     CurrentIncidentStateSnapshot,
@@ -46,6 +50,14 @@ class IncidentPublicationAuthorityReaderPort(Protocol):
         *,
         incident_id: str,
     ) -> CurrentIncidentStateSnapshot | None: ...
+
+
+class GuidanceAuthorityActivationReaderPort(Protocol):
+    def read_current(
+        self,
+        *,
+        incident_id: str,
+    ) -> GuidanceAuthorityActivationSnapshot | None: ...
 
 
 class IncidentEnrichmentPublicationPort(Protocol):
@@ -100,6 +112,7 @@ class Wc027EnrichmentFeedRuntime:
     guidance_binding_signature_verifier: SignatureVerifier
     correlation: CorrelationRuntimePort
     incident_authority: IncidentPublicationAuthorityReaderPort
+    guidance_activation: GuidanceAuthorityActivationReaderPort
     enrichment_publication: IncidentEnrichmentPublicationPort
     feed_publication: IncidentEnrichmentFeedPublicationPort
     notification_publication: NotificationV2PublicationPort
@@ -133,12 +146,28 @@ class Wc027EnrichmentFeedRuntime:
             raise Wc027EnrichmentSourceNotReadyError(
                 "current incident occurrence and active index are required"
             )
+        activation = self.guidance_activation.read_current(
+            incident_id=incident_id
+        )
+        if activation is None:
+            raise Wc027EnrichmentSourceNotReadyError(
+                "current guidance authority activation is required"
+            )
+        verify_guidance_authority_activation(
+            activation.activation,
+            binding,
+            trusted_key_id=self.guidance_binding_key_id,
+            signature_verifier=self.guidance_binding_signature_verifier,
+            verified_at=published_at,
+        )
         subject = request.incident_subject
         if (
             current.state != subject.incident_state
             or current.occurrence.state_reference != subject.state_reference
             or current.occurrence.state_attestation_reference
             != subject.attestation_reference
+            or current.occurrence.occurrence_digest
+            != activation.activation.occurrence_digest
         ):
             raise ValueError(
                 "signed guidance binding is stale for the current incident occurrence"
@@ -208,7 +237,7 @@ def verify_wc027_guidance_binding_signature(
         },
     )
     if (
-        binding.binding_attestation.key_vault_key_id != trusted_key_id
+        binding.binding_attestation.key_id != trusted_key_id
         or signature_verifier(
             canonicalize_json(preimage).encode("utf-8"),
             binding.binding_attestation.detached_signature,

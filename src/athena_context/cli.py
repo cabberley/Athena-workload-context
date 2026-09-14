@@ -36,6 +36,11 @@ from athena_context.eventing import (
     run_resource_graph_change_history_worker,
     run_scheduled_signal_detector,
 )
+from athena_context.guidance.production import (
+    load_wc027_guidance_authority_publisher_configuration,
+    run_wc027_guidance_authority_publisher_worker,
+    submit_wc027_guidance_authority_request,
+)
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
     prepare_wc013_live_acceptance,
@@ -371,6 +376,39 @@ def build_parser() -> argparse.ArgumentParser:
     wc027_worker_parser.add_argument("--config", type=Path)
     wc027_worker_parser.add_argument("--config-json")
     wc027_worker_parser.add_argument(
+        "--max-wait-time-seconds",
+        type=int,
+        default=30,
+        choices=range(1, 301),
+    )
+    wc027_authority_submit_parser = subparsers.add_parser(
+        "wc027-guidance-authority-submit",
+        help="enqueue one signed bounded guidance-authority publication request",
+    )
+    wc027_authority_submit_parser.add_argument(
+        "--request",
+        required=True,
+        type=Path,
+    )
+    wc027_authority_submit_parser.add_argument(
+        "--service-bus-namespace",
+        required=True,
+    )
+    wc027_authority_submit_parser.add_argument(
+        "--request-queue",
+        default="wc027-guidance-authority-requests",
+    )
+    wc027_authority_submit_parser.add_argument(
+        "--managed-identity-client-id",
+        required=True,
+    )
+    wc027_authority_worker_parser = subparsers.add_parser(
+        "wc027-guidance-authority-publisher",
+        help="publish and activate one signed WC-027 guidance authority binding",
+    )
+    wc027_authority_worker_parser.add_argument("--config", type=Path)
+    wc027_authority_worker_parser.add_argument("--config-json")
+    wc027_authority_worker_parser.add_argument(
         "--max-wait-time-seconds",
         type=int,
         default=30,
@@ -974,6 +1012,40 @@ def main(
                 else "WC-027 enrichment trigger queue was empty or deferred\n"
             )
             return 0
+        if args.command == "wc027-guidance-authority-submit":
+            request_id = submit_wc027_guidance_authority_request(
+                request_path=args.request,
+                fully_qualified_namespace=args.service_bus_namespace,
+                queue_name=args.request_queue,
+                managed_identity_client_id=args.managed_identity_client_id,
+            )
+            output.write(
+                f"WC-027 guidance authority request queued: {request_id}\n"
+            )
+            return 0
+        if args.command == "wc027-guidance-authority-publisher":
+            configuration_json = (
+                args.config_json
+                or os.environ.get(
+                    "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON"
+                )
+            )
+            guidance_publisher_configuration = (
+                load_wc027_guidance_authority_publisher_configuration(
+                    path=args.config,
+                    environment_json=configuration_json,
+                )
+            )
+            processed = run_wc027_guidance_authority_publisher_worker(
+                configuration=guidance_publisher_configuration,
+                max_wait_time_seconds=args.max_wait_time_seconds,
+            )
+            output.write(
+                "WC-027 guidance authority published and queued\n"
+                if processed
+                else "WC-027 guidance authority request queue was empty or deferred\n"
+            )
+            return 0
         if args.command == "wc025-change-event-ingester":
             event_count = run_event_grid_change_ingestion_worker(
                 fully_qualified_namespace=args.service_bus_namespace,
@@ -1055,6 +1127,8 @@ def main(
             "wc016-notification-dispatcher",
             "wc027-enrichment-feed-submit",
             "wc027-enrichment-feed-producer",
+            "wc027-guidance-authority-submit",
+            "wc027-guidance-authority-publisher",
             "wc025-change-event-ingester",
             "wc025-change-dead-letter-purge",
             "wc025-change-history-query",

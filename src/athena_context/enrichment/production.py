@@ -86,6 +86,9 @@ from athena_context.eventing.notification_v2 import (
     NotificationV2Trust,
 )
 from athena_context.eventing.runtime import AzureServiceBusNotificationOutbox
+from athena_context.guidance.azure import (
+    AzureTableGuidanceAuthorityActivationStore,
+)
 from athena_context.presentation_assets import (
     PresentationAssetReadResult,
     PresentationAssetUnavailableError,
@@ -110,6 +113,15 @@ class _WritableBlobSource:
     reader_identity_resource_id: str
     writer_identity_client_id: str
     writer_identity_resource_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TableSource:
+    endpoint: str
+    table: str
+    partition_key: str
+    identity_client_id: str
+    identity_resource_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +170,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
     context_authority_source: _BlobSource
     monitoring_intent_source: _BlobSource
     guidance_authority_source: _BlobSource
+    guidance_activation: _TableSource
     monitoring_collector_contract: MonitoringCollectorContract
     monitoring_collector_key: _MonitoringCollectorKey
     incident_key: _KeyAuthority
@@ -193,6 +206,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 "presentationUrl",
                 "correlationSources",
                 "guidanceAuthoritySource",
+                "guidanceActivation",
                 "monitoringCollectorContract",
                 "monitoringCollectorKey",
                 "keys",
@@ -254,6 +268,21 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 "identityResourceId",
             },
             "feedRegistry",
+        )
+        guidance_activation = _mapping(
+            root["guidanceActivation"],
+            "guidanceActivation",
+        )
+        _require_keys(
+            guidance_activation,
+            {
+                "tableEndpoint",
+                "tableName",
+                "partitionKey",
+                "identityClientId",
+                "identityResourceId",
+            },
+            "guidanceActivation",
         )
         deployment_binding = _mapping(
             root["deploymentBinding"],
@@ -369,6 +398,31 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 root["guidanceAuthoritySource"],
                 "guidanceAuthoritySource",
             ),
+            guidance_activation=_TableSource(
+                endpoint=_https_origin(
+                    guidance_activation["tableEndpoint"],
+                    "guidanceActivation.tableEndpoint",
+                    suffix=".table.core.windows.net",
+                ),
+                table=_text(
+                    guidance_activation["tableName"],
+                    "guidanceActivation.tableName",
+                    maximum=63,
+                ),
+                partition_key=_text(
+                    guidance_activation["partitionKey"],
+                    "guidanceActivation.partitionKey",
+                    maximum=256,
+                ),
+                identity_client_id=_client_id(
+                    guidance_activation["identityClientId"],
+                    "guidanceActivation.identityClientId",
+                ),
+                identity_resource_id=_managed_identity_resource_id(
+                    guidance_activation["identityResourceId"],
+                    "guidanceActivation.identityResourceId",
+                ),
+            ),
             monitoring_collector_contract=(
                 MonitoringCollectorContract.model_validate_json(
                     json.dumps(root["monitoringCollectorContract"])
@@ -389,6 +443,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
             guidance_binding_key=_key_authority(
                 keys["guidanceBinding"],
                 "keys.guidanceBinding",
+                allow_logical_key_id=True,
             ),
             change_key=_key_authority(keys["change"], "keys.change"),
             monitoring_intent_key=_key_authority(
@@ -484,6 +539,10 @@ class Wc027EnrichmentFeedProductionConfiguration:
             (
                 self.registry_identity_client_id,
                 self.registry_identity_resource_id,
+            ),
+            (
+                self.guidance_activation.identity_client_id,
+                self.guidance_activation.identity_resource_id,
             ),
             *(
                 (source.identity_client_id, source.identity_resource_id)
@@ -674,7 +733,7 @@ def build_wc027_enrichment_feed_runtime(
     guidance_binding_verifier = _verifier(configuration.guidance_binding_key)
     verify_wc027_guidance_binding_signature(
         binding,
-        trusted_key_id=configuration.guidance_binding_key.key_vault_key_id,
+        trusted_key_id=configuration.guidance_binding_key.key_id,
         signature_verifier=guidance_binding_verifier.verify_preimage,
     )
 
@@ -797,9 +856,7 @@ def build_wc027_enrichment_feed_runtime(
         correlation_binding_signature_verifier=(
             correlation_binding_verifier.verify_preimage
         ),
-        guidance_binding_key_id=(
-            configuration.guidance_binding_key.key_vault_key_id
-        ),
+        guidance_binding_key_id=configuration.guidance_binding_key.key_id,
         guidance_binding_signature_verifier=(
             guidance_binding_verifier.verify_preimage
         ),
@@ -881,14 +938,20 @@ def build_wc027_enrichment_feed_runtime(
         outbox=notification_outbox,
     )
     return Wc027EnrichmentFeedRuntime(
-        guidance_binding_key_id=(
-            configuration.guidance_binding_key.key_vault_key_id
-        ),
+        guidance_binding_key_id=configuration.guidance_binding_key.key_id,
         guidance_binding_signature_verifier=(
             guidance_binding_verifier.verify_preimage
         ),
         correlation=correlation,
         incident_authority=incident_reader,
+        guidance_activation=AzureTableGuidanceAuthorityActivationStore(
+            endpoint=configuration.guidance_activation.endpoint,
+            table_name=configuration.guidance_activation.table,
+            partition_key=configuration.guidance_activation.partition_key,
+            managed_identity_client_id=(
+                configuration.guidance_activation.identity_client_id
+            ),
+        ),
         enrichment_publication=enrichment,
         feed_publication=feed,
         notification_publication=notification,

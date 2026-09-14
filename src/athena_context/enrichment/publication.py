@@ -622,7 +622,7 @@ class IncidentEnrichmentPublicationService:
             },
         )
         if (
-            binding.binding_attestation.key_vault_key_id != self.guidance_binding_key_id
+            binding.binding_attestation.key_id != self.guidance_binding_key_id
             or self.guidance_binding_signature_verifier(
                 canonicalize_json(preimage).encode("utf-8"),
                 binding.binding_attestation.detached_signature,

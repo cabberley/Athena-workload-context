@@ -52,6 +52,9 @@ param feedV2ReaderIdentityResourceId string
 @description('Feed registry Table writer identity resource ID.')
 param registryWriterIdentityResourceId string
 
+@description('Read-only identity resource ID for the current guidance-authority activation row.')
+param guidanceActivationReaderIdentityResourceId string
+
 @description('Trust/public-key reader identity resource ID used for Key Vault Reader and all verification keys.')
 param trustReaderIdentityResourceId string
 
@@ -107,6 +110,14 @@ param feedRegistryTableName string = 'Wc027FeedRegistry'
 @maxLength(256)
 param feedRegistryPartitionKey string
 
+@description('Guidance-authority activation Table name.')
+param guidanceActivationTableName string = 'Wc027GuidanceActivation'
+
+@description('Guidance-authority activation partition key.')
+@minLength(1)
+@maxLength(256)
+param guidanceActivationPartitionKey string = 'wc027-guidance-authority'
+
 @description('Existing storage account resource ID that hosts the correlation and guidance-authority evidence containers.')
 param correlationSourceStorageAccountResourceId string
 
@@ -155,6 +166,11 @@ param correlationBindingKeyResourceId string
 @description('Existing guidance-binding verification key ARM resource ID.')
 param guidanceBindingKeyResourceId string
 
+@description('Stable logical key ID embedded in signed guidance bindings and activations.')
+@minLength(1)
+@maxLength(512)
+param guidanceBindingLogicalKeyId string
+
 @description('Existing change-evidence verification key ARM resource ID.')
 param changeKeyResourceId string
 
@@ -191,6 +207,7 @@ var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -246,6 +263,11 @@ resource feedV2ReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@
 resource registryWriterIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(registryWriterIdentityResourceId, '/'))
   scope: resourceGroup(split(registryWriterIdentityResourceId, '/')[2], split(registryWriterIdentityResourceId, '/')[4])
+}
+
+resource guidanceActivationReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: last(split(guidanceActivationReaderIdentityResourceId, '/'))
+  scope: resourceGroup(split(guidanceActivationReaderIdentityResourceId, '/')[2], split(guidanceActivationReaderIdentityResourceId, '/')[4])
 }
 
 resource trustReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
@@ -314,6 +336,7 @@ var attachedIdentityResourceIds = [
   feedV2ProducerReaderIdentity.id
   feedV2WriterIdentity.id
   registryWriterIdentity.id
+  guidanceActivationReaderIdentity.id
   trustReaderIdentity.id
   monitoringReaderIdentity.id
   changeReaderIdentity.id
@@ -433,6 +456,12 @@ resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2025-06-0
 resource feedRegistry 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
   parent: tableService
   name: feedRegistryTableName
+  properties: {}
+}
+
+resource guidanceActivation 'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01' = {
+  parent: tableService
+  name: guidanceActivationTableName
   properties: {}
 }
 
@@ -610,6 +639,19 @@ resource registryWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       storageTableDataContributorRoleDefinitionId
+    )
+  }
+}
+
+resource guidanceActivationReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, storageTableDataReaderRoleDefinitionId)
+  scope: guidanceActivation
+  properties: {
+    principalId: guidanceActivationReaderIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageTableDataReaderRoleDefinitionId
     )
   }
 }
@@ -865,6 +907,13 @@ var runtimeConfiguration = {
     identityClientId: registryWriterIdentity.properties.clientId
     identityResourceId: registryWriterIdentity.id
   }
+  guidanceActivation: {
+    tableEndpoint: replayStorage.properties.primaryEndpoints.table
+    tableName: guidanceActivation.name
+    partitionKey: guidanceActivationPartitionKey
+    identityClientId: guidanceActivationReaderIdentity.properties.clientId
+    identityResourceId: guidanceActivationReaderIdentity.id
+  }
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -929,7 +978,7 @@ var runtimeConfiguration = {
       identityResourceId: trustReaderIdentity.id
     }
     guidanceBinding: {
-      keyId: guidanceBindingKey.properties.keyUriWithVersion
+      keyId: guidanceBindingLogicalKeyId
       keyVaultKeyId: guidanceBindingKey.properties.keyUriWithVersion
       keyFingerprint: trustDomainMetadata.guidanceBinding.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
@@ -1010,6 +1059,7 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
+  guidanceActivationReader.id
   incidentKeyVerifierRoleId
   extensionResourceId(incidentKey.id, 'Microsoft.Authorization/roleAssignments', guid(incidentKey.id, trustReaderIdentity.id, incidentKeyVerifierRoleId))
   correlationBindingKeyVerifierRoleId

@@ -564,7 +564,7 @@ def _feed_v2_gateway_fixture(
             "athena.wc027PublishedGuidanceAuthorityBindingAttestation.v2"
         ),
         signatureAlgorithm="RS256",
-        keyVaultKeyId="synthetic-key://guidance-binding",
+        keyId="synthetic-key://guidance-binding",
         signedPreimageDigest=compute_artifact_digest(
             _json_value(binding_payload)
         ),

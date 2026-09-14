@@ -302,7 +302,7 @@ def _publication_service(
         incident_signature_verifier=incident_verifier,
         correlation_binding_key_id=(request.binding_attestation.key_vault_key_id),
         correlation_binding_signature_verifier=_verify_signature,
-        guidance_binding_key_id=(binding.binding_attestation.key_vault_key_id),
+        guidance_binding_key_id=(binding.binding_attestation.key_id),
         guidance_binding_signature_verifier=_verify_signature,
         report_key_id=_REPORT_KEY_ID,
         report_signer=_Signer(),
