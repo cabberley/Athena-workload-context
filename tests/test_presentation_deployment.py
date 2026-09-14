@@ -129,7 +129,7 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
 
     assert (
         "br/public:avm/res/managed-identity/user-assigned-identity:0.6.0"
-        in presentation
+        in orchestration
     )
     assert "br/public:avm/res/app/container-app:0.23.0" in presentation
     assert "publicNetworkAccess: 'Disabled'" in foundation
@@ -141,7 +141,7 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
         orchestration
     )
     assert "userAssignedResourceIds" in presentation
-    assert "presentationIdentity.outputs.resourceId" in presentation
+    assert "presentationIdentityResourceId" in presentation
     assert "systemAssigned" not in presentation
     assert "secrets:" not in presentation
     assert "name: 'athena-presentation-asset-gateway'" in presentation
@@ -154,10 +154,17 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
     assert "'--incident-container'" in presentation
     assert "incidentAssetContainerName" in presentation
     assert "'--incident-key-id'" in presentation
+    assert "'--incident-key-vault-key-id'" in presentation
+    assert "incidentSigningKeyVaultKeyId" in presentation
     assert "'--incident-key-fingerprint'" in presentation
     assert "'--incident-public-key'" in presentation
     assert "'--managed-identity-client-id'" in presentation
-    assert "presentationIdentity.outputs.clientId" in presentation
+    assert "presentationIdentityClientId" in presentation
+    assert (
+        "incidentSigningKeyVaultKeyId: "
+        "acceptanceResources.outputs.incidentSigningKeyUriWithVersion"
+        in orchestration
+    )
     assert "'--port'" in presentation
     assert "'8081'" in presentation
     assert "name: 'AZURE_CLIENT_ID'" in presentation
@@ -267,7 +274,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
         "collectorControllerPrincipalId: validatedCollectorControllerPrincipalId"
         in orchestration
     )
-    assert "toLower(presentationWeb.outputs.identityPrincipalId)" in orchestration
+    assert "toLower(presentationIdentity.outputs.principalId)" in orchestration
     assert "toLower(evidenceIdentity.properties.principalId)" in orchestration
     assert "toLower(acceptanceJobIdentity.properties.principalId)" in orchestration
     assert "map(operatorArtifactReaderObjectIds" in orchestration

@@ -143,6 +143,7 @@ class IncidentEnrichmentPublicationService:
     guidance_authority_reader: VersionPinnedArtifactReaderPort
     artifact_writer: IncidentEnrichmentArtifactWriterPort
     incident_key_id: str
+    incident_key_vault_key_id: str
     incident_key_fingerprint: str
     incident_signature_verifier: SignatureVerifier
     correlation_binding_key_id: str
@@ -164,6 +165,7 @@ class IncidentEnrichmentPublicationService:
             raise TypeError("incident enrichment requires the exact CorrelationService instance")
         key_ids = (
             self.incident_key_id,
+            self.incident_key_vault_key_id,
             self.correlation_binding_key_id,
             self.guidance_binding_key_id,
             self.report_key_id,
@@ -496,10 +498,12 @@ class IncidentEnrichmentPublicationService:
             or state_attestation_bytes != state_attestation.canonical_bytes()
             or pointer_bytes != pointer.canonical_bytes()
             or pointer_attestation_bytes != pointer_attestation.canonical_bytes()
-            or state_attestation.key_vault_key_id != self.incident_key_id
+            or state_attestation.key_vault_key_id
+            != self.incident_key_vault_key_id
             or pointer.key_id != self.incident_key_id
             or pointer.key_fingerprint != self.incident_key_fingerprint
-            or pointer_attestation.key_vault_key_id != self.incident_key_id
+            or pointer_attestation.key_vault_key_id
+            != self.incident_key_vault_key_id
             or self.incident_signature_verifier(
                 state_preimage,
                 state_attestation.detached_signature,
@@ -592,7 +596,8 @@ class IncidentEnrichmentPublicationService:
             or subject.incident_state_attestation != state_attestation
             or subject.state_reference != occurrence.state_reference
             or subject.attestation_reference != occurrence.state_attestation_reference
-            or subject.subject_attestation.key_vault_key_id != self.incident_key_id
+            or subject.subject_attestation.key_vault_key_id
+            != self.incident_key_vault_key_id
             or self.incident_signature_verifier(
                 canonicalize_json(subject_preimage).encode("utf-8"),
                 subject.subject_attestation.detached_signature,

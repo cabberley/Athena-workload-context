@@ -2344,6 +2344,8 @@ def test_cli_removed_raw_normalizer_and_requires_incident_trust_boundaries() -> 
             "11111111-1111-1111-1111-111111111111",
             "--incident-key-id",
             INCIDENT_KEY_ID,
+            "--incident-key-vault-key-id",
+            INCIDENT_KEY_ID,
             "--incident-key-fingerprint",
             INCIDENT_KEY_FINGERPRINT,
             "--incident-public-key",

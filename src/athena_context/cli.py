@@ -251,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("incident-assets",),
     )
     gateway_parser.add_argument("--incident-key-id", required=True)
+    gateway_parser.add_argument("--incident-key-vault-key-id", required=True)
     gateway_parser.add_argument("--incident-key-fingerprint", required=True)
     gateway_parser.add_argument("--incident-public-key", required=True, type=Path)
     for trust_name in ("feed-v2", "report", "guidance", "enrichment"):
@@ -855,6 +856,7 @@ def main(
                 container_name=args.container,
                 incident_container_name=args.incident_container,
                 incident_key_id=args.incident_key_id,
+                incident_key_vault_key_id=args.incident_key_vault_key_id,
                 incident_key_fingerprint=args.incident_key_fingerprint,
                 incident_public_key_path=args.incident_public_key,
                 incident_feed_v2_key_id=args.incident_feed_v2_key_id,

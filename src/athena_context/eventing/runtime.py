@@ -1398,6 +1398,7 @@ def _build_notification_v2_trust(
     )
     return NotificationV2Trust(
         lifecycle_key_id=configuration.lifecycle.key_id,
+        lifecycle_key_vault_key_id=configuration.lifecycle.key_vault_key_id,
         lifecycle_key_fingerprint=configuration.lifecycle.key_fingerprint,
         lifecycle_signature_verifier=lifecycle.verify_preimage,
         feed_key_id=configuration.feed.key_id,

@@ -77,6 +77,28 @@ var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
 var runtimeAuthorityAssets = parsedEnrichmentRuntimeConfiguration.guidanceAuthoritySource
 var runtimeActivation = parsedEnrichmentRuntimeConfiguration.guidanceActivation
+var runtimeTrustDomainFingerprints = [
+  parsedEnrichmentRuntimeConfiguration.monitoringCollectorKey.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.change.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.monitoringIntent.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.incident.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.correlationBinding.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.report.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.guidance.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.enrichment.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.feed.keyFingerprint
+  parsedEnrichmentRuntimeConfiguration.keys.notification.keyFingerprint
+]
+var validatedRuntimeTrustDomainFingerprints = length(union(runtimeTrustDomainFingerprints, runtimeTrustDomainFingerprints)) == length(runtimeTrustDomainFingerprints)
+  ? runtimeTrustDomainFingerprints
+  : fail('WC-027 runtime trust-domain public key fingerprints must be distinct')
+var validatedRequestKeyFingerprint = !contains(validatedRuntimeTrustDomainFingerprints, requestKeyFingerprint)
+  ? requestKeyFingerprint
+  : fail('guidance publication request public key fingerprint must use a distinct trust domain')
+var validatedBindingKeyFingerprint = bindingKeyFingerprint == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
+  ? bindingKeyFingerprint
+  : fail('publisher binding signer fingerprint must match runtime guidance trust')
 var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
 var activationStorageAccountName = last(split(activationStorageAccountResourceId, '/'))
 var expectedAuthorityBlobEndpoint = 'https://${toLower(authorityStorageAccountName)}.blob.${environment().suffixes.storage}'
@@ -382,14 +404,14 @@ var publisherConfiguration = {
   requestKey: {
     keyId: requestLogicalKeyId
     keyVaultKeyId: requestKey.properties.keyUriWithVersion
-    keyFingerprint: requestKeyFingerprint
+    keyFingerprint: validatedRequestKeyFingerprint
     identityClientId: requestTrustReaderIdentity.properties.clientId
     identityResourceId: requestTrustReaderIdentity.id
   }
   bindingSigningKey: {
     keyId: bindingLogicalKeyId
     keyVaultKeyId: bindingKey.properties.keyUriWithVersion
-    keyFingerprint: bindingKeyFingerprint
+    keyFingerprint: validatedBindingKeyFingerprint
     identityClientId: bindingSignerIdentity.properties.clientId
     identityResourceId: bindingSignerIdentity.id
   }

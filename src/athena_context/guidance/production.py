@@ -278,6 +278,11 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 item.key_vault_key_id
                 for item in (*all_runtime_keys, binding_trust)
             }
+            or self.request_key.key_fingerprint
+            in {
+                item.key_fingerprint
+                for item in (*all_runtime_keys, binding_trust)
+            }
         ):
             raise ValueError(
                 "guidance publication request key must use a distinct trust domain"

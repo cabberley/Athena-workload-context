@@ -183,6 +183,23 @@ param monitoringCollectorKeyResourceId string
 @description('Non-secret public-key fingerprints for every trust domain. Key IDs are derived from referenced versioned Key Vault resources.')
 param trustDomainMetadata object
 
+var runtimeTrustDomainFingerprints = [
+  trustDomainMetadata.monitoringCollector.keyFingerprint
+  trustDomainMetadata.change.keyFingerprint
+  trustDomainMetadata.monitoringIntent.keyFingerprint
+  trustDomainMetadata.incident.keyFingerprint
+  trustDomainMetadata.correlationBinding.keyFingerprint
+  trustDomainMetadata.guidanceBinding.keyFingerprint
+  trustDomainMetadata.report.keyFingerprint
+  trustDomainMetadata.guidance.keyFingerprint
+  trustDomainMetadata.enrichment.keyFingerprint
+  trustDomainMetadata.feed.keyFingerprint
+  trustDomainMetadata.notification.keyFingerprint
+]
+var validatedTrustDomainMetadata = length(union(runtimeTrustDomainFingerprints, runtimeTrustDomainFingerprints)) == length(runtimeTrustDomainFingerprints)
+  ? trustDomainMetadata
+  : fail('WC-027 trust-domain public key fingerprints must be distinct')
+
 @description('Reviewed non-secret monitoring collector contract object.')
 param monitoringCollectorContract object
 
@@ -956,7 +973,7 @@ var runtimeConfiguration = {
   monitoringCollectorKey: {
     keyId: monitoringCollectorKey.properties.keyUriWithVersion
     keyVaultKeyId: monitoringCollectorKey.properties.keyUriWithVersion
-    keyFingerprint: trustDomainMetadata.monitoringCollector.keyFingerprint
+    keyFingerprint: validatedTrustDomainMetadata.monitoringCollector.keyFingerprint
     identityClientId: trustReaderIdentity.properties.clientId
     identityResourceId: trustReaderIdentity.id
     activatedAt: monitoringCollectorKeyActivatedAt
@@ -966,70 +983,70 @@ var runtimeConfiguration = {
     incident: {
       keyId: 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
       keyVaultKeyId: incidentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.incident.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.incident.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     correlationBinding: {
       keyId: correlationBindingKey.properties.keyUriWithVersion
       keyVaultKeyId: correlationBindingKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.correlationBinding.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.correlationBinding.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     guidanceBinding: {
       keyId: guidanceBindingLogicalKeyId
       keyVaultKeyId: guidanceBindingKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.guidanceBinding.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.guidanceBinding.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     change: {
       keyId: changeKey.properties.keyUriWithVersion
       keyVaultKeyId: changeKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.change.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.change.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     monitoringIntent: {
       keyId: monitoringIntentKey.properties.keyUriWithVersion
       keyVaultKeyId: monitoringIntentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.monitoringIntent.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.monitoringIntent.keyFingerprint
       identityClientId: trustReaderIdentity.properties.clientId
       identityResourceId: trustReaderIdentity.id
     }
     report: {
       keyId: reportKey.properties.keyUriWithVersion
       keyVaultKeyId: reportKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.report.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.report.keyFingerprint
       identityClientId: reportSignerIdentity.properties.clientId
       identityResourceId: reportSignerIdentity.id
     }
     guidance: {
       keyId: guidanceKey.properties.keyUriWithVersion
       keyVaultKeyId: guidanceKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.guidance.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.guidance.keyFingerprint
       identityClientId: guidanceSignerIdentity.properties.clientId
       identityResourceId: guidanceSignerIdentity.id
     }
     enrichment: {
       keyId: enrichmentKey.properties.keyUriWithVersion
       keyVaultKeyId: enrichmentKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.enrichment.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.enrichment.keyFingerprint
       identityClientId: enrichmentSignerIdentity.properties.clientId
       identityResourceId: enrichmentSignerIdentity.id
     }
     feed: {
       keyId: feedKey.properties.keyUriWithVersion
       keyVaultKeyId: feedKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.feed.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.feed.keyFingerprint
       identityClientId: feedSignerIdentity.properties.clientId
       identityResourceId: feedSignerIdentity.id
     }
     notification: {
       keyId: notificationKey.properties.keyUriWithVersion
       keyVaultKeyId: notificationKey.properties.keyUriWithVersion
-      keyFingerprint: trustDomainMetadata.notification.keyFingerprint
+      keyFingerprint: validatedTrustDomainMetadata.notification.keyFingerprint
       identityClientId: notificationSignerIdentity.properties.clientId
       identityResourceId: notificationSignerIdentity.id
     }

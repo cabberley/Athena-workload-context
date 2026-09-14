@@ -509,6 +509,12 @@ class Wc027EnrichmentFeedProductionConfiguration:
             raise ValueError(
                 "WC-027 trust-domain Key Vault key versions must be distinct"
             )
+        if len({item.key_fingerprint for item in all_key_authorities}) != len(
+            all_key_authorities
+        ):
+            raise ValueError(
+                "WC-027 trust-domain public key fingerprints must be distinct"
+            )
         producer_signing_authorities = (
             self.report_key,
             self.guidance_key,
@@ -850,6 +856,7 @@ def build_wc027_enrichment_feed_runtime(
         guidance_authority_reader=guidance_authority_reader,
         artifact_writer=artifact_writer,
         incident_key_id=configuration.incident_key.key_id,
+        incident_key_vault_key_id=configuration.incident_key.key_vault_key_id,
         incident_key_fingerprint=configuration.incident_key.key_fingerprint,
         incident_signature_verifier=lifecycle_verifier.verify_preimage,
         correlation_binding_key_id=(
@@ -919,6 +926,7 @@ def build_wc027_enrichment_feed_runtime(
         ),
         trust=NotificationV2Trust(
             lifecycle_key_id=configuration.incident_key.key_id,
+            lifecycle_key_vault_key_id=configuration.incident_key.key_vault_key_id,
             lifecycle_key_fingerprint=configuration.incident_key.key_fingerprint,
             lifecycle_signature_verifier=lifecycle_verifier.verify_preimage,
             feed_key_id=configuration.feed_key.key_id,

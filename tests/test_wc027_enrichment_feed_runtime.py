@@ -480,6 +480,10 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         configuration.binding_signing_key.identity_resource_id
         != configuration.enrichment_runtime.guidance_binding_key.identity_resource_id
     )
+    assert (
+        configuration.binding_signing_key.key_fingerprint
+        == configuration.enrichment_runtime.guidance_binding_key.key_fingerprint
+    )
 
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:
@@ -489,6 +493,28 @@ def test_publisher_configuration_rejects_reused_request_authority() -> None:
     ]["incident"]["keyId"]
 
     with pytest.raises(ValueError, match="distinct trust domain"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_publisher_configuration_rejects_reused_request_public_key_material() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["requestKey"]["keyFingerprint"] = payload[  # type: ignore[index]
+        "enrichmentRuntimeConfiguration"
+    ]["keys"]["incident"]["keyFingerprint"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="distinct trust domain"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_publisher_configuration_rejects_binding_fingerprint_mismatch() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["bindingSigningKey"]["keyFingerprint"] = "sha256:" + "d" * 64  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="does not match runtime guidance trust"):
         Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
             json.dumps(payload)
         )
@@ -566,6 +592,18 @@ def test_runtime_rejects_guidance_authority_storage_domain_reuse() -> None:
     ]["monitoring"]["containerName"]
 
     with pytest.raises(ValueError, match="storage domains must be distinct"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["keys"]["notification"]["keyFingerprint"] = payload["keys"]["feed"][  # type: ignore[index]
+        "keyFingerprint"
+    ]
+
+    with pytest.raises(ValueError, match="public key fingerprints must be distinct"):
         Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
             json.dumps(payload)
         )

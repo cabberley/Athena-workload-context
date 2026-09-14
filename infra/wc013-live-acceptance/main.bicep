@@ -701,7 +701,7 @@ var forbiddenCollectorControllerPrincipalIds = concat(
   [
     toLower(evidenceIdentity.properties.principalId)
     toLower(acceptanceJobIdentity.properties.principalId)
-    toLower(presentationWeb.outputs.identityPrincipalId)
+    toLower(presentationIdentity.outputs.principalId)
     toLower(wc016DetectorIdentity.outputs.principalId)
     toLower(wc016OrchestratorIdentity.outputs.principalId)
     toLower(wc016NotificationIdentity.outputs.principalId)
@@ -798,6 +798,20 @@ module wc016NotificationIdentity 'br/public:avm/res/managed-identity/user-assign
     isolationScope: 'Regional'
     tags: union(resourceTags, {
       identityPurpose: 'wc016-servicebus-teams-notification-only'
+    })
+  }
+}
+
+module presentationIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: 'wc013-presentation-pull-identity'
+  scope: foundationResourceGroup
+  params: {
+    name: '${namePrefix}-presentation-id'
+    location: location
+    enableTelemetry: false
+    isolationScope: 'Regional'
+    tags: union(resourceTags, {
+      identityPurpose: 'presentation-acr-pull-and-private-assets-reader'
     })
   }
 }
@@ -904,7 +918,11 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     presentationAssetContainerName: presentationAssetContainerName
     incidentAssetContainerName: incidentAssetContainerName
     incidentSigningKeyId: incidentSigningKeyId
+    incidentSigningKeyVaultKeyId: acceptanceResources.outputs.incidentSigningKeyUriWithVersion
     incidentSigningKeyFingerprint: signingKeyFingerprint
+    presentationIdentityResourceId: presentationIdentity.outputs.resourceId
+    presentationIdentityClientId: presentationIdentity.outputs.clientId
+    presentationIdentityPrincipalId: presentationIdentity.outputs.principalId
     tags: resourceTags
   }
 }
@@ -943,7 +961,7 @@ module acceptanceResources 'modules/acceptance-resources.bicep' = {
     collectorArtifactContainerName: collectorArtifactContainerName
     presentationAssetContainerName: presentationAssetContainerName
     incidentAssetContainerName: incidentAssetContainerName
-    presentationIdentityPrincipalId: presentationWeb.outputs.identityPrincipalId
+    presentationIdentityPrincipalId: presentationIdentity.outputs.principalId
     incidentOrchestratorPrincipalId: wc016OrchestratorIdentity.outputs.principalId
     notificationDispatcherPrincipalId: wc016NotificationIdentity.outputs.principalId
     wc016RuntimeEnabled: validatedWc016RuntimeEnabled
@@ -1286,13 +1304,13 @@ output presentationFqdn string = presentationWeb.outputs.fqdn
 output presentationHttpsUrl string = presentationWeb.outputs.httpsUrl
 
 @description('Presentation identity resource ID. This identity receives only AcrPull and Blob Data Reader on presentation-assets and incident-assets.')
-output presentationIdentityResourceId string = presentationWeb.outputs.identityResourceId
+output presentationIdentityResourceId string = presentationIdentity.outputs.resourceId
 
 @description('Presentation identity client ID for ACR pull and read-only presentation asset access.')
-output presentationIdentityClientId string = presentationWeb.outputs.identityClientId
+output presentationIdentityClientId string = presentationIdentity.outputs.clientId
 
 @description('Presentation identity principal ID scoped to ACR pull and read-only access to the two presentation containers.')
-output presentationIdentityPrincipalId string = presentationWeb.outputs.identityPrincipalId
+output presentationIdentityPrincipalId string = presentationIdentity.outputs.principalId
 
 @description('Existing trusted-ingestion resource application client ID; Bicep intentionally does not create Entra applications.')
 output trustedIngestionResourceApplicationClientId string = trustedIngestionResourceApplicationClientId

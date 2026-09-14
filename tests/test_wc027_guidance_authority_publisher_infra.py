@@ -49,6 +49,11 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "keyId: bindingLogicalKeyId",
         "keyVaultKeyId: requestKey.properties.keyUriWithVersion",
         "keyVaultKeyId: bindingKey.properties.keyUriWithVersion",
+        "validatedRequestKeyFingerprint",
+        "validatedBindingKeyFingerprint",
+        "runtimeTrustDomainFingerprints",
+        "public key fingerprints must be distinct",
+        "must match runtime guidance trust",
         "authorityStorageAccountResourceId",
         "activationStorageAccountResourceId",
         "runtimeAuthorityAssets.blobEndpoint",
@@ -136,6 +141,9 @@ def test_runtime_requires_current_activation_and_logical_binding_key() -> None:
     assert "tableName: guidanceActivation.name" in source
     assert "keyId: guidanceBindingLogicalKeyId" in source
     assert "storageTableDataReaderRoleDefinitionId" in source
+    assert "runtimeTrustDomainFingerprints" in source
+    assert "validatedTrustDomainMetadata" in source
+    assert "trust-domain public key fingerprints must be distinct" in source
 
 
 def test_readiness_remains_false_until_deployment_is_proven() -> None:
