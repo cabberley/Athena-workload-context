@@ -207,8 +207,9 @@ expected assignment inventory, expected-principal list, and policy principals mu
 an empty, partial, or changed assignment export fails closed. Use `--all` as shown and do not combine
 paginated API pages manually; object-form evidence with a continuation link is rejected as
 incomplete. Preserve `condition` and `conditionVersion` in both the evidence and reviewed inventory;
-removing or changing an authorization condition fails closed. Run the offline RBAC gate with that
-reviewed policy:
+removing or changing an authorization condition fails closed. Preserve each canonical
+`roleDefinitionId` in the reviewed inventory and any allowance; production mode rejects name-only
+or conflicting built-in role entries. Run the offline RBAC gate with that reviewed policy:
 
 ```powershell
 $RbacPreflightJson = & athena-context wc029-preflight rbac `

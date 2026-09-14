@@ -26,6 +26,9 @@ Container Apps network values are type checked independently: ingress `external`
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
 resources were not resolved into the reviewed `changes` collection.
+Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
+one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
+names cannot impersonate structurally nested protected settings.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
@@ -78,12 +81,14 @@ The policy is bounded JSON:
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
     },
     {
       "principalId": "00000000-0000-0000-0000-000000000002",
-      "roleDefinitionName": "Log Analytics Reader",
-      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring",
+      "roleDefinitionName": "Storage Blob Data Reader",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload/providers/Microsoft.Storage/storageAccounts/athena/blobServices/default/containers/evidence",
       "condition": "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'evidence'",
       "conditionVersion": "2.0"
     }
@@ -92,6 +97,7 @@ The policy is bounded JSON:
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
       "roleDefinitionName": "Reader",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
     }
   ],
@@ -127,8 +133,10 @@ IDs are likewise structurally checked before their built-in privilege is evaluat
 object-form evidence containing a continuation link is rejected as incomplete. Allowances that
 supply both a role name and role ID must agree and must be present in `expectedAssignments`.
 Authorization-affecting `condition` and `conditionVersion` fields must be supplied together and are
-included in exact inventory and allowance matching. Oversized integer literals and other parser
-failures are reported as malformed input with exit code `3`.
+included in exact inventory and allowance matching. Production evidence, expected assignments, and
+broad-assignment allowances require canonical `roleDefinitionId` values. Recognized built-in role
+names must agree with their official IDs; name-only or spoofed-ID entries fail closed. Oversized
+integer literals and other parser failures are reported as malformed input with exit code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

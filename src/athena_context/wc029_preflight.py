@@ -35,6 +35,9 @@ _ROLE_ID_TO_NAME = {
     "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9": ("user access administrator"),
 }
 _BROAD_ROLE_IDS = frozenset(_ROLE_ID_TO_NAME)
+_ROLE_NAME_TO_ID = {
+    role_name: role_id for role_id, role_name in _ROLE_ID_TO_NAME.items()
+}
 _GUID_PATTERN = (
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}"
@@ -290,6 +293,11 @@ def _allowance_matches(
     )
 
 
+def _has_case_insensitive(mapping: dict[str, Any], name: str) -> bool:
+    expected = name.casefold()
+    return any(key.casefold() == expected for key in mapping)
+
+
 def _require_string(
     value: object,
     *,
@@ -417,7 +425,17 @@ def _what_if_changes(
     if status != "succeeded" or (error is not None and error != {}):
         raise PreflightInputError("what-if operation did not succeed")
     properties = _get_case_insensitive(root, "properties")
-    container = _mapping(properties, field_name="properties") if properties is not None else root
+    if properties is not None:
+        if _has_case_insensitive(root, "changes") or _has_case_insensitive(
+            root,
+            "potentialChanges",
+        ):
+            raise PreflightInputError(
+                "what-if document contains mixed result envelopes"
+            )
+        container = _mapping(properties, field_name="properties")
+    else:
+        container = root
     changes = _get_case_insensitive(container, "changes")
     potential_changes = _get_case_insensitive(
         container,
@@ -499,18 +517,7 @@ def _walk_delta(
             and children is None
         ):
             raise PreflightInputError("delta item lacks inspectable after value or children")
-        values.append(
-            (
-                path,
-                after,
-                property_change_type,
-            )
-        )
-        if (
-            property_change_type not in {"delete", "remove"}
-            and isinstance(after, (dict, list))
-        ):
-            values.extend(_flatten_after(after, root=path))
+        child_items: list[dict[str, Any]] = []
         if children is not None:
             child_items = [
                 _mapping(child, field_name="delta child")
@@ -520,6 +527,24 @@ def _walk_delta(
                     maximum_items=MAX_CHANGES,
                 )
             ]
+            if not child_items:
+                raise PreflightInputError(
+                    "delta item contains no inspectable children"
+                )
+        if property_change_type in {"delete", "remove"} or after is not None:
+            values.append(
+                (
+                    path,
+                    after,
+                    property_change_type,
+                )
+            )
+        if (
+            property_change_type not in {"delete", "remove"}
+            and isinstance(after, (dict, list))
+        ):
+            values.extend(_flatten_after(after, root=path))
+        if child_items:
             stack.extend((child, path) for child in reversed(child_items))
     return values
 
@@ -534,7 +559,13 @@ def _flatten_after(
     while stack:
         item, path = stack.pop()
         if isinstance(item, dict):
-            stack.extend((child, f"{path}.{key}") for key, child in reversed(list(item.items())))
+            stack.extend(
+                (
+                    child,
+                    f"{path}.{key.replace('~', '~0').replace('.', '~1')}",
+                )
+                for key, child in reversed(list(item.items()))
+            )
         elif isinstance(item, list):
             stack.extend(
                 (child, f"{path}[{index}]") for index, child in reversed(list(enumerate(item)))
@@ -542,12 +573,6 @@ def _flatten_after(
         else:
             values.append((path, item, "set"))
     return values
-
-
-def _enabled(value: object) -> bool:
-    return value is True or (
-        isinstance(value, str) and value.strip().casefold() in {"allow", "enabled", "true"}
-    )
 
 
 def _unsafe_property_violations(
@@ -608,6 +633,32 @@ def _unsafe_property_violations(
                     detail=(
                         "Key Vault create must explicitly disable public "
                         "network access and set network default action Deny"
+                    ),
+                )
+            )
+    if resource_type == _CONTAINER_ENVIRONMENT_TYPE and change_type == "create":
+        values_by_path = {
+            _canonical_property_path(path): value
+            for path, value, _ in candidates
+        }
+        public_network = values_by_path.get(
+            "properties.publicnetworkaccess"
+        )
+        internal = values_by_path.get(
+            "properties.vnetconfiguration.internal"
+        )
+        if (
+            not isinstance(public_network, str)
+            or _normalized(public_network) != "disabled"
+            or internal is not True
+        ):
+            violations.append(
+                PreflightViolation(
+                    code="public-container-apps-exposure",
+                    subject=resource_id,
+                    detail=(
+                        "managed environment create must explicitly disable "
+                        "public network access and set internal to true"
                     ),
                 )
             )
@@ -765,27 +816,35 @@ def _unsafe_property_violations(
         if (
             resource_type == _STORAGE_ACCOUNT_TYPE
             and path == "properties.allowsharedkeyaccess"
-            and (_enabled(after) or removed)
         ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-shared-key-enabled",
-                    subject=resource_id,
-                    detail=f"shared-key access enabled at {path}",
+            if not removed and type(after) is not bool:
+                raise PreflightInputError(
+                    "allowSharedKeyAccess must be boolean"
                 )
-            )
+            if removed or after is True:
+                violations.append(
+                    PreflightViolation(
+                        code="storage-shared-key-enabled",
+                        subject=resource_id,
+                        detail=f"shared-key access enabled at {path}",
+                    )
+                )
         if (
             resource_type == _STORAGE_ACCOUNT_TYPE
             and path == "properties.allowblobpublicaccess"
-            and (_enabled(after) or removed)
         ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-public-blob-access",
-                    subject=resource_id,
-                    detail=f"public blob access enabled at {path}",
+            if not removed and type(after) is not bool:
+                raise PreflightInputError(
+                    "allowBlobPublicAccess must be boolean"
                 )
-            )
+            if removed or after is True:
+                violations.append(
+                    PreflightViolation(
+                        code="storage-public-blob-access",
+                        subject=resource_id,
+                        detail=f"public blob access enabled at {path}",
+                    )
+                )
         if (
             resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}
             and path
@@ -793,36 +852,65 @@ def _unsafe_property_violations(
                 "properties.publicnetworkaccess",
                 "properties.networkacls.defaultaction",
             }
-            and (
-                removed
-                or not isinstance(after, str)
-                or _normalized(after)
-                != (
+        ):
+            if removed:
+                unsafe_network_value = True
+            else:
+                value = _normalized(
+                    _require_string(
+                        after,
+                        field_name=path,
+                        maximum_length=64,
+                    )
+                )
+                allowed_values = (
+                    {"disabled", "enabled", "securedbyperimeter"}
+                    if path == "properties.publicnetworkaccess"
+                    else {"allow", "deny"}
+                )
+                if value not in allowed_values:
+                    raise PreflightInputError(
+                        f"{path} has an unsupported value"
+                    )
+                unsafe_network_value = value != (
                     "disabled"
                     if path == "properties.publicnetworkaccess"
                     else "deny"
                 )
-            )
-        ):
-            violations.append(
-                PreflightViolation(
-                    code="public-data-plane-access",
-                    subject=resource_id,
-                    detail=f"unsafe public data-plane setting at {path}",
+            if unsafe_network_value:
+                violations.append(
+                    PreflightViolation(
+                        code="public-data-plane-access",
+                        subject=resource_id,
+                        detail=f"unsafe public data-plane setting at {path}",
+                    )
                 )
-            )
         if (
             resource_type == _STORAGE_CONTAINER_TYPE
             and path == "properties.publicaccess"
-            and (_normalized(str(after or "")) in {"blob", "container"} or removed)
         ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-container-public-access",
-                    subject=resource_id,
-                    detail=f"public container access enabled at {path}",
+            if removed:
+                public_access = ""
+            else:
+                public_access = _normalized(
+                    _require_string(
+                        after,
+                        field_name="publicAccess",
+                        maximum_length=64,
+                    )
                 )
-            )
+                if public_access not in {"none", "blob", "container"}:
+                    raise PreflightInputError(
+                        "publicAccess has an unsupported value"
+                    )
+            if removed or public_access != "none":
+                violations.append(
+                    PreflightViolation(
+                        code="storage-container-public-access",
+                        subject=resource_id,
+                        detail=f"public container access enabled at {path}",
+                    )
+                )
     return tuple(violations)
 
 
@@ -954,7 +1042,18 @@ def _parse_rbac_assignment(
         )
     )
     mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
-    if role_name and mapped_role_id is not None and role_name != mapped_role_id:
+    expected_role_id = _ROLE_NAME_TO_ID.get(role_name)
+    if (
+        role_name
+        and role_id
+        and (
+            (mapped_role_id is not None and role_name != mapped_role_id)
+            or (
+                expected_role_id is not None
+                and role_id != expected_role_id
+            )
+        )
+    ):
         raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
     canonical_role = role_name or mapped_role_id or role_id
     if not canonical_role:
@@ -1186,6 +1285,20 @@ def evaluate_role_assignments(
         raise PreflightInputError(
             "RBAC policy requires expectedAssignments"
         )
+    if require_separation_rules and any(
+        not assignment.role_definition_id
+        for assignment in policy.expected_assignments
+    ):
+        raise PreflightInputError(
+            "expectedAssignments require roleDefinitionId"
+        )
+    if require_separation_rules and any(
+        not allowance.role_definition_id
+        for allowance in policy.allowed_broad_assignments
+    ):
+        raise PreflightInputError(
+            "allowedBroadAssignments require roleDefinitionId"
+        )
     rule_principal_ids = frozenset(
         rule.principal_id for rule in policy.separation_rules
     )
@@ -1258,6 +1371,12 @@ def evaluate_role_assignments(
         assignments.append(assignment)
         unique_assignments.add(assignment)
         assignment_principal_ids.add(assignment.principal_id)
+    if require_separation_rules and any(
+        not assignment.role_definition_id for assignment in assignments
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence requires roleDefinitionId"
+        )
     if (
         require_separation_rules
         and not assignment_principal_ids.issubset(policy.expected_principal_ids)
