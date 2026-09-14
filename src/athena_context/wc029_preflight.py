@@ -686,28 +686,82 @@ def _unsafe_property_violations(
                         ),
                     )
                 )
-    for raw_path, after, property_change_type in candidates:
-        path = _canonical_property_path(raw_path)
-        removed = property_change_type in {"delete", "remove"}
-        if (resource_type in {_CONTAINER_APP_TYPE, _CONTAINER_ENVIRONMENT_TYPE}) and (
-            (
-                "ingress.external" in path
-                or "publicnetworkaccess" in path
-                or "vnetconfiguration.internal" in path
+    container_network_targets: tuple[str, ...] = ()
+    if resource_type == _CONTAINER_APP_TYPE:
+        container_network_targets = (
+            "properties.configuration.ingress.external",
+            "properties.publicnetworkaccess",
+        )
+    elif resource_type == _CONTAINER_ENVIRONMENT_TYPE:
+        container_network_targets = (
+            "properties.publicnetworkaccess",
+            "properties.vnetconfiguration.internal",
+        )
+    for target in container_network_targets:
+        related_delta = [
+            (raw_path, property_change_type)
+            for raw_path, _, property_change_type in delta_candidates
+            if (
+                (path := _canonical_property_path(raw_path)) == target
+                or target.startswith(path + ".")
             )
-            and (
-                _enabled(after)
-                or removed
-                or ("vnetconfiguration.internal" in path and after is False)
-            )
-        ):
+        ]
+        exact_values = [
+            (after, property_change_type)
+            for raw_path, after, property_change_type in candidates
+            if _canonical_property_path(raw_path) == target
+        ]
+        parent_removed = any(
+            _canonical_property_path(raw_path) != target
+            and property_change_type in {"delete", "remove"}
+            for raw_path, property_change_type in related_delta
+        )
+        if parent_removed or (related_delta and not exact_values):
             violations.append(
                 PreflightViolation(
                     code="public-container-apps-exposure",
                     subject=resource_id,
-                    detail=f"unsafe public Container Apps setting at {path}",
+                    detail=f"network change lacks explicit safe value at {target}",
                 )
             )
+    for raw_path, after, property_change_type in candidates:
+        path = _canonical_property_path(raw_path)
+        removed = property_change_type in {"delete", "remove"}
+        if path in container_network_targets:
+            unsafe_container_network = removed
+            if not removed and path == "properties.configuration.ingress.external":
+                if type(after) is not bool:
+                    raise PreflightInputError(
+                        "Container Apps ingress.external must be boolean"
+                    )
+                unsafe_container_network = after
+            elif not removed and path == "properties.vnetconfiguration.internal":
+                if type(after) is not bool:
+                    raise PreflightInputError(
+                        "Container Apps vnetConfiguration.internal must be boolean"
+                    )
+                unsafe_container_network = not after
+            elif not removed and path == "properties.publicnetworkaccess":
+                public_network_access = _normalized(
+                    _require_string(
+                        after,
+                        field_name="publicNetworkAccess",
+                        maximum_length=64,
+                    )
+                )
+                if public_network_access not in {"disabled", "enabled"}:
+                    raise PreflightInputError(
+                        "Container Apps publicNetworkAccess is unsupported"
+                    )
+                unsafe_container_network = public_network_access != "disabled"
+            if unsafe_container_network:
+                violations.append(
+                    PreflightViolation(
+                        code="public-container-apps-exposure",
+                        subject=resource_id,
+                        detail=f"unsafe public Container Apps setting at {path}",
+                    )
+                )
         if (
             resource_type == _STORAGE_ACCOUNT_TYPE
             and path == "properties.allowsharedkeyaccess"

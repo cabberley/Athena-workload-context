@@ -21,6 +21,11 @@ _CONTAINER_APP_ID = (
     "rg-athena-wc013-live/providers/Microsoft.App/containerApps/"
     "athena-presentation"
 )
+_CONTAINER_ENVIRONMENT_ID = (
+    f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/"
+    "rg-athena-wc013-live/providers/Microsoft.App/managedEnvironments/"
+    "athena-runtime"
+)
 _STORAGE_ID = (
     f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/"
     "rg-athena-wc013-live/providers/Microsoft.Storage/storageAccounts/"
@@ -230,6 +235,157 @@ def test_what_if_never_allows_public_container_apps_exposure() -> None:
     )
 
     assert {item.code for item in violations} == {"public-container-apps-exposure"}
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "path", "safe_value", "unsafe_value"),
+    [
+        (
+            _CONTAINER_APP_ID,
+            "properties.configuration.ingress.external",
+            False,
+            True,
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "properties.publicNetworkAccess",
+            "Disabled",
+            "Enabled",
+        ),
+        (
+            _CONTAINER_ENVIRONMENT_ID,
+            "properties.vnetConfiguration.internal",
+            True,
+            False,
+        ),
+        (
+            _CONTAINER_ENVIRONMENT_ID,
+            "properties.publicNetworkAccess",
+            "Disabled",
+            "Enabled",
+        ),
+    ],
+)
+def test_container_apps_network_properties_use_strict_safe_values(
+    resource_id: str,
+    path: str,
+    safe_value: object,
+    unsafe_value: object,
+) -> None:
+    safe = _what_if(
+        _change(
+            resource_id,
+            "Modify",
+            path=path,
+            after=safe_value,
+        )
+    )
+    unsafe = _what_if(
+        _change(
+            resource_id,
+            "Modify",
+            path=path,
+            after=unsafe_value,
+        )
+    )
+
+    assert (
+        evaluate_what_if(
+            safe,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+        == ()
+    )
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            unsafe,
+            allowed_change_ids=frozenset({resource_id}),
+        )
+    } == {"public-container-apps-exposure"}
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "path", "value"),
+    [
+        (
+            _CONTAINER_APP_ID,
+            "properties.configuration.ingress.external",
+            "false",
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "properties.publicNetworkAccess",
+            "Bogus",
+        ),
+        (
+            _CONTAINER_ENVIRONMENT_ID,
+            "properties.vnetConfiguration.internal",
+            "true",
+        ),
+    ],
+)
+def test_container_apps_network_properties_reject_malformed_values(
+    resource_id: str,
+    path: str,
+    value: object,
+) -> None:
+    with pytest.raises(PreflightInputError, match="Container Apps"):
+        evaluate_what_if(
+            _what_if(
+                _change(
+                    resource_id,
+                    "Modify",
+                    path=path,
+                    after=value,
+                )
+            ),
+            allowed_change_ids=frozenset({resource_id}),
+        )
+
+
+def test_container_apps_network_parent_delta_requires_safe_leaf() -> None:
+    safe = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties.configuration.ingress",
+                    "propertyChangeType": "Modify",
+                    "after": {"external": False},
+                }
+            ],
+        }
+    )
+    incomplete = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties.configuration.ingress",
+                    "propertyChangeType": "Modify",
+                    "after": {"targetPort": 443},
+                }
+            ],
+        }
+    )
+
+    assert (
+        evaluate_what_if(
+            safe,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+        == ()
+    )
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            incomplete,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+    } == {"public-container-apps-exposure"}
 
 
 def test_what_if_inspects_full_resource_payloads() -> None:

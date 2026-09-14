@@ -19,6 +19,9 @@ their own payloads. Blob containers must explicitly use `publicAccess: None`.
 Storage or Key Vault network ACL changes must include a complete after-state proving
 `publicNetworkAccess: Disabled` and `networkAcls.defaultAction: Deny`; deleting the ACL parent or
 providing only a partial child delta fails closed.
+Container Apps network values are type checked independently: ingress `external` must be boolean
+`false`, managed-environment `vnetConfiguration.internal` must be boolean `true`, and
+`publicNetworkAccess` must be `Disabled`. Unknown values and partial parent deltas fail closed.
 
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
