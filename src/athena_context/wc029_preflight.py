@@ -78,6 +78,14 @@ class BroadAssignmentAllowance:
 
 
 @dataclass(frozen=True, slots=True)
+class RbacAssignment:
+    principal_id: str
+    role_name: str
+    role_definition_id: str
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
 class SeparationRule:
     principal_id: str
     forbidden_role_names: frozenset[str]
@@ -89,6 +97,7 @@ class RbacPolicy:
     allowed_broad_assignments: frozenset[BroadAssignmentAllowance]
     separation_rules: tuple[SeparationRule, ...]
     expected_principal_ids: frozenset[str]
+    expected_assignments: frozenset[RbacAssignment]
 
 
 type PreflightKind = Literal["rbac", "what-if"]
@@ -722,12 +731,74 @@ def evaluate_what_if(
     return tuple(violations)
 
 
+def _parse_rbac_assignment(
+    value: object,
+    *,
+    field_name: str,
+) -> RbacAssignment:
+    assignment = _mapping(value, field_name=field_name)
+    principal_id = _normalized(
+        _require_string(
+            _get_case_insensitive(assignment, "principalId"),
+            field_name="principalId",
+        )
+    )
+    raw_role_name = _get_case_insensitive(
+        assignment,
+        "roleDefinitionName",
+    )
+    raw_role_id = _get_case_insensitive(
+        assignment,
+        "roleDefinitionId",
+    )
+    role_name = (
+        ""
+        if raw_role_name is None
+        else _canonical_role_key(
+            _require_string(
+                raw_role_name,
+                field_name="roleDefinitionName",
+            )
+        )
+    )
+    role_id = (
+        ""
+        if raw_role_id is None
+        else _canonical_role_id(
+            _require_string(
+                raw_role_id,
+                field_name="roleDefinitionId",
+            )
+        )
+    )
+    mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
+    if role_name and mapped_role_id is not None and role_name != mapped_role_id:
+        raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
+    canonical_role = role_name or mapped_role_id or role_id
+    if not canonical_role:
+        raise PreflightInputError(
+            "role assignment requires roleDefinitionName or roleDefinitionId"
+        )
+    return RbacAssignment(
+        principal_id=principal_id,
+        role_name=canonical_role,
+        role_definition_id=role_id,
+        scope=_canonical_scope(
+            _require_string(
+                _get_case_insensitive(assignment, "scope"),
+                field_name="scope",
+            )
+        ),
+    )
+
+
 def _parse_policy(document: object | None) -> RbacPolicy:
     if document is None:
         return RbacPolicy(
             allowed_broad_assignments=frozenset(),
             separation_rules=(),
             expected_principal_ids=frozenset(),
+            expected_assignments=frozenset(),
         )
     _validate_json_shape(document)
     root = _mapping(document, field_name="RBAC policy")
@@ -742,55 +813,20 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             field_name="allowedBroadAssignments",
             maximum_items=MAX_POLICY_ITEMS,
         ):
-            item = _mapping(raw_item, field_name="broad assignment allowance")
-            role_value = _get_case_insensitive(
-                item,
-                "roleDefinitionId",
+            parsed_allowance = _parse_rbac_assignment(
+                raw_item,
+                field_name="broad assignment allowance",
             )
-            role_name_value = _get_case_insensitive(
-                item,
-                "roleDefinitionName",
+            allowance = BroadAssignmentAllowance(
+                principal_id=parsed_allowance.principal_id,
+                role_name=parsed_allowance.role_name,
+                scope=parsed_allowance.scope,
             )
-            if role_value is None and role_name_value is None:
+            if allowance in allowances:
                 raise PreflightInputError(
-                    "broad assignment allowance requires "
-                    "roleDefinitionName or roleDefinitionId"
+                    "allowedBroadAssignments contains a duplicate assignment"
                 )
-            if role_value is not None:
-                allowance_role_id = _canonical_role_id(
-                    _require_string(
-                        role_value,
-                        field_name="roleDefinitionId",
-                    )
-                )
-                allowance_role = _ROLE_ID_TO_NAME.get(
-                    allowance_role_id,
-                    allowance_role_id,
-                )
-            else:
-                allowance_role = _canonical_role_key(
-                    _require_string(
-                        role_name_value,
-                        field_name="roleDefinitionName",
-                    )
-                )
-            allowances.add(
-                BroadAssignmentAllowance(
-                    principal_id=_normalized(
-                        _require_string(
-                            _get_case_insensitive(item, "principalId"),
-                            field_name="principalId",
-                        )
-                    ),
-                    role_name=allowance_role,
-                    scope=_canonical_scope(
-                        _require_string(
-                            _get_case_insensitive(item, "scope"),
-                            field_name="scope",
-                        )
-                    ),
-                )
-            )
+            allowances.add(allowance)
     raw_rules = _get_case_insensitive(root, "separationRules")
     rules: list[SeparationRule] = []
     if raw_rules is not None:
@@ -866,10 +902,31 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                     "expectedPrincipalIds contains a duplicate principalId"
                 )
             expected_principal_ids.add(principal_id)
+    raw_expected_assignments = _get_case_insensitive(
+        root,
+        "expectedAssignments",
+    )
+    expected_assignments: set[RbacAssignment] = set()
+    if raw_expected_assignments is not None:
+        for raw_assignment in _sequence(
+            raw_expected_assignments,
+            field_name="expectedAssignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            expected_assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="expected assignment",
+            )
+            if expected_assignment in expected_assignments:
+                raise PreflightInputError(
+                    "expectedAssignments contains a duplicate assignment"
+                )
+            expected_assignments.add(expected_assignment)
     return RbacPolicy(
         allowed_broad_assignments=frozenset(allowances),
         separation_rules=tuple(rules),
         expected_principal_ids=frozenset(expected_principal_ids),
+        expected_assignments=frozenset(expected_assignments),
     )
 
 
@@ -912,6 +969,10 @@ def evaluate_role_assignments(
         raise PreflightInputError(
             "RBAC policy requires expectedPrincipalIds"
         )
+    if require_separation_rules and not policy.expected_assignments:
+        raise PreflightInputError(
+            "RBAC policy requires expectedAssignments"
+        )
     rule_principal_ids = frozenset(
         rule.principal_id for rule in policy.separation_rules
     )
@@ -932,65 +993,76 @@ def evaluate_role_assignments(
         raise PreflightInputError(
             "RBAC policy principals must be listed in expectedPrincipalIds"
         )
+    expected_assignment_principal_ids = frozenset(
+        assignment.principal_id for assignment in policy.expected_assignments
+    )
+    if (
+        require_separation_rules
+        and expected_assignment_principal_ids != policy.expected_principal_ids
+    ):
+        raise PreflightInputError(
+            "expectedAssignments principals must exactly match expectedPrincipalIds"
+        )
+    expected_allowances = frozenset(
+        BroadAssignmentAllowance(
+            principal_id=assignment.principal_id,
+            role_name=assignment.role_name,
+            scope=assignment.scope,
+        )
+        for assignment in policy.expected_assignments
+    )
+    if (
+        require_separation_rules
+        and not policy.allowed_broad_assignments.issubset(expected_allowances)
+    ):
+        raise PreflightInputError(
+            "allowedBroadAssignments must be listed in expectedAssignments"
+        )
     raw_assignments = _role_assignments(document)
     if require_separation_rules and not raw_assignments:
         raise PreflightInputError("role-assignment evidence must not be empty")
-    violations: list[PreflightViolation] = []
+    assignments: list[RbacAssignment] = []
+    unique_assignments: set[RbacAssignment] = set()
     assignment_principal_ids: set[str] = set()
     for raw_assignment in raw_assignments:
-        assignment = _mapping(
+        assignment = _parse_rbac_assignment(
             raw_assignment,
             field_name="role assignment",
         )
-        principal_id = _normalized(
-            _require_string(
-                _get_case_insensitive(assignment, "principalId"),
-                field_name="principalId",
-            )
-        )
-        assignment_principal_ids.add(principal_id)
-        raw_role_name = _get_case_insensitive(
-            assignment,
-            "roleDefinitionName",
-        )
-        raw_role_id = _get_case_insensitive(
-            assignment,
-            "roleDefinitionId",
-        )
-        role_name = (
-            ""
-            if raw_role_name is None
-            else _canonical_role_key(
-                _require_string(
-                    raw_role_name,
-                    field_name="roleDefinitionName",
-                )
-            )
-        )
-        role_id = (
-            ""
-            if raw_role_id is None
-            else _canonical_role_id(
-                _require_string(
-                    raw_role_id,
-                    field_name="roleDefinitionId",
-                )
-            )
-        )
-        mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
-        if role_name and mapped_role_id is not None and role_name != mapped_role_id:
-            raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
-        canonical_role = role_name or mapped_role_id or role_id
-        if not canonical_role:
+        if assignment in unique_assignments:
             raise PreflightInputError(
-                "role assignment requires roleDefinitionName or roleDefinitionId"
+                "role-assignment evidence contains a duplicate assignment"
             )
-        scope = _canonical_scope(
-            _require_string(
-                _get_case_insensitive(assignment, "scope"),
-                field_name="scope",
-            )
+        assignments.append(assignment)
+        unique_assignments.add(assignment)
+        assignment_principal_ids.add(assignment.principal_id)
+    if (
+        require_separation_rules
+        and not assignment_principal_ids.issubset(policy.expected_principal_ids)
+    ):
+        raise PreflightInputError(
+            "role assignment principal is not covered by expectedPrincipalIds"
         )
+    if (
+        require_separation_rules
+        and assignment_principal_ids != policy.expected_principal_ids
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence does not cover every expectedPrincipalId"
+        )
+    if (
+        require_separation_rules
+        and unique_assignments != policy.expected_assignments
+    ):
+        raise PreflightInputError(
+            "role-assignment evidence does not exactly match expectedAssignments"
+        )
+    violations: list[PreflightViolation] = []
+    for assignment in assignments:
+        principal_id = assignment.principal_id
+        canonical_role = assignment.role_name
+        role_id = assignment.role_definition_id
+        scope = assignment.scope
         broad_scope = (
             scope == "/"
             or _SUBSCRIPTION_SCOPE.fullmatch(scope) is not None
@@ -1033,20 +1105,6 @@ def evaluate_role_assignments(
                         detail=(f"{canonical_role} is forbidden at scope {scope}"),
                     )
                 )
-    if (
-        require_separation_rules
-        and not assignment_principal_ids.issubset(policy.expected_principal_ids)
-    ):
-        raise PreflightInputError(
-            "role assignment principal is not covered by expectedPrincipalIds"
-        )
-    if (
-        require_separation_rules
-        and assignment_principal_ids != policy.expected_principal_ids
-    ):
-        raise PreflightInputError(
-            "role-assignment evidence does not cover every expectedPrincipalId"
-        )
     return tuple(violations)
 
 

@@ -50,14 +50,14 @@ athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json
 ```
 
-The production wrapper requires `--policy`, a non-empty `expectedPrincipalIds` array, and one
-non-vacuous `separationRules` entry for every expected principal. Every rule must name at least one
-forbidden role and one forbidden scope prefix. The saved role-assignment evidence must be non-empty
-and must cover exactly the expected principals; policy entries or assignments for an unexpected
-principal fail closed. This prevents an incomplete export or an unrelated syntactically valid rule
-from producing a safe result. The legacy module entry point keeps its historical optional-policy
-behavior for compatibility and must not be used as the guarded deployment gate without a reviewed
-policy.
+The production wrapper requires `--policy`, a non-empty `expectedPrincipalIds` array, an exact
+reviewed `expectedAssignments` inventory, and one non-vacuous `separationRules` entry for every
+expected principal. Every rule must name at least one forbidden role and one forbidden scope prefix.
+The saved role-assignment evidence must be non-empty and must match the normalized expected
+assignment inventory exactly; policy entries or assignments for an unexpected principal fail
+closed. This prevents a partial export or an unrelated syntactically valid rule from producing a
+safe result. The legacy module entry point keeps its historical optional-policy behavior for
+compatibility and must not be used as the guarded deployment gate without a reviewed policy.
 
 The policy is bounded JSON:
 
@@ -67,6 +67,18 @@ The policy is bounded JSON:
     "00000000-0000-0000-0000-000000000001",
     "00000000-0000-0000-0000-000000000002"
   ],
+  "expectedAssignments": [
+    {
+      "principalId": "00000000-0000-0000-0000-000000000001",
+      "roleDefinitionName": "Reader",
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-workload"
+    },
+    {
+      "principalId": "00000000-0000-0000-0000-000000000002",
+      "roleDefinitionName": "Log Analytics Reader",
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring"
+    }
+  ],
   "allowedBroadAssignments": [
     {
       "principalId": "00000000-0000-0000-0000-000000000001",
@@ -75,6 +87,13 @@ The policy is bounded JSON:
     }
   ],
   "separationRules": [
+    {
+      "principalId": "00000000-0000-0000-0000-000000000001",
+      "forbiddenRoleNames": ["Owner", "Contributor"],
+      "forbiddenScopePrefixes": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000"
+      ]
+    },
     {
       "principalId": "00000000-0000-0000-0000-000000000002",
       "forbiddenRoleNames": ["Reader", "Log Analytics Reader"],
@@ -96,8 +115,10 @@ JSON object keys must be unique and cannot collide under case folding. Scope val
 without trailing slashes and structurally validated before allowance, broad-scope, and separation
 evaluation, so alternate or noncanonical ARM scope spellings cannot bypass the gate. Role definition
 IDs are likewise structurally checked before their built-in privilege is evaluated. Paginated
-object-form evidence containing a continuation link is rejected as incomplete. Oversized integer
-literals and other parser failures are reported as malformed input with exit code `3`.
+object-form evidence containing a continuation link is rejected as incomplete. Allowances that
+supply both a role name and role ID must agree and must be present in `expectedAssignments`.
+Oversized integer literals and other parser failures are reported as malformed input with exit
+code `3`.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Azure CLI output, exact repeated `--allow-change` values, reviewed policy, and machine-readable

@@ -82,9 +82,20 @@ def _assignment(
     return value
 
 
-def _production_policy(*principal_ids: str) -> dict[str, object]:
+def _production_policy(
+    *principal_ids: str,
+    expected_assignments: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
     return {
         "expectedPrincipalIds": list(principal_ids),
+        "expectedAssignments": (
+            expected_assignments
+            if expected_assignments is not None
+            else [
+                _assignment(principal_id=principal_id)
+                for principal_id in principal_ids
+            ]
+        ),
         "separationRules": [
             {
                 "principalId": principal_id,
@@ -1118,25 +1129,29 @@ def test_public_cli_rejects_empty_rbac_separation_policy(tmp_path) -> None:
 
 def test_public_cli_accepts_complete_expected_principal_coverage(tmp_path) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments = [
+        _assignment(
+            principal_id=principal_id,
+            role_name="AcrPull",
+            scope=(
+                f"{_RG_SCOPE}/providers/"
+                "Microsoft.ContainerRegistry/registries/synthetic"
+            ),
+        )
+    ]
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
-        json.dumps(
-            [
-                _assignment(
-                    principal_id=principal_id,
-                    role_name="AcrPull",
-                    scope=(
-                        f"{_RG_SCOPE}/providers/"
-                        "Microsoft.ContainerRegistry/registries/synthetic"
-                    ),
-                )
-            ]
-        ),
+        json.dumps(assignments),
         encoding="utf-8",
     )
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(
-        json.dumps(_production_policy(principal_id)),
+        json.dumps(
+            _production_policy(
+                principal_id,
+                expected_assignments=assignments,
+            )
+        ),
         encoding="utf-8",
     )
     stdout = StringIO()
@@ -1201,20 +1216,21 @@ def test_public_cli_rejects_paginated_assignment_evidence(
     continuation_key: str,
 ) -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments = [
+        _assignment(
+            principal_id=principal_id,
+            role_name="AcrPull",
+            scope=(
+                f"{_RG_SCOPE}/providers/"
+                "Microsoft.ContainerRegistry/registries/synthetic"
+            ),
+        )
+    ]
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(
         json.dumps(
             {
-                "value": [
-                    _assignment(
-                        principal_id=principal_id,
-                        role_name="AcrPull",
-                        scope=(
-                            f"{_RG_SCOPE}/providers/"
-                            "Microsoft.ContainerRegistry/registries/synthetic"
-                        ),
-                    )
-                ],
+                "value": assignments,
                 continuation_key: "https://management.azure.com/continuation",
             }
         ),
@@ -1222,7 +1238,12 @@ def test_public_cli_rejects_paginated_assignment_evidence(
     )
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(
-        json.dumps(_production_policy(principal_id)),
+        json.dumps(
+            _production_policy(
+                principal_id,
+                expected_assignments=assignments,
+            )
+        ),
         encoding="utf-8",
     )
     stdout = StringIO()
@@ -1273,6 +1294,24 @@ def test_public_cli_rejects_paginated_assignment_evidence(
         ),
         (
             [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
+            {
+                "expectedPrincipalIds": [
+                    "11111111-1111-1111-1111-111111111111",
+                ],
+                "separationRules": [
+                    {
+                        "principalId": "11111111-1111-1111-1111-111111111111",
+                        "forbiddenRoleNames": ["Owner"],
+                        "forbiddenScopePrefixes": [
+                            f"/subscriptions/{_SUBSCRIPTION_ID}",
+                        ],
+                    }
+                ],
+            },
+            "RBAC policy requires expectedAssignments",
+        ),
+        (
+            [_assignment(principal_id="11111111-1111-1111-1111-111111111111")],
             _production_policy("22222222-2222-2222-2222-222222222222"),
             "role assignment principal is not covered by expectedPrincipalIds",
         ),
@@ -1291,6 +1330,11 @@ def test_public_cli_rejects_paginated_assignment_evidence(
             {
                 "expectedPrincipalIds": [
                     "11111111-1111-1111-1111-111111111111",
+                ],
+                "expectedAssignments": [
+                    _assignment(
+                        principal_id="11111111-1111-1111-1111-111111111111",
+                    )
                 ],
                 "separationRules": [
                     {
@@ -1348,6 +1392,122 @@ def test_public_cli_rejects_incomplete_or_unmatched_principal_coverage(
     assert exit_code == 3
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == f"WC-029 preflight rbac failed: {message}\n"
+
+
+def test_public_cli_rejects_truncated_assignment_inventory(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    safe_assignment = _assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=(
+            f"{_RG_SCOPE}/providers/"
+            "Microsoft.ContainerRegistry/registries/synthetic"
+        ),
+    )
+    omitted_owner = _assignment(
+        principal_id=principal_id,
+        role_name="Owner",
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([safe_assignment]),
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(
+            _production_policy(
+                principal_id,
+                expected_assignments=[safe_assignment, omitted_owner],
+            )
+        ),
+        encoding="utf-8",
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+            "--format",
+            "json",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert json.loads(stderr.getvalue()) == {
+        "error": (
+            "role-assignment evidence does not exactly match "
+            "expectedAssignments"
+        ),
+        "kind": "rbac",
+        "safe": False,
+    }
+
+
+def test_public_cli_rejects_conflicting_allowance_role_name_and_id(
+    tmp_path,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    owner_role_id = (
+        f"/subscriptions/{_SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    )
+    owner_assignment = _assignment(
+        principal_id=principal_id,
+        role_name="Owner",
+        role_id=owner_role_id,
+        scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+    )
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(
+        json.dumps([owner_assignment]),
+        encoding="utf-8",
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[owner_assignment],
+    )
+    policy["allowedBroadAssignments"] = [
+        _assignment(
+            principal_id=principal_id,
+            role_name="Reader",
+            role_id=owner_role_id,
+            scope=f"/subscriptions/{_SUBSCRIPTION_ID}",
+        )
+    ]
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = cli_main(
+        [
+            "wc029-preflight",
+            "rbac",
+            str(assignments_path),
+            "--policy",
+            str(policy_path),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "WC-029 preflight rbac failed: "
+        "roleDefinitionName and roleDefinitionId conflict\n"
+    )
 
 
 def test_public_cli_rejects_vacuous_rbac_separation_rule(tmp_path) -> None:
