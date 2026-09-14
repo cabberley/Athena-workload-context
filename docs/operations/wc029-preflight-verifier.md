@@ -18,7 +18,8 @@ properties is treated as unsafe; child resources such as containers and keys are
 their own payloads. Blob containers must explicitly use `publicAccess: None`.
 Storage or Key Vault network ACL changes must include a complete after-state proving
 `publicNetworkAccess: Disabled` and `networkAcls.defaultAction: Deny`; deleting the ACL parent or
-any higher protected-property ancestor, or providing only a partial child delta, fails closed.
+changing any higher protected-property ancestor without every protected descendant's explicit safe
+after-value, or providing only a partial child delta, fails closed.
 Container Apps network values are type checked independently: ingress `external` must be boolean
 `false`, managed-environment `vnetConfiguration.internal` must be boolean `true`, and
 `publicNetworkAccess` must be `Disabled`. Unknown values and partial parent deltas fail closed.

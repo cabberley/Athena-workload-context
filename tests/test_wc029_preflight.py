@@ -1037,6 +1037,65 @@ def test_what_if_rejects_protected_properties_ancestor_removal(
     } == expected_codes
 
 
+def test_storage_ancestor_modify_requires_complete_protected_after_state() -> None:
+    incomplete = _what_if(
+        {
+            "resourceId": _STORAGE_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties",
+                    "propertyChangeType": "Modify",
+                    "before": {
+                        "allowSharedKeyAccess": False,
+                        "allowBlobPublicAccess": False,
+                    },
+                    "after": {
+                        "publicNetworkAccess": "Disabled",
+                        "networkAcls": {"defaultAction": "Deny"},
+                    },
+                }
+            ],
+        }
+    )
+    complete = _what_if(
+        {
+            "resourceId": _STORAGE_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "properties",
+                    "propertyChangeType": "Modify",
+                    "after": {
+                        "allowSharedKeyAccess": False,
+                        "allowBlobPublicAccess": False,
+                        "publicNetworkAccess": "Disabled",
+                        "networkAcls": {"defaultAction": "Deny"},
+                    },
+                }
+            ],
+        }
+    )
+
+    assert {
+        item.code
+        for item in evaluate_what_if(
+            incomplete,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+    } == {
+        "storage-public-blob-access",
+        "storage-shared-key-enabled",
+    }
+    assert (
+        evaluate_what_if(
+            complete,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+        == ()
+    )
+
+
 @pytest.mark.parametrize(
     ("resource_id", "path", "value", "message"),
     [

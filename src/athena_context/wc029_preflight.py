@@ -695,50 +695,53 @@ def _unsafe_property_violations(
                 detail=("change lacks FullResourcePayloads or inspectable delta"),
             ),
         )
-    removed_delta_paths = [
-        _canonical_property_path(raw_path)
-        for raw_path, _, property_change_type in delta_candidates
-        if property_change_type in {"delete", "remove"}
-    ]
-
-    def ancestor_removed(target: str) -> bool:
+    def delta_touches(target: str) -> bool:
         return any(
-            removed_path != target
-            and target.startswith(removed_path + ".")
-            for removed_path in removed_delta_paths
+            (path := _canonical_property_path(raw_path)) == target
+            or target.startswith(path + ".")
+            for raw_path, _, _ in delta_candidates
+        )
+
+    def has_exact_evidence(target: str) -> bool:
+        return any(
+            _canonical_property_path(raw_path) == target
+            for raw_path, _, _ in candidates
         )
 
     if (
         resource_type == _STORAGE_ACCOUNT_TYPE
-        and ancestor_removed("properties.allowsharedkeyaccess")
+        and delta_touches("properties.allowsharedkeyaccess")
+        and not has_exact_evidence("properties.allowsharedkeyaccess")
     ):
         violations.append(
             PreflightViolation(
                 code="storage-shared-key-enabled",
                 subject=resource_id,
-                detail="ancestor removal deletes shared-key protection",
+                detail="ancestor change omits explicit shared-key protection",
             )
         )
     if (
         resource_type == _STORAGE_ACCOUNT_TYPE
-        and ancestor_removed("properties.allowblobpublicaccess")
+        and delta_touches("properties.allowblobpublicaccess")
+        and not has_exact_evidence("properties.allowblobpublicaccess")
     ):
         violations.append(
             PreflightViolation(
                 code="storage-public-blob-access",
                 subject=resource_id,
-                detail="ancestor removal deletes public-blob protection",
+                detail="ancestor change omits explicit public-blob protection",
             )
         )
     if (
         resource_type == _STORAGE_CONTAINER_TYPE
-        and ancestor_removed("properties.publicaccess")
+        and delta_touches("properties.publicaccess")
+        and not has_exact_evidence("properties.publicaccess")
     ):
         violations.append(
             PreflightViolation(
                 code="storage-container-public-access",
                 subject=resource_id,
-                detail="ancestor removal deletes private-container protection",
+                detail="ancestor change omits explicit private-container protection",
             )
         )
     if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
