@@ -2938,7 +2938,7 @@ class _PinnedDirectoryHandle:
             os.close(self.descriptor)
             self.descriptor = None
         if self.windows_handle is not None:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32 = _windows_kernel32()
             kernel32.CloseHandle(ctypes.c_void_p(self.windows_handle))
             self.windows_handle = None
 
@@ -2961,8 +2961,20 @@ class _WindowsByHandleFileInformation(ctypes.Structure):
     ]
 
 
+def _windows_kernel32() -> Any:
+    factory = getattr(ctypes, "WinDLL", None)
+    if factory is None:
+        raise OSError("Windows kernel APIs are unavailable")
+    return factory("kernel32", use_last_error=True)
+
+
+def _windows_last_error() -> int:
+    getter = getattr(ctypes, "get_last_error", None)
+    return 0 if getter is None else int(getter())
+
+
 def _windows_directory_identity(handle: int) -> tuple[int, int, int]:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _windows_kernel32()
     get_information = kernel32.GetFileInformationByHandle
     get_information.argtypes = [
         ctypes.c_void_p,
@@ -2977,7 +2989,10 @@ def _windows_directory_identity(handle: int) -> tuple[int, int, int]:
         )
         == 0
     ):
-        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
+        raise OSError(
+            _windows_last_error(),
+            "GetFileInformationByHandle failed",
+        )
     file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
     return (
         file_index,
@@ -2994,7 +3009,7 @@ def _open_pinned_directory(
     name: str | None = None,
 ) -> _PinnedDirectoryHandle:
     if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _windows_kernel32()
         create_file = kernel32.CreateFileW
         create_file.argtypes = [
             ctypes.c_wchar_p,
@@ -3017,7 +3032,10 @@ def _open_pinned_directory(
         )
         invalid_handle = ctypes.c_void_p(-1).value
         if handle in {None, invalid_handle}:
-            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+            raise OSError(
+                _windows_last_error(),
+                "CreateFileW failed",
+            )
         raw_handle = int(handle)
         try:
             inode, link_count, attributes = _windows_directory_identity(raw_handle)
