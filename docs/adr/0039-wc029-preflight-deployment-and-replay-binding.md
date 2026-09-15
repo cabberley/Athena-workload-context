@@ -18,6 +18,11 @@ paths:
   and
 - a still-valid collection run and manifest could be evaluated repeatedly.
 
+Further exact-SHA review found that the saved what-if result did not prove the exact collection
+request, diagnostics could be ignored, additional authorization/imperative resource families were
+not blocked, decimal hashing was non-injective under active context, RBAC URL/CLI tokens admitted
+aliases, and nested path generation had no aggregate work budget.
+
 Freshness does not prove single use, and the pure what-if evaluator does not yet derive the
 post-deployment principal, role, condition, and inherited scope needed to apply the reviewed
 separation policy to an authorization mutation.
@@ -51,8 +56,22 @@ Use the following guarded preflight contract:
    manifest for the same execution, or the same collection run under another execution fails even
    before `expiresAt`.
 6. JSON decimal values are parsed into a bounded exact representation and serialized canonically
-   for hashing. Direct binary floating-point values are rejected, so distinct evidence values cannot
-   collapse before equality or digest checks.
+   for hashing from lossless `Decimal.as_tuple()` fields without active-context operations. Integer
+   and decimal representation classes use different canonical type tags. Direct binary
+   floating-point values are rejected.
+7. The what-if envelope carries the exact Azure CLI command and arguments. The manifest binds their
+   digest. Only direct subscription/group what-if commands with `FullResourcePayloads`, full
+   `Provider` validation, exact `--no-pretty-print` and JSON output, and no exclusions, transforms,
+   or unknown options are valid. JSON mode requires one template file and one `@file.json`;
+   `.bicepparam` mode passes one direct `.bicepparam` path and forbids `--template-file`. Any
+   non-empty diagnostic blocks release.
+8. Creates or modifies under any `Microsoft.Authorization` or `Microsoft.ManagedServices` family,
+   plus `Microsoft.Resources/deploymentScripts`, remain blocked until their post-deployment effects
+   are fully evaluated.
+9. RBAC provenance URL query keys are unique after decoding and exact lowercase ASCII. CLI evidence
+   uses exact ASCII option names and case-sensitive fixed values.
+10. Canonical paths have a 4096-character limit and one evaluation-wide generated-path item and
+    character budget, checked before concatenation or candidate materialization.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -71,6 +90,8 @@ blocked output is returned.
   regenerates an otherwise valid manifest.
 - The release ledger is trusted workflow state. Operators must keep it persistent and protected and
   must not delete, clone, replace, or redirect it to reuse evidence.
+- Guarded what-if artifacts must add exact request provenance and regenerate the reviewed shared
+  manifest because `whatIfRequestDigest` is mandatory.
 - The legacy module entry point remains available for compatibility but is not the guarded
   deployment gate.
 - Authorization mutations remain deliberately unavailable rather than being accepted without
@@ -98,4 +119,8 @@ manifest success across both artifact kinds, repeated consumption, and cross-art
 rebinding, collection-run rebinding, complete snapshot identity, snapshot type spoofing, and
 high-precision decimal distinction. Existing Unicode, freshness, pagination, hierarchy,
 group-derived assignment, complete inventory, meaningful-delta, duplicate-rule, violation-count,
-and rendered-output bounds remain in the full test suite.
+and rendered-output bounds remain in the full test suite. Additional adversarial cases cover request
+transforms/exclusions, diagnostics, expanded authorization and imperative families, decoded query
+key collisions, fuzzy/non-ASCII CLI tokens, wide decimals, integer-versus-decimal digest identity,
+surrounding-whitespace aliases, JSON and `.bicepparam` request modes, required
+`--no-pretty-print`, and nested/aggregate path amplification.

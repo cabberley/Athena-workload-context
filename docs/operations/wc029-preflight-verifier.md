@@ -24,14 +24,29 @@ Container Apps network values are type checked independently: ingress `external`
 `false`, managed-environment `vnetConfiguration.internal` must be boolean `true`, and
 `publicNetworkAccess` must be `Disabled`. Unknown values and partial parent deltas fail closed.
 
+The attested artifact also contains `whatIfRequest`, the exact Azure CLI command token array and
+argument array used to obtain the result. The release gate accepts only `az deployment sub what-if`
+or `az deployment group what-if` with one exact subscription, name,
+`--no-pretty-print`, exact JSON output, `FullResourcePayloads`, and full `Provider` validation.
+JSON mode requires one local template file and one `@parameters.json` file. A separately exact
+`.bicepparam` mode passes one direct `.bicepparam` path and omits `--template-file`, because the
+Bicep parameter artifact declares its template with `using`.
+Subscription requests require a canonical location; group requests require one resource group from
+the reviewed deployment boundary. Unknown or duplicate options, equals-form options, case or
+Unicode aliases, `--query`, output transforms, excluded change types, weaker validation, and
+short-circuit/create commands fail closed. The shared manifest binds `whatIfRequestDigest`, so a
+valid-looking request cannot be substituted after review.
+
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
 resources were not resolved into the reviewed `changes` collection.
-Planned `Microsoft.Authorization/roleAssignments` and `roleDefinitions` creates or modifies always
-block, even when their IDs are allowlisted. The what-if gate does not yet derive the resulting
-principal, role, condition, and inherited scope into the separation policy; authorization changes
-therefore require a future separation-aware evaluator rather than being treated as ordinary
-resource mutations.
+Any non-empty `diagnostics` or `validationDiagnostics` value anywhere in the response makes the
+analysis incomplete for release and fails closed. Planned creates or modifies under any
+`Microsoft.Authorization` or `Microsoft.ManagedServices` resource family also block, including PIM
+assignment/eligibility schedule requests and Lighthouse registration assignments/definitions.
+`Microsoft.Resources/deploymentScripts` and descendants block as unsupported imperative execution.
+These changes remain blocked even when allowlisted because the gate does not yet derive their full
+post-deployment authorization or execution effects.
 `NoChange` is accepted only with complete, object-valued, type-exact, structurally identical
 `before` and `after` snapshots and no effective delta. Each snapshot must contain matching `id`,
 `name`, `type`, and object-valued `properties`. Every `NoEffect` entry must contain both `before`
@@ -52,7 +67,9 @@ dotted ASCII identifier components and canonical numeric indexes such as `contai
 slashes, backslashes, tildes/JSON-pointer escapes, non-exact root suffixes, empty components,
 non-numeric or malformed brackets, and leading-zero indexes are rejected. Unicode characters whose
 case fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property
-paths.
+paths. Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
+generated-path count and character work. Nested path accumulation and wide generated snapshots fail
+deterministically before an unbounded candidate set is materialized.
 Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
 missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
 and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
@@ -68,10 +85,11 @@ Production what-if evidence is an attested envelope containing `whatIf` and the 
 `athena.wc029PreflightManifest.v1` manifest. The manifest contains `collectionRunId`, an immutable
 `deploymentExecutionId`, `collectedAt`, `expiresAt`, a reviewed `deploymentTarget`, and SHA-256
 bindings for the what-if result, RBAC evidence, policy, deployment, template, parameters, and
-normalized `--allow-change` list. `deploymentTarget` contains the exact tenant, subscription, and
-non-empty set of resource-group boundaries. Every what-if resource ID, snapshot ID, potential-change
-ID, and allowlist ID must belong to that subscription and one of those resource groups. The RBAC
-target tenant, subscription, and resource group must match the same manifest exactly.
+normalized `--allow-change` list, plus the exact `whatIfRequest`. `deploymentTarget` contains the
+exact tenant, subscription, and non-empty set of resource-group boundaries. Every what-if resource
+ID, snapshot ID, potential-change ID, and allowlist ID must belong to that subscription and one of
+those resource groups. The RBAC target tenant, subscription, and resource group must match the same
+manifest exactly.
 
 The validity window must be positive and no longer than 30 minutes; a collection time more than five
 minutes in the future fails deterministically. Time validity alone is not replay protection. Both
@@ -169,7 +187,9 @@ Initial Graph requests must use the unfiltered service-principal membership endp
 filter on the first page is rejected. Initial ARM role-assignment requests allow only
 `api-version=2022-04-01` and the exact `atScope() and assignedTo(...)` filter. Continuations must stay
 on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
-Cross-tenant parameters and caller-added selection filters are rejected.
+Cross-tenant parameters and caller-added selection filters are rejected. Decoded query keys must be
+exact lowercase ASCII and unique; exact duplicates, percent-decoded duplicates, casefold aliases,
+and fuzzy spellings fail before query comparison.
 
 The Resource Graph response must explicitly report `resultTruncated` as JSON `false` or the exact
 transport string `"false"`, no non-null `skipToken` or `$skipToken`, and
@@ -210,7 +230,9 @@ CLI-equivalent evidence requires two exact collections. The target/ancestor comm
 `--scope`, `--include-inherited`, and `--include-groups` without `--all`. The subscription-descendant
 command uses `--all`, `--assignee-object-id`, and `--include-groups` without `--scope`. Selection or
 output transforms such as `--role`, `--resource-group`, or `--query`, equals-form overrides,
-duplicate flags, and alternate assignee forms fail closed.
+duplicate flags, and alternate assignee forms fail closed. Every option token is exact lowercase
+ASCII, and fixed values such as `--output json`, principal IDs, and boolean fill values are
+case-sensitive; Unicode/casefold aliases and fuzzy option spelling are invalid.
 
 The policy is bounded JSON:
 
@@ -307,9 +329,10 @@ Recognized built-in role names must agree with their official IDs; name-only, ID
 entries fail closed. Every production separation rule also requires reviewed
 `forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a
 false display name cannot bypass separation. Oversized integer literals and other parser failures
-are reported as malformed input with exit code `3`. JSON decimals are parsed and hashed exactly
-within bounded precision and exponent limits; distinct decimal values cannot collapse through
-binary floating-point rounding before `NoEffect` or manifest-digest comparison.
+are reported as malformed input with exit code `3`. JSON decimals are parsed into bounded exact
+values and hashed from their lossless `Decimal.as_tuple()` representation without active-context
+rounding. Integer and decimal representation classes remain distinct, so wide decimals and `1`
+versus `1.0` cannot collapse before `NoEffect` or manifest-digest comparison.
 
 Equivalent separation rules are rejected before evaluation. Identical violations from distinct
 non-equivalent rules are emitted once, no result may contain more than 256 unique violations, and

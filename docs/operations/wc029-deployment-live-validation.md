@@ -122,9 +122,11 @@ az deployment sub what-if `
   --name $DeploymentName `
   --location $Location `
   --template-file infra/wc013-live-acceptance/main.bicep `
-  --parameters .azure/wc013.parameters.json `
+  --parameters '@.azure/wc013.parameters.json' `
   --result-format FullResourcePayloads `
-  --no-pretty-print
+  --validation-level Provider `
+  --no-pretty-print `
+  --output json
 ```
 
 Use scope-correct, reviewed parameters for every root:
@@ -155,10 +157,20 @@ The versioned `athena.wc029PreflightManifest.v1` records UTC `collectedAt`/`expi
 validity window no longer than 30 minutes, the deployment execution ID, and a reviewed
 `deploymentTarget` containing the exact tenant, subscription, and non-empty resource-group boundary
 set. It also contains SHA-256 bindings for the raw what-if, RBAC payload, reviewed policy,
-deployment, template, parameters, and normalized allowlist. Store one byte-equivalent shared
-manifest in both artifacts and have a reviewer approve its SHA-256 digest independently of the
-artifacts. Every what-if resource, snapshot, potential-change, and allowlist ID must be inside the
-manifest boundary. The RBAC target must match its tenant, subscription, and resource group exactly.
+deployment, template, parameters, normalized allowlist, and the exact `whatIfRequest` command and
+arguments used to obtain the result. Store one byte-equivalent shared manifest in both artifacts and
+have a reviewer approve its SHA-256 digest independently of the artifacts. Every what-if resource,
+snapshot, potential-change, and allowlist ID must be inside the manifest boundary. The RBAC target
+must match its tenant, subscription, and resource group exactly.
+
+The attested request must prove exact `az deployment sub what-if` or
+`az deployment group what-if` execution with `FullResourcePayloads`, full `Provider` validation,
+exact `--no-pretty-print` and `--output json`, and no query, output transform, exclusion,
+short-circuit, or unknown option. JSON mode uses one local `--template-file` and one
+`--parameters @file.json`. Reviewed `.bicepparam` mode passes the `.bicepparam` path directly and
+omits `--template-file`; do not prefix Bicep parameter files with `@`. Reject every non-empty
+diagnostic anywhere in the response; warnings and incomplete-analysis diagnostics require a new
+collection rather than operator interpretation.
 
 ```powershell
 $CollectionRunId = [guid]::NewGuid().ToString()
@@ -209,8 +221,9 @@ The gate fails on:
 - any `Delete`;
 - any `<resource>`, `<resource>.`, or `.` root `Delete`/`Remove` hidden under a non-delete change;
 - any planned `Microsoft.Authorization/roleAssignments` or `roleDefinitions` create or modify,
-  even if its resource ID is allowlisted, until post-deployment authorization derivation is
-  separation-aware;
+  any PIM assignment/eligibility schedule request, any `Microsoft.ManagedServices` registration
+  assignment/definition, or any `Microsoft.Resources/deploymentScripts` mutation, even if its
+  resource ID is allowlisted, until post-deployment effects are fully evaluated;
 - an unapproved `Create` or `Modify`;
 - changes to VNet, subnet, NSG, load balancer, Key Vault, Storage network rules, AMPLS, private DNS,
   or role assignments that are absent from the reviewed change set;
@@ -226,6 +239,10 @@ The gate fails on:
 ARM resource and role-definition IDs, scopes, reviewed allowlist values, and request URLs must
 remain ASCII. Do not normalize or transliterate Unicode lookalikes; Kelvin sign `K`, long-s `ſ`, and
 percent-encoded Unicode aliases fail the gate.
+
+Property paths are individually limited to 4096 characters and share one aggregate generated-path
+work budget. Nested delta hierarchies or wide snapshots that exceed either bound fail before
+candidate materialization.
 
 Do not continue by manually ignoring a failed preflight result. Update IaC or the reviewed
 allowlist and rerun the gate.
@@ -378,6 +395,9 @@ az role assignment list `
 
 Do not use `--assignee`, omit either include flag, combine `--all` with `--scope`, add `--role`,
 `--resource-group`, or `--query`, use equals-form duplicate options, or transform the JSON output.
+Option names must be exact lowercase ASCII and fixed values such as `--output json` are
+case-sensitive. Decoded request-URL query keys must also be exact lowercase ASCII and unique after
+percent decoding.
 
 The CLI equivalent for the separate subscription-descendant inventory is:
 

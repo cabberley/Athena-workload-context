@@ -93,6 +93,35 @@ def _deployment_target(
     }
 
 
+def _what_if_request(
+    *,
+    deployment_target: dict[str, object] | None = None,
+) -> dict[str, object]:
+    target = _deployment_target() if deployment_target is None else deployment_target
+    subscription_id = target["subscriptionId"]
+    assert isinstance(subscription_id, str)
+    return {
+        "command": ["az", "deployment", "sub", "what-if"],
+        "arguments": [
+            "--subscription",
+            subscription_id,
+            "--location",
+            "australiaeast",
+            "--name",
+            "synthetic-wc029",
+            "--parameters",
+            "infra/main.bicepparam",
+            "--result-format",
+            "FullResourcePayloads",
+            "--validation-level",
+            "Provider",
+            "--no-pretty-print",
+            "--output",
+            "json",
+        ],
+    }
+
+
 def _json_digest(value: object) -> str:
     return _canonical_json_digest(value)
 
@@ -103,6 +132,7 @@ def _manifest(
     collection_run_id: str = _COLLECTION_RUN_ID,
     deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
     deployment_target: dict[str, object] | None = None,
+    what_if_request: dict[str, object] | None = None,
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -146,6 +176,7 @@ def _attested_what_if(
     collection_run_id: str = _COLLECTION_RUN_ID,
     deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
     deployment_target: dict[str, object] | None = None,
+    what_if_request: dict[str, object] | None = None,
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -159,6 +190,11 @@ def _attested_what_if(
         ),
         key=lambda item: (item["raw"], item["canonical"]),
     )
+    request = (
+        _what_if_request(deployment_target=deployment_target)
+        if what_if_request is None
+        else copy.deepcopy(what_if_request)
+    )
     manifest = _manifest(
         {
             "allowChangeIdsDigest": _json_digest({"allowChangeIds": allowlist_records}),
@@ -168,6 +204,7 @@ def _attested_what_if(
             "rbacEvidenceDigest": _EMPTY_DIGEST,
             "templateDigest": _TEMPLATE_DIGEST,
             "whatIfDigest": _json_digest(document),
+            "whatIfRequestDigest": _json_digest(request),
         },
         collection_run_id=collection_run_id,
         deployment_execution_id=deployment_execution_id,
@@ -185,10 +222,12 @@ def _attested_what_if(
                 "parametersDigest",
                 "templateDigest",
                 "whatIfDigest",
+                "whatIfRequestDigest",
             ),
         ),
         "manifest": manifest,
         "whatIf": document,
+        "whatIfRequest": request,
     }
 
 
@@ -212,6 +251,7 @@ def _attested_rbac(
             "rbacEvidenceDigest": _json_digest(artifact),
             "templateDigest": _TEMPLATE_DIGEST,
             "whatIfDigest": _EMPTY_DIGEST,
+            "whatIfRequestDigest": _EMPTY_DIGEST,
         },
         collection_run_id=collection_run_id,
         deployment_execution_id=deployment_execution_id,
@@ -236,6 +276,7 @@ def _attested_pair(
     allowed_change_ids: frozenset[str] = frozenset(),
     deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
     deployment_target: dict[str, object] | None = None,
+    what_if_request: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     allowlist_records = sorted(
         (
@@ -247,6 +288,11 @@ def _attested_pair(
         ),
         key=lambda item: (item["raw"], item["canonical"]),
     )
+    request = (
+        _what_if_request(deployment_target=deployment_target)
+        if what_if_request is None
+        else copy.deepcopy(what_if_request)
+    )
     rbac_payload = copy.deepcopy(evidence)
     manifest = _manifest(
         {
@@ -257,6 +303,7 @@ def _attested_pair(
             "rbacEvidenceDigest": _json_digest(rbac_payload),
             "templateDigest": _TEMPLATE_DIGEST,
             "whatIfDigest": _json_digest(what_if),
+            "whatIfRequestDigest": _json_digest(request),
         },
         deployment_execution_id=deployment_execution_id,
         deployment_target=deployment_target,
@@ -274,10 +321,12 @@ def _attested_pair(
                     "parametersDigest",
                     "templateDigest",
                     "whatIfDigest",
+                    "whatIfRequestDigest",
                 ),
             ),
             "manifest": what_if_manifest,
             "whatIf": what_if,
+            "whatIfRequest": request,
         },
         {
             **rbac_payload,
@@ -1219,6 +1268,38 @@ def test_what_if_rejects_malformed_potential_changes() -> None:
         (
             f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.Authorization/roleDefinitions/"
             "77777777-7777-7777-7777-777777777777",
+            "Modify",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Authorization/"
+            "roleAssignmentScheduleRequests/"
+            "88888888-8888-8888-8888-888888888888",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Authorization/"
+            "roleEligibilityScheduleRequests/"
+            "99999999-9999-9999-9999-999999999999",
+            "Modify",
+        ),
+        (
+            f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.ManagedServices/"
+            "registrationAssignments/"
+            "12121212-1212-1212-1212-121212121212",
+            "Create",
+        ),
+        (
+            f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.ManagedServices/"
+            "registrationDefinitions/"
+            "13131313-1313-1313-1313-131313131313",
+            "Modify",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Resources/deploymentScripts/synthetic-script",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Resources/deploymentScripts/synthetic-script",
             "Modify",
         ),
     ],
@@ -2395,6 +2476,52 @@ def test_property_paths_reject_every_unsupported_grammar_form(
         )
 
 
+def test_nested_delta_path_accumulation_is_bounded_before_materialization() -> None:
+    nested: dict[str, object] = {
+        "path": "leaf" + "x" * 296,
+        "propertyChangeType": "Modify",
+        "after": True,
+    }
+    for index in range(14):
+        nested = {
+            "path": f"parent{index:02d}" + "x" * 292,
+            "children": [nested],
+        }
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "delta": [nested],
+    }
+
+    with pytest.raises(PreflightInputError, match="property path exceeds"):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_delta_path_generation_has_an_aggregate_work_budget() -> None:
+    delta = [
+        {
+            "path": f"path{index:04d}" + "x" * 2980,
+            "propertyChangeType": "Modify",
+            "after": index,
+        }
+        for index in range(1500)
+    ]
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "delta": delta,
+    }
+
+    with pytest.raises(PreflightInputError, match="aggregate work budget"):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
 def test_security_identifiers_reject_kelvin_aliases_and_bind_raw_allowlists() -> None:
     kelvin_scope = _RG_SCOPE.replace("workload", "wor\u212aload")
     with pytest.raises(PreflightInputError, match="non-ASCII"):
@@ -3389,6 +3516,26 @@ def test_json_decimals_remain_exact_for_digest_and_noeffect(
     assert lower != higher
     assert _json_digest(lower) != _json_digest(higher)
 
+    wide_lower_path = tmp_path / "wide-lower.json"
+    wide_higher_path = tmp_path / "wide-higher.json"
+    integer_path = tmp_path / "integer.json"
+    decimal_path = tmp_path / "decimal.json"
+    wide_lower_path.write_text(
+        '{"value":123456789012345678901234567890.1}',
+        encoding="utf-8",
+    )
+    wide_higher_path.write_text(
+        '{"value":123456789012345678901234567890.2}',
+        encoding="utf-8",
+    )
+    integer_path.write_text('{"value":1}', encoding="utf-8")
+    decimal_path.write_text('{"value":1.0}', encoding="utf-8")
+
+    assert _json_digest(load_json_file(wide_lower_path)) != _json_digest(
+        load_json_file(wide_higher_path)
+    )
+    assert _json_digest(load_json_file(integer_path)) != _json_digest(load_json_file(decimal_path))
+
     change = _change(_STORAGE_ID, "NoChange")
     assert isinstance(change["before"], dict)
     assert isinstance(change["after"], dict)
@@ -3694,6 +3841,190 @@ def test_public_cli_emits_deterministic_json_and_blocks_delete(tmp_path) -> None
     assert stderr.getvalue() == ""
 
 
+def test_attested_what_if_requires_exact_full_analysis_request() -> None:
+    document = _what_if(_change(_STORAGE_ID, "NoChange"))
+
+    def replace_value(request: dict[str, object], option: str, value: str) -> None:
+        arguments = request["arguments"]
+        assert isinstance(arguments, list)
+        arguments[arguments.index(option) + 1] = value
+
+    invalid_requests: list[dict[str, object]] = []
+    wrong_command = _what_if_request()
+    command = wrong_command["command"]
+    assert isinstance(command, list)
+    command[-1] = "create"
+    invalid_requests.append(wrong_command)
+
+    for option, value in (
+        ("--result-format", "ResourceIdOnly"),
+        ("--validation-level", "ProviderNoRbac"),
+        ("--output", "tsv"),
+    ):
+        request = _what_if_request()
+        replace_value(request, option, value)
+        invalid_requests.append(request)
+
+    for option, value in (
+        ("--query", "properties.changes"),
+        ("--exclude-change-types", "NoChange"),
+        ("--what-if-exclude-change-types", "NoChange"),
+    ):
+        request = _what_if_request()
+        arguments = request["arguments"]
+        assert isinstance(arguments, list)
+        arguments.extend([option, value])
+        invalid_requests.append(request)
+
+    fuzzy_option = _what_if_request()
+    fuzzy_arguments = fuzzy_option["arguments"]
+    assert isinstance(fuzzy_arguments, list)
+    fuzzy_arguments[fuzzy_arguments.index("--result-format")] = "--Result-Format"
+    invalid_requests.append(fuzzy_option)
+
+    missing_no_pretty = _what_if_request()
+    missing_no_pretty_arguments = missing_no_pretty["arguments"]
+    assert isinstance(missing_no_pretty_arguments, list)
+    missing_no_pretty_arguments.remove("--no-pretty-print")
+    invalid_requests.append(missing_no_pretty)
+
+    padded_option = _what_if_request()
+    padded_option_arguments = padded_option["arguments"]
+    assert isinstance(padded_option_arguments, list)
+    padded_option_arguments[padded_option_arguments.index("--subscription")] = " --subscription "
+    invalid_requests.append(padded_option)
+
+    padded_value = _what_if_request()
+    padded_value_arguments = padded_value["arguments"]
+    assert isinstance(padded_value_arguments, list)
+    padded_value_arguments[padded_value_arguments.index("--output") + 1] = " json "
+    invalid_requests.append(padded_value)
+
+    for request in invalid_requests:
+        artifact = _attested_what_if(
+            document,
+            what_if_request=request,
+        )
+        with pytest.raises(PreflightInputError, match="what-if command"):
+            evaluate_what_if(
+                artifact,
+                require_attestation=True,
+                expected_collection_run_id=_COLLECTION_RUN_ID,
+                expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+                attestation_manifest_digest=_json_digest(artifact["manifest"]),
+                deployment_digest=_DEPLOYMENT_DIGEST,
+                template_digest=_TEMPLATE_DIGEST,
+                parameters_digest=_PARAMETERS_DIGEST,
+            )
+
+    json_request = _what_if_request()
+    json_arguments = json_request["arguments"]
+    assert isinstance(json_arguments, list)
+    parameters_index = json_arguments.index("--parameters")
+    json_arguments[parameters_index + 1] = "@infra/main.parameters.json"
+    json_arguments[parameters_index:parameters_index] = [
+        "--template-file",
+        "infra/main.bicep",
+    ]
+    json_artifact = _attested_what_if(
+        document,
+        what_if_request=json_request,
+    )
+    assert (
+        evaluate_what_if(
+            json_artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(json_artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+        == ()
+    )
+
+
+def test_attested_what_if_binds_request_and_rejects_diagnostics() -> None:
+    document = _what_if(_change(_STORAGE_ID, "NoChange"))
+    artifact = _attested_what_if(document)
+    request = artifact["whatIfRequest"]
+    assert isinstance(request, dict)
+    arguments = request["arguments"]
+    assert isinstance(arguments, list)
+    arguments[arguments.index("--name") + 1] = "different-valid-name"
+    with pytest.raises(
+        PreflightInputError,
+        match="whatIfRequestDigest does not match",
+    ):
+        evaluate_what_if(
+            artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    for diagnostic_document in (
+        {
+            **_what_if(_change(_STORAGE_ID, "NoChange")),
+            "diagnostics": [{"level": "Warning", "message": "synthetic"}],
+        },
+        {
+            "status": "Succeeded",
+            "properties": {
+                "changes": [_change(_STORAGE_ID, "NoChange")],
+                "diagnostics": {"code": "IncompleteAnalysis"},
+            },
+        },
+        {
+            "status": "Succeeded",
+            "properties": {
+                "changes": [
+                    {
+                        **_change(_STORAGE_ID, "NoChange"),
+                        "validationDiagnostics": "synthetic",
+                    }
+                ],
+            },
+        },
+    ):
+        diagnostic_artifact = _attested_what_if(diagnostic_document)
+        with pytest.raises(PreflightInputError, match="diagnostics"):
+            evaluate_what_if(
+                diagnostic_artifact,
+                require_attestation=True,
+                expected_collection_run_id=_COLLECTION_RUN_ID,
+                expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+                attestation_manifest_digest=_json_digest(diagnostic_artifact["manifest"]),
+                deployment_digest=_DEPLOYMENT_DIGEST,
+                template_digest=_TEMPLATE_DIGEST,
+                parameters_digest=_PARAMETERS_DIGEST,
+            )
+
+    empty_diagnostics = {
+        **document,
+        "diagnostics": [],
+    }
+    empty_artifact = _attested_what_if(empty_diagnostics)
+    assert (
+        evaluate_what_if(
+            empty_artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(empty_artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+        == ()
+    )
+
+
 def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
     now = datetime(2026, 9, 15, 1, 0, tzinfo=UTC)
     document = _what_if(_change(_STORAGE_ID, "NoChange"))
@@ -3749,6 +4080,7 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             "parametersDigest",
             "templateDigest",
             "whatIfDigest",
+            "whatIfRequestDigest",
         ),
     )
     with pytest.raises(
@@ -4775,12 +5107,12 @@ def test_guarded_rbac_rejects_pagination_gaps(
         (
             "arm",
             "&%24skipToken=synthetic",
-            "requestUrl is not canonical",
+            "exact lowercase ASCII",
         ),
         (
             "arm",
             "&tenantId=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            "requestUrl is not canonical",
+            "exact lowercase ASCII",
         ),
         (
             "graph",
@@ -4896,6 +5228,46 @@ def test_guarded_rbac_rejects_percent_encoded_kelvin_url_alias() -> None:
     )
 
     with pytest.raises(PreflightInputError, match="non-ASCII"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("query_suffix", "message"),
+    [
+        ("&%61pi-version=2022-04-01", "duplicate decoded key"),
+        ("&API-VERSION=2022-04-01", "exact lowercase ASCII"),
+        ("&%24filter=duplicate", "duplicate decoded key"),
+    ],
+)
+def test_guarded_rbac_rejects_query_key_aliases(
+    query_suffix: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    ancestors = role_assignments["ancestors"]
+    assert isinstance(ancestors, dict)
+    pages = ancestors["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["requestUrl"] = str(page["requestUrl"]) + query_suffix
+
+    with pytest.raises(PreflightInputError, match=message):
         _evaluate_guarded_rbac(
             evidence,
             _production_policy(
@@ -5451,6 +5823,66 @@ def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
             "--all",
             "--output",
             "json",
+        ],
+        [
+            "--ſubscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--output",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-Groups",
+            "--all",
+            "--output",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--OUTPUT",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--output",
+            "JSON",
+        ],
+        [
+            " --subscription ",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--output",
+            "json",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--output",
+            " json ",
         ],
         [
             "--subscription",

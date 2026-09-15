@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, TextIO
-from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
+from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_CHANGES = 5000
@@ -24,6 +24,9 @@ MAX_JSON_DECIMAL_DIGITS = 1024
 MAX_JSON_DECIMAL_EXPONENT = 1024
 MAX_VIOLATIONS = 256
 MAX_RENDER_BYTES = 1024 * 1024
+MAX_PROPERTY_PATH_LENGTH = 4096
+MAX_PROPERTY_PATH_ITEMS = 50000
+MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
 MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
 MAX_ATTESTATION_CLOCK_SKEW = timedelta(minutes=5)
 
@@ -82,10 +85,13 @@ _PROPERTY_COMPONENT = re.compile(
     r"(?P<indexes>(?:\[(?:0|[1-9][0-9]*)\])*)$"
 )
 _PROPERTY_INDEX = re.compile(r"\[(0|[1-9][0-9]*)\]")
-_AUTHORIZATION_MUTATION_TYPES = frozenset(
+_UNSUPPORTED_MUTATION_PREFIXES = (
+    "microsoft.authorization/",
+    "microsoft.managedservices/",
+)
+_UNSUPPORTED_IMPERATIVE_TYPES = frozenset(
     {
-        "microsoft.authorization/roleassignments",
-        "microsoft.authorization/roledefinitions",
+        "microsoft.resources/deploymentscripts",
     }
 )
 _MANIFEST_SCHEMA_VERSION = "athena.wc029PreflightManifest.v1"
@@ -105,6 +111,7 @@ _MANIFEST_BINDING_NAMES = frozenset(
         "rbacEvidenceDigest",
         "templateDigest",
         "whatIfDigest",
+        "whatIfRequestDigest",
     }
 )
 _MANIFEST_FIELD_NAMES = frozenset(
@@ -147,6 +154,22 @@ class DeploymentTarget:
     tenant_id: str
     subscription_id: str
     resource_group_scopes: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _PropertyPathBudget:
+    items: int = 0
+    characters: int = 0
+
+    def charge(self, path: str) -> None:
+        if len(path) > MAX_PROPERTY_PATH_LENGTH:
+            raise PreflightInputError(
+                f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters"
+            )
+        self.items += 1
+        self.characters += len(path)
+        if self.items > MAX_PROPERTY_PATH_ITEMS or self.characters > MAX_PROPERTY_PATH_CHARACTERS:
+            raise PreflightInputError("property path generation exceeds its aggregate work budget")
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +302,13 @@ def _resource_type(resource_id: str) -> str:
     return "/".join((namespace, *type_segments))
 
 
+def _is_unsupported_authorization_or_imperative_type(resource_type: str) -> bool:
+    return resource_type.startswith(_UNSUPPORTED_MUTATION_PREFIXES) or any(
+        resource_type == imperative_type or resource_type.startswith(imperative_type + "/")
+        for imperative_type in _UNSUPPORTED_IMPERATIVE_TYPES
+    )
+
+
 def _reject_json_constant(value: str) -> None:
     raise PreflightInputError(f"invalid JSON constant: {value}")
 
@@ -367,6 +397,8 @@ def _canonical_role_id(value: str) -> str:
 
 
 def _property_path_tokens(value: str) -> tuple[PropertyPathToken, ...]:
+    if len(value) > MAX_PROPERTY_PATH_LENGTH:
+        raise PreflightInputError(f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters")
     normalized = value.lower()
     if normalized != value.casefold():
         raise PreflightInputError("property path has ambiguous Unicode case folding")
@@ -408,11 +440,33 @@ def _format_property_path(tokens: Sequence[PropertyPathToken]) -> str:
             raise PreflightInputError("property path cannot start with an array index")
         else:
             components[-1] += f"[{token}]"
-    return ".".join(components)
+    path = ".".join(components)
+    if len(path) > MAX_PROPERTY_PATH_LENGTH:
+        raise PreflightInputError(f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters")
+    return path
 
 
 def _canonical_property_path(value: str) -> str:
     return _format_property_path(_property_path_tokens(value))
+
+
+def _accumulated_property_path(
+    parent_path: str,
+    own_path: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> str:
+    if parent_path:
+        if len(parent_path) + len(own_path) + 1 > MAX_PROPERTY_PATH_LENGTH:
+            raise PreflightInputError(
+                f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters"
+            )
+        raw_path = f"{parent_path}.{own_path}"
+    else:
+        raw_path = own_path
+    canonical_path = _canonical_property_path(raw_path)
+    budget.charge(canonical_path)
+    return canonical_path
 
 
 def _property_path_contains(ancestor: str, descendant: str) -> bool:
@@ -488,44 +542,41 @@ def _canonical_guid(value: object, *, field_name: str) -> str:
     return guid
 
 
-def _canonical_decimal(value: Decimal) -> str:
-    if not value.is_finite():
-        raise PreflightInputError("JSON decimal must be finite")
-    if value == 0:
-        return "0"
-    rendered = format(value.normalize(), "f")
-    if "." in rendered:
-        rendered = rendered.rstrip("0").rstrip(".")
-    return rendered
+def _length_prefixed(tag: bytes, payload: bytes) -> bytes:
+    return tag + str(len(payload)).encode("ascii") + b":" + payload
 
 
-def _canonical_json_text(value: object) -> str:
+def _canonical_json_bytes(value: object) -> bytes:
     if value is None:
-        return "null"
+        return b"n;"
     if type(value) is bool:
-        return "true" if value else "false"
+        return b"b1;" if value else b"b0;"
     if type(value) is int:
-        return str(value)
+        return b"i" + str(value).encode("ascii") + b";"
     if isinstance(value, Decimal):
-        return _canonical_decimal(value)
+        if not value.is_finite():
+            raise PreflightInputError("JSON decimal must be finite")
+        decimal_tuple = value.as_tuple()
+        if not isinstance(decimal_tuple.exponent, int):
+            raise PreflightInputError("JSON decimal exponent is invalid")
+        digits = "".join(str(digit) for digit in decimal_tuple.digits) or "0"
+        payload = f"{decimal_tuple.sign}:{decimal_tuple.exponent}:{digits}".encode("ascii")
+        return _length_prefixed(b"d", payload)
     if type(value) is str:
-        return json.dumps(value, ensure_ascii=True)
+        return _length_prefixed(b"s", value.encode("utf-8"))
     if isinstance(value, list):
-        return "[" + ",".join(_canonical_json_text(item) for item in value) + "]"
+        payload = b"".join(_canonical_json_bytes(item) for item in value)
+        return b"l" + str(len(value)).encode("ascii") + b":" + payload
     if isinstance(value, dict) and all(type(key) is str for key in value):
-        return (
-            "{"
-            + ",".join(
-                json.dumps(key, ensure_ascii=True) + ":" + _canonical_json_text(value[key])
-                for key in sorted(value)
-            )
-            + "}"
+        payload = b"".join(
+            _canonical_json_bytes(key) + _canonical_json_bytes(value[key]) for key in sorted(value)
         )
+        return b"o" + str(len(value)).encode("ascii") + b":" + payload
     raise PreflightInputError("canonical JSON contains an unsupported value")
 
 
 def _canonical_json_digest(value: object) -> str:
-    serialized = _canonical_json_text(value).encode("utf-8")
+    serialized = _canonical_json_bytes(value)
     return "sha256:" + hashlib.sha256(serialized).hexdigest()
 
 
@@ -1089,10 +1140,172 @@ def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
     return None
 
 
+def _require_exact_cli_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    if type(value) is not str or value != value.strip():
+        raise PreflightInputError(f"{field_name} must not contain surrounding whitespace")
+    return _require_string(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    )
+
+
+def _validate_what_if_request(
+    value: object,
+    *,
+    deployment_target: DeploymentTarget,
+) -> None:
+    request = _mapping(
+        value,
+        field_name="what-if request",
+    )
+    if {key.casefold() for key in request} != {"arguments", "command"}:
+        raise PreflightInputError("what-if request has an invalid envelope")
+    command = [
+        _require_exact_cli_token(
+            token,
+            field_name="what-if command token",
+            maximum_length=64,
+        )
+        for token in _sequence(
+            _get_case_insensitive(request, "command"),
+            field_name="what-if command",
+            maximum_items=4,
+        )
+    ]
+    if any(not token.isascii() for token in command):
+        raise PreflightInputError("what-if command tokens must use ASCII")
+    if len(command) != 4 or command[:2] != ["az", "deployment"] or command[3] != "what-if":
+        raise PreflightInputError("what-if command must use az deployment <scope> what-if")
+    deployment_scope = command[2]
+    if deployment_scope not in {"group", "sub"}:
+        raise PreflightInputError("what-if command scope is unsupported")
+
+    arguments = [
+        _require_exact_cli_token(
+            argument,
+            field_name="what-if command argument",
+            maximum_length=4096,
+        )
+        for argument in _sequence(
+            _get_case_insensitive(request, "arguments"),
+            field_name="what-if command arguments",
+            maximum_items=32,
+        )
+    ]
+    if any(not argument.isascii() for argument in arguments):
+        raise PreflightInputError("what-if command arguments must use ASCII")
+    allowed_options = {
+        "--location",
+        "--name",
+        "--output",
+        "--parameters",
+        "--resource-group",
+        "--result-format",
+        "--subscription",
+        "--template-file",
+        "--validation-level",
+    }
+    switch_options = {"--no-pretty-print"}
+    parsed: dict[str, str] = {}
+    switches: set[str] = set()
+    index = 0
+    while index < len(arguments):
+        option = arguments[index]
+        if option in switch_options:
+            if option in switches:
+                raise PreflightInputError("what-if command contains a duplicate switch")
+            switches.add(option)
+            index += 1
+            continue
+        if (
+            option not in allowed_options
+            or "=" in option
+            or option in parsed
+            or index + 1 >= len(arguments)
+        ):
+            raise PreflightInputError(
+                "what-if command contains an unsupported, duplicate, or incomplete option"
+            )
+        option_value = arguments[index + 1]
+        if option_value.startswith("--"):
+            raise PreflightInputError("what-if command option is missing its value")
+        parsed[option] = option_value
+        index += 2
+    required_options = {
+        "--name",
+        "--output",
+        "--parameters",
+        "--result-format",
+        "--subscription",
+        "--validation-level",
+        "--location" if deployment_scope == "sub" else "--resource-group",
+    }
+    parameters_value = parsed.get("--parameters", "")
+    json_parameters = parameters_value.startswith("@")
+    if json_parameters:
+        required_options.add("--template-file")
+    if set(parsed) != required_options or switches != {"--no-pretty-print"}:
+        raise PreflightInputError("what-if command options are incomplete or unsupported")
+    if parsed["--subscription"] != deployment_target.subscription_id:
+        raise PreflightInputError("what-if command uses the wrong subscription")
+    if parsed["--result-format"] != "FullResourcePayloads":
+        raise PreflightInputError("what-if command requires FullResourcePayloads")
+    if parsed["--validation-level"] != "Provider":
+        raise PreflightInputError("what-if command requires full Provider validation")
+    if parsed["--output"] != "json":
+        raise PreflightInputError("what-if command output must be exact json")
+    if json_parameters:
+        if (
+            len(parameters_value) == 1
+            or not parameters_value.casefold().endswith(".json")
+            or parsed["--template-file"].startswith("-")
+        ):
+            raise PreflightInputError(
+                "what-if JSON parameters require one @file and one template file"
+            )
+    elif not parameters_value.casefold().endswith(".bicepparam") or "--template-file" in parsed:
+        raise PreflightInputError(
+            "what-if bicepparam mode requires one direct .bicepparam path without --template-file"
+        )
+    if deployment_scope == "sub":
+        if re.fullmatch(r"[a-z0-9-]+", parsed["--location"]) is None:
+            raise PreflightInputError("what-if command location is not canonical")
+    else:
+        reviewed_resource_groups = {
+            scope.rsplit("/", 1)[-1] for scope in deployment_target.resource_group_scopes
+        }
+        if parsed["--resource-group"] not in reviewed_resource_groups:
+            raise PreflightInputError("what-if command resource group is outside deploymentTarget")
+
+
+def _reject_nonempty_what_if_diagnostics(document: object) -> None:
+    stack: list[object] = [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key.casefold() in {"diagnostics", "validationdiagnostics"}:
+                    if child is None or (isinstance(child, (dict, list, str)) and len(child) == 0):
+                        continue
+                    raise PreflightInputError(
+                        "what-if diagnostics must be absent or empty for the release gate"
+                    )
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
 def _what_if_changes(
     document: object,
 ) -> tuple[list[object], list[object]]:
     _validate_json_shape(document)
+    _reject_nonempty_what_if_diagnostics(document)
     root = _mapping(document, field_name="what-if document")
     status = _normalized(
         _require_string(
@@ -1151,7 +1364,12 @@ def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _property_child_path(parent: str, key: str) -> str | None:
+def _property_child_path(
+    parent: str,
+    key: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> str | None:
     if (
         not key.isascii()
         or key.lower() != key.casefold()
@@ -1159,11 +1377,20 @@ def _property_child_path(parent: str, key: str) -> str | None:
         or _PROPERTY_NAME.fullmatch(key) is None
     ):
         return None
-    return _format_property_path((*_property_path_tokens(parent), key.lower()))
+    path = _format_property_path((*_property_path_tokens(parent), key.lower()))
+    budget.charge(path)
+    return path
 
 
-def _property_index_path(parent: str, index: int) -> str:
-    return _format_property_path((*_property_path_tokens(parent), index))
+def _property_index_path(
+    parent: str,
+    index: int,
+    *,
+    budget: _PropertyPathBudget,
+) -> str:
+    path = _format_property_path((*_property_path_tokens(parent), index))
+    budget.charge(path)
+    return path
 
 
 def _json_values_equal(left: object, right: object) -> bool:
@@ -1186,6 +1413,7 @@ def _derive_snapshot_delta(
     after: object,
     *,
     root: str = "<resource>",
+    budget: _PropertyPathBudget,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[object, object, str]] = [(before, after, root)]
@@ -1196,8 +1424,13 @@ def _derive_snapshot_delta(
         if isinstance(old_value, dict) and isinstance(new_value, dict):
             keys = sorted(set(old_value) | set(new_value))
             for key in reversed(keys):
-                child_path = _property_child_path(path, key)
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
                 if child_path is None:
+                    budget.charge(path)
                     values.append((path, new_value.get(key), "modify"))
                     continue
                 if key not in new_value:
@@ -1210,6 +1443,7 @@ def _derive_snapshot_delta(
                             _flatten_after(
                                 child,
                                 root=child_path,
+                                budget=budget,
                             )
                         )
                 else:
@@ -1223,7 +1457,13 @@ def _derive_snapshot_delta(
             continue
         values.append((path, new_value, "modify"))
         if isinstance(new_value, (dict, list)):
-            values.extend(_flatten_after(new_value, root=path))
+            values.extend(
+                _flatten_after(
+                    new_value,
+                    root=path,
+                    budget=budget,
+                )
+            )
     return values
 
 
@@ -1238,6 +1478,7 @@ def _is_meaningful_delta_candidate(path: str, value: object) -> bool:
 def _walk_delta(
     items: list[dict[str, Any]],
     *,
+    budget: _PropertyPathBudget,
     snapshot_before: dict[str, Any] | None = None,
     snapshot_after: dict[str, Any] | None = None,
 ) -> list[tuple[str, object, str]]:
@@ -1249,7 +1490,11 @@ def _walk_delta(
             _get_case_insensitive(item, "path"),
             field_name="delta path",
         )
-        path = ".".join(part for part in (parent_path, own_path) if part)
+        canonical_path = _accumulated_property_path(
+            parent_path,
+            own_path,
+            budget=budget,
+        )
         children = _get_case_insensitive(item, "children")
         raw_change_type = _get_case_insensitive(
             item,
@@ -1279,7 +1524,6 @@ def _walk_delta(
         after_supplied = _has_case_insensitive(item, "after")
         before = _get_case_insensitive(item, "before")
         after = _get_case_insensitive(item, "after")
-        canonical_path = _canonical_property_path(path)
         if (
             canonical_path == _RESOURCE_ROOT_PATH
             and property_change_type not in {"delete", "remove", "noeffect"}
@@ -1326,6 +1570,7 @@ def _walk_delta(
                         before,
                         after,
                         root=canonical_path,
+                        budget=budget,
                     )
                 )
             else:
@@ -1337,7 +1582,13 @@ def _walk_delta(
                     )
                 )
                 if isinstance(after, (dict, list)):
-                    values.extend(_flatten_after(after, root=canonical_path))
+                    values.extend(
+                        _flatten_after(
+                            after,
+                            root=canonical_path,
+                            budget=budget,
+                        )
+                    )
         if child_items:
             stack.extend((child, canonical_path) for child in reversed(child_items))
     return values
@@ -1452,6 +1703,8 @@ def _validate_resource_snapshot(
 def _validate_no_change(
     resource_id: str,
     change: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
 ) -> None:
     if not _has_case_insensitive(
         change,
@@ -1483,8 +1736,11 @@ def _validate_no_change(
             _get_case_insensitive(item, "path"),
             field_name="delta path",
         )
-        path = ".".join(part for part in (parent_path, own_path) if part)
-        canonical_path = _canonical_property_path(path)
+        canonical_path = _accumulated_property_path(
+            parent_path,
+            own_path,
+            budget=budget,
+        )
         if canonical_path in seen_paths:
             raise PreflightInputError("NoChange contains duplicate delta paths")
         seen_paths.add(canonical_path)
@@ -1572,6 +1828,7 @@ def _validate_no_change(
             stack.extend((child, canonical_path) for child in reversed(child_items))
     if _walk_delta(
         delta,
+        budget=budget,
         snapshot_before=before,
         snapshot_after=after,
     ):
@@ -1583,6 +1840,7 @@ def _flatten_after(
     value: object,
     *,
     root: str = "<resource>",
+    budget: _PropertyPathBudget,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[object, str]] = [(value, root)]
@@ -1590,12 +1848,23 @@ def _flatten_after(
         item, path = stack.pop()
         if isinstance(item, dict):
             for key, child in reversed(list(item.items())):
-                child_path = _property_child_path(path, key)
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
                 if child_path is not None:
                     stack.append((child, child_path))
         elif isinstance(item, list):
             stack.extend(
-                (child, _property_index_path(path, index))
+                (
+                    child,
+                    _property_index_path(
+                        path,
+                        index,
+                        budget=budget,
+                    ),
+                )
                 for index, child in reversed(list(enumerate(item)))
             )
         else:
@@ -1606,6 +1875,8 @@ def _flatten_after(
 def _unsafe_property_violations(
     resource_id: str,
     change: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
 ) -> tuple[PreflightViolation, ...]:
     resource_type = _resource_type(resource_id)
     change_type = _normalized(
@@ -1648,10 +1919,12 @@ def _unsafe_property_violations(
         snapshot_delta_candidates = _derive_snapshot_delta(
             before_payload,
             after_payload,
+            budget=budget,
         )
     declared_delta_candidates = (
         _walk_delta(
             delta,
+            budget=budget,
             snapshot_before=snapshot_before_payload,
             snapshot_after=snapshot_after_payload,
         )
@@ -1677,7 +1950,12 @@ def _unsafe_property_violations(
     ]
     candidates = list(delta_candidates)
     if isinstance(after_payload, (dict, list)):
-        candidates.extend(_flatten_after(after_payload))
+        candidates.extend(
+            _flatten_after(
+                after_payload,
+                budget=budget,
+            )
+        )
     if change_type != "delete" and any(
         property_change_type in {"delete", "remove"}
         and _canonical_property_path(raw_path) == _RESOURCE_ROOT_PATH
@@ -2082,9 +2360,11 @@ def evaluate_what_if(
             "attestation",
             "manifest",
             "whatif",
+            "whatifrequest",
         }:
             raise PreflightInputError("attested what-if artifact has an invalid envelope")
         what_if_document = _get_case_insensitive(root, "whatIf")
+        what_if_request = _get_case_insensitive(root, "whatIfRequest")
         manifest = _parse_attestation_manifest(
             _get_case_insensitive(root, "manifest"),
             expected_collection_run_id=expected_collection_run_id,
@@ -2093,6 +2373,10 @@ def evaluate_what_if(
             now=_current_utc(now),
         )
         deployment_target = manifest.deployment_target
+        _validate_what_if_request(
+            what_if_request,
+            deployment_target=deployment_target,
+        )
         for allowed_change_id in normalized_allowlist:
             _validate_deployment_resource_id(
                 allowed_change_id,
@@ -2114,6 +2398,7 @@ def evaluate_what_if(
                 field_name="reviewed template digest",
             ),
             "whatIfDigest": _canonical_json_digest(what_if_document),
+            "whatIfRequestDigest": _canonical_json_digest(what_if_request),
         }
         for binding_name, expected_digest in expected_bindings.items():
             if manifest.bindings[binding_name] != expected_digest:
@@ -2128,6 +2413,7 @@ def evaluate_what_if(
         )
         document = what_if_document
     violations: list[PreflightViolation] = []
+    path_budget = _PropertyPathBudget()
     changes, potential_changes = _what_if_changes(document)
     for raw_change in potential_changes:
         potential_change = _mapping(
@@ -2181,7 +2467,11 @@ def evaluate_what_if(
             )
         )
         if change_type == "nochange":
-            _validate_no_change(resource_id, change)
+            _validate_no_change(
+                resource_id,
+                change,
+                budget=path_budget,
+            )
             continue
         if change_type == "ignore":
             violations.append(
@@ -2219,14 +2509,14 @@ def evaluate_what_if(
                 )
             )
             continue
-        if _resource_type(canonical_resource_id) in _AUTHORIZATION_MUTATION_TYPES:
+        if _is_unsupported_authorization_or_imperative_type(_resource_type(canonical_resource_id)):
             violations.append(
                 PreflightViolation(
                     code="authorization-change-unsupported",
                     subject=resource_id,
                     detail=(
-                        "planned Microsoft.Authorization role assignment or role "
-                        "definition mutations require a future separation-aware evaluator"
+                        "planned authorization-affecting or imperative mutations require "
+                        "a future separation-aware evaluator"
                     ),
                 )
             )
@@ -2239,7 +2529,13 @@ def evaluate_what_if(
                     detail=f"{change_type} is absent from the reviewed allowlist",
                 )
             )
-        violations.extend(_unsafe_property_violations(resource_id, change))
+        violations.extend(
+            _unsafe_property_violations(
+                resource_id,
+                change,
+                budget=path_budget,
+            )
+        )
     return _finalize_violations(violations)
 
 
@@ -2796,6 +3092,34 @@ def _split_url(value: str, *, field_name: str) -> SplitResult:
         raise PreflightInputError(f"{field_name} is not a valid URL") from exc
 
 
+def _parse_exact_query(
+    parts: SplitResult,
+    *,
+    field_name: str,
+) -> dict[str, list[str]]:
+    try:
+        pairs = parse_qsl(
+            parts.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} query is malformed") from exc
+    query: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for key, value in pairs:
+        folded_key = key.casefold()
+        if not key.isascii() or key != folded_key:
+            raise PreflightInputError(f"{field_name} query keys must use exact lowercase ASCII")
+        if folded_key in seen:
+            raise PreflightInputError(f"{field_name} query contains a duplicate decoded key")
+        if not value.isascii():
+            raise PreflightInputError(f"{field_name} query values must use ASCII")
+        seen.add(folded_key)
+        query[key] = [value]
+    return query
+
+
 def _paged_values(
     value: object,
     *,
@@ -2912,13 +3236,7 @@ def _validate_arm_get_url(
         or parts.fragment
     ):
         raise PreflightInputError(f"{field_name} is not canonical")
-    query = {
-        key.casefold(): values
-        for key, values in parse_qs(
-            parts.query,
-            keep_blank_values=True,
-        ).items()
-    }
+    query = _parse_exact_query(parts, field_name=field_name)
     normalized_expected = {
         key.casefold(): [expected_value] for key, expected_value in expected_query.items()
     }
@@ -3279,13 +3597,10 @@ def _validate_graph_urls(
                 "Graph membership requestUrl does not match the effective "
                 "service-principal object ID"
             )
-        query = {
-            key.casefold(): values
-            for key, values in parse_qs(
-                parts.query,
-                keep_blank_values=True,
-            ).items()
-        }
+        query = _parse_exact_query(
+            parts,
+            field_name="Graph membership requestUrl",
+        )
         if parts.fragment or (index == 0 and query):
             raise PreflightInputError("initial Graph membership requestUrl must be unfiltered")
         if index > 0 and (
@@ -3461,13 +3776,10 @@ def _validate_arm_role_assignment_urls(
         )
         if unquote(parts.path).casefold() != expected_path:
             raise PreflightInputError("ARM role-assignment requestUrl uses the wrong scope")
-        query = {
-            key.casefold(): values
-            for key, values in parse_qs(
-                parts.query,
-                keep_blank_values=True,
-            ).items()
-        }
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM role-assignment requestUrl",
+        )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
             allowed_keys.add("$skiptoken")
@@ -3525,13 +3837,10 @@ def _validate_descendant_arm_urls(
             raise PreflightInputError(
                 "ARM descendant role-assignment requestUrl uses the wrong subscription"
             )
-        query = {
-            key.casefold(): values
-            for key, values in parse_qs(
-                parts.query,
-                keep_blank_values=True,
-            ).items()
-        }
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM descendant role-assignment requestUrl",
+        )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
             allowed_keys.add("$skiptoken")
@@ -3633,7 +3942,7 @@ def _validate_cli_arguments(
     include_descendants: bool = False,
 ) -> None:
     arguments = [
-        _require_string(
+        _require_exact_cli_token(
             argument,
             field_name="Azure CLI role-assignment argument",
             maximum_length=4096,
@@ -3644,8 +3953,9 @@ def _validate_cli_arguments(
             maximum_items=64,
         )
     ]
-    normalized = [argument.casefold() for argument in arguments]
-    if any(argument.startswith("--") and "=" in argument for argument in normalized):
+    if any(not argument.isascii() for argument in arguments):
+        raise PreflightInputError("Azure CLI role collection arguments must use ASCII")
+    if any(argument.startswith("--") and "=" in argument for argument in arguments):
         raise PreflightInputError("Azure CLI role collection does not allow equals-form arguments")
     switch_flags = {"--include-groups", "--only-show-errors"}
     if include_descendants:
@@ -3674,7 +3984,7 @@ def _validate_cli_arguments(
     seen: set[str] = set()
     index = 0
     while index < len(arguments):
-        argument = normalized[index]
+        argument = arguments[index]
         if argument in seen:
             raise PreflightInputError(f"Azure CLI role collection repeats {argument}")
         if argument in switch_flags:
@@ -3693,8 +4003,6 @@ def _validate_cli_arguments(
             raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
         if argument == "--scope":
             actual_value = _canonical_scope(actual_value)
-        else:
-            actual_value = _normalized(actual_value)
         if actual_value != expected_values[argument]:
             raise PreflightInputError(f"Azure CLI role collection uses the wrong {argument}")
         index += 2
