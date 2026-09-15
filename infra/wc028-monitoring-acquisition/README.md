@@ -16,6 +16,8 @@ match `acquisitionRuntimeConfigurationDigest`.
 - the private Container Apps managed environment and digest-pinned runtime image;
 - the WC-024 collector identity, versioned `monitoring-evidence-signing` key, storage account, and
   immutable `monitoring-evidence` container;
+- the exact versioned monitoring-intent signing key whose public material is required for local
+  signature verification;
 - the WC-025 versioned `change-evidence` container; and
 - the exact workload resource group and Network Watcher named by the acquisition authority.
 
@@ -64,6 +66,7 @@ The deployment adds only:
 
 - `AcrPull` on the existing registry;
 - Activity Log and Resource Graph change-history reads at the approved workload resource group;
+- public-key read access on the exact monitoring-intent signing key;
 - known-Blob read/write data actions on the exact WC-025 `change-evidence` container.
 
 It adds no built-in Reader, Contributor, Owner, list, delete, diagnostic-setting, alert-rule, or

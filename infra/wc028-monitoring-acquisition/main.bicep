@@ -33,6 +33,12 @@ param monitoringEvidenceContainerResourceId string
 @description('Existing exact versioned WC-024 collector signing key URI.')
 param monitoringCollectorSigningKeyUriWithVersion string
 
+@description('Exact monitoring-intent signing key resource ID whose public key may be read.')
+param monitoringIntentSigningKeyResourceId string
+
+@description('Exact versioned monitoring-intent signing key URI trusted by the reviewed runtime configuration.')
+param monitoringIntentSigningKeyUriWithVersion string
+
 @description('Existing immutable source-authority storage account resource ID. It must differ from monitoring evidence storage.')
 param sourceAuthorityStorageAccountResourceId string
 
@@ -122,6 +128,34 @@ var validatedSigningKeyUri = contains(
 )
   ? monitoringCollectorSigningKeyUriWithVersion
   : fail('WC-028 must reuse the exact versioned WC-024 monitoring evidence signing key')
+var monitoringIntentKeyResourceSegments = split(monitoringIntentSigningKeyResourceId, '/')
+var monitoringIntentKeyUriSegments = split(monitoringIntentSigningKeyUriWithVersion, '/')
+var monitoringIntentVaultName = length(monitoringIntentKeyResourceSegments) == 11
+  ? monitoringIntentKeyResourceSegments[8]
+  : ''
+var monitoringIntentKeyName = length(monitoringIntentKeyResourceSegments) == 11
+  ? monitoringIntentKeyResourceSegments[10]
+  : ''
+var monitoringIntentKeyUriPrefix = 'https://${monitoringIntentVaultName}.${environment().suffixes.keyvaultDns}/keys/${monitoringIntentKeyName}/'
+var validatedMonitoringIntentSigningKeyResourceId = length(
+  monitoringIntentKeyResourceSegments
+) == 11 && toLower(monitoringIntentKeyResourceSegments[1]) == 'subscriptions' && toLower(
+  monitoringIntentKeyResourceSegments[3]
+) == 'resourcegroups' && toLower(monitoringIntentKeyResourceSegments[5]) == 'providers' && toLower(
+  monitoringIntentKeyResourceSegments[6]
+) == 'microsoft.keyvault' && toLower(monitoringIntentKeyResourceSegments[7]) == 'vaults' && toLower(
+  monitoringIntentKeyResourceSegments[9]
+) == 'keys' && !empty(monitoringIntentVaultName) && !empty(monitoringIntentKeyName)
+  ? monitoringIntentSigningKeyResourceId
+  : fail('monitoringIntentSigningKeyResourceId must identify one exact Key Vault key')
+var validatedMonitoringIntentSigningKeyUri = length(
+  monitoringIntentKeyUriSegments
+) == 6 && startsWith(
+  toLower(monitoringIntentSigningKeyUriWithVersion),
+  toLower(monitoringIntentKeyUriPrefix)
+) && !empty(monitoringIntentKeyUriSegments[5])
+  ? monitoringIntentSigningKeyUriWithVersion
+  : fail('monitoringIntentSigningKeyUriWithVersion must be one exact versioned URI for monitoringIntentSigningKeyResourceId')
 var configurationDigestCandidate = replace(acquisitionRuntimeConfigurationDigest, 'sha256:', '')
 var configurationDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   configurationDigestCandidate,
@@ -154,6 +188,7 @@ var resourceTags = union(tags, {
   changeEvidenceStorageAccountResourceId: changeEvidenceStorageAccountResourceId
   changeEvidenceContainerResourceId: validatedChangeEvidenceContainerResourceId
   signingKeyUri: validatedSigningKeyUri
+  monitoringIntentSigningKeyUri: validatedMonitoringIntentSigningKeyUri
 })
 var acrPullRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
@@ -172,6 +207,7 @@ module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
     workloadResourceGroupResourceId: workloadResourceGroupResourceId
     changeEvidenceStorageAccountResourceId: changeEvidenceStorageAccountResourceId
     changeEvidenceContainerResourceId: validatedChangeEvidenceContainerResourceId
+    monitoringIntentSigningKeyResourceId: validatedMonitoringIntentSigningKeyResourceId
   }
 }
 
@@ -262,6 +298,10 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
             {
               name: 'ATHENA_WC028_DEPLOYED_COLLECTOR_SIGNING_KEY_ID'
               value: validatedSigningKeyUri
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID'
+              value: validatedMonitoringIntentSigningKeyUri
             }
             {
               name: 'ATHENA_WC028_DEPLOYED_WORKLOAD_RESOURCE_GROUP_ID'

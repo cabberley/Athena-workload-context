@@ -472,6 +472,10 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 self.collector_signing_key.key_vault_key_id,
             ),
             (
+                "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID",
+                self.monitoring_intent_trusted_key.key_vault_key_id,
+            ),
+            (
                 "ATHENA_WC028_DEPLOYED_WORKLOAD_RESOURCE_GROUP_ID",
                 str(contract.get("workloadResourceGroupId", "")),
             ),
@@ -546,6 +550,63 @@ def load_wc028_monitoring_acquisition_job_configuration(
 def _utc_now_milliseconds() -> datetime:
     value = datetime.now(UTC)
     return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+
+class _CredentialBoundAcquisitionClock:
+    """Share the credential verification time with source result claims."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._clock = _utc_now_milliseconds if clock is None else clock
+        self._collection_time: datetime | None = None
+
+    def runtime_now(self) -> datetime:
+        current = self._clock()
+        if (
+            not isinstance(current, datetime)
+            or current.utcoffset() != UTC.utcoffset(current)
+            or current.microsecond % 1000
+        ):
+            raise MonitoringAcquisitionJobError("acquisition runtime clock is not millisecond UTC")
+        if self._collection_time is None:
+            self._collection_time = current
+        return current
+
+    def source_collection_time(self) -> datetime:
+        if self._collection_time is None:
+            raise MonitoringAcquisitionJobError(
+                "credential verification time is unavailable before source I/O"
+            )
+        return self._collection_time
+
+
+def _validate_monitoring_intent_key_lifecycle(
+    *,
+    monitoring_intent: PublishedMonitoringIntent,
+    key_record: TrustedKeyRecord,
+    as_of: datetime,
+) -> None:
+    if (
+        as_of.utcoffset() != UTC.utcoffset(as_of)
+        or as_of.microsecond % 1000
+        or not key_record.enabled
+        or key_record.activated_at > monitoring_intent.published_at
+        or key_record.activated_at > as_of
+        or (key_record.retired_at is not None and key_record.retired_at <= as_of)
+        or (
+            key_record.expires_at is not None
+            and (
+                key_record.expires_at <= monitoring_intent.published_at
+                or key_record.expires_at <= as_of
+            )
+        )
+    ):
+        raise MonitoringAcquisitionJobError(
+            "monitoring intent signing key is not trusted for publication and acquisition"
+        )
 
 
 def _azure_utc_milliseconds(value: object, *, label: str) -> datetime:
@@ -1957,6 +2018,29 @@ def run_wc028_monitoring_acquisition_job(
         trusted_key_anchor=configuration.monitoring_intent_trusted_key.anchor,
         managed_identity_client_id=configuration.managed_identity_client_id,
     )
+    expected_intent_key_record = TrustedKeyRecord(
+        anchor=configuration.monitoring_intent_trusted_key.anchor,
+        public_key=intent_verifier.public_key,
+        enabled=True,
+        activated_at=configuration.monitoring_intent_trusted_key.activated_at,
+        expires_at=configuration.monitoring_intent_trusted_key.expires_at,
+    )
+    intent_key_resolver = KeyVaultTrustedKeyResolver(
+        expected_record=expected_intent_key_record,
+        managed_identity_client_id=configuration.managed_identity_client_id,
+    )
+    resolved_intent_key_record = intent_key_resolver(
+        configuration.monitoring_intent_trusted_key.anchor
+    )
+    if resolved_intent_key_record is None:
+        raise MonitoringAcquisitionJobError(
+            "monitoring intent signing key is not the pinned enabled version"
+        )
+    _validate_monitoring_intent_key_lifecycle(
+        monitoring_intent=monitoring_intent,
+        key_record=resolved_intent_key_record,
+        as_of=_utc_now_milliseconds(),
+    )
     validate_published_monitoring_intent_assets(
         intent_reference,
         monitoring_intent,
@@ -2023,6 +2107,7 @@ def run_wc028_monitoring_acquisition_job(
         monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
         monitoring_intent_asset_loader=load_intent_assets,
     )
+    acquisition_clock = _CredentialBoundAcquisitionClock()
     transport = AzureManagedIdentityJsonTransport(
         timeout_seconds=configuration.http_timeout_seconds,
         retry_limit=configuration.http_retry_limit,
@@ -2034,10 +2119,12 @@ def run_wc028_monitoring_acquisition_job(
         network_watcher_resource_id=configuration.network_watcher_resource_id,
         authorized_resource_ids=acquisition_authority.allowed_resource_ids,
         transport=transport,
+        clock=acquisition_clock.source_collection_time,
     )
     acquisition_adapter = CredentialBoundMonitoringAcquisitionAdapter(
         reviewed_collector_contract=collector_contract,
         acquisition_port=port,
+        utc_now=acquisition_clock.runtime_now,
     )
     monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
         blob_endpoint=configuration.evidence_blob_endpoint,

@@ -37,8 +37,10 @@ from athena_context.monitoring_acquisition_runtime import (
     Wc028MonitoringAcquisitionJobConfiguration,
     _build_acquisition_receipt_verifier,
     _coverage_descriptor,
+    _CredentialBoundAcquisitionClock,
     _result,
     _validate_acquisition_authority_preflight,
+    _validate_monitoring_intent_key_lifecycle,
     load_wc028_monitoring_acquisition_job_configuration,
 )
 
@@ -274,6 +276,14 @@ def test_configuration_rejects_deployment_binding_substitution(
     with pytest.raises(ValidationError, match="DEPLOYED_COLLECTOR"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(_configuration_payload())
 
+    monkeypatch.delenv("ATHENA_WC028_DEPLOYED_COLLECTOR_IDENTITY_PRINCIPAL_ID")
+    monkeypatch.setenv(
+        "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID",
+        COLLECTOR_KEY_ID,
+    )
+    with pytest.raises(ValidationError, match="MONITORING_INTENT_SIGNING_KEY"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(_configuration_payload())
+
 
 def test_configuration_loader_is_bounded_and_unambiguous(tmp_path: Path) -> None:
     path = tmp_path / "configuration.json"
@@ -432,6 +442,78 @@ def test_receipt_verifier_reuses_hardened_identity_and_key_policy(
     assert captured["maximum_receipt_age_seconds"] == 300
 
 
+def test_credential_bound_clock_keeps_source_claims_at_verification_time() -> None:
+    values = iter((NOW, NOW + timedelta(seconds=1)))
+    clock = _CredentialBoundAcquisitionClock(clock=lambda: next(values))
+
+    with pytest.raises(MonitoringAcquisitionJobError, match="verification time"):
+        clock.source_collection_time()
+
+    assert clock.runtime_now() == NOW
+    assert clock.source_collection_time() == NOW
+    assert clock.runtime_now() == NOW + timedelta(seconds=1)
+    assert clock.source_collection_time() == NOW
+
+
+def test_monitoring_intent_key_lifecycle_is_enforced() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    fingerprint = sha256_hex(
+        public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    trusted_key = MonitoringRuntimeTrustedKey(
+        keyVaultKeyId=INTENT_KEY_ID,
+        publicKeyFingerprint=fingerprint,
+        activatedAt=NOW - timedelta(days=2),
+    )
+    monitoring_intent = cast(
+        Any,
+        SimpleNamespace(published_at=NOW - timedelta(days=1)),
+    )
+    record = TrustedKeyRecord(
+        anchor=trusted_key.anchor,
+        public_key=public_key,
+        enabled=True,
+        activated_at=NOW - timedelta(days=2),
+    )
+
+    _validate_monitoring_intent_key_lifecycle(
+        monitoring_intent=monitoring_intent,
+        key_record=record,
+        as_of=NOW,
+    )
+
+    not_active_at_publication = TrustedKeyRecord(
+        anchor=trusted_key.anchor,
+        public_key=public_key,
+        enabled=True,
+        activated_at=NOW,
+    )
+    with pytest.raises(MonitoringAcquisitionJobError, match="not trusted"):
+        _validate_monitoring_intent_key_lifecycle(
+            monitoring_intent=monitoring_intent,
+            key_record=not_active_at_publication,
+            as_of=NOW,
+        )
+
+    expired = TrustedKeyRecord(
+        anchor=trusted_key.anchor,
+        public_key=public_key,
+        enabled=True,
+        activated_at=NOW - timedelta(days=2),
+        expires_at=NOW,
+    )
+    with pytest.raises(MonitoringAcquisitionJobError, match="not trusted"):
+        _validate_monitoring_intent_key_lifecycle(
+            monitoring_intent=monitoring_intent,
+            key_record=expired,
+            as_of=NOW,
+        )
+
+
 def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -497,7 +579,7 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         "MonitoringAcquisitionAuthority": acquisition_authority,
     }
     captured: dict[str, object] = {}
-    key_resolver = cast(Any, lambda _anchor: None)
+    key_resolver = cast(Any, lambda _anchor: object())
     transaction = object()
     commit_port = object()
     acquisition_adapter = object()
@@ -517,6 +599,11 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         runtime_module,
         "validate_monitoring_intent_activation_eligible",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_monitoring_intent_key_lifecycle",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
         runtime_module,
@@ -634,6 +721,13 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     adapter_arguments = cast(dict[str, object], captured["adapter"])
     assert adapter_arguments["reviewed_collector_contract"] is collector_contract
     assert adapter_arguments["acquisition_port"] is captured["port"]
+    runtime_clock = cast(Any, adapter_arguments["utc_now"])
+    source_clock = cast(
+        Any,
+        cast(dict[str, object], captured["port"])["clock"],
+    )
+    assert runtime_clock() == NOW
+    assert source_clock() == NOW
     commit_arguments = cast(dict[str, object], captured["commit"])
     assert commit_arguments["key_resolver"] is key_resolver
     assert commit_arguments["reviewed_collector_contract"] is collector_contract

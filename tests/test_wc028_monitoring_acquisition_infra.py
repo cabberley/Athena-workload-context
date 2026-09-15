@@ -24,6 +24,8 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "monitoringEvidenceStorageAccountResourceId",
         "monitoringEvidenceContainerResourceId",
         "monitoringCollectorSigningKeyUriWithVersion",
+        "monitoringIntentSigningKeyResourceId",
+        "monitoringIntentSigningKeyUriWithVersion",
         "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_JSON",
         "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_DIGEST",
         "secretRef: 'wc028-runtime-configuration'",
@@ -34,6 +36,7 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "ATHENA_WC028_DEPLOYED_EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_EVIDENCE_CONTAINER_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_COLLECTOR_SIGNING_KEY_ID",
+        "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID",
         "ATHENA_WC028_DEPLOYED_WORKLOAD_RESOURCE_GROUP_ID",
         "ATHENA_WC028_DEPLOYED_NETWORK_WATCHER_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_CHANGE_EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID",
@@ -55,10 +58,7 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
 
 
 def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
-    source = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in sorted(INFRA.rglob("*.bicep"))
-    )
+    source = "\n".join(path.read_text(encoding="utf-8") for path in sorted(INFRA.rglob("*.bicep")))
 
     for forbidden in (
         "acdd72a7-3385-48ef-bd42-f606fba81ae7",
@@ -75,6 +75,9 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
         "'*/write'",
         "containers/blobs/delete",
         "containers/blobs/list",
+        "Microsoft.KeyVault/vaults/keys/sign/action",
+        "Microsoft.KeyVault/vaults/keys/write",
+        "Microsoft.KeyVault/vaults/keys/delete",
         "listKeys(",
         "connectionString",
     ):
@@ -86,18 +89,19 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
         "Microsoft.Resources/changes/read",
         "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
         "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+        "Microsoft.KeyVault/vaults/keys/read",
         "changeEvidenceBlobService.properties.isVersioningEnabled == true",
     ):
         assert required_permission in source
 
-    assert source.count("Microsoft.Authorization/roleAssignments") == 3
+    assert source.count("Microsoft.Authorization/roleAssignments") == 4
     for role_name in (
         "boundedAcquisitionReaderRole",
         "createOnlyChangeEvidenceRole",
+        "monitoringIntentKeyReaderRole",
     ):
         assert (
-            f"resource {role_name} "
-            "'Microsoft.Authorization/roleDefinitions@2022-04-01'"
+            f"resource {role_name} 'Microsoft.Authorization/roleDefinitions@2022-04-01'"
         ) in source
     assert "autoRemediation: 'disabled'" in source
     assert "normalizedCollectorIdentityResourceId != normalizedContextIdentityResourceId" in source
@@ -107,3 +111,4 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
     ) in source
     assert "scope: workloadResourceGroup" in source
     assert "scope: changeEvidenceContainer" in source
+    assert "scope: key" in source
