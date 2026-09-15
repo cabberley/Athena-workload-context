@@ -11,6 +11,9 @@ BLOB_READER_RBAC = (
 KEY_VERIFIER_RBAC = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-verifier-rbac.bicep"
 )
+KEY_SIGN_VERIFY_RBAC = (
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-sign-verify-rbac.bicep"
+)
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -78,15 +81,15 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     ):
         assert removed not in source
 
-    for scope in (
-        "scope: reportKey",
-        "scope: guidanceKey",
-        "scope: enrichmentKey",
-        "scope: feedKey",
-        "scope: notificationKey",
+    for module_name in (
+        "reportSignerRbac",
+        "guidanceSignerRbac",
+        "enrichmentSignerRbac",
+        "feedSignerRbac",
+        "notificationSignerRbac",
     ):
-        assert scope in source
-    assert source.count("keyVaultCryptoUserRoleDefinitionId") >= 10
+        assert f"module {module_name} 'modules/key-sign-verify-rbac.bicep'" in source
+    assert "keyVaultCryptoUserRoleDefinitionId" not in source
     assert "module producerImagePull" in source
     assert "attached runtime identity resource IDs must be distinct" in source
 
@@ -267,13 +270,23 @@ def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
         "feedV2ProducerReaderIdentity",
         "feedV2WriterIdentity",
         "registryWriterIdentity",
-        "reportSignerIdentity",
-        "guidanceSignerIdentity",
-        "enrichmentSignerIdentity",
-        "feedSignerIdentity",
-        "notificationSignerIdentity",
     ):
         assert f"principalId: {identity}.properties.principalId" in source
+
+    sign_verify = KEY_SIGN_VERIFY_RBAC.read_text(encoding="utf-8")
+    assert "principalId: identity.properties.principalId" in sign_verify
+    assert "scope: key" in sign_verify
+    assert "Microsoft.KeyVault/vaults/keys/sign/action" in sign_verify
+    assert "Microsoft.KeyVault/vaults/keys/verify/action" in sign_verify
+    for forbidden in (
+        "keys/read",
+        "keys/encrypt/action",
+        "keys/decrypt/action",
+        "keys/wrap/action",
+        "keys/unwrap/action",
+        "keys/delete",
+    ):
+        assert forbidden not in sign_verify
 
     for identity in (
         "trustReaderIdentity",

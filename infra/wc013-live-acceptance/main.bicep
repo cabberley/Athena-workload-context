@@ -320,6 +320,13 @@ var registrySecretReferenceProperty = join([
 ], '')
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var rejectedIncidentFixtureFingerprint = 'sha256:22be507b9bc31492e1dec2c0f8e9db1c75ca999c13dfb6670e2cce2320ee1a2e'
+var wc027ExpectedScalerMetadataKeys = [
+  'namespace'
+  'queueName'
+  'messageCount'
+  'cloud'
+  'isSessionsEnabled'
+]
 var validatedWc016RuntimeEnabled = wc016RuntimeEnabled && !wc016LegacyCleanupConfirmed
   ? fail('WC-016 cannot be activated until the exact legacy cleanup report confirms zero residuals')
   : wc016RuntimeEnabled && signingKeyFingerprint == rejectedIncidentFixtureFingerprint
@@ -403,6 +410,10 @@ var wc027PublisherHasUngovernedContainerFeatures = wc027PublisherReady && wc027P
 var wc027PublisherHasSecretScalerAuth = wc027PublisherReady && wc027PublisherJobResourceIdValid && length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
   ? !empty(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].auth)
   : false
+var wc027PublisherScalerMetadataKeys = wc027PublisherReady && wc027PublisherJobResourceIdValid && length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+  ? map(items(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata), item => item.key)
+  : []
+var wc027PublisherScalerMetadataFieldsMatch = length(wc027PublisherScalerMetadataKeys) == length(wc027ExpectedScalerMetadataKeys) && length(union(wc027PublisherScalerMetadataKeys, wc027ExpectedScalerMetadataKeys)) == length(wc027ExpectedScalerMetadataKeys)
 var wc027PublisherHasSecretRegistryAuth = wc027PublisherReady && wc027PublisherJobResourceIdValid && length(wc027PublisherJob!.properties.configuration.registries) == 1
   ? !empty(wc027PublisherJob!.properties.configuration.registries[0].username) || !empty(wc027PublisherJob!.properties.configuration.registries[0][registrySecretReferenceProperty])
   : false
@@ -459,6 +470,8 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
                               ? fail('WC-027 publisher Job scaler type does not match')
                             : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity != wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
                               ? fail('WC-027 publisher Job scaler identity does not match')
+                              : wc027PublisherReady && !wc027PublisherScalerMetadataFieldsMatch
+                                ? fail('WC-027 publisher Job scaler metadata fields do not match')
                               : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace != first(split(wc027ParsedPublisherConfiguration.serviceBus.namespace, '.'))
                                 ? fail('WC-027 publisher Job scaler namespace does not match')
                                 : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName != wc027ParsedPublisherConfiguration.serviceBus.requestQueueName
@@ -617,6 +630,10 @@ var wc027ProducerHasUngovernedContainerFeatures = wc027FeedV2ProducerReady && wc
 var wc027ProducerHasSecretScalerAuth = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && length(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
   ? !empty(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].auth)
   : false
+var wc027ProducerScalerMetadataKeys = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && length(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+  ? map(items(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata), item => item.key)
+  : []
+var wc027ProducerScalerMetadataFieldsMatch = length(wc027ProducerScalerMetadataKeys) == length(wc027ExpectedScalerMetadataKeys) && length(union(wc027ProducerScalerMetadataKeys, wc027ExpectedScalerMetadataKeys)) == length(wc027ExpectedScalerMetadataKeys)
 var wc027ProducerHasSecretRegistryAuth = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && length(wc027ProducerJob!.properties.configuration.registries) == 1
   ? !empty(wc027ProducerJob!.properties.configuration.registries[0].username) || !empty(wc027ProducerJob!.properties.configuration.registries[0][registrySecretReferenceProperty])
   : false
@@ -678,6 +695,8 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
                                             ? fail('WC-027 producer Job scaler type does not match')
                                           : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity != wc027ParsedConfiguration.serviceBus.brokerIdentityResourceId
                                             ? fail('WC-027 producer Job scaler identity does not match')
+                                            : wc027FeedV2ProducerReady && !wc027ProducerScalerMetadataFieldsMatch
+                                              ? fail('WC-027 producer Job scaler metadata fields do not match')
                                             : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace != first(split(wc027ParsedConfiguration.serviceBus.namespace, '.'))
                                               ? fail('WC-027 producer Job scaler namespace does not match')
                                               : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName != wc027ParsedConfiguration.serviceBus.triggerQueueName

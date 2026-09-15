@@ -97,8 +97,9 @@ correlation reader identities/storage domains, and reused producer signing keys 
 - the empty private `wc027-guidance-authority` source container needed to establish the producer
   reader boundary before the separately governed publisher receives create-only access;
 - Key Vault public-key reader;
-- one exact-key Crypto User assignment for each report, guidance, enrichment, feed, and
-  notification signer; and
+- one custom exact-key sign-and-verify role for each report, guidance, enrichment, feed, and
+  notification signer, with no key read, encrypt, decrypt, wrap, unwrap, release, update, or
+  delete actions; and
 - ACR pull for the broker identity.
 
 Supply the referenced resource IDs/names (user-assigned identities, replay storage account,
@@ -124,6 +125,20 @@ closed. It also requires the producer trigger, publisher request, and notificati
 to be `Active`, non-forwarding, explicitly non-auto-deleting, and to match their exact
 stage-specific session, duplicate-detection window, TTL, lock, delivery-count, capacity, batching,
 partitioning, and message-size profiles.
+
+The deployment output validator parses the generated producer JSON through
+`Wc027EnrichmentFeedProductionConfiguration` and the publisher JSON through
+`Wc027GuidanceAuthorityPublisherConfiguration` before accepting any partial output projection.
+Both Python and WC-013 Bicep readiness also require scaler metadata to contain exactly
+`namespace`, `queueName`, `messageCount`, `cloud`, and `isSessionsEnabled`; legacy
+`activationMessageCount` and every other extra field fail closed.
+
+Upgrades from the earlier built-in Key Vault Crypto User assignments use a separate reviewed
+same-principal migration list. Supply each of the five exact legacy deterministic assignment IDs
+with `--legacy-crypto-user-migration-assignment` during producer planning. Planning requires the
+listed assignments to be present and exact; controlled operator revocation must remove them before
+`apply`, and producer/publisher/live-acceptance verification independently confirms that none of
+the five deterministic legacy IDs remains. The orchestrator never deletes them.
 
 For WC-029 deployment, do not deploy this root as an untracked side step. Use the governed
 foundation -> producer -> publisher -> live-acceptance sequence in
@@ -272,12 +287,14 @@ rejected. The publisher must be ready and the WC-016 runtime must be enabled.
   already-created publisher sender assignment on `wc027-enrichment-feed-requests`. Producer
   verification enumerates the complete direct assignment set at that queue. It accepts only current
   producer assignments, the deterministic current publisher assignment, and up to four exact
-  retired queue-assignment IDs explicitly approved in the reviewed plan. Fresh deployment requires no
-  publisher assignment. Planning proves each approved retired assignment is present and exact;
-  controlled operator revocation must then remove it before `apply` reruns the final what-if or
-  performs any deployment. Post-deployment readiness checks the queue again before emitting a
-  handoff. The orchestrator performs no automatic RBAC deletion and allows no broad publisher
-  exemption.
+  retired queue-assignment IDs explicitly approved with
+  `--rotation-transition-assignment`. The same reviewed transition model covers every other
+  deterministic assignment affected by identity rotation, including notification and publisher
+  queues, exact keys, Blob containers, Tables, and ACR. Planning proves every approved retired
+  assignment is present and conforms to an approved exact role/condition profile; controlled
+  operator revocation must then remove all of them before `apply` reruns the final what-if or
+  performs any deployment. Post-deployment readiness verifies their continued absence. The
+  orchestrator performs no automatic RBAC deletion and allows no broad publisher exemption.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.

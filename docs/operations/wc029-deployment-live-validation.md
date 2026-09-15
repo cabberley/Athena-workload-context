@@ -277,6 +277,17 @@ Run the four orchestration stages in order. Use a unique deployment name and a n
 directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
 `apply`; the apply command rejects any changed byte.
 
+The plan schema is `athena.wc029DeploymentPlan.v3`. Every Azure deployment validate, what-if, and
+create command includes `--no-prompt true`, and the subprocess receives no stdin. Before any Azure
+validation, the orchestrator compiles the exact Bicep template and requires the effective parameter
+document to contain every template parameter without a default value. Missing reviewed values
+cannot be supplied interactively.
+
+Use `--rotation-transition-assignment <exact-role-assignment-id>` for retired-principal
+assignments. Producer upgrades from the earlier signer grants use the distinct
+`--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` option because those
+assignments remain bound to the current signer principals while their role profile changes.
+
 ```powershell
 $Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
 
@@ -361,15 +372,25 @@ publisher retry, or a later producer upgrade, only the deterministic assignment 
 its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
 The complete set of direct assignments at the dedicated trigger queue must contain only the current
 producer assignments, the current deterministic publisher assignment when present, and at most
-four exact retired transition IDs explicitly recorded in the reviewed plan's `--allow-change`
-entries. Planning requires each approved transition assignment to be present and validates its
-retired service principal, exact queue scope, Service Bus Data Receiver or Data Sender role, and
-absent condition. After the plan is independently reviewed, an operator performs separately
-approved controlled revocation. `apply` then requires every transition ID to be absent before it
-reruns the final byte-exact what-if or starts deployment, and the post-deployment readiness check
-repeats that absence requirement before emitting a handoff. The orchestrator never deletes RBAC
-automatically. Any stale unapproved assignment, current-principal duplicate, missing current
-assignment, or leaked assignment page fails closed.
+four exact retired queue transition IDs. Record transition IDs separately with
+`--rotation-transition-assignment`; do not overload the what-if `--allow-change` list. The reviewed
+plan carries a bounded maximum of 32 transition assignments across all rotated-identity scopes,
+including notification sender, publisher request receiver, exact Key Vault roles, Blob and Table
+assignments, and ACR pull. Planning requires every approved transition ID to be present, bound to a
+retired service principal, and constrained to an approved exact scope/role/condition profile.
+After independent plan review, an operator performs separately approved controlled revocation.
+`apply` requires every transition ID to be absent before rerunning the final byte-exact what-if or
+starting deployment, and post-deployment verification repeats that absence requirement before
+emitting a handoff. The orchestrator never deletes RBAC automatically. Any stale unapproved queue
+assignment, current-principal duplicate, missing current assignment, malformed transition role, or
+leaked assignment page fails closed.
+
+The five deterministic legacy Key Vault Crypto User assignments are not classified as retired
+identity transitions. Producer planning carries them in the separately bounded
+`legacyCryptoUserMigrationAssignmentIds` plan field, validates their current signer principals and
+exact key scopes, and requires the reviewed set to match the assignments still present. They must
+be manually revoked before create; apply and every later producer dependency check require all
+five IDs to remain absent.
 
 Publisher verification re-queries effective RBAC for the union of publisher principals and every
 producer principal proven by the independently approved producer binding. Separated producer-only

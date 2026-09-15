@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,12 @@ from uuid import UUID, uuid5
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from athena_context.enrichment.production import (  # noqa: E402
+    Wc027EnrichmentFeedProductionConfiguration,
+)
+from athena_context.guidance.production import (  # noqa: E402
+    Wc027GuidanceAuthorityPublisherConfiguration,
+)
 from athena_context.wc029_preflight import (  # noqa: E402
     PreflightInputError,
     evaluate_role_assignments,
@@ -49,8 +56,10 @@ GRAPH_HOST = "graph.microsoft.com"
 MAX_TRANSITIVE_GROUPS = 10_000
 MAX_GRAPH_MEMBERSHIP_PAGES = 128
 MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
+MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS = 32
+MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS = 5
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
-PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v2"
+PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v3"
 HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v2"
 RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v1"
 HANDOFF_FIELDS = frozenset(
@@ -89,6 +98,8 @@ PLAN_FIELDS = frozenset(
         "whatIfPath",
         "whatIfSha256",
         "allowedChangeResourceIds",
+        "rotationTransitionAssignmentIds",
+        "legacyCryptoUserMigrationAssignmentIds",
         "foundationHandoffPath",
         "foundationHandoffSha256",
         "producerHandoffPath",
@@ -159,6 +170,15 @@ PUBLISHER_INVOCATION_BOUNDARY = {
 }
 SERVICE_BUS_NON_AUTO_DELETE_DURATION = "P10675199DT2H48M5.4775807S"
 PRODUCER_TRIGGER_QUEUE_NAME = "wc027-enrichment-feed-requests"
+SCALER_METADATA_FIELDS = frozenset(
+    {
+        "namespace",
+        "queueName",
+        "messageCount",
+        "cloud",
+        "isSessionsEnabled",
+    }
+)
 PRODUCER_TRIGGER_QUEUE_PROFILE = {
     "status": "Active",
     "autoDeleteOnIdle": SERVICE_BUS_NON_AUTO_DELETE_DURATION,
@@ -495,7 +515,16 @@ def _validate_subscription_boundary(
                 and "/subscriptions/" in child.casefold()
                 and (normalized_key in {"id", "scope"} or normalized_key.endswith("id"))
             )
-            declared_resource_id = normalized_key.endswith("resourceid") and child not in (None, "")
+            versioned_collector_key_uri = (
+                child_field.casefold().endswith("monitoringcollectorcontract.signingkeyresourceid")
+                and isinstance(child, str)
+                and child.startswith("https://")
+            )
+            declared_resource_id = (
+                normalized_key.endswith("resourceid")
+                and child not in (None, "")
+                and not versioned_collector_key_uri
+            )
             if id_like_value or declared_resource_id:
                 _canonical_subscription_resource_id(
                     child,
@@ -690,6 +719,48 @@ def _load_parameters(path: Path) -> dict[str, dict[str, object]]:
             raise OrchestrationError(f"parameters.{name} must contain exactly one value property")
         normalized[name] = {"value": entry["value"]}
     return normalized
+
+
+def _required_template_parameter_names(stage: str) -> set[str]:
+    template = _mapping(
+        _run_json(
+            [
+                "az",
+                "bicep",
+                "build",
+                "--file",
+                str(TEMPLATES[stage]),
+                "--stdout",
+            ],
+            field=f"compiled {stage} Bicep template",
+        ),
+        field=f"compiled {stage} Bicep template",
+    )
+    parameters = _mapping(
+        template.get("parameters"),
+        field=f"compiled {stage} template parameters",
+    )
+    required: set[str] = set()
+    for name, raw_definition in parameters.items():
+        definition = _mapping(
+            raw_definition,
+            field=f"compiled {stage} template parameter {name}",
+        )
+        if "defaultValue" not in definition:
+            required.add(name)
+    return required
+
+
+def _verify_effective_parameter_completeness(
+    stage: str,
+    parameters: Mapping[str, Mapping[str, object]],
+) -> None:
+    missing = _required_template_parameter_names(stage) - set(parameters)
+    if missing:
+        raise OrchestrationError(
+            "effective parameter document omits required template parameters: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def _parameter_value(
@@ -1043,6 +1114,7 @@ def _load_plan_manifest(
         effective_parameters,
         subscription_id=subscription_id,
     )
+    _verify_effective_parameter_completeness(stage, effective_parameters)
     what_if = _read_json(what_if_path)
     _validate_subscription_boundary(
         what_if,
@@ -1066,6 +1138,22 @@ def _load_plan_manifest(
         {item.casefold() for item in allowed_changes}
     ) != len(allowed_changes):
         raise OrchestrationError("plan allowed change resource IDs must be sorted and distinct")
+    rotation_transition_assignments = _canonical_rotation_transition_assignments(
+        manifest.get("rotationTransitionAssignmentIds"),
+        subscription_id=subscription_id,
+        field="plan rotation transition assignments",
+    )
+    if manifest.get("rotationTransitionAssignmentIds") != (rotation_transition_assignments):
+        raise OrchestrationError("plan rotation transition assignment IDs must be sorted")
+    legacy_crypto_user_migration_assignments = _canonical_legacy_crypto_user_migration_assignments(
+        manifest.get("legacyCryptoUserMigrationAssignmentIds"),
+        subscription_id=subscription_id,
+        field="plan legacy Crypto User migration assignments",
+    )
+    if manifest.get("legacyCryptoUserMigrationAssignmentIds") != (
+        legacy_crypto_user_migration_assignments
+    ):
+        raise OrchestrationError("plan legacy Crypto User migration assignment IDs must be sorted")
     violations = evaluate_what_if(
         what_if,
         allowed_change_ids=frozenset(allowed_changes),
@@ -1321,6 +1409,28 @@ def _load_verified_predecessors(
     return verified
 
 
+def _predecessor_rotation_transition_assignment_ids(
+    verified: Mapping[str, Mapping[str, object]],
+    *,
+    subscription_id: str,
+) -> set[str]:
+    transition_ids: set[str] = set()
+    for predecessor, record in verified.items():
+        plan = _mapping(
+            record.get("plan"),
+            field=f"verified {predecessor} plan",
+        )
+        transition_ids.update(
+            resource_id.casefold()
+            for resource_id in _canonical_rotation_transition_assignments(
+                plan.get("rotationTransitionAssignmentIds"),
+                subscription_id=subscription_id,
+                field=f"{predecessor} rotation transition assignments",
+            )
+        )
+    return transition_ids
+
+
 def _predecessor_receipt_references(
     verified: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
@@ -1509,6 +1619,12 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
             "producer configuration digest does not hash the exact deployed JSON"
         )
     try:
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(configuration_json)
+    except (TypeError, ValueError) as exc:
+        raise OrchestrationError(
+            "producer configuration fails the authoritative production model"
+        ) from exc
+    try:
         configuration = _mapping(
             json.loads(configuration_json),
             field="producer configuration",
@@ -1673,6 +1789,12 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         raise OrchestrationError(
             "publisher configuration digest does not hash the exact deployed JSON"
         )
+    try:
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(configuration_json)
+    except (TypeError, ValueError) as exc:
+        raise OrchestrationError(
+            "publisher configuration fails the authoritative production model"
+        ) from exc
     try:
         configuration = _mapping(
             json.loads(configuration_json),
@@ -2180,6 +2302,8 @@ def _az_command(
             str(TEMPLATES[stage]),
             "--parameters",
             str(parameter_path),
+            "--no-prompt",
+            "true",
             "--only-show-errors",
             "--output",
             "json",
@@ -2191,9 +2315,16 @@ def _az_command(
 
 
 def _run(command: Sequence[str]) -> str:
+    resolved_command = list(command)
+    if resolved_command and resolved_command[0] == "az":
+        az_executable = shutil.which("az") or shutil.which("az.cmd")
+        if az_executable is None:
+            raise OrchestrationError("Azure CLI executable is unavailable")
+        resolved_command[0] = az_executable
     completed = subprocess.run(  # noqa: S603
-        list(command),
+        resolved_command,
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
@@ -2435,6 +2566,9 @@ KEY_VERIFY_PERMISSION_PROFILE = _RolePermissionProfile(
     data_actions=frozenset({KEY_READ_DATA_ACTION, KEY_VERIFY_DATA_ACTION})
 )
 KEY_SIGN_PERMISSION_PROFILE = _RolePermissionProfile(data_actions=frozenset({KEY_SIGN_DATA_ACTION}))
+KEY_SIGN_VERIFY_PERMISSION_PROFILE = _RolePermissionProfile(
+    data_actions=frozenset({KEY_SIGN_DATA_ACTION, KEY_VERIFY_DATA_ACTION})
+)
 APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES = frozenset(
     {
         FEED_BLOB_WRITER_PERMISSION_PROFILE,
@@ -2442,6 +2576,7 @@ APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES = frozenset(
         TABLE_CAS_PERMISSION_PROFILE,
         KEY_VERIFY_PERMISSION_PROFILE,
         KEY_SIGN_PERMISSION_PROFILE,
+        KEY_SIGN_VERIFY_PERMISSION_PROFILE,
     }
 )
 ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE = {
@@ -2474,7 +2609,11 @@ ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE = {
         {TABLE_CAS_PERMISSION_PROFILE}
     ),
     "microsoft.keyvault/vaults/keys": frozenset(
-        {KEY_VERIFY_PERMISSION_PROFILE, KEY_SIGN_PERMISSION_PROFILE}
+        {
+            KEY_VERIFY_PERMISSION_PROFILE,
+            KEY_SIGN_PERMISSION_PROFILE,
+            KEY_SIGN_VERIFY_PERMISSION_PROFILE,
+        }
     ),
 }
 
@@ -2682,7 +2821,7 @@ def _producer_expected_rbac_assignments(
     subscription_id: str,
 ) -> dict[str, _ExpectedRoleAssignment]:
     role_definition_ids = _binding_role_definition_ids(binding)
-    if len(role_definition_ids) != 7:
+    if len(role_definition_ids) != 12:
         raise OrchestrationError(
             "producer deployment binding does not contain its exact custom role definitions"
         )
@@ -2911,10 +3050,6 @@ def _producer_expected_rbac_assignments(
             subscription_id,
             TABLE_DATA_READER_ROLE_ID,
         ),
-        "key_crypto_user": _built_in_role_definition_id(
-            subscription_id,
-            KEY_VAULT_CRYPTO_USER_ROLE_ID,
-        ),
     }
 
     expected = [
@@ -3081,12 +3216,15 @@ def _producer_expected_rbac_assignments(
             custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
     ]
-    for name, scope in (
-        ("report", report_key_id),
-        ("guidance", guidance_key_id),
-        ("enrichment", enrichment_key_id),
-        ("feed", feed_key_id),
-        ("notification", notification_key_id),
+    for role_index, (name, scope) in enumerate(
+        (
+            ("report", report_key_id),
+            ("guidance", guidance_key_id),
+            ("enrichment", enrichment_key_id),
+            ("feed", feed_key_id),
+            ("notification", notification_key_id),
+        ),
+        start=7,
     ):
         expected.append(
             _expected_role_assignment(
@@ -3097,7 +3235,8 @@ def _producer_expected_rbac_assignments(
                 ),
                 principal_ids_by_identity=principal_ids_by_identity,
                 scope=scope,
-                role_definition_id=built_in_roles["key_crypto_user"],
+                role_definition_id=role_definition_ids[role_index],
+                custom_role_permissions=KEY_SIGN_VERIFY_PERMISSION_PROFILE,
             )
         )
     for index, identity_resource_id in enumerate(
@@ -3161,6 +3300,54 @@ def _prospective_publisher_sender_assignment(
             ),
         )
     }
+
+
+def _producer_legacy_crypto_user_assignments(
+    *,
+    configuration: Mapping[str, object],
+    foundation_values: Mapping[str, object],
+    principal_ids_by_identity: Mapping[str, str],
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    keys = _mapping(configuration.get("keys"), field="producer keys")
+    key_vault_id = _azure_resource_id(
+        foundation_values.get("keyVaultResourceId"),
+        field="producer foundation Key Vault resource ID",
+    )
+    role_definition_id = _built_in_role_definition_id(
+        subscription_id,
+        KEY_VAULT_CRYPTO_USER_ROLE_ID,
+    )
+    expected: dict[str, _ExpectedRoleAssignment] = {}
+    for name in (
+        "report",
+        "guidance",
+        "enrichment",
+        "feed",
+        "notification",
+    ):
+        key = _mapping(keys.get(name), field=f"producer key {name}")
+        identity_resource_id = _configured_identity_resource_id(
+            key,
+            field=f"producer key {name}",
+        )
+        scope = (
+            f"{key_vault_id}/keys/"
+            f"{_key_name(_string(key.get('keyVaultKeyId'), field=f'producer key {name} URI'))}"
+        )
+        assignment_id = _deterministic_role_assignment_id(
+            scope,
+            identity_resource_id,
+            KEY_VAULT_CRYPTO_USER_ROLE_ID,
+        )
+        expected[assignment_id.casefold()] = _expected_role_assignment(
+            f"legacy producer {name} Crypto User migration",
+            identity_resource_id=identity_resource_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=scope,
+            role_definition_id=role_definition_id,
+        )
+    return expected
 
 
 def _planned_trigger_queue_assignments(
@@ -3256,6 +3443,88 @@ def _planned_trigger_queue_assignments(
     return expected
 
 
+def _planned_legacy_crypto_user_assignments(
+    *,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    resource_group: str,
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    key_vault_name = _string(
+        _parameter_value(effective_parameters, "keyVaultName"),
+        field="planned producer Key Vault name",
+    )
+    signer_bindings = (
+        ("report", "reportSigningKeyName", "reportSignerIdentityResourceId"),
+        (
+            "guidance",
+            "guidanceSigningKeyName",
+            "guidanceSignerIdentityResourceId",
+        ),
+        (
+            "enrichment",
+            "enrichmentSigningKeyName",
+            "enrichmentSignerIdentityResourceId",
+        ),
+        ("feed", "feedSigningKeyName", "feedSignerIdentityResourceId"),
+        (
+            "notification",
+            "notificationSigningKeyName",
+            "notificationSignerIdentityResourceId",
+        ),
+    )
+    identity_resource_ids = [
+        _azure_resource_id(
+            _parameter_value(effective_parameters, identity_parameter),
+            field=f"planned producer {name} signer identity",
+        )
+        for name, _key_parameter, identity_parameter in signer_bindings
+    ]
+    principal_ids_by_identity = _verify_identities(
+        {},
+        additional_identity_resource_ids=identity_resource_ids,
+        rbac_identity_resource_ids=identity_resource_ids,
+        subscription_id=subscription_id,
+    )
+    role_definition_id = _built_in_role_definition_id(
+        subscription_id,
+        KEY_VAULT_CRYPTO_USER_ROLE_ID,
+    )
+    expected: dict[str, _ExpectedRoleAssignment] = {}
+    for (
+        name,
+        key_parameter,
+        identity_parameter,
+    ), identity_resource_id in zip(
+        signer_bindings,
+        identity_resource_ids,
+        strict=True,
+    ):
+        key_name = _string(
+            _parameter_value(effective_parameters, key_parameter),
+            field=f"planned producer {name} signing key",
+        )
+        scope = (
+            f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}/"
+            f"providers/Microsoft.KeyVault/vaults/{key_vault_name}/keys/{key_name}"
+        )
+        assignment_id = _deterministic_role_assignment_id(
+            scope,
+            identity_resource_id,
+            KEY_VAULT_CRYPTO_USER_ROLE_ID,
+        )
+        expected[assignment_id.casefold()] = _expected_role_assignment(
+            f"legacy producer {name} Crypto User migration",
+            identity_resource_id=_azure_resource_id(
+                _parameter_value(effective_parameters, identity_parameter),
+                field=f"planned producer {name} signer identity",
+            ),
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=scope,
+            role_definition_id=role_definition_id,
+        )
+    return expected
+
+
 def _verify_planned_trigger_queue_transition_state(
     *,
     effective_parameters: Mapping[str, Mapping[str, object]],
@@ -3275,6 +3544,41 @@ def _verify_planned_trigger_queue_transition_state(
         transition_state=transition_state,
         subscription_id=subscription_id,
     )
+
+
+def _current_principal_ids_from_effective_parameters(
+    parameters: Mapping[str, Mapping[str, object]],
+    *,
+    subscription_id: str,
+) -> set[str]:
+    identity_resource_ids: dict[str, str] = {}
+    for name, entry in parameters.items():
+        normalized_name = name.casefold()
+        value = entry.get("value")
+        if normalized_name.endswith("identityresourceid") and isinstance(value, str):
+            resource_id = _azure_resource_id(
+                value,
+                field=f"parameters.{name}",
+            )
+            identity_resource_ids[resource_id.casefold()] = resource_id
+        elif normalized_name.endswith("identityresourceids"):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise OrchestrationError(f"parameters.{name} must be an identity resource ID array")
+            for index, item in enumerate(value):
+                resource_id = _azure_resource_id(
+                    item,
+                    field=f"parameters.{name}[{index}]",
+                )
+                identity_resource_ids[resource_id.casefold()] = resource_id
+    if not identity_resource_ids:
+        raise OrchestrationError("rotation verification found no current identity resource IDs")
+    principals_by_identity = _verify_identities(
+        {},
+        additional_identity_resource_ids=list(identity_resource_ids.values()),
+        rbac_identity_resource_ids=list(identity_resource_ids.values()),
+        subscription_id=subscription_id,
+    )
+    return set(principals_by_identity.values())
 
 
 def _publisher_expected_rbac_assignments(
@@ -3695,6 +3999,82 @@ def _verify_rbac_resources(
     return assignment_ids_by_principal
 
 
+def _verify_legacy_crypto_user_migration(
+    expected_assignments: Mapping[str, _ExpectedRoleAssignment],
+    reviewed_assignment_ids: set[str] | frozenset[str],
+    *,
+    migration_state: str,
+    subscription_id: str,
+) -> None:
+    if migration_state not in {"present", "absent"}:
+        raise OrchestrationError("legacy Crypto User migration state is invalid")
+    reviewed_ids = {resource_id.casefold() for resource_id in reviewed_assignment_ids}
+    if not reviewed_ids.issubset(expected_assignments):
+        raise OrchestrationError(
+            "legacy Crypto User migration approval is outside the exact "
+            "deterministic assignment set"
+        )
+    assignments_by_scope: dict[str, set[str]] = {}
+    for assignment_id, expected in expected_assignments.items():
+        assignments_by_scope.setdefault(expected.scope.casefold(), set()).add(assignment_id)
+    observed_ids: set[str] = set()
+    for normalized_scope, expected_ids in assignments_by_scope.items():
+        scope = next(
+            expected.scope
+            for expected in expected_assignments.values()
+            if expected.scope.casefold() == normalized_scope
+        )
+        assignments = _merge_effective_role_assignment_documents(
+            [
+                _run_json(
+                    [
+                        "az",
+                        "role",
+                        "assignment",
+                        "list",
+                        "--subscription",
+                        subscription_id,
+                        "--scope",
+                        scope,
+                        "--only-show-errors",
+                        "--output",
+                        "json",
+                    ],
+                    field=f"legacy Crypto User assignments at {scope}",
+                )
+            ],
+            field=f"legacy Crypto User assignments at {scope}",
+        )
+        scope_ids = {
+            _string(
+                assignment.get("id"),
+                field="legacy Crypto User assignment ID",
+            ).casefold()
+            for assignment in assignments
+        }
+        observed_ids.update(expected_ids & scope_ids)
+    if migration_state == "present":
+        if observed_ids != reviewed_ids:
+            raise OrchestrationError(
+                "legacy Crypto User migration evidence does not exactly match "
+                "the reviewed assignment IDs"
+            )
+        if observed_ids:
+            _verify_rbac_resources(
+                {"rbacResourceIds": sorted(observed_ids)},
+                expected_assignments={
+                    assignment_id: expected_assignments[assignment_id]
+                    for assignment_id in observed_ids
+                },
+                subscription_id=subscription_id,
+            )
+    elif observed_ids:
+        raise OrchestrationError(
+            "legacy Crypto User assignments require controlled revocation "
+            "before deployment or readiness"
+        )
+
+
 def _verify_complete_trigger_queue_assignment_set(
     *,
     current_expected_assignments: Mapping[str, _ExpectedRoleAssignment],
@@ -3910,6 +4290,223 @@ def _verify_trigger_queue_assignment_set(
     if prospective_id not in prospective_assignment_ids:
         return {}
     return {prospective_expected.principal_id.casefold(): {prospective_id.casefold()}}
+
+
+def _canonical_rotation_transition_assignments(
+    values: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> list[str]:
+    if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+        raise OrchestrationError(f"{field} must be a string array")
+    canonical = [
+        _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field=f"{field}[{index}]",
+        )
+        for index, resource_id in enumerate(values)
+    ]
+    if any(
+        "/providers/microsoft.authorization/roleassignments/" not in resource_id.casefold()
+        for resource_id in canonical
+    ):
+        raise OrchestrationError(f"{field} must contain only role assignment resource IDs")
+    if len({resource_id.casefold() for resource_id in canonical}) != len(canonical):
+        raise OrchestrationError(f"{field} must contain distinct values")
+    if len(canonical) > MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS:
+        raise OrchestrationError(f"{field} exceeds the bounded maximum")
+    return sorted(canonical)
+
+
+def _canonical_legacy_crypto_user_migration_assignments(
+    values: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> list[str]:
+    assignments = _canonical_rotation_transition_assignments(
+        values,
+        subscription_id=subscription_id,
+        field=field,
+    )
+    if len(assignments) > MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS:
+        raise OrchestrationError(f"{field} exceeds the bounded maximum")
+    return assignments
+
+
+def _rotation_transition_assignment_ids(
+    approved_transition_ids: set[str] | frozenset[str],
+    *,
+    subscription_id: str,
+) -> set[str]:
+    transition_ids: set[str] = set()
+    for resource_id in approved_transition_ids:
+        canonical = _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field="approved rotation transition assignment",
+        )
+        if "/providers/microsoft.authorization/roleassignments/" not in canonical.casefold():
+            raise OrchestrationError("rotation transition approval must identify a role assignment")
+        transition_ids.add(canonical.casefold())
+    if len(transition_ids) > MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS:
+        raise OrchestrationError(
+            "approved rotation transition assignments exceed the bounded maximum"
+        )
+    return transition_ids
+
+
+def _verify_reviewed_rotation_transitions(
+    approved_transition_ids: set[str] | frozenset[str],
+    *,
+    current_principal_ids: set[str],
+    transition_state: str,
+    subscription_id: str,
+) -> None:
+    if transition_state not in {"present", "absent"}:
+        raise OrchestrationError("rotation transition state is invalid")
+    transition_ids = _rotation_transition_assignment_ids(
+        approved_transition_ids,
+        subscription_id=subscription_id,
+    )
+    if not transition_ids:
+        return
+    transition_ids_by_scope: dict[str, set[str]] = {}
+    for assignment_id in transition_ids:
+        scope = _role_assignment_scope(assignment_id)
+        transition_ids_by_scope.setdefault(scope.casefold(), set()).add(assignment_id)
+    observed_transition_ids: set[str] = set()
+    for normalized_scope, scoped_transition_ids in transition_ids_by_scope.items():
+        scope = _role_assignment_scope(next(iter(scoped_transition_ids)))
+        assignments = _merge_effective_role_assignment_documents(
+            [
+                _run_json(
+                    [
+                        "az",
+                        "role",
+                        "assignment",
+                        "list",
+                        "--subscription",
+                        subscription_id,
+                        "--scope",
+                        scope,
+                        "--only-show-errors",
+                        "--output",
+                        "json",
+                    ],
+                    field=f"complete role assignments at rotation scope {scope}",
+                )
+            ],
+            field=f"rotation role assignments at {normalized_scope}",
+        )
+        observed_ids = {
+            _string(
+                assignment.get("id"),
+                field="rotation scope role assignment ID",
+            ).casefold()
+            for assignment in assignments
+        }
+        observed_transition_ids.update(scoped_transition_ids & observed_ids)
+    if transition_state == "present":
+        missing = transition_ids - observed_transition_ids
+        if missing:
+            raise OrchestrationError(
+                "approved rotation transition assignment evidence is incomplete"
+            )
+    elif observed_transition_ids:
+        raise OrchestrationError(
+            "retired deterministic assignments require controlled revocation "
+            "before deployment or readiness"
+        )
+    if transition_state == "absent":
+        return
+
+    normalized_current_principals = {
+        principal_id.casefold() for principal_id in current_principal_ids
+    }
+    for assignment_id in sorted(observed_transition_ids):
+        resource = _get_resource(
+            assignment_id,
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            resource.get("id"),
+            assignment_id,
+            field="approved rotation transition assignment readback",
+        )
+        properties = _mapping(
+            resource.get("properties"),
+            field="approved rotation transition assignment properties",
+        )
+        principal_id = _canonical_directory_object_id(
+            properties.get("principalId"),
+            field="retired rotation principal ID",
+        )
+        if principal_id in normalized_current_principals:
+            raise OrchestrationError(
+                "approved rotation transition assignment is not bound to a retired principal"
+            )
+        if properties.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                "approved rotation transition principal type must be ServicePrincipal"
+            )
+        scope = _role_assignment_scope(assignment_id)
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                scope,
+                field="approved rotation transition scope",
+            )
+        role_definition_id = _canonical_subscription_resource_id(
+            properties.get("roleDefinitionId"),
+            subscription_id=subscription_id,
+            field="approved rotation transition role definition",
+        )
+        role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+        scope_type = _resource_type(scope)
+        custom_permissions: _RolePermissionProfile | None = None
+        if role_id in BUILT_IN_DATA_ROLE_IDS:
+            if role_id not in ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE.get(
+                scope_type,
+                frozenset(),
+            ):
+                raise OrchestrationError(
+                    "approved rotation transition role does not match its scope"
+                )
+        else:
+            role = _get_resource(
+                role_definition_id,
+                subscription_id=subscription_id,
+            )
+            _require_subscription_resource_id_equal(
+                role.get("id"),
+                role_definition_id,
+                subscription_id=subscription_id,
+                field="approved rotation custom role readback",
+            )
+            custom_permissions = _verify_custom_role(role)
+            if custom_permissions not in (
+                ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE.get(
+                    scope_type,
+                    frozenset(),
+                )
+            ):
+                raise OrchestrationError("approved rotation custom role does not match its scope")
+        grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
+            custom_permissions is not None
+            and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
+        )
+        expected_condition_version = "2.0" if grants_blob_read else None
+        expected_condition = BLOB_LIST_DENY_CONDITION if grants_blob_read else None
+        if (
+            properties.get("conditionVersion") != expected_condition_version
+            or properties.get("condition") != expected_condition
+        ):
+            raise OrchestrationError(
+                "approved rotation transition condition does not match its exact role profile"
+            )
 
 
 def _canonical_directory_object_id(value: object, *, field: str) -> str:
@@ -4492,6 +5089,11 @@ def _verify_job_behavior(
         field="job scaler identity",
     )
     metadata = _mapping(rule.get("metadata"), field="job scaler metadata")
+    _require_exact_fields(
+        metadata,
+        SCALER_METADATA_FIELDS,
+        field="job scaler metadata",
+    )
     _require_equal(
         metadata.get("namespace"),
         namespace_host.removesuffix(".servicebus.windows.net"),
@@ -4950,6 +5552,23 @@ def _verify_producer_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    _verify_legacy_crypto_user_migration(
+        _producer_legacy_crypto_user_assignments(
+            configuration=configuration,
+            foundation_values=foundation_values,
+            principal_ids_by_identity=identity_principal_ids,
+            subscription_id=subscription_id,
+        ),
+        set(),
+        migration_state="absent",
+        subscription_id=subscription_id,
+    )
+    _verify_reviewed_rotation_transitions(
+        set(approved_transition_assignment_ids),
+        current_principal_ids=allowed_principal_ids,
+        transition_state=("absent" if require_transition_revoked else "present"),
+        subscription_id=subscription_id,
+    )
     expected_assignments = _producer_expected_rbac_assignments(
         binding,
         configuration=configuration,
@@ -5178,6 +5797,8 @@ def _verify_publisher_resources(
     effective_parameters: Mapping[str, Mapping[str, object]],
     producer_assignment_ids_by_principal: Mapping[str, set[str]],
     subscription_id: str,
+    approved_transition_assignment_ids: set[str] | frozenset[str] = frozenset(),
+    require_transition_revoked: bool = True,
 ) -> dict[str, set[str]]:
     validated_outputs = _publisher_outputs({"outputs": dict(outputs)})
     configuration = _mapping(
@@ -5287,6 +5908,15 @@ def _verify_publisher_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    _verify_reviewed_rotation_transitions(
+        set(approved_transition_assignment_ids),
+        current_principal_ids={
+            *allowed_principal_ids,
+            *(principal_id.casefold() for principal_id in producer_assignment_ids_by_principal),
+        },
+        transition_state=("absent" if require_transition_revoked else "present"),
+        subscription_id=subscription_id,
+    )
     expected_assignments = _publisher_expected_rbac_assignments(
         binding,
         configuration=configuration,
@@ -5568,6 +6198,7 @@ def _verify_live_dependencies(
     producer: Mapping[str, object],
     publisher: Mapping[str, object],
     subscription_id: str,
+    rotation_transition_assignment_ids: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     _verify_foundation_resources(foundation, subscription_id=subscription_id)
     producer_assignment_ids_by_principal = _verify_producer_resources(
@@ -5575,6 +6206,8 @@ def _verify_live_dependencies(
         foundation=foundation,
         effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
         subscription_id=subscription_id,
+        approved_transition_assignment_ids=set(rotation_transition_assignment_ids),
+        require_transition_revoked=True,
     )
     _verify_publisher_resources(
         _mapping(publisher["outputs"], field="publisher outputs"),
@@ -5582,6 +6215,8 @@ def _verify_live_dependencies(
         effective_parameters=_bindings_as_parameters(_handoff_bindings(publisher)),
         producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
         subscription_id=subscription_id,
+        approved_transition_assignment_ids=set(rotation_transition_assignment_ids),
+        require_transition_revoked=True,
     )
 
 
@@ -5803,6 +6438,32 @@ def plan(args: argparse.Namespace) -> Path:
     ]
     if len({value.casefold() for value in allowed_changes}) != len(allowed_changes):
         raise OrchestrationError("allowed change resource IDs must be distinct")
+    rotation_transition_assignments = _canonical_rotation_transition_assignments(
+        list(getattr(args, "rotation_transition_assignment", [])),
+        subscription_id=subscription_id,
+        field="rotation transition assignments",
+    )
+    legacy_crypto_user_migration_assignments = _canonical_legacy_crypto_user_migration_assignments(
+        list(
+            getattr(
+                args,
+                "legacy_crypto_user_migration_assignment",
+                [],
+            )
+        ),
+        subscription_id=subscription_id,
+        field="legacy Crypto User migration assignments",
+    )
+    predecessor_rotation_transition_ids = _predecessor_rotation_transition_assignment_ids(
+        verified_predecessors,
+        subscription_id=subscription_id,
+    )
+    if args.stage in {"foundation", "live-acceptance"} and rotation_transition_assignments:
+        raise OrchestrationError(
+            f"{args.stage} does not accept new rotation transition assignments"
+        )
+    if args.stage != "producer" and legacy_crypto_user_migration_assignments:
+        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
     _ensure_clean_worktree()
     effective = build_effective_parameters(
         stage=args.stage,
@@ -5815,6 +6476,26 @@ def plan(args: argparse.Namespace) -> Path:
         effective,
         subscription_id=subscription_id,
     )
+    _verify_effective_parameter_completeness(args.stage, effective)
+    if args.stage in {"producer", "publisher"}:
+        current_principal_ids = _current_principal_ids_from_effective_parameters(
+            effective,
+            subscription_id=subscription_id,
+        )
+        if predecessor_rotation_transition_ids:
+            _verify_reviewed_rotation_transitions(
+                predecessor_rotation_transition_ids,
+                current_principal_ids=current_principal_ids,
+                transition_state="absent",
+                subscription_id=subscription_id,
+            )
+        if rotation_transition_assignments:
+            _verify_reviewed_rotation_transitions(
+                set(rotation_transition_assignments),
+                current_principal_ids=current_principal_ids,
+                transition_state="present",
+                subscription_id=subscription_id,
+            )
     if args.stage == "producer":
         foundation = _mapping(
             verified_predecessors["foundation"]["handoff"],
@@ -5834,8 +6515,21 @@ def plan(args: argparse.Namespace) -> Path:
                 args.resource_group,
                 field="producer resource group",
             ),
-            approved_transition_assignment_ids=set(allowed_changes),
+            approved_transition_assignment_ids=set(rotation_transition_assignments),
             transition_state="present",
+            subscription_id=subscription_id,
+        )
+        _verify_legacy_crypto_user_migration(
+            _planned_legacy_crypto_user_assignments(
+                effective_parameters=effective,
+                resource_group=_string(
+                    args.resource_group,
+                    field="producer resource group",
+                ),
+                subscription_id=subscription_id,
+            ),
+            set(legacy_crypto_user_migration_assignments),
+            migration_state="present",
             subscription_id=subscription_id,
         )
     elif args.stage == "publisher":
@@ -5865,7 +6559,7 @@ def plan(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
-            approved_transition_assignment_ids=set(allowed_changes),
+            approved_transition_assignment_ids=set(rotation_transition_assignments),
             require_transition_revoked=False,
         )
         _verify_publisher_binding_key_head(
@@ -5909,6 +6603,7 @@ def plan(args: argparse.Namespace) -> Path:
             producer=producer,
             publisher=publisher,
             subscription_id=subscription_id,
+            rotation_transition_assignment_ids=(predecessor_rotation_transition_ids),
         )
     stem = f"{args.stage}-{args.deployment_name}"
     effective_path = args.evidence_directory / f"{stem}.parameters.json"
@@ -5970,6 +6665,8 @@ def plan(args: argparse.Namespace) -> Path:
         "whatIfPath": str(what_if_path.resolve()),
         "whatIfSha256": _sha256_file(what_if_path),
         "allowedChangeResourceIds": sorted(allowed_changes),
+        "rotationTransitionAssignmentIds": rotation_transition_assignments,
+        "legacyCryptoUserMigrationAssignmentIds": (legacy_crypto_user_migration_assignments),
         "foundationHandoffPath": (
             None if args.foundation_handoff is None else str(args.foundation_handoff.resolve())
         ),
@@ -6063,6 +6760,18 @@ def apply(args: argparse.Namespace) -> Path:
             subscription_id=subscription_id,
             field=f"allowed changes[{index}]",
         )
+    rotation_transition_assignment_ids = _canonical_rotation_transition_assignments(
+        manifest.get("rotationTransitionAssignmentIds"),
+        subscription_id=subscription_id,
+        field="rotation transition assignments",
+    )
+    legacy_crypto_user_migration_assignment_ids = (
+        _canonical_legacy_crypto_user_migration_assignments(
+            manifest.get("legacyCryptoUserMigrationAssignmentIds"),
+            subscription_id=subscription_id,
+            field="legacy Crypto User migration assignments",
+        )
+    )
     violations = evaluate_what_if(
         what_if,
         allowed_change_ids=frozenset(allowed_change_ids),
@@ -6132,11 +6841,36 @@ def apply(args: argparse.Namespace) -> Path:
         receipt_paths=receipt_paths,
         reviewed_receipt_sha256s=reviewed_receipt_sha256s,
     )
+    predecessor_rotation_transition_ids = _predecessor_rotation_transition_assignment_ids(
+        verified_predecessors,
+        subscription_id=subscription_id,
+    )
+    if stage in {"foundation", "live-acceptance"} and rotation_transition_assignment_ids:
+        raise OrchestrationError(f"{stage} does not accept new rotation transition assignments")
+    if stage != "producer" and legacy_crypto_user_migration_assignment_ids:
+        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
+    reviewed_rotation_transition_ids = {
+        *rotation_transition_assignment_ids,
+        *predecessor_rotation_transition_ids,
+    }
     effective_parameters = _load_parameters(effective_path)
     _validate_effective_parameter_subscription_boundary(
         effective_parameters,
         subscription_id=subscription_id,
     )
+    _verify_effective_parameter_completeness(stage, effective_parameters)
+    if stage in {"producer", "publisher"} and reviewed_rotation_transition_ids:
+        _verify_reviewed_rotation_transitions(
+            reviewed_rotation_transition_ids,
+            current_principal_ids=(
+                _current_principal_ids_from_effective_parameters(
+                    effective_parameters,
+                    subscription_id=subscription_id,
+                )
+            ),
+            transition_state="absent",
+            subscription_id=subscription_id,
+        )
     foundation = (
         None
         if "foundation" not in verified_predecessors
@@ -6178,8 +6912,21 @@ def apply(args: argparse.Namespace) -> Path:
                 resource_group,
                 field="producer resource group",
             ),
-            approved_transition_assignment_ids=set(allowed_change_ids),
+            approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
             transition_state="absent",
+            subscription_id=subscription_id,
+        )
+        _verify_legacy_crypto_user_migration(
+            _planned_legacy_crypto_user_assignments(
+                effective_parameters=effective_parameters,
+                resource_group=_string(
+                    resource_group,
+                    field="producer resource group",
+                ),
+                subscription_id=subscription_id,
+            ),
+            set(legacy_crypto_user_migration_assignment_ids),
+            migration_state="absent",
             subscription_id=subscription_id,
         )
     elif stage == "publisher":
@@ -6203,7 +6950,7 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
-            approved_transition_assignment_ids=set(allowed_change_ids),
+            approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
             require_transition_revoked=True,
         )
         _verify_publisher_binding_key_head(
@@ -6237,6 +6984,7 @@ def apply(args: argparse.Namespace) -> Path:
             producer=producer,
             publisher=publisher,
             subscription_id=subscription_id,
+            rotation_transition_assignment_ids=(reviewed_rotation_transition_ids),
         )
     current_what_if = _run_json(
         _az_command(
@@ -6296,7 +7044,7 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=effective_parameters,
             subscription_id=subscription_id,
-            approved_transition_assignment_ids=set(allowed_change_ids),
+            approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
             require_transition_revoked=True,
         )
     elif stage == "live-acceptance":
@@ -6307,6 +7055,7 @@ def apply(args: argparse.Namespace) -> Path:
             producer=producer,
             publisher=publisher,
             subscription_id=subscription_id,
+            rotation_transition_assignment_ids=(reviewed_rotation_transition_ids),
         )
     elif stage == "publisher":
         if foundation is None or producer is None:
@@ -6316,7 +7065,7 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
-            approved_transition_assignment_ids=set(allowed_change_ids),
+            approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
             require_transition_revoked=True,
         )
         _verify_publisher_resources(
@@ -6325,6 +7074,8 @@ def apply(args: argparse.Namespace) -> Path:
             effective_parameters=effective_parameters,
             producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
             subscription_id=subscription_id,
+            approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
+            require_transition_revoked=True,
         )
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
@@ -6390,6 +7141,16 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--publisher-receipt", type=Path)
     plan_parser.add_argument("--publisher-reviewed-receipt-sha256")
     plan_parser.add_argument("--allow-change", action="append", default=[])
+    plan_parser.add_argument(
+        "--rotation-transition-assignment",
+        action="append",
+        default=[],
+    )
+    plan_parser.add_argument(
+        "--legacy-crypto-user-migration-assignment",
+        action="append",
+        default=[],
+    )
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--plan-manifest", type=Path, required=True)
     apply_parser.add_argument("--reviewed-plan-sha256", required=True)

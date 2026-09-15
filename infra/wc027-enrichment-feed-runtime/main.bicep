@@ -225,7 +225,6 @@ var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
-var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
@@ -827,68 +826,48 @@ module monitoringCollectorKeyVerifier 'modules/key-verifier-rbac.bicep' = {
   }
 }
 
-resource reportSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(reportKey.id, reportSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: reportKey
-  properties: {
-    principalId: reportSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module reportSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-report-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: reportKey.name
+    identityResourceId: reportSignerIdentity.id
   }
 }
 
-resource guidanceSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(guidanceKey.id, guidanceSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: guidanceKey
-  properties: {
-    principalId: guidanceSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module guidanceSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-guidance-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: guidanceKey.name
+    identityResourceId: guidanceSignerIdentity.id
   }
 }
 
-resource enrichmentSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(enrichmentKey.id, enrichmentSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: enrichmentKey
-  properties: {
-    principalId: enrichmentSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module enrichmentSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-enrichment-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: enrichmentKey.name
+    identityResourceId: enrichmentSignerIdentity.id
   }
 }
 
-resource feedSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(feedKey.id, feedSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: feedKey
-  properties: {
-    principalId: feedSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module feedSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-feed-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: feedKey.name
+    identityResourceId: feedSignerIdentity.id
   }
 }
 
-resource notificationSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(notificationKey.id, notificationSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: notificationKey
-  properties: {
-    principalId: notificationSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module notificationSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-notification-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: notificationKey.name
+    identityResourceId: notificationSignerIdentity.id
   }
 }
 
@@ -1071,6 +1050,16 @@ var guidanceBindingKeyVerifierRoleId = extensionResourceId('/subscriptions/${spl
 var changeKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(changeKeyResourceId, '/')[2]}/resourceGroups/${split(changeKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(changeKey.id, 'athena-wc027-key-verifier'))
 var monitoringIntentKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringIntentKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringIntentKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringIntentKey.id, 'athena-wc027-key-verifier'))
 var monitoringCollectorKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringCollectorKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringCollectorKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringCollectorKey.id, 'athena-wc027-key-verifier'))
+var reportSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(reportKey.id, 'athena-wc027-key-sign-verify'))
+var reportSignerAssignmentId = extensionResourceId(reportKey.id, 'Microsoft.Authorization/roleAssignments', guid(reportKey.id, reportSignerIdentity.id, reportSignerRoleId))
+var guidanceSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(guidanceKey.id, 'athena-wc027-key-sign-verify'))
+var guidanceSignerAssignmentId = extensionResourceId(guidanceKey.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceKey.id, guidanceSignerIdentity.id, guidanceSignerRoleId))
+var enrichmentSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(enrichmentKey.id, 'athena-wc027-key-sign-verify'))
+var enrichmentSignerAssignmentId = extensionResourceId(enrichmentKey.id, 'Microsoft.Authorization/roleAssignments', guid(enrichmentKey.id, enrichmentSignerIdentity.id, enrichmentSignerRoleId))
+var feedSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(feedKey.id, 'athena-wc027-key-sign-verify'))
+var feedSignerAssignmentId = extensionResourceId(feedKey.id, 'Microsoft.Authorization/roleAssignments', guid(feedKey.id, feedSignerIdentity.id, feedSignerRoleId))
+var notificationSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(notificationKey.id, 'athena-wc027-key-sign-verify'))
+var notificationSignerAssignmentId = extensionResourceId(notificationKey.id, 'Microsoft.Authorization/roleAssignments', guid(notificationKey.id, notificationSignerIdentity.id, notificationSignerRoleId))
 
 var coreRbacResourceIds = [
   triggerReceiver.id
@@ -1100,11 +1089,16 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentKey.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentKey.id, trustReaderIdentity.id, monitoringIntentKeyVerifierRoleId))
   monitoringCollectorKeyVerifierRoleId
   extensionResourceId(monitoringCollectorKey.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringCollectorKey.id, trustReaderIdentity.id, monitoringCollectorKeyVerifierRoleId))
-  reportSignerRole.id
-  guidanceSignerRole.id
-  enrichmentSignerRole.id
-  feedSignerRole.id
-  notificationSignerRole.id
+  reportSignerRoleId
+  reportSignerAssignmentId
+  guidanceSignerRoleId
+  guidanceSignerAssignmentId
+  enrichmentSignerRoleId
+  enrichmentSignerAssignmentId
+  feedSignerRoleId
+  feedSignerAssignmentId
+  notificationSignerRoleId
+  notificationSignerAssignmentId
 ]
 var triggerSubmitterRbacResourceIds = map(
   triggerSubmitterIdentityResourceIds,
@@ -1197,6 +1191,11 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
   }
   dependsOn: [
     producerImagePull
+    reportSignerRbac
+    guidanceSignerRbac
+    enrichmentSignerRbac
+    feedSignerRbac
+    notificationSignerRbac
     triggerSubmitters
   ]
 }

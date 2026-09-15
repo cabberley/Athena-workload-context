@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 from scripts import wc029_deployment_orchestration as orchestration
 
+from test_wc024_monitoring_contract import _collector_contract
+
+REQUIRED_TEMPLATE_PARAMETER_NAMES = orchestration._required_template_parameter_names
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "operations" / "wc029-deployment-live-validation.md"
 WC013_ROOT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
@@ -15,6 +18,17 @@ PRODUCER_ROOT = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 PUBLISHER_ROOT = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000001"
 RUNTIME_RESOURCE_GROUP = "rg"
+
+
+@pytest.fixture(autouse=True)
+def _stub_required_template_parameter_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestration,
+        "_required_template_parameter_names",
+        lambda _stage: set(),
+    )
 
 
 def _digest(value: str) -> str:
@@ -119,6 +133,8 @@ def _write_plan(
         "whatIfPath": str(what_if_path.resolve()),
         "whatIfSha256": orchestration._sha256_file(what_if_path),
         "allowedChangeResourceIds": [],
+        "rotationTransitionAssignmentIds": [],
+        "legacyCryptoUserMigrationAssignmentIds": [],
         "predecessorReceipts": predecessor_receipts,
     }
     for predecessor in ("foundation", "producer", "publisher"):
@@ -180,6 +196,7 @@ def _write_safe_plan_inputs(tmp_path: Path, stage: str) -> tuple[Path, Path]:
 
 def _foundation_outputs() -> dict[str, object]:
     key_base = "https://athenawc013.vault.azure.net/keys"
+    key_version = "1" * 32
     return {
         "managedEnvironmentResourceId": (
             "/subscriptions/00000000-0000-0000-0000-000000000001/"
@@ -209,15 +226,19 @@ def _foundation_outputs() -> dict[str, object]:
         ),
         "presentationHttpsUrl": "https://athena.internal.example",
         "wc016ServiceBusNamespace": "athena-wc016-events.servicebus.windows.net",
-        "incidentSigningKeyUriWithVersion": f"{key_base}/wc016-incident/v1",
+        "incidentSigningKeyUriWithVersion": (f"{key_base}/wc016-incident/{key_version}"),
         "wc016ApprovedConfiguration": {
             "wc027OrchestrationFoundation": {
                 "notificationQueueName": "incident-notification-outbox",
-                "feedSigningKeyUriWithVersion": f"{key_base}/wc027-feed/v1",
-                "reportSigningKeyUriWithVersion": f"{key_base}/wc027-report/v1",
-                "guidanceSigningKeyUriWithVersion": (f"{key_base}/wc027-guidance/v1"),
-                "enrichmentSigningKeyUriWithVersion": (f"{key_base}/wc027-enrichment/v1"),
-                "notificationSigningKeyUriWithVersion": (f"{key_base}/wc027-notification/v1"),
+                "feedSigningKeyUriWithVersion": (f"{key_base}/wc027-feed/{key_version}"),
+                "reportSigningKeyUriWithVersion": (f"{key_base}/wc027-report/{key_version}"),
+                "guidanceSigningKeyUriWithVersion": (f"{key_base}/wc027-guidance/{key_version}"),
+                "enrichmentSigningKeyUriWithVersion": (
+                    f"{key_base}/wc027-enrichment/{key_version}"
+                ),
+                "notificationSigningKeyUriWithVersion": (
+                    f"{key_base}/wc027-notification/{key_version}"
+                ),
             }
         },
     }
@@ -265,6 +286,15 @@ def _producer_outputs() -> dict[str, object]:
             start=10,
         )
     }
+    identities["monitoring"] = {
+        "identityResourceId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
+            "rg-athena-demo-monitoring/providers/Microsoft.ManagedIdentity/"
+            "userAssignedIdentities/"
+            "athena-demo-monitoring-monitoring-collector-id"
+        ),
+        "identityClientId": "00000000-0000-0000-0000-000000000001",
+    }
     replay_storage_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
         "Microsoft.Storage/storageAccounts/athenawc013"
@@ -277,7 +307,36 @@ def _producer_outputs() -> dict[str, object]:
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
         "Microsoft.ServiceBus/namespaces/athena-wc016-events"
     )
+    foundation = _foundation_outputs()
+    external_key_version = "2" * 32
+
+    def key_binding(
+        *,
+        identity_name: str,
+        key_vault_key_id: str,
+        fingerprint_character: str,
+        logical_key_id: str | None = None,
+    ) -> dict[str, str]:
+        return {
+            "keyId": logical_key_id or key_vault_key_id,
+            "keyVaultKeyId": key_vault_key_id,
+            "keyFingerprint": (f"sha256:{fingerprint_character * 64}"),
+            **identities[identity_name],
+        }
+
+    monitoring_collector_contract = json.loads(
+        json.dumps(
+            _collector_contract().model_dump(
+                mode="json",
+                by_alias=True,
+            )
+        ).replace(
+            "00000000-0000-0000-0000-000000000000",
+            SUBSCRIPTION_ID,
+        )
+    )
     configuration = {
+        "schemaVersion": ("athena.wc027EnrichmentFeedRuntimeConfiguration.v1"),
         "serviceBus": {
             "namespace": "athena-wc016-events.servicebus.windows.net",
             "triggerQueueName": "wc027-enrichment-feed-requests",
@@ -285,8 +344,13 @@ def _producer_outputs() -> dict[str, object]:
             "brokerIdentityClientId": identities["broker"]["identityClientId"],
             "brokerIdentityResourceId": identities["broker"]["identityResourceId"],
         },
-        "incidentLifecycleAssets": identities["incident-reader"],
+        "incidentLifecycleAssets": {
+            "blobEndpoint": "https://athenawc013.blob.core.windows.net",
+            "containerName": "incident-assets",
+            **identities["incident-reader"],
+        },
         "enrichmentFeedAssets": {
+            "blobEndpoint": "https://athenawc013.blob.core.windows.net",
             "containerName": "wc027-enrichment-feed-v2",
             "readerIdentityClientId": identities["feed-reader"]["identityClientId"],
             "readerIdentityResourceId": identities["feed-reader"]["identityResourceId"],
@@ -294,72 +358,141 @@ def _producer_outputs() -> dict[str, object]:
             "writerIdentityResourceId": identities["feed-writer"]["identityResourceId"],
         },
         "feedRegistry": {
+            "tableEndpoint": "https://athenawc013.table.core.windows.net",
             "tableName": "Wc027FeedRegistry",
+            "partitionKey": "wc027-feed-v2",
             **identities["registry-writer"],
         },
         "guidanceActivation": {
+            "tableEndpoint": "https://athenawc013.table.core.windows.net",
             "tableName": "Wc027GuidanceActivation",
             "partitionKey": "wc027-guidance-authority",
             **identities["activation-reader"],
         },
         "correlationSources": {
             "monitoring": {
+                "blobEndpoint": ("https://athenacorrelation.blob.core.windows.net"),
                 "containerName": "monitoring-context",
                 **identities["monitoring"],
             },
             "change": {
+                "blobEndpoint": ("https://athenacorrelation.blob.core.windows.net"),
                 "containerName": "change-evidence",
                 **identities["change"],
             },
             "contextAuthority": {
+                "blobEndpoint": ("https://athenacorrelation.blob.core.windows.net"),
                 "containerName": "context-authority",
                 **identities["context"],
             },
             "monitoringIntent": {
+                "blobEndpoint": ("https://athenacorrelation.blob.core.windows.net"),
                 "containerName": "monitoring-intent",
                 **identities["intent"],
             },
         },
         "guidanceAuthoritySource": {
+            "blobEndpoint": ("https://athenacorrelation.blob.core.windows.net"),
             "containerName": "wc027-guidance-authority",
             **identities["authority"],
         },
-        "monitoringCollectorKey": identities["trust"],
-        "keys": {
-            "incident": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc016-incident/v1"),
-                **identities["trust"],
-            },
-            "correlationBinding": identities["trust"],
-            "guidanceBinding": {
-                **identities["trust"],
-                "keyId": "synthetic-key://athena/wc027-guidance-binding",
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
-                "keyFingerprint": f"sha256:{'b' * 64}",
-            },
-            "change": identities["trust"],
-            "monitoringIntent": identities["trust"],
-            "report": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-report/v1"),
-                **identities["report-signer"],
-            },
-            "guidance": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-guidance/v1"),
-                **identities["guidance-signer"],
-            },
-            "enrichment": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-enrichment/v1"),
-                **identities["enrichment-signer"],
-            },
-            "feed": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-feed/v1"),
-                **identities["feed-signer"],
-            },
-            "notification": {
-                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-notification/v1"),
-                **identities["notification-signer"],
-            },
+        "monitoringCollectorContract": monitoring_collector_contract,
+        "monitoringCollectorKey": {
+            **key_binding(
+                identity_name="trust",
+                key_vault_key_id=(
+                    "https://athena.vault.azure.net/keys/"
+                    f"monitoring-collector/{external_key_version}"
+                ),
+                fingerprint_character="b",
+            ),
+            "activatedAt": "2026-09-01T00:00:00Z",
+            "expiresAt": None,
         },
+        "keys": {
+            "incident": key_binding(
+                identity_name="trust",
+                key_vault_key_id=str(foundation["incidentSigningKeyUriWithVersion"]),
+                fingerprint_character="1",
+                logical_key_id=("synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"),
+            ),
+            "correlationBinding": key_binding(
+                identity_name="trust",
+                key_vault_key_id=(
+                    "https://athena.vault.azure.net/keys/"
+                    f"correlation-binding/{external_key_version}"
+                ),
+                fingerprint_character="2",
+            ),
+            "guidanceBinding": key_binding(
+                identity_name="trust",
+                key_vault_key_id=(
+                    f"https://athena.vault.azure.net/keys/guidance-binding/{external_key_version}"
+                ),
+                fingerprint_character="3",
+                logical_key_id=("synthetic-key://athena/wc027-guidance-binding"),
+            ),
+            "change": key_binding(
+                identity_name="trust",
+                key_vault_key_id=(
+                    f"https://athena.vault.azure.net/keys/change/{external_key_version}"
+                ),
+                fingerprint_character="4",
+            ),
+            "monitoringIntent": key_binding(
+                identity_name="trust",
+                key_vault_key_id=(
+                    f"https://athena.vault.azure.net/keys/monitoring-intent/{external_key_version}"
+                ),
+                fingerprint_character="5",
+            ),
+            "report": key_binding(
+                identity_name="report-signer",
+                key_vault_key_id=str(
+                    foundation["wc016ApprovedConfiguration"]["wc027OrchestrationFoundation"][
+                        "reportSigningKeyUriWithVersion"
+                    ]
+                ),
+                fingerprint_character="6",
+            ),
+            "guidance": key_binding(
+                identity_name="guidance-signer",
+                key_vault_key_id=str(
+                    foundation["wc016ApprovedConfiguration"]["wc027OrchestrationFoundation"][
+                        "guidanceSigningKeyUriWithVersion"
+                    ]
+                ),
+                fingerprint_character="7",
+            ),
+            "enrichment": key_binding(
+                identity_name="enrichment-signer",
+                key_vault_key_id=str(
+                    foundation["wc016ApprovedConfiguration"]["wc027OrchestrationFoundation"][
+                        "enrichmentSigningKeyUriWithVersion"
+                    ]
+                ),
+                fingerprint_character="8",
+            ),
+            "feed": key_binding(
+                identity_name="feed-signer",
+                key_vault_key_id=str(
+                    foundation["wc016ApprovedConfiguration"]["wc027OrchestrationFoundation"][
+                        "feedSigningKeyUriWithVersion"
+                    ]
+                ),
+                fingerprint_character="9",
+            ),
+            "notification": key_binding(
+                identity_name="notification-signer",
+                key_vault_key_id=str(
+                    foundation["wc016ApprovedConfiguration"]["wc027OrchestrationFoundation"][
+                        "notificationSigningKeyUriWithVersion"
+                    ]
+                ),
+                fingerprint_character="a",
+            ),
+        },
+        "presentationUrl": "https://athena.internal.example",
         "deploymentBinding": {
             "attachedIdentityResourceIds": [
                 value["identityResourceId"] for value in identities.values()
@@ -472,7 +605,6 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
                 "activation-writer",
                 "binding-signer",
                 "request-trust",
-                "binding-trust",
             ),
             start=40,
         )
@@ -504,7 +636,11 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
         "Microsoft.KeyVault/vaults/athena/keys/guidance-binding"
     )
+    runtime_authority = producer_configuration["guidanceAuthoritySource"]
+    runtime_activation = producer_configuration["guidanceActivation"]
+    runtime_binding_key = producer_configuration["keys"]["guidanceBinding"]
     configuration = {
+        "schemaVersion": ("athena.wc027GuidanceAuthorityPublisherConfiguration.v1"),
         "serviceBus": {
             "namespace": "athena-wc016-events.servicebus.windows.net",
             "requestQueueName": "wc027-guidance-authority-requests",
@@ -515,6 +651,7 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
             ],
         },
         "authorityAssets": {
+            "blobEndpoint": runtime_authority["blobEndpoint"],
             "containerName": "wc027-guidance-authority",
             "readerIdentityClientId": publisher_identities["authority-reader"]["identityClientId"],
             "readerIdentityResourceId": publisher_identities["authority-reader"][
@@ -526,15 +663,22 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
             ],
         },
         "guidanceActivation": {
+            "tableEndpoint": runtime_activation["tableEndpoint"],
             "tableName": "Wc027GuidanceActivation",
+            "partitionKey": runtime_activation["partitionKey"],
             "identityClientId": publisher_identities["activation-writer"]["identityClientId"],
             "identityResourceId": publisher_identities["activation-writer"]["identityResourceId"],
         },
-        "requestKey": publisher_identities["request-trust"],
+        "requestKey": {
+            "keyId": ("synthetic-key://athena/wc027-guidance-publication-request"),
+            "keyVaultKeyId": (f"https://athena.vault.azure.net/keys/guidance-request/{'3' * 32}"),
+            "keyFingerprint": f"sha256:{'c' * 64}",
+            **publisher_identities["request-trust"],
+        },
         "bindingSigningKey": {
-            "keyId": "synthetic-key://athena/wc027-guidance-binding",
-            "keyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
-            "keyFingerprint": f"sha256:{'b' * 64}",
+            "keyId": runtime_binding_key["keyId"],
+            "keyVaultKeyId": runtime_binding_key["keyVaultKeyId"],
+            "keyFingerprint": runtime_binding_key["keyFingerprint"],
             **publisher_identities["binding-signer"],
         },
         "enrichmentRuntimeConfiguration": producer_configuration,
@@ -576,7 +720,7 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         ),
         "bindingLogicalKeyId": "synthetic-key://athena/wc027-guidance-binding",
         "bindingKeyResourceId": binding_key_resource_id,
-        "bindingKeyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
+        "bindingKeyVaultKeyId": runtime_binding_key["keyVaultKeyId"],
     }
 
 
@@ -596,7 +740,7 @@ def _publisher_parameter_bindings() -> dict[str, object]:
         ),
         "bindingTrustReaderIdentityResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
-            "Microsoft.ManagedIdentity/userAssignedIdentities/binding-trust"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/trust"
         ),
         "managedEnvironmentResourceId": _foundation_outputs()["managedEnvironmentResourceId"],
         "registryResourceId": (
@@ -964,6 +1108,96 @@ def test_stage_inputs_require_exact_governed_predecessors_and_scope() -> None:
         )
 
 
+@pytest.mark.parametrize("operation", ("validate", "what-if", "create"))
+def test_azure_deployment_commands_are_noninteractive(operation: str) -> None:
+    command = orchestration._az_command(
+        operation=operation,
+        stage="producer",
+        deployment_name="synthetic-producer",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        parameter_path=Path("synthetic.parameters.json"),
+    )
+    no_prompt_index = command.index("--no-prompt")
+    assert command[no_prompt_index + 1] == "true"
+
+
+def test_azure_command_stdin_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(command: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return orchestration.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="{}",
+            stderr="",
+        )
+
+    monkeypatch.setattr(orchestration.shutil, "which", lambda _name: "az")
+    monkeypatch.setattr(orchestration.subprocess, "run", run)
+    assert orchestration._run(["az", "deployment", "group", "validate"]) == "{}"
+    assert captured["stdin"] is orchestration.subprocess.DEVNULL
+
+
+def test_effective_parameters_require_every_required_template_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestration,
+        "_required_template_parameter_names",
+        lambda _stage: {"present", "missing"},
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="omits required template parameters: missing",
+    ):
+        orchestration._verify_effective_parameter_completeness(
+            "producer",
+            {"present": {"value": "reviewed"}},
+        )
+
+
+def test_required_template_parameters_come_from_compiled_bicep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        captured.append(list(command))
+        return {
+            "parameters": {
+                "required": {"type": "string"},
+                "optional": {
+                    "type": "string",
+                    "defaultValue": "reviewed-default",
+                },
+            }
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    assert REQUIRED_TEMPLATE_PARAMETER_NAMES("producer") == {"required"}
+    assert captured[0][:3] == ["az", "bicep", "build"]
+
+
+def test_parameter_completeness_precedes_azure_validation() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    plan_start = source.index("def plan(")
+    completeness = source.index(
+        "_verify_effective_parameter_completeness(args.stage, effective)",
+        plan_start,
+    )
+    parameter_write = source.index(
+        "_write_new_json(effective_path",
+        completeness,
+    )
+    azure_validate = source.index('operation="validate"', parameter_write)
+    assert completeness < parameter_write < azure_validate
+
+
 def test_subscription_boundary_rejects_cross_subscription_and_noncanonical_ids() -> None:
     governed_resource = (
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
@@ -1123,6 +1357,34 @@ def test_required_root_outputs_cannot_be_missing_or_mismatched() -> None:
         match="binding key version output",
     ):
         orchestration._publisher_outputs({"outputs": mismatched_publisher_output})
+
+
+@pytest.mark.parametrize("stage", ("producer", "publisher"))
+def test_output_validators_use_authoritative_production_configuration_models(
+    stage: str,
+) -> None:
+    producer = _producer_outputs()
+    if stage == "producer":
+        outputs = dict(producer)
+        configuration_field = "deployedRuntimeConfigurationJson"
+        digest_field = "deployedRuntimeConfigurationDigest"
+        validator = orchestration._producer_outputs
+    else:
+        outputs = _publisher_outputs(producer)
+        configuration_field = "deployedPublisherConfigurationJson"
+        digest_field = "deployedPublisherConfigurationDigest"
+        validator = orchestration._publisher_outputs
+    configuration = json.loads(str(outputs[configuration_field]))
+    configuration["schemaVersion"] = "athena.synthetic.invalid.v1"
+    configuration_json = json.dumps(configuration, separators=(",", ":"))
+    outputs[configuration_field] = configuration_json
+    outputs[digest_field] = _digest(configuration_json)
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="authoritative production model",
+    ):
+        validator({"outputs": outputs})
 
 
 def test_handoff_schema_rejects_unexpected_fields(tmp_path: Path) -> None:
@@ -1455,6 +1717,19 @@ def test_job_behavior_rejects_ungoverned_executable_or_secret_fields() -> None:
     ]
     with pytest.raises(orchestration.OrchestrationError, match="secrets"):
         orchestration._verify_job_behavior(job=secret_registry_job, **kwargs)
+
+    extra_scaler_metadata_job = json.loads(json.dumps(job))
+    extra_scaler_metadata_job["properties"]["configuration"]["eventTriggerConfig"]["scale"][
+        "rules"
+    ][0]["metadata"]["activationMessageCount"] = "1"
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="scaler metadata.*activationMessageCount",
+    ):
+        orchestration._verify_job_behavior(
+            job=extra_scaler_metadata_job,
+            **kwargs,
+        )
 
 
 def test_rbac_role_must_match_its_exact_resource_scope(
@@ -1944,7 +2219,7 @@ def test_both_wc027_roots_derive_complete_exact_assignment_maps() -> None:
     producer_binding = {
         "rbacResourceIds": [
             str(producer["feedV2WriterRoleDefinitionId"]),
-            *(role_definition_id(index) for index in range(1, 7)),
+            *(role_definition_id(index) for index in range(1, 12)),
             *(assignment_id(index) for index in range(100, 126)),
         ]
     }
@@ -1990,6 +2265,9 @@ def test_both_wc027_roots_derive_complete_exact_assignment_maps() -> None:
     )
     assert producer_expected[producer_assignment_ids[14]].custom_role_permissions == (
         orchestration.KEY_VERIFY_PERMISSION_PROFILE
+    )
+    assert producer_expected[producer_assignment_ids[20]].custom_role_permissions == (
+        orchestration.KEY_SIGN_VERIFY_PERMISSION_PROFILE
     )
     assert producer_expected[producer_assignment_ids[-1]].label == ("producer trigger submitter 0")
 
@@ -2431,6 +2709,241 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
             subscription_id=SUBSCRIPTION_ID,
         )
         == {}
+    )
+
+
+def test_rotation_transitions_cover_all_deterministic_assignment_domains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subscription_role_base = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions"
+    )
+    custom_role_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "97979797-1111-4111-8111-111111111111"
+    )
+    domains = (
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+                "incident-notification-outbox"
+            ),
+            f"{subscription_role_base}/{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}",
+            None,
+            None,
+        ),
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+                "wc027-guidance-authority-requests"
+            ),
+            f"{subscription_role_base}/{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}",
+            None,
+            None,
+        ),
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.KeyVault/vaults/athena/keys/wc027-report"
+            ),
+            custom_role_id,
+            None,
+            None,
+        ),
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+                "containers/wc027-enrichment-feed-v2"
+            ),
+            f"{subscription_role_base}/{orchestration.BLOB_DATA_READER_ROLE_ID}",
+            "2.0",
+            orchestration.BLOB_LIST_DENY_CONDITION,
+        ),
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.Storage/storageAccounts/athena/tableServices/default/"
+                "tables/Wc027FeedRegistry"
+            ),
+            f"{subscription_role_base}/{orchestration.TABLE_DATA_CONTRIBUTOR_ROLE_ID}",
+            None,
+            None,
+        ),
+        (
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
+                "rg-athena-platform-dev/providers/Microsoft.ContainerRegistry/"
+                "registries/athena"
+            ),
+            f"{subscription_role_base}/{orchestration.ACR_PULL_ROLE_ID}",
+            None,
+            None,
+        ),
+    )
+    transition_ids: set[str] = set()
+    resources: dict[str, dict[str, object]] = {
+        custom_role_id.casefold(): {
+            "id": custom_role_id,
+            "properties": {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": sorted(
+                            orchestration.KEY_SIGN_VERIFY_PERMISSION_PROFILE.data_actions
+                        ),
+                        "notDataActions": [],
+                    }
+                ]
+            },
+        }
+    }
+    assignments_by_scope: dict[str, list[dict[str, object]]] = {}
+    for index, (
+        scope,
+        role_definition_id,
+        condition_version,
+        condition,
+    ) in enumerate(domains, start=1):
+        assignment_id = (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            f"97979797-{index:04d}-4{index:03d}-8{index:03d}-{index:012d}"
+        )
+        principal_id = f"98989898-{index:04d}-4{index:03d}-8{index:03d}-{index:012d}"
+        transition_ids.add(assignment_id)
+        assignments_by_scope.setdefault(scope.casefold(), []).append(
+            {"id": assignment_id, "scope": scope}
+        )
+        resources[assignment_id.casefold()] = {
+            "id": assignment_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": scope,
+                "conditionVersion": condition_version,
+                "condition": condition,
+            },
+        }
+    transitions_present = True
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        scope = arguments[arguments.index("--scope") + 1]
+        return assignments_by_scope.get(scope.casefold(), []) if transitions_present else []
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: resources[resource_id.casefold()],
+    )
+    orchestration._verify_reviewed_rotation_transitions(
+        transition_ids,
+        current_principal_ids={"99999999-9999-4999-8999-999999999999"},
+        transition_state="present",
+        subscription_id=SUBSCRIPTION_ID,
+    )
+
+    transitions_present = False
+    orchestration._verify_reviewed_rotation_transitions(
+        transition_ids,
+        current_principal_ids={"99999999-9999-4999-8999-999999999999"},
+        transition_state="absent",
+        subscription_id=SUBSCRIPTION_ID,
+    )
+
+
+def test_rotation_transition_manifest_is_bounded_and_role_assignment_only() -> None:
+    non_assignment = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena"
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="only role assignment",
+    ):
+        orchestration._canonical_rotation_transition_assignments(
+            [non_assignment],
+            subscription_id=SUBSCRIPTION_ID,
+            field="rotation transitions",
+        )
+
+
+def test_legacy_crypto_user_migration_allows_current_principal_only_until_revoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "98989898-1111-4111-8111-111111111111"
+    key_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.KeyVault/vaults/athena/keys/wc027-report"
+    )
+    assignment_id = (
+        f"{key_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-2222-4222-8222-222222222222"
+    )
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.KEY_VAULT_CRYPTO_USER_ROLE_ID}"
+    )
+    expected = {
+        assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label="legacy producer report Crypto User migration",
+            principal_id=principal_id,
+            scope=key_scope,
+            role_definition_id=role_definition_id,
+        )
+    }
+    migration_present = True
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda command, *, field: (
+            [{"id": assignment_id, "scope": key_scope}] if migration_present else []
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": key_scope,
+            },
+        },
+    )
+
+    orchestration._verify_legacy_crypto_user_migration(
+        expected,
+        {assignment_id},
+        migration_state="present",
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="does not exactly match",
+    ):
+        orchestration._verify_legacy_crypto_user_migration(
+            expected,
+            set(),
+            migration_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    migration_present = False
+    orchestration._verify_legacy_crypto_user_migration(
+        expected,
+        {assignment_id},
+        migration_state="absent",
+        subscription_id=SUBSCRIPTION_ID,
     )
 
 
@@ -2969,6 +3482,71 @@ def test_publisher_verification_collects_separated_producer_principal_evidence(
     assert queried_principals == [{producer_principal, publisher_principal}]
 
 
+def test_live_acceptance_revalidates_predecessor_rotation_transitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.KeyVault/vaults/athena/keys/wc027-report/providers/"
+        "Microsoft.Authorization/roleAssignments/"
+        "99919191-1111-4111-8111-111111111111"
+    )
+    captured: list[tuple[str, set[str], bool]] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_verify_foundation_resources",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def verify_producer(
+        _outputs: object,
+        **kwargs: object,
+    ) -> dict[str, set[str]]:
+        captured.append(
+            (
+                "producer",
+                set(kwargs["approved_transition_assignment_ids"]),
+                bool(kwargs["require_transition_revoked"]),
+            )
+        )
+        return {}
+
+    def verify_publisher(
+        _outputs: object,
+        **kwargs: object,
+    ) -> dict[str, set[str]]:
+        captured.append(
+            (
+                "publisher",
+                set(kwargs["approved_transition_assignment_ids"]),
+                bool(kwargs["require_transition_revoked"]),
+            )
+        )
+        return {}
+
+    monkeypatch.setattr(
+        orchestration,
+        "_verify_producer_resources",
+        verify_producer,
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_verify_publisher_resources",
+        verify_publisher,
+    )
+    orchestration._verify_live_dependencies(
+        foundation={},
+        producer={"outputs": {}},
+        publisher={"outputs": {}},
+        subscription_id=SUBSCRIPTION_ID,
+        rotation_transition_assignment_ids={transition_id},
+    )
+    assert captured == [
+        ("producer", {transition_id}, True),
+        ("publisher", {transition_id}, True),
+    ]
+
+
 def test_management_group_service_bus_data_owner_is_treated_as_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3221,8 +3799,13 @@ def test_wc013_exports_foundation_values_required_by_orchestrator() -> None:
         "WC-027 publisher logical binding key does not match",
         "WC-027 publisher Job contains ungoverned identity",
         "WC-027 publisher Job must use only the exact user-assigned identities",
+        "WC-027 producer Job scaler metadata fields do not match",
+        "WC-027 publisher Job scaler metadata fields do not match",
     ):
         assert required_job_check in source
+    assert "var wc027ExpectedScalerMetadataKeys = [" in source
+    assert "wc027ProducerScalerMetadataFieldsMatch" in source
+    assert "wc027PublisherScalerMetadataFieldsMatch" in source
     for expected in (
         "notificationQueueName: validatedWc016RuntimeEnabled",
         (
@@ -3323,8 +3906,13 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--foundation-reviewed-receipt-sha256"' in source
     assert '--producer-reviewed-receipt-sha256"' in source
     assert '--publisher-reviewed-receipt-sha256"' in source
+    assert "athena.wc029DeploymentPlan.v3" in source
     assert "athena.wc029DeploymentReceipt.v1" in source
     assert "predecessorReceiptSha256s" in source
+    assert "--rotation-transition-assignment" in source
+    assert "rotationTransitionAssignmentIds" in source
+    assert "--legacy-crypto-user-migration-assignment" in source
+    assert "legacyCryptoUserMigrationAssignmentIds" in source
     assert "receipt does not prove an independently reviewed plan" in source
     assert "return receipt_path" in source
     assert "plan manifest does not match the independently reviewed SHA-256" in source
