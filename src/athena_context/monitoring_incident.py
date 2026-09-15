@@ -4,6 +4,9 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
+from uuid import UUID
+
+from athena_context.contracts.common import compute_artifact_digest
 
 type MonitoringIncidentHealthState = Literal[
     "healthy",
@@ -66,6 +69,67 @@ class MonitoringIncidentSelection:
     previous: MonitoringIncidentSample
     current: tuple[MonitoringIncidentSample, ...]
     current_state: Literal["degraded", "unhealthy", "unavailable"]
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedIncident:
+    incident_resource_id: str
+    previous_record_id: str
+    current_record_ids: tuple[str, ...]
+    current_state: Literal["degraded", "unhealthy", "unavailable"]
+    transition_digest: str
+
+
+def build_selected_incident(
+    *,
+    incident_resource_id: str,
+    previous_record_id: str,
+    current_record_ids: tuple[str, ...],
+    current_state: Literal["degraded", "unhealthy", "unavailable"],
+) -> SelectedIncident:
+    normalized_resource_id = incident_resource_id.casefold().rstrip("/")
+    normalized_current_ids = tuple(sorted(current_record_ids))
+    resource_segments = normalized_resource_id.strip("/").split("/")
+    try:
+        subscription_id_is_valid = (
+            len(resource_segments) >= 8
+            and resource_segments[0] == "subscriptions"
+            and str(UUID(resource_segments[1])) == resource_segments[1]
+            and resource_segments[2] == "resourcegroups"
+            and bool(resource_segments[3])
+            and resource_segments[4] == "providers"
+            and bool(resource_segments[5])
+            and bool(resource_segments[6])
+            and bool(resource_segments[7])
+            and (len(resource_segments) - 6) % 2 == 0
+        )
+    except (ValueError, IndexError):
+        subscription_id_is_valid = False
+    if (
+        not subscription_id_is_valid
+        or not 1 <= len(previous_record_id) <= 2048
+        or not normalized_current_ids
+        or len(normalized_current_ids) != len(set(normalized_current_ids))
+        or previous_record_id in normalized_current_ids
+        or any(not 1 <= len(item) <= 2048 for item in normalized_current_ids)
+        or current_state not in {"degraded", "unhealthy", "unavailable"}
+    ):
+        raise MonitoringIncidentSelectionError(
+            "selected incident record IDs and resource must be canonical and unique"
+        )
+    payload = {
+        "incidentResourceId": normalized_resource_id,
+        "previousRecordId": previous_record_id,
+        "currentRecordIds": list(normalized_current_ids),
+        "currentState": current_state,
+    }
+    return SelectedIncident(
+        incident_resource_id=normalized_resource_id,
+        previous_record_id=previous_record_id,
+        current_record_ids=normalized_current_ids,
+        current_state=current_state,
+        transition_digest=compute_artifact_digest(payload),
+    )
 
 
 def select_monitoring_incident(
@@ -194,6 +258,8 @@ __all__ = [
     "MonitoringIncidentSample",
     "MonitoringIncidentSelection",
     "MonitoringIncidentSelectionError",
+    "SelectedIncident",
+    "build_selected_incident",
     "monitoring_health_source_record_reference",
     "monitoring_source_record_reference",
     "select_monitoring_incident",

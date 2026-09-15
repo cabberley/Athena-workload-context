@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import re
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Literal, cast
 from uuid import UUID
 
@@ -20,10 +21,7 @@ from athena_context.contracts.models import (
     UtcDateTime,
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
-from athena_context.monitoring_incident import (
-    MonitoringHealthRecordKind,
-    monitoring_health_source_record_reference,
-)
+from athena_context.monitoring_incident import build_selected_incident
 
 MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION = "athena.wc024MonitoringCollectorContract.v2"
 MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
@@ -1865,79 +1863,163 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
         return self
 
 
-class MonitoringIncidentHealthSampleBinding(_StrictMonitoringContract):
-    """Signed binding from one source health record to its persisted observation."""
+class MonitoringIpFlowProvenance(_StrictMonitoringContract):
+    """Signed normalized IP Flow evidence bound to one acquisition exchange."""
 
-    record_kind: MonitoringHealthRecordKind = Field(alias="recordKind")
-    source_record_id: str = Field(
-        alias="sourceRecordId",
+    schema_version: Literal["athena.wc028MonitoringIpFlowProvenance.v1"] = Field(
+        alias="schemaVersion"
+    )
+    exchange_sequence: int = Field(alias="exchangeSequence", ge=1, le=32)
+    ip_flow_request_digest: Sha256Digest = Field(alias="ipFlowRequestDigest")
+    ip_flow_result_digest: Sha256Digest = Field(alias="ipFlowResultDigest")
+    traffic_analytics_request_digest: Sha256Digest = Field(alias="trafficAnalyticsRequestDigest")
+    correlation_request_id: str = Field(
+        alias="correlationRequestId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    target_resource_id: str = Field(
+        alias="targetResourceId",
         min_length=1,
         max_length=2048,
     )
-    source_record_reference: str = Field(
-        alias="sourceRecordReference",
-        pattern=r"^[a-z-]+:sha256:[a-f0-9]{64}$",
-    )
-    observation_id: str = Field(
-        alias="observationId",
-        pattern=r"^obs-[a-f0-9]{32}$",
-    )
-    control_id: str = Field(
-        alias="controlId",
-        pattern=r"^monitoring-control-[a-f0-9]{32}$",
-    )
-    resource_id: str = Field(
-        alias="resourceId",
+    source_resource_id: str = Field(
+        alias="sourceResourceId",
         min_length=1,
         max_length=2048,
     )
-    state: Literal["healthy", "degraded", "unhealthy", "unavailable"]
-    observed_start: UtcDateTime = Field(alias="observedStart")
-    observed_end: UtcDateTime = Field(alias="observedEnd")
-    sample_digest: Sha256Digest = Field(alias="sampleDigest")
+    destination_resource_id: str = Field(
+        alias="destinationResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    direction: Literal["inbound", "outbound"]
+    protocol: Literal["Tcp", "Udp"]
+    source_address: str = Field(alias="sourceAddress", min_length=2, max_length=45)
+    destination_address: str = Field(
+        alias="destinationAddress",
+        min_length=2,
+        max_length=45,
+    )
+    source_port: int = Field(alias="sourcePort", ge=0, le=65535)
+    destination_port: int = Field(alias="destinationPort", ge=0, le=65535)
+    five_tuple_digest: Sha256Digest = Field(alias="fiveTupleDigest")
+    historical_decision: Literal["allowed", "denied", "unknown"] = Field(alias="historicalDecision")
+    historical_rule_resource_id: str = Field(
+        alias="historicalRuleResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    access: Literal["Allow", "Deny"]
+    result_rule_resource_id: str | None = Field(
+        default=None,
+        alias="resultRuleResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    causal_change_correlation_id: str | None = Field(
+        default=None,
+        alias="causalChangeCorrelationId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    requested_at: UtcDateTime = Field(alias="requestedAt")
+    received_at: UtcDateTime = Field(alias="receivedAt")
+    checked_at: UtcDateTime = Field(alias="checkedAt")
+    provenance_digest: Sha256Digest = Field(alias="provenanceDigest")
 
-    @field_validator("resource_id")
+    @field_validator(
+        "target_resource_id",
+        "source_resource_id",
+        "destination_resource_id",
+        "historical_rule_resource_id",
+        "result_rule_resource_id",
+    )
     @classmethod
-    def normalize_resource_id(cls, value: str) -> str:
+    def normalize_resource_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.casefold().rstrip("/")
         _parse_arm_resource_id(normalized)
         return normalized
 
+    @field_validator("source_address", "destination_address")
+    @classmethod
+    def normalize_address(cls, value: str) -> str:
+        try:
+            return ip_address(value).compressed
+        except ValueError as exc:
+            raise ValueError("IP Flow provenance address must be canonical") from exc
+
+    @field_validator("correlation_request_id")
+    @classmethod
+    def normalize_correlation_request_id(cls, value: str) -> str:
+        return value.casefold()
+
     @model_validator(mode="after")
-    def validate_sample(self) -> MonitoringIncidentHealthSampleBinding:
-        if self.source_record_reference != monitoring_health_source_record_reference(
-            self.record_kind,
-            self.source_record_id,
+    def validate_provenance(self) -> MonitoringIpFlowProvenance:
+        expected_target = (
+            self.destination_resource_id if self.direction == "inbound" else self.source_resource_id
+        )
+        tuple_payload = {
+            "direction": self.direction,
+            "protocol": self.protocol,
+            "sourceResourceId": self.source_resource_id,
+            "destinationResourceId": self.destination_resource_id,
+            "sourceAddress": self.source_address,
+            "destinationAddress": self.destination_address,
+            "sourcePort": self.source_port,
+            "destinationPort": self.destination_port,
+        }
+        if (
+            self.requested_at != self.checked_at
+            or self.checked_at > self.received_at
+            or self.target_resource_id != expected_target
+            or self.five_tuple_digest != compute_artifact_digest(tuple_payload)
         ):
-            raise ValueError("incident sample sourceRecordReference does not bind sourceRecordId")
-        if self.observed_start > self.observed_end:
-            raise ValueError("incident sample interval is invalid")
+            raise ValueError(
+                "IP Flow provenance does not bind exact exchange time, target, and tuple"
+            )
+        if self.access == "Deny" and self.result_rule_resource_id is None:
+            raise ValueError("denied IP Flow provenance requires the returned rule")
+        if self.causal_change_correlation_id is not None and (
+            self.historical_decision != "denied"
+            or self.access != "Deny"
+            or self.result_rule_resource_id != self.historical_rule_resource_id
+        ):
+            raise ValueError(
+                "causal IP Flow provenance requires exact denied decision and rule binding"
+            )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
                 by_alias=True,
-                exclude={"sample_digest"},
+                exclude_none=True,
+                exclude={"provenance_digest"},
             )
         )
-        if self.sample_digest != expected:
-            raise ValueError("sampleDigest does not bind the incident health sample")
+        if self.provenance_digest != expected:
+            raise ValueError("provenanceDigest does not bind normalized IP Flow evidence")
         return self
 
 
-class MonitoringIncidentSelection(_StrictMonitoringContract):
-    """Collector-signed canonical incident seed selected from acquired health records."""
+class MonitoringSelectedIncident(_StrictMonitoringContract):
+    """Minimal collector-signed incident selection bound to normalized batch IDs."""
 
     incident_resource_id: str = Field(
         alias="incidentResourceId",
         min_length=1,
         max_length=2048,
     )
-    previous_health: MonitoringIncidentHealthSampleBinding = Field(alias="previousHealth")
-    current_health: tuple[MonitoringIncidentHealthSampleBinding, ...] = Field(
-        alias="currentHealth",
+    previous_record_id: str = Field(
+        alias="previousRecordId",
+        min_length=1,
+        max_length=2048,
+    )
+    current_record_ids: tuple[str, ...] = Field(
+        alias="currentRecordIds",
         min_length=1,
         max_length=32,
     )
+    current_state: Literal["degraded", "unhealthy", "unavailable"] = Field(alias="currentState")
     transition_digest: Sha256Digest = Field(alias="transitionDigest")
 
     @field_validator("incident_resource_id")
@@ -1947,41 +2029,29 @@ class MonitoringIncidentSelection(_StrictMonitoringContract):
         _parse_arm_resource_id(normalized)
         return normalized
 
+    @field_validator("current_record_ids")
+    @classmethod
+    def validate_current_record_ids(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("currentRecordIds must be sorted and unique")
+        return values
+
     @model_validator(mode="after")
-    def validate_selection(self) -> MonitoringIncidentSelection:
-        current_keys = tuple(
-            (item.source_record_reference, item.observation_id) for item in self.current_health
+    def validate_selection(self) -> MonitoringSelectedIncident:
+        expected = build_selected_incident(
+            incident_resource_id=self.incident_resource_id,
+            previous_record_id=self.previous_record_id,
+            current_record_ids=self.current_record_ids,
+            current_state=self.current_state,
         )
-        current_states = {item.state for item in self.current_health}
-        current_controls = {item.control_id for item in self.current_health}
         if (
-            self.previous_health.state != "healthy"
-            or not current_states
-            or not current_states.issubset({"degraded", "unhealthy", "unavailable"})
-            or len(current_states) != 1
-            or len(current_controls) != 1
-            or self.previous_health.control_id not in current_controls
-            or self.previous_health.resource_id != self.incident_resource_id
-            or any(item.resource_id != self.incident_resource_id for item in self.current_health)
-            or self.previous_health.observed_end
-            > min(item.observed_start for item in self.current_health)
-            or current_keys != tuple(sorted(current_keys))
-            or len(current_keys) != len(set(current_keys))
-            or self.previous_health.observation_id
-            in {item.observation_id for item in self.current_health}
+            self.previous_record_id in self.current_record_ids
+            or self.transition_digest != expected.transition_digest
         ):
-            raise ValueError(
-                "incident selection is not one deterministic healthy-to-adverse transition"
-            )
-        expected = compute_artifact_digest(
-            self.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude={"transition_digest"},
-            )
-        )
-        if self.transition_digest != expected:
-            raise ValueError("transitionDigest does not bind the incident selection")
+            raise ValueError("transitionDigest does not bind selectedIncident")
         return self
 
 
@@ -2059,9 +2129,9 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         alias="normalizedEvidenceDigest",
         pattern=_DIGEST_PATTERN,
     )
-    incident_selection: MonitoringIncidentSelection | None = Field(
+    selected_incident: MonitoringSelectedIncident | None = Field(
         default=None,
-        alias="incidentSelection",
+        alias="selectedIncident",
     )
     execution_started_at: UtcDateTime = Field(alias="executionStartedAt")
     execution_completed_at: UtcDateTime = Field(alias="executionCompletedAt")
@@ -2093,7 +2163,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.authenticated_tenant_id is not None
                 or self.credential_proofs is not None
                 or self.identity_proof is not None
-                or self.incident_selection is not None
+                or self.selected_incident is not None
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
                 or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
@@ -2111,7 +2181,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.authenticated_tenant_id is not None
                 or self.credential_proofs is not None
                 or self.identity_proof is not None
-                or self.incident_selection is not None
+                or self.selected_incident is not None
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
                 or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
@@ -2126,7 +2196,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.authenticated_tenant_id is None
                 or self.credential_proofs is None
                 or self.identity_proof is not None
-                or self.incident_selection is not None
+                or self.selected_incident is not None
                 or re.fullmatch(
                     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
                     self.authenticated_principal_id,
@@ -2151,11 +2221,11 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
             )
             if self.schema_version == MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION:
-                if identity_proof_invalid or self.incident_selection is not None:
+                if identity_proof_invalid or self.selected_incident is not None:
                     raise ValueError(
                         "v4 acquisition receipt requires only one Athena identity proof"
                     )
-            elif identity_proof_invalid or self.incident_selection is None:
+            elif identity_proof_invalid or self.selected_incident is None:
                 raise ValueError(
                     "v5 acquisition receipt requires identity proof and incident selection"
                 )
@@ -2553,7 +2623,7 @@ def verify_monitoring_acquisition_receipt_attestation(
         or receipt.authenticated_client_id is None
         or receipt.authenticated_tenant_id is None
         or receipt.identity_proof is None
-        or receipt.incident_selection is None
+        or receipt.selected_incident is None
     ):
         raise ValueError("production verification requires incident-bound acquisition receipt v5")
     effective_rbac_inventory = cast(
@@ -2676,8 +2746,8 @@ __all__ = [
     "MonitoringEvidenceAttestation",
     "MonitoringEvidenceHandoff",
     "MonitoringIdentityProof",
-    "MonitoringIncidentHealthSampleBinding",
-    "MonitoringIncidentSelection",
+    "MonitoringIpFlowProvenance",
+    "MonitoringSelectedIncident",
     "MonitoringIpFlowVerifyOperation",
     "MonitoringReadOperation",
     "MonitoringResourceLogOperation",

@@ -11,10 +11,10 @@ from pydantic import ValidationError
 
 import athena_context.correlation.engine as correlation_engine
 from athena_context.contracts import (
-    CORRELATION_REQUEST_SCHEMA_VERSION,
     LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION,
     LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidencePersistenceHandoff,
@@ -99,6 +99,42 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _json_value(item) for key, item in value.items() if item is not None}
     return value
+
+
+def _ip_flow_provenance(*, direct_attribution: bool) -> dict[str, object]:
+    tuple_payload = {
+        "direction": "inbound",
+        "protocol": "Tcp",
+        "sourceResourceId": WEB_ID.casefold(),
+        "destinationResourceId": DB_ID.casefold(),
+        "sourceAddress": "192.0.2.10",
+        "destinationAddress": "192.0.2.20",
+        "sourcePort": 443,
+        "destinationPort": 1433,
+    }
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringIpFlowProvenance.v1",
+        "exchangeSequence": 1,
+        "ipFlowRequestDigest": "sha256:" + "a" * 64,
+        "ipFlowResultDigest": "sha256:" + "b" * 64,
+        "trafficAnalyticsRequestDigest": "sha256:" + "c" * 64,
+        "correlationRequestId": "93e948cc-df1e-4caf-8a91-c31aa3803793",
+        "targetResourceId": DB_ID.casefold(),
+        **tuple_payload,
+        "fiveTupleDigest": compute_artifact_digest(tuple_payload),
+        "historicalDecision": "denied",
+        "historicalRuleResourceId": NSG_RULE_ID.casefold(),
+        "access": "Deny",
+        "resultRuleResourceId": NSG_RULE_ID.casefold(),
+        "causalChangeCorrelationId": (CHANGE_CORRELATION_ID if direct_attribution else None),
+        "requestedAt": NOW,
+        "checkedAt": NOW,
+        "receivedAt": NOW,
+    }
+    return {
+        **payload,
+        "provenanceDigest": compute_artifact_digest(_json_value(payload)),
+    }
 
 
 def _scope(
@@ -576,6 +612,7 @@ def _batch(
             destinationPort=1433,
             enforcementResourceId=NSG_ID,
             ruleResourceId=NSG_RULE_ID,
+            ipFlowProvenance=_ip_flow_provenance(direct_attribution=direct_attribution),
             changeCorrelationId=(CHANGE_CORRELATION_ID if direct_attribution else None),
             attributionMethod=("ipFlowVerify" if direct_attribution else None),
             attributionEvidence=(
@@ -935,7 +972,7 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
     assert commit.calls == 1
     assert prepared.intent_digest
     assert prepared.monitoring_bundle.schema_version == MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
-    assert request.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+    assert request.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
     assert prepared.monitoring_bundle.monitoring_intent_reference is not None
     assert prepared.monitoring_bundle.collected_at == NOW
     query_observation_digests = {
@@ -2076,7 +2113,7 @@ def test_downstream_verification_rereads_signed_intent_and_resolves_controls() -
         )
 
 
-def test_downstream_verification_rejects_reissued_stale_source_evidence() -> None:
+def test_production_verification_rejects_historical_v3_request() -> None:
     _, intent, _ = _authority()
     reference, attestation = _intent_assets(intent)
     _, _, request, _ = _execute(direct_attribution=True)
@@ -2115,8 +2152,9 @@ def test_downstream_verification_rejects_reissued_stale_source_evidence() -> Non
     )
     object.__setattr__(service, "_require_signed_monitoring_intent", True)
 
+    assert reissued_request.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
     assert reissued_request.trusted_as_of == trusted_as_of
-    with pytest.raises(ValueError, match="evidence exceeds"):
+    with pytest.raises(ValueError, match="incident-bound request v4"):
         service.correlate(reissued_request)
 
 

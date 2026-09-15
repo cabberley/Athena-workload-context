@@ -14,7 +14,9 @@ from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_REQUEST_SCHEMA_VERSION,
     MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidenceArtifact,
@@ -36,7 +38,9 @@ from athena_context.contracts import (
     MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
     MonitoringIntentEvidenceReference,
+    MonitoringIpFlowProvenance,
     MonitoringObservation,
+    MonitoringSelectedIncident,
     NetworkFlowObservation,
     NormalizedChangeEvidence,
     PlatformHealthObservation,
@@ -60,7 +64,10 @@ from athena_context.eventing.change_ingestion import (
     build_change_evidence_artifact,
     normalize_resource_graph_change,
 )
-from athena_context.monitoring_incident import monitoring_source_record_reference
+from athena_context.monitoring_incident import (
+    build_selected_incident,
+    monitoring_source_record_reference,
+)
 
 MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
 MAX_MONITORING_COLLECTION_BYTES = 512 * 1024
@@ -349,23 +356,9 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
         min_length=1,
         max_length=2048,
     )
-    ip_flow_access: Literal["Allow", "Deny"] | None = Field(
+    ip_flow_provenance: MonitoringIpFlowProvenance | None = Field(
         default=None,
-        alias="ipFlowAccess",
-    )
-    ip_flow_rule_resource_id: str | None = Field(
-        default=None,
-        alias="ipFlowRuleResourceId",
-        min_length=1,
-        max_length=2048,
-    )
-    ip_flow_checked_at: UtcDateTime | None = Field(
-        default=None,
-        alias="ipFlowCheckedAt",
-    )
-    ip_flow_result_digest: Sha256Digest | None = Field(
-        default=None,
-        alias="ipFlowResultDigest",
+        alias="ipFlowProvenance",
     )
     change_correlation_id: str | None = Field(
         default=None,
@@ -385,21 +378,27 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
 
     @model_validator(mode="after")
     def validate_attribution_pair(self) -> NetworkWatcherFlowRecord:
-        ip_flow_values = (
-            self.ip_flow_access,
-            self.ip_flow_checked_at,
-            self.ip_flow_result_digest,
-        )
-        if any(value is not None for value in ip_flow_values) and not all(
-            value is not None for value in ip_flow_values
-        ):
-            raise ValueError(
-                "network flow IP Flow evidence requires access, checkedAt, and result digest"
-            )
-        if self.ip_flow_rule_resource_id is not None and self.ip_flow_access is None:
-            raise ValueError("network flow IP Flow rule cannot exist without point-in-time access")
-        if self.ip_flow_checked_at is not None and self.ip_flow_checked_at < self.observed_end:
+        provenance = self.ip_flow_provenance
+        if provenance is not None and provenance.checked_at < self.observed_end:
             raise ValueError("network flow IP Flow checkedAt must not predate historical evidence")
+        if provenance is not None and (
+            provenance.historical_decision != self.decision
+            or self.rule_resource_id is None
+            or provenance.historical_rule_resource_id.casefold().rstrip("/")
+            != self.rule_resource_id.casefold().rstrip("/")
+            or provenance.source_resource_id.casefold().rstrip("/")
+            != self.source_resource_id.casefold().rstrip("/")
+            or provenance.destination_resource_id.casefold().rstrip("/")
+            != self.destination_resource_id.casefold().rstrip("/")
+            or provenance.direction != self.direction
+            or provenance.protocol != self.protocol
+            or provenance.source_address != self.source_address
+            or provenance.destination_address != self.destination_address
+            or provenance.source_port != self.source_port
+            or provenance.destination_port != self.destination_port
+            or provenance.causal_change_correlation_id != self.change_correlation_id
+        ):
+            raise ValueError("network flow IP Flow provenance does not bind the retained flow")
         values = (
             self.change_correlation_id,
             self.attribution_method,
@@ -409,16 +408,13 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
             value is not None for value in values
         ):
             raise ValueError("flow attribution requires correlation ID, method, and exact evidence")
-        if (
-            self.attribution_method == "ipFlowVerify"
-            and self.ip_flow_access is not None
-            and (
-                self.ip_flow_access != "Deny"
-                or self.ip_flow_rule_resource_id is None
-                or self.rule_resource_id is None
-                or self.ip_flow_rule_resource_id.casefold().rstrip("/")
-                != self.rule_resource_id.casefold().rstrip("/")
-            )
+        if self.attribution_method == "ipFlowVerify" and (
+            provenance is None
+            or provenance.access != "Deny"
+            or provenance.result_rule_resource_id is None
+            or self.rule_resource_id is None
+            or provenance.result_rule_resource_id.casefold().rstrip("/")
+            != self.rule_resource_id.casefold().rstrip("/")
         ):
             raise ValueError("IP Flow attribution requires an exact denied point-in-time rule")
         return self
@@ -1400,12 +1396,9 @@ def _network_flow_observation(
     destination_id = normalized[2]
     enforcement_id = normalized[3]
     rule_id = normalized[4] if len(normalized) == 5 else None
-    ip_flow_rule_id = None
-    if record.ip_flow_rule_resource_id is not None:
-        (ip_flow_rule_id,) = _require_resources(
-            control,
-            record.ip_flow_rule_resource_id,
-        )
+    provenance = record.ip_flow_provenance
+    if provenance is not None and provenance.result_rule_resource_id is not None:
+        _require_resources(control, provenance.result_rule_resource_id)
     _require_path(control, record.path_id, context, normalized)
     tuple_payload = _tuple_payload(
         record,
@@ -1442,18 +1435,15 @@ def _network_flow_observation(
         "queryExecutionDigest": record.query_execution_digest,
         "summaryCode": (
             f"network.flow-{record.decision}"
-            if record.ip_flow_access is None
-            else (f"network.flow-{record.decision}-ipflow-{record.ip_flow_access.casefold()}")
+            if provenance is None
+            else f"network.flow-{record.decision}-ipflow-{provenance.access.casefold()}"
         ),
         "pathId": record.path_id,
         "decision": record.decision,
         **tuple_payload,
         "enforcementResourceId": enforcement_id,
         "ruleResourceId": rule_id,
-        "ipFlowAccess": record.ip_flow_access,
-        "ipFlowRuleResourceId": ip_flow_rule_id,
-        "ipFlowCheckedAt": record.ip_flow_checked_at,
-        "ipFlowResultDigest": record.ip_flow_result_digest,
+        "ipFlowProvenance": provenance,
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "effectiveRuleAttribution": attributed,
         "attributionMethod": record.attribution_method if attributed else None,
@@ -2335,7 +2325,22 @@ def _build_evidence_index(
 def _build_transition(
     prepared: PreparedMonitoringCollection,
     evidence_index: tuple[CorrelationEvidenceCitation, ...],
-) -> IncidentHealthTransition:
+) -> tuple[IncidentHealthTransition, MonitoringSelectedIncident]:
+    selected = build_selected_incident(
+        incident_resource_id=prepared.incident_resource_id,
+        previous_record_id=prepared.previous_health_source_record_id,
+        current_record_ids=prepared.current_health_source_record_ids,
+        current_state=prepared.current_health_state,
+    )
+    selected_incident = MonitoringSelectedIncident.model_validate(
+        {
+            "incidentResourceId": selected.incident_resource_id,
+            "previousRecordId": selected.previous_record_id,
+            "currentRecordIds": selected.current_record_ids,
+            "currentState": selected.current_state,
+            "transitionDigest": selected.transition_digest,
+        }
+    )
     citations = {item.evidence_id: item for item in evidence_index}
     previous = citations[prepared.previous_health_observation_id]
     current = tuple(citations[item] for item in prepared.current_health_observation_ids)
@@ -2349,12 +2354,15 @@ def _build_transition(
         "currentStateEvidence": tuple(sorted(current, key=lambda item: item.evidence_id)),
     }
     digest = compute_artifact_digest(_json_value(payload))
-    return IncidentHealthTransition.model_validate(
-        {
-            **payload,
-            "transitionId": f"transition-{digest.removeprefix('sha256:')[:32]}",
-            "transitionDigest": digest,
-        }
+    return (
+        IncidentHealthTransition.model_validate(
+            {
+                **payload,
+                "transitionId": f"transition-{digest.removeprefix('sha256:')[:32]}",
+                "transitionDigest": digest,
+            }
+        ),
+        selected_incident,
     )
 
 
@@ -2402,7 +2410,13 @@ def build_collected_correlation_request(
         change_handoffs=ordered_handoffs,
     )
     evidence_index = _build_evidence_index(prepared, committed)
-    transition = _build_transition(prepared, evidence_index)
+    transition, selected_incident = _build_transition(prepared, evidence_index)
+    request_schema_version = (
+        CORRELATION_REQUEST_SCHEMA_VERSION
+        if acquisition_receipt is not None
+        and acquisition_receipt.schema_version == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        else PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
+    )
     change_digests = tuple(
         sorted(sha256_hex(item.canonical_bytes()) for item in prepared.change_artifacts)
     )
@@ -2443,7 +2457,11 @@ def build_collected_correlation_request(
     inventory_payload: dict[str, object] = {
         "ruleCatalogDigest": CORRELATION_RULE_CATALOG_DIGEST,
         "contextBindingDigest": context_binding.binding_digest,
-        "incidentTransitionDigest": transition.transition_digest,
+        "incidentTransitionDigest": (
+            selected_incident.transition_digest
+            if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            else transition.transition_digest
+        ),
         "monitoringHandoffDigest": (committed.monitoring_handoff.compute_artifact_digest_value()),
         "monitoringBundleDigest": sha256_hex(prepared.monitoring_bundle.canonical_bytes()),
         "changeArtifactDigests": change_digests,
@@ -2467,7 +2485,7 @@ def build_collected_correlation_request(
         }
     )
     request_payload: dict[str, object] = {
-        "schemaVersion": CORRELATION_REQUEST_SCHEMA_VERSION,
+        "schemaVersion": request_schema_version,
         "algorithmId": CORRELATION_ALGORITHM_ID,
         "ruleCatalogDigest": CORRELATION_RULE_CATALOG_DIGEST,
         "incidentRevision": incident_revision,
@@ -2475,6 +2493,11 @@ def build_collected_correlation_request(
         "trustedAsOf": trusted_as_of,
         "expiresAt": expires_at,
         "contextBinding": context_binding,
+        "selectedIncident": (
+            selected_incident
+            if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            else None
+        ),
         "incidentAnchor": transition,
         "monitoringHandoff": committed.monitoring_handoff,
         "monitoringBundle": prepared.monitoring_bundle,

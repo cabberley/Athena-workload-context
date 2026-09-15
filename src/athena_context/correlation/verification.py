@@ -28,6 +28,7 @@ from athena_context.contracts.common import (
 from athena_context.contracts.correlation import (
     CORRELATION_MAX_CANONICAL_BYTES,
     CORRELATION_REPORT_SCHEMA_VERSION,
+    CORRELATION_REQUEST_SCHEMA_VERSION,
     ConnectionMonitorObservation,
     CorrelationReport,
     CorrelationRequest,
@@ -76,6 +77,8 @@ from athena_context.eventing.change_ingestion import (
 from athena_context.monitoring_incident import (
     MonitoringIncidentSample,
     MonitoringIncidentSelectionError,
+    build_selected_incident,
+    monitoring_health_source_record_reference,
     select_monitoring_incident,
 )
 
@@ -437,6 +440,7 @@ def _verify_persisted_monitoring_scope(
                     "persisted Connection Monitor observation escapes collector scopes"
                 )
         elif isinstance(observation, NetworkFlowObservation):
+            ip_flow_provenance = observation.ip_flow_provenance
             vm_resources = {
                 observation.subject_resource_id,
                 observation.source_resource_id,
@@ -445,6 +449,12 @@ def _verify_persisted_monitoring_scope(
             network_resources = {
                 observation.enforcement_resource_id,
                 *(() if observation.rule_resource_id is None else (observation.rule_resource_id,)),
+                *(
+                    ()
+                    if ip_flow_provenance is None
+                    or ip_flow_provenance.result_rule_resource_id is None
+                    else (ip_flow_provenance.result_rule_resource_id,)
+                ),
                 *(
                     ()
                     if observation.ip_flow_rule_resource_id is None
@@ -568,6 +578,11 @@ class _CorrelationVerificationService:
         request = CorrelationRequest.model_validate_json(request.model_dump_json(by_alias=True))
         assert_catalog_digest()
         assert_contract_compatibility()
+        if (
+            self.require_signed_monitoring_intent
+            and request.schema_version != CORRELATION_REQUEST_SCHEMA_VERSION
+        ):
+            raise ValueError("production correlation requires incident-bound request v4")
         if evaluated_at < request.trusted_as_of:
             raise ValueError("verification time must not precede request trustedAsOf")
         if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
@@ -1114,9 +1129,9 @@ def _verify_collector_incident_selection(
     request: CorrelationRequest,
     receipt: MonitoringAcquisitionReceipt,
 ) -> None:
-    signed_selection = receipt.incident_selection
-    if signed_selection is None:
-        raise ValueError("production acquisition receipt omits collector incident selection")
+    signed_selection = receipt.selected_incident
+    if signed_selection is None or request.selected_incident != signed_selection:
+        raise ValueError("production request does not bind receipt selectedIncident")
     observations = {item.observation_id: item for item in request.monitoring_bundle.observations}
     samples: list[MonitoringIncidentSample] = []
     for observation in request.monitoring_bundle.observations:
@@ -1144,49 +1159,101 @@ def _verify_collector_incident_selection(
         raise ValueError(
             "persisted observations cannot reconstruct collector incident selection"
         ) from exc
-    signed_samples = (
-        signed_selection.previous_health,
-        *signed_selection.current_health,
+
+    def resolve_record_id(record_id: str) -> HealthObservation:
+        references = {
+            monitoring_health_source_record_reference(record_kind, record_id)
+            for record_kind in (
+                "amaHeartbeat",
+                "vmConnectionHealth",
+                "resourceHealth",
+            )
+        }
+        matches = tuple(
+            _require_health_observation(item)
+            for item in observations.values()
+            if item.source_record_reference in references
+        )
+        if len(matches) != 1:
+            raise ValueError("selectedIncident record ID must resolve to exactly one observation")
+        return matches[0]
+
+    previous_observation = resolve_record_id(signed_selection.previous_record_id)
+    current_observations = tuple(
+        resolve_record_id(record_id) for record_id in signed_selection.current_record_ids
     )
-    for sample in signed_samples:
-        signed_observation = observations.get(sample.observation_id)
-        if signed_observation is None:
-            raise ValueError("collector incident selection references a missing observation")
-        provenance = signed_observation.control_provenance
-        if (
-            signed_observation.source_record_reference != sample.source_record_reference
-            or signed_observation.subject_resource_id != sample.resource_id
-            or signed_observation.observed_start != sample.observed_start
-            or signed_observation.observed_end != sample.observed_end
-            or _observation_health_state(signed_observation) != sample.state
-            or provenance is None
-            or provenance.control_id != sample.control_id
-        ):
-            raise ValueError("collector incident selection does not match persisted observations")
-    reconstructed_current = tuple(
+    rebuilt_selection = build_selected_incident(
+        incident_resource_id=reconstructed.incident_resource_id,
+        previous_record_id=signed_selection.previous_record_id,
+        current_record_ids=signed_selection.current_record_ids,
+        current_state=reconstructed.current_state,
+    )
+    reconstructed_current = {
         (item.selection_key, item.payload_id) for item in reconstructed.current
-    )
-    signed_current = tuple(
-        (item.source_record_reference, item.observation_id)
-        for item in signed_selection.current_health
-    )
+    }
+    resolved_current = {
+        (item.source_record_reference, item.observation_id) for item in current_observations
+    }
     anchor = request.incident_anchor
-    anchor_previous_ids = tuple(item.evidence_id for item in anchor.previous_state_evidence)
     anchor_current_ids = {item.evidence_id for item in anchor.current_state_evidence}
-    signed_current_ids = {item.observation_id for item in signed_selection.current_health}
+    resolved_current_ids = {item.observation_id for item in current_observations}
     if (
-        reconstructed.incident_resource_id != signed_selection.incident_resource_id
-        or reconstructed.previous.selection_key
-        != signed_selection.previous_health.source_record_reference
-        or reconstructed.previous.payload_id != signed_selection.previous_health.observation_id
-        or reconstructed_current != signed_current
-        or anchor.affected_resource_id != signed_selection.incident_resource_id
-        or anchor.previous_state != "healthy"
-        or anchor.current_state != reconstructed.current_state
-        or anchor_previous_ids != (signed_selection.previous_health.observation_id,)
-        or not signed_current_ids.issubset(anchor_current_ids)
+        rebuilt_selection.incident_resource_id != signed_selection.incident_resource_id
+        or rebuilt_selection.previous_record_id != signed_selection.previous_record_id
+        or rebuilt_selection.current_record_ids != signed_selection.current_record_ids
+        or rebuilt_selection.current_state != signed_selection.current_state
+        or rebuilt_selection.transition_digest != signed_selection.transition_digest
+        or reconstructed.previous.selection_key != previous_observation.source_record_reference
+        or reconstructed.previous.payload_id != previous_observation.observation_id
+        or reconstructed_current != resolved_current
+        or anchor_current_ids != resolved_current_ids
+        or tuple(item.evidence_id for item in anchor.previous_state_evidence)
+        != (previous_observation.observation_id,)
     ):
-        raise ValueError("correlation incident anchor does not match signed collector selection")
+        raise ValueError("reconstructed incident does not match signed selectedIncident")
+    evidence_by_id = {item.evidence_id: item for item in request.evidence_index}
+    current_citations = tuple(evidence_by_id[item.observation_id] for item in current_observations)
+    previous_citation = evidence_by_id[previous_observation.observation_id]
+    anchor_payload: dict[str, object] = {
+        "affectedResourceId": rebuilt_selection.incident_resource_id,
+        "previousState": "healthy",
+        "currentState": rebuilt_selection.current_state,
+        "observedStart": min(item.observed_start for item in current_citations),
+        "observedEnd": max(item.observed_end for item in current_citations),
+        "previousStateEvidence": (previous_citation,),
+        "currentStateEvidence": tuple(sorted(current_citations, key=lambda item: item.evidence_id)),
+    }
+    digest_payload = {
+        **anchor_payload,
+        "previousStateEvidence": [
+            previous_citation.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        ],
+        "currentStateEvidence": [
+            item.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            for item in sorted(
+                current_citations,
+                key=lambda item: item.evidence_id,
+            )
+        ],
+    }
+    transition_digest = compute_artifact_digest(digest_payload)
+    reconstructed_anchor = type(anchor).model_validate(
+        {
+            **anchor_payload,
+            "transitionId": (f"transition-{transition_digest.removeprefix('sha256:')[:32]}"),
+            "transitionDigest": transition_digest,
+        }
+    )
+    if anchor != reconstructed_anchor:
+        raise ValueError("canonical incident transition does not match signed selectedIncident")
 
 
 def _verify_network_rule_parents(request: CorrelationRequest) -> None:
@@ -1196,6 +1263,11 @@ def _verify_network_rule_parents(request: CorrelationRequest) -> None:
             continue
         for rule_resource_id in (
             observation.rule_resource_id,
+            (
+                observation.ip_flow_provenance.result_rule_resource_id
+                if observation.ip_flow_provenance is not None
+                else None
+            ),
             observation.ip_flow_rule_resource_id,
         ):
             if rule_resource_id is None:

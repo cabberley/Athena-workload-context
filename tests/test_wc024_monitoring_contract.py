@@ -27,8 +27,7 @@ from athena_context.contracts import (
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
     MonitoringIdentityProof,
-    MonitoringIncidentHealthSampleBinding,
-    MonitoringIncidentSelection,
+    MonitoringSelectedIncident,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     VersionPinnedBlobReference,
@@ -41,7 +40,7 @@ from athena_context.contracts import (
     verify_monitoring_evidence_handoff_attestation,
 )
 from athena_context.monitoring_incident import (
-    monitoring_health_source_record_reference,
+    build_selected_incident,
 )
 
 COLLECTOR_CONTRACT_MODULE = (
@@ -1093,32 +1092,20 @@ def _trusted_signed_handoff() -> tuple[
     return signed_handoff, _collector_contract(), anchor, record
 
 
-def _incident_sample(
-    *,
-    source_record_id: str,
-    observation_id: str,
-    state: str,
-    observed_start: datetime,
-    observed_end: datetime,
-) -> MonitoringIncidentHealthSampleBinding:
-    payload: dict[str, object] = {
-        "recordKind": "amaHeartbeat",
-        "sourceRecordId": source_record_id,
-        "sourceRecordReference": monitoring_health_source_record_reference(
-            "amaHeartbeat",
-            source_record_id,
-        ),
-        "observationId": observation_id,
-        "controlId": "monitoring-control-" + "9" * 32,
-        "resourceId": SIGNAL_READ_SCOPE_IDS[0].casefold(),
-        "state": state,
-        "observedStart": observed_start,
-        "observedEnd": observed_end,
-    }
-    return MonitoringIncidentHealthSampleBinding.model_validate(
+def _selected_incident() -> MonitoringSelectedIncident:
+    selected = build_selected_incident(
+        incident_resource_id=SIGNAL_READ_SCOPE_IDS[0],
+        previous_record_id="heartbeat-previous",
+        current_record_ids=("heartbeat-current",),
+        current_state="unhealthy",
+    )
+    return MonitoringSelectedIncident.model_validate(
         {
-            **payload,
-            "sampleDigest": compute_artifact_digest(_json_value(payload)),
+            "incidentResourceId": selected.incident_resource_id,
+            "previousRecordId": selected.previous_record_id,
+            "currentRecordIds": selected.current_record_ids,
+            "currentState": selected.current_state,
+            "transitionDigest": selected.transition_digest,
         }
     )
 
@@ -1188,31 +1175,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         checkedAt=observed_at,
         identityProofDigest=proof.proof_digest,
     )
-    previous_sample = _incident_sample(
-        source_record_id="heartbeat-previous",
-        observation_id="obs-" + "7" * 32,
-        state="healthy",
-        observed_start=observed_at.replace(minute=55, hour=1),
-        observed_end=observed_at.replace(minute=56, hour=1),
-    )
-    current_sample = _incident_sample(
-        source_record_id="heartbeat-current",
-        observation_id="obs-" + "8" * 32,
-        state="unhealthy",
-        observed_start=observed_at.replace(minute=57, hour=1),
-        observed_end=observed_at.replace(minute=58, hour=1),
-    )
-    selection_payload: dict[str, object] = {
-        "incidentResourceId": SIGNAL_READ_SCOPE_IDS[0].casefold(),
-        "previousHealth": previous_sample,
-        "currentHealth": (current_sample,),
-    }
-    incident_selection = MonitoringIncidentSelection.model_validate(
-        {
-            **selection_payload,
-            "transitionDigest": compute_artifact_digest(_json_value(selection_payload)),
-        }
-    )
+    selected_incident = _selected_incident()
     payload: dict[str, object] = {
         "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         "authenticatedPrincipalId": reader_principal,
@@ -1229,7 +1192,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         "contextBindingDigest": "sha256:" + "3" * 64,
         "collectionBatchDigest": "sha256:" + "4" * 64,
         "normalizedEvidenceDigest": "sha256:" + "5" * 64,
-        "incidentSelection": incident_selection.model_dump(
+        "selectedIncident": selected_incident.model_dump(
             mode="json",
             by_alias=True,
         ),
@@ -1266,7 +1229,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             **signed_payload,
             "exchanges": (exchange,),
             "identityProof": proof,
-            "incidentSelection": incident_selection,
+            "selectedIncident": selected_incident,
         },
         collectorAttestation=MonitoringEvidenceAttestation(
             signatureAlgorithm="RS256",
@@ -1337,7 +1300,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             "monitoringReaderIdentityId",
             "athenaContextPrincipalId",
             "identityProof",
-            "incidentSelection",
+            "selectedIncident",
         }
     }
     legacy_payload.update(

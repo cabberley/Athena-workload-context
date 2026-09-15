@@ -174,6 +174,47 @@ def _network_flow_observation(
         "sourcePort": 443,
         "destinationPort": 1433,
     }
+    actual_effective_attribution = (
+        effective_rule_attribution
+        and decision == "denied"
+        and include_rule_resource_id
+    )
+    ip_flow_provenance: dict[str, object] | None = None
+    if include_rule_resource_id:
+        checked_at = observed_end or NOW
+        provenance_payload: dict[str, object] = {
+            "schemaVersion": "athena.wc028MonitoringIpFlowProvenance.v1",
+            "exchangeSequence": 1,
+            "ipFlowRequestDigest": "sha256:" + "a" * 64,
+            "ipFlowResultDigest": "sha256:" + "b" * 64,
+            "trafficAnalyticsRequestDigest": "sha256:" + "c" * 64,
+            "correlationRequestId": "93e948cc-df1e-4caf-8a91-c31aa3803793",
+            "targetResourceId": (
+                DB_ID.lower()
+                if direction == "inbound"
+                else WEB_ID.lower()
+            ),
+            **tuple_payload,
+            "fiveTupleDigest": compute_artifact_digest(tuple_payload),
+            "historicalDecision": decision,
+            "historicalRuleResourceId": rule_resource_id.lower(),
+            "access": "Allow" if decision == "allowed" else "Deny",
+            "resultRuleResourceId": rule_resource_id.lower(),
+            "causalChangeCorrelationId": (
+                "11111111-1111-1111-1111-111111111111"
+                if actual_effective_attribution
+                else None
+            ),
+            "requestedAt": checked_at,
+            "checkedAt": checked_at,
+            "receivedAt": checked_at,
+        }
+        ip_flow_provenance = {
+            **provenance_payload,
+            "provenanceDigest": compute_artifact_digest(
+                _json_value(provenance_payload)
+            ),
+        }
     payload: dict[str, object] = {
         "observationKind": "networkFlow",
         "subjectResourceId": WEB_ID.lower(),
@@ -199,28 +240,29 @@ def _network_flow_observation(
             if include_rule_resource_id
             else None
         ),
+        "ipFlowProvenance": ip_flow_provenance,
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
-        "effectiveRuleAttribution": effective_rule_attribution,
+        "effectiveRuleAttribution": actual_effective_attribution,
         "attributionMethod": (
-            "ipFlowVerify" if effective_rule_attribution else None
+            "ipFlowVerify" if actual_effective_attribution else None
         ),
         "causalEffect": (
-            "introducedDenyForTuple" if effective_rule_attribution else None
+            "introducedDenyForTuple" if actual_effective_attribution else None
         ),
         "attributionProofDigest": (
-            "sha256:" + "7" * 64 if effective_rule_attribution else None
+            "sha256:" + "7" * 64 if actual_effective_attribution else None
         ),
         "matchedChangeKey": (
-            matched_change_key if effective_rule_attribution else None
+            matched_change_key if actual_effective_attribution else None
         ),
         "matchedChangeEvidenceId": (
-            matched_change_evidence_id if effective_rule_attribution else None
+            matched_change_evidence_id if actual_effective_attribution else None
         ),
         "matchedChangeArtifactDigest": (
-            matched_change_artifact_digest if effective_rule_attribution else None
+            matched_change_artifact_digest if actual_effective_attribution else None
         ),
         "matchedPropertyPaths": (
-            ("properties.access",) if effective_rule_attribution else ()
+            ("properties.access",) if actual_effective_attribution else ()
         ),
     }
     digest = compute_artifact_digest(_json_value(payload))
@@ -1634,6 +1676,39 @@ def test_network_tuple_and_nsg_property_bindings_are_exact() -> None:
         rule_resource_id=f"{NSG_ID}/securityRules/allow-other",
     )
     assert not correlation_contract._same_flow(flow, sibling_flow)
+
+
+def test_historical_network_flow_fields_remain_parseable_without_current_provenance() -> None:
+    flow = _network_flow_observation(
+        path=_dependency_path(),
+        effective_rule_attribution=False,
+    )
+    payload = flow.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"observation_id", "observation_digest"},
+    )
+    provenance = payload.pop("ipFlowProvenance")
+    payload.update(
+        {
+            "ipFlowAccess": provenance["access"],
+            "ipFlowRuleResourceId": provenance["resultRuleResourceId"],
+            "ipFlowCheckedAt": provenance["checkedAt"],
+            "ipFlowResultDigest": provenance["ipFlowResultDigest"],
+        }
+    )
+    digest = compute_artifact_digest(_json_value(payload))
+
+    historical = NetworkFlowObservation(
+        **payload,
+        observationId=f"obs-{digest.removeprefix('sha256:')[:32]}",
+        observationDigest=digest,
+    )
+
+    assert historical.ip_flow_provenance is None
+    assert historical.ip_flow_access == "Deny"
+    assert historical.ip_flow_rule_resource_id == NSG_RULE_ID.lower()
 
 
 def test_change_properties_reject_case_insensitive_duplicates() -> None:

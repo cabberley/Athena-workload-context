@@ -1060,7 +1060,14 @@ def _change_hypothesis(
 
 
 def _flow_is_denied(flow: NetworkFlowObservation) -> bool:
-    return flow.decision == "denied" and flow.ip_flow_access != "Allow"
+    provenance = flow.ip_flow_provenance
+    if provenance is None:
+        return flow.decision == "denied" and flow.ip_flow_access != "Allow"
+    return (
+        flow.decision == "denied"
+        and provenance.access == "Deny"
+        and provenance.result_rule_resource_id == flow.rule_resource_id
+    )
 
 
 def _dependency_hypotheses(
@@ -1617,7 +1624,14 @@ def _network_observation_contradictions(
             (coverage, observation)
             for observation in request.monitoring_bundle.observations
             if isinstance(observation, NetworkFlowObservation)
-            and (observation.decision == "allowed" or observation.ip_flow_access == "Allow")
+            and (
+                observation.decision == "allowed"
+                or (
+                    observation.ip_flow_provenance is not None
+                    and observation.ip_flow_provenance.access == "Allow"
+                )
+                or observation.ip_flow_access == "Allow"
+            )
             and any(
                 _nsg_chain_key(observation) == _nsg_chain_key(denied_flow)
                 for denied_flow in claimed_flows
@@ -1694,7 +1708,11 @@ def _chain_has_hard_conflict(
 ) -> bool:
     if any(
         isinstance(item, NetworkFlowObservation)
-        and (item.decision == "allowed" or item.ip_flow_access == "Allow")
+        and (
+            item.decision == "allowed"
+            or (item.ip_flow_provenance is not None and item.ip_flow_provenance.access == "Allow")
+            or item.ip_flow_access == "Allow"
+        )
         and _same_flow(item, flow)
         and _overlaps_incident(item, request)
         and _matching_flow_coverage(request, item) is not None

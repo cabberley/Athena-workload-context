@@ -575,7 +575,10 @@ def test_ip_flow_client_maps_local_tuple_and_polls_only_bound_arm_location() -> 
             status_code=202,
             headers={"Location": operation_url, "Retry-After": "0"},
         ),
-        _ResponseSpec({"access": "Deny", "ruleName": PRODUCTION_NSG_RULE_ID}),
+        _ResponseSpec(
+            {"access": "Deny", "ruleName": PRODUCTION_NSG_RULE_ID},
+            headers={"x-ms-correlation-request-id": ("93e948cc-df1e-4caf-8a91-c31aa3803793")},
+        ),
     )
     credential = _Credential()
     contract = _acquisition_collector_contract()
@@ -590,6 +593,7 @@ def test_ip_flow_client_maps_local_tuple_and_polls_only_bound_arm_location() -> 
     assert credential.scopes == [("https://management.azure.com/.default",)]
     assert result.access == "Deny"
     assert result.rule_resource_id == PRODUCTION_NSG_RULE_ID.casefold()
+    assert result.correlation_request_id == "93e948cc-df1e-4caf-8a91-c31aa3803793"
     assert transport.sleeps == [0]
     assert len(transport.requests) == 2
     initial = transport.requests[0]
@@ -607,6 +611,36 @@ def test_ip_flow_client_maps_local_tuple_and_polls_only_bound_arm_location() -> 
         "remoteIPAddress": "192.0.2.10",
     }
     assert transport.requests[1].url == operation_url
+
+
+def test_ip_flow_client_normalizes_request_id_fallback() -> None:
+    transport = _MockTransport(
+        _ResponseSpec(
+            {"access": "Allow"},
+            headers={"x-ms-request-id": "84BA07FB-0911-4D67-946A-67A9EAC90506"},
+        )
+    )
+    client = AzureIpFlowVerifyAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    result = client.query_ip_flow_verify(_ip_flow_request())
+
+    assert result.correlation_request_id == "84ba07fb-0911-4d67-946a-67a9eac90506"
+
+
+def test_ip_flow_client_rejects_missing_request_id() -> None:
+    transport = _MockTransport(_ResponseSpec({"access": "Allow"}))
+    client = AzureIpFlowVerifyAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(MonitoringAcquisitionError, match="correlation request ID"):
+        client.query_ip_flow_verify(_ip_flow_request())
 
 
 def test_ip_flow_client_rejects_polling_endpoint_escape_before_follow() -> None:

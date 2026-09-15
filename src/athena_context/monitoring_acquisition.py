@@ -39,7 +39,6 @@ from athena_context.contracts import (
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringIdentityProof,
-    MonitoringObservation,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
@@ -56,10 +55,8 @@ from athena_context.contracts import (
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.monitoring import (
     MonitoringEffectiveRbacInventory,
-    MonitoringIncidentHealthSampleBinding,
-)
-from athena_context.contracts.monitoring import (
-    MonitoringIncidentSelection as SignedMonitoringIncidentSelection,
+    MonitoringIpFlowProvenance,
+    MonitoringSelectedIncident,
 )
 from athena_context.monitoring_collection import (
     AmaHeartbeatRecord,
@@ -81,6 +78,8 @@ from athena_context.monitoring_collection import (
 from athena_context.monitoring_incident import (
     MonitoringIncidentSample,
     MonitoringIncidentSelectionError,
+    SelectedIncident,
+    build_selected_incident,
     monitoring_health_source_record_reference,
     select_monitoring_incident,
 )
@@ -1065,6 +1064,10 @@ class IpFlowVerifyResult(_StrictAcquisitionModel):
     source_identity_id: str = Field(alias="sourceIdentityId")
     collected_at: UtcDateTime = Field(alias="collectedAt")
     checked_at: UtcDateTime = Field(alias="checkedAt")
+    correlation_request_id: str = Field(
+        alias="correlationRequestId",
+        pattern=_GUID_PATTERN.pattern,
+    )
     access: Literal["Allow", "Deny"]
     rule_resource_id: str | None = Field(default=None, alias="ruleResourceId")
     response_bytes: int = Field(alias="responseBytes", ge=0, le=MAX_ACQUISITION_RESPONSE_BYTES)
@@ -1079,6 +1082,11 @@ class IpFlowVerifyResult(_StrictAcquisitionModel):
     @classmethod
     def validate_rule(cls, value: str | None) -> str | None:
         return None if value is None else _canonical_resource_id(value)
+
+    @field_validator("correlation_request_id")
+    @classmethod
+    def normalize_correlation_request_id(cls, value: str) -> str:
+        return value.casefold()
 
 
 class TrafficAnalyticsRow(_WindowedRow):
@@ -2640,6 +2648,16 @@ class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
             if rule_name is not None and rule_name.startswith("/")
             else None
         )
+        correlation_request_id = response.headers.get(
+            "x-ms-correlation-request-id"
+        ) or response.headers.get("x-ms-request-id")
+        if (
+            correlation_request_id is None
+            or _GUID_PATTERN.fullmatch(correlation_request_id.casefold()) is None
+        ):
+            raise MonitoringAcquisitionError(
+                "IP Flow Verify response omitted its correlation request ID"
+            )
         return IpFlowVerifyResult(
             schemaVersion="athena.wc028IpFlowVerifyResult.v1",
             source="ipFlowVerify",
@@ -2647,6 +2665,7 @@ class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
             sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
             collectedAt=request.checked_at,
             checkedAt=request.checked_at,
+            correlationRequestId=correlation_request_id.casefold(),
             access=access,
             ruleResourceId=rule_resource_id,
             responseBytes=response_bytes,
@@ -3408,8 +3427,9 @@ def _record_scope_resources(record: MonitoringCollectionRecord) -> set[str]:
         }
         if record.rule_resource_id is not None:
             resources.add(_canonical_resource_id(record.rule_resource_id))
-        if record.ip_flow_rule_resource_id is not None:
-            resources.add(_canonical_resource_id(record.ip_flow_rule_resource_id))
+        provenance = record.ip_flow_provenance
+        if provenance is not None and provenance.result_rule_resource_id is not None:
+            resources.add(_canonical_resource_id(provenance.result_rule_resource_id))
         return resources
     if isinstance(record, ResourceHealthRecord):
         return {_canonical_resource_id(record.resource_id)}
@@ -3587,133 +3607,33 @@ def _health_state(
     return None
 
 
-def _incident_sample_binding(
-    source_record_id: str,
+def _receipt_selected_incident(
     *,
     batch: MonitoringCollectionBatch,
-    prepared: PreparedMonitoringCollection,
-    controls: Mapping[str, PublishedMonitoringIntentControl],
-) -> MonitoringIncidentHealthSampleBinding:
-    records = {
-        item.source_record_id: item
-        for item in batch.records
-        if isinstance(
-            item,
-            (
-                AmaHeartbeatRecord,
-                VmConnectionHealthRecord,
-                ResourceHealthRecord,
-            ),
-        )
-    }
-    try:
-        record = records[source_record_id]
-        control = controls[record.control_id]
-    except KeyError as exc:
-        raise MonitoringAcquisitionError(
-            "signed incident selection references an unknown health record"
-        ) from exc
-    if isinstance(record, AmaHeartbeatRecord):
-        record_kind: Literal[
-            "amaHeartbeat",
-            "vmConnectionHealth",
-            "resourceHealth",
-        ] = "amaHeartbeat"
-        resource_id = record.resource_id
-    elif isinstance(record, VmConnectionHealthRecord):
-        record_kind = "vmConnectionHealth"
-        resource_id = record.subject_resource_id
-    else:
-        record_kind = "resourceHealth"
-        resource_id = record.resource_id
-    state = _health_state(record, control)
-    if state is None:
-        raise MonitoringAcquisitionError(
-            "signed incident selection cannot reference unknown health"
-        )
-    source_reference = monitoring_health_source_record_reference(
-        record_kind,
-        source_record_id,
+    selected_incident: SelectedIncident,
+) -> MonitoringSelectedIncident:
+    record_ids = {item.source_record_id for item in batch.records}
+    rebuilt = build_selected_incident(
+        incident_resource_id=batch.incident_resource_id,
+        previous_record_id=batch.previous_health_source_record_id,
+        current_record_ids=batch.current_health_source_record_ids,
+        current_state=selected_incident.current_state,
     )
-    observations: tuple[MonitoringObservation, ...] = tuple(
-        item
-        for item in prepared.monitoring_bundle.observations
-        if item.source_record_reference == source_reference
-    )
-    if len(observations) != 1:
-        raise MonitoringAcquisitionError(
-            "signed incident health record must map to exactly one persisted observation"
-        )
-    observation = observations[0]
-    provenance = observation.control_provenance
     if (
-        observation.subject_resource_id != _canonical_resource_id(resource_id)
-        or observation.observed_start != record.observed_start
-        or observation.observed_end != record.observed_end
-        or provenance is None
-        or provenance.control_id != record.control_id
+        selected_incident != rebuilt
+        or selected_incident.previous_record_id not in record_ids
+        or not set(selected_incident.current_record_ids).issubset(record_ids)
     ):
         raise MonitoringAcquisitionError(
-            "signed incident health record does not match persisted observation"
+            "selected incident must exist exactly in the signed normalized batch"
         )
-    payload: dict[str, object] = {
-        "recordKind": record_kind,
-        "sourceRecordId": source_record_id,
-        "sourceRecordReference": source_reference,
-        "observationId": observation.observation_id,
-        "controlId": record.control_id,
-        "resourceId": resource_id,
-        "state": state,
-        "observedStart": record.observed_start,
-        "observedEnd": record.observed_end,
-    }
-    return MonitoringIncidentHealthSampleBinding.model_validate(
+    return MonitoringSelectedIncident.model_validate(
         {
-            **payload,
-            "sampleDigest": compute_artifact_digest(_json_value(payload)),
-        }
-    )
-
-
-def _signed_incident_selection(
-    *,
-    batch: MonitoringCollectionBatch,
-    prepared: PreparedMonitoringCollection,
-    monitoring_intent: PublishedMonitoringIntent,
-) -> SignedMonitoringIncidentSelection:
-    controls = {item.control_id: item for item in monitoring_intent.controls}
-    previous = _incident_sample_binding(
-        prepared.previous_health_source_record_id,
-        batch=batch,
-        prepared=prepared,
-        controls=controls,
-    )
-    current = tuple(
-        sorted(
-            (
-                _incident_sample_binding(
-                    source_record_id,
-                    batch=batch,
-                    prepared=prepared,
-                    controls=controls,
-                )
-                for source_record_id in prepared.current_health_source_record_ids
-            ),
-            key=lambda item: (
-                item.source_record_reference,
-                item.observation_id,
-            ),
-        )
-    )
-    payload: dict[str, object] = {
-        "incidentResourceId": prepared.incident_resource_id,
-        "previousHealth": previous,
-        "currentHealth": current,
-    }
-    return SignedMonitoringIncidentSelection.model_validate(
-        {
-            **payload,
-            "transitionDigest": compute_artifact_digest(_json_value(payload)),
+            "incidentResourceId": selected_incident.incident_resource_id,
+            "previousRecordId": selected_incident.previous_record_id,
+            "currentRecordIds": selected_incident.current_record_ids,
+            "currentState": selected_incident.current_state,
+            "transitionDigest": selected_incident.transition_digest,
         }
     )
 
@@ -3858,7 +3778,7 @@ class MonitoringAcquisitionCoordinator:
         monitoring_intent: PublishedMonitoringIntent,
         context_binding: PublishedRuntimeContextBinding,
         batch: MonitoringCollectionBatch,
-        prepared: PreparedMonitoringCollection,
+        selected_incident: SelectedIncident,
         collection_batch_digest: str,
         normalized_evidence_digest: str,
     ) -> MonitoringAcquisitionReceipt:
@@ -3893,10 +3813,9 @@ class MonitoringAcquisitionCoordinator:
             "contextBindingDigest": context_binding.binding_digest,
             "collectionBatchDigest": collection_batch_digest,
             "normalizedEvidenceDigest": normalized_evidence_digest,
-            "incidentSelection": _signed_incident_selection(
+            "selectedIncident": _receipt_selected_incident(
                 batch=batch,
-                prepared=prepared,
-                monitoring_intent=monitoring_intent,
+                selected_incident=selected_incident,
             ),
             "executionStartedAt": execution.started_at,
             "executionCompletedAt": execution_completed_at,
@@ -4163,11 +4082,29 @@ class MonitoringAcquisitionCoordinator:
             if isinstance(item, NetworkWatcherFlowRecord) and (
                 item.change_correlation_id is not None or item.attribution_evidence is not None
             ):
+                provenance = item.ip_flow_provenance
+                if provenance is None:
+                    raise MonitoringAcquisitionError(
+                        "attributed network flow omitted signed IP Flow provenance"
+                    )
+                provenance_payload = provenance.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude={"provenance_digest", "causal_change_correlation_id"},
+                    exclude_none=True,
+                )
+                provenance = MonitoringIpFlowProvenance.model_validate(
+                    {
+                        **provenance_payload,
+                        "provenanceDigest": compute_artifact_digest(provenance_payload),
+                    }
+                )
                 item = item.model_copy(
                     update={
                         "change_correlation_id": None,
                         "attribution_method": None,
                         "attribution_evidence": None,
+                        "ip_flow_provenance": provenance,
                     }
                 )
                 manual_reasons.append(
@@ -4176,16 +4113,16 @@ class MonitoringAcquisitionCoordinator:
                 )
             unit_records.append(item)
 
-        previous_id, current_ids, incident_resource_id = self._select_incident(
+        selected_incident = self._select_incident(
             unit_records,
             controls_by_id,
         )
         batch = MonitoringCollectionBatch(
             schemaVersion="athena.wc028MonitoringCollectionBatch.v2",
             collectedAt=collected_at,
-            incidentResourceId=incident_resource_id,
-            previousHealthSourceRecordId=previous_id,
-            currentHealthSourceRecordIds=current_ids,
+            incidentResourceId=selected_incident.incident_resource_id,
+            previousHealthSourceRecordId=selected_incident.previous_record_id,
+            currentHealthSourceRecordIds=selected_incident.current_record_ids,
             records=tuple(
                 sorted(
                     unit_records,
@@ -4220,7 +4157,7 @@ class MonitoringAcquisitionCoordinator:
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
             batch=batch,
-            prepared=preliminary,
+            selected_incident=selected_incident,
             collection_batch_digest=sha256_hex(batch.canonical_bytes()),
             normalized_evidence_digest=(
                 preliminary.monitoring_bundle.compute_normalized_evidence_digest_value()
@@ -4875,16 +4812,55 @@ class MonitoringAcquisitionCoordinator:
             if (matched_change is not None and attribution_rule_id is not None)
             else None
         )
+        exchange = execution.exchanges[-1]
+        if (
+            exchange.source != "ipFlowVerify"
+            or exchange.request_digest != verification_request.request_digest
+        ):
+            raise MonitoringAcquisitionError(
+                "IP Flow provenance could not bind the exact acquisition exchange"
+            )
+        provenance_payload: dict[str, object] = {
+            "schemaVersion": "athena.wc028MonitoringIpFlowProvenance.v1",
+            "exchangeSequence": exchange.sequence,
+            "ipFlowRequestDigest": verification_request.request_digest,
+            "ipFlowResultDigest": exchange.result_digest,
+            "trafficAnalyticsRequestDigest": request.request_digest,
+            "correlationRequestId": verification.correlation_request_id,
+            "targetResourceId": verification_request.target_resource_id,
+            "sourceResourceId": row.source_resource_candidates[0],
+            "destinationResourceId": row.destination_resource_candidates[0],
+            "direction": row.direction,
+            "protocol": row.protocol,
+            "sourceAddress": row.source_address,
+            "destinationAddress": row.destination_address,
+            "sourcePort": row.source_port,
+            "destinationPort": row.destination_port,
+            "fiveTupleDigest": _traffic_row_five_tuple_digest(row),
+            "historicalDecision": row.decision,
+            "historicalRuleResourceId": row.rule_resource_id,
+            "access": verification.access,
+            "resultRuleResourceId": verification.rule_resource_id,
+            "causalChangeCorrelationId": (
+                matched_change.correlation_id if matched_change is not None else None
+            ),
+            "requestedAt": exchange.requested_at,
+            "checkedAt": verification.checked_at,
+            "receivedAt": exchange.received_at,
+        }
+        provenance = MonitoringIpFlowProvenance.model_validate(
+            {
+                **provenance_payload,
+                "provenanceDigest": compute_artifact_digest(_json_value(provenance_payload)),
+            }
+        )
         retained_payload = {
             **base_record.model_dump(
                 mode="python",
                 by_alias=True,
                 exclude_none=True,
             ),
-            "ipFlowAccess": verification.access,
-            "ipFlowRuleResourceId": verification.rule_resource_id,
-            "ipFlowCheckedAt": verification.checked_at,
-            "ipFlowResultDigest": sha256_hex(verification.canonical_bytes()),
+            "ipFlowProvenance": provenance,
         }
         if matched_change is not None and attribution is not None:
             retained_payload.update(
@@ -5160,7 +5136,7 @@ class MonitoringAcquisitionCoordinator:
         self,
         records: list[MonitoringCollectionRecord],
         controls: dict[str, PublishedMonitoringIntentControl],
-    ) -> tuple[str, tuple[str, ...], str]:
+    ) -> SelectedIncident:
         samples: list[MonitoringIncidentSample] = []
         for record in records:
             state = _health_state(record, controls[record.control_id])
@@ -5201,10 +5177,11 @@ class MonitoringAcquisitionCoordinator:
             selection = select_monitoring_incident(tuple(samples))
         except MonitoringIncidentSelectionError as exc:
             raise MonitoringAcquisitionError(str(exc)) from exc
-        return (
-            selection.previous.payload_id,
-            tuple(item.payload_id for item in selection.current),
-            selection.incident_resource_id,
+        return build_selected_incident(
+            incident_resource_id=selection.incident_resource_id,
+            previous_record_id=selection.previous.payload_id,
+            current_record_ids=tuple(item.payload_id for item in selection.current),
+            current_state=selection.current_state,
         )
 
 

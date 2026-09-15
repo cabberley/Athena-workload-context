@@ -22,6 +22,8 @@ from athena_context.contracts.monitoring import (
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
     MonitoringEvidenceHandoff,
+    MonitoringIpFlowProvenance,
+    MonitoringSelectedIncident,
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
@@ -41,9 +43,12 @@ MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
 LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
     Literal["athena.wc026CorrelationRequest.v2"]
 ] = "athena.wc026CorrelationRequest.v2"
-CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
     Literal["athena.wc028CorrelationRequest.v3"]
 ] = "athena.wc028CorrelationRequest.v3"
+CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+    Literal["athena.wc028CorrelationRequest.v4"]
+] = "athena.wc028CorrelationRequest.v4"
 CORRELATION_REPORT_SCHEMA_VERSION = "athena.wc026CorrelationReport.v1"
 CORRELATION_ALGORITHM_ID = "athena.wc026.correlation.v1"
 CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
@@ -563,6 +568,10 @@ class NetworkFlowObservation(_MonitoringObservation):
         min_length=1,
         max_length=2048,
     )
+    ip_flow_provenance: MonitoringIpFlowProvenance | None = Field(
+        default=None,
+        alias="ipFlowProvenance",
+    )
     ip_flow_access: Literal["Allow", "Deny"] | None = Field(
         default=None,
         alias="ipFlowAccess",
@@ -642,25 +651,38 @@ class NetworkFlowObservation(_MonitoringObservation):
 
     @model_validator(mode="after")
     def validate_attribution(self) -> NetworkFlowObservation:
-        ip_flow_values = (
+        provenance = self.ip_flow_provenance
+        legacy_ip_flow_values = (
             self.ip_flow_access,
             self.ip_flow_checked_at,
             self.ip_flow_result_digest,
         )
-        if any(value is not None for value in ip_flow_values) and not all(
-            value is not None for value in ip_flow_values
+        if provenance is not None and (
+            any(value is not None for value in legacy_ip_flow_values)
+            or self.ip_flow_rule_resource_id is not None
         ):
+            raise ValueError(
+                "network flow must not mix current and historical IP Flow evidence"
+            )
+        if provenance is None and any(
+            value is not None for value in legacy_ip_flow_values
+        ) and not all(value is not None for value in legacy_ip_flow_values):
             raise ValueError(
                 "network flow IP Flow evidence requires access, checkedAt, and result digest"
             )
-        if self.ip_flow_rule_resource_id is not None and self.ip_flow_access is None:
+        if (
+            provenance is None
+            and self.ip_flow_rule_resource_id is not None
+            and self.ip_flow_access is None
+        ):
             raise ValueError(
                 "network flow IP Flow rule cannot exist without point-in-time access"
             )
-        if (
-            self.ip_flow_checked_at is not None
-            and self.ip_flow_checked_at < self.observed_end
-        ):
+        if provenance is not None and provenance.checked_at < self.observed_end:
+            raise ValueError(
+                "network flow IP Flow checkedAt must not predate historical evidence"
+            )
+        if self.ip_flow_checked_at is not None and self.ip_flow_checked_at < self.observed_end:
             raise ValueError(
                 "network flow IP Flow checkedAt must not predate historical evidence"
             )
@@ -680,6 +702,23 @@ class NetworkFlowObservation(_MonitoringObservation):
         }
         if self.five_tuple_digest != compute_artifact_digest(tuple_payload):
             raise ValueError("fiveTupleDigest does not bind the exact flow tuple")
+        if provenance is not None and (
+            provenance.five_tuple_digest != self.five_tuple_digest
+            or provenance.historical_decision != self.decision
+            or self.rule_resource_id is None
+            or provenance.historical_rule_resource_id != self.rule_resource_id
+            or provenance.source_resource_id != self.source_resource_id
+            or provenance.destination_resource_id != self.destination_resource_id
+            or provenance.direction != self.direction
+            or provenance.protocol != self.protocol
+            or provenance.source_address != self.source_address
+            or provenance.destination_address != self.destination_address
+            or provenance.source_port != self.source_port
+            or provenance.destination_port != self.destination_port
+        ):
+            raise ValueError(
+                "network flow IP Flow provenance does not bind the exact retained evidence"
+            )
         if self.rule_resource_id is not None:
             enforcement_segments = self.enforcement_resource_id.split("/")
             rule_segments = self.rule_resource_id.split("/")
@@ -699,6 +738,10 @@ class NetworkFlowObservation(_MonitoringObservation):
                 )
         if self.effective_rule_attribution and (
             self.rule_resource_id is None
+            or (
+                provenance is not None
+                and provenance.causal_change_correlation_id is None
+            )
             or self.attribution_method is None
             or self.causal_effect != "introducedDenyForTuple"
             or self.attribution_proof_digest is None
@@ -710,8 +753,14 @@ class NetworkFlowObservation(_MonitoringObservation):
             raise ValueError(
                 "effective rule attribution requires direct proof and change binding"
             )
-        if (
-            self.attribution_method == "ipFlowVerify"
+        current_ip_flow_invalid = provenance is not None and (
+            provenance.access != "Deny"
+            or provenance.result_rule_resource_id is None
+            or self.rule_resource_id is None
+            or provenance.result_rule_resource_id != self.rule_resource_id
+        )
+        historical_ip_flow_invalid = (
+            provenance is None
             and self.ip_flow_access is not None
             and (
                 self.ip_flow_access != "Deny"
@@ -719,6 +768,9 @@ class NetworkFlowObservation(_MonitoringObservation):
                 or self.rule_resource_id is None
                 or self.ip_flow_rule_resource_id != self.rule_resource_id
             )
+        )
+        if self.attribution_method == "ipFlowVerify" and (
+            current_ip_flow_invalid or historical_ip_flow_invalid
         ):
             raise ValueError(
                 "IP Flow attribution requires the exact denied point-in-time rule"
@@ -1204,6 +1256,62 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                         "acquisition evidence bundle requires an immutable digest manifest"
                     )
                 if (
+                    self.acquisition_receipt.schema_version
+                    == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+                ):
+                    ip_flow_exchanges = tuple(
+                        item
+                        for item in self.acquisition_receipt.exchanges
+                        if item.source == "ipFlowVerify"
+                    )
+                    flow_observations = tuple(
+                        item
+                        for item in self.observations
+                        if isinstance(item, NetworkFlowObservation)
+                    )
+                    provenances = tuple(
+                        item.ip_flow_provenance for item in flow_observations
+                    )
+                    if (
+                        any(item is None for item in provenances)
+                        or len(ip_flow_exchanges) != len(flow_observations)
+                    ):
+                        raise ValueError(
+                            "current acquisition bundle requires exactly one semantic "
+                            "IP Flow provenance mapping per retained network observation"
+                        )
+                    exchanges_by_sequence = {
+                        item.sequence: item for item in ip_flow_exchanges
+                    }
+                    provenances_by_sequence = {
+                        item.exchange_sequence: item
+                        for item in provenances
+                        if item is not None
+                    }
+                    if (
+                        len(exchanges_by_sequence) != len(ip_flow_exchanges)
+                        or len(provenances_by_sequence) != len(flow_observations)
+                        or set(exchanges_by_sequence) != set(provenances_by_sequence)
+                    ):
+                        raise ValueError(
+                            "IP Flow provenance must map each exchange to exactly one "
+                            "retained network observation"
+                        )
+                    for sequence, provenance in provenances_by_sequence.items():
+                        exchange = exchanges_by_sequence[sequence]
+                        if (
+                            provenance.ip_flow_request_digest
+                            != exchange.request_digest
+                            or provenance.ip_flow_result_digest
+                            != exchange.result_digest
+                            or provenance.requested_at != exchange.requested_at
+                            or provenance.checked_at != exchange.checked_at
+                            or provenance.received_at != exchange.received_at
+                        ):
+                            raise ValueError(
+                                "IP Flow provenance does not bind its exact signed exchange"
+                            )
+                if (
                     self.acquisition_receipt.collector_contract_digest
                     != self.monitoring_contract_digest
                     or self.acquisition_receipt.execution_started_at != self.collected_at
@@ -1225,22 +1333,6 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                 ):
                     raise ValueError(
                         "acquisition receipt does not bind the monitoring bundle"
-                    )
-                if (
-                    self.acquisition_receipt.schema_version
-                    == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
-                    and any(
-                        isinstance(item, NetworkFlowObservation)
-                        and (
-                            item.ip_flow_access is None
-                            or item.ip_flow_checked_at is None
-                            or item.ip_flow_result_digest is None
-                        )
-                        for item in self.observations
-                    )
-                ):
-                    raise ValueError(
-                        "current acquisition bundle requires semantic IP Flow evidence"
                     )
             elif (
                 self.acquisition_receipt is not None
@@ -1344,7 +1436,10 @@ def _observation_resource_ids(
             resource_ids.add(observation.destination_resource_id)
         if observation.rule_resource_id is not None:
             resource_ids.add(observation.rule_resource_id)
-        if observation.ip_flow_rule_resource_id is not None:
+        provenance = observation.ip_flow_provenance
+        if provenance is not None and provenance.result_rule_resource_id is not None:
+            resource_ids.add(provenance.result_rule_resource_id)
+        elif observation.ip_flow_rule_resource_id is not None:
             resource_ids.add(observation.ip_flow_rule_resource_id)
     elif isinstance(observation, ConnectionMonitorObservation):
         resource_ids.update(
@@ -1890,6 +1985,7 @@ class CorrelationRequest(_StrictCorrelationModel):
     schema_version: Literal[
         "athena.wc026CorrelationRequest.v2",
         "athena.wc028CorrelationRequest.v3",
+        "athena.wc028CorrelationRequest.v4",
     ] = Field(alias="schemaVersion")
     request_id: str = Field(alias="requestId")
     algorithm_id: Literal["athena.wc026.correlation.v1"] = Field(alias="algorithmId")
@@ -1899,6 +1995,10 @@ class CorrelationRequest(_StrictCorrelationModel):
     trusted_as_of: UtcDateTime = Field(alias="trustedAsOf")
     expires_at: UtcDateTime = Field(alias="expiresAt")
     context_binding: CorrelationContextBinding = Field(alias="contextBinding")
+    selected_incident: MonitoringSelectedIncident | None = Field(
+        default=None,
+        alias="selectedIncident",
+    )
     incident_anchor: IncidentHealthTransition = Field(alias="incidentAnchor")
     monitoring_handoff: MonitoringEvidenceHandoff = Field(alias="monitoringHandoff")
     monitoring_bundle: MonitoringEvidenceBundle = Field(alias="monitoringBundle")
@@ -1926,6 +2026,7 @@ class CorrelationRequest(_StrictCorrelationModel):
             if (
                 self.monitoring_bundle.schema_version
                 != LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                or self.selected_incident is not None
                 or self.evidence_inventory.monitoring_intent_asset_reference_digest
                 is not None
                 or self.evidence_inventory.monitoring_control_provenance_digest
@@ -1934,18 +2035,42 @@ class CorrelationRequest(_StrictCorrelationModel):
                 raise ValueError(
                     "legacy correlation request cannot contain WC028 provenance fields"
                 )
+        elif self.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION:
+            if (
+                self.selected_incident is not None
+                or self.monitoring_bundle.schema_version
+                not in {
+                    MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                    MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                }
+                or (
+                    self.monitoring_bundle.acquisition_receipt is not None
+                    and self.monitoring_bundle.acquisition_receipt.schema_version
+                    == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+                )
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest
+                is None
+                or self.evidence_inventory.monitoring_control_provenance_digest
+                is None
+            ):
+                raise ValueError(
+                    "historical v3 request cannot contain current production selection"
+                )
         elif (
-            self.monitoring_bundle.schema_version
-            not in {
-                MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
-                MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
-            }
+            self.selected_incident is None
+            or self.monitoring_bundle.schema_version
+            != MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+            or self.monitoring_bundle.acquisition_receipt is None
+            or self.monitoring_bundle.acquisition_receipt.schema_version
+            != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+            or self.monitoring_bundle.acquisition_receipt.selected_incident
+            != self.selected_incident
             or self.evidence_inventory.monitoring_intent_asset_reference_digest
             is None
             or self.evidence_inventory.monitoring_control_provenance_digest is None
         ):
             raise ValueError(
-                "WC028 correlation request requires the WC028 evidence bundle and inventory"
+                "production v4 request requires receipt v5 selectedIncident"
             )
         if not (
             self.issued_at <= self.trusted_as_of <= self.expires_at
@@ -2082,10 +2207,27 @@ class CorrelationRequest(_StrictCorrelationModel):
                 )
             artifact, artifact_digest = matched
             change = artifact.evidence
+            provenance = observation.ip_flow_provenance
+            current_provenance_invalid = (
+                self.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+                and (
+                    provenance is None
+                    or provenance.historical_decision != "denied"
+                    or provenance.access != "Deny"
+                    or provenance.result_rule_resource_id
+                    != observation.rule_resource_id
+                    or provenance.causal_change_correlation_id
+                    != change.correlation_id
+                    or provenance.checked_at < observation.observed_end
+                    or provenance.received_at > self.trusted_as_of
+                )
+            )
             if (
                 observation.matched_change_artifact_digest != artifact_digest
                 or observation.matched_change_key != change.change_key
                 or observation.rule_resource_id != change.target_resource_id
+                or change.occurred_at > observation.observed_start
+                or current_provenance_invalid
                 or change.target_resource_type.casefold()
                 != "microsoft.network/networksecuritygroups/securityrules"
                 or not set(observation.matched_property_paths).issubset(
@@ -2334,12 +2476,18 @@ class CorrelationRequest(_StrictCorrelationModel):
             if control_provenance
             else None
         )
+        expected_incident_transition_digest = (
+            self.selected_incident.transition_digest
+            if self.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            and self.selected_incident is not None
+            else self.incident_anchor.transition_digest
+        )
         if (
             self.evidence_inventory.rule_catalog_digest != self.rule_catalog_digest
             or self.evidence_inventory.context_binding_digest
             != self.context_binding.binding_digest
             or self.evidence_inventory.incident_transition_digest
-            != self.incident_anchor.transition_digest
+            != expected_incident_transition_digest
             or self.evidence_inventory.monitoring_handoff_digest != handoff_digest
             or self.evidence_inventory.monitoring_bundle_digest
             != monitoring_bundle_digest
@@ -3930,6 +4078,7 @@ __all__ = [
     "LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
+    "PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION",
     "BindingMode",
     "ConfidenceCap",
     "ConfidenceCapCode",
