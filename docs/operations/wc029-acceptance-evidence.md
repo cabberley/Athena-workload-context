@@ -12,11 +12,16 @@ The harness:
 - consumes exact files already captured by the reviewed deployment, preflight, monitoring,
   correlation, incident, publication, probe, RBAC, queue, and recovery paths;
 - validates an exact allowlisted schema for every non-Azure artifact class;
+- requires the exact inventory file SHA-256 through the out-of-band
+  `--approved-inventory-sha256` argument before trusting any deployment, key, manifest,
+  capability, endpoint, or RBAC declaration;
 - reuses the existing WC-029 what-if and RBAC evaluators against the captured raw inputs;
 - verifies captured RSA public-key fingerprints and every captured signed artifact offline,
   including schema-specific signed preimages and exact versioned Key Vault key IDs;
 - rejects incomplete, duplicate, unlisted, linked, escaping, malformed, noncanonical, oversized,
   or internally inconsistent inputs; and
+- captures the validated directory into an immutable in-memory snapshot using stable no-follow
+  file handles, file identities, link-count checks, and before/after directory identities; and
 - creates one new record exclusively outside the input directory. It never overwrites a prior
   record.
 
@@ -42,6 +47,7 @@ Instead, include their already captured outputs as evidence:
 | Container Apps Jobs | Execution capture and post-run read-back |
 | WC-028/WC-025/WC-026 | Monitoring, change, report, and report-attestation artifacts |
 | WC-016/WC-027 | Active/resolved incident, guidance, enrichment, feed, and notification artifacts |
+| Context publication | Exact manifest document, cited clauses, publication authority, and independent authority signature |
 | Private endpoint probes | Canonical URL probe receipts |
 | Service Bus checks | Baseline, scenario-drain, and final zero-count queue receipts |
 | Scenario operator | Plan, apply receipt, observation, recovery action, and recovery proof |
@@ -83,19 +89,24 @@ wc029-capture/
     ...
 ```
 
-The output directory must already exist and must be outside `wc029-capture/`. This keeps the input
-directory read-only and makes directory-membership validation meaningful.
+The output directory must already exist and must be outside `wc029-capture/`. The input directory
+must remain unchanged while the tool captures its private snapshot. Any file or parent-directory
+identity drift fails the run.
 
 ## Version inventory
 
 The index names exactly one canonical `athena.wc029VersionInventory.v1` artifact. It records:
 
 - the exact 40-character source commit;
-- every deployment ID, stage, deployment name, and template SHA-256;
+- every deployment ID, stage, subscription, resource group, location, template path/SHA-256,
+  base/effective parameter SHA-256, and exact upstream deployment roots;
 - every lowercase digest-pinned container image;
 - every approved HTTPS endpoint origin and exact probed path;
-- every managed-identity principal whose effective RBAC must be present;
-- the published manifest ID, version, profile, and digest; and
+- every managed-identity boundary, forbidden role set, and forbidden scope set whose effective
+  RBAC must be present;
+- every scenario target/action capability and whether a deployed IncidentState producer exists;
+- the exact published manifest artifact, authority artifact, independent authority attestation,
+  clause set, version, profile, and digests; and
 - every signing purpose, exact versioned Key Vault key ID, public-key fingerprint, and captured
   public-key artifact ID.
 
@@ -105,9 +116,13 @@ binds the what-if bytes, the output binds the exact plan SHA-256, and the read-b
 handoff plus identical deployment outputs. Source commit, stage, deployment name, scope, and
 template digest must agree with the inventory.
 
-Each `athena.wc029SigningPublicKey.v1` artifact contains only a public RSA key, its exact versioned
-Key Vault key ID, purpose, and fingerprint. The harness recomputes the SPKI SHA-256, requires every
-inventoried key to be exercised, and verifies the captured signatures with the matching key.
+The caller obtains the inventory SHA-256 through the reviewed release channel, not from the bundle
+being checked. A digest calculated from an unreviewed bundle is not approval.
+
+Each `athena.wc029SigningPublicKey.v1` artifact contains only a public RSA key, its exact Key Vault
+key ID with a 32-hex version, purpose, and fingerprint. The approved inventory binds those values.
+The harness recomputes the SPKI SHA-256, requires every independent signing purpose to be exercised,
+and verifies the captured signatures with the matching key.
 
 ## Required global evidence
 
@@ -115,11 +130,13 @@ Global evidence must contain:
 
 - the version inventory;
 - public-key evidence for every inventoried signing purpose;
+- exact published-manifest, publication-authority, and authority-attestation evidence;
 - deployment plan, what-if, output, and read-back evidence for every inventoried deployment;
 - at least one successful Job execution and its exact post-run read-back;
 - one canonical successful HTTPS URL probe for every inventoried endpoint/path coordinate;
 - captured effective RBAC covering exactly the inventoried principals;
-- the reviewed non-vacuous RBAC separation policy;
+- the reviewed non-vacuous RBAC separation policy, with one exact rule for every approved
+  principal/boundary and no recursive case-insensitive key collisions;
 - digest-bound successful `what-if` and `rbac` preflight results;
 - a baseline zero-count queue capture; and
 - a final zero-count queue capture.
@@ -139,18 +156,20 @@ The index must include each WC-029 scenario class exactly once:
 5. `backend-degradation`
 6. `nsg-connectivity-loss`
 
-At least one scenario must be `correlation-only` and at least one must be
-`incident-producing`.
+The index records a mode for review, but it is not authoritative. The harness derives
+`correlation-only` versus `incident-producing` from the approved scenario capability inventory and
+the exact capability output in the trusted deployment read-back. At least one approved capability
+must use each mode.
 
 Every scenario has all five phases:
 
 | Phase | Minimum evidence |
 | --- | --- |
-| `plan` | Scenario plan |
+| `plan` | Immutable baseline state and scenario plan |
 | `apply` | Exact bounded mutation receipt |
 | `observe` | Monitoring evidence, correlation report, and report attestation |
 | `recover` | Exact recovery-action receipt |
-| `verify` | Successful Job execution/read-back pair and canonical recovery proof |
+| `verify` | Immutable recovered state, successful post-recovery Job execution/read-back, signed scenario execution manifest, and recovery proof |
 
 The NSG connectivity scenario also requires signed change evidence.
 
@@ -170,9 +189,11 @@ An incident-producing scenario additionally requires:
 - guidance and attestation;
 - enrichment manifest and attestation;
 - active feed evidence and attestation;
+- active feed index and index attestation;
 - active notification provenance;
 - resolved IncidentState and attestation;
 - resolved feed evidence and attestation;
+- resolved feed index and index attestation;
 - resolved notification provenance; and
 - a scenario-scoped zero-count queue capture in `verify`.
 
@@ -183,7 +204,10 @@ not chosen by the index. The harness verifies:
 - WC-025 change-evidence signatures;
 - WC-026 report publication statements and signatures;
 - WC-016 active/resolved IncidentState signatures;
-- WC-027 guidance, enrichment, feed-pointer, and notification signatures; and
+- WC-027 guidance, enrichment, feed-pointer, feed-index, and notification signatures;
+- an independent signed scenario-execution manifest that covers every plan/apply/observe/recover/
+  verify artifact, its exact bytes, phase, input/request digest, execution ID, target, action, and
+  bounded chronological window; and
 - the exact active report/state/guidance/enrichment/feed/notification lineage for each
   incident-producing scenario.
 
@@ -196,9 +220,12 @@ Each scenario has one canonical `athena.wc029RecoveryProof.v1` in `verify`. It r
 
 - `healthy=true`;
 - `residualMutationCount=0`;
-- exact plan, mutation-receipt, recovery-action, target-resource, and source-state bindings;
-- equal baseline and recovered normalized-state digests; and
-- the exact scenario Job read-back, plus drained queue evidence for incident-producing scenarios.
+- exact plan, signed scenario execution ID, mutation receipt, recovery action, and target resource;
+- separate immutable `athena.wc029ResourceState.v1` baseline and recovered artifacts whose
+  normalized state digests are recomputed from the exact target and state document;
+- equal recomputed baseline and recovered state digests; and
+- the exact post-recovery Job read-back, which must start after recovery and reference the recovered
+  state and recovery action, plus drained queue evidence for incident-producing scenarios.
 
 A proof referencing global evidence, another scenario, another phase, or itself fails closed.
 
@@ -215,6 +242,11 @@ Harness-owned canonical receipts include:
   source commit, digest-pinned image, result artifact digests, and post-run state.
 - `athena.wc029ScenarioPlan.v1`, `athena.wc029MutationReceipt.v1`, and
   `athena.wc029RecoveryAction.v1`: one target-bound plan/apply/recover chain.
+- `athena.wc029ScenarioExecutionManifest.v1` and its independent RSA attestation: complete
+  execution lineage and phase windows for every scenario artifact.
+- `athena.wc029PublishedManifest.v1`, `athena.wc029PublicationAuthority.v1`, and its independent
+  attestation: exact manifest content, resolved cited clauses, publication record/audit heads, and
+  authority proof used by report publication.
 - `athena.wc029ManifestCitation.v1`: the exact published manifest/profile/digest, clause IDs,
   active IncidentState digest, and WC-026 report ID/digest.
 
@@ -226,6 +258,7 @@ separate listed evidence artifact when operational review requires it.
 ```powershell
 python -m athena_context.wc029_acceptance_evidence `
   C:\wc029-evidence\capture-20260914T000000Z `
+  --approved-inventory-sha256 'sha256:<reviewed-64-lowercase-hex>' `
   --index acceptance-index.json `
   --output-directory C:\wc029-evidence\records
 ```
@@ -248,7 +281,12 @@ Its `aggregateDigest` covers the canonical record excluding only that digest fie
 contains exact byte and canonical-JSON SHA-256 values for the index and every evidence artifact,
 relative paths only, sorted artifact/scenario references, the full version inventory, and explicit
 `validationMode=offline-contract-digest-and-signature`, `azureMutationPerformed=false`, and
-`incidentEvidenceSynthesized=false` guardrails.
+`incidentEvidenceSynthesized=false` guardrails. It also records the out-of-band approved inventory
+digest.
+
+Output publication uses an exclusive staging file followed by a no-replace hard-link commit. Once
+the final digest-named link succeeds, staging cleanup failure cannot turn the committed record into
+a reported failure.
 
 Archive the closed input directory and content-addressed output together under the approved release
 retention policy. Any later byte change produces a different digest and requires a new record.

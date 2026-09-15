@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import ctypes
 import json
 import os
 import re
@@ -11,7 +12,9 @@ import stat
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 from urllib.parse import urlsplit
@@ -37,6 +40,7 @@ from athena_context.contracts import (
     IncidentState,
     IncidentStateAttestation,
     MonitoringEvidenceHandoff,
+    PublishedContextAuthority,
     PublishedCorrelationReportAttestation,
     UtcDateTime,
     canonicalize_json,
@@ -56,13 +60,19 @@ ACCEPTANCE_INDEX_SCHEMA_VERSION = "athena.wc029AcceptanceEvidenceIndex.v1"
 ACCEPTANCE_RECORD_SCHEMA_VERSION = "athena.wc029AcceptanceEvidenceRecord.v1"
 VERSION_INVENTORY_SCHEMA_VERSION = "athena.wc029VersionInventory.v1"
 SIGNING_PUBLIC_KEY_SCHEMA_VERSION = "athena.wc029SigningPublicKey.v1"
+PUBLISHED_MANIFEST_SCHEMA_VERSION = "athena.wc029PublishedManifest.v1"
+PUBLICATION_AUTHORITY_SCHEMA_VERSION = "athena.wc029PublicationAuthority.v1"
+PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION = "athena.wc029PublicationAuthorityAttestation.v1"
 DEPLOYMENT_READBACK_SCHEMA_VERSION = "athena.wc029DeploymentReadback.v1"
 JOB_EXECUTION_SCHEMA_VERSION = "athena.wc029JobExecution.v1"
 JOB_READBACK_SCHEMA_VERSION = "athena.wc029JobReadback.v1"
 PREFLIGHT_RESULT_SCHEMA_VERSION = "athena.wc029PreflightResult.v1"
 SCENARIO_PLAN_SCHEMA_VERSION = "athena.wc029ScenarioPlan.v1"
+SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION = "athena.wc029ScenarioExecutionManifest.v1"
+SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION = "athena.wc029ScenarioExecutionAttestation.v1"
 MUTATION_RECEIPT_SCHEMA_VERSION = "athena.wc029MutationReceipt.v1"
 RECOVERY_ACTION_SCHEMA_VERSION = "athena.wc029RecoveryAction.v1"
+RESOURCE_STATE_SCHEMA_VERSION = "athena.wc029ResourceState.v1"
 MANIFEST_CITATION_SCHEMA_VERSION = "athena.wc029ManifestCitation.v1"
 INCIDENT_OMISSION_SCHEMA_VERSION = "athena.wc029IncidentOmission.v1"
 RECOVERY_PROOF_SCHEMA_VERSION = "athena.wc029RecoveryProof.v1"
@@ -93,6 +103,9 @@ type JobScope = Literal["global", "scenario"]
 type EvidenceClass = Literal[
     "version-inventory",
     "signing-public-key",
+    "published-manifest",
+    "publication-authority",
+    "publication-authority-attestation",
     "deployment-plan",
     "deployment-what-if",
     "deployment-output",
@@ -105,6 +118,7 @@ type EvidenceClass = Literal[
     "preflight-result",
     "queue-state",
     "scenario-plan",
+    "baseline-state",
     "mutation-receipt",
     "monitoring-evidence",
     "change-evidence",
@@ -122,11 +136,18 @@ type EvidenceClass = Literal[
     "enrichment-attestation",
     "feed-active",
     "feed-active-attestation",
+    "feed-index-active",
+    "feed-index-active-attestation",
     "feed-resolved",
     "feed-resolved-attestation",
+    "feed-index-resolved",
+    "feed-index-resolved-attestation",
     "notification-active",
     "notification-resolved",
     "recovery-action",
+    "recovered-state",
+    "scenario-execution-manifest",
+    "scenario-execution-attestation",
     "recovery-proof",
 ]
 
@@ -151,7 +172,8 @@ _IMAGE_PATTERN = re.compile(
 _SIGNATURE_PATTERN = re.compile(r"^[A-Za-z0-9_+/=-]{1,8192}$")
 _RESOURCE_ID_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]{1,90}/providers/"
-    r"[A-Za-z0-9.]+/[A-Za-z0-9._()/-]+$"
+    r"[A-Za-z0-9.]+/[A-Za-z0-9._()/-]+$",
+    re.IGNORECASE,
 )
 _JOB_RESOURCE_ID_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]{1,90}/providers/"
@@ -166,6 +188,9 @@ _GLOBAL_REQUIRED_CLASSES: frozenset[EvidenceClass] = frozenset(
     {
         "version-inventory",
         "signing-public-key",
+        "published-manifest",
+        "publication-authority",
+        "publication-authority-attestation",
         "deployment-plan",
         "deployment-what-if",
         "deployment-output",
@@ -192,8 +217,12 @@ _INCIDENT_ONLY_CLASSES: frozenset[EvidenceClass] = frozenset(
         "enrichment-attestation",
         "feed-active",
         "feed-active-attestation",
+        "feed-index-active",
+        "feed-index-active-attestation",
         "feed-resolved",
         "feed-resolved-attestation",
+        "feed-index-resolved",
+        "feed-index-resolved-attestation",
         "notification-active",
         "notification-resolved",
     }
@@ -206,6 +235,10 @@ _ATTESTATION_SUBJECT_CLASSES: dict[EvidenceClass, EvidenceClass] = {
     "enrichment-attestation": "enrichment-manifest",
     "feed-active-attestation": "feed-active",
     "feed-resolved-attestation": "feed-resolved",
+    "feed-index-active-attestation": "feed-index-active",
+    "feed-index-resolved-attestation": "feed-index-resolved",
+    "publication-authority-attestation": "publication-authority",
+    "scenario-execution-attestation": "scenario-execution-manifest",
 }
 _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
     "monitoring-evidence": "monitoring",
@@ -217,12 +250,19 @@ _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
     "enrichment-attestation": "enrichment",
     "feed-active-attestation": "feed",
     "feed-resolved-attestation": "feed",
+    "feed-index-active-attestation": "feed",
+    "feed-index-resolved-attestation": "feed",
+    "publication-authority-attestation": "context-authority",
+    "scenario-execution-attestation": "scenario-authority",
     "notification-active": "notification",
     "notification-resolved": "notification",
 }
 _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "version-inventory": VERSION_INVENTORY_SCHEMA_VERSION,
     "signing-public-key": SIGNING_PUBLIC_KEY_SCHEMA_VERSION,
+    "published-manifest": PUBLISHED_MANIFEST_SCHEMA_VERSION,
+    "publication-authority": PUBLICATION_AUTHORITY_SCHEMA_VERSION,
+    "publication-authority-attestation": (PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION),
     "deployment-plan": "athena.wc029DeploymentPlan.v1",
     "deployment-what-if": None,
     "deployment-output": "athena.wc029DeploymentHandoff.v1",
@@ -235,6 +275,7 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "preflight-result": PREFLIGHT_RESULT_SCHEMA_VERSION,
     "queue-state": QUEUE_STATE_SCHEMA_VERSION,
     "scenario-plan": SCENARIO_PLAN_SCHEMA_VERSION,
+    "baseline-state": RESOURCE_STATE_SCHEMA_VERSION,
     "mutation-receipt": MUTATION_RECEIPT_SCHEMA_VERSION,
     "monitoring-evidence": "athena.wc024MonitoringEvidenceHandoff.v1",
     "change-evidence": "athena.changeEvidenceArtifact.v1",
@@ -252,11 +293,18 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "enrichment-attestation": "athena.wc027IncidentEnrichmentAttestation.v1",
     "feed-active": "athena.wc027IncidentEnrichmentFeedPointer.v2",
     "feed-active-attestation": ("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
+    "feed-index-active": "athena.wc027IncidentFeedIndex.v2",
+    "feed-index-active-attestation": ("athena.wc027IncidentFeedIndexAttestation.v2"),
     "feed-resolved": "athena.wc027IncidentEnrichmentFeedPointer.v2",
     "feed-resolved-attestation": ("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
+    "feed-index-resolved": "athena.wc027IncidentFeedIndex.v2",
+    "feed-index-resolved-attestation": ("athena.wc027IncidentFeedIndexAttestation.v2"),
     "notification-active": "athena.wc027IncidentNotificationEnvelope.v2",
     "notification-resolved": "athena.wc027IncidentNotificationEnvelope.v2",
     "recovery-action": RECOVERY_ACTION_SCHEMA_VERSION,
+    "recovered-state": RESOURCE_STATE_SCHEMA_VERSION,
+    "scenario-execution-manifest": SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION,
+    "scenario-execution-attestation": (SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION),
     "recovery-proof": RECOVERY_PROOF_SCHEMA_VERSION,
 }
 
@@ -322,6 +370,18 @@ def _validate_relative_file(value: str) -> str:
     return value
 
 
+def _validate_portable_relative_path(value: str) -> str:
+    if (
+        value != value.strip()
+        or "\\" in value
+        or ":" in value
+        or _PORTABLE_RELATIVE_FILE_PATTERN.fullmatch(value) is None
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError("path must be one bounded portable relative path")
+    return value
+
+
 def _validate_versioned_key_id(value: str) -> str:
     parsed = urlsplit(value)
     parts = [part for part in parsed.path.split("/") if part]
@@ -335,13 +395,37 @@ def _validate_versioned_key_id(value: str) -> str:
         or parsed.fragment
         or len(parts) != 3
         or parts[0].casefold() != "keys"
-        or any(
-            not part or len(part) > 128 or re.fullmatch(r"[A-Za-z0-9-]+", part) is None
-            for part in parts[1:]
-        )
+        or re.fullmatch(r"[A-Za-z0-9-]{1,127}", parts[1]) is None
+        or re.fullmatch(r"[A-Fa-f0-9]{32}", parts[2]) is None
     ):
         raise ValueError("keyVaultKeyId must be one exact versioned Key Vault key ID")
     return value
+
+
+class Wc029TrustedUpstreamHandoff(_StrictAcceptanceModel):
+    stage: Literal["foundation", "producer", "publisher"]
+    deployment_id: str = Field(
+        alias="deploymentId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    output_artifact_id: str = Field(
+        alias="outputArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    handoff_path: str = Field(
+        alias="handoffPath",
+        min_length=1,
+        max_length=2048,
+    )
+    content_sha256: str = Field(
+        alias="contentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @field_validator("content_sha256")
+    @classmethod
+    def validate_content_digest(cls, value: str) -> str:
+        return _validate_digest(value, label="upstream contentSha256")
 
 
 class Wc029DeploymentVersion(_StrictAcceptanceModel):
@@ -355,9 +439,49 @@ class Wc029DeploymentVersion(_StrictAcceptanceModel):
         max_length=128,
     )
     stage: DeploymentStage
+    subscription_id: str = Field(
+        alias="subscriptionId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    resource_group: str | None = Field(
+        default=None,
+        alias="resourceGroup",
+        min_length=1,
+        max_length=90,
+    )
+    location: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    template_path: str = Field(
+        alias="templatePath",
+        min_length=1,
+        max_length=512,
+    )
     template_sha256: str = Field(
         alias="templateSha256",
         pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    base_parameter_sha256: str = Field(
+        alias="baseParameterSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    effective_parameter_sha256: str = Field(
+        alias="effectiveParameterSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    parameter_bindings_sha256: str = Field(
+        alias="parameterBindingsSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    upstream_handoffs: tuple[Wc029TrustedUpstreamHandoff, ...] = Field(
+        default=(),
+        alias="upstreamHandoffs",
+        max_length=3,
     )
 
     @field_validator("deployment_name")
@@ -373,6 +497,19 @@ class Wc029DeploymentVersion(_StrictAcceptanceModel):
     @classmethod
     def validate_template_digest(cls, value: str) -> str:
         return _validate_digest(value, label="templateSha256")
+
+    @model_validator(mode="after")
+    def validate_scope_and_dependencies(self) -> Wc029DeploymentVersion:
+        if (self.stage in {"foundation", "live-acceptance"}) != (self.resource_group is None):
+            raise ValueError("trusted deployment scope does not match its stage")
+        keys = tuple((item.stage, item.deployment_id) for item in self.upstream_handoffs)
+        stage_rank = {"foundation": 0, "producer": 1, "publisher": 2}
+        if keys != tuple(sorted(keys, key=lambda item: (stage_rank[item[0]], item[1]))) or len(
+            keys
+        ) != len(set(keys)):
+            raise ValueError("upstreamHandoffs must be unique and stage ordered")
+        _validate_portable_relative_path(self.template_path)
+        return self
 
 
 class Wc029ImageVersion(_StrictAcceptanceModel):
@@ -436,6 +573,238 @@ class Wc029EndpointVersion(_StrictAcceptanceModel):
         return values
 
 
+class Wc029RbacBoundary(_StrictAcceptanceModel):
+    boundary_id: str = Field(
+        alias="boundaryId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    principal_id: str = Field(
+        alias="principalId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    forbidden_role_names: tuple[str, ...] = Field(
+        alias="forbiddenRoleNames",
+        min_length=1,
+        max_length=64,
+    )
+    forbidden_scope_prefixes: tuple[str, ...] = Field(
+        alias="forbiddenScopePrefixes",
+        min_length=1,
+        max_length=64,
+    )
+    boundary_digest: str = Field(
+        alias="boundaryDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("boundaryDigest")
+        return payload
+
+    @model_validator(mode="after")
+    def validate_boundary(self) -> Wc029RbacBoundary:
+        roles = tuple(item.casefold() for item in self.forbidden_role_names)
+        scopes = tuple(item.casefold().rstrip("/") for item in self.forbidden_scope_prefixes)
+        if (
+            roles != tuple(sorted(roles))
+            or len(roles) != len(set(roles))
+            or scopes != tuple(sorted(scopes))
+            or len(scopes) != len(set(scopes))
+        ):
+            raise ValueError("RBAC boundary roles and scopes must be unique and sorted")
+        if self.boundary_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("boundaryDigest does not bind the RBAC boundary")
+        return self
+
+
+class Wc029ScenarioCapability(_StrictAcceptanceModel):
+    scenario_class: ScenarioClass = Field(alias="scenarioClass")
+    target_resource_id: str = Field(
+        alias="targetResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    mutation_action_digest: str = Field(
+        alias="mutationActionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    recovery_action_digest: str = Field(
+        alias="recoveryActionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    incident_producer_schema_version: Literal["athena.incidentState.v1"] | None = Field(
+        default=None,
+        alias="incidentProducerSchemaVersion",
+    )
+    capability_digest: str = Field(
+        alias="capabilityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("capabilityDigest")
+        return payload
+
+    @property
+    def evidence_mode(self) -> ScenarioMode:
+        return (
+            "incident-producing"
+            if self.incident_producer_schema_version is not None
+            else "correlation-only"
+        )
+
+    @model_validator(mode="after")
+    def validate_capability(self) -> Wc029ScenarioCapability:
+        if _RESOURCE_ID_PATTERN.fullmatch(self.target_resource_id) is None:
+            raise ValueError("scenario capability target must be a complete resource ID")
+        if self.capability_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("capabilityDigest does not bind scenario capability")
+        return self
+
+
+class Wc029PublishedClause(_StrictAcceptanceModel):
+    clause_id: str = Field(
+        alias="clauseId",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    json_pointer: str = Field(
+        alias="jsonPointer",
+        min_length=1,
+        max_length=512,
+        pattern=r"^/(?:[^/~]|~0|~1)+(?:/(?:[^/~]|~0|~1)+)*$",
+    )
+    clause_digest: str = Field(
+        alias="clauseDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+
+def _resolve_json_pointer(document: object, pointer: str) -> object:
+    current = document
+    for raw_segment in pointer.removeprefix("/").split("/"):
+        segment = raw_segment.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            if segment not in current:
+                raise ValueError("manifest clause JSON pointer is unresolved")
+            current = current[segment]
+        elif isinstance(current, list):
+            if not segment.isdigit():
+                raise ValueError("manifest clause array pointer is invalid")
+            index = int(segment)
+            if index >= len(current):
+                raise ValueError("manifest clause array pointer is unresolved")
+            current = current[index]
+        else:
+            raise ValueError("manifest clause JSON pointer crosses a scalar")
+    return current
+
+
+class Wc029PublishedManifestEvidence(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029PublishedManifest.v1"] = Field(alias="schemaVersion")
+    workload_id: str = Field(
+        alias="workloadId",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    manifest_id: str = Field(alias="manifestId", min_length=1, max_length=128)
+    manifest_version: str = Field(
+        alias="manifestVersion",
+        min_length=1,
+        max_length=256,
+    )
+    profile_id: str = Field(alias="profileId", min_length=1, max_length=128)
+    manifest_document: dict[str, Any] = Field(alias="manifestDocument")
+    cited_clauses: tuple[Wc029PublishedClause, ...] = Field(
+        alias="citedClauses",
+        min_length=1,
+        max_length=128,
+    )
+    publication_record_digest: str = Field(
+        alias="publicationRecordDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    audit_head_digest: str = Field(
+        alias="auditHeadDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    published_at: UtcDateTime = Field(alias="publishedAt")
+    manifest_digest: str = Field(
+        alias="manifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Wc029PublishedManifestEvidence:
+        if not self.manifest_document:
+            raise ValueError("published manifest document must not be empty")
+        if (
+            self.manifest_document.get("manifestId") != self.manifest_id
+            or self.manifest_document.get("manifestVersion") != self.manifest_version
+        ):
+            raise ValueError("published manifest coordinates do not match its document")
+        if self.manifest_digest != compute_artifact_digest(self.manifest_document):
+            raise ValueError("manifestDigest does not bind manifestDocument")
+        clause_ids = tuple(item.clause_id for item in self.cited_clauses)
+        pointers = tuple(item.json_pointer for item in self.cited_clauses)
+        if (
+            clause_ids != tuple(sorted(clause_ids))
+            or len(clause_ids) != len(set(clause_ids))
+            or len(pointers) != len(set(pointers))
+        ):
+            raise ValueError("cited manifest clauses must be unique and sorted")
+        for clause in self.cited_clauses:
+            resolved_clause = _resolve_json_pointer(
+                self.manifest_document,
+                clause.json_pointer,
+            )
+            if (
+                not isinstance(resolved_clause, dict)
+                or resolved_clause.get("clauseId") != clause.clause_id
+                or clause.clause_digest != compute_artifact_digest(resolved_clause)
+            ):
+                raise ValueError("cited clause digest does not bind manifest content")
+        return self
+
+
+class Wc029PublicationAuthorityEvidence(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029PublicationAuthority.v1"] = Field(alias="schemaVersion")
+    authority: PublishedContextAuthority
+
+
+class Wc029PublicationAuthorityAttestation(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029PublicationAuthorityAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    authority_id: str = Field(
+        alias="authorityId",
+        pattern=r"^publication-authority-[a-f0-9]{32}$",
+    )
+    authority_digest: str = Field(
+        alias="authorityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: str = Field(
+        alias="signedPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
 class Wc029ManifestVersion(_StrictAcceptanceModel):
     manifest_id: str = Field(alias="manifestId", min_length=1, max_length=128)
     manifest_version: str = Field(
@@ -449,6 +818,30 @@ class Wc029ManifestVersion(_StrictAcceptanceModel):
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
     publication_status: Literal["published"] = Field(alias="publicationStatus")
+    manifest_artifact_id: str = Field(
+        alias="manifestArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    manifest_artifact_sha256: str = Field(
+        alias="manifestArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    cited_clause_map_digest: str = Field(
+        alias="citedClauseMapDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    authority_artifact_id: str = Field(
+        alias="authorityArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    authority_attestation_artifact_id: str = Field(
+        alias="authorityAttestationArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    authority_digest: str = Field(
+        alias="authorityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
 
     @field_validator("manifest_id", "profile_id")
     @classmethod
@@ -466,6 +859,30 @@ class Wc029ManifestVersion(_StrictAcceptanceModel):
     @classmethod
     def validate_manifest_digest(cls, value: str) -> str:
         return _validate_digest(value, label="manifestDigest")
+
+    @model_validator(mode="after")
+    def validate_publication_coordinates(self) -> Wc029ManifestVersion:
+        _validate_digest(self.authority_digest, label="authorityDigest")
+        _validate_digest(
+            self.manifest_artifact_sha256,
+            label="manifestArtifactSha256",
+        )
+        _validate_digest(
+            self.cited_clause_map_digest,
+            label="citedClauseMapDigest",
+        )
+        if (
+            len(
+                {
+                    self.manifest_artifact_id,
+                    self.authority_artifact_id,
+                    self.authority_attestation_artifact_id,
+                }
+            )
+            != 3
+        ):
+            raise ValueError("manifest publication artifact IDs must be distinct")
+        return self
 
 
 class Wc029KeyVersion(_StrictAcceptanceModel):
@@ -503,10 +920,19 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
     )
     images: tuple[Wc029ImageVersion, ...] = Field(min_length=1, max_length=64)
     endpoints: tuple[Wc029EndpointVersion, ...] = Field(min_length=1, max_length=32)
-    principal_ids: tuple[str, ...] = Field(
-        alias="principalIds",
+    rbac_boundaries: tuple[Wc029RbacBoundary, ...] = Field(
+        alias="rbacBoundaries",
         min_length=1,
-        max_length=64,
+        max_length=128,
+    )
+    capability_deployment_id: str = Field(
+        alias="capabilityDeploymentId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    scenario_capabilities: tuple[Wc029ScenarioCapability, ...] = Field(
+        alias="scenarioCapabilities",
+        min_length=len(REQUIRED_SCENARIO_CLASSES),
+        max_length=len(REQUIRED_SCENARIO_CLASSES),
     )
     manifest: Wc029ManifestVersion
     keys: tuple[Wc029KeyVersion, ...] = Field(min_length=1, max_length=32)
@@ -541,8 +967,16 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
                 tuple(item.origin.casefold() for item in self.endpoints),
             ),
             (
-                "principal IDs",
-                tuple(item.casefold() for item in self.principal_ids),
+                "RBAC boundary IDs",
+                tuple(item.boundary_id for item in self.rbac_boundaries),
+            ),
+            (
+                "RBAC boundary digests",
+                tuple(item.boundary_digest for item in self.rbac_boundaries),
+            ),
+            (
+                "scenario capability digests",
+                tuple(item.capability_digest for item in self.scenario_capabilities),
             ),
             (
                 "key purposes",
@@ -576,14 +1010,64 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             sorted(item.endpoint_id for item in self.endpoints)
         ):
             raise ValueError("endpoints must be sorted by endpointId")
-        if tuple(item.casefold() for item in self.principal_ids) != tuple(
-            sorted(item.casefold() for item in self.principal_ids)
+        if tuple(item.boundary_id for item in self.rbac_boundaries) != tuple(
+            sorted(item.boundary_id for item in self.rbac_boundaries)
         ):
-            raise ValueError("principalIds must be sorted")
+            raise ValueError("rbacBoundaries must be sorted by boundaryId")
+        capability_classes = tuple(item.scenario_class for item in self.scenario_capabilities)
+        if capability_classes != tuple(sorted(REQUIRED_SCENARIO_CLASSES)) or set(
+            capability_classes
+        ) != set(REQUIRED_SCENARIO_CLASSES):
+            raise ValueError("scenarioCapabilities must cover every required scenario class")
+        if {item.evidence_mode for item in self.scenario_capabilities} != {
+            "correlation-only",
+            "incident-producing",
+        }:
+            raise ValueError("trusted scenario capabilities must exercise both evidence modes")
+        deployment_ids = {item.deployment_id for item in self.deployments}
+        stage_rank = {
+            "foundation": 0,
+            "producer": 1,
+            "publisher": 2,
+            "live-acceptance": 3,
+        }
+        deployment_by_id = {item.deployment_id: item for item in self.deployments}
+        for deployment in self.deployments:
+            if any(
+                upstream.deployment_id not in deployment_ids
+                or upstream.deployment_id == deployment.deployment_id
+                or deployment_by_id[upstream.deployment_id].stage != upstream.stage
+                or stage_rank[upstream.stage] >= stage_rank[deployment.stage]
+                for upstream in deployment.upstream_handoffs
+            ):
+                raise ValueError("trusted deployment upstream roots are missing or out of order")
+        if self.capability_deployment_id not in deployment_ids:
+            raise ValueError("capabilityDeploymentId must identify one trusted deployment root")
         if tuple(item.purpose for item in self.keys) != tuple(
             sorted(item.purpose for item in self.keys)
         ):
             raise ValueError("keys must be sorted by purpose")
+        required_key_purposes = {
+            "change",
+            "context-authority",
+            "enrichment",
+            "feed",
+            "guidance",
+            "incident",
+            "monitoring",
+            "notification",
+            "report",
+            "scenario-authority",
+        }
+        if {item.purpose for item in self.keys} != required_key_purposes:
+            raise ValueError("trusted inventory must contain every independent signing purpose")
+        manifest_artifact_ids = {
+            self.manifest.manifest_artifact_id,
+            self.manifest.authority_artifact_id,
+            self.manifest.authority_attestation_artifact_id,
+        }
+        if len(manifest_artifact_ids) != 3:
+            raise ValueError("manifest publication artifact IDs must be distinct")
         return self
 
 
@@ -813,10 +1297,40 @@ class Wc029DeploymentReadbackEvidence(_StrictAcceptanceModel):
         min_length=1,
         max_length=90,
     )
+    location: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
     deployment_name: str = Field(
         alias="deploymentName",
         min_length=1,
         max_length=128,
+    )
+    template_path: str = Field(
+        alias="templatePath",
+        min_length=1,
+        max_length=512,
+    )
+    template_sha256: str = Field(
+        alias="templateSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    base_parameter_sha256: str = Field(
+        alias="baseParameterSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    effective_parameter_sha256: str = Field(
+        alias="effectiveParameterSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    parameter_bindings_sha256: str = Field(
+        alias="parameterBindingsSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    upstream_handoffs: tuple[Wc029TrustedUpstreamHandoff, ...] = Field(
+        alias="upstreamHandoffs",
+        max_length=3,
     )
     observed_at: UtcDateTime = Field(alias="observedAt")
     provisioning_state: Literal["Succeeded"] = Field(alias="provisioningState")
@@ -836,6 +1350,13 @@ class Wc029DeploymentReadbackEvidence(_StrictAcceptanceModel):
             raise ValueError("deployment read-back must contain outputs")
         if self.outputs_sha256 != sha256_hex(canonicalize_json(self.outputs)):
             raise ValueError("deployment read-back outputs digest is invalid")
+        _validate_portable_relative_path(self.template_path)
+        keys = tuple((item.stage, item.deployment_id) for item in self.upstream_handoffs)
+        stage_rank = {"foundation": 0, "producer": 1, "publisher": 2}
+        if keys != tuple(sorted(keys, key=lambda item: (stage_rank[item[0]], item[1]))) or len(
+            keys
+        ) != len(set(keys)):
+            raise ValueError("upstreamHandoffs must be unique and stage ordered")
         return self
 
 
@@ -862,6 +1383,20 @@ class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
         default=None,
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str | None = Field(
+        default=None,
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    scenario_plan_digest: str | None = Field(
+        default=None,
+        alias="scenarioPlanDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    input_digest: str = Field(
+        alias="inputDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
     )
     phase: ScenarioPhase | None = None
     execution_id: str = Field(
@@ -892,9 +1427,15 @@ class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
 
     @model_validator(mode="after")
     def validate_execution(self) -> Wc029JobExecutionEvidence:
-        if (self.scope == "scenario") != (self.scenario_id is not None and self.phase is not None):
-            raise ValueError("scenario job execution requires scenarioId and phase")
-        if self.scope == "global" and (self.scenario_id is not None or self.phase is not None):
+        scenario_values = (
+            self.scenario_id,
+            self.scenario_execution_id,
+            self.scenario_plan_digest,
+            self.phase,
+        )
+        if (self.scope == "scenario") != all(item is not None for item in scenario_values):
+            raise ValueError("scenario job execution requires scenario, execution, plan, and phase")
+        if self.scope == "global" and any(item is not None for item in scenario_values):
             raise ValueError("global job execution cannot claim a scenario phase")
         if self.completed_at < self.started_at:
             raise ValueError("job completion precedes start")
@@ -913,6 +1454,16 @@ class Wc029JobReadbackEvidence(_StrictAcceptanceModel):
         default=None,
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str | None = Field(
+        default=None,
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    scenario_plan_digest: str | None = Field(
+        default=None,
+        alias="scenarioPlanDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
     )
     phase: ScenarioPhase | None = None
     execution_id: str = Field(
@@ -951,9 +1502,15 @@ class Wc029JobReadbackEvidence(_StrictAcceptanceModel):
 
     @model_validator(mode="after")
     def validate_readback(self) -> Wc029JobReadbackEvidence:
-        if (self.scope == "scenario") != (self.scenario_id is not None and self.phase is not None):
-            raise ValueError("scenario Job read-back requires scenarioId and phase")
-        if self.scope == "global" and (self.scenario_id is not None or self.phase is not None):
+        scenario_values = (
+            self.scenario_id,
+            self.scenario_execution_id,
+            self.scenario_plan_digest,
+            self.phase,
+        )
+        if (self.scope == "scenario") != all(item is not None for item in scenario_values):
+            raise ValueError("scenario Job read-back requires scenario, execution, plan, and phase")
+        if self.scope == "global" and any(item is not None for item in scenario_values):
             raise ValueError("global Job read-back cannot claim a scenario phase")
         Wc029ImageVersion(component=self.component, image=self.image)
         ids = tuple(item.artifact_id for item in self.result_artifacts)
@@ -1021,8 +1578,16 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
     )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
     scenario_class: ScenarioClass = Field(alias="scenarioClass")
     evidence_mode: ScenarioMode = Field(alias="evidenceMode")
+    capability_digest: str = Field(
+        alias="capabilityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     source_commit: str = Field(alias="sourceCommit", pattern=r"^[a-f0-9]{40}$")
     target_resource_id: str = Field(
         alias="targetResourceId",
@@ -1041,6 +1606,28 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
         alias="recoveryActionDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    monitoring_request_digest: str = Field(
+        alias="monitoringRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    correlation_request_digest: str = Field(
+        alias="correlationRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    change_request_digest: str | None = Field(
+        default=None,
+        alias="changeRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    verification_input_digest: str = Field(
+        alias="verificationInputDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    baseline_state_artifact_id: str = Field(
+        alias="baselineStateArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    planned_at: UtcDateTime = Field(alias="plannedAt")
     expected_signal_codes: tuple[str, ...] = Field(
         alias="expectedSignalCodes",
         min_length=1,
@@ -1069,6 +1656,10 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
     def validate_plan(self) -> Wc029ScenarioPlanEvidence:
         if _RESOURCE_ID_PATTERN.fullmatch(self.target_resource_id) is None:
             raise ValueError("scenario target must be a complete Azure resource ID")
+        if (self.scenario_class == "nsg-connectivity-loss") != (
+            self.change_request_digest is not None
+        ):
+            raise ValueError("changeRequestDigest is required only for NSG connectivity loss")
         for label, values in (
             ("expectedSignalCodes", self.expected_signal_codes),
             ("abortThresholds", self.abort_thresholds),
@@ -1086,8 +1677,13 @@ class Wc029MutationReceipt(_StrictAcceptanceModel):
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
     )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
     scenario_class: ScenarioClass = Field(alias="scenarioClass")
-    plan_digest: str = Field(
+    plan_digest: str | None = Field(
+        default=None,
         alias="planDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
@@ -1124,6 +1720,10 @@ class Wc029RecoveryActionEvidence(_StrictAcceptanceModel):
     scenario_id: str = Field(
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
     )
     scenario_class: ScenarioClass = Field(alias="scenarioClass")
     plan_digest: str = Field(
@@ -1167,6 +1767,10 @@ class Wc029ManifestCitationEvidence(_StrictAcceptanceModel):
     scenario_id: str = Field(
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
     )
     manifest_id: str = Field(alias="manifestId", min_length=1, max_length=128)
     manifest_version: str = Field(
@@ -1234,13 +1838,26 @@ class Wc029QueueStateEvidence(_StrictAcceptanceModel):
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
     )
+    scenario_execution_id: str | None = Field(
+        default=None,
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
     captured_at: UtcDateTime = Field(alias="capturedAt")
     queues: tuple[Wc029QueueState, ...] = Field(min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def validate_scope(self) -> Wc029QueueStateEvidence:
-        if (self.capture_scope == "scenario-verify") != (self.scenario_id is not None):
-            raise ValueError("scenarioId is required only for scenario-verify queue evidence")
+        if (self.capture_scope == "scenario-verify") != (
+            self.scenario_id is not None and self.scenario_execution_id is not None
+        ):
+            raise ValueError(
+                "scenarioId and scenarioExecutionId are required only for scenario-verify"
+            )
+        if self.capture_scope != "scenario-verify" and (
+            self.scenario_id is not None or self.scenario_execution_id is not None
+        ):
+            raise ValueError("global queue evidence cannot claim a scenario execution")
         keys = tuple(
             (item.namespace.casefold(), item.queue_name.casefold()) for item in self.queues
         )
@@ -1306,6 +1923,10 @@ class Wc029IncidentOmission(_StrictAcceptanceModel):
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
     )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
     reason_code: Literal["unsupported-incident-producer"] = Field(alias="reasonCode")
     incident_evidence_expected: Literal[False] = Field(alias="incidentEvidenceExpected")
     incident_evidence_observed: Literal[False] = Field(alias="incidentEvidenceObserved")
@@ -1321,11 +1942,254 @@ class Wc029IncidentOmission(_StrictAcceptanceModel):
         return _validate_fixed_text(value, label="omission detail", maximum_length=512)
 
 
+class Wc029ResourceStateEvidence(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029ResourceState.v1"] = Field(alias="schemaVersion")
+    capture_kind: Literal["baseline", "recovered"] = Field(alias="captureKind")
+    scenario_id: str = Field(
+        alias="scenarioId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    scenario_class: ScenarioClass = Field(alias="scenarioClass")
+    plan_digest: str | None = Field(
+        default=None,
+        alias="planDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    mutation_receipt_digest: str | None = Field(
+        default=None,
+        alias="mutationReceiptDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    target_resource_id: str = Field(
+        alias="targetResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    captured_at: UtcDateTime = Field(alias="capturedAt")
+    state_document: dict[str, Any] = Field(alias="stateDocument")
+    state_digest: str = Field(
+        alias="stateDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Wc029ResourceStateEvidence:
+        if not self.state_document:
+            raise ValueError("resource state document must not be empty")
+        if (self.capture_kind == "recovered") != (
+            self.mutation_receipt_digest is not None and self.plan_digest is not None
+        ):
+            raise ValueError(
+                "planDigest and mutationReceiptDigest are required only for recovered state"
+            )
+        if self.capture_kind == "baseline" and (
+            self.plan_digest is not None or self.mutation_receipt_digest is not None
+        ):
+            raise ValueError("baseline state cannot depend on future plan or mutation")
+        expected = compute_artifact_digest(
+            {
+                "targetResourceId": self.target_resource_id.casefold().rstrip("/"),
+                "stateDocument": self.state_document,
+            }
+        )
+        if self.state_digest != expected:
+            raise ValueError("stateDigest does not bind target and stateDocument")
+        return self
+
+
+class Wc029ScenarioPhaseWindow(_StrictAcceptanceModel):
+    phase: ScenarioPhase
+    started_at: UtcDateTime = Field(alias="startedAt")
+    completed_at: UtcDateTime = Field(alias="completedAt")
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Wc029ScenarioPhaseWindow:
+        if self.completed_at < self.started_at:
+            raise ValueError("scenario phase window completes before it starts")
+        return self
+
+
+class Wc029ScenarioArtifactBinding(_StrictAcceptanceModel):
+    artifact_id: str = Field(
+        alias="artifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    phase: ScenarioPhase
+    content_sha256: str = Field(
+        alias="contentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    input_digest: str = Field(
+        alias="inputDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+
+class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029ScenarioExecutionManifest.v1"] = Field(
+        alias="schemaVersion"
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    scenario_id: str = Field(
+        alias="scenarioId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_class: ScenarioClass = Field(alias="scenarioClass")
+    evidence_mode: ScenarioMode = Field(alias="evidenceMode")
+    capability_digest: str = Field(
+        alias="capabilityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    source_commit: str = Field(alias="sourceCommit", pattern=r"^[a-f0-9]{40}$")
+    target_resource_id: str = Field(
+        alias="targetResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    mutation_action_digest: str = Field(
+        alias="mutationActionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    recovery_action_digest: str = Field(
+        alias="recoveryActionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    monitoring_request_digest: str = Field(
+        alias="monitoringRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    correlation_request_digest: str = Field(
+        alias="correlationRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    change_request_digest: str | None = Field(
+        default=None,
+        alias="changeRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    verification_input_digest: str = Field(
+        alias="verificationInputDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    plan_digest: str = Field(
+        alias="planDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    mutation_receipt_digest: str = Field(
+        alias="mutationReceiptDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    recovery_action_result_digest: str = Field(
+        alias="recoveryActionResultDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    phase_windows: tuple[Wc029ScenarioPhaseWindow, ...] = Field(
+        alias="phaseWindows",
+        min_length=5,
+        max_length=5,
+    )
+    artifacts: tuple[Wc029ScenarioArtifactBinding, ...] = Field(
+        min_length=1,
+        max_length=128,
+    )
+    manifest_digest: str = Field(
+        alias="manifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("manifestDigest")
+        return payload
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Wc029ScenarioExecutionManifest:
+        phases = tuple(item.phase for item in self.phase_windows)
+        expected_phases: tuple[ScenarioPhase, ...] = (
+            "plan",
+            "apply",
+            "observe",
+            "recover",
+            "verify",
+        )
+        if phases != expected_phases:
+            raise ValueError("phaseWindows must use the exact lifecycle order")
+        if any(
+            current.completed_at > following.started_at
+            for current, following in zip(
+                self.phase_windows,
+                self.phase_windows[1:],
+                strict=False,
+            )
+        ):
+            raise ValueError("scenario phase windows must not overlap")
+        if self.phase_windows[-1].completed_at - self.phase_windows[0].started_at > timedelta(
+            hours=24
+        ):
+            raise ValueError("scenario execution window must not exceed 24 hours")
+        phase_rank = {
+            "plan": 0,
+            "apply": 1,
+            "observe": 2,
+            "recover": 3,
+            "verify": 4,
+        }
+        keys = tuple((item.phase, item.artifact_id) for item in self.artifacts)
+        if keys != tuple(sorted(keys, key=lambda item: (phase_rank[item[0]], item[1]))) or len(
+            keys
+        ) != len(set(keys)):
+            raise ValueError("scenario artifact bindings must be unique and sorted")
+        if self.manifest_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("manifestDigest does not bind scenario execution")
+        return self
+
+
+class Wc029ScenarioExecutionAttestation(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029ScenarioExecutionAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    manifest_digest: str = Field(
+        alias="manifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: str = Field(
+        alias="signedPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
 class Wc029RecoveryProof(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029RecoveryProof.v1"] = Field(alias="schemaVersion")
     scenario_id: str = Field(
         alias="scenarioId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
     )
     scenario_class: ScenarioClass = Field(alias="scenarioClass")
     plan_digest: str = Field(
@@ -1348,6 +2212,8 @@ class Wc029RecoveryProof(_StrictAcceptanceModel):
     verified_at: UtcDateTime = Field(alias="verifiedAt")
     healthy: Literal[True]
     residual_mutation_count: Literal[0] = Field(alias="residualMutationCount")
+    baseline_state: Wc029ArtifactDigestReference = Field(alias="baselineState")
+    recovered_state: Wc029ArtifactDigestReference = Field(alias="recoveredState")
     baseline_state_digest: str = Field(
         alias="baselineStateDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
@@ -1355,6 +2221,9 @@ class Wc029RecoveryProof(_StrictAcceptanceModel):
     recovered_state_digest: str = Field(
         alias="recoveredStateDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    post_recovery_job_readback: Wc029ArtifactDigestReference = Field(
+        alias="postRecoveryJobReadback"
     )
     evidence_artifact_ids: tuple[str, ...] = Field(
         alias="evidenceArtifactIds",
@@ -1371,8 +2240,6 @@ class Wc029RecoveryProof(_StrictAcceptanceModel):
     def validate_recovery(self) -> Wc029RecoveryProof:
         if _RESOURCE_ID_PATTERN.fullmatch(self.target_resource_id) is None:
             raise ValueError("recovery proof target must be a complete Azure resource ID")
-        if self.baseline_state_digest != self.recovered_state_digest:
-            raise ValueError("recovered state digest must match the captured baseline")
         if tuple(self.evidence_artifact_ids) != tuple(sorted(self.evidence_artifact_ids)) or len(
             self.evidence_artifact_ids
         ) != len(set(self.evidence_artifact_ids)):
@@ -1558,14 +2425,6 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             raise ValueError("scenario IDs must be unique")
         if set(scenario_classes) != set(REQUIRED_SCENARIO_CLASSES):
             raise ValueError("acceptance index must contain every required WC-029 scenario class")
-        if {item.evidence_mode for item in self.scenarios} != {
-            "correlation-only",
-            "incident-producing",
-        }:
-            raise ValueError(
-                "acceptance index must exercise correlation-only and incident-producing modes"
-            )
-
         references = list(self.global_artifact_ids)
         for scenario in self.scenarios:
             for _phase, phase_ids in scenario.phases.items():
@@ -1597,6 +2456,9 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             )
         singleton_classes: tuple[EvidenceClass, ...] = (
             "version-inventory",
+            "published-manifest",
+            "publication-authority",
+            "publication-authority-attestation",
             "effective-rbac",
             "rbac-policy",
         )
@@ -1706,7 +2568,7 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             for phase, artifact_ids in scenario.phases.items()
         }
         required_common: dict[ScenarioPhase, tuple[EvidenceClass, ...]] = {
-            "plan": ("scenario-plan",),
+            "plan": ("scenario-plan", "baseline-state"),
             "apply": ("mutation-receipt",),
             "observe": (
                 "monitoring-evidence",
@@ -1714,7 +2576,14 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
                 "correlation-report-attestation",
             ),
             "recover": ("recovery-action",),
-            "verify": ("recovery-proof", "job-execution", "job-readback"),
+            "verify": (
+                "recovered-state",
+                "scenario-execution-manifest",
+                "scenario-execution-attestation",
+                "recovery-proof",
+                "job-execution",
+                "job-readback",
+            ),
         }
         for phase, required in required_common.items():
             invalid = [
@@ -1734,11 +2603,10 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             raise ValueError("NSG connectivity evidence requires an exact change artifact")
         if scenario.scenario_class != "nsg-connectivity-loss" and all_counts["change-evidence"] > 1:
             raise ValueError("a scenario cannot contain duplicate change evidence")
-        if scenario.evidence_mode == "correlation-only":
-            if phase_counts["observe"]["incident-omission"] != 1:
-                raise ValueError(
-                    "correlation-only scenarios require exactly one bounded incident omission"
-                )
+        omission_count = phase_counts["observe"]["incident-omission"]
+        if omission_count > 1:
+            raise ValueError("a scenario cannot contain duplicate incident omission evidence")
+        if omission_count == 1:
             forbidden = {
                 evidence_class
                 for evidence_class in _INCIDENT_ONLY_CLASSES
@@ -1759,6 +2627,8 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             "enrichment-attestation",
             "feed-active",
             "feed-active-attestation",
+            "feed-index-active",
+            "feed-index-active-attestation",
             "notification-active",
         }
         required_incident_verify: set[EvidenceClass] = {
@@ -1766,6 +2636,8 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             "incident-state-resolved-attestation",
             "feed-resolved",
             "feed-resolved-attestation",
+            "feed-index-resolved",
+            "feed-index-resolved-attestation",
             "notification-resolved",
             "queue-state",
         }
@@ -1784,8 +2656,6 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
                 "incident-producing scenario is missing signed active/resolved evidence: "
                 f"observe={sorted(missing_observe)}, verify={sorted(missing_verify)}"
             )
-        if all_counts["incident-omission"]:
-            raise ValueError("incident-producing scenarios cannot carry omission metadata")
 
 
 class Wc029SourceIndexRecord(_StrictAcceptanceModel):
@@ -1844,6 +2714,10 @@ class Wc029AcceptanceEvidenceRecord(_StrictAcceptanceModel):
     incident_evidence_synthesized: Literal[False] = Field(alias="incidentEvidenceSynthesized")
     evidence_status: Literal["complete"] = Field(alias="evidenceStatus")
     source_index: Wc029SourceIndexRecord = Field(alias="sourceIndex")
+    approved_inventory_sha256: str = Field(
+        alias="approvedInventorySha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     version_inventory: Wc029VersionInventory = Field(alias="versionInventory")
     global_artifact_ids: tuple[str, ...] = Field(alias="globalArtifactIds")
     scenarios: tuple[Wc029ScenarioEvidence, ...]
@@ -1896,6 +2770,9 @@ class _LoadedArtifact:
 _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     VERSION_INVENTORY_SCHEMA_VERSION: Wc029VersionInventory,
     SIGNING_PUBLIC_KEY_SCHEMA_VERSION: Wc029SigningPublicKeyEvidence,
+    PUBLISHED_MANIFEST_SCHEMA_VERSION: Wc029PublishedManifestEvidence,
+    PUBLICATION_AUTHORITY_SCHEMA_VERSION: Wc029PublicationAuthorityEvidence,
+    PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION: (Wc029PublicationAuthorityAttestation),
     "athena.wc029DeploymentPlan.v1": Wc029DeploymentPlanEvidence,
     "athena.wc029DeploymentHandoff.v1": Wc029DeploymentHandoffEvidence,
     DEPLOYMENT_READBACK_SCHEMA_VERSION: Wc029DeploymentReadbackEvidence,
@@ -1903,6 +2780,9 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     JOB_READBACK_SCHEMA_VERSION: Wc029JobReadbackEvidence,
     PREFLIGHT_RESULT_SCHEMA_VERSION: Wc029PreflightResultEvidence,
     SCENARIO_PLAN_SCHEMA_VERSION: Wc029ScenarioPlanEvidence,
+    RESOURCE_STATE_SCHEMA_VERSION: Wc029ResourceStateEvidence,
+    SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION: (Wc029ScenarioExecutionManifest),
+    SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION: (Wc029ScenarioExecutionAttestation),
     MUTATION_RECEIPT_SCHEMA_VERSION: Wc029MutationReceipt,
     RECOVERY_ACTION_SCHEMA_VERSION: Wc029RecoveryActionEvidence,
     MANIFEST_CITATION_SCHEMA_VERSION: Wc029ManifestCitationEvidence,
@@ -1932,9 +2812,14 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
 
 def _reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
+    normalized_keys: set[str] = set()
     for key, item in pairs:
-        if key in value:
-            raise Wc029AcceptanceEvidenceError("JSON input contains a duplicate object key")
+        normalized_key = key.casefold()
+        if normalized_key in normalized_keys:
+            raise Wc029AcceptanceEvidenceError(
+                "JSON input contains a case-insensitive duplicate object key"
+            )
+        normalized_keys.add(normalized_key)
         value[key] = item
     return value
 
@@ -1964,8 +2849,34 @@ def _validate_json_shape(value: object) -> None:
             raise Wc029AcceptanceEvidenceError("JSON input contains an unsupported value")
 
 
+def _validate_json_nesting(raw: bytes) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in {0x7B, 0x5B}:
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise Wc029AcceptanceEvidenceError("JSON input exceeds its parse-time depth bound")
+        elif byte in {0x7D, 0x5D}:
+            depth -= 1
+            if depth < 0:
+                raise Wc029AcceptanceEvidenceError("JSON input has unbalanced containers")
+
+
 def _parse_strict_json(raw: bytes, *, label: str) -> tuple[object, bytes]:
     try:
+        _validate_json_nesting(raw)
         parsed = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
@@ -1975,7 +2886,13 @@ def _parse_strict_json(raw: bytes, *, label: str) -> tuple[object, bytes]:
         canonical = canonicalize_json(parsed).encode("utf-8")
     except Wc029AcceptanceEvidenceError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise Wc029AcceptanceEvidenceError(
             f"{label} is not strict canonicalizable UTF-8 JSON"
         ) from exc
@@ -1986,106 +2903,213 @@ def _is_reparse_point(path_stat: os.stat_result) -> bool:
     return bool(getattr(path_stat, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
-def _resolve_directory(path: Path, *, label: str) -> Path:
-    try:
-        path_stat = path.lstat()
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise Wc029AcceptanceEvidenceError(f"{label} is unavailable") from exc
-    if (
-        not stat.S_ISDIR(path_stat.st_mode)
-        or stat.S_ISLNK(path_stat.st_mode)
-        or _is_reparse_point(path_stat)
-        or not resolved.is_dir()
-    ):
-        raise Wc029AcceptanceEvidenceError(
-            f"{label} must be one real directory, not a link or reparse point"
+@dataclass(frozen=True, slots=True)
+class _PathIdentity:
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    size: int
+    modified_ns: int
+    file_attributes: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> _PathIdentity:
+        return cls(
+            device=value.st_dev,
+            inode=value.st_ino,
+            mode=value.st_mode,
+            link_count=value.st_nlink,
+            size=value.st_size,
+            modified_ns=value.st_mtime_ns,
+            file_attributes=getattr(value, "st_file_attributes", 0),
         )
-    return resolved
 
 
-def _resolve_regular_file(root: Path, relative_file: str, *, label: str) -> Path:
-    parts = _validate_relative_file(relative_file).split("/")
-    current = root
-    try:
-        for part in parts:
-            current = current / part
-            item_stat = current.lstat()
-            if stat.S_ISLNK(item_stat.st_mode) or _is_reparse_point(item_stat):
+@dataclass(slots=True)
+class _PinnedDirectoryHandle:
+    path: Path
+    identity: _PathIdentity
+    descriptor: int | None = None
+    windows_handle: int | None = None
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        if self.windows_handle is not None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle(ctypes.c_void_p(self.windows_handle))
+            self.windows_handle = None
+
+
+class _WindowsByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", ctypes.c_ulong),
+        ("ftCreationTimeLow", ctypes.c_ulong),
+        ("ftCreationTimeHigh", ctypes.c_ulong),
+        ("ftLastAccessTimeLow", ctypes.c_ulong),
+        ("ftLastAccessTimeHigh", ctypes.c_ulong),
+        ("ftLastWriteTimeLow", ctypes.c_ulong),
+        ("ftLastWriteTimeHigh", ctypes.c_ulong),
+        ("dwVolumeSerialNumber", ctypes.c_ulong),
+        ("nFileSizeHigh", ctypes.c_ulong),
+        ("nFileSizeLow", ctypes.c_ulong),
+        ("nNumberOfLinks", ctypes.c_ulong),
+        ("nFileIndexHigh", ctypes.c_ulong),
+        ("nFileIndexLow", ctypes.c_ulong),
+    ]
+
+
+def _windows_directory_identity(handle: int) -> tuple[int, int, int]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsByHandleFileInformation),
+    ]
+    get_information.restype = ctypes.c_int
+    information = _WindowsByHandleFileInformation()
+    if (
+        get_information(
+            ctypes.c_void_p(handle),
+            ctypes.byref(information),
+        )
+        == 0
+    ):
+        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
+    file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    return (
+        file_index,
+        int(information.nNumberOfLinks),
+        int(information.dwFileAttributes),
+    )
+
+
+def _open_pinned_directory(
+    path: Path,
+    expected: _PathIdentity,
+    *,
+    parent: _PinnedDirectoryHandle | None = None,
+    name: str | None = None,
+) -> _PinnedDirectoryHandle:
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(path),
+            0x0001 | 0x0080,
+            0x0001 | 0x0002,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle in {None, invalid_handle}:
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        raw_handle = int(handle)
+        try:
+            inode, link_count, attributes = _windows_directory_identity(raw_handle)
+            if (
+                inode != expected.inode
+                or link_count != expected.link_count
+                or attributes != expected.file_attributes
+                or attributes & _REPARSE_POINT
+                or not attributes & 0x10
+            ):
                 raise Wc029AcceptanceEvidenceError(
-                    f"{label} contains a symbolic link or reparse point"
+                    "directory handle identity does not match its validated path"
                 )
-        resolved = current.resolve(strict=True)
-        item_stat = current.lstat()
-    except Wc029AcceptanceEvidenceError:
-        raise
-    except OSError as exc:
-        raise Wc029AcceptanceEvidenceError(f"{label} is unavailable") from exc
-    if (
-        not stat.S_ISREG(item_stat.st_mode)
-        or not resolved.is_file()
-        or not resolved.is_relative_to(root)
-        or item_stat.st_nlink != 1
-    ):
-        raise Wc029AcceptanceEvidenceError(
-            f"{label} escaped the evidence root or is not one singly linked regular file"
+        except OSError, Wc029AcceptanceEvidenceError:
+            kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
+            raise
+        return _PinnedDirectoryHandle(
+            path=path,
+            identity=expected,
+            windows_handle=raw_handle,
         )
-    return resolved
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(
+        name if parent is not None and name is not None else path,
+        flags,
+        dir_fd=None if parent is None else parent.descriptor,
+    )
+    opened = _PathIdentity.from_stat(os.fstat(descriptor))
+    if (
+        opened != expected
+        or not stat.S_ISDIR(opened.mode)
+        or stat.S_ISLNK(opened.mode)
+        or _is_reparse_point(os.fstat(descriptor))
+    ):
+        os.close(descriptor)
+        raise Wc029AcceptanceEvidenceError(
+            "directory handle identity does not match its validated path"
+        )
+    return _PinnedDirectoryHandle(
+        path=path,
+        identity=expected,
+        descriptor=descriptor,
+    )
 
 
-def _read_bounded_regular_file(
+def _stable_directory_path(
     path: Path,
     *,
-    maximum_bytes: int,
     label: str,
-) -> bytes:
+) -> tuple[Path, _PathIdentity]:
+    absolute = Path(os.path.abspath(path))
     try:
-        before = path.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or stat.S_ISLNK(before.st_mode)
-            or _is_reparse_point(before)
-            or before.st_nlink != 1
-        ):
-            raise Wc029AcceptanceEvidenceError(f"{label} is not a regular file")
-        if before.st_size < 1 or before.st_size > maximum_bytes:
-            raise Wc029AcceptanceEvidenceError(
-                f"{label} must contain between 1 and {maximum_bytes} bytes"
-            )
-        with path.open("rb") as stream:
-            opened = os.fstat(stream.fileno())
-            if (
-                opened.st_size != before.st_size
-                or opened.st_mtime_ns != before.st_mtime_ns
-                or (before.st_ino and opened.st_ino != before.st_ino)
-            ):
-                raise Wc029AcceptanceEvidenceError(f"{label} changed before it was read")
-            content = stream.read(maximum_bytes + 1)
-            after = os.fstat(stream.fileno())
-    except Wc029AcceptanceEvidenceError:
-        raise
+        expected = _PathIdentity.from_stat(absolute.lstat())
     except OSError as exc:
-        raise Wc029AcceptanceEvidenceError(f"{label} could not be read") from exc
+        raise Wc029AcceptanceEvidenceError(f"{label} is unavailable") from exc
     if (
-        not content
-        or len(content) > maximum_bytes
-        or after.st_size != opened.st_size
-        or after.st_mtime_ns != opened.st_mtime_ns
+        not stat.S_ISDIR(expected.mode)
+        or stat.S_ISLNK(expected.mode)
+        or expected.file_attributes & _REPARSE_POINT
     ):
         raise Wc029AcceptanceEvidenceError(
-            f"{label} is empty, oversized, or changed while being read"
+            f"{label} must be one real directory without reparse points"
         )
-    return content
+    pin = _open_pinned_directory(absolute, expected)
+    try:
+        resolved = absolute.resolve(strict=True)
+        if (
+            os.path.normcase(str(resolved)) != os.path.normcase(str(absolute))
+            or _PathIdentity.from_stat(resolved.lstat()) != expected
+        ):
+            raise Wc029AcceptanceEvidenceError(f"{label} contains a linked or unstable parent path")
+    finally:
+        pin.close()
+    return absolute, expected
 
 
-def _raise_walk_error(error: OSError) -> NoReturn:
-    raise Wc029AcceptanceEvidenceError(
-        "evidence directory contains an unreadable subtree"
-    ) from error
+@dataclass(frozen=True, slots=True)
+class _BundleSnapshot:
+    files: dict[str, bytes]
 
 
-def _discover_bundle_files(root: Path) -> dict[str, int]:
-    discovered: dict[str, int] = {}
+def _scan_bundle_tree(
+    root: Path,
+) -> tuple[dict[str, _PathIdentity], dict[str, _PathIdentity]]:
+    directories: dict[str, _PathIdentity] = {".": _PathIdentity.from_stat(root.lstat())}
+    files: dict[str, _PathIdentity] = {}
     for current_text, directory_names, file_names in os.walk(
         root,
         topdown=True,
@@ -2101,33 +3125,175 @@ def _discover_bundle_files(root: Path) -> dict[str, int]:
                 raise Wc029AcceptanceEvidenceError(
                     "evidence directory contains an unreadable entry"
                 ) from exc
-            if stat.S_ISLNK(directory_stat.st_mode) or _is_reparse_point(directory_stat):
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or stat.S_ISLNK(directory_stat.st_mode)
+                or _is_reparse_point(directory_stat)
+            ):
                 raise Wc029AcceptanceEvidenceError(
-                    "evidence directory contains a symbolic link or reparse point"
+                    "evidence directory contains a linked or non-directory entry"
                 )
-        for name in file_names:
-            relative = (current / name).relative_to(root).as_posix()
-            path = _resolve_regular_file(
-                root,
-                relative,
-                label=f"evidence file {relative}",
+            directories[directory.relative_to(root).as_posix()] = _PathIdentity.from_stat(
+                directory_stat
             )
+        for name in file_names:
+            path = current / name
+            relative = path.relative_to(root).as_posix()
             if not relative.endswith(".json"):
                 raise Wc029AcceptanceEvidenceError(
                     f"evidence directory contains non-JSON file {relative}"
                 )
             try:
-                size = path.stat(follow_symlinks=False).st_size
+                file_stat = path.lstat()
             except OSError as exc:
                 raise Wc029AcceptanceEvidenceError(
                     f"evidence file {relative} cannot be inspected"
                 ) from exc
-            discovered[relative] = size
-            if len(discovered) > MAX_EVIDENCE_FILES + 1:
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or stat.S_ISLNK(file_stat.st_mode)
+                or _is_reparse_point(file_stat)
+                or file_stat.st_nlink != 1
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    f"evidence file {relative} must be one singly linked regular file"
+                )
+            files[relative] = _PathIdentity.from_stat(file_stat)
+            if len(files) > MAX_EVIDENCE_FILES + 1:
                 raise Wc029AcceptanceEvidenceError(
                     "evidence directory exceeds its file-count bound"
                 )
-    return discovered
+    return directories, files
+
+
+def _read_snapshot_file(
+    path: Path,
+    expected: _PathIdentity,
+    *,
+    parent: _PinnedDirectoryHandle,
+    maximum_bytes: int,
+    label: str,
+) -> bytes:
+    if expected.size < 1 or expected.size > maximum_bytes:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} must contain between 1 and {maximum_bytes} bytes"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path if os.name == "nt" else path.name,
+            flags,
+            dir_fd=(None if os.name == "nt" else parent.descriptor),
+        )
+        opened = os.fstat(descriptor)
+        opened_identity = _PathIdentity.from_stat(opened)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened_identity != expected:
+            raise Wc029AcceptanceEvidenceError(
+                f"{label} changed before its stable handle was opened"
+            )
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            content = stream.read(maximum_bytes + 1)
+            after = _PathIdentity.from_stat(os.fstat(stream.fileno()))
+        if after != opened_identity:
+            raise Wc029AcceptanceEvidenceError(f"{label} changed while its stable handle was read")
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} could not be captured into the private snapshot"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not content or len(content) > maximum_bytes:
+        raise Wc029AcceptanceEvidenceError(f"{label} is empty or oversized")
+    return content
+
+
+def _capture_bundle_snapshot(
+    root: Path,
+    *,
+    index_relative: str,
+) -> _BundleSnapshot:
+    stable_root, root_identity = _stable_directory_path(
+        root,
+        label="evidence root",
+    )
+    pins: dict[str, _PinnedDirectoryHandle] = {}
+    try:
+        pins["."] = _open_pinned_directory(
+            stable_root,
+            root_identity,
+        )
+        before_directories, before_files = _scan_bundle_tree(stable_root)
+        if before_directories.get(".") != root_identity:
+            raise Wc029AcceptanceEvidenceError(
+                "evidence root changed after its stable handle was opened"
+            )
+        for relative in sorted(
+            (item for item in before_directories if item != "."),
+            key=lambda item: (len(Path(item).parts), item),
+        ):
+            relative_path = Path(relative)
+            parent_relative = (
+                relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
+            )
+            pins[relative] = _open_pinned_directory(
+                stable_root / relative_path,
+                before_directories[relative],
+                parent=pins[parent_relative],
+                name=relative_path.name,
+            )
+        if index_relative not in before_files:
+            raise Wc029AcceptanceEvidenceError("acceptance index is missing")
+        artifact_bytes = sum(
+            identity.size
+            for relative, identity in before_files.items()
+            if relative != index_relative
+        )
+        if artifact_bytes > MAX_TOTAL_EVIDENCE_BYTES:
+            raise Wc029AcceptanceEvidenceError("aggregate evidence exceeds its total byte bound")
+        captured: dict[str, bytes] = {}
+        for relative, identity in sorted(before_files.items()):
+            relative_path = Path(relative)
+            parent_relative = (
+                relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
+            )
+            captured[relative] = _read_snapshot_file(
+                stable_root / relative_path,
+                identity,
+                parent=pins[parent_relative],
+                maximum_bytes=(
+                    MAX_INDEX_BYTES if relative == index_relative else MAX_ARTIFACT_TRANSFER_BYTES
+                ),
+                label=(
+                    "acceptance index"
+                    if relative == index_relative
+                    else f"evidence file {relative}"
+                ),
+            )
+        after_directories, after_files = _scan_bundle_tree(stable_root)
+        if before_directories != after_directories or before_files != after_files:
+            raise Wc029AcceptanceEvidenceError(
+                "evidence directory changed while the private snapshot was captured"
+            )
+        return _BundleSnapshot(files=captured)
+    finally:
+        for pin in reversed(tuple(pins.values())):
+            pin.close()
+
+
+def _raise_walk_error(error: OSError) -> NoReturn:
+    raise Wc029AcceptanceEvidenceError(
+        "evidence directory contains an unreadable subtree"
+    ) from error
 
 
 def _model_canonical_bytes(model: BaseModel) -> bytes:
@@ -2137,19 +3303,9 @@ def _model_canonical_bytes(model: BaseModel) -> bytes:
 
 
 def _load_artifact(
-    root: Path,
+    raw: bytes,
     declaration: Wc029EvidenceFileDeclaration,
 ) -> _LoadedArtifact:
-    path = _resolve_regular_file(
-        root,
-        declaration.path,
-        label=f"artifact {declaration.artifact_id}",
-    )
-    raw = _read_bounded_regular_file(
-        path,
-        maximum_bytes=MAX_ARTIFACT_TRANSFER_BYTES,
-        label=f"artifact {declaration.artifact_id}",
-    )
     parsed, canonical = _parse_strict_json(
         raw,
         label=f"artifact {declaration.artifact_id}",
@@ -2176,7 +3332,7 @@ def _load_artifact(
         model_type = _KNOWN_MODELS[cast(str, schema_version)]
         try:
             model = model_type.model_validate_json(raw)
-        except (ValidationError, TypeError, ValueError) as exc:
+        except (RecursionError, ValidationError, TypeError, ValueError) as exc:
             raise Wc029AcceptanceEvidenceError(
                 f"artifact {declaration.artifact_id} violates {schema_version}"
             ) from exc
@@ -2239,43 +3395,105 @@ def _preflight_implementation_sha256() -> str:
     return sha256_hex(payload)
 
 
+def _normalize_casefold_json(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key).casefold(): _normalize_casefold_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_casefold_json(item) for item in value]
+    return value
+
+
 def _validate_rbac_document(
     document: object,
     *,
     label: str,
-) -> frozenset[str]:
+) -> tuple[object, frozenset[str]]:
+    normalized = _normalize_casefold_json(document)
     assignments = (
-        document
-        if isinstance(document, list)
-        else _require_mapping(document, label=label).get("value")
+        normalized
+        if isinstance(normalized, list)
+        else _require_mapping(normalized, label=label).get("value")
     )
     if not isinstance(assignments, list) or not assignments:
         raise Wc029AcceptanceEvidenceError(f"{label} must contain at least one role assignment")
     principal_ids: set[str] = set()
     for raw_assignment in assignments:
         assignment = _require_mapping(raw_assignment, label="role assignment")
-        principal_id = assignment.get("principalId")
+        principal_id = assignment.get("principalid")
         if type(principal_id) is not str or not principal_id:
             raise Wc029AcceptanceEvidenceError("effective RBAC assignment is missing principalId")
         principal_ids.add(principal_id.casefold())
-    return frozenset(principal_ids)
+    return normalized, frozenset(principal_ids)
 
 
-def _validate_rbac_policy(document: object) -> None:
-    policy = _require_mapping(document, label="RBAC policy")
-    if set(policy) != {"allowedBroadAssignments", "separationRules"}:
+def _validate_rbac_policy(
+    document: object,
+    *,
+    inventory: Wc029VersionInventory,
+) -> object:
+    normalized = _normalize_casefold_json(document)
+    policy = _require_mapping(normalized, label="RBAC policy")
+    if set(policy) != {"allowedbroadassignments", "separationrules"}:
         raise Wc029AcceptanceEvidenceError(
             "RBAC policy must contain exact allowance and separation collections"
         )
-    if not isinstance(policy["allowedBroadAssignments"], list) or not isinstance(
-        policy["separationRules"],
+    if not isinstance(policy["allowedbroadassignments"], list) or not isinstance(
+        policy["separationrules"],
         list,
     ):
         raise Wc029AcceptanceEvidenceError("RBAC policy collections must be arrays")
-    if not policy["separationRules"]:
+    rules = policy["separationrules"]
+    if not rules:
         raise Wc029AcceptanceEvidenceError(
             "RBAC policy requires at least one identity-separation rule"
         )
+    normalized_rules: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+    for raw_rule in rules:
+        rule = _require_mapping(raw_rule, label="RBAC separation rule")
+        if set(rule) != {
+            "principalid",
+            "forbiddenrolenames",
+            "forbiddenscopeprefixes",
+        }:
+            raise Wc029AcceptanceEvidenceError("RBAC separation rule has unexpected fields")
+        principal = rule.get("principalid")
+        roles = rule.get("forbiddenrolenames")
+        scopes = rule.get("forbiddenscopeprefixes")
+        if (
+            type(principal) is not str
+            or not principal
+            or not isinstance(roles, list)
+            or not roles
+            or any(type(item) is not str or not item for item in roles)
+            or not isinstance(scopes, list)
+            or not scopes
+            or any(type(item) is not str or not item for item in scopes)
+        ):
+            raise Wc029AcceptanceEvidenceError("RBAC separation rule must be non-vacuous")
+        key = (
+            principal.casefold(),
+            tuple(sorted(item.casefold() for item in roles)),
+            tuple(sorted(item.casefold().rstrip("/") for item in scopes)),
+        )
+        if key in normalized_rules:
+            raise Wc029AcceptanceEvidenceError("RBAC separation rules must be unique")
+        normalized_rules.add(key)
+
+    expected = {
+        (
+            boundary.principal_id.casefold(),
+            tuple(sorted(item.casefold() for item in boundary.forbidden_role_names)),
+            tuple(
+                sorted(item.casefold().rstrip("/") for item in boundary.forbidden_scope_prefixes)
+            ),
+        )
+        for boundary in inventory.rbac_boundaries
+    }
+    if normalized_rules != expected:
+        raise Wc029AcceptanceEvidenceError(
+            "RBAC policy does not exactly cover every approved principal boundary"
+        )
+    return normalized
 
 
 def _validate_preflight_evidence(
@@ -2308,19 +3526,25 @@ def _validate_preflight_evidence(
         raise Wc029AcceptanceEvidenceError(
             "RBAC preflight result does not bind its exact input, policy, and validator"
         )
-    principal_ids = _validate_rbac_document(
+    normalized_rbac, principal_ids = _validate_rbac_document(
         rbac_input.parsed,
         label="effective RBAC",
     )
-    if principal_ids != frozenset(item.casefold() for item in inventory.principal_ids):
+    expected_principals = frozenset(
+        item.principal_id.casefold() for item in inventory.rbac_boundaries
+    )
+    if principal_ids != expected_principals:
         raise Wc029AcceptanceEvidenceError(
             "effective RBAC does not cover the exact inventoried principals"
         )
-    _validate_rbac_policy(policy.parsed)
+    normalized_policy = _validate_rbac_policy(
+        policy.parsed,
+        inventory=inventory,
+    )
     try:
         violations = evaluate_role_assignments(
-            rbac_input.parsed,
-            policy_document=policy.parsed,
+            normalized_rbac,
+            policy_document=normalized_policy,
         )
     except PreflightInputError as exc:
         raise Wc029AcceptanceEvidenceError(
@@ -2422,11 +3646,55 @@ def _validate_deployment_evidence(
             readback_artifact,
             Wc029DeploymentReadbackEvidence,
         )
+        plan_upstream = {
+            "foundation": (
+                plan.foundation_handoff_path,
+                plan.foundation_handoff_sha256,
+            ),
+            "producer": (
+                plan.producer_handoff_path,
+                plan.producer_handoff_sha256,
+            ),
+            "publisher": (
+                plan.publisher_handoff_path,
+                plan.publisher_handoff_sha256,
+            ),
+        }
+        for upstream in coordinate.upstream_handoffs:
+            upstream_artifact = artifacts.get(upstream.output_artifact_id)
+            if (
+                upstream_artifact is None
+                or upstream_artifact.declaration.evidence_class != "deployment-output"
+                or upstream_artifact.declaration.deployment_id != upstream.deployment_id
+                or upstream_artifact.record.content_sha256 != upstream.content_sha256
+                or plan_upstream[upstream.stage] != (upstream.handoff_path, upstream.content_sha256)
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    f"deployment {deployment_id} upstream {upstream.stage} "
+                    "handoff identity is invalid"
+                )
+        unused_plan_handoffs = {
+            stage
+            for stage, values in plan_upstream.items()
+            if values != (None, None)
+            and stage not in {item.stage for item in coordinate.upstream_handoffs}
+        }
+        if unused_plan_handoffs:
+            raise Wc029AcceptanceEvidenceError(
+                f"deployment {deployment_id} contains unapproved named handoffs"
+            )
         if (
             plan.source_commit != inventory.source_commit
             or plan.stage != coordinate.stage
+            or plan.subscription_id.casefold() != coordinate.subscription_id.casefold()
+            or (plan.resource_group or "").casefold()
+            != (coordinate.resource_group or "").casefold()
+            or plan.location != coordinate.location
             or plan.deployment_name != coordinate.deployment_name
+            or plan.template_path != coordinate.template_path
             or plan.template_sha256 != coordinate.template_sha256
+            or plan.base_parameter_sha256 != coordinate.base_parameter_sha256
+            or plan.effective_parameter_sha256 != coordinate.effective_parameter_sha256
             or plan.what_if_sha256 != what_ifs[deployment_id].record.content_sha256
             or plan.preflight_sha256 != _preflight_implementation_sha256()
         ):
@@ -2436,7 +3704,11 @@ def _validate_deployment_evidence(
         if (
             output.source_commit != inventory.source_commit
             or output.stage != coordinate.stage
+            or output.subscription_id.casefold() != coordinate.subscription_id.casefold()
+            or (output.resource_group or "").casefold()
+            != (coordinate.resource_group or "").casefold()
             or output.deployment_name != coordinate.deployment_name
+            or output.parameter_bindings_sha256 != coordinate.parameter_bindings_sha256
             or output.plan_manifest_sha256 != plan_artifact.record.content_sha256
             or output_artifact.declaration.binds_artifact_id
             != plan_artifact.declaration.artifact_id
@@ -2447,10 +3719,17 @@ def _validate_deployment_evidence(
         if (
             readback.source_commit != inventory.source_commit
             or readback.stage != coordinate.stage
-            or readback.deployment_name != coordinate.deployment_name
-            or readback.subscription_id.casefold() != output.subscription_id.casefold()
+            or readback.subscription_id.casefold() != coordinate.subscription_id.casefold()
             or (readback.resource_group or "").casefold()
-            != (output.resource_group or "").casefold()
+            != (coordinate.resource_group or "").casefold()
+            or readback.location != coordinate.location
+            or readback.deployment_name != coordinate.deployment_name
+            or readback.template_path != coordinate.template_path
+            or readback.template_sha256 != coordinate.template_sha256
+            or readback.base_parameter_sha256 != coordinate.base_parameter_sha256
+            or readback.effective_parameter_sha256 != coordinate.effective_parameter_sha256
+            or readback.parameter_bindings_sha256 != coordinate.parameter_bindings_sha256
+            or readback.upstream_handoffs != coordinate.upstream_handoffs
             or readback.output_handoff_sha256 != output_artifact.record.content_sha256
             or readback.outputs != output.outputs
             or readback.outputs_sha256 != output.outputs_sha256
@@ -2460,6 +3739,19 @@ def _validate_deployment_evidence(
             raise Wc029AcceptanceEvidenceError(
                 f"deployment read-back {deployment_id} does not prove successful output state"
             )
+        if deployment_id == inventory.capability_deployment_id:
+            capabilities = [
+                item.model_dump(mode="json", by_alias=True, exclude_none=True)
+                for item in inventory.scenario_capabilities
+            ]
+            capability_digest = compute_artifact_digest(capabilities)
+            if (
+                readback.outputs.get("wc029ScenarioCapabilities") != capabilities
+                or readback.outputs.get("wc029ScenarioCapabilitiesDigest") != capability_digest
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "trusted scenario capabilities are absent from deployment read-back"
+                )
 
 
 def _decode_signature(value: str, *, standard_base64: bool) -> bytes:
@@ -2625,6 +3917,34 @@ def _validate_signed_artifacts(
                 standard_base64=False,
                 artifact_id=artifact.declaration.artifact_id,
             )
+        elif evidence_class == "publication-authority-attestation":
+            authority_attestation = _require_model(
+                artifact,
+                Wc029PublicationAuthorityAttestation,
+            )
+            authority_evidence = _require_model(
+                cast(_LoadedArtifact, subject),
+                Wc029PublicationAuthorityEvidence,
+            )
+            authority = authority_evidence.authority
+            if (
+                authority_attestation.authority_id != authority.authority_id
+                or authority_attestation.authority_digest != authority.authority_digest
+                or authority_attestation.signed_preimage_digest
+                != sha256_hex(authority.canonical_bytes())
+                or authority_attestation.key_vault_key_id.casefold()
+                != key.key_vault_key_id.casefold()
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "publication authority attestation does not bind exact authority"
+                )
+            _verify_signature(
+                public_key,
+                preimage=authority.canonical_bytes(),
+                signature=authority_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
         elif evidence_class in {
             "incident-state-active-attestation",
             "incident-state-resolved-attestation",
@@ -2723,6 +4043,62 @@ def _validate_signed_artifacts(
                 public_key,
                 preimage=pointer.canonical_bytes(),
                 signature=feed_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
+        elif evidence_class in {
+            "feed-index-active-attestation",
+            "feed-index-resolved-attestation",
+        }:
+            index_attestation = _require_model(
+                artifact,
+                IncidentFeedIndexAttestationV2,
+            )
+            feed_index = _require_model(
+                cast(_LoadedArtifact, subject),
+                IncidentFeedIndexV2,
+            )
+            if (
+                index_attestation.index_digest != sha256_hex(feed_index.canonical_bytes())
+                or index_attestation.key_vault_key_id.casefold() != key.key_vault_key_id.casefold()
+                or feed_index.key_id.casefold() != key.key_vault_key_id.casefold()
+                or feed_index.key_fingerprint != key.public_key_fingerprint
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "feed index attestation does not bind exact index and key"
+                )
+            _verify_signature(
+                public_key,
+                preimage=feed_index.canonical_bytes(),
+                signature=index_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
+        elif evidence_class == "scenario-execution-attestation":
+            execution_attestation = _require_model(
+                artifact,
+                Wc029ScenarioExecutionAttestation,
+            )
+            execution_manifest = _require_model(
+                cast(_LoadedArtifact, subject),
+                Wc029ScenarioExecutionManifest,
+            )
+            if (
+                execution_attestation.scenario_execution_id
+                != execution_manifest.scenario_execution_id
+                or execution_attestation.manifest_digest != execution_manifest.manifest_digest
+                or execution_attestation.signed_preimage_digest
+                != sha256_hex(execution_manifest.canonical_bytes())
+                or execution_attestation.key_vault_key_id.casefold()
+                != key.key_vault_key_id.casefold()
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "scenario execution attestation does not bind exact manifest"
+                )
+            _verify_signature(
+                public_key,
+                preimage=execution_manifest.canonical_bytes(),
+                signature=execution_attestation.detached_signature,
                 standard_base64=False,
                 artifact_id=artifact.declaration.artifact_id,
             )
@@ -2830,6 +4206,8 @@ def _validate_job_evidence(
             or readback.image != execution.image
             or readback.scope != execution.scope
             or readback.scenario_id != execution.scenario_id
+            or readback.scenario_execution_id != execution.scenario_execution_id
+            or readback.scenario_plan_digest != execution.scenario_plan_digest
             or readback.phase != execution.phase
             or readback.observed_at < execution.completed_at
         ):
@@ -2910,6 +4288,67 @@ def _validate_url_probes(
         )
 
 
+def _validate_publication_authority(
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> None:
+    manifest_inventory = inventory.manifest
+    manifest_artifact = artifacts.get(manifest_inventory.manifest_artifact_id)
+    authority_artifact = artifacts.get(manifest_inventory.authority_artifact_id)
+    attestation_artifact = artifacts.get(manifest_inventory.authority_attestation_artifact_id)
+    if (
+        manifest_artifact is None
+        or manifest_artifact.declaration.evidence_class != "published-manifest"
+        or authority_artifact is None
+        or authority_artifact.declaration.evidence_class != "publication-authority"
+        or attestation_artifact is None
+        or attestation_artifact.declaration.evidence_class != "publication-authority-attestation"
+        or attestation_artifact.declaration.binds_artifact_id
+        != authority_artifact.declaration.artifact_id
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "trusted manifest publication artifacts are missing or misbound"
+        )
+    manifest = _require_model(
+        manifest_artifact,
+        Wc029PublishedManifestEvidence,
+    )
+    authority = _require_model(
+        authority_artifact,
+        Wc029PublicationAuthorityEvidence,
+    ).authority
+    if (
+        manifest.manifest_id != manifest_inventory.manifest_id
+        or manifest.manifest_version != manifest_inventory.manifest_version
+        or manifest.profile_id != manifest_inventory.profile_id
+        or manifest.manifest_digest != manifest_inventory.manifest_digest
+        or manifest_artifact.record.content_sha256 != manifest_inventory.manifest_artifact_sha256
+        or compute_artifact_digest(
+            [
+                item.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for item in manifest.cited_clauses
+            ]
+        )
+        != manifest_inventory.cited_clause_map_digest
+        or authority.workload_id != manifest.workload_id
+        or authority.manifest_id != manifest.manifest_id
+        or authority.manifest_version != manifest.manifest_version
+        or authority.manifest_digest != manifest.manifest_digest
+        or authority.profile_id != manifest.profile_id
+        or authority.publication_record_digest != manifest.publication_record_digest
+        or authority.audit_head_digest != manifest.audit_head_digest
+        or authority.published_at != manifest.published_at
+        or authority.authority_digest != manifest_inventory.authority_digest
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "published manifest and authority do not match approved inventory"
+        )
+
+
 def _scenario_artifacts_by_class(
     scenario: Wc029ScenarioEvidence,
     artifacts: Mapping[str, _LoadedArtifact],
@@ -2927,10 +4366,193 @@ def _scenario_artifacts_by_class(
     return selected
 
 
+def _phase_window(
+    manifest: Wc029ScenarioExecutionManifest,
+    phase: ScenarioPhase,
+) -> Wc029ScenarioPhaseWindow:
+    return next(item for item in manifest.phase_windows if item.phase == phase)
+
+
+def _require_in_phase(
+    manifest: Wc029ScenarioExecutionManifest,
+    phase: ScenarioPhase,
+    value: UtcDateTime,
+    *,
+    label: str,
+) -> None:
+    window = _phase_window(manifest, phase)
+    if value < window.started_at or value > window.completed_at:
+        raise Wc029AcceptanceEvidenceError(f"{label} falls outside the signed {phase} phase window")
+
+
+def _scenario_artifact_input_digest(
+    artifact: _LoadedArtifact,
+    *,
+    plan: Wc029ScenarioPlanEvidence,
+) -> str:
+    evidence_class = artifact.declaration.evidence_class
+    model = artifact.model
+    if isinstance(model, Wc029ScenarioPlanEvidence):
+        return model.plan_digest
+    if isinstance(model, Wc029ResourceStateEvidence):
+        return model.state_digest
+    if isinstance(model, Wc029MutationReceipt):
+        return model.result_digest
+    if isinstance(model, MonitoringEvidenceHandoff):
+        return plan.monitoring_request_digest
+    if isinstance(model, ChangeEvidenceArtifact):
+        return model.evidence.source_digest
+    if isinstance(model, CorrelationReport):
+        return model.request_digest
+    if isinstance(model, PublishedCorrelationReportAttestation):
+        return model.statement.correlation_request_digest
+    if isinstance(model, Wc029IncidentOmission):
+        return artifact.record.canonical_json_sha256
+    if isinstance(model, IncidentState):
+        return model.result_digest
+    if isinstance(model, IncidentStateAttestation):
+        return model.result_digest
+    if isinstance(model, Wc029ManifestCitationEvidence):
+        return model.citation_digest
+    if isinstance(model, IncidentGuidance):
+        return model.guidance_digest
+    if isinstance(model, IncidentGuidanceAttestation):
+        return model.guidance_digest
+    if isinstance(model, IncidentEnrichmentManifest):
+        return model.manifest_digest
+    if isinstance(model, IncidentEnrichmentAttestation):
+        return model.manifest_digest
+    if isinstance(model, IncidentEnrichmentFeedPointer):
+        return model.pointer_digest
+    if isinstance(model, IncidentEnrichmentFeedPointerAttestation):
+        return model.pointer_digest
+    if isinstance(model, IncidentFeedIndexV2):
+        return sha256_hex(model.canonical_bytes())
+    if isinstance(model, IncidentFeedIndexAttestationV2):
+        return model.index_digest
+    if isinstance(model, IncidentNotificationEnvelopeV2):
+        return model.notification.notification_digest
+    if isinstance(model, Wc029RecoveryActionEvidence):
+        return model.result_digest
+    if isinstance(model, Wc029JobExecutionEvidence):
+        return model.input_digest
+    if isinstance(model, Wc029JobReadbackEvidence):
+        return model.execution_digest
+    if isinstance(model, Wc029QueueStateEvidence):
+        return artifact.record.canonical_json_sha256
+    if isinstance(model, Wc029RecoveryProof):
+        return compute_artifact_digest(
+            model.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
+    raise Wc029AcceptanceEvidenceError(
+        f"scenario artifact {artifact.declaration.artifact_id} "
+        f"has no trusted input-digest rule for {evidence_class}"
+    )
+
+
+def _monitoring_request_digest(handoff: MonitoringEvidenceHandoff) -> str:
+    return compute_artifact_digest(
+        {
+            "collectorContractDigest": handoff.collector_contract_digest,
+            "collectionId": handoff.collection_id,
+            "evidence": handoff.evidence.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+        }
+    )
+
+
+def _require_incident_state_digest(state: IncidentState) -> None:
+    if state.result_digest != sha256_hex(incident_state_signature_preimage(state)):
+        raise Wc029AcceptanceEvidenceError(
+            "IncidentState resultDigest does not bind its signature preimage"
+        )
+
+
+def _validate_signed_scenario_execution(
+    scenario: Wc029ScenarioEvidence,
+    capability: Wc029ScenarioCapability,
+    selected: Mapping[EvidenceClass, _LoadedArtifact],
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> Wc029ScenarioExecutionManifest:
+    plan = _require_model(
+        selected["scenario-plan"],
+        Wc029ScenarioPlanEvidence,
+    )
+    execution_manifest = _require_model(
+        selected["scenario-execution-manifest"],
+        Wc029ScenarioExecutionManifest,
+    )
+    execution_attestation = _require_model(
+        selected["scenario-execution-attestation"],
+        Wc029ScenarioExecutionAttestation,
+    )
+    if (
+        execution_attestation.scenario_execution_id != execution_manifest.scenario_execution_id
+        or execution_attestation.manifest_digest != execution_manifest.manifest_digest
+        or selected["scenario-execution-attestation"].declaration.binds_artifact_id
+        != selected["scenario-execution-manifest"].declaration.artifact_id
+        or execution_manifest.scenario_id != scenario.scenario_id
+        or execution_manifest.scenario_class != scenario.scenario_class
+        or execution_manifest.evidence_mode != capability.evidence_mode
+        or execution_manifest.capability_digest != capability.capability_digest
+        or execution_manifest.source_commit != plan.source_commit
+        or execution_manifest.target_resource_id.casefold()
+        != capability.target_resource_id.casefold()
+        or execution_manifest.mutation_action_digest != capability.mutation_action_digest
+        or execution_manifest.recovery_action_digest != capability.recovery_action_digest
+        or execution_manifest.monitoring_request_digest != plan.monitoring_request_digest
+        or execution_manifest.correlation_request_digest != plan.correlation_request_digest
+        or execution_manifest.change_request_digest != plan.change_request_digest
+        or execution_manifest.verification_input_digest != plan.verification_input_digest
+        or execution_manifest.plan_digest != plan.plan_digest
+        or execution_manifest.scenario_execution_id != plan.scenario_execution_id
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            f"scenario {scenario.scenario_id} signed execution manifest "
+            "does not match trusted capability and plan"
+        )
+
+    excluded_ids = {
+        selected["scenario-execution-manifest"].declaration.artifact_id,
+        selected["scenario-execution-attestation"].declaration.artifact_id,
+    }
+    expected_ids = {
+        artifact_id
+        for _phase, artifact_ids in scenario.phases.items()
+        for artifact_id in artifact_ids
+        if artifact_id not in excluded_ids
+    }
+    bindings = {item.artifact_id: item for item in execution_manifest.artifacts}
+    if set(bindings) != expected_ids:
+        raise Wc029AcceptanceEvidenceError(
+            "signed scenario execution manifest does not cover every phase artifact"
+        )
+    phase_by_id = {
+        artifact_id: phase
+        for phase, artifact_ids in scenario.phases.items()
+        for artifact_id in artifact_ids
+    }
+    for artifact_id, binding in bindings.items():
+        bound = artifacts[artifact_id]
+        if (
+            binding.phase != phase_by_id[artifact_id]
+            or binding.content_sha256 != bound.record.content_sha256
+            or binding.input_digest != _scenario_artifact_input_digest(bound, plan=plan)
+        ):
+            raise Wc029AcceptanceEvidenceError(
+                f"signed scenario binding for {artifact_id} is invalid"
+            )
+    return execution_manifest
+
+
 def _validate_scenario_lifecycle(
     scenario: Wc029ScenarioEvidence,
     inventory: Wc029VersionInventory,
     selected: Mapping[EvidenceClass, _LoadedArtifact],
+    artifacts: Mapping[str, _LoadedArtifact],
 ) -> None:
     active_state = _require_model(
         selected["incident-state-active"],
@@ -2955,15 +4577,23 @@ def _validate_scenario_lifecycle(
         raise Wc029AcceptanceEvidenceError(
             f"scenario {scenario.scenario_id} incident lifecycle is inconsistent"
         )
+    _require_incident_state_digest(active_state)
+    _require_incident_state_digest(resolved_state)
 
     report = _require_model(selected["correlation-report"], CorrelationReport)
     report_attestation = _require_model(
         selected["correlation-report-attestation"],
         PublishedCorrelationReportAttestation,
     )
+    authority = _require_model(
+        artifacts[inventory.manifest.authority_artifact_id],
+        Wc029PublicationAuthorityEvidence,
+    ).authority
     if (
         report_attestation.statement.incident_id != active_state.incident_id
         or report_attestation.statement.incident_state_result_digest != active_state.result_digest
+        or report_attestation.statement.authority_proof_digest
+        != sha256_hex(authority.canonical_bytes())
     ):
         raise Wc029AcceptanceEvidenceError(
             "incident-producing report does not bind the active occurrence"
@@ -2974,8 +4604,18 @@ def _validate_scenario_lifecycle(
         Wc029ManifestCitationEvidence,
     )
     manifest = inventory.manifest
+    published_manifest = _require_model(
+        artifacts[manifest.manifest_artifact_id],
+        Wc029PublishedManifestEvidence,
+    )
+    published_clauses = {item.clause_id for item in published_manifest.cited_clauses}
     if (
         citation.scenario_id != scenario.scenario_id
+        or citation.scenario_execution_id
+        != _require_model(
+            selected["scenario-plan"],
+            Wc029ScenarioPlanEvidence,
+        ).scenario_execution_id
         or citation.manifest_id != manifest.manifest_id
         or citation.manifest_version != manifest.manifest_version
         or citation.profile_id != manifest.profile_id
@@ -2983,6 +4623,7 @@ def _validate_scenario_lifecycle(
         or citation.correlation_report_id != report.report_id
         or citation.correlation_report_digest != report.report_digest
         or citation.incident_state_result_digest != active_state.result_digest
+        or not set(citation.clause_ids).issubset(published_clauses)
     ):
         raise Wc029AcceptanceEvidenceError(
             "manifest citation does not match the exact published inventory"
@@ -3001,6 +4642,14 @@ def _validate_scenario_lifecycle(
         selected["feed-resolved"],
         IncidentEnrichmentFeedPointer,
     )
+    active_feed_index = _require_model(
+        selected["feed-index-active"],
+        IncidentFeedIndexV2,
+    )
+    resolved_feed_index = _require_model(
+        selected["feed-index-resolved"],
+        IncidentFeedIndexV2,
+    )
     active_notification = _require_model(
         selected["notification-active"],
         IncidentNotificationEnvelopeV2,
@@ -3009,6 +4658,20 @@ def _validate_scenario_lifecycle(
         selected["notification-resolved"],
         IncidentNotificationEnvelopeV2,
     ).notification
+    active_entries = tuple(
+        item for item in active_feed_index.active if item.incident_id == active_state.incident_id
+    )
+    resolved_entries = tuple(
+        item
+        for item in resolved_feed_index.recently_resolved
+        if item.incident_id == resolved_state.incident_id
+    )
+    if len(active_entries) != 1 or len(resolved_entries) != 1:
+        raise Wc029AcceptanceEvidenceError(
+            "active and resolved feed indexes must each contain one scenario occurrence"
+        )
+    active_entry = active_entries[0]
+    resolved_entry = resolved_entries[0]
     if (
         guidance.source_binding.incident_id != active_state.incident_id
         or guidance.source_binding.incident_state_digest != active_state.result_digest
@@ -3022,20 +4685,61 @@ def _validate_scenario_lifecycle(
         or active_feed.incident_id != active_state.incident_id
         or active_feed.state_result_digest != active_state.result_digest
         or active_feed.enrichment_asset.manifest_digest != enrichment.manifest_digest
+        or active_entry.lifecycle != "active"
+        or active_entry.state_result_digest != active_state.result_digest
+        or active_entry.feed_pointer_reference.content_digest
+        != sha256_hex(active_feed.canonical_bytes())
+        or active_entry.feed_pointer_attestation_reference.content_digest
+        != sha256_hex(
+            _require_model(
+                selected["feed-active-attestation"],
+                IncidentEnrichmentFeedPointerAttestation,
+            ).canonical_bytes()
+        )
         or resolved_feed.lifecycle != "resolved"
+        or any(item.incident_id == active_state.incident_id for item in resolved_feed_index.active)
+        or resolved_feed_index.published_at < active_feed_index.published_at
         or resolved_feed.incident_id != resolved_state.incident_id
         or resolved_feed.state_result_digest != resolved_state.result_digest
+        or resolved_entry.lifecycle != "resolved"
+        or resolved_entry.state_result_digest != resolved_state.result_digest
+        or resolved_entry.feed_pointer_reference.content_digest
+        != sha256_hex(resolved_feed.canonical_bytes())
+        or resolved_entry.feed_pointer_attestation_reference.content_digest
+        != sha256_hex(
+            _require_model(
+                selected["feed-resolved-attestation"],
+                IncidentEnrichmentFeedPointerAttestation,
+            ).canonical_bytes()
+        )
         or active_notification.lifecycle != "active"
         or active_notification.incident_id != active_state.incident_id
+        or active_notification.transition_id != active_state.transition_id
         or active_notification.state_result_digest != active_state.result_digest
+        or active_notification.occurrence_digest != active_feed.occurrence_digest
+        or active_notification.enrichment_asset != active_feed.enrichment_asset
         or active_notification.feed_pointer_reference.content_digest
         != sha256_hex(active_feed.canonical_bytes())
-        or active_notification.guidance_asset.guidance_digest != guidance.guidance_digest
+        or active_notification.feed_pointer_reference != active_entry.feed_pointer_reference
+        or active_notification.feed_pointer_attestation_reference
+        != active_entry.feed_pointer_attestation_reference
+        or active_notification.feed_index_digest != sha256_hex(active_feed_index.canonical_bytes())
+        or active_notification.feed_published_at != active_feed_index.published_at
+        or active_notification.guidance_asset != enrichment.guidance_asset
         or resolved_notification.lifecycle != "resolved"
         or resolved_notification.incident_id != resolved_state.incident_id
+        or resolved_notification.transition_id != resolved_state.transition_id
         or resolved_notification.state_result_digest != resolved_state.result_digest
+        or resolved_notification.occurrence_digest != resolved_feed.occurrence_digest
+        or resolved_notification.enrichment_asset != resolved_feed.enrichment_asset
         or resolved_notification.feed_pointer_reference.content_digest
         != sha256_hex(resolved_feed.canonical_bytes())
+        or resolved_notification.feed_pointer_reference != resolved_entry.feed_pointer_reference
+        or resolved_notification.feed_pointer_attestation_reference
+        != resolved_entry.feed_pointer_attestation_reference
+        or resolved_notification.feed_index_digest
+        != sha256_hex(resolved_feed_index.canonical_bytes())
+        or resolved_notification.feed_published_at != resolved_feed_index.published_at
     ):
         raise Wc029AcceptanceEvidenceError(
             f"scenario {scenario.scenario_id} signed incident assets do not form one chain"
@@ -3047,7 +4751,14 @@ def _validate_scenario_evidence(
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
 ) -> None:
+    capabilities = {item.scenario_class: item for item in inventory.scenario_capabilities}
     for scenario in index.scenarios:
+        capability = capabilities[scenario.scenario_class]
+        if scenario.evidence_mode != capability.evidence_mode:
+            raise Wc029AcceptanceEvidenceError(
+                f"scenario {scenario.scenario_id} evidence mode does not match "
+                "trusted deployed capability"
+            )
         selected = _scenario_artifacts_by_class(scenario, artifacts)
         plan = _require_model(
             selected["scenario-plan"],
@@ -3061,35 +4772,97 @@ def _validate_scenario_evidence(
             selected["recovery-action"],
             Wc029RecoveryActionEvidence,
         )
+        baseline_state = _require_model(
+            selected["baseline-state"],
+            Wc029ResourceStateEvidence,
+        )
+        recovered_state = _require_model(
+            selected["recovered-state"],
+            Wc029ResourceStateEvidence,
+        )
+        job_execution = _require_model(
+            selected["job-execution"],
+            Wc029JobExecutionEvidence,
+        )
+        job_readback = _require_model(
+            selected["job-readback"],
+            Wc029JobReadbackEvidence,
+        )
         proof = _require_model(
             selected["recovery-proof"],
             Wc029RecoveryProof,
         )
+        execution_manifest = _validate_signed_scenario_execution(
+            scenario,
+            capability,
+            selected,
+            artifacts,
+        )
         if (
             plan.scenario_id != scenario.scenario_id
             or plan.scenario_class != scenario.scenario_class
-            or plan.evidence_mode != scenario.evidence_mode
+            or plan.evidence_mode != capability.evidence_mode
+            or plan.capability_digest != capability.capability_digest
             or plan.source_commit != inventory.source_commit
+            or plan.target_resource_id.casefold() != capability.target_resource_id.casefold()
+            or plan.mutation_action_digest != capability.mutation_action_digest
+            or plan.recovery_action_digest != capability.recovery_action_digest
+            or plan.baseline_state_artifact_id != selected["baseline-state"].declaration.artifact_id
+            or plan.baseline_state_digest != baseline_state.state_digest
+            or baseline_state.capture_kind != "baseline"
+            or baseline_state.scenario_id != scenario.scenario_id
+            or baseline_state.scenario_execution_id != plan.scenario_execution_id
+            or baseline_state.scenario_class != scenario.scenario_class
+            or baseline_state.plan_digest is not None
+            or baseline_state.mutation_receipt_digest is not None
+            or baseline_state.target_resource_id.casefold() != plan.target_resource_id.casefold()
             or mutation.scenario_id != scenario.scenario_id
+            or mutation.scenario_execution_id != plan.scenario_execution_id
             or mutation.scenario_class != scenario.scenario_class
             or mutation.plan_digest != plan.plan_digest
             or mutation.target_resource_id.casefold() != plan.target_resource_id.casefold()
             or mutation.mutation_action_digest != plan.mutation_action_digest
             or recovery.scenario_id != scenario.scenario_id
+            or recovery.scenario_execution_id != plan.scenario_execution_id
             or recovery.scenario_class != scenario.scenario_class
             or recovery.plan_digest != plan.plan_digest
             or recovery.mutation_receipt_digest != mutation.result_digest
             or recovery.target_resource_id.casefold() != plan.target_resource_id.casefold()
             or recovery.recovery_action_digest != plan.recovery_action_digest
             or recovery.recovered_at < mutation.applied_at
+            or recovered_state.capture_kind != "recovered"
+            or recovered_state.scenario_id != scenario.scenario_id
+            or recovered_state.scenario_execution_id != plan.scenario_execution_id
+            or recovered_state.scenario_class != scenario.scenario_class
+            or recovered_state.plan_digest != plan.plan_digest
+            or recovered_state.mutation_receipt_digest != mutation.result_digest
+            or recovered_state.target_resource_id.casefold() != plan.target_resource_id.casefold()
+            or recovered_state.captured_at < recovery.recovered_at
+            or recovered_state.state_digest != baseline_state.state_digest
             or proof.scenario_id != scenario.scenario_id
+            or proof.scenario_execution_id != plan.scenario_execution_id
             or proof.scenario_class != scenario.scenario_class
             or proof.plan_digest != plan.plan_digest
             or proof.mutation_receipt_digest != mutation.result_digest
             or proof.recovery_action_result_digest != recovery.result_digest
             or proof.target_resource_id.casefold() != plan.target_resource_id.casefold()
-            or proof.baseline_state_digest != plan.baseline_state_digest
+            or proof.baseline_state_digest != baseline_state.state_digest
+            or proof.recovered_state_digest != recovered_state.state_digest
+            or proof.baseline_state.artifact_id
+            != selected["baseline-state"].declaration.artifact_id
+            or proof.baseline_state.content_sha256
+            != selected["baseline-state"].record.content_sha256
+            or proof.recovered_state.artifact_id
+            != selected["recovered-state"].declaration.artifact_id
+            or proof.recovered_state.content_sha256
+            != selected["recovered-state"].record.content_sha256
+            or proof.post_recovery_job_readback.artifact_id
+            != selected["job-readback"].declaration.artifact_id
+            or proof.post_recovery_job_readback.content_sha256
+            != selected["job-readback"].record.content_sha256
             or proof.verified_at < recovery.recovered_at
+            or execution_manifest.mutation_receipt_digest != mutation.result_digest
+            or execution_manifest.recovery_action_result_digest != recovery.result_digest
         ):
             raise Wc029AcceptanceEvidenceError(
                 f"scenario {scenario.scenario_id} phase receipts are not one exact chain"
@@ -3107,29 +4880,138 @@ def _validate_scenario_evidence(
             raise Wc029AcceptanceEvidenceError(
                 "recovery proof must cite the scenario Job read-back"
             )
+        job_results = {
+            item.artifact_id: item.content_sha256 for item in job_readback.result_artifacts
+        }
+        if (
+            job_execution.scenario_execution_id != plan.scenario_execution_id
+            or job_execution.scenario_plan_digest != plan.plan_digest
+            or job_execution.input_digest != plan.verification_input_digest
+            or job_execution.started_at < recovery.recovered_at
+            or job_execution.started_at < recovered_state.captured_at
+            or job_readback.scenario_execution_id != plan.scenario_execution_id
+            or job_readback.scenario_plan_digest != plan.plan_digest
+            or job_readback.observed_at < job_execution.completed_at
+            or job_readback.observed_at < recovered_state.captured_at
+            or proof.verified_at < job_readback.observed_at
+            or job_results.get(selected["recovered-state"].declaration.artifact_id)
+            != selected["recovered-state"].record.content_sha256
+            or job_results.get(selected["recovery-action"].declaration.artifact_id)
+            != selected["recovery-action"].record.content_sha256
+        ):
+            raise Wc029AcceptanceEvidenceError(
+                "post-recovery Job evidence does not bind recovered state and action"
+            )
 
         report = _require_model(selected["correlation-report"], CorrelationReport)
+        monitoring = _require_model(
+            selected["monitoring-evidence"],
+            MonitoringEvidenceHandoff,
+        )
         if (
             report.binding_mode != "publishedRuntime"
             or report.preview_only
             or report.no_auto_remediation is not True
+            or report.request_digest != plan.correlation_request_digest
+            or plan.monitoring_request_digest != _monitoring_request_digest(monitoring)
         ):
             raise Wc029AcceptanceEvidenceError(
                 "scenario correlation report is not a published read-only result"
             )
-        _require_model(selected["monitoring-evidence"], MonitoringEvidenceHandoff)
         if scenario.scenario_class == "nsg-connectivity-loss":
-            _require_model(selected["change-evidence"], ChangeEvidenceArtifact)
+            change = _require_model(
+                selected["change-evidence"],
+                ChangeEvidenceArtifact,
+            )
+            if (
+                change.evidence.source_digest != plan.change_request_digest
+                or change.evidence.target_resource_id.casefold()
+                != plan.target_resource_id.casefold()
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "change evidence does not bind the trusted scenario request and target"
+                )
+            _require_in_phase(
+                execution_manifest,
+                "observe",
+                change.evidence.occurred_at,
+                label="change occurrence",
+            )
+            _require_in_phase(
+                execution_manifest,
+                "observe",
+                change.evidence.received_at,
+                label="change receipt",
+            )
 
-        if scenario.evidence_mode == "correlation-only":
+        _require_in_phase(
+            execution_manifest,
+            "plan",
+            plan.planned_at,
+            label="scenario plan",
+        )
+        _require_in_phase(
+            execution_manifest,
+            "plan",
+            baseline_state.captured_at,
+            label="baseline state",
+        )
+        _require_in_phase(
+            execution_manifest,
+            "apply",
+            mutation.applied_at,
+            label="mutation receipt",
+        )
+        _require_in_phase(
+            execution_manifest,
+            "observe",
+            monitoring.observed_at,
+            label="monitoring evidence",
+        )
+        _require_in_phase(
+            execution_manifest,
+            "observe",
+            report.as_of,
+            label="correlation report",
+        )
+        _require_in_phase(
+            execution_manifest,
+            "recover",
+            recovery.recovered_at,
+            label="recovery action",
+        )
+        for label, timestamp in (
+            ("recovered state", recovered_state.captured_at),
+            ("verification Job start", job_execution.started_at),
+            ("verification Job completion", job_execution.completed_at),
+            ("verification Job read-back", job_readback.observed_at),
+            ("recovery proof", proof.verified_at),
+        ):
+            _require_in_phase(
+                execution_manifest,
+                "verify",
+                timestamp,
+                label=label,
+            )
+
+        if capability.evidence_mode == "correlation-only":
             omission = _require_model(
                 selected["incident-omission"],
                 Wc029IncidentOmission,
             )
-            if omission.scenario_id != scenario.scenario_id:
+            if (
+                omission.scenario_id != scenario.scenario_id
+                or omission.scenario_execution_id != plan.scenario_execution_id
+            ):
                 raise Wc029AcceptanceEvidenceError(
                     "incident omission does not bind its correlation-only scenario"
                 )
+            _require_in_phase(
+                execution_manifest,
+                "observe",
+                omission.observed_at,
+                label="incident omission",
+            )
             continue
         queue = _require_model(
             selected["queue-state"],
@@ -3138,15 +5020,130 @@ def _validate_scenario_evidence(
         if (
             queue.capture_scope != "scenario-verify"
             or queue.scenario_id != scenario.scenario_id
+            or queue.scenario_execution_id != plan.scenario_execution_id
             or selected["queue-state"].declaration.artifact_id not in proof.evidence_artifact_ids
+            or proof.verified_at < queue.captured_at
         ):
             raise Wc029AcceptanceEvidenceError(
                 "incident-producing recovery proof requires its drained queue evidence"
             )
+        active_state = _require_model(
+            selected["incident-state-active"],
+            IncidentState,
+        )
+        resolved_state = _require_model(
+            selected["incident-state-resolved"],
+            IncidentState,
+        )
+        guidance = _require_model(selected["guidance"], IncidentGuidance)
+        active_feed = _require_model(
+            selected["feed-active"],
+            IncidentEnrichmentFeedPointer,
+        )
+        active_feed_index = _require_model(
+            selected["feed-index-active"],
+            IncidentFeedIndexV2,
+        )
+        active_notification = _require_model(
+            selected["notification-active"],
+            IncidentNotificationEnvelopeV2,
+        ).notification
+        resolved_feed = _require_model(
+            selected["feed-resolved"],
+            IncidentEnrichmentFeedPointer,
+        )
+        resolved_feed_index = _require_model(
+            selected["feed-index-resolved"],
+            IncidentFeedIndexV2,
+        )
+        resolved_notification = _require_model(
+            selected["notification-resolved"],
+            IncidentNotificationEnvelopeV2,
+        ).notification
+        for label, timestamp in (
+            ("active IncidentState", active_state.updated_at),
+            ("incident guidance", guidance.generated_at),
+            ("active feed pointer", active_feed.published_at),
+            ("active feed index", active_feed_index.published_at),
+            ("active notification", active_notification.feed_published_at),
+        ):
+            _require_in_phase(
+                execution_manifest,
+                "observe",
+                timestamp,
+                label=label,
+            )
+        for label, timestamp in (
+            ("resolved IncidentState", resolved_state.updated_at),
+            ("resolved feed pointer", resolved_feed.published_at),
+            ("resolved feed index", resolved_feed_index.published_at),
+            ("resolved notification", resolved_notification.feed_published_at),
+            ("scenario queue drain", queue.captured_at),
+        ):
+            _require_in_phase(
+                execution_manifest,
+                "verify",
+                timestamp,
+                label=label,
+            )
+            if proof.verified_at < timestamp:
+                raise Wc029AcceptanceEvidenceError(f"recovery proof precedes {label}")
         _validate_scenario_lifecycle(
             scenario,
             inventory,
             selected,
+            artifacts,
+        )
+
+
+def _validate_global_chronology(
+    index: Wc029AcceptanceEvidenceIndex,
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> None:
+    baseline_queue = next(
+        _require_model(item, Wc029QueueStateEvidence)
+        for item in artifacts.values()
+        if item.declaration.evidence_class == "queue-state"
+        and item.declaration.queue_scope == "baseline"
+    )
+    final_queue = next(
+        _require_model(item, Wc029QueueStateEvidence)
+        for item in artifacts.values()
+        if item.declaration.evidence_class == "queue-state"
+        and item.declaration.queue_scope == "final"
+    )
+    capability_readback = next(
+        _require_model(item, Wc029DeploymentReadbackEvidence)
+        for item in artifacts.values()
+        if item.declaration.evidence_class == "deployment-readback"
+        and item.declaration.deployment_id == inventory.capability_deployment_id
+    )
+    scenario_starts: list[UtcDateTime] = []
+    scenario_completions: list[UtcDateTime] = []
+    for scenario in index.scenarios:
+        selected = _scenario_artifacts_by_class(scenario, artifacts)
+        plan = _require_model(
+            selected["scenario-plan"],
+            Wc029ScenarioPlanEvidence,
+        )
+        baseline_state = _require_model(
+            selected["baseline-state"],
+            Wc029ResourceStateEvidence,
+        )
+        proof = _require_model(
+            selected["recovery-proof"],
+            Wc029RecoveryProof,
+        )
+        scenario_starts.append(min(plan.planned_at, baseline_state.captured_at))
+        scenario_completions.append(proof.verified_at)
+    if (
+        capability_readback.observed_at > baseline_queue.captured_at
+        or baseline_queue.captured_at > min(scenario_starts)
+        or final_queue.captured_at < max(scenario_completions)
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "global deployment, baseline, scenario, and final chronology is invalid"
         )
 
 
@@ -3157,6 +5154,9 @@ def _validate_specialized_evidence(
 ) -> None:
     owners = _artifact_owners(index)
     scenario_by_id = {item.scenario_id: item for item in index.scenarios}
+    capability_modes = {
+        item.scenario_class: item.evidence_mode for item in inventory.scenario_capabilities
+    }
     for artifact in artifacts.values():
         declaration = artifact.declaration
         if declaration.evidence_class == "queue-state":
@@ -3172,7 +5172,8 @@ def _validate_specialized_evidence(
                     owner is None
                     or owner[1] != "verify"
                     or artifact.model.scenario_id != owner[0]
-                    or scenario_by_id[owner[0]].evidence_mode != "incident-producing"
+                    or capability_modes[scenario_by_id[owner[0]].scenario_class]
+                    != "incident-producing"
                 ):
                     raise Wc029AcceptanceEvidenceError(
                         "scenario queue-state must verify one incident-producing scenario"
@@ -3189,7 +5190,7 @@ def _validate_specialized_evidence(
                 owner is None
                 or owner[1] != "observe"
                 or artifact.model.scenario_id != owner[0]
-                or scenario_by_id[owner[0]].evidence_mode != "correlation-only"
+                or capability_modes[scenario_by_id[owner[0]].scenario_class] != "correlation-only"
             ):
                 raise Wc029AcceptanceEvidenceError(
                     "incident omission does not bind its correlation-only scenario"
@@ -3197,7 +5198,9 @@ def _validate_specialized_evidence(
     _validate_preflight_evidence(inventory, artifacts)
     _validate_job_evidence(index, inventory, artifacts)
     _validate_url_probes(inventory, artifacts)
+    _validate_publication_authority(inventory, artifacts)
     _validate_scenario_evidence(index, inventory, artifacts)
+    _validate_global_chronology(index, inventory, artifacts)
 
 
 def _sorted_scenario(scenario: Wc029ScenarioEvidence) -> Wc029ScenarioEvidence:
@@ -3218,18 +5221,18 @@ def _sorted_scenario(scenario: Wc029ScenarioEvidence) -> Wc029ScenarioEvidence:
 def aggregate_acceptance_evidence(
     evidence_root: Path,
     *,
+    approved_inventory_sha256: str,
     index_file: str = "acceptance-index.json",
 ) -> Wc029AcceptanceEvidenceRecord:
     """Build one canonical WC-029 record without network or Azure operations."""
 
-    root = _resolve_directory(evidence_root, label="evidence root")
+    root = Path(evidence_root)
     index_relative = _validate_relative_file(index_file)
-    index_path = _resolve_regular_file(root, index_relative, label="acceptance index")
-    index_raw = _read_bounded_regular_file(
-        index_path,
-        maximum_bytes=MAX_INDEX_BYTES,
-        label="acceptance index",
+    snapshot = _capture_bundle_snapshot(
+        root,
+        index_relative=index_relative,
     )
+    index_raw = snapshot.files[index_relative]
     index_parsed, index_canonical = _parse_strict_json(
         index_raw,
         label="acceptance index",
@@ -3243,40 +5246,47 @@ def aggregate_acceptance_evidence(
         raise Wc029AcceptanceEvidenceError(
             "acceptance index path must not also be declared as evidence"
         )
-    discovered = _discover_bundle_files(root)
-    if discovered[index_relative] != len(index_raw):
-        raise Wc029AcceptanceEvidenceError("acceptance index changed during directory validation")
     expected_files = {index_relative, *(item.path for item in index.artifacts)}
-    discovered_files = set(discovered)
+    discovered_files = set(snapshot.files)
     if discovered_files != expected_files:
         missing = sorted(expected_files - discovered_files)
         unlisted = sorted(discovered_files - expected_files)
         raise Wc029AcceptanceEvidenceError(
             f"evidence directory membership mismatch; missing={missing}, unlisted={unlisted}"
         )
-    artifact_total_bytes = sum(discovered[item.path] for item in index.artifacts)
+    artifact_total_bytes = sum(len(snapshot.files[item.path]) for item in index.artifacts)
     total_bytes = len(index_raw) + artifact_total_bytes
     if artifact_total_bytes > MAX_TOTAL_EVIDENCE_BYTES:
         raise Wc029AcceptanceEvidenceError("aggregate evidence exceeds its total byte bound")
     loaded: dict[str, _LoadedArtifact] = {}
     remaining_bytes = MAX_TOTAL_EVIDENCE_BYTES
     for declaration in index.artifacts:
-        declared_size = discovered[declaration.path]
+        declared_size = len(snapshot.files[declaration.path])
         if declared_size > remaining_bytes:
             raise Wc029AcceptanceEvidenceError(
                 "aggregate evidence exceeds its remaining byte budget"
             )
-        loaded_artifact = _load_artifact(root, declaration)
-        if len(loaded_artifact.raw) != declared_size:
-            raise Wc029AcceptanceEvidenceError(
-                f"artifact {declaration.artifact_id} changed after size preflight"
-            )
+        loaded_artifact = _load_artifact(
+            snapshot.files[declaration.path],
+            declaration,
+        )
         loaded[declaration.artifact_id] = loaded_artifact
         remaining_bytes -= len(loaded_artifact.raw)
 
     inventory_loaded = loaded[index.version_inventory_artifact_id]
     if not isinstance(inventory_loaded.model, Wc029VersionInventory):
         raise Wc029AcceptanceEvidenceError("version inventory artifact is invalid")
+    try:
+        approved_inventory_sha256 = _validate_digest(
+            approved_inventory_sha256,
+            label="approvedInventorySha256",
+        )
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError("approved inventory digest is invalid") from exc
+    if inventory_loaded.record.content_sha256 != approved_inventory_sha256:
+        raise Wc029AcceptanceEvidenceError(
+            "version inventory does not match the out-of-band approved digest"
+        )
     inventory = inventory_loaded.model
 
     _validate_deployment_evidence(inventory, loaded)
@@ -3302,6 +5312,7 @@ def aggregate_acceptance_evidence(
         incident_evidence_synthesized=False,
         evidence_status="complete",
         source_index=source_index,
+        approved_inventory_sha256=approved_inventory_sha256,
         version_inventory=inventory,
         global_artifact_ids=tuple(sorted(index.global_artifact_ids)),
         scenarios=scenarios,
@@ -3325,34 +5336,98 @@ def write_acceptance_record(
 ) -> Path:
     """Create a content-addressed record exclusively outside the captured input root."""
 
-    root = _resolve_directory(evidence_root, label="evidence root")
-    output_root = _resolve_directory(output_directory, label="output directory")
-    if output_root == root or output_root.is_relative_to(root):
-        raise Wc029AcceptanceEvidenceError(
-            "output directory must be outside the read-only evidence root"
-        )
-    filename = "wc029-acceptance-" + record.aggregate_digest.removeprefix("sha256:") + ".json"
-    output_path = output_root / filename
-    staging_path = output_root / (f".{filename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-    payload = record.canonical_bytes()
+    root, root_identity = _stable_directory_path(
+        evidence_root,
+        label="evidence root",
+    )
+    output_root, output_identity = _stable_directory_path(
+        output_directory,
+        label="output directory",
+    )
+    root_pin = _open_pinned_directory(root, root_identity)
+    output_pin = _open_pinned_directory(output_root, output_identity)
     try:
-        with staging_path.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(staging_path, output_path)
-        staging_path.unlink()
-    except FileExistsError as exc:
-        staging_path.unlink(missing_ok=True)
-        raise Wc029AcceptanceEvidenceError(
-            "refusing to overwrite an existing immutable acceptance record"
-        ) from exc
-    except OSError as exc:
-        staging_path.unlink(missing_ok=True)
-        raise Wc029AcceptanceEvidenceError(
-            "acceptance record could not be created exclusively"
-        ) from exc
-    return output_path
+        if output_root == root or output_root.is_relative_to(root):
+            raise Wc029AcceptanceEvidenceError(
+                "output directory must be outside the read-only evidence root"
+            )
+        filename = "wc029-acceptance-" + record.aggregate_digest.removeprefix("sha256:") + ".json"
+        staging_name = f".{filename}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        output_path = output_root / filename
+        staging_path = output_root / staging_name
+        payload = record.canonical_bytes()
+
+        descriptor = -1
+        try:
+            if os.name == "nt":
+                with staging_path.open("xb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                descriptor = os.open(
+                    staging_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=output_pin.descriptor,
+                )
+                with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                    descriptor = -1
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except FileExistsError as exc:
+            raise Wc029AcceptanceEvidenceError(
+                "acceptance staging path unexpectedly already exists"
+            ) from exc
+        except OSError as exc:
+            raise Wc029AcceptanceEvidenceError(
+                "acceptance record staging bytes could not be persisted"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        try:
+            if os.name == "nt":
+                os.link(staging_path, output_path)
+            else:
+                os.link(
+                    staging_name,
+                    filename,
+                    src_dir_fd=output_pin.descriptor,
+                    dst_dir_fd=output_pin.descriptor,
+                    follow_symlinks=False,
+                )
+        except FileExistsError as exc:
+            if os.name == "nt":
+                staging_path.unlink(missing_ok=True)
+            else:
+                with suppress(OSError):
+                    os.unlink(staging_name, dir_fd=output_pin.descriptor)
+            raise Wc029AcceptanceEvidenceError(
+                "refusing to overwrite an existing immutable acceptance record"
+            ) from exc
+        except OSError as exc:
+            if os.name == "nt":
+                staging_path.unlink(missing_ok=True)
+            else:
+                with suppress(OSError):
+                    os.unlink(staging_name, dir_fd=output_pin.descriptor)
+            raise Wc029AcceptanceEvidenceError(
+                "acceptance record could not be created exclusively"
+            ) from exc
+
+        if os.name == "nt":
+            with suppress(OSError):
+                staging_path.unlink()
+        else:
+            with suppress(OSError):
+                os.unlink(staging_name, dir_fd=output_pin.descriptor)
+        return output_path
+    finally:
+        output_pin.close()
+        root_pin.close()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -3368,6 +5443,7 @@ def _parser() -> argparse.ArgumentParser:
         default="acceptance-index.json",
         help="portable path below evidence_root",
     )
+    parser.add_argument("--approved-inventory-sha256", required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     return parser
 
@@ -3377,6 +5453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         record = aggregate_acceptance_evidence(
             args.evidence_root,
+            approved_inventory_sha256=args.approved_inventory_sha256,
             index_file=args.index,
         )
         output = write_acceptance_record(
@@ -3422,10 +5499,16 @@ __all__ = [
     "MANIFEST_CITATION_SCHEMA_VERSION",
     "MUTATION_RECEIPT_SCHEMA_VERSION",
     "PREFLIGHT_RESULT_SCHEMA_VERSION",
+    "PUBLISHED_MANIFEST_SCHEMA_VERSION",
+    "PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION",
+    "PUBLICATION_AUTHORITY_SCHEMA_VERSION",
     "QUEUE_STATE_SCHEMA_VERSION",
     "RECOVERY_ACTION_SCHEMA_VERSION",
     "RECOVERY_PROOF_SCHEMA_VERSION",
     "REQUIRED_SCENARIO_CLASSES",
+    "RESOURCE_STATE_SCHEMA_VERSION",
+    "SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION",
+    "SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION",
     "SCENARIO_PLAN_SCHEMA_VERSION",
     "SIGNING_PUBLIC_KEY_SCHEMA_VERSION",
     "URL_PROBE_SCHEMA_VERSION",
@@ -3448,11 +5531,22 @@ __all__ = [
     "Wc029ManifestVersion",
     "Wc029MutationReceipt",
     "Wc029PreflightResultEvidence",
+    "Wc029PublishedClause",
+    "Wc029PublishedManifestEvidence",
+    "Wc029PublicationAuthorityAttestation",
+    "Wc029PublicationAuthorityEvidence",
     "Wc029QueueState",
     "Wc029QueueStateEvidence",
     "Wc029RecoveryActionEvidence",
     "Wc029RecoveryProof",
+    "Wc029ResourceStateEvidence",
+    "Wc029RbacBoundary",
+    "Wc029ScenarioArtifactBinding",
+    "Wc029ScenarioCapability",
     "Wc029ScenarioEvidence",
+    "Wc029ScenarioExecutionAttestation",
+    "Wc029ScenarioExecutionManifest",
+    "Wc029ScenarioPhaseWindow",
     "Wc029ScenarioPlanEvidence",
     "Wc029ScenarioPhases",
     "Wc029SigningPublicKeyEvidence",
