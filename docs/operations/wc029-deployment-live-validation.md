@@ -222,14 +222,22 @@ allowlist and rerun the gate.
 
 ## Phase 3: effective RBAC
 
-Record inherited and direct assignments for every managed identity:
+Record both assignment sets for every managed identity. `--all` enumerates assignments at or below
+the subscription but does not return parent management-group grants, so run the scoped inherited
+query separately and review the de-duplicated union by assignment ID:
 
 ```powershell
-az role assignment list `
+$atOrBelowSubscription = az role assignment list `
   --subscription $SubscriptionId `
   --assignee-object-id '<principal-id>' `
-  --include-inherited `
   --all `
+  --output json
+
+$inheritedFromAncestors = az role assignment list `
+  --subscription $SubscriptionId `
+  --assignee-object-id '<principal-id>' `
+  --scope "/subscriptions/$SubscriptionId" `
+  --include-inherited `
   --output json
 ```
 
@@ -242,6 +250,10 @@ Required separation:
 - incident/enrichment publishers: exact Blob contributor, queue, and Key Vault crypto roles only;
 - notification dispatcher: exact v2 queue/table/Logic App rights only; and
 - no generic Contributor assignment for a runtime identity.
+
+Without separate reviewed management-group hierarchy evidence, treat every assignment returned by
+the inherited query at a management-group scope as applying to every governed subscription
+resource and reject it unless that exact assignment is explicitly reviewed.
 
 ## Phase 4: deploy
 
@@ -313,14 +325,17 @@ blocks every later stage; reconcile the reviewed digest and repeat validate/what
 continuing with the mis-tagged Job. Apply also rejects a non-succeeded deployment, missing required
 root output, mismatched queue/container/table/key output, unexpected Job identity, tag, command,
 scaler, registry, environment, init container, volume, secret, secret reference, or secret-backed
-authentication; a listed RBAC role that does not match its exact resource type; any effective
-broad inherited grant on a governed identity; any unreviewed effective assignment intersecting a
-governed WC-027 scope for any attached, submitter, or reader identity; any public/non-RBAC parent
-Key Vault behind an external trust key; a Blob Data Reader without the exact canonical
+authentication; any RBAC assignment whose exact assignment ID is not bound to its reviewed
+principal, scope, role definition, and condition; any effective broad inherited grant on a
+governed identity; any unreviewed effective assignment intersecting a governed WC-027 scope for
+any attached, submitter, or reader identity; any unreviewed management-group assignment, which is
+conservatively treated as inherited by every governed resource unless separate reviewed hierarchy
+evidence is introduced; any public/non-RBAC parent Key Vault behind an external trust key; any
+assignment whose resolved role permissions include Blob read without the exact canonical
 condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact Active,
-non-forwarding stage profile; a noncanonical/cross-subscription resource ID before validation or
-what-if; and any final WC-013 readiness readback that differs from the two accepted WC-027
-handoffs.
+non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource ID
+before validation or what-if; and any final WC-013 readiness readback that differs from the two
+accepted WC-027 handoffs.
 
 ### Publisher invocation boundary
 

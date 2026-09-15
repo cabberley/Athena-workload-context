@@ -110,12 +110,15 @@ Record the `producerImage`, `deployedRuntimeConfigurationDigest`,
 container/table IDs with the Job resource ID for the root readiness gate. The producer root
 creates no guidance-authority bytes and grants no authority writer role.
 
-Deployment verification requires every Blob Data Reader assignment to retain condition version
-`2.0` and the exact canonical no-`Blob.List` expression; absent, altered, or duplicated condition
-forms fail closed. It also requires the producer trigger, publisher request, and notification
-outbox queues to be `Active`, non-forwarding, and to match their exact stage-specific session,
-duplicate-detection window, TTL, lock, delivery-count, capacity, batching, partitioning, and
-message-size profiles.
+Deployment verification derives an exact assignment-ID-to-principal, scope, role-definition, and
+condition mapping for every RBAC assignment emitted by both WC-027 roots. Principal swaps and any
+extra, missing, or differently conditioned assignment fail closed. Every assignment whose resolved
+role permissions include Blob read — including the custom feed-v2 writer role — must retain
+condition version `2.0` and the exact canonical no-`Blob.List` expression; absent, altered, or
+duplicated condition forms fail closed. It also requires the producer trigger, publisher request,
+and notification outbox queues to be `Active`, non-forwarding, explicitly non-auto-deleting, and to
+match their exact stage-specific session, duplicate-detection window, TTL, lock, delivery-count,
+capacity, batching, partitioning, and message-size profiles.
 
 For WC-029 deployment, do not deploy this root as an untracked side step. Use the governed
 foundation -> producer -> publisher -> live-acceptance sequence in

@@ -12,9 +12,7 @@ RUNBOOK = ROOT / "docs" / "operations" / "wc029-deployment-live-validation.md"
 WC013_ROOT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 WC016_ROOT = ROOT / "infra" / "wc016-event-reassessment" / "main.bicep"
 PRODUCER_ROOT = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
-PUBLISHER_ROOT = (
-    ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
-)
+PUBLISHER_ROOT = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000001"
 RUNTIME_RESOURCE_GROUP = "rg"
 
@@ -32,9 +30,7 @@ def _write_parameters(path: Path, values: dict[str, object]) -> None:
                     "2019-04-01/deploymentParameters.json#"
                 ),
                 "contentVersion": "1.0.0.0",
-                "parameters": {
-                    name: {"value": value} for name, value in values.items()
-                },
+                "parameters": {name: {"value": value} for name, value in values.items()},
             }
         ),
         encoding="utf-8",
@@ -45,11 +41,7 @@ def _foundation_parameter_bindings(
     values: dict[str, object],
 ) -> dict[str, object]:
     parameters = {name: {"value": value} for name, value in values.items()}
-    return {
-        "foundationParametersSha256": orchestration._foundation_parameter_digest(
-            parameters
-        )
-    }
+    return {"foundationParametersSha256": orchestration._foundation_parameter_digest(parameters)}
 
 
 def _write_handoff(
@@ -65,16 +57,12 @@ def _write_handoff(
     predecessor_hashes = (
         {
             predecessor: f"sha256:{str(index + 1) * 64}"
-            for index, predecessor in enumerate(
-                orchestration.EXPECTED_PREDECESSOR_STAGES[stage]
-            )
+            for index, predecessor in enumerate(orchestration.EXPECTED_PREDECESSOR_STAGES[stage])
         }
         if predecessor_receipt_sha256s is None
         else predecessor_receipt_sha256s
     )
-    resource_group = (
-        RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
-    )
+    resource_group = RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
     path.write_text(
         json.dumps(
             {
@@ -93,9 +81,7 @@ def _write_handoff(
                     orchestration._canonical_json_bytes(bindings)
                 ),
                 "planManifestSha256": (
-                    f"sha256:{'a' * 64}"
-                    if plan_manifest_sha256 is None
-                    else plan_manifest_sha256
+                    f"sha256:{'a' * 64}" if plan_manifest_sha256 is None else plan_manifest_sha256
                 ),
                 "predecessorReceiptSha256s": predecessor_hashes,
             }
@@ -113,9 +99,7 @@ def _write_plan(
     predecessor_handoffs: dict[str, Path],
     predecessor_receipts: dict[str, dict[str, object]],
 ) -> None:
-    resource_group = (
-        RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
-    )
+    resource_group = RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
     document: dict[str, object] = {
         "schemaVersion": orchestration.PLAN_SCHEMA_VERSION,
         "stage": stage,
@@ -124,18 +108,10 @@ def _write_plan(
         "location": "australiaeast",
         "resourceGroup": resource_group,
         "deploymentName": f"synthetic-{stage}",
-        "templatePath": str(
-            orchestration.TEMPLATES[stage].relative_to(ROOT)
-        ).replace("\\", "/"),
-        "templateSha256": orchestration._sha256_file(
-            orchestration.TEMPLATES[stage]
-        ),
-        "orchestratorSha256": orchestration._sha256_file(
-            Path(orchestration.__file__).resolve()
-        ),
-        "preflightSha256": orchestration._sha256_file(
-            orchestration.PREFLIGHT_PATH
-        ),
+        "templatePath": str(orchestration.TEMPLATES[stage].relative_to(ROOT)).replace("\\", "/"),
+        "templateSha256": orchestration._sha256_file(orchestration.TEMPLATES[stage]),
+        "orchestratorSha256": orchestration._sha256_file(Path(orchestration.__file__).resolve()),
+        "preflightSha256": orchestration._sha256_file(orchestration.PREFLIGHT_PATH),
         "baseParameterPath": str(parameter_path.resolve()),
         "baseParameterSha256": orchestration._sha256_file(parameter_path),
         "effectiveParameterPath": str(parameter_path.resolve()),
@@ -151,9 +127,7 @@ def _write_plan(
             None if handoff_path is None else str(handoff_path.resolve())
         )
         document[f"{predecessor}HandoffSha256"] = (
-            None
-            if handoff_path is None
-            else orchestration._sha256_file(handoff_path)
+            None if handoff_path is None else orchestration._sha256_file(handoff_path)
         )
     path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -176,17 +150,13 @@ def _write_receipt(
                 "sourceCommit": orchestration.SOURCE_COMMIT,
                 "subscriptionId": SUBSCRIPTION_ID,
                 "resourceGroup": (
-                    RUNTIME_RESOURCE_GROUP
-                    if stage in {"producer", "publisher"}
-                    else None
+                    RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
                 ),
                 "deploymentName": f"synthetic-{stage}",
                 "planManifestPath": str(plan_path.resolve()),
                 "planManifestSha256": plan_digest,
                 "reviewedPlanSha256": (
-                    plan_digest
-                    if reviewed_plan_sha256 is None
-                    else reviewed_plan_sha256
+                    plan_digest if reviewed_plan_sha256 is None else reviewed_plan_sha256
                 ),
                 "handoffPath": str(handoff_path.resolve()),
                 "handoffSha256": orchestration._sha256_file(handoff_path),
@@ -245,15 +215,9 @@ def _foundation_outputs() -> dict[str, object]:
                 "notificationQueueName": "incident-notification-outbox",
                 "feedSigningKeyUriWithVersion": f"{key_base}/wc027-feed/v1",
                 "reportSigningKeyUriWithVersion": f"{key_base}/wc027-report/v1",
-                "guidanceSigningKeyUriWithVersion": (
-                    f"{key_base}/wc027-guidance/v1"
-                ),
-                "enrichmentSigningKeyUriWithVersion": (
-                    f"{key_base}/wc027-enrichment/v1"
-                ),
-                "notificationSigningKeyUriWithVersion": (
-                    f"{key_base}/wc027-notification/v1"
-                ),
+                "guidanceSigningKeyUriWithVersion": (f"{key_base}/wc027-guidance/v1"),
+                "enrichmentSigningKeyUriWithVersion": (f"{key_base}/wc027-enrichment/v1"),
+                "notificationSigningKeyUriWithVersion": (f"{key_base}/wc027-notification/v1"),
             }
         },
     }
@@ -325,13 +289,9 @@ def _producer_outputs() -> dict[str, object]:
         "enrichmentFeedAssets": {
             "containerName": "wc027-enrichment-feed-v2",
             "readerIdentityClientId": identities["feed-reader"]["identityClientId"],
-            "readerIdentityResourceId": identities["feed-reader"][
-                "identityResourceId"
-            ],
+            "readerIdentityResourceId": identities["feed-reader"]["identityResourceId"],
             "writerIdentityClientId": identities["feed-writer"]["identityClientId"],
-            "writerIdentityResourceId": identities["feed-writer"][
-                "identityResourceId"
-            ],
+            "writerIdentityResourceId": identities["feed-writer"]["identityResourceId"],
         },
         "feedRegistry": {
             "tableName": "Wc027FeedRegistry",
@@ -343,10 +303,22 @@ def _producer_outputs() -> dict[str, object]:
             **identities["activation-reader"],
         },
         "correlationSources": {
-            "monitoring": identities["monitoring"],
-            "change": identities["change"],
-            "contextAuthority": identities["context"],
-            "monitoringIntent": identities["intent"],
+            "monitoring": {
+                "containerName": "monitoring-context",
+                **identities["monitoring"],
+            },
+            "change": {
+                "containerName": "change-evidence",
+                **identities["change"],
+            },
+            "contextAuthority": {
+                "containerName": "context-authority",
+                **identities["context"],
+            },
+            "monitoringIntent": {
+                "containerName": "monitoring-intent",
+                **identities["intent"],
+            },
         },
         "guidanceAuthoritySource": {
             "containerName": "wc027-guidance-authority",
@@ -354,23 +326,39 @@ def _producer_outputs() -> dict[str, object]:
         },
         "monitoringCollectorKey": identities["trust"],
         "keys": {
-            "incident": identities["trust"],
+            "incident": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc016-incident/v1"),
+                **identities["trust"],
+            },
             "correlationBinding": identities["trust"],
             "guidanceBinding": {
                 **identities["trust"],
                 "keyId": "synthetic-key://athena/wc027-guidance-binding",
-                "keyVaultKeyId": (
-                    "https://athena.vault.azure.net/keys/guidance-binding/v1"
-                ),
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
                 "keyFingerprint": f"sha256:{'b' * 64}",
             },
             "change": identities["trust"],
             "monitoringIntent": identities["trust"],
-            "report": identities["report-signer"],
-            "guidance": identities["guidance-signer"],
-            "enrichment": identities["enrichment-signer"],
-            "feed": identities["feed-signer"],
-            "notification": identities["notification-signer"],
+            "report": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-report/v1"),
+                **identities["report-signer"],
+            },
+            "guidance": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-guidance/v1"),
+                **identities["guidance-signer"],
+            },
+            "enrichment": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-enrichment/v1"),
+                **identities["enrichment-signer"],
+            },
+            "feed": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-feed/v1"),
+                **identities["feed-signer"],
+            },
+            "notification": {
+                "keyVaultKeyId": ("https://athena.vault.azure.net/keys/wc027-notification/v1"),
+                **identities["notification-signer"],
+            },
         },
         "deploymentBinding": {
             "attachedIdentityResourceIds": [
@@ -391,17 +379,14 @@ def _producer_outputs() -> dict[str, object]:
             "resourceGroups/rg/providers/Microsoft.App/jobs/wc027-producer"
         ),
         "producerImage": (
-            "athena.azurecr.io/athena/wc027-enrichment-feed-producer@sha256:"
-            + "2" * 64
+            "athena.azurecr.io/athena/wc027-enrichment-feed-producer@sha256:" + "2" * 64
         ),
         "deployedRuntimeConfigurationJson": configuration_json,
         "deployedRuntimeConfigurationDigest": _digest(configuration_json),
         "attachedIdentityResourceIds": configuration["deploymentBinding"][
             "attachedIdentityResourceIds"
         ],
-        "bindingEvidenceDigest": configuration["deploymentBinding"][
-            "bindingEvidenceId"
-        ],
+        "bindingEvidenceDigest": configuration["deploymentBinding"]["bindingEvidenceId"],
         "feedV2WriterRoleDefinitionId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.Authorization/roleDefinitions/"
@@ -409,28 +394,21 @@ def _producer_outputs() -> dict[str, object]:
         ),
         "feedV2ContainerName": "wc027-enrichment-feed-v2",
         "feedV2ContainerResourceId": (
-            f"{replay_storage_id}/blobServices/default/containers/"
-            "wc027-enrichment-feed-v2"
+            f"{replay_storage_id}/blobServices/default/containers/wc027-enrichment-feed-v2"
         ),
         "feedRegistryTableResourceId": (
             f"{replay_storage_id}/tableServices/default/tables/Wc027FeedRegistry"
         ),
         "guidanceActivationTableResourceId": (
-            f"{replay_storage_id}/tableServices/default/tables/"
-            "Wc027GuidanceActivation"
+            f"{replay_storage_id}/tableServices/default/tables/Wc027GuidanceActivation"
         ),
         "guidanceAuthoritySourceContainerResourceId": (
-            f"{correlation_storage_id}/blobServices/default/containers/"
-            "wc027-guidance-authority"
+            f"{correlation_storage_id}/blobServices/default/containers/wc027-guidance-authority"
         ),
         "triggerQueueName": "wc027-enrichment-feed-requests",
-        "triggerQueueResourceId": (
-            f"{service_bus_id}/queues/wc027-enrichment-feed-requests"
-        ),
+        "triggerQueueResourceId": (f"{service_bus_id}/queues/wc027-enrichment-feed-requests"),
         "notificationQueueName": "incident-notification-outbox",
-        "notificationQueueResourceId": (
-            f"{service_bus_id}/queues/incident-notification-outbox"
-        ),
+        "notificationQueueResourceId": (f"{service_bus_id}/queues/incident-notification-outbox"),
         "namespaceHostName": "athena-wc016-events.servicebus.windows.net",
     }
 
@@ -457,9 +435,7 @@ def _producer_parameter_bindings() -> dict[str, object]:
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.KeyVault/vaults/athena/keys/guidance-binding"
         ),
-        "managedEnvironmentResourceId": _foundation_outputs()[
-            "managedEnvironmentResourceId"
-        ],
+        "managedEnvironmentResourceId": _foundation_outputs()["managedEnvironmentResourceId"],
         "monitoringCollectorKeyResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.KeyVault/vaults/athena/keys/monitoring-collector"
@@ -467,6 +443,10 @@ def _producer_parameter_bindings() -> dict[str, object]:
         "monitoringIntentKeyResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.KeyVault/vaults/athena/keys/monitoring-intent"
+        ),
+        "registryResourceId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+            "Microsoft.ContainerRegistry/registries/athena"
         ),
         "serviceBusNamespaceName": "athena-wc016-events",
         "triggerSubmitterIdentityResourceIds": [
@@ -491,13 +471,12 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
                 "activation-writer",
                 "binding-signer",
                 "request-trust",
+                "binding-trust",
             ),
             start=40,
         )
     }
-    producer_configuration = json.loads(
-        str(producer["deployedRuntimeConfigurationJson"])
-    )
+    producer_configuration = json.loads(str(producer["deployedRuntimeConfigurationJson"]))
     source_identity_ids = [
         producer_configuration["incidentLifecycleAssets"]["identityResourceId"],
         *(
@@ -506,9 +485,7 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         ),
         producer_configuration["keys"]["guidanceBinding"]["identityResourceId"],
     ]
-    attached_identity_ids = [
-        value["identityResourceId"] for value in publisher_identities.values()
-    ]
+    attached_identity_ids = [value["identityResourceId"] for value in publisher_identities.values()]
     attached_identity_ids.extend(source_identity_ids)
     service_bus_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
@@ -531,43 +508,31 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
             "namespace": "athena-wc016-events.servicebus.windows.net",
             "requestQueueName": "wc027-guidance-authority-requests",
             "triggerQueueName": "wc027-enrichment-feed-requests",
-            "brokerIdentityClientId": publisher_identities["publisher-broker"][
-                "identityClientId"
-            ],
+            "brokerIdentityClientId": publisher_identities["publisher-broker"]["identityClientId"],
             "brokerIdentityResourceId": publisher_identities["publisher-broker"][
                 "identityResourceId"
             ],
         },
         "authorityAssets": {
             "containerName": "wc027-guidance-authority",
-            "readerIdentityClientId": publisher_identities["authority-reader"][
-                "identityClientId"
-            ],
+            "readerIdentityClientId": publisher_identities["authority-reader"]["identityClientId"],
             "readerIdentityResourceId": publisher_identities["authority-reader"][
                 "identityResourceId"
             ],
-            "writerIdentityClientId": publisher_identities["authority-writer"][
-                "identityClientId"
-            ],
+            "writerIdentityClientId": publisher_identities["authority-writer"]["identityClientId"],
             "writerIdentityResourceId": publisher_identities["authority-writer"][
                 "identityResourceId"
             ],
         },
         "guidanceActivation": {
             "tableName": "Wc027GuidanceActivation",
-            "identityClientId": publisher_identities["activation-writer"][
-                "identityClientId"
-            ],
-            "identityResourceId": publisher_identities["activation-writer"][
-                "identityResourceId"
-            ],
+            "identityClientId": publisher_identities["activation-writer"]["identityClientId"],
+            "identityResourceId": publisher_identities["activation-writer"]["identityResourceId"],
         },
         "requestKey": publisher_identities["request-trust"],
         "bindingSigningKey": {
             "keyId": "synthetic-key://athena/wc027-guidance-binding",
-            "keyVaultKeyId": (
-                "https://athena.vault.azure.net/keys/guidance-binding/v1"
-            ),
+            "keyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
             "keyFingerprint": f"sha256:{'b' * 64}",
             **publisher_identities["binding-signer"],
         },
@@ -589,39 +554,28 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
             "resourceGroups/rg/providers/Microsoft.App/jobs/wc027-publisher"
         ),
         "publisherImage": (
-            "athena.azurecr.io/athena/wc027-guidance-authority-publisher@sha256:"
-            + "1" * 64
+            "athena.azurecr.io/athena/wc027-guidance-authority-publisher@sha256:" + "1" * 64
         ),
         "deployedPublisherConfigurationJson": configuration_json,
         "deployedPublisherConfigurationDigest": _digest(configuration_json),
         "attachedIdentityResourceIds": configuration["deploymentBinding"][
             "attachedIdentityResourceIds"
         ],
-        "bindingEvidenceDigest": configuration["deploymentBinding"][
-            "bindingEvidenceId"
-        ],
+        "bindingEvidenceDigest": configuration["deploymentBinding"]["bindingEvidenceId"],
         "requestQueueName": "wc027-guidance-authority-requests",
-        "requestQueueResourceId": (
-            f"{service_bus_id}/queues/wc027-guidance-authority-requests"
-        ),
-        "triggerQueueResourceId": (
-            f"{service_bus_id}/queues/wc027-enrichment-feed-requests"
-        ),
+        "requestQueueResourceId": (f"{service_bus_id}/queues/wc027-guidance-authority-requests"),
+        "triggerQueueResourceId": (f"{service_bus_id}/queues/wc027-enrichment-feed-requests"),
         "authorityContainerName": "wc027-guidance-authority",
         "authorityContainerResourceId": (
-            f"{authority_storage_id}/blobServices/default/containers/"
-            "wc027-guidance-authority"
+            f"{authority_storage_id}/blobServices/default/containers/wc027-guidance-authority"
         ),
         "activationTableName": "Wc027GuidanceActivation",
         "activationTableResourceId": (
-            f"{activation_storage_id}/tableServices/default/tables/"
-            "Wc027GuidanceActivation"
+            f"{activation_storage_id}/tableServices/default/tables/Wc027GuidanceActivation"
         ),
         "bindingLogicalKeyId": "synthetic-key://athena/wc027-guidance-binding",
         "bindingKeyResourceId": binding_key_resource_id,
-        "bindingKeyVaultKeyId": (
-            "https://athena.vault.azure.net/keys/guidance-binding/v1"
-        ),
+        "bindingKeyVaultKeyId": ("https://athena.vault.azure.net/keys/guidance-binding/v1"),
     }
 
 
@@ -639,9 +593,15 @@ def _publisher_parameter_bindings() -> dict[str, object]:
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.KeyVault/vaults/athena/keys/guidance-binding"
         ),
-        "managedEnvironmentResourceId": _foundation_outputs()[
-            "managedEnvironmentResourceId"
-        ],
+        "bindingTrustReaderIdentityResourceId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/binding-trust"
+        ),
+        "managedEnvironmentResourceId": _foundation_outputs()["managedEnvironmentResourceId"],
+        "registryResourceId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+            "Microsoft.ContainerRegistry/registries/athena"
+        ),
         "requestSubmitterIdentityResourceIds": [
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.ManagedIdentity/userAssignedIdentities/request-submitter"
@@ -690,8 +650,7 @@ def _write_stage_bundle(
         predecessor_receipts=predecessor_receipts,
     )
     predecessor_hashes = {
-        predecessor: bundle["receiptSha256"]
-        for predecessor, bundle in predecessors.items()
+        predecessor: bundle["receiptSha256"] for predecessor, bundle in predecessors.items()
     }
     handoff_path = stage_directory / f"{stage}.handoff.json"
     _write_handoff(
@@ -729,18 +688,14 @@ def _accepted_readiness_outputs(
                     "ready": True,
                     "jobResourceId": producer["producerJobResourceId"],
                     "image": producer["producerImage"],
-                    "configurationDigest": producer[
-                        "deployedRuntimeConfigurationDigest"
-                    ],
+                    "configurationDigest": producer["deployedRuntimeConfigurationDigest"],
                     "bindingEvidenceDigest": producer["bindingEvidenceDigest"],
                 },
                 "publisher": {
                     "ready": True,
                     "jobResourceId": publisher["publisherJobResourceId"],
                     "image": publisher["publisherImage"],
-                    "configurationDigest": publisher[
-                        "deployedPublisherConfigurationDigest"
-                    ],
+                    "configurationDigest": publisher["deployedPublisherConfigurationDigest"],
                     "embeddedProducerConfigurationDigest": producer[
                         "deployedRuntimeConfigurationDigest"
                     ],
@@ -799,9 +754,7 @@ def test_producer_parameters_are_bound_to_foundation_outputs(tmp_path: Path) -> 
         foundation_path,
         "foundation",
         outputs,
-        parameter_bindings=_foundation_parameter_bindings(
-            {"wc016RuntimeEnabled": True}
-        ),
+        parameter_bindings=_foundation_parameter_bindings({"wc016RuntimeEnabled": True}),
     )
     parameters = tmp_path / "producer.parameters.json"
     _write_parameters(
@@ -812,9 +765,7 @@ def test_producer_parameters_are_bound_to_foundation_outputs(tmp_path: Path) -> 
             "serviceBusNamespaceName": "athena-wc016-events",
             "notificationQueueName": "incident-notification-outbox",
             "incidentAssetContainerName": "incident-assets",
-            "feedV2ReaderIdentityResourceId": outputs[
-                "presentationIdentityResourceId"
-            ],
+            "feedV2ReaderIdentityResourceId": outputs["presentationIdentityResourceId"],
             "presentationUrl": outputs["presentationHttpsUrl"],
             "keyVaultName": "athenawc013",
             "incidentSigningKeyName": "wc016-incident",
@@ -831,9 +782,10 @@ def test_producer_parameters_are_bound_to_foundation_outputs(tmp_path: Path) -> 
         parameter_path=parameters,
         foundation_handoff_path=foundation_path,
     )
-    assert effective["managedEnvironmentResourceId"]["value"] == outputs[
-        "managedEnvironmentResourceId"
-    ]
+    assert (
+        effective["managedEnvironmentResourceId"]["value"]
+        == outputs["managedEnvironmentResourceId"]
+    )
 
     document = json.loads(parameters.read_text(encoding="utf-8"))
     document["parameters"]["notificationQueueName"]["value"] = "wrong-queue"
@@ -876,39 +828,41 @@ def test_publisher_and_acceptance_use_exact_output_handoffs(tmp_path: Path) -> N
         foundation_handoff_path=foundation_path,
         producer_handoff_path=producer_path,
     )
-    assert effective_publisher["enrichmentRuntimeConfigurationJson"]["value"] == (
-        producer["deployedRuntimeConfigurationJson"]
+    assert (
+        effective_publisher["enrichmentRuntimeConfigurationJson"]["value"]
+        == (producer["deployedRuntimeConfigurationJson"])
     )
-    assert effective_publisher["enrichmentRuntimeConfigurationDigest"]["value"] == (
-        producer["deployedRuntimeConfigurationDigest"]
+    assert (
+        effective_publisher["enrichmentRuntimeConfigurationDigest"]["value"]
+        == (producer["deployedRuntimeConfigurationDigest"])
     )
-    assert effective_publisher["serviceBusNamespaceName"]["value"] == (
-        "athena-wc016-events"
+    assert effective_publisher["serviceBusNamespaceName"]["value"] == ("athena-wc016-events")
+    assert (
+        effective_publisher["managedEnvironmentResourceId"]["value"]
+        == (_foundation_outputs()["managedEnvironmentResourceId"])
     )
-    assert effective_publisher["managedEnvironmentResourceId"]["value"] == (
-        _foundation_outputs()["managedEnvironmentResourceId"]
+    assert (
+        effective_publisher["authorityStorageAccountResourceId"]["value"]
+        == (_producer_parameter_bindings()["correlationSourceStorageAccountResourceId"])
     )
-    assert effective_publisher["authorityStorageAccountResourceId"]["value"] == (
-        _producer_parameter_bindings()["correlationSourceStorageAccountResourceId"]
+    assert (
+        effective_publisher["bindingKeyResourceId"]["value"]
+        == (_producer_parameter_bindings()["guidanceBindingKeyResourceId"])
     )
-    assert effective_publisher["bindingKeyResourceId"]["value"] == (
-        _producer_parameter_bindings()["guidanceBindingKeyResourceId"]
+    producer_configuration = json.loads(str(producer["deployedRuntimeConfigurationJson"]))
+    assert (
+        effective_publisher["brokerIdentityResourceId"]["value"]
+        == (producer_configuration["serviceBus"]["brokerIdentityResourceId"])
     )
-    producer_configuration = json.loads(
-        str(producer["deployedRuntimeConfigurationJson"])
+    assert (
+        effective_publisher["bindingLogicalKeyId"]["value"]
+        == (producer_configuration["keys"]["guidanceBinding"]["keyId"])
     )
-    assert effective_publisher["brokerIdentityResourceId"]["value"] == (
-        producer_configuration["serviceBus"]["brokerIdentityResourceId"]
+    assert (
+        effective_publisher["bindingKeyFingerprint"]["value"]
+        == (producer_configuration["keys"]["guidanceBinding"]["keyFingerprint"])
     )
-    assert effective_publisher["bindingLogicalKeyId"]["value"] == (
-        producer_configuration["keys"]["guidanceBinding"]["keyId"]
-    )
-    assert effective_publisher["bindingKeyFingerprint"]["value"] == (
-        producer_configuration["keys"]["guidanceBinding"]["keyFingerprint"]
-    )
-    assert effective_publisher["bindingTrustReaderIdentityResourceId"]["value"].endswith(
-        "/trust"
-    )
+    assert effective_publisher["bindingTrustReaderIdentityResourceId"]["value"].endswith("/trust")
     assert len(effective_publisher["sourceIdentityResourceIds"]["value"]) == 5
 
     publisher = _publisher_outputs(producer)
@@ -936,12 +890,11 @@ def test_publisher_and_acceptance_use_exact_output_handoffs(tmp_path: Path) -> N
     )
     assert effective_acceptance["wc027FeedV2ProducerReady"]["value"] is True
     assert effective_acceptance["wc027PublisherReady"]["value"] is True
-    assert effective_acceptance["wc027PublisherImage"]["value"] == publisher[
-        "publisherImage"
-    ]
-    assert effective_acceptance["wc027EnrichmentFeedProducerImage"]["value"] == producer[
-        "producerImage"
-    ]
+    assert effective_acceptance["wc027PublisherImage"]["value"] == publisher["publisherImage"]
+    assert (
+        effective_acceptance["wc027EnrichmentFeedProducerImage"]["value"]
+        == producer["producerImage"]
+    )
     assert effective_acceptance["wc016RuntimeEnabled"]["value"] is True
 
 
@@ -1176,9 +1129,7 @@ def test_handoff_schema_rejects_unexpected_fields(tmp_path: Path) -> None:
         path,
         "foundation",
         _foundation_outputs(),
-        parameter_bindings=_foundation_parameter_bindings(
-            {"wc016RuntimeEnabled": True}
-        ),
+        parameter_bindings=_foundation_parameter_bindings({"wc016RuntimeEnabled": True}),
     )
     document = json.loads(path.read_text(encoding="utf-8"))
     document["unexpected"] = "not-reviewed"
@@ -1270,12 +1221,8 @@ def test_predecessor_receipts_preserve_exact_approval_order(
     assert tuple(verified) == ("foundation", "producer")
 
     producer_receipt_path = Path(str(producer["receiptPath"]))
-    producer_receipt = json.loads(
-        producer_receipt_path.read_text(encoding="utf-8")
-    )
-    producer_receipt["predecessorReceiptSha256s"]["foundation"] = (
-        f"sha256:{'d' * 64}"
-    )
+    producer_receipt = json.loads(producer_receipt_path.read_text(encoding="utf-8"))
+    producer_receipt["predecessorReceiptSha256s"]["foundation"] = f"sha256:{'d' * 64}"
     producer_receipt_path.write_text(
         json.dumps(producer_receipt),
         encoding="utf-8",
@@ -1322,9 +1269,9 @@ def test_live_acceptance_requires_exact_job_readback() -> None:
         )
 
     mismatched_readback = json.loads(json.dumps(outputs))
-    mismatched_readback["wc016ApprovedConfiguration"]["wc027DeploymentReadiness"][
-        "producer"
-    ]["image"] = str(producer["producerImage"]).replace("2" * 64, "3" * 64)
+    mismatched_readback["wc016ApprovedConfiguration"]["wc027DeploymentReadiness"]["producer"][
+        "image"
+    ] = str(producer["producerImage"]).replace("2" * 64, "3" * 64)
     with pytest.raises(orchestration.OrchestrationError, match="producer image"):
         orchestration._acceptance_outputs(
             mismatched_readback,
@@ -1370,27 +1317,19 @@ def test_job_binding_rejects_missing_identity_or_mismatched_tags() -> None:
         },
         "identity": {
             "type": "UserAssigned",
-            "userAssignedIdentities": {
-                identity_id: {} for identity_id in identity_ids
-            },
+            "userAssignedIdentities": {identity_id: {} for identity_id in identity_ids},
         },
         "tags": {
-            "runtimeConfigurationDigest": producer[
-                "deployedRuntimeConfigurationDigest"
-            ],
+            "runtimeConfigurationDigest": producer["deployedRuntimeConfigurationDigest"],
             "bindingEvidenceDigest": producer["bindingEvidenceDigest"],
         },
     }
     orchestration._verify_job_deployment_binding(
         job=job,
         expected_resource_id=str(producer["producerJobResourceId"]),
-        expected_environment_resource_id=str(
-            _foundation_outputs()["managedEnvironmentResourceId"]
-        ),
+        expected_environment_resource_id=str(_foundation_outputs()["managedEnvironmentResourceId"]),
         expected_identity_resource_ids=identity_ids,
-        expected_configuration_digest=str(
-            producer["deployedRuntimeConfigurationDigest"]
-        ),
+        expected_configuration_digest=str(producer["deployedRuntimeConfigurationDigest"]),
         expected_binding_evidence=str(producer["bindingEvidenceDigest"]),
     )
 
@@ -1404,9 +1343,7 @@ def test_job_binding_rejects_missing_identity_or_mismatched_tags() -> None:
                 _foundation_outputs()["managedEnvironmentResourceId"]
             ),
             expected_identity_resource_ids=identity_ids,
-            expected_configuration_digest=str(
-                producer["deployedRuntimeConfigurationDigest"]
-            ),
+            expected_configuration_digest=str(producer["deployedRuntimeConfigurationDigest"]),
             expected_binding_evidence=str(producer["bindingEvidenceDigest"]),
         )
 
@@ -1420,9 +1357,7 @@ def test_job_binding_rejects_missing_identity_or_mismatched_tags() -> None:
                 _foundation_outputs()["managedEnvironmentResourceId"]
             ),
             expected_identity_resource_ids=identity_ids,
-            expected_configuration_digest=str(
-                producer["deployedRuntimeConfigurationDigest"]
-            ),
+            expected_configuration_digest=str(producer["deployedRuntimeConfigurationDigest"]),
             expected_binding_evidence=str(producer["bindingEvidenceDigest"]),
         )
 
@@ -1470,9 +1405,7 @@ def test_job_behavior_rejects_ungoverned_executable_or_secret_fields() -> None:
                             {
                                 "name": "wc027-signed-binding",
                                 "type": "azure-servicebus",
-                                "identity": service_bus[
-                                    "brokerIdentityResourceId"
-                                ],
+                                "identity": service_bus["brokerIdentityResourceId"],
                                 "metadata": {
                                     "namespace": "athena-wc016-events",
                                     "queueName": "wc027-enrichment-feed-requests",
@@ -1559,7 +1492,20 @@ def test_rbac_role_must_match_its_exact_resource_scope(
     with pytest.raises(orchestration.OrchestrationError, match="exact resource scope"):
         orchestration._verify_rbac_resources(
             {"rbacResourceIds": [assignment_id]},
-            allowed_principal_ids={principal_id},
+            expected_assignments={
+                assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                    label="synthetic queue blob reader",
+                    principal_id=principal_id,
+                    scope=queue_scope,
+                    role_definition_id=(
+                        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                        "Microsoft.Authorization/roleDefinitions/"
+                        f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+                    ),
+                    condition_version="2.0",
+                    condition=orchestration.BLOB_LIST_DENY_CONDITION,
+                )
+            },
             subscription_id=SUBSCRIPTION_ID,
         )
 
@@ -1619,7 +1565,20 @@ def test_blob_reader_requires_exact_no_list_condition(
     with pytest.raises(orchestration.OrchestrationError, match="no-Blob.List"):
         orchestration._verify_rbac_resources(
             {"rbacResourceIds": [assignment_id]},
-            allowed_principal_ids={principal_id},
+            expected_assignments={
+                assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                    label="synthetic blob reader",
+                    principal_id=principal_id,
+                    scope=container_scope,
+                    role_definition_id=(
+                        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                        "Microsoft.Authorization/roleDefinitions/"
+                        f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+                    ),
+                    condition_version="2.0",
+                    condition=orchestration.BLOB_LIST_DENY_CONDITION,
+                )
+            },
             subscription_id=SUBSCRIPTION_ID,
         )
 
@@ -1659,10 +1618,342 @@ def test_blob_reader_accepts_only_canonical_no_list_condition(
 
     verified = orchestration._verify_rbac_resources(
         {"rbacResourceIds": [assignment_id]},
-        allowed_principal_ids={principal_id},
+        expected_assignments={
+            assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                label="synthetic blob reader",
+                principal_id=principal_id,
+                scope=container_scope,
+                role_definition_id=(
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+                ),
+                condition_version="2.0",
+                condition=orchestration.BLOB_LIST_DENY_CONDITION,
+            )
+        },
         subscription_id=SUBSCRIPTION_ID,
     )
     assert verified == {principal_id: {assignment_id.casefold()}}
+
+
+def test_custom_feed_writer_requires_canonical_no_list_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+        "containers/wc027-enrichment-feed-v2"
+    )
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "50505050-5050-5050-5050-505050505050"
+    )
+    assignment_id = (
+        f"{container_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "60606060-6060-6060-6060-606060606060"
+    )
+    principal_id = "70707070-7070-7070-7070-707070707070"
+    resources = {
+        role_definition_id.casefold(): {
+            "id": role_definition_id,
+            "properties": {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": [
+                            orchestration.BLOB_READ_DATA_ACTION,
+                            (
+                                "Microsoft.Storage/storageAccounts/blobServices/"
+                                "containers/blobs/write"
+                            ),
+                        ],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+        },
+        assignment_id.casefold(): {
+            "id": assignment_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": container_scope,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: resources[resource_id.casefold()],
+    )
+
+    with pytest.raises(orchestration.OrchestrationError, match="no-Blob.List"):
+        orchestration._verify_rbac_resources(
+            {"rbacResourceIds": [role_definition_id, assignment_id]},
+            expected_assignments={
+                assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                    label="producer feed-v2 writer",
+                    principal_id=principal_id,
+                    scope=container_scope,
+                    role_definition_id=role_definition_id,
+                    condition_version="2.0",
+                    condition=orchestration.BLOB_LIST_DENY_CONDITION,
+                )
+            },
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_exact_assignment_mapping_rejects_principal_swaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}"
+    )
+    assignment_ids = [
+        (
+            f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+            "71717171-7171-7171-7171-717171717171"
+        ),
+        (
+            f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+            "72727272-7272-7272-7272-727272727272"
+        ),
+    ]
+    principal_ids = [
+        "73737373-7373-7373-7373-737373737373",
+        "74747474-7474-7474-7474-747474747474",
+    ]
+    resources = {
+        assignment_ids[0].casefold(): {
+            "id": assignment_ids[0],
+            "properties": {
+                "principalId": principal_ids[1],
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": queue_scope,
+            },
+        },
+        assignment_ids[1].casefold(): {
+            "id": assignment_ids[1],
+            "properties": {
+                "principalId": principal_ids[0],
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": queue_scope,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: resources[resource_id.casefold()],
+    )
+    expected_assignments = {
+        assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label=f"synthetic submitter {index}",
+            principal_id=principal_ids[index],
+            scope=queue_scope,
+            role_definition_id=role_definition_id,
+        )
+        for index, assignment_id in enumerate(assignment_ids)
+    }
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="exact intended principal",
+    ):
+        orchestration._verify_rbac_resources(
+            {"rbacResourceIds": assignment_ids},
+            expected_assignments=expected_assignments,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_exact_assignment_mapping_rejects_unreviewed_non_blob_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "75757575-7575-7575-7575-757575757575"
+    )
+    principal_id = "76767676-7676-7676-7676-767676767676"
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "conditionVersion": "2.0",
+                "condition": orchestration.BLOB_LIST_DENY_CONDITION,
+                "scope": queue_scope,
+            },
+        },
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="exact intended condition",
+    ):
+        orchestration._verify_rbac_resources(
+            {"rbacResourceIds": [assignment_id]},
+            expected_assignments={
+                assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                    label="producer trigger submitter",
+                    principal_id=principal_id,
+                    scope=queue_scope,
+                    role_definition_id=role_definition_id,
+                )
+            },
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_both_wc027_roots_derive_complete_exact_assignment_maps() -> None:
+    generic_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/synthetic-rbac"
+    )
+
+    def synthetic_uuid(index: int) -> str:
+        return f"00000000-0000-0000-0000-{index:012x}"
+
+    def role_definition_id(index: int) -> str:
+        return (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{synthetic_uuid(index)}"
+        )
+
+    def assignment_id(index: int) -> str:
+        return (
+            f"{generic_scope}/providers/Microsoft.Authorization/roleAssignments/"
+            f"{synthetic_uuid(index)}"
+        )
+
+    producer = _producer_outputs()
+    producer_configuration = json.loads(str(producer["deployedRuntimeConfigurationJson"]))
+    producer_binding = {
+        "rbacResourceIds": [
+            str(producer["feedV2WriterRoleDefinitionId"]),
+            *(role_definition_id(index) for index in range(1, 7)),
+            *(assignment_id(index) for index in range(100, 126)),
+        ]
+    }
+    producer_identity_ids = {
+        identity_id.casefold()
+        for identity_id in producer_configuration["deploymentBinding"][
+            "attachedIdentityResourceIds"
+        ]
+    }
+    producer_identity_ids.add(
+        str(_producer_parameter_bindings()["feedV2ReaderIdentityResourceId"]).casefold()
+    )
+    producer_identity_ids.update(
+        identity_id.casefold()
+        for identity_id in _producer_parameter_bindings()["triggerSubmitterIdentityResourceIds"]
+    )
+    producer_principals = {
+        identity_id: synthetic_uuid(index)
+        for index, identity_id in enumerate(
+            sorted(producer_identity_ids),
+            start=500,
+        )
+    }
+    producer_expected = orchestration._producer_expected_rbac_assignments(
+        producer_binding,
+        configuration=producer_configuration,
+        outputs=producer,
+        foundation_values=_foundation_outputs(),
+        effective_parameters={
+            name: {"value": value} for name, value in _producer_parameter_bindings().items()
+        },
+        principal_ids_by_identity=producer_principals,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    producer_assignment_ids = [assignment_id(index).casefold() for index in range(100, 126)]
+    assert len(producer_expected) == 26
+    assert producer_expected[producer_assignment_ids[3]].label == ("producer feed-v2 writer")
+    assert producer_expected[producer_assignment_ids[3]].condition == (
+        orchestration.BLOB_LIST_DENY_CONDITION
+    )
+    assert producer_expected[producer_assignment_ids[-1]].label == ("producer trigger submitter 0")
+
+    publisher = _publisher_outputs(producer)
+    publisher_configuration = json.loads(str(publisher["deployedPublisherConfigurationJson"]))
+    publisher_binding = {
+        "rbacResourceIds": [
+            *(role_definition_id(index) for index in range(10, 15)),
+            *(assignment_id(index) for index in range(200, 210)),
+        ]
+    }
+    publisher_identity_ids = {
+        identity_id.casefold()
+        for identity_id in publisher_configuration["deploymentBinding"][
+            "attachedIdentityResourceIds"
+        ]
+    }
+    publisher_identity_ids.update(
+        identity_id.casefold()
+        for identity_id in _publisher_parameter_bindings()["requestSubmitterIdentityResourceIds"]
+    )
+    publisher_principals = {
+        identity_id: synthetic_uuid(index)
+        for index, identity_id in enumerate(
+            sorted(publisher_identity_ids),
+            start=600,
+        )
+    }
+    publisher_expected = orchestration._publisher_expected_rbac_assignments(
+        publisher_binding,
+        configuration=publisher_configuration,
+        outputs=publisher,
+        effective_parameters={
+            name: {"value": value} for name, value in _publisher_parameter_bindings().items()
+        },
+        principal_ids_by_identity=publisher_principals,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    publisher_assignment_ids = [assignment_id(index).casefold() for index in range(200, 210)]
+    assert len(publisher_expected) == 10
+    assert publisher_expected[publisher_assignment_ids[3]].label == ("publisher authority reader")
+    assert (
+        publisher_expected[publisher_assignment_ids[6]].principal_id
+        == (
+            publisher_principals[
+                str(
+                    _publisher_parameter_bindings()["bindingTrustReaderIdentityResourceId"]
+                ).casefold()
+            ]
+        )
+    )
+    assert publisher_expected[publisher_assignment_ids[-1]].label == (
+        "publisher request submitter 0"
+    )
 
 
 def test_publisher_trigger_handoff_requires_exact_sender_role(
@@ -1696,20 +1987,22 @@ def test_publisher_trigger_handoff_requires_exact_sender_role(
             },
         },
     )
-    with pytest.raises(orchestration.OrchestrationError, match="exact required"):
+    with pytest.raises(orchestration.OrchestrationError, match="role definition"):
         orchestration._verify_rbac_resources(
             {"rbacResourceIds": [assignment_id]},
-            allowed_principal_ids={principal_id},
+            expected_assignments={
+                assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+                    label="publisher producer-trigger sender",
+                    principal_id=principal_id,
+                    scope=trigger_scope,
+                    role_definition_id=(
+                        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                        "Microsoft.Authorization/roleDefinitions/"
+                        f"{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}"
+                    ),
+                )
+            },
             subscription_id=SUBSCRIPTION_ID,
-            required_assignments=frozenset(
-                {
-                    (
-                        trigger_scope.casefold(),
-                        principal_id,
-                        "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-                    )
-                }
-            ),
         )
 
 
@@ -1827,6 +2120,19 @@ def test_service_bus_queue_requires_exact_stage_profile(
     properties["forwardTo"] = "unexpected-forward"
     with pytest.raises(orchestration.OrchestrationError, match="forwardTo"):
         orchestration._verify_service_bus_queue(**arguments)
+    properties["forwardTo"] = None
+
+    properties["autoDeleteOnIdle"] = "PT5M"
+    with pytest.raises(orchestration.OrchestrationError, match="autoDeleteOnIdle"):
+        orchestration._verify_service_bus_queue(**arguments)
+
+
+def test_wc027_queue_templates_pin_non_auto_deleting_profiles() -> None:
+    non_auto_delete = f"autoDeleteOnIdle: '{orchestration.SERVICE_BUS_NON_AUTO_DELETE_DURATION}'"
+    for template in (PRODUCER_ROOT, PUBLISHER_ROOT, WC016_ROOT):
+        source = template.read_text(encoding="utf-8")
+        assert non_auto_delete in source
+        assert "autoDeleteOnIdle: 'PT5M'" not in source
 
 
 def test_external_key_must_match_a_private_governed_vault(
@@ -1866,11 +2172,17 @@ def test_effective_broad_rbac_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     principal_id = "55555555-5555-5555-5555-555555555555"
+    assignment_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleAssignments/"
+        "54545454-5454-5454-5454-545454545454"
+    )
 
     def run_json(_command: object, *, field: str) -> object:
         assert "effective role assignments" in field
         return [
             {
+                "id": assignment_id,
                 "principalId": principal_id,
                 "roleDefinitionName": "Contributor",
                 "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
@@ -1904,9 +2216,7 @@ def test_unreviewed_effective_assignment_is_rejected(
     monkeypatch.setattr(
         orchestration,
         "_run_json",
-        lambda _command, *, field: [
-            {"id": unexpected_assignment, "scope": governed_scope}
-        ],
+        lambda _command, *, field: [{"id": unexpected_assignment, "scope": governed_scope}],
     )
     with pytest.raises(
         orchestration.OrchestrationError,
@@ -1918,6 +2228,98 @@ def test_unreviewed_effective_assignment_is_rejected(
                     expected_assignment.casefold(),
                 }
             },
+            additional_allowed_assignment_ids=set(),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_effective_assignment_allowlist_is_bound_to_exact_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_principal = "81818181-8181-8181-8181-818181818181"
+    second_principal = "82828282-8282-8282-8282-828282828282"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    first_assignment = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "83838383-8383-8383-8383-838383838383"
+    )
+    second_assignment = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "84848484-8484-8484-8484-848484848484"
+    )
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        principal = arguments[arguments.index("--assignee-object-id") + 1]
+        if principal == first_principal:
+            return [{"id": first_assignment, "scope": queue_scope}]
+        assert principal == second_principal
+        return [{"id": first_assignment, "scope": queue_scope}]
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed effective role assignment",
+    ):
+        orchestration._verify_exact_effective_assignments(
+            {
+                first_principal: {first_assignment.casefold()},
+                second_principal: {second_assignment.casefold()},
+            },
+            additional_allowed_assignment_ids=set(),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_management_group_service_bus_data_owner_is_treated_as_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "85858585-8585-8585-8585-858585858585"
+    expected_assignment = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests/providers/"
+        "Microsoft.Authorization/roleAssignments/"
+        "86868686-8686-8686-8686-868686868686"
+    )
+    management_group_assignment = (
+        "/providers/Microsoft.Management/managementGroups/review-required/"
+        "providers/Microsoft.Authorization/roleAssignments/"
+        "87878787-8787-8787-8787-878787878787"
+    )
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if "--all" in arguments:
+            assert "--scope" not in arguments
+            assert "--include-inherited" not in arguments
+            return []
+        assert "--all" not in arguments
+        assert "--include-inherited" in arguments
+        scope_index = arguments.index("--scope")
+        assert arguments[scope_index + 1] == f"/subscriptions/{SUBSCRIPTION_ID}"
+        return [
+            {
+                "id": management_group_assignment,
+                "principalId": principal_id,
+                "roleDefinitionName": "Azure Service Bus Data Owner",
+                "scope": ("/providers/Microsoft.Management/managementGroups/review-required"),
+            }
+        ]
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed effective role assignment",
+    ):
+        orchestration._verify_exact_effective_assignments(
+            {principal_id: {expected_assignment.casefold()}},
             additional_allowed_assignment_ids=set(),
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -1940,10 +2342,7 @@ def test_wc013_exports_foundation_values_required_by_orchestrator() -> None:
     assert "wc027OrchestrationFoundation: {" in source
     assert "wc027DeploymentReadiness: {" in source
     assert "param wc027EnrichmentFeedProducerImage string = ''" in source
-    assert (
-        "wc027PublisherJobResourceIdRawSegments,\n  ["
-        in source
-    )
+    assert "wc027PublisherJobResourceIdRawSegments,\n  [" in source
     for required_job_check in (
         "WC-027 producer Job container array does not match",
         "WC-027 producer Job image does not match",
@@ -1990,9 +2389,7 @@ def test_wc027_roots_emit_exact_handoff_outputs() -> None:
     producer = PRODUCER_ROOT.read_text(encoding="utf-8")
     publisher = PUBLISHER_ROOT.read_text(encoding="utf-8")
 
-    assert "module guidanceAuthoritySourceContainer 'modules/private-container.bicep'" in (
-        producer
-    )
+    assert "module guidanceAuthoritySourceContainer 'modules/private-container.bicep'" in (producer)
     for output_name in (
         "producerImage",
         "feedV2ContainerResourceId",
@@ -2040,9 +2437,7 @@ def test_service_bus_stage_profiles_are_explicit_in_iac() -> None:
 
 
 def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
-    source = (
-        ROOT / "scripts" / "wc029_deployment_orchestration.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
     assert '--reviewed-plan-sha256", required=True' in source
     assert '--foundation-receipt", type=Path' in source
     assert '--foundation-reviewed-receipt-sha256"' in source
@@ -2081,15 +2476,13 @@ def test_runbook_keeps_wc027_roots_and_order_governed() -> None:
 
 
 def test_publisher_runtime_exists_but_automatic_request_invocation_is_separate() -> None:
-    production = (
-        ROOT / "src" / "athena_context" / "guidance" / "production.py"
-    ).read_text(encoding="utf-8")
-    azure = (
-        ROOT / "src" / "athena_context" / "guidance" / "azure.py"
-    ).read_text(encoding="utf-8")
-    orchestrator = (
-        ROOT / "scripts" / "wc029_deployment_orchestration.py"
-    ).read_text(encoding="utf-8")
+    production = (ROOT / "src" / "athena_context" / "guidance" / "production.py").read_text(
+        encoding="utf-8"
+    )
+    azure = (ROOT / "src" / "athena_context" / "guidance" / "azure.py").read_text(encoding="utf-8")
+    orchestrator = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(
+        encoding="utf-8"
+    )
     runbook = RUNBOOK.read_text(encoding="utf-8")
 
     assert "client.get_queue_sender(" in production
@@ -2101,6 +2494,4 @@ def test_publisher_runtime_exists_but_automatic_request_invocation_is_separate()
     assert '"automaticRequestProducerPresent": False' in orchestrator
     assert '"runtimeInvocationValidated": False' in orchestrator
     assert "This four-stage tool establishes deployment wiring" in runbook
-    assert "No merged production component automatically constructs and submits" in (
-        runbook
-    )
+    assert "No merged production component automatically constructs and submits" in (runbook)

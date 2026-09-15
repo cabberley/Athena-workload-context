@@ -389,6 +389,7 @@ resource triggerQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
   name: triggerQueueName
   properties: {
     status: 'Active'
+    autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'P7D'

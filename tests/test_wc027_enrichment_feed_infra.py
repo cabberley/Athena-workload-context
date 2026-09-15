@@ -6,18 +6,10 @@ ROOT_BICEP = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 DOCKERFILE = ROOT / "apps" / "enrichment-feed-producer" / "Dockerfile"
 CLI = ROOT / "src" / "athena_context" / "cli.py"
 BLOB_READER_RBAC = (
-    ROOT
-    / "infra"
-    / "wc027-enrichment-feed-runtime"
-    / "modules"
-    / "blob-reader-rbac.bicep"
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "blob-reader-rbac.bicep"
 )
 KEY_VERIFIER_RBAC = (
-    ROOT
-    / "infra"
-    / "wc027-enrichment-feed-runtime"
-    / "modules"
-    / "key-verifier-rbac.bicep"
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-verifier-rbac.bicep"
 )
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
@@ -35,6 +27,7 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "requiresSession: true" in source
     assert "requiresDuplicateDetection: true" in source
     assert "duplicateDetectionHistoryTimeWindow: 'P7D'" in source
+    assert "autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'" in source
     assert "maxMessageSizeInKilobytes: 12288" in source
     assert "type: 'azure-servicebus'" in source
     assert "isSessionsEnabled: 'true'" in source
@@ -42,10 +35,7 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "listKeys(" not in source
     assert "runtimeConfigurationJson" in source
     assert "triggerSubmitterIdentityResourceIds" in source
-    assert (
-        "principalId: triggerSubmitterIdentities[index].properties.principalId"
-        in source
-    )
+    assert "principalId: triggerSubmitterIdentities[index].properties.principalId" in source
     assert "scope: triggerQueue" in source
     assert "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON" in source
     assert "'wc027-enrichment-feed-producer'" in source
@@ -122,12 +112,8 @@ def test_wc027_custom_v2_writer_role_excludes_delete_and_list() -> None:
 
     role = _resource_block(source, "feedV2WriterRole")
     assert "type: 'CustomRole'" in role
-    assert (
-        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" in role
-    )
-    assert (
-        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write" in role
-    )
+    assert "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" in role
+    assert "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write" in role
     # No delete data actions and no container listing.
     assert "blobs/delete" not in role
     assert "containers/delete" not in role
@@ -145,10 +131,7 @@ def test_wc027_custom_v2_writer_role_excludes_delete_and_list() -> None:
 
     producer_reader = _resource_block(source, "feedV2ProducerReader")
     assert "scope: feedV2Container" in producer_reader
-    assert (
-        "principalId: feedV2ProducerReaderIdentity.properties.principalId"
-        in producer_reader
-    )
+    assert "principalId: feedV2ProducerReaderIdentity.properties.principalId" in producer_reader
     assert "storageBlobDataReaderRoleDefinitionId" in producer_reader
     assert "SubOperationMatches{\\'Blob.List\\'}" in producer_reader
 
@@ -309,8 +292,7 @@ def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
     # Readiness evidence tags/outputs are emitted for the root deployment.
     assert "bindingEvidenceDigest: bindingEvidenceDigest" in source
     assert (
-        "output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds"
-        in source
+        "output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds" in source
     )
     assert "output bindingEvidenceDigest string = bindingEvidenceDigest" in source
 
@@ -320,24 +302,15 @@ def test_wc027_notification_gate_requires_deployed_job_resource_id() -> None:
 
     assert "param wc027FeedV2ProducerReady bool = false" in source
     assert "param wc027EnrichmentFeedProducerJobResourceId string = ''" in source
-    assert (
-        "param wc027EnrichmentFeedProducerConfigurationDigest string = ''"
-        in source
-    )
-    assert (
-        "param wc027EnrichmentFeedProducerConfigurationJson string = ''"
-        in source
-    )
+    assert "param wc027EnrichmentFeedProducerConfigurationDigest string = ''" in source
+    assert "param wc027EnrichmentFeedProducerConfigurationJson string = ''" in source
     assert "validatedWc027FeedV2ProducerReady" in source
     assert "toLower(wc027ProducerJobResourceIdSegments[6]) == 'microsoft.app'" in source
     assert "toLower(wc027ProducerJobResourceIdSegments[7]) == 'jobs'" in source
     assert "exact deployed producer configuration digest" in source
     assert "wc027ProducerJob!.tags.runtimeConfigurationDigest" in source
     assert "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON" in source
-    assert (
-        "notificationV2ProducerReady: validatedWc027FeedV2ProducerReady"
-        in source
-    )
+    assert "notificationV2ProducerReady: validatedWc027FeedV2ProducerReady" in source
 
 
 def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() -> None:
@@ -356,10 +329,7 @@ def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() 
     assert "wc027PublisherJob!.properties.template.containers[0].command[0]" in source
     assert "wc027PublisherJob!.properties.template.containers[0].args[0]" in source
     assert "wc027PublisherJob!.tags.enrichmentRuntimeConfigurationDigest" in source
-    assert (
-        "string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration)"
-        in source
-    )
+    assert "string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration)" in source
     assert "eventTriggerConfig.scale.rules) != 1" in source
     assert "configuration.registries) != 1" in source
     assert "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON" in source
@@ -373,22 +343,15 @@ def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() 
     assert "explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher" in source
 
     # Readiness verifies the RBAC binding evidence generated by the WC-027 deployment.
-    assert (
-        "empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)"
-        in source
-    )
+    assert "empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)" in source
     assert (
         "wc027ProducerJob!.tags.bindingEvidenceDigest != "
-        "wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId"
-        in source
+        "wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId" in source
     )
 
     # Readiness derives the exact identity set from the deployed configuration.
     assert "items(wc027ProducerJob!.identity.userAssignedIdentities)" in source
-    assert (
-        "wc027ParsedConfiguration.deploymentBinding.attachedIdentityResourceIds"
-        in source
-    )
+    assert "wc027ParsedConfiguration.deploymentBinding.attachedIdentityResourceIds" in source
     assert "wc027ConfigurationIdentitiesMatchBinding" in source
     assert "wc027ParsedConfiguration.guidanceActivation.identityResourceId" in source
     assert "wc027RbacEvidenceMatchesConfiguration" in source
@@ -407,9 +370,6 @@ def test_wc027_producer_image_and_cli_are_executable() -> None:
 
     assert "COPY requirements-wc016.lock ./" in dockerfile
     assert "--require-hashes" in dockerfile
-    assert (
-        'ENTRYPOINT ["athena-context", "wc027-enrichment-feed-producer"]'
-        in dockerfile
-    )
+    assert 'ENTRYPOINT ["athena-context", "wc027-enrichment-feed-producer"]' in dockerfile
     assert '"wc027-enrichment-feed-submit"' in cli
     assert '"wc027-enrichment-feed-producer"' in cli

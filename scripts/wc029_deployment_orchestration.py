@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -149,12 +150,12 @@ PUBLISHER_INVOCATION_BOUNDARY = {
     "schemaVersion": "athena.wc029PublisherInvocationBoundary.v1",
     "automaticRequestProducerPresent": False,
     "runtimeInvocationValidated": False,
-    "requiredRequestSchemaVersion": (
-        "athena.wc027GuidanceAuthorityPublicationRequest.v1"
-    ),
+    "requiredRequestSchemaVersion": ("athena.wc027GuidanceAuthorityPublicationRequest.v1"),
 }
+SERVICE_BUS_NON_AUTO_DELETE_DURATION = "P10675199DT2H48M5.4775807S"
 PRODUCER_TRIGGER_QUEUE_PROFILE = {
     "status": "Active",
+    "autoDeleteOnIdle": SERVICE_BUS_NON_AUTO_DELETE_DURATION,
     "requiresSession": True,
     "requiresDuplicateDetection": True,
     "duplicateDetectionHistoryTimeWindow": "P7D",
@@ -170,6 +171,7 @@ PRODUCER_TRIGGER_QUEUE_PROFILE = {
 }
 PUBLISHER_REQUEST_QUEUE_PROFILE = {
     "status": "Active",
+    "autoDeleteOnIdle": SERVICE_BUS_NON_AUTO_DELETE_DURATION,
     "requiresSession": True,
     "requiresDuplicateDetection": True,
     "duplicateDetectionHistoryTimeWindow": "PT15M",
@@ -185,6 +187,7 @@ PUBLISHER_REQUEST_QUEUE_PROFILE = {
 }
 NOTIFICATION_QUEUE_PROFILE = {
     "status": "Active",
+    "autoDeleteOnIdle": SERVICE_BUS_NON_AUTO_DELETE_DURATION,
     "requiresSession": True,
     "requiresDuplicateDetection": True,
     "duplicateDetectionHistoryTimeWindow": "P7D",
@@ -249,6 +252,7 @@ PRODUCER_BINDING_FIELDS = frozenset(
         "managedEnvironmentResourceId",
         "monitoringCollectorKeyResourceId",
         "monitoringIntentKeyResourceId",
+        "registryResourceId",
         "serviceBusNamespaceName",
         "triggerSubmitterIdentityResourceIds",
     }
@@ -257,8 +261,10 @@ PUBLISHER_BINDING_FIELDS = frozenset(
     {
         "authorityStorageAccountResourceId",
         "activationStorageAccountResourceId",
+        "bindingTrustReaderIdentityResourceId",
         "bindingKeyResourceId",
         "managedEnvironmentResourceId",
+        "registryResourceId",
         "requestSubmitterIdentityResourceIds",
         "requestKeyResourceId",
         "serviceBusNamespaceName",
@@ -282,6 +288,16 @@ WC027_ACCEPTANCE_PARAMETER_NAMES = frozenset(
 
 class OrchestrationError(ValueError):
     """Raised when deployment evidence or a cross-root handoff fails closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedRoleAssignment:
+    label: str
+    principal_id: str
+    scope: str
+    role_definition_id: str
+    condition_version: str | None = None
+    condition: str | None = None
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -392,22 +408,14 @@ def _canonical_subscription_resource_id(
     if resource_id != resource_id.strip() or resource_id.endswith("/"):
         raise OrchestrationError(f"{field} must be a canonical Azure resource ID")
     segments = resource_id.split("/")
-    if (
-        len(segments) < 3
-        or segments[0] != ""
-        or segments[1] != "subscriptions"
-    ):
-        raise OrchestrationError(
-            f"{field} must begin with the canonical /subscriptions/ scope"
-        )
+    if len(segments) < 3 or segments[0] != "" or segments[1] != "subscriptions":
+        raise OrchestrationError(f"{field} must begin with the canonical /subscriptions/ scope")
     resource_subscription = _canonical_subscription_id(
         segments[2],
         field=f"{field} subscription",
     )
     if resource_subscription != subscription_id:
-        raise OrchestrationError(
-            f"{field} is outside the governed deployment subscription"
-        )
+        raise OrchestrationError(f"{field} is outside the governed deployment subscription")
     if len(segments) == 3:
         return resource_id
     index = 3
@@ -422,14 +430,10 @@ def _canonical_subscription_resource_id(
         if index == len(segments):
             return resource_id
     if index >= len(segments) or segments[index] != "providers":
-        raise OrchestrationError(
-            f"{field} has a noncanonical provider boundary"
-        )
+        raise OrchestrationError(f"{field} has a noncanonical provider boundary")
     while index < len(segments):
         if segments[index] != "providers" or index + 3 >= len(segments):
-            raise OrchestrationError(
-                f"{field} has an incomplete provider resource path"
-            )
+            raise OrchestrationError(f"{field} has an incomplete provider resource path")
         _validate_resource_id_segment(
             segments[index + 1],
             field=f"{field} provider namespace",
@@ -438,9 +442,7 @@ def _canonical_subscription_resource_id(
         resource_pairs = 0
         while index < len(segments) and segments[index] != "providers":
             if index + 1 >= len(segments):
-                raise OrchestrationError(
-                    f"{field} has an unmatched resource type/name segment"
-                )
+                raise OrchestrationError(f"{field} has an unmatched resource type/name segment")
             _validate_resource_id_segment(
                 segments[index],
                 field=f"{field} resource type",
@@ -463,9 +465,7 @@ def _validate_subscription_boundary(
     field: str,
 ) -> None:
     if isinstance(value, dict):
-        identity_map = field.rsplit(".", 1)[-1].casefold() == (
-            "userassignedidentities"
-        )
+        identity_map = field.rsplit(".", 1)[-1].casefold() == ("userassignedidentities")
         for key, child in value.items():
             child_field = f"{field}.{key}"
             normalized_key = key.casefold()
@@ -478,15 +478,9 @@ def _validate_subscription_boundary(
             id_like_value = (
                 isinstance(child, str)
                 and "/subscriptions/" in child.casefold()
-                and (
-                    normalized_key in {"id", "scope"}
-                    or normalized_key.endswith("id")
-                )
+                and (normalized_key in {"id", "scope"} or normalized_key.endswith("id"))
             )
-            declared_resource_id = (
-                normalized_key.endswith("resourceid")
-                and child not in (None, "")
-            )
+            declared_resource_id = normalized_key.endswith("resourceid") and child not in (None, "")
             if id_like_value or declared_resource_id:
                 _canonical_subscription_resource_id(
                     child,
@@ -494,9 +488,7 @@ def _validate_subscription_boundary(
                     field=child_field,
                 )
             elif normalized_key.endswith("resourceids"):
-                if not isinstance(child, list) or any(
-                    not isinstance(item, str) for item in child
-                ):
+                if not isinstance(child, list) or any(not isinstance(item, str) for item in child):
                     raise OrchestrationError(
                         f"{child_field} must be an array of canonical resource IDs"
                     )
@@ -509,12 +501,9 @@ def _validate_subscription_boundary(
             if (
                 key.casefold().endswith("subscriptionid")
                 and isinstance(child, str)
-                and _canonical_subscription_id(child, field=child_field)
-                != subscription_id
+                and _canonical_subscription_id(child, field=child_field) != subscription_id
             ):
-                raise OrchestrationError(
-                    f"{child_field} does not match the governed subscription"
-                )
+                raise OrchestrationError(f"{child_field} does not match the governed subscription")
             _validate_subscription_boundary(
                 child,
                 subscription_id=subscription_id,
@@ -543,9 +532,7 @@ def _validate_subscription_boundary(
         try:
             nested = json.loads(value)
         except json.JSONDecodeError as exc:
-            raise OrchestrationError(
-                f"{field} contains malformed embedded JSON"
-            ) from exc
+            raise OrchestrationError(f"{field} contains malformed embedded JSON") from exc
         _validate_subscription_boundary(
             nested,
             subscription_id=subscription_id,
@@ -569,9 +556,7 @@ def _validate_effective_parameter_subscription_boundary(
             )
             != subscription_id
         ):
-            raise OrchestrationError(
-                f"parameters.{name} does not match the governed subscription"
-            )
+            raise OrchestrationError(f"parameters.{name} does not match the governed subscription")
         _validate_subscription_boundary(
             value,
             subscription_id=subscription_id,
@@ -649,6 +634,27 @@ def _require_resource_id_equal(
         raise OrchestrationError(f"{field} does not match its authoritative handoff")
 
 
+def _require_subscription_resource_id_equal(
+    actual: object,
+    expected: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> None:
+    actual_id = _canonical_subscription_resource_id(
+        actual,
+        subscription_id=subscription_id,
+        field=f"{field} actual",
+    )
+    expected_id = _canonical_subscription_resource_id(
+        expected,
+        subscription_id=subscription_id,
+        field=f"{field} expected",
+    )
+    if actual_id.casefold() != expected_id.casefold():
+        raise OrchestrationError(f"{field} does not match its exact intended value")
+
+
 def _write_new_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -666,9 +672,7 @@ def _load_parameters(path: Path) -> dict[str, dict[str, object]]:
     for name, raw_entry in parameters.items():
         entry = _mapping(raw_entry, field=f"parameters.{name}")
         if set(entry) != {"value"}:
-            raise OrchestrationError(
-                f"parameters.{name} must contain exactly one value property"
-            )
+            raise OrchestrationError(f"parameters.{name} must contain exactly one value property")
         normalized[name] = {"value": entry["value"]}
     return normalized
 
@@ -704,9 +708,7 @@ def _foundation_parameter_digest(
 
 def _require_equal(actual: object, expected: object, *, field: str) -> None:
     if actual != expected:
-        raise OrchestrationError(
-            f"{field} does not match its authoritative foundation handoff"
-        )
+        raise OrchestrationError(f"{field} does not match its authoritative foundation handoff")
 
 
 def _require_absent_or_empty(value: object, *, field: str) -> None:
@@ -755,9 +757,7 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
     if expected_stage in {"producer", "publisher"}:
         _string(resource_group, field="handoff.resourceGroup")
     elif resource_group is not None:
-        raise OrchestrationError(
-            f"{expected_stage} handoff must use subscription deployment scope"
-        )
+        raise OrchestrationError(f"{expected_stage} handoff must use subscription deployment scope")
     _string(handoff.get("deploymentName"), field="handoff.deploymentName")
     _sha256_digest(
         handoff.get("planManifestSha256"),
@@ -805,9 +805,7 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
         "publisher": PUBLISHER_BINDING_FIELDS,
         "live-acceptance": frozenset(),
     }.get(expected_stage)
-    if (
-        expected_binding_fields is not None
-    ):
+    if expected_binding_fields is not None:
         _require_exact_fields(
             parameter_bindings,
             expected_binding_fields,
@@ -852,9 +850,7 @@ def _verify_handoff_scope(
         field="handoff.subscriptionId",
     )
     if handoff_subscription != governed_subscription:
-        raise OrchestrationError(
-            "deployment handoff subscription does not match the current stage"
-        )
+        raise OrchestrationError("deployment handoff subscription does not match the current stage")
     if resource_group is not None:
         handoff_resource_group = _string(
             handoff.get("resourceGroup"),
@@ -890,14 +886,10 @@ def _validate_stage_inputs(
         publisher_handoff_path is not None,
     )
     if actual != expected:
-        raise OrchestrationError(
-            f"{stage} requires exactly the governed predecessor handoffs"
-        )
+        raise OrchestrationError(f"{stage} requires exactly the governed predecessor handoffs")
     if stage in SUBSCRIPTION_STAGES:
         if resource_group is not None:
-            raise OrchestrationError(
-                f"{stage} is subscription-scoped and rejects --resource-group"
-            )
+            raise OrchestrationError(f"{stage} is subscription-scoped and rejects --resource-group")
     elif not resource_group:
         raise OrchestrationError(f"{stage} requires --resource-group")
 
@@ -910,9 +902,7 @@ def _validate_predecessor_receipt_inputs(
 ) -> None:
     expected = frozenset(EXPECTED_PREDECESSOR_STAGES[stage])
     provided_paths = frozenset(
-        predecessor
-        for predecessor, path in receipt_paths.items()
-        if path is not None
+        predecessor for predecessor, path in receipt_paths.items() if path is not None
     )
     provided_digests = frozenset(
         predecessor
@@ -937,9 +927,7 @@ def _ensure_evidence_directory_outside_repository(path: Path) -> None:
         resolved.relative_to(ROOT.resolve())
     except ValueError:
         return
-    raise OrchestrationError(
-        "deployment evidence directory must be outside the repository"
-    )
+    raise OrchestrationError("deployment evidence directory must be outside the repository")
 
 
 def _load_plan_manifest(
@@ -1017,12 +1005,8 @@ def _load_plan_manifest(
             field="plan effective parameters",
         )
     )
-    what_if_path = Path(
-        _string(manifest.get("whatIfPath"), field="plan what-if path")
-    )
-    _ensure_evidence_directory_outside_repository(
-        effective_parameter_path.parent
-    )
+    what_if_path = Path(_string(manifest.get("whatIfPath"), field="plan what-if path"))
+    _ensure_evidence_directory_outside_repository(effective_parameter_path.parent)
     _ensure_evidence_directory_outside_repository(what_if_path.parent)
     for artifact_path, digest_field, field in (
         (base_parameter_path, "baseParameterSha256", "base parameter artifact"),
@@ -1063,14 +1047,10 @@ def _load_plan_manifest(
         )
         for index, resource_id in enumerate(raw_allowed_changes)
     ]
-    if (
-        allowed_changes != sorted(allowed_changes)
-        or len({item.casefold() for item in allowed_changes})
-        != len(allowed_changes)
-    ):
-        raise OrchestrationError(
-            "plan allowed change resource IDs must be sorted and distinct"
-        )
+    if allowed_changes != sorted(allowed_changes) or len(
+        {item.casefold() for item in allowed_changes}
+    ) != len(allowed_changes):
+        raise OrchestrationError("plan allowed change resource IDs must be sorted and distinct")
     violations = evaluate_what_if(
         what_if,
         allowed_change_ids=frozenset(allowed_changes),
@@ -1107,26 +1087,20 @@ def _load_plan_manifest(
             field=f"{predecessor} reviewed receipt SHA-256",
         )
         if actual_digest != reviewed_digest:
-            raise OrchestrationError(
-                f"{predecessor} receipt digest was not independently approved"
-            )
+            raise OrchestrationError(f"{predecessor} receipt digest was not independently approved")
     for predecessor in ("foundation", "producer", "publisher"):
         handoff_path = handoff_paths[predecessor]
         handoff_digest_value = manifest.get(f"{predecessor}HandoffSha256")
         if handoff_path is None:
             if handoff_digest_value is not None:
-                raise OrchestrationError(
-                    f"plan {predecessor} handoff digest has no path"
-                )
+                raise OrchestrationError(f"plan {predecessor} handoff digest has no path")
             continue
         handoff_digest = _sha256_digest(
             handoff_digest_value,
             field=f"plan {predecessor} handoff SHA-256",
         )
         if _sha256_file(handoff_path) != handoff_digest:
-            raise OrchestrationError(
-                f"plan {predecessor} handoff changed after review"
-            )
+            raise OrchestrationError(f"plan {predecessor} handoff changed after review")
     _string(manifest.get("location"), field="plan location")
     _string(manifest.get("deploymentName"), field="plan deployment name")
     return manifest
@@ -1198,9 +1172,7 @@ def _load_verified_predecessor(
         field=f"{expected_stage} receipt handoff SHA-256",
     )
     if _sha256_file(handoff_path) != handoff_digest:
-        raise OrchestrationError(
-            f"{expected_stage} handoff does not match its deployment receipt"
-        )
+        raise OrchestrationError(f"{expected_stage} handoff does not match its deployment receipt")
     plan = _load_plan_manifest(plan_path, expected_stage=expected_stage)
     handoff = _load_handoff(handoff_path, expected_stage=expected_stage)
     receipt_subscription = _canonical_subscription_id(
@@ -1219,16 +1191,12 @@ def _load_verified_predecessor(
                 f"{expected_stage} {document_name} does not match its receipt scope"
             )
     if handoff.get("planManifestSha256") != plan_digest:
-        raise OrchestrationError(
-            f"{expected_stage} handoff is not bound to its reviewed plan"
-        )
+        raise OrchestrationError(f"{expected_stage} handoff is not bound to its reviewed plan")
     receipt_predecessors = _mapping(
         receipt.get("predecessorReceiptSha256s"),
         field=f"{expected_stage} receipt predecessor hashes",
     )
-    expected_predecessors = frozenset(
-        EXPECTED_PREDECESSOR_STAGES[expected_stage]
-    )
+    expected_predecessors = frozenset(EXPECTED_PREDECESSOR_STAGES[expected_stage])
     _require_exact_fields(
         receipt_predecessors,
         expected_predecessors,
@@ -1255,9 +1223,7 @@ def _load_verified_predecessor(
         for predecessor, reference in plan_predecessors.items()
     }
     if plan_predecessor_hashes != receipt_predecessors:
-        raise OrchestrationError(
-            f"{expected_stage} plan predecessor receipt chain does not match"
-        )
+        raise OrchestrationError(f"{expected_stage} plan predecessor receipt chain does not match")
     return {
         "handoff": handoff,
         "handoffPath": handoff_path.resolve(),
@@ -1289,14 +1255,8 @@ def _load_verified_predecessors(
         handoff_path = handoff_paths[predecessor]
         receipt_path = receipt_paths[predecessor]
         reviewed_digest = reviewed_receipt_sha256s[predecessor]
-        if (
-            handoff_path is None
-            or receipt_path is None
-            or reviewed_digest is None
-        ):
-            raise OrchestrationError(
-                f"{stage} predecessor receipt inputs are incomplete"
-            )
+        if handoff_path is None or receipt_path is None or reviewed_digest is None:
+            raise OrchestrationError(f"{stage} predecessor receipt inputs are incomplete")
         record = _load_verified_predecessor(
             expected_stage=predecessor,
             handoff_path=handoff_path,
@@ -1329,8 +1289,7 @@ def _load_verified_predecessors(
                 Path(_string(reference.get("path"), field="receipt path")).resolve()
                 != prior_record["receiptPath"]
                 or reference.get("sha256") != prior_record["receiptSha256"]
-                or reference.get("reviewedSha256")
-                != prior_record["reviewedReceiptSha256"]
+                or reference.get("reviewedSha256") != prior_record["reviewedReceiptSha256"]
                 or Path(
                     _string(
                         plan.get(f"{prior}HandoffPath"),
@@ -1338,8 +1297,7 @@ def _load_verified_predecessors(
                     )
                 ).resolve()
                 != prior_record["handoffPath"]
-                or plan.get(f"{prior}HandoffSha256")
-                != prior_record["handoffSha256"]
+                or plan.get(f"{prior}HandoffSha256") != prior_record["handoffSha256"]
             ):
                 raise OrchestrationError(
                     f"{predecessor} plan does not preserve the exact {prior} chain"
@@ -1364,10 +1322,7 @@ def _predecessor_receipt_references(
 def _predecessor_receipt_hashes(
     verified: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
-    return {
-        stage: record["receiptSha256"]
-        for stage, record in verified.items()
-    }
+    return {stage: record["receiptSha256"] for stage, record in verified.items()}
 
 
 def _foundation_outputs(
@@ -1404,9 +1359,7 @@ def _foundation_outputs(
     normalized_outputs = dict(outputs)
     normalized_outputs.update(
         {
-            "wc016NotificationQueueName": wc027_foundation.get(
-                "notificationQueueName"
-            ),
+            "wc016NotificationQueueName": wc027_foundation.get("notificationQueueName"),
             "incidentFeedV2SigningKeyUriWithVersion": wc027_foundation.get(
                 "feedSigningKeyUriWithVersion"
             ),
@@ -1456,10 +1409,13 @@ def _foundation_outputs(
         )
         if handoff.get("subscriptionId") is not None:
             subscription_id, _ = _resource_subscription_and_group(resource_id)
-            if subscription_id.casefold() != _string(
-                handoff.get("subscriptionId"),
-                field="foundation handoff subscription",
-            ).casefold():
+            if (
+                subscription_id.casefold()
+                != _string(
+                    handoff.get("subscriptionId"),
+                    field="foundation handoff subscription",
+                ).casefold()
+            ):
                 raise OrchestrationError(
                     f"foundation output {name} is outside the handoff subscription"
                 )
@@ -1503,20 +1459,24 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         field="producer job",
     )
     if handoff.get("subscriptionId") is not None:
-        subscription_id, resource_group = _resource_subscription_and_group(
-            job_resource_id
-        )
-        if subscription_id.casefold() != _string(
-            handoff.get("subscriptionId"),
-            field="producer handoff subscription",
-        ).casefold():
+        subscription_id, resource_group = _resource_subscription_and_group(job_resource_id)
+        if (
+            subscription_id.casefold()
+            != _string(
+                handoff.get("subscriptionId"),
+                field="producer handoff subscription",
+            ).casefold()
+        ):
             raise OrchestrationError(
                 "producer Job subscription does not match its deployment handoff"
             )
-        if resource_group.casefold() != _string(
-            handoff.get("resourceGroup"),
-            field="producer handoff resource group",
-        ).casefold():
+        if (
+            resource_group.casefold()
+            != _string(
+                handoff.get("resourceGroup"),
+                field="producer handoff resource group",
+            ).casefold()
+        ):
             raise OrchestrationError(
                 "producer Job resource group does not match its deployment handoff"
             )
@@ -1664,20 +1624,24 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         field="publisher job",
     )
     if handoff.get("subscriptionId") is not None:
-        subscription_id, resource_group = _resource_subscription_and_group(
-            job_resource_id
-        )
-        if subscription_id.casefold() != _string(
-            handoff.get("subscriptionId"),
-            field="publisher handoff subscription",
-        ).casefold():
+        subscription_id, resource_group = _resource_subscription_and_group(job_resource_id)
+        if (
+            subscription_id.casefold()
+            != _string(
+                handoff.get("subscriptionId"),
+                field="publisher handoff subscription",
+            ).casefold()
+        ):
             raise OrchestrationError(
                 "publisher Job subscription does not match its deployment handoff"
             )
-        if resource_group.casefold() != _string(
-            handoff.get("resourceGroup"),
-            field="publisher handoff resource group",
-        ).casefold():
+        if (
+            resource_group.casefold()
+            != _string(
+                handoff.get("resourceGroup"),
+                field="publisher handoff resource group",
+            ).casefold()
+        ):
             raise OrchestrationError(
                 "publisher Job resource group does not match its deployment handoff"
             )
@@ -1839,9 +1803,7 @@ def _producer_parameters(
         "replayStorageAccountName": _resource_name(
             _string(outputs["replayStorageAccountResourceId"], field="replay storage")
         ),
-        "serviceBusNamespaceName": service_bus_host.removesuffix(
-            ".servicebus.windows.net"
-        ),
+        "serviceBusNamespaceName": service_bus_host.removesuffix(".servicebus.windows.net"),
         "notificationQueueName": outputs["wc016NotificationQueueName"],
         "incidentAssetContainerName": _resource_name(
             _string(
@@ -1851,9 +1813,7 @@ def _producer_parameters(
         ),
         "feedV2ReaderIdentityResourceId": outputs["presentationIdentityResourceId"],
         "presentationUrl": outputs["presentationHttpsUrl"],
-        "keyVaultName": _resource_name(
-            _string(outputs["keyVaultResourceId"], field="key vault")
-        ),
+        "keyVaultName": _resource_name(_string(outputs["keyVaultResourceId"], field="key vault")),
         "incidentSigningKeyName": _key_name(
             _string(outputs["incidentSigningKeyUriWithVersion"], field="incident key")
         ),
@@ -1955,9 +1915,7 @@ def _publisher_parameters(
         ),
         monitoring_collector_key.get("identityResourceId"),
         *(
-            _mapping(keys.get(name), field=f"producer key {name}").get(
-                "identityResourceId"
-            )
+            _mapping(keys.get(name), field=f"producer key {name}").get("identityResourceId")
             for name in (
                 "incident",
                 "correlationBinding",
@@ -2147,9 +2105,7 @@ def build_effective_parameters(
         )
     if stage == "publisher":
         if foundation_handoff_path is None or producer_handoff_path is None:
-            raise OrchestrationError(
-                "publisher stage requires foundation and producer handoffs"
-            )
+            raise OrchestrationError("publisher stage requires foundation and producer handoffs")
         return _publisher_parameters(
             parameters,
             _load_handoff(foundation_handoff_path, expected_stage="foundation"),
@@ -2176,8 +2132,7 @@ def build_effective_parameters(
 def _parameter_document(parameters: Mapping[str, object]) -> dict[str, object]:
     return {
         "$schema": (
-            "https://schema.management.azure.com/schemas/"
-            "2019-04-01/deploymentParameters.json#"
+            "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
         ),
         "contentVersion": "1.0.0.0",
         "parameters": parameters,
@@ -2230,9 +2185,7 @@ def _run(command: Sequence[str]) -> str:
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        raise OrchestrationError(
-            f"command failed with exit code {completed.returncode}: {detail}"
-        )
+        raise OrchestrationError(f"command failed with exit code {completed.returncode}: {detail}")
     return completed.stdout
 
 
@@ -2398,13 +2351,9 @@ def _verify_private_service_bus_namespace(
     if str(network_properties.get("defaultAction", "")).casefold() != "deny":
         raise OrchestrationError("Service Bus network default action must be Deny")
     if str(network_properties.get("publicNetworkAccess", "")).casefold() != "disabled":
-        raise OrchestrationError(
-            "Service Bus network rules must keep public access disabled"
-        )
+        raise OrchestrationError("Service Bus network rules must keep public access disabled")
     if network_properties.get("trustedServiceAccessEnabled") is not False:
-        raise OrchestrationError(
-            "Service Bus trusted-service network bypass must be disabled"
-        )
+        raise OrchestrationError("Service Bus trusted-service network bypass must be disabled")
 
 
 def _resource_group_scope(resource_id: str) -> str:
@@ -2415,18 +2364,25 @@ def _resource_group_scope(resource_id: str) -> str:
     return resource_id[:index]
 
 
+ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+SERVICE_BUS_DATA_RECEIVER_ROLE_ID = "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d"
+SERVICE_BUS_DATA_SENDER_ROLE_ID = "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
+BLOB_DATA_READER_ROLE_ID = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+TABLE_DATA_CONTRIBUTOR_ROLE_ID = "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
+TABLE_DATA_READER_ROLE_ID = "76199698-9eea-4c19-bc75-cec21354c6b6"
+KEY_VAULT_CRYPTO_USER_ROLE_ID = "12338af0-0e69-4776-bea7-57ae8d297424"
+BLOB_READ_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
 BUILT_IN_DATA_ROLE_IDS = frozenset(
     {
-        "7f951dda-4ed3-4680-a7ca-43fe172d538d",
-        "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
-        "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-        "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
-        "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
-        "76199698-9eea-4c19-bc75-cec21354c6b6",
-        "12338af0-0e69-4776-bea7-57ae8d297424",
+        ACR_PULL_ROLE_ID,
+        SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+        SERVICE_BUS_DATA_SENDER_ROLE_ID,
+        BLOB_DATA_READER_ROLE_ID,
+        TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+        TABLE_DATA_READER_ROLE_ID,
+        KEY_VAULT_CRYPTO_USER_ROLE_ID,
     }
 )
-BLOB_DATA_READER_ROLE_ID = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
 BLOB_LIST_DENY_CONDITION = (
     "(!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/"
     "containers/blobs/read'} AND SubOperationMatches{'Blob.List'}))"
@@ -2435,15 +2391,11 @@ ALLOWED_CUSTOM_DATA_ACTIONS = frozenset(
     {
         frozenset(
             {
-                "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+                BLOB_READ_DATA_ACTION,
                 "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
             }
         ),
-        frozenset(
-            {
-                "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
-            }
-        ),
+        frozenset({"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"}),
         frozenset(
             {
                 "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read",
@@ -2461,44 +2413,35 @@ ALLOWED_CUSTOM_DATA_ACTIONS = frozenset(
     }
 )
 ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE = {
-    "microsoft.containerregistry/registries": frozenset(
-        {"7f951dda-4ed3-4680-a7ca-43fe172d538d"}
-    ),
+    "microsoft.containerregistry/registries": frozenset({ACR_PULL_ROLE_ID}),
     "microsoft.servicebus/namespaces/queues": frozenset(
         {
-            "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
-            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+            SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+            SERVICE_BUS_DATA_SENDER_ROLE_ID,
         }
     ),
     "microsoft.storage/storageaccounts/blobservices/containers": frozenset(
-        {"2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"}
+        {BLOB_DATA_READER_ROLE_ID}
     ),
     "microsoft.storage/storageaccounts/tableservices/tables": frozenset(
         {
-            "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
-            "76199698-9eea-4c19-bc75-cec21354c6b6",
+            TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+            TABLE_DATA_READER_ROLE_ID,
         }
     ),
-    "microsoft.keyvault/vaults/keys": frozenset(
-        {"12338af0-0e69-4776-bea7-57ae8d297424"}
-    ),
+    "microsoft.keyvault/vaults/keys": frozenset({KEY_VAULT_CRYPTO_USER_ROLE_ID}),
 }
 ALLOWED_CUSTOM_ACTIONS_BY_SCOPE_TYPE = {
     "microsoft.storage/storageaccounts/blobservices/containers": frozenset(
         {
             frozenset(
                 {
-                    "Microsoft.Storage/storageAccounts/blobServices/"
-                    "containers/blobs/read",
-                    "Microsoft.Storage/storageAccounts/blobServices/"
-                    "containers/blobs/write",
+                    BLOB_READ_DATA_ACTION,
+                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
                 }
             ),
             frozenset(
-                {
-                    "Microsoft.Storage/storageAccounts/blobServices/"
-                    "containers/blobs/add/action"
-                }
+                {"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"}
             ),
         }
     ),
@@ -2506,12 +2449,9 @@ ALLOWED_CUSTOM_ACTIONS_BY_SCOPE_TYPE = {
         {
             frozenset(
                 {
-                    "Microsoft.Storage/storageAccounts/tableServices/"
-                    "tables/entities/read",
-                    "Microsoft.Storage/storageAccounts/tableServices/"
-                    "tables/entities/add/action",
-                    "Microsoft.Storage/storageAccounts/tableServices/"
-                    "tables/entities/update/action",
+                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read",
+                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action",
+                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action",
                 }
             )
         }
@@ -2548,10 +2488,7 @@ def _identity_bindings(value: object) -> dict[str, str]:
                     field="configured identity client ID",
                 )
                 existing = bindings.get(normalized_resource_id)
-                if (
-                    existing is not None
-                    and existing.casefold() != configured_client_id.casefold()
-                ):
+                if existing is not None and existing.casefold() != configured_client_id.casefold():
                     raise OrchestrationError(
                         "one identity resource ID has conflicting configured client IDs"
                     )
@@ -2578,9 +2515,7 @@ def _verify_identities(
         *bindings,
         *(item.casefold() for item in additional_identity_resource_ids),
     }
-    rbac_identity_ids = {
-        item.casefold() for item in rbac_identity_resource_ids
-    }
+    rbac_identity_ids = {item.casefold() for item in rbac_identity_resource_ids}
     principal_ids: dict[str, str] = {}
     for normalized_resource_id in identity_resource_ids:
         identity = _get_resource(
@@ -2607,6 +2542,760 @@ def _verify_identities(
         if normalized_resource_id in rbac_identity_ids:
             principal_ids[normalized_resource_id] = principal_id
     return principal_ids
+
+
+def _built_in_role_definition_id(subscription_id: str, role_id: str) -> str:
+    return (
+        f"/subscriptions/{subscription_id}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{role_id}"
+    )
+
+
+def _binding_rbac_resource_ids(binding: Mapping[str, object]) -> list[str]:
+    return _string_list(
+        binding.get("rbacResourceIds"),
+        field="deployment binding RBAC resource IDs",
+    )
+
+
+def _binding_role_definition_ids(binding: Mapping[str, object]) -> list[str]:
+    return [
+        resource_id
+        for resource_id in _binding_rbac_resource_ids(binding)
+        if "/providers/microsoft.authorization/roledefinitions/" in resource_id.casefold()
+    ]
+
+
+def _bind_expected_assignment_ids(
+    binding: Mapping[str, object],
+    expected_assignments: Sequence[_ExpectedRoleAssignment],
+    *,
+    root_name: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    assignment_ids = [
+        resource_id
+        for resource_id in _binding_rbac_resource_ids(binding)
+        if "/providers/microsoft.authorization/roleassignments/" in resource_id.casefold()
+    ]
+    if len(assignment_ids) != len(expected_assignments):
+        raise OrchestrationError(
+            f"{root_name} deployment binding does not contain its exact expected "
+            "role-assignment mapping"
+        )
+    return {
+        assignment_id.casefold(): expected
+        for assignment_id, expected in zip(
+            assignment_ids,
+            expected_assignments,
+            strict=True,
+        )
+    }
+
+
+def _configured_identity_resource_id(value: object, *, field: str) -> str:
+    return _azure_resource_id(
+        _mapping(value, field=field).get("identityResourceId"),
+        field=f"{field} identity resource ID",
+    )
+
+
+def _principal_for_identity(
+    principal_ids_by_identity: Mapping[str, str],
+    identity_resource_id: str,
+    *,
+    field: str,
+) -> str:
+    normalized_identity_id = _azure_resource_id(
+        identity_resource_id,
+        field=field,
+    ).casefold()
+    principal_id = principal_ids_by_identity.get(normalized_identity_id)
+    if principal_id is None:
+        raise OrchestrationError(
+            f"{field} is missing from the exact resolved identity-to-principal mapping"
+        )
+    return principal_id
+
+
+def _expected_role_assignment(
+    label: str,
+    *,
+    identity_resource_id: str,
+    principal_ids_by_identity: Mapping[str, str],
+    scope: str,
+    role_definition_id: str,
+    condition_version: str | None = None,
+    condition: str | None = None,
+) -> _ExpectedRoleAssignment:
+    return _ExpectedRoleAssignment(
+        label=label,
+        principal_id=_principal_for_identity(
+            principal_ids_by_identity,
+            identity_resource_id,
+            field=f"{label} identity",
+        ),
+        scope=_azure_resource_id(scope, field=f"{label} scope"),
+        role_definition_id=role_definition_id,
+        condition_version=condition_version,
+        condition=condition,
+    )
+
+
+def _producer_expected_rbac_assignments(
+    binding: Mapping[str, object],
+    *,
+    configuration: Mapping[str, object],
+    outputs: Mapping[str, object],
+    foundation_values: Mapping[str, object],
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    principal_ids_by_identity: Mapping[str, str],
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    role_definition_ids = _binding_role_definition_ids(binding)
+    if len(role_definition_ids) != 7:
+        raise OrchestrationError(
+            "producer deployment binding does not contain its exact custom role definitions"
+        )
+    _require_subscription_resource_id_equal(
+        role_definition_ids[0],
+        outputs.get("feedV2WriterRoleDefinitionId"),
+        subscription_id=subscription_id,
+        field="producer feed-v2 writer role definition",
+    )
+
+    service_bus = _mapping(
+        configuration.get("serviceBus"),
+        field="producer service bus",
+    )
+    incident_assets = _mapping(
+        configuration.get("incidentLifecycleAssets"),
+        field="producer incident lifecycle assets",
+    )
+    enrichment_assets = _mapping(
+        configuration.get("enrichmentFeedAssets"),
+        field="producer enrichment/feed assets",
+    )
+    feed_registry = _mapping(
+        configuration.get("feedRegistry"),
+        field="producer feed registry",
+    )
+    guidance_activation = _mapping(
+        configuration.get("guidanceActivation"),
+        field="producer guidance activation",
+    )
+    correlation_sources = _mapping(
+        configuration.get("correlationSources"),
+        field="producer correlation sources",
+    )
+    guidance_authority = _mapping(
+        configuration.get("guidanceAuthoritySource"),
+        field="producer guidance authority source",
+    )
+    monitoring_collector_key = _mapping(
+        configuration.get("monitoringCollectorKey"),
+        field="producer monitoring collector key",
+    )
+    keys = _mapping(configuration.get("keys"), field="producer keys")
+
+    broker_identity_id = _azure_resource_id(
+        service_bus.get("brokerIdentityResourceId"),
+        field="producer broker identity",
+    )
+    incident_reader_identity_id = _configured_identity_resource_id(
+        incident_assets,
+        field="producer incident lifecycle assets",
+    )
+    feed_reader_identity_id = _azure_resource_id(
+        enrichment_assets.get("readerIdentityResourceId"),
+        field="producer enrichment/feed reader identity",
+    )
+    feed_writer_identity_id = _azure_resource_id(
+        enrichment_assets.get("writerIdentityResourceId"),
+        field="producer enrichment/feed writer identity",
+    )
+    registry_writer_identity_id = _configured_identity_resource_id(
+        feed_registry,
+        field="producer feed registry",
+    )
+    activation_reader_identity_id = _configured_identity_resource_id(
+        guidance_activation,
+        field="producer guidance activation",
+    )
+    monitoring_identity_id = _configured_identity_resource_id(
+        correlation_sources.get("monitoring"),
+        field="producer monitoring source",
+    )
+    change_identity_id = _configured_identity_resource_id(
+        correlation_sources.get("change"),
+        field="producer change source",
+    )
+    context_identity_id = _configured_identity_resource_id(
+        correlation_sources.get("contextAuthority"),
+        field="producer context-authority source",
+    )
+    monitoring_intent_identity_id = _configured_identity_resource_id(
+        correlation_sources.get("monitoringIntent"),
+        field="producer monitoring-intent source",
+    )
+    authority_identity_id = _configured_identity_resource_id(
+        guidance_authority,
+        field="producer guidance-authority source",
+    )
+    trust_identity_id = _configured_identity_resource_id(
+        monitoring_collector_key,
+        field="producer monitoring collector key",
+    )
+
+    trigger_queue_id = _azure_resource_id(
+        outputs.get("triggerQueueResourceId"),
+        field="producer trigger queue resource ID",
+    )
+    notification_queue_id = _azure_resource_id(
+        outputs.get("notificationQueueResourceId"),
+        field="producer notification queue resource ID",
+    )
+    registry_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "registryResourceId"),
+        field="producer registry resource ID",
+    )
+    feed_container_id = _azure_resource_id(
+        outputs.get("feedV2ContainerResourceId"),
+        field="producer feed-v2 container resource ID",
+    )
+    incident_container_id = _azure_resource_id(
+        foundation_values.get("incidentAssetContainerResourceId"),
+        field="producer incident container resource ID",
+    )
+    correlation_storage_id = _azure_resource_id(
+        _parameter_value(
+            effective_parameters,
+            "correlationSourceStorageAccountResourceId",
+        ),
+        field="producer correlation storage resource ID",
+    )
+
+    def correlation_container_id(name: str, *, field: str) -> str:
+        source = _mapping(correlation_sources.get(name), field=field)
+        container_name = _string(
+            source.get("containerName"),
+            field=f"{field} container name",
+        )
+        return f"{correlation_storage_id}/blobServices/default/containers/{container_name}"
+
+    monitoring_container_id = correlation_container_id(
+        "monitoring",
+        field="producer monitoring source",
+    )
+    change_container_id = correlation_container_id(
+        "change",
+        field="producer change source",
+    )
+    context_container_id = correlation_container_id(
+        "contextAuthority",
+        field="producer context-authority source",
+    )
+    monitoring_intent_container_id = correlation_container_id(
+        "monitoringIntent",
+        field="producer monitoring-intent source",
+    )
+    authority_container_id = _azure_resource_id(
+        outputs.get("guidanceAuthoritySourceContainerResourceId"),
+        field="producer guidance-authority container resource ID",
+    )
+    registry_table_id = _azure_resource_id(
+        outputs.get("feedRegistryTableResourceId"),
+        field="producer feed registry table resource ID",
+    )
+    activation_table_id = _azure_resource_id(
+        outputs.get("guidanceActivationTableResourceId"),
+        field="producer guidance activation table resource ID",
+    )
+    key_vault_id = _azure_resource_id(
+        foundation_values.get("keyVaultResourceId"),
+        field="producer foundation Key Vault resource ID",
+    )
+
+    def foundation_key_scope(name: str) -> str:
+        key = _mapping(keys.get(name), field=f"producer key {name}")
+        key_name = _key_name(
+            _string(
+                key.get("keyVaultKeyId"),
+                field=f"producer key {name} URI",
+            )
+        )
+        return f"{key_vault_id}/keys/{key_name}"
+
+    incident_key_id = foundation_key_scope("incident")
+    report_key_id = foundation_key_scope("report")
+    guidance_key_id = foundation_key_scope("guidance")
+    enrichment_key_id = foundation_key_scope("enrichment")
+    feed_key_id = foundation_key_scope("feed")
+    notification_key_id = foundation_key_scope("notification")
+    correlation_binding_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "correlationBindingKeyResourceId"),
+        field="producer correlation-binding key resource ID",
+    )
+    guidance_binding_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "guidanceBindingKeyResourceId"),
+        field="producer guidance-binding key resource ID",
+    )
+    change_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "changeKeyResourceId"),
+        field="producer change key resource ID",
+    )
+    monitoring_intent_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "monitoringIntentKeyResourceId"),
+        field="producer monitoring-intent key resource ID",
+    )
+    monitoring_collector_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "monitoringCollectorKeyResourceId"),
+        field="producer monitoring-collector key resource ID",
+    )
+
+    blob_condition = {
+        "condition_version": "2.0",
+        "condition": BLOB_LIST_DENY_CONDITION,
+    }
+    built_in_roles = {
+        "acr_pull": _built_in_role_definition_id(
+            subscription_id,
+            ACR_PULL_ROLE_ID,
+        ),
+        "service_bus_receiver": _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+        ),
+        "service_bus_sender": _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_SENDER_ROLE_ID,
+        ),
+        "blob_reader": _built_in_role_definition_id(
+            subscription_id,
+            BLOB_DATA_READER_ROLE_ID,
+        ),
+        "table_contributor": _built_in_role_definition_id(
+            subscription_id,
+            TABLE_DATA_CONTRIBUTOR_ROLE_ID,
+        ),
+        "table_reader": _built_in_role_definition_id(
+            subscription_id,
+            TABLE_DATA_READER_ROLE_ID,
+        ),
+        "key_crypto_user": _built_in_role_definition_id(
+            subscription_id,
+            KEY_VAULT_CRYPTO_USER_ROLE_ID,
+        ),
+    }
+
+    expected = [
+        _expected_role_assignment(
+            "producer trigger receiver",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=trigger_queue_id,
+            role_definition_id=built_in_roles["service_bus_receiver"],
+        ),
+        _expected_role_assignment(
+            "producer notification sender",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=notification_queue_id,
+            role_definition_id=built_in_roles["service_bus_sender"],
+        ),
+        _expected_role_assignment(
+            "producer registry pull",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=registry_id,
+            role_definition_id=built_in_roles["acr_pull"],
+        ),
+        _expected_role_assignment(
+            "producer feed-v2 writer",
+            identity_resource_id=feed_writer_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=feed_container_id,
+            role_definition_id=role_definition_ids[0],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer feed-v2 readback reader",
+            identity_resource_id=feed_reader_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=feed_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer presentation feed-v2 reader",
+            identity_resource_id=_string(
+                _parameter_value(
+                    effective_parameters,
+                    "feedV2ReaderIdentityResourceId",
+                ),
+                field="producer presentation reader identity",
+            ),
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=feed_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer incident reader",
+            identity_resource_id=incident_reader_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=incident_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer monitoring source reader",
+            identity_resource_id=monitoring_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=monitoring_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer change source reader",
+            identity_resource_id=change_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=change_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer context-authority source reader",
+            identity_resource_id=context_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=context_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer monitoring-intent source reader",
+            identity_resource_id=monitoring_intent_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=monitoring_intent_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer guidance-authority source reader",
+            identity_resource_id=authority_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=authority_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "producer feed registry writer",
+            identity_resource_id=registry_writer_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=registry_table_id,
+            role_definition_id=built_in_roles["table_contributor"],
+        ),
+        _expected_role_assignment(
+            "producer guidance activation reader",
+            identity_resource_id=activation_reader_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=activation_table_id,
+            role_definition_id=built_in_roles["table_reader"],
+        ),
+        _expected_role_assignment(
+            "producer incident key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=incident_key_id,
+            role_definition_id=role_definition_ids[1],
+        ),
+        _expected_role_assignment(
+            "producer correlation-binding key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=correlation_binding_key_id,
+            role_definition_id=role_definition_ids[2],
+        ),
+        _expected_role_assignment(
+            "producer guidance-binding key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=guidance_binding_key_id,
+            role_definition_id=role_definition_ids[3],
+        ),
+        _expected_role_assignment(
+            "producer change key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=change_key_id,
+            role_definition_id=role_definition_ids[4],
+        ),
+        _expected_role_assignment(
+            "producer monitoring-intent key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=monitoring_intent_key_id,
+            role_definition_id=role_definition_ids[5],
+        ),
+        _expected_role_assignment(
+            "producer monitoring-collector key verifier",
+            identity_resource_id=trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=monitoring_collector_key_id,
+            role_definition_id=role_definition_ids[6],
+        ),
+    ]
+    for name, scope in (
+        ("report", report_key_id),
+        ("guidance", guidance_key_id),
+        ("enrichment", enrichment_key_id),
+        ("feed", feed_key_id),
+        ("notification", notification_key_id),
+    ):
+        expected.append(
+            _expected_role_assignment(
+                f"producer {name} signer",
+                identity_resource_id=_configured_identity_resource_id(
+                    keys.get(name),
+                    field=f"producer key {name}",
+                ),
+                principal_ids_by_identity=principal_ids_by_identity,
+                scope=scope,
+                role_definition_id=built_in_roles["key_crypto_user"],
+            )
+        )
+    for index, identity_resource_id in enumerate(
+        _string_list(
+            _parameter_value(
+                effective_parameters,
+                "triggerSubmitterIdentityResourceIds",
+            ),
+            field="producer trigger submitter identities",
+        )
+    ):
+        expected.append(
+            _expected_role_assignment(
+                f"producer trigger submitter {index}",
+                identity_resource_id=identity_resource_id,
+                principal_ids_by_identity=principal_ids_by_identity,
+                scope=trigger_queue_id,
+                role_definition_id=built_in_roles["service_bus_sender"],
+            )
+        )
+    return _bind_expected_assignment_ids(
+        binding,
+        expected,
+        root_name="producer",
+    )
+
+
+def _publisher_expected_rbac_assignments(
+    binding: Mapping[str, object],
+    *,
+    configuration: Mapping[str, object],
+    outputs: Mapping[str, object],
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    principal_ids_by_identity: Mapping[str, str],
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    role_definition_ids = _binding_role_definition_ids(binding)
+    if len(role_definition_ids) != 5:
+        raise OrchestrationError(
+            "publisher deployment binding does not contain its exact custom role definitions"
+        )
+
+    service_bus = _mapping(
+        configuration.get("serviceBus"),
+        field="publisher service bus",
+    )
+    authority_assets = _mapping(
+        configuration.get("authorityAssets"),
+        field="publisher authority assets",
+    )
+    guidance_activation = _mapping(
+        configuration.get("guidanceActivation"),
+        field="publisher guidance activation",
+    )
+    request_key = _mapping(
+        configuration.get("requestKey"),
+        field="publisher request key",
+    )
+    binding_key = _mapping(
+        configuration.get("bindingSigningKey"),
+        field="publisher binding signing key",
+    )
+
+    broker_identity_id = _azure_resource_id(
+        service_bus.get("brokerIdentityResourceId"),
+        field="publisher broker identity",
+    )
+    authority_reader_identity_id = _azure_resource_id(
+        authority_assets.get("readerIdentityResourceId"),
+        field="publisher authority reader identity",
+    )
+    authority_writer_identity_id = _azure_resource_id(
+        authority_assets.get("writerIdentityResourceId"),
+        field="publisher authority writer identity",
+    )
+    activation_writer_identity_id = _configured_identity_resource_id(
+        guidance_activation,
+        field="publisher guidance activation",
+    )
+    request_trust_identity_id = _configured_identity_resource_id(
+        request_key,
+        field="publisher request key",
+    )
+    binding_signer_identity_id = _configured_identity_resource_id(
+        binding_key,
+        field="publisher binding signing key",
+    )
+    binding_trust_identity_id = _azure_resource_id(
+        _parameter_value(
+            effective_parameters,
+            "bindingTrustReaderIdentityResourceId",
+        ),
+        field="publisher binding trust reader identity",
+    )
+
+    request_queue_id = _azure_resource_id(
+        outputs.get("requestQueueResourceId"),
+        field="publisher request queue resource ID",
+    )
+    trigger_queue_id = _azure_resource_id(
+        outputs.get("triggerQueueResourceId"),
+        field="publisher trigger queue resource ID",
+    )
+    authority_container_id = _azure_resource_id(
+        outputs.get("authorityContainerResourceId"),
+        field="publisher authority container resource ID",
+    )
+    activation_table_id = _azure_resource_id(
+        outputs.get("activationTableResourceId"),
+        field="publisher activation table resource ID",
+    )
+    request_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "requestKeyResourceId"),
+        field="publisher request key resource ID",
+    )
+    binding_key_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "bindingKeyResourceId"),
+        field="publisher binding key resource ID",
+    )
+    registry_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "registryResourceId"),
+        field="publisher registry resource ID",
+    )
+
+    blob_condition = {
+        "condition_version": "2.0",
+        "condition": BLOB_LIST_DENY_CONDITION,
+    }
+    built_in_roles = {
+        "acr_pull": _built_in_role_definition_id(
+            subscription_id,
+            ACR_PULL_ROLE_ID,
+        ),
+        "service_bus_receiver": _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+        ),
+        "service_bus_sender": _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_SENDER_ROLE_ID,
+        ),
+        "blob_reader": _built_in_role_definition_id(
+            subscription_id,
+            BLOB_DATA_READER_ROLE_ID,
+        ),
+    }
+    expected = [
+        _expected_role_assignment(
+            "publisher request receiver",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=request_queue_id,
+            role_definition_id=built_in_roles["service_bus_receiver"],
+        ),
+        _expected_role_assignment(
+            "publisher producer-trigger sender",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=trigger_queue_id,
+            role_definition_id=built_in_roles["service_bus_sender"],
+        ),
+        _expected_role_assignment(
+            "publisher authority writer",
+            identity_resource_id=authority_writer_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=authority_container_id,
+            role_definition_id=role_definition_ids[0],
+        ),
+        _expected_role_assignment(
+            "publisher authority reader",
+            identity_resource_id=authority_reader_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=authority_container_id,
+            role_definition_id=built_in_roles["blob_reader"],
+            **blob_condition,
+        ),
+        _expected_role_assignment(
+            "publisher activation writer",
+            identity_resource_id=activation_writer_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=activation_table_id,
+            role_definition_id=role_definition_ids[1],
+        ),
+        _expected_role_assignment(
+            "publisher request key verifier",
+            identity_resource_id=request_trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=request_key_id,
+            role_definition_id=role_definition_ids[2],
+        ),
+        _expected_role_assignment(
+            "publisher binding key verifier",
+            identity_resource_id=binding_trust_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=binding_key_id,
+            role_definition_id=role_definition_ids[3],
+        ),
+        _expected_role_assignment(
+            "publisher binding signer",
+            identity_resource_id=binding_signer_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=binding_key_id,
+            role_definition_id=role_definition_ids[4],
+        ),
+        _expected_role_assignment(
+            "publisher registry pull",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=registry_id,
+            role_definition_id=built_in_roles["acr_pull"],
+        ),
+    ]
+    for index, identity_resource_id in enumerate(
+        _string_list(
+            _parameter_value(
+                effective_parameters,
+                "requestSubmitterIdentityResourceIds",
+            ),
+            field="publisher request submitter identities",
+        )
+    ):
+        expected.append(
+            _expected_role_assignment(
+                f"publisher request submitter {index}",
+                identity_resource_id=identity_resource_id,
+                principal_ids_by_identity=principal_ids_by_identity,
+                scope=request_queue_id,
+                role_definition_id=built_in_roles["service_bus_sender"],
+            )
+        )
+    return _bind_expected_assignment_ids(
+        binding,
+        expected,
+        root_name="publisher",
+    )
 
 
 def _resource_type(resource_id: str) -> str:
@@ -2652,14 +3341,28 @@ def _verify_custom_role(resource: Mapping[str, object]) -> frozenset[str]:
 def _verify_rbac_resources(
     binding: Mapping[str, object],
     *,
-    allowed_principal_ids: set[str],
+    expected_assignments: Mapping[str, _ExpectedRoleAssignment],
     subscription_id: str,
-    required_assignments: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> dict[str, set[str]]:
-    resource_ids = _string_list(
-        binding.get("rbacResourceIds"),
-        field="deployment binding RBAC resource IDs",
-    )
+    resource_ids = _binding_rbac_resource_ids(binding)
+    assignment_ids = {
+        resource_id.casefold()
+        for resource_id in resource_ids
+        if "/providers/microsoft.authorization/roleassignments/" in resource_id.casefold()
+    }
+    if assignment_ids != set(expected_assignments):
+        raise OrchestrationError(
+            "deployment binding role assignments do not match the exact expected mapping"
+        )
+    for resource_id in resource_ids:
+        normalized_id = resource_id.casefold()
+        if (
+            "/providers/microsoft.authorization/roledefinitions/" not in normalized_id
+            and "/providers/microsoft.authorization/roleassignments/" not in normalized_id
+        ):
+            raise OrchestrationError(
+                f"deployment binding contains unsupported RBAC resource: {resource_id}"
+            )
     resources: dict[str, dict[str, Any]] = {}
     for resource_id in resource_ids:
         resource = _get_resource(resource_id, subscription_id=subscription_id)
@@ -2673,61 +3376,78 @@ def _verify_rbac_resources(
     for resource_id in resource_ids:
         normalized_id = resource_id.casefold()
         if "/providers/microsoft.authorization/roledefinitions/" in normalized_id:
-            custom_roles[resource_id.rsplit("/", 1)[-1].casefold()] = (
-                _verify_custom_role(resources[normalized_id])
-            )
+            custom_roles[normalized_id] = _verify_custom_role(resources[normalized_id])
             continue
     used_custom_roles: set[str] = set()
     assignment_ids_by_principal: dict[str, set[str]] = {}
-    verified_assignments: set[tuple[str, str, str]] = set()
     for resource_id in resource_ids:
         normalized_id = resource_id.casefold()
         if "/providers/microsoft.authorization/roledefinitions/" in normalized_id:
             continue
-        if "/providers/microsoft.authorization/roleassignments/" not in normalized_id:
-            raise OrchestrationError(
-                f"deployment binding contains unsupported RBAC resource: {resource_id}"
-            )
+        expected = expected_assignments[normalized_id]
         resource = resources[normalized_id]
         properties = _mapping(
             resource.get("properties"),
-            field="role assignment properties",
+            field=f"{expected.label} role assignment properties",
         )
         principal_id = _string(
             properties.get("principalId"),
-            field="role assignment principal ID",
+            field=f"{expected.label} role assignment principal ID",
         ).casefold()
-        if principal_id not in allowed_principal_ids:
+        if principal_id != expected.principal_id.casefold():
             raise OrchestrationError(
-                "role assignment principal is outside the exact governed identity set"
+                f"{expected.label} role assignment does not match its exact intended principal"
             )
-        assignment_ids_by_principal.setdefault(principal_id, set()).add(
-            resource_id.casefold()
-        )
-        role_definition_id = _string(
+        assignment_ids_by_principal.setdefault(principal_id, set()).add(normalized_id)
+        role_definition_id = _canonical_subscription_resource_id(
             properties.get("roleDefinitionId"),
-            field="role assignment role definition",
+            subscription_id=subscription_id,
+            field=f"{expected.label} role assignment role definition",
+        )
+        _require_subscription_resource_id_equal(
+            role_definition_id,
+            expected.role_definition_id,
+            subscription_id=subscription_id,
+            field=f"{expected.label} role assignment role definition",
         )
         role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
-        if role_id == BLOB_DATA_READER_ROLE_ID and (
+        scope = _role_assignment_scope(resource_id)
+        _require_resource_id_equal(
+            scope,
+            expected.scope,
+            field=f"{expected.label} role assignment scope",
+        )
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                expected.scope,
+                field=f"{expected.label} role assignment scope property",
+            )
+        if properties.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                f"{expected.label} role assignment principal type must be ServicePrincipal"
+            )
+
+        custom_actions = custom_roles.get(role_definition_id.casefold())
+        grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
+            custom_actions is not None and BLOB_READ_DATA_ACTION in custom_actions
+        )
+        if grants_blob_read and (
             properties.get("conditionVersion") != "2.0"
             or properties.get("condition") != BLOB_LIST_DENY_CONDITION
         ):
             raise OrchestrationError(
-                "Blob Data Reader assignment must use the exact no-Blob.List ABAC condition"
+                f"{expected.label} role assignment whose resolved role includes "
+                "Blob read must use the exact no-Blob.List ABAC condition"
             )
-        scope = _role_assignment_scope(resource_id)
-        verified_assignments.add((scope.casefold(), principal_id, role_id))
-        if properties.get("scope") is not None:
-            _require_resource_id_equal(
-                properties.get("scope"),
-                scope,
-                field="role assignment scope",
-            )
-        if properties.get("principalType") not in (None, "ServicePrincipal"):
+        if (
+            properties.get("conditionVersion") != expected.condition_version
+            or properties.get("condition") != expected.condition
+        ):
             raise OrchestrationError(
-                "role assignment principal type must be ServicePrincipal"
+                f"{expected.label} role assignment does not match its exact intended condition"
             )
+
         scope_type = _resource_type(scope)
         if role_id in BUILT_IN_DATA_ROLE_IDS:
             allowed_role_ids = ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE.get(
@@ -2739,7 +3459,6 @@ def _verify_rbac_resources(
                     "role assignment role does not match its exact resource scope"
                 )
             continue
-        custom_actions = custom_roles.get(role_id)
         if custom_actions is None:
             raise OrchestrationError(
                 "role assignment references a custom role outside the deployment binding"
@@ -2752,25 +3471,21 @@ def _verify_rbac_resources(
             raise OrchestrationError(
                 "custom role permissions do not match the assignment resource scope"
             )
-        used_custom_roles.add(role_id)
+        used_custom_roles.add(role_definition_id.casefold())
     if used_custom_roles != set(custom_roles):
-        raise OrchestrationError(
-            "deployment binding contains an unused or unassigned custom role"
-        )
-    if not required_assignments.issubset(verified_assignments):
-        raise OrchestrationError(
-            "deployment binding is missing an exact required role assignment"
-        )
+        raise OrchestrationError("deployment binding contains an unused or unassigned custom role")
     return assignment_ids_by_principal
 
 
-def _verify_no_broad_effective_assignments(
-    principal_ids: set[str],
+def _effective_role_assignments(
+    principal_id: str,
     *,
     subscription_id: str,
-) -> None:
-    for principal_id in sorted(principal_ids):
-        assignments = _run_json(
+    field: str,
+) -> list[dict[str, Any]]:
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    query_documents = (
+        _run_json(
             [
                 "az",
                 "role",
@@ -2780,22 +3495,89 @@ def _verify_no_broad_effective_assignments(
                 subscription_id,
                 "--assignee-object-id",
                 principal_id,
-                "--include-inherited",
                 "--all",
                 "--only-show-errors",
                 "--output",
                 "json",
             ],
+            field=f"{field} at or below the subscription",
+        ),
+        _run_json(
+            [
+                "az",
+                "role",
+                "assignment",
+                "list",
+                "--subscription",
+                subscription_id,
+                "--assignee-object-id",
+                principal_id,
+                "--scope",
+                subscription_scope,
+                "--include-inherited",
+                "--only-show-errors",
+                "--output",
+                "json",
+            ],
+            field=f"{field} inherited from subscription ancestors",
+        ),
+    )
+    merged: dict[str, dict[str, Any]] = {}
+    for document in query_documents:
+        if not isinstance(document, list):
+            raise OrchestrationError(f"{field} must be an array")
+        for index, raw_assignment in enumerate(document):
+            assignment = _mapping(
+                raw_assignment,
+                field=f"{field} item {index}",
+            )
+            assignment_id = _string(
+                assignment.get("id"),
+                field=f"{field} assignment ID",
+            ).casefold()
+            existing = merged.get(assignment_id)
+            if existing is None:
+                merged[assignment_id] = assignment
+                continue
+            for property_name in (
+                "principalId",
+                "roleDefinitionId",
+                "roleDefinitionName",
+                "scope",
+            ):
+                existing_value = existing.get(property_name)
+                incoming_value = assignment.get(property_name)
+                if (
+                    existing_value not in (None, "")
+                    and incoming_value not in (None, "")
+                    and str(existing_value).casefold() != str(incoming_value).casefold()
+                ):
+                    raise OrchestrationError(
+                        f"{field} returned conflicting duplicate assignment {assignment_id}"
+                    )
+                if existing_value in (None, "") and incoming_value not in (None, ""):
+                    existing[property_name] = incoming_value
+    return list(merged.values())
+
+
+def _verify_no_broad_effective_assignments(
+    principal_ids: set[str],
+    *,
+    subscription_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    assignments_by_principal: dict[str, list[dict[str, Any]]] = {}
+    for principal_id in sorted(principal_ids):
+        assignments = _effective_role_assignments(
+            principal_id,
+            subscription_id=subscription_id,
             field=f"effective role assignments for {principal_id}",
         )
+        assignments_by_principal[principal_id.casefold()] = assignments
         violations = evaluate_role_assignments(assignments)
         if violations:
-            details = "; ".join(
-                f"{item.code}: {item.detail}" for item in violations
-            )
-            raise OrchestrationError(
-                f"governed identity has prohibited broad RBAC: {details}"
-            )
+            details = "; ".join(f"{item.code}: {item.detail}" for item in violations)
+            raise OrchestrationError(f"governed identity has prohibited broad RBAC: {details}")
+    return assignments_by_principal
 
 
 def _role_assignment_ids(binding: Mapping[str, object]) -> set[str]:
@@ -2805,21 +3587,27 @@ def _role_assignment_ids(binding: Mapping[str, object]) -> set[str]:
             binding.get("rbacResourceIds"),
             field="deployment binding RBAC resource IDs",
         )
-        if "/providers/microsoft.authorization/roleassignments/"
-        in resource_id.casefold()
+        if "/providers/microsoft.authorization/roleassignments/" in resource_id.casefold()
     }
 
 
 def _governed_rbac_scopes(assignment_ids: set[str]) -> set[str]:
-    return {
-        _role_assignment_scope(resource_id).casefold()
-        for resource_id in assignment_ids
-    }
+    return {_role_assignment_scope(resource_id).casefold() for resource_id in assignment_ids}
 
 
 def _scopes_overlap(first: str, second: str) -> bool:
     normalized_first = first.rstrip("/").casefold()
     normalized_second = second.rstrip("/").casefold()
+    management_group_prefix = "/providers/microsoft.management/managementgroups/"
+    if normalized_first in {"", "/"} or normalized_second in {"", "/"}:
+        return True
+    if normalized_first.startswith(management_group_prefix) or normalized_second.startswith(
+        management_group_prefix
+    ):
+        # No independently reviewed management-group hierarchy is accepted by this
+        # orchestration path. Conservatively treat every management-group assignment
+        # returned as inherited by every governed resource in the subscription.
+        return True
     return (
         normalized_first == normalized_second
         or normalized_first.startswith(normalized_second + "/")
@@ -2832,37 +3620,55 @@ def _verify_exact_effective_assignments(
     *,
     additional_allowed_assignment_ids: set[str],
     subscription_id: str,
+    effective_assignments_by_principal: Mapping[str, list[dict[str, Any]]] | None = None,
 ) -> None:
-    allowed_assignment_ids = {
-        assignment_id
-        for assignment_ids in expected_assignments_by_principal.values()
-        for assignment_id in assignment_ids
-    }
-    allowed_assignment_ids.update(additional_allowed_assignment_ids)
-    for principal_id, expected_assignment_ids in sorted(
-        expected_assignments_by_principal.items()
-    ):
-        governed_scopes = _governed_rbac_scopes(expected_assignment_ids)
-        assignments = _run_json(
-            [
-                "az",
-                "role",
-                "assignment",
-                "list",
-                "--subscription",
-                subscription_id,
-                "--assignee-object-id",
-                principal_id,
-                "--include-inherited",
-                "--all",
-                "--only-show-errors",
-                "--output",
-                "json",
-            ],
-            field=f"exact role assignments for {principal_id}",
+    additional_assignment_ids_by_principal: dict[str, set[str]] = {}
+    for assignment_id in sorted(additional_allowed_assignment_ids):
+        assignment = _get_resource(
+            assignment_id,
+            subscription_id=subscription_id,
         )
-        if not isinstance(assignments, list):
-            raise OrchestrationError("effective role assignments must be an array")
+        _require_resource_id_equal(
+            assignment.get("id"),
+            assignment_id,
+            field="additional reviewed RBAC assignment readback",
+        )
+        properties = _mapping(
+            assignment.get("properties"),
+            field="additional reviewed RBAC assignment properties",
+        )
+        principal_id = _string(
+            properties.get("principalId"),
+            field="additional reviewed RBAC assignment principal ID",
+        ).casefold()
+        if properties.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                "additional reviewed RBAC assignment principal type must be ServicePrincipal"
+            )
+        additional_assignment_ids_by_principal.setdefault(principal_id, set()).add(
+            assignment_id.casefold()
+        )
+    for principal_id, expected_assignment_ids in sorted(expected_assignments_by_principal.items()):
+        allowed_assignment_ids = {
+            assignment_id.casefold() for assignment_id in expected_assignment_ids
+        }
+        allowed_assignment_ids.update(
+            additional_assignment_ids_by_principal.get(principal_id.casefold(), set())
+        )
+        governed_scopes = _governed_rbac_scopes(expected_assignment_ids)
+        assignments = (
+            _effective_role_assignments(
+                principal_id,
+                subscription_id=subscription_id,
+                field=f"exact role assignments for {principal_id}",
+            )
+            if effective_assignments_by_principal is None
+            else effective_assignments_by_principal.get(principal_id.casefold())
+        )
+        if assignments is None:
+            raise OrchestrationError(
+                "effective role assignment evidence is missing a governed principal"
+            )
         for index, raw_assignment in enumerate(assignments):
             assignment = _mapping(
                 raw_assignment,
@@ -2876,10 +3682,17 @@ def _verify_exact_effective_assignments(
                 assignment.get("scope"),
                 field="effective role assignment scope",
             )
-            if any(
-                _scopes_overlap(assignment_scope, governed_scope)
-                for governed_scope in governed_scopes
-            ) and assignment_id not in allowed_assignment_ids:
+            if assignment_scope != assignment_scope.strip() or not assignment_scope.startswith("/"):
+                raise OrchestrationError(
+                    "effective role assignment scope must be a canonical absolute scope"
+                )
+            if (
+                any(
+                    _scopes_overlap(assignment_scope, governed_scope)
+                    for governed_scope in governed_scopes
+                )
+                and assignment_id not in allowed_assignment_ids
+            ):
                 raise OrchestrationError(
                     "governed runtime identity has an unreviewed effective role assignment"
                 )
@@ -3198,9 +4011,7 @@ def _verify_key(
         not isinstance(item, str) for item in key_operations
     ):
         raise OrchestrationError("Key Vault key operations are absent")
-    if not required_operations.issubset(
-        {item.casefold() for item in key_operations}
-    ):
+    if not required_operations.issubset({item.casefold() for item in key_operations}):
         raise OrchestrationError(
             f"Key Vault key lacks required operations {sorted(required_operations)}: "
             f"{versioned_key_uri}"
@@ -3328,9 +4139,7 @@ def _key_resource_parts(resource_id: str) -> tuple[str, str]:
         vault_name = segments[vault_index + 1]
         key_name = segments[key_index + 1]
     except (ValueError, IndexError) as exc:
-        raise OrchestrationError(
-            f"invalid Key Vault key resource ID: {resource_id}"
-        ) from exc
+        raise OrchestrationError(f"invalid Key Vault key resource ID: {resource_id}") from exc
     return vault_name, key_name
 
 
@@ -3344,13 +4153,9 @@ def _key_vault_resource_id(key_resource_id: str) -> str:
     try:
         key_index = lowered.index("keys")
     except ValueError as exc:
-        raise OrchestrationError(
-            f"invalid Key Vault key resource ID: {key_resource_id}"
-        ) from exc
+        raise OrchestrationError(f"invalid Key Vault key resource ID: {key_resource_id}") from exc
     if key_index < 2 or lowered[key_index - 2] != "vaults":
-        raise OrchestrationError(
-            f"invalid Key Vault key resource ID: {key_resource_id}"
-        )
+        raise OrchestrationError(f"invalid Key Vault key resource ID: {key_resource_id}")
     return "/" + "/".join(segments[:key_index])
 
 
@@ -3530,60 +4335,32 @@ def _verify_producer_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
-    required_assignments = {
-        (
-            _string(
-                validated_outputs["triggerQueueResourceId"],
-                field="producer trigger queue resource ID",
-            ).casefold(),
-            identity_principal_ids[broker_identity_resource_id.casefold()],
-            "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
-        ),
-        (
-            _string(
-                validated_outputs["notificationQueueResourceId"],
-                field="producer notification queue resource ID",
-            ).casefold(),
-            identity_principal_ids[broker_identity_resource_id.casefold()],
-            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-        ),
-    }
-    required_assignments.update(
-        (
-            _string(
-                validated_outputs["triggerQueueResourceId"],
-                field="producer trigger queue resource ID",
-            ).casefold(),
-            identity_principal_ids[identity_resource_id.casefold()],
-            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-        )
-        for identity_resource_id in _string_list(
-            _parameter_value(
-                effective_parameters,
-                "triggerSubmitterIdentityResourceIds",
-            ),
-            field="producer trigger submitter identities",
-        )
+    expected_assignments = _producer_expected_rbac_assignments(
+        binding,
+        configuration=configuration,
+        outputs=validated_outputs,
+        foundation_values=foundation_values,
+        effective_parameters=effective_parameters,
+        principal_ids_by_identity=identity_principal_ids,
+        subscription_id=subscription_id,
     )
     assignment_ids_by_principal = _verify_rbac_resources(
         binding,
-        allowed_principal_ids=allowed_principal_ids,
+        expected_assignments=expected_assignments,
         subscription_id=subscription_id,
-        required_assignments=frozenset(required_assignments),
     )
-    _verify_no_broad_effective_assignments(
+    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
         allowed_principal_ids,
         subscription_id=subscription_id,
     )
     additional_allowed_assignment_ids: set[str] = set()
     for additional_binding in additional_rbac_bindings:
-        additional_allowed_assignment_ids.update(
-            _role_assignment_ids(additional_binding)
-        )
+        additional_allowed_assignment_ids.update(_role_assignment_ids(additional_binding))
     _verify_exact_effective_assignments(
         assignment_ids_by_principal,
         additional_allowed_assignment_ids=additional_allowed_assignment_ids,
         subscription_id=subscription_id,
+        effective_assignments_by_principal=effective_assignments_by_principal,
     )
     namespace_name = _string(
         _parameter_value(effective_parameters, "serviceBusNamespaceName"),
@@ -3753,12 +4530,8 @@ def _verify_producer_resources(
         "feed": foundation_values["incidentFeedV2SigningKeyUriWithVersion"],
         "report": foundation_values["incidentReportSigningKeyUriWithVersion"],
         "guidance": foundation_values["incidentGuidanceSigningKeyUriWithVersion"],
-        "enrichment": foundation_values[
-            "incidentEnrichmentSigningKeyUriWithVersion"
-        ],
-        "notification": foundation_values[
-            "incidentNotificationSigningKeyUriWithVersion"
-        ],
+        "enrichment": foundation_values["incidentEnrichmentSigningKeyUriWithVersion"],
+        "notification": foundation_values["incidentNotificationSigningKeyUriWithVersion"],
     }
     for name, expected_uri in expected_foundation_keys.items():
         configured_key = _mapping(
@@ -3857,9 +4630,7 @@ def _verify_publisher_resources(
         expected_command="athena-context",
         expected_argument="wc027-guidance-authority-publisher",
         expected_rule_name="wc027-guidance-authority-request",
-        expected_environment_name=(
-            "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON"
-        ),
+        expected_environment_name=("ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON"),
         expected_configuration_json=_string(
             validated_outputs["deployedPublisherConfigurationJson"],
             field="publisher configuration JSON",
@@ -3889,45 +4660,20 @@ def _verify_publisher_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
-    required_assignments = {
-        (
-            _string(
-                validated_outputs["requestQueueResourceId"],
-                field="publisher request queue resource ID",
-            ).casefold(),
-            identity_principal_ids[broker_identity_resource_id.casefold()],
-            "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
-        ),
-        (
-            _string(
-                validated_outputs["triggerQueueResourceId"],
-                field="publisher trigger queue resource ID",
-            ).casefold(),
-            identity_principal_ids[broker_identity_resource_id.casefold()],
-            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-        ),
-    }
-    required_assignments.update(
-        (
-            _string(
-                validated_outputs["requestQueueResourceId"],
-                field="publisher request queue resource ID",
-            ).casefold(),
-            identity_principal_ids[identity_resource_id.casefold()],
-            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
-        )
-        for identity_resource_id in _string_list(
-            additional_identity_ids,
-            field="publisher request submitter identities",
-        )
+    expected_assignments = _publisher_expected_rbac_assignments(
+        binding,
+        configuration=configuration,
+        outputs=validated_outputs,
+        effective_parameters=effective_parameters,
+        principal_ids_by_identity=identity_principal_ids,
+        subscription_id=subscription_id,
     )
     assignment_ids_by_principal = _verify_rbac_resources(
         binding,
-        allowed_principal_ids=allowed_principal_ids,
+        expected_assignments=expected_assignments,
         subscription_id=subscription_id,
-        required_assignments=frozenset(required_assignments),
     )
-    _verify_no_broad_effective_assignments(
+    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
         allowed_principal_ids,
         subscription_id=subscription_id,
     )
@@ -3944,13 +4690,12 @@ def _verify_publisher_resources(
         producer_configuration_for_rbac.get("deploymentBinding"),
         field="producer deployment binding",
     )
-    additional_allowed_assignment_ids = _role_assignment_ids(
-        producer_binding_for_rbac
-    )
+    additional_allowed_assignment_ids = _role_assignment_ids(producer_binding_for_rbac)
     _verify_exact_effective_assignments(
         assignment_ids_by_principal,
         additional_allowed_assignment_ids=additional_allowed_assignment_ids,
         subscription_id=subscription_id,
+        effective_assignments_by_principal=effective_assignments_by_principal,
     )
     _verify_service_bus_queue(
         job_resource_id=publisher_job_id,
@@ -4073,9 +4818,7 @@ def _verify_publisher_resources(
         _mapping(publisher_job["properties"], field="publisher job properties").get(
             "environmentId"
         ),
-        _mapping(producer_job["properties"], field="producer job properties").get(
-            "environmentId"
-        ),
+        _mapping(producer_job["properties"], field="producer job properties").get("environmentId"),
         field="publisher managed environment",
     )
     producer_configuration = _mapping(
@@ -4125,11 +4868,7 @@ def _parameter_bindings(
     effective_parameters: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
     if stage == "foundation":
-        return {
-            "foundationParametersSha256": _foundation_parameter_digest(
-                effective_parameters
-            )
-        }
+        return {"foundationParametersSha256": _foundation_parameter_digest(effective_parameters)}
     names = {
         "producer": (
             "correlationSourceStorageAccountResourceId",
@@ -4140,14 +4879,17 @@ def _parameter_bindings(
             "managedEnvironmentResourceId",
             "monitoringCollectorKeyResourceId",
             "monitoringIntentKeyResourceId",
+            "registryResourceId",
             "serviceBusNamespaceName",
             "triggerSubmitterIdentityResourceIds",
         ),
         "publisher": (
             "authorityStorageAccountResourceId",
             "activationStorageAccountResourceId",
+            "bindingTrustReaderIdentityResourceId",
             "bindingKeyResourceId",
             "managedEnvironmentResourceId",
+            "registryResourceId",
             "requestSubmitterIdentityResourceIds",
             "requestKeyResourceId",
             "serviceBusNamespaceName",
@@ -4197,9 +4939,7 @@ def _handoff_outputs(
                 approved_configuration.get("wc027DeploymentReadiness"),
                 field="live-acceptance WC-027 readiness",
             ),
-            "publisherInvocationBoundary": dict(
-                PUBLISHER_INVOCATION_BOUNDARY
-            ),
+            "publisherInvocationBoundary": dict(PUBLISHER_INVOCATION_BOUNDARY),
         }
         _validate_live_acceptance_handoff_outputs(projected)
         return projected
@@ -4285,9 +5025,7 @@ def _readiness_sections(
             field="live-acceptance WC-027 readiness output",
         )
     if set(readiness) != {"producer", "publisher"}:
-        raise OrchestrationError(
-            "live-acceptance WC-027 readiness output has unexpected fields"
-        )
+        raise OrchestrationError("live-acceptance WC-027 readiness output has unexpected fields")
     producer_readback = _mapping(
         readiness.get("producer"),
         field="live-acceptance producer readback",
@@ -4303,9 +5041,7 @@ def _readiness_sections(
         "configurationDigest",
         "bindingEvidenceDigest",
     }:
-        raise OrchestrationError(
-            "live-acceptance producer readback has unexpected fields"
-        )
+        raise OrchestrationError("live-acceptance producer readback has unexpected fields")
     if set(publisher_readback) != {
         "ready",
         "jobResourceId",
@@ -4314,9 +5050,7 @@ def _readiness_sections(
         "embeddedProducerConfigurationDigest",
         "bindingEvidenceDigest",
     }:
-        raise OrchestrationError(
-            "live-acceptance publisher readback has unexpected fields"
-        )
+        raise OrchestrationError("live-acceptance publisher readback has unexpected fields")
     if producer_readback.get("ready") is not True:
         raise OrchestrationError("live-acceptance did not confirm producer readiness")
     if publisher_readback.get("ready") is not True:
@@ -4523,9 +5257,7 @@ def plan(args: argparse.Namespace) -> Path:
         _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
             foundation=foundation,
-            effective_parameters=_bindings_as_parameters(
-                _handoff_bindings(producer)
-            ),
+            effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
         )
         _verify_publisher_binding_key_head(
@@ -4609,9 +5341,7 @@ def plan(args: argparse.Namespace) -> Path:
         allowed_change_ids=frozenset(allowed_changes),
     )
     if violations:
-        details = "; ".join(
-            f"{item.code}: {item.subject}: {item.detail}" for item in violations
-        )
+        details = "; ".join(f"{item.code}: {item.subject}: {item.detail}" for item in violations)
         raise OrchestrationError(f"WC-029 what-if gate failed: {details}")
     manifest = {
         "schemaVersion": PLAN_SCHEMA_VERSION,
@@ -4633,38 +5363,24 @@ def plan(args: argparse.Namespace) -> Path:
         "whatIfSha256": _sha256_file(what_if_path),
         "allowedChangeResourceIds": sorted(allowed_changes),
         "foundationHandoffPath": (
-            None
-            if args.foundation_handoff is None
-            else str(args.foundation_handoff.resolve())
+            None if args.foundation_handoff is None else str(args.foundation_handoff.resolve())
         ),
         "foundationHandoffSha256": (
-            None
-            if args.foundation_handoff is None
-            else _sha256_file(args.foundation_handoff)
+            None if args.foundation_handoff is None else _sha256_file(args.foundation_handoff)
         ),
         "producerHandoffPath": (
-            None
-            if args.producer_handoff is None
-            else str(args.producer_handoff.resolve())
+            None if args.producer_handoff is None else str(args.producer_handoff.resolve())
         ),
         "producerHandoffSha256": (
-            None
-            if args.producer_handoff is None
-            else _sha256_file(args.producer_handoff)
+            None if args.producer_handoff is None else _sha256_file(args.producer_handoff)
         ),
         "publisherHandoffPath": (
-            None
-            if args.publisher_handoff is None
-            else str(args.publisher_handoff.resolve())
+            None if args.publisher_handoff is None else str(args.publisher_handoff.resolve())
         ),
         "publisherHandoffSha256": (
-            None
-            if args.publisher_handoff is None
-            else _sha256_file(args.publisher_handoff)
+            None if args.publisher_handoff is None else _sha256_file(args.publisher_handoff)
         ),
-        "predecessorReceipts": _predecessor_receipt_references(
-            verified_predecessors
-        ),
+        "predecessorReceipts": _predecessor_receipt_references(verified_predecessors),
     }
     _write_new_json(manifest_path, manifest)
     return manifest_path
@@ -4676,9 +5392,7 @@ def apply(args: argparse.Namespace) -> Path:
         field="reviewed plan SHA-256",
     )
     if _sha256_file(args.plan_manifest) != reviewed_digest:
-        raise OrchestrationError(
-            "plan manifest does not match the independently reviewed SHA-256"
-        )
+        raise OrchestrationError("plan manifest does not match the independently reviewed SHA-256")
     _ensure_evidence_directory_outside_repository(args.plan_manifest.parent)
     _ensure_clean_worktree()
     manifest = _load_plan_manifest(args.plan_manifest)
@@ -4700,9 +5414,7 @@ def apply(args: argparse.Namespace) -> Path:
         _string(manifest.get("effectiveParameterPath"), field="effective parameters")
     )
     what_if_path = Path(_string(manifest.get("whatIfPath"), field="what-if path"))
-    base_parameter_path = Path(
-        _string(manifest.get("baseParameterPath"), field="base parameters")
-    )
+    base_parameter_path = Path(_string(manifest.get("baseParameterPath"), field="base parameters"))
     if _sha256_file(base_parameter_path) != manifest.get("baseParameterSha256"):
         raise OrchestrationError("base parameter artifact changed after review")
     if _sha256_file(effective_path) != manifest.get("effectiveParameterSha256"):
@@ -4795,13 +5507,9 @@ def apply(args: argparse.Namespace) -> Path:
         for predecessor in ("foundation", "producer", "publisher")
     }
     handoff_paths = {
-        "foundation": (
-            None if foundation_path is None else Path(str(foundation_path))
-        ),
+        "foundation": (None if foundation_path is None else Path(str(foundation_path))),
         "producer": None if producer_path is None else Path(str(producer_path)),
-        "publisher": (
-            None if publisher_path is None else Path(str(publisher_path))
-        ),
+        "publisher": (None if publisher_path is None else Path(str(publisher_path))),
     }
     _validate_stage_inputs(
         stage=stage,
@@ -4875,9 +5583,7 @@ def apply(args: argparse.Namespace) -> Path:
         _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
             foundation=foundation,
-            effective_parameters=_bindings_as_parameters(
-                _handoff_bindings(producer)
-            ),
+            effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
         )
         _verify_publisher_binding_key_head(
@@ -4999,9 +5705,7 @@ def apply(args: argparse.Namespace) -> Path:
         _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
             foundation=foundation,
-            effective_parameters=_bindings_as_parameters(
-                _handoff_bindings(producer)
-            ),
+            effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
             additional_rbac_bindings=(deployed_publisher_binding,),
         )
@@ -5013,9 +5717,7 @@ def apply(args: argparse.Namespace) -> Path:
         )
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
-    predecessor_receipt_hashes = _predecessor_receipt_hashes(
-        verified_predecessors
-    )
+    predecessor_receipt_hashes = _predecessor_receipt_hashes(verified_predecessors)
     handoff = {
         "schemaVersion": HANDOFF_SCHEMA_VERSION,
         "stage": stage,
@@ -5026,15 +5728,11 @@ def apply(args: argparse.Namespace) -> Path:
         "outputs": handoff_outputs,
         "outputsSha256": _sha256_bytes(_canonical_json_bytes(handoff_outputs)),
         "parameterBindings": bindings,
-        "parameterBindingsSha256": _sha256_bytes(
-            _canonical_json_bytes(bindings)
-        ),
+        "parameterBindingsSha256": _sha256_bytes(_canonical_json_bytes(bindings)),
         "planManifestSha256": _sha256_file(args.plan_manifest),
         "predecessorReceiptSha256s": predecessor_receipt_hashes,
     }
-    handoff_path = args.plan_manifest.with_name(
-        f"{stage}-{deployment_name}.handoff.json"
-    )
+    handoff_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.handoff.json")
     _write_new_json(handoff_path, handoff)
     receipt = {
         "schemaVersion": RECEIPT_SCHEMA_VERSION,
@@ -5050,9 +5748,7 @@ def apply(args: argparse.Namespace) -> Path:
         "handoffSha256": _sha256_file(handoff_path),
         "predecessorReceiptSha256s": predecessor_receipt_hashes,
     }
-    receipt_path = args.plan_manifest.with_name(
-        f"{stage}-{deployment_name}.receipt.json"
-    )
+    receipt_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.receipt.json")
     _write_new_json(receipt_path, receipt)
     return receipt_path
 
