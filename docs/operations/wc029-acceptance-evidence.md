@@ -63,9 +63,11 @@ Subdirectories are allowed. Every file must be JSON. Symbolic links, hard links,
 points, unreadable subtrees, unlisted files, missing files, path traversal, duplicate paths, and
 case-only path aliases fail.
 
-Before retaining child handles, the harness bounds the complete tree to 256 directories, 16 path
-segments, 512 characters per relative path, and 16,384 aggregate relative-path characters. Empty
-directories count toward every applicable bound and cannot exhaust the process handle table.
+The harness uses incremental bounded `os.scandir` traversal rather than `os.walk`. It charges every
+entry before recording its identity or adding a directory to the bounded traversal stack. Before
+retaining child handles, it limits the complete tree to 256 directories, 16 path segments, 512
+characters per relative path, and 16,384 aggregate relative-path characters. Empty directories
+count toward every applicable bound and cannot exhaust the process handle table.
 
 Example:
 
@@ -202,6 +204,13 @@ Every scenario has all five phases:
 
 The NSG connectivity scenario also requires signed change evidence.
 
+The plan precommits a unique correlation-request intent nonce and digest over the scenario,
+execution ID, accepted context binding, and exact target. The canonical request anchor resource
+must equal both the plan and trusted capability targets. Request issuance belongs to `plan`;
+`trustedAsOf` and expiry belong to `observe`, with expiry before recovery. The final request digest
+is retained by the later signed execution manifest and report lineage, not by the precommit plan,
+and is not used as a substitute for the earlier intent commitment.
+
 Every signed phase window has positive duration and is strictly separated from the following
 window. Mutation, recovery, recovered-state capture, Job start, Job completion, Job read-back, and
 recovery proof timestamps must be strictly increasing; equal timestamps fail.
@@ -260,6 +269,14 @@ not chosen by the index. The harness verifies:
   notification signatures;
 - each v2 feed index against the canonical digest of its corresponding signed v1 active-state
   source index through the shared feed-index validator;
+- the incident enrichment manifest through the shared
+  `validate_incident_enrichment_manifest_binding` validator against the exact captured bound
+  request, report, guidance, subject, transition, revision, publication statement, authority,
+  attestations, immutable references, and source-state digests;
+- the exact report, guidance, and enrichment references through
+  `validate_published_correlation_report_assets`, `validate_incident_guidance_assets`, and
+  `validate_incident_enrichment_assets`, including every captured attestation byte digest and
+  signature;
 - an independent signed scenario-execution manifest that covers every plan/apply/observe/recover/
   verify artifact, its exact bytes, phase, input/request digest, execution ID, target, action, and
   bounded chronological window; and
@@ -315,6 +332,10 @@ Harness-owned canonical receipts include:
 
 These receipts summarize already captured observations. Preserve the raw source capture as a
 separate listed evidence artifact when operational review requires it.
+
+Every `bindsArtifactId` is validated as an existing declared artifact before any binding lookup.
+Unknown index, attestation, Job, key, manifest, or scenario binding references fail as bounded
+domain errors and the CLI returns exit code `2`; they never escape as `KeyError` tracebacks.
 
 ## Run
 

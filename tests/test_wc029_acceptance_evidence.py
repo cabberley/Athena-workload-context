@@ -63,6 +63,10 @@ from athena_context.contracts import (
     incident_state_signature_preimage,
     resolve_manifest_profile,
     sha256_hex,
+    validate_incident_enrichment_assets,
+    validate_incident_enrichment_manifest_binding,
+    validate_incident_guidance_assets,
+    validate_published_correlation_report_assets,
 )
 from athena_context.contracts.change_ingestion import (
     change_evidence_attestation_preimage,
@@ -1777,9 +1781,9 @@ def _correlation_request_for_context(
     )
     request_payload.update(
         {
-            "issuedAt": trusted_as_of - timedelta(minutes=1),
+            "issuedAt": (trusted_as_of - timedelta(minutes=11, seconds=30)),
             "trustedAsOf": trusted_as_of,
-            "expiresAt": trusted_as_of + timedelta(minutes=9),
+            "expiresAt": trusted_as_of + timedelta(seconds=20),
             "contextBinding": context_binding,
             "incidentAnchor": incident_anchor,
             "monitoringHandoff": monitoring_handoff,
@@ -1977,10 +1981,22 @@ def _scenario_plan(
     baseline_state_digest: str,
     planned_at: datetime,
     monitoring_request_digest: str,
-    correlation_request_digest: str,
+    correlation_context_binding_digest: str,
     change_request_digest: str | None,
     verification_input_digest: str,
 ) -> acceptance.Wc029ScenarioPlanEvidence:
+    correlation_request_intent_nonce = sha256_hex(
+        f"{scenario_execution_id}:correlation-request-intent"
+    ).removeprefix("sha256:")[:32]
+    correlation_request_intent_digest = compute_artifact_digest(
+        {
+            "scenarioId": scenario_id,
+            "scenarioExecutionId": scenario_execution_id,
+            "targetResourceId": capability.target_resource_id.casefold().rstrip("/"),
+            "contextBindingDigest": correlation_context_binding_digest,
+            "intentNonce": correlation_request_intent_nonce,
+        }
+    )
     payload: dict[str, object] = {
         "schemaVersion": acceptance.SCENARIO_PLAN_SCHEMA_VERSION,
         "scenarioId": scenario_id,
@@ -1994,7 +2010,9 @@ def _scenario_plan(
         "mutationActionDigest": capability.mutation_action_digest,
         "recoveryActionDigest": capability.recovery_action_digest,
         "monitoringRequestDigest": monitoring_request_digest,
-        "correlationRequestDigest": correlation_request_digest,
+        "correlationContextBindingDigest": (correlation_context_binding_digest),
+        "correlationRequestIntentNonce": correlation_request_intent_nonce,
+        "correlationRequestIntentDigest": correlation_request_intent_digest,
         "changeRequestDigest": change_request_digest,
         "verificationInputDigest": verification_input_digest,
         "baselineStateArtifactId": baseline_state_artifact_id,
@@ -3056,11 +3074,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
     capabilities = tuple(
         _scenario_capability(
             scenario_class,
-            (
-                change.evidence.target_resource_id
-                if scenario_class == "nsg-connectivity-loss"
-                else _TARGETS[scenario_class]
-            ),
+            WEB_ID,
             incident_producing=scenario_class == "web-tier-failure",
         )
         for scenario_class in acceptance.REQUIRED_SCENARIO_CLASSES
@@ -3560,7 +3574,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             baseline_state_digest=baseline_state.state_digest,
             planned_at=planned_at,
             monitoring_request_digest=acceptance._monitoring_request_digest(monitoring),
-            correlation_request_digest=scenario_request.request_digest,
+            correlation_context_binding_digest=(scenario_request.context_binding.binding_digest),
             change_request_digest=(
                 change.evidence.source_digest if scenario_class == "nsg-connectivity-loss" else None
             ),
@@ -3986,7 +4000,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             "mutationActionDigest": capability.mutation_action_digest,
             "recoveryActionDigest": capability.recovery_action_digest,
             "monitoringRequestDigest": (scenario_plan.monitoring_request_digest),
-            "correlationRequestDigest": (scenario_plan.correlation_request_digest),
+            "correlationRequestDigest": scenario_request.request_digest,
             "changeRequestDigest": scenario_plan.change_request_digest,
             "verificationInputDigest": (scenario_plan.verification_input_digest),
             "planDigest": scenario_plan.plan_digest,
@@ -4298,6 +4312,31 @@ def test_index_rejects_missing_duplicate_and_aliased_inputs(
 
     with pytest.raises(acceptance.Wc029AcceptanceEvidenceError):
         _aggregate(bundle)
+
+
+def test_unknown_binding_references_fail_as_bounded_domain_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    declaration = _declaration(
+        bundle,
+        "scenario-disk-capacity-pressure-report-attestation",
+    )
+    declaration["bindsArtifactId"] = "missing-report-artifact"
+    _rewrite_index(bundle)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="acceptance index failed closed validation",
+    ):
+        _aggregate(bundle)
+
+    assert acceptance.main(_cli_arguments(bundle)) == 2
+    error = capsys.readouterr().err
+    assert "acceptance index failed closed validation" in error
+    assert "KeyError" not in error
+    assert "Traceback" not in error
 
 
 def test_rejects_missing_and_unlisted_files(tmp_path: Path) -> None:
@@ -4656,24 +4695,14 @@ def test_unreadable_subtree_walk_error_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = _build_bundle(tmp_path)
-    real_walk = os.walk
+    real_scandir = os.scandir
 
-    def failing_walk(
-        path: Path,
-        *,
-        topdown: bool,
-        followlinks: bool,
-        onerror: Any,
-    ) -> Any:
-        onerror(PermissionError("synthetic unreadable subtree"))
-        return real_walk(
-            path,
-            topdown=topdown,
-            followlinks=followlinks,
-            onerror=onerror,
-        )
+    def failing_scandir(path: os.PathLike[str] | str) -> Any:
+        if Path(path) == bundle.root:
+            raise PermissionError("synthetic unreadable subtree")
+        return real_scandir(path)
 
-    monkeypatch.setattr(acceptance.os, "walk", failing_walk)
+    monkeypatch.setattr(acceptance.os, "scandir", failing_scandir)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
         match="unreadable subtree",
@@ -5082,6 +5111,17 @@ def test_report_and_attestation_require_the_accepted_context_binding(
     plan = acceptance.Wc029ScenarioPlanEvidence.model_validate_json(
         context_mismatch.artifact_paths["scenario-disk-capacity-pressure-plan"].read_bytes()
     )
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        context_mismatch.artifact_paths["version-inventory"].read_bytes()
+    )
+    capability = next(
+        item for item in inventory.scenario_capabilities if item.scenario_class == scenario_class
+    )
+    execution_manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        context_mismatch.artifact_paths[
+            "scenario-disk-capacity-pressure-execution-manifest"
+        ].read_bytes()
+    )
     active_state = IncidentState.model_validate_json(
         context_mismatch.artifact_paths["scenario-web-tier-failure-incident-active"].read_bytes()
     )
@@ -5090,7 +5130,17 @@ def test_report_and_attestation_require_the_accepted_context_binding(
             "scenario-web-tier-failure-incident-active-attestation"
         ].read_bytes()
     )
-    wrong_request = _request(dependency_paths=published_manifest.context_binding.dependency_paths)
+    wrong_context = _request(
+        dependency_paths=published_manifest.context_binding.dependency_paths
+    ).context_binding
+    assert isinstance(wrong_context, PublishedRuntimeContextBinding)
+    wrong_request = _correlation_request_for_context(
+        wrong_context,
+        trusted_as_of=request.trusted_as_of,
+        rule_catalog_digest=request.rule_catalog_digest,
+        monitoring_key=context_mismatch.keys["monitoring"],
+        monitoring_private_key=context_mismatch.private_keys["monitoring"],
+    )
     incident_attestation = PublishedCorrelationReportAttestation.model_validate_json(
         context_mismatch.artifact_paths["scenario-web-tier-failure-report-attestation"].read_bytes()
     )
@@ -5111,6 +5161,28 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         key=context_mismatch.keys["report"],
         private_key=context_mismatch.private_keys["report"],
     )
+    wrong_plan_payload = plan.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"plan_digest"},
+    )
+    wrong_plan_payload["correlationContextBindingDigest"] = (
+        wrong_request.context_binding.binding_digest
+    )
+    wrong_plan_payload["correlationRequestIntentDigest"] = compute_artifact_digest(
+        {
+            "scenarioId": plan.scenario_id,
+            "scenarioExecutionId": plan.scenario_execution_id,
+            "targetResourceId": plan.target_resource_id.casefold().rstrip("/"),
+            "contextBindingDigest": (wrong_request.context_binding.binding_digest),
+            "intentNonce": plan.correlation_request_intent_nonce,
+        }
+    )
+    wrong_plan = _digest_bound_model(
+        acceptance.Wc029ScenarioPlanEvidence,
+        wrong_plan_payload,
+        digest_field="planDigest",
+    )
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
         match="captured correlation request context",
@@ -5122,7 +5194,9 @@ def test_report_and_attestation_require_the_accepted_context_binding(
             wrong_request.monitoring_handoff,
             published_manifest,
             authority,
-            plan,
+            wrong_plan,
+            capability,
+            execution_manifest,
         )
 
     smuggled = _build_bundle(tmp_path / "smuggled")
@@ -5182,6 +5256,85 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         match="statement does not match exact captured provenance",
     ):
         _aggregate(incident_mismatch)
+
+
+def test_correlation_request_target_intent_and_phase_timing_are_bound(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path / "binding")
+    scenario_class = "disk-capacity-pressure"
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"scenario-{scenario_class}-correlation-request"].read_bytes()
+    )
+    plan = acceptance.Wc029ScenarioPlanEvidence.model_validate_json(
+        bundle.artifact_paths[f"scenario-{scenario_class}-plan"].read_bytes()
+    )
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        bundle.artifact_paths["version-inventory"].read_bytes()
+    )
+    capability = next(
+        item for item in inventory.scenario_capabilities if item.scenario_class == scenario_class
+    )
+    execution_manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths[f"scenario-{scenario_class}-execution-manifest"].read_bytes()
+    )
+    other_target = _TARGETS[scenario_class]
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="precommitted scenario target",
+    ):
+        acceptance._validate_correlation_request_plan_binding(
+            request,
+            plan.model_copy(update={"target_resource_id": other_target}),
+            capability.model_copy(update={"target_resource_id": other_target}),
+            execution_manifest,
+        )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="precommitted scenario target",
+    ):
+        acceptance._validate_correlation_request_plan_binding(
+            request.model_copy(update={"issued_at": plan.planned_at - timedelta(seconds=1)}),
+            plan,
+            capability,
+            execution_manifest,
+        )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="precommitted scenario target",
+    ):
+        acceptance._validate_correlation_request_plan_binding(
+            request.model_copy(update={"issued_at": plan.planned_at}),
+            plan,
+            capability,
+            execution_manifest,
+        )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="outside the signed observe phase window",
+    ):
+        acceptance._validate_correlation_request_plan_binding(
+            request.model_copy(
+                update={"expires_at": (execution_manifest.phase_windows[3].started_at)}
+            ),
+            plan,
+            capability,
+            execution_manifest,
+        )
+
+    intent = _build_bundle(tmp_path / "intent")
+    plan_path = intent.artifact_paths[f"scenario-{scenario_class}-plan"]
+    plan_document = _read_json(plan_path)
+    plan_document["correlationRequestIntentNonce"] = "f" * 32
+    _write(plan_path, plan_document)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="scenario-disk-capacity-pressure-plan.*violates",
+    ):
+        _aggregate(intent)
 
 
 def test_verification_job_must_start_after_recovery(
@@ -5895,6 +6048,185 @@ def test_incident_findings_require_exact_effective_manifest_coverage() -> None:
         )
 
 
+def test_enrichment_manifest_uses_exact_shared_binding_validation(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    scenario_prefix = "scenario-web-tier-failure"
+    enrichment = IncidentEnrichmentManifest.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-enrichment"].read_bytes()
+    )
+    bound_request = IncidentBoundCorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-incident-bound-request"].read_bytes()
+    )
+    report = CorrelationReport.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-report"].read_bytes()
+    )
+    guidance = IncidentGuidance.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-guidance"].read_bytes()
+    )
+    report_attestation = PublishedCorrelationReportAttestation.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-report-attestation"].read_bytes()
+    )
+    guidance_attestation = IncidentGuidanceAttestation.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-guidance-attestation"].read_bytes()
+    )
+    enrichment_attestation = IncidentEnrichmentAttestation.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-enrichment-attestation"].read_bytes()
+    )
+    active_feed = IncidentEnrichmentFeedPointer.model_validate_json(
+        bundle.artifact_paths[f"{scenario_prefix}-feed-active"].read_bytes()
+    )
+
+    def rebuild_manifest(
+        *,
+        incident_revision: int | None = None,
+        state_reference: VersionPinnedBlobReference | None = None,
+        publication_statement_digest: str | None = None,
+    ) -> IncidentEnrichmentManifest:
+        report_asset_payload = enrichment.correlation_report_asset.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"reference_id", "reference_digest"},
+        )
+        if incident_revision is not None:
+            report_asset_payload["incidentRevision"] = incident_revision
+        if publication_statement_digest is not None:
+            report_asset_payload["publicationStatementDigest"] = publication_statement_digest
+        report_asset_digest = compute_artifact_digest(_json_value(report_asset_payload))
+        report_asset = PublishedCorrelationReportAssetReference(
+            **report_asset_payload,
+            referenceId=("report-asset-" + report_asset_digest.removeprefix("sha256:")[:32]),
+            referenceDigest=report_asset_digest,
+        )
+        manifest_payload = enrichment.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"enrichment_id", "manifest_digest"},
+        )
+        manifest_payload["correlationReportAsset"] = report_asset
+        if incident_revision is not None:
+            manifest_payload["incidentRevision"] = incident_revision
+        if state_reference is not None:
+            manifest_payload["incidentStateReference"] = state_reference
+        manifest_digest = compute_artifact_digest(_json_value(manifest_payload))
+        return IncidentEnrichmentManifest(
+            **manifest_payload,
+            enrichmentId=("incident-enrichment-" + manifest_digest.removeprefix("sha256:")[:32]),
+            manifestDigest=manifest_digest,
+        )
+
+    wrong_revision = rebuild_manifest(incident_revision=enrichment.incident_revision + 1)
+    wrong_reference = rebuild_manifest(
+        state_reference=enrichment.incident_state_reference.model_copy(
+            update={"version": "substituted-state-version"}
+        )
+    )
+    wrong_statement = rebuild_manifest(publication_statement_digest="sha256:" + ("f" * 64))
+    for mutated in (
+        wrong_revision,
+        wrong_reference,
+        wrong_statement,
+    ):
+        with pytest.raises(
+            ValueError,
+            match="does not match exact assets",
+        ):
+            validate_incident_enrichment_manifest_binding(
+                mutated,
+                bound_request,
+                report,
+                guidance,
+            )
+
+    report_reference_payload = enrichment.correlation_report_asset.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"reference_id", "reference_digest"},
+    )
+    report_reference_payload["attestationReference"] = (
+        enrichment.correlation_report_asset.attestation_reference.model_copy(
+            update={"content_digest": "sha256:" + ("f" * 64)}
+        )
+    )
+    report_reference_digest = compute_artifact_digest(_json_value(report_reference_payload))
+    wrong_report_reference = PublishedCorrelationReportAssetReference(
+        **report_reference_payload,
+        referenceId=("report-asset-" + report_reference_digest.removeprefix("sha256:")[:32]),
+        referenceDigest=report_reference_digest,
+    )
+    with pytest.raises(ValueError, match="do not match exact content"):
+        validate_published_correlation_report_assets(
+            wrong_report_reference,
+            report,
+            report_attestation,
+            bound_request,
+            expected_authority_proof_digest=(
+                bound_request.correlation_request.context_binding.publication_authority_reference.content_digest
+            ),
+            trusted_report_key_id=bundle.keys["report"].key_id,
+            report_signature_verifier=acceptance._signature_verifier(
+                bundle.keys["report"].public_key
+            ),
+        )
+
+    guidance_reference_payload = enrichment.guidance_asset.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"reference_id", "reference_digest"},
+    )
+    guidance_reference_payload["attestationReference"] = (
+        enrichment.guidance_asset.attestation_reference.model_copy(
+            update={"content_digest": "sha256:" + ("e" * 64)}
+        )
+    )
+    guidance_reference_digest = compute_artifact_digest(_json_value(guidance_reference_payload))
+    wrong_guidance_reference = IncidentGuidanceAssetReference(
+        **guidance_reference_payload,
+        referenceId=("guidance-asset-" + guidance_reference_digest.removeprefix("sha256:")[:32]),
+        referenceDigest=guidance_reference_digest,
+    )
+    with pytest.raises(ValueError, match="do not match exact content"):
+        validate_incident_guidance_assets(
+            wrong_guidance_reference,
+            guidance,
+            guidance_attestation,
+            trusted_guidance_key_id=bundle.keys["guidance"].key_id,
+            guidance_signature_verifier=acceptance._signature_verifier(
+                bundle.keys["guidance"].public_key
+            ),
+        )
+
+    enrichment_reference_payload = active_feed.enrichment_asset.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"reference_id", "reference_digest"},
+    )
+    enrichment_reference_payload["attestationReference"] = (
+        active_feed.enrichment_asset.attestation_reference.model_copy(
+            update={"content_digest": "sha256:" + ("d" * 64)}
+        )
+    )
+    enrichment_reference_digest = compute_artifact_digest(_json_value(enrichment_reference_payload))
+    wrong_enrichment_reference = IncidentEnrichmentAssetReference(
+        **enrichment_reference_payload,
+        referenceId=(
+            "enrichment-asset-" + enrichment_reference_digest.removeprefix("sha256:")[:32]
+        ),
+        referenceDigest=enrichment_reference_digest,
+    )
+    with pytest.raises(ValueError, match="do not match exact content"):
+        validate_incident_enrichment_assets(
+            wrong_enrichment_reference,
+            enrichment,
+            enrichment_attestation,
+            trusted_enrichment_key_id=bundle.keys["enrichment"].key_id,
+            enrichment_signature_verifier=acceptance._signature_verifier(
+                bundle.keys["enrichment"].public_key
+            ),
+        )
+
+
 def test_v2_feed_indexes_require_signed_authoritative_v1_sources(
     tmp_path: Path,
 ) -> None:
@@ -6044,7 +6376,16 @@ def test_private_snapshot_blocks_or_detects_restored_mtime_race(
 
 def test_snapshot_rejects_directory_handle_exhaustion_inputs(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    valid = _build_bundle(tmp_path / "scandir")
+
+    def unexpected_walk(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("os.walk must not enumerate the evidence tree")
+
+    monkeypatch.setattr(acceptance.os, "walk", unexpected_walk)
+    _aggregate(valid)
+
     directory_count = _build_bundle(tmp_path / "directory-count")
     for index in range(acceptance.MAX_EVIDENCE_DIRECTORIES):
         (directory_count.root / f"empty-{index:03d}").mkdir()

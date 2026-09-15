@@ -58,7 +58,11 @@ from athena_context.contracts import (
     resolve_manifest_profile,
     sha256_hex,
     validate_correlation_report_binding,
+    validate_incident_enrichment_assets,
+    validate_incident_enrichment_manifest_binding,
     validate_incident_feed_index_assets,
+    validate_incident_guidance_assets,
+    validate_published_correlation_report_assets,
 )
 from athena_context.contracts.change_ingestion import change_evidence_attestation_preimage
 from athena_context.contracts.monitoring import monitoring_handoff_preimage
@@ -1956,8 +1960,16 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
         alias="monitoringRequestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
-    correlation_request_digest: str = Field(
-        alias="correlationRequestDigest",
+    correlation_context_binding_digest: str = Field(
+        alias="correlationContextBindingDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    correlation_request_intent_nonce: str = Field(
+        alias="correlationRequestIntentNonce",
+        pattern=r"^[a-f0-9]{32}$",
+    )
+    correlation_request_intent_digest: str = Field(
+        alias="correlationRequestIntentDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
     change_request_digest: str | None = Field(
@@ -2012,6 +2024,19 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
         ):
             if values != tuple(sorted(values)) or len(values) != len(set(values)):
                 raise ValueError(f"{label} must be unique and sorted")
+        expected_request_intent_digest = compute_artifact_digest(
+            {
+                "scenarioId": self.scenario_id,
+                "scenarioExecutionId": self.scenario_execution_id,
+                "targetResourceId": self.target_resource_id.casefold().rstrip("/"),
+                "contextBindingDigest": self.correlation_context_binding_digest,
+                "intentNonce": self.correlation_request_intent_nonce,
+            }
+        )
+        if self.correlation_request_intent_digest != expected_request_intent_digest:
+            raise ValueError(
+                "correlationRequestIntentDigest does not bind the precommitted request intent"
+            )
         if self.plan_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("planDigest does not bind the scenario plan")
         return self
@@ -2771,6 +2796,15 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             raise ValueError("scenario IDs must be unique")
         if set(scenario_classes) != set(REQUIRED_SCENARIO_CLASSES):
             raise ValueError("acceptance index must contain every required WC-029 scenario class")
+        binding_references = {
+            item.binds_artifact_id for item in self.artifacts if item.binds_artifact_id is not None
+        }
+        unknown_binding_references = binding_references - set(artifact_ids)
+        if unknown_binding_references:
+            raise ValueError(
+                "index contains unknown bindsArtifactId references: "
+                f"{sorted(unknown_binding_references)}"
+            )
         references = list(self.global_artifact_ids)
         for scenario in self.scenarios:
             for _phase, phase_ids in scenario.phases.items():
@@ -2884,7 +2918,9 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             if expected_subject_class is None:
                 continue
             subject_id = cast(str, item.binds_artifact_id)
-            subject = artifact_by_id[subject_id]
+            subject = artifact_by_id.get(subject_id)
+            if subject is None:
+                raise ValueError(f"{item.artifact_id} binds an unknown artifact ID")
             if subject.evidence_class != expected_subject_class:
                 raise ValueError(
                     f"{item.artifact_id} binds {subject.evidence_class}, "
@@ -2895,7 +2931,9 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
         for item in self.artifacts:
             if item.evidence_class != "job-readback":
                 continue
-            execution = artifact_by_id[cast(str, item.binds_artifact_id)]
+            execution = artifact_by_id.get(cast(str, item.binds_artifact_id))
+            if execution is None:
+                raise ValueError("Job read-back binds an unknown execution")
             if execution.evidence_class != "job-execution":
                 raise ValueError("Job read-back must bind a Job execution")
             if owner[item.artifact_id] != owner[execution.artifact_id]:
@@ -3617,11 +3655,11 @@ def _scan_bundle_tree(
     files: dict[str, _PathIdentity] = {}
     total_path_characters = 0
 
-    def account_path(relative: str) -> None:
+    def account_path(relative: str, *, depth: int) -> None:
         nonlocal total_path_characters
         if len(relative) > MAX_EVIDENCE_RELATIVE_PATH_CHARS:
             raise Wc029AcceptanceEvidenceError("evidence relative path exceeds its length bound")
-        if len(Path(relative).parts) > MAX_EVIDENCE_PATH_DEPTH:
+        if depth > MAX_EVIDENCE_PATH_DEPTH:
             raise Wc029AcceptanceEvidenceError("evidence tree exceeds its traversal-depth bound")
         total_path_characters += len(relative)
         if total_path_characters > MAX_TOTAL_EVIDENCE_PATH_CHARACTERS:
@@ -3629,73 +3667,75 @@ def _scan_bundle_tree(
                 "evidence tree exceeds its total path-character bound"
             )
 
-    for current_text, directory_names, file_names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-        onerror=_raise_walk_error,
-    ):
-        current = Path(current_text)
-        for name in directory_names:
-            directory = current / name
-            relative = directory.relative_to(root).as_posix()
-            if len(directories) >= MAX_EVIDENCE_DIRECTORIES:
-                raise Wc029AcceptanceEvidenceError(
-                    "evidence directory exceeds its directory-count bound"
-                )
-            account_path(relative)
-            try:
-                directory_stat = directory.lstat()
-            except OSError as exc:
-                raise Wc029AcceptanceEvidenceError(
-                    "evidence directory contains an unreadable entry"
-                ) from exc
-            if (
-                not stat.S_ISDIR(directory_stat.st_mode)
-                or stat.S_ISLNK(directory_stat.st_mode)
-                or _is_reparse_point(directory_stat)
-            ):
-                raise Wc029AcceptanceEvidenceError(
-                    "evidence directory contains a linked or non-directory entry"
-                )
-            directories[relative] = _PathIdentity.from_stat(directory_stat)
-        for name in file_names:
-            path = current / name
-            relative = path.relative_to(root).as_posix()
-            if len(files) >= MAX_EVIDENCE_FILES + 1:
-                raise Wc029AcceptanceEvidenceError(
-                    "evidence directory exceeds its file-count bound"
-                )
-            account_path(relative)
-            if not relative.endswith(".json"):
-                raise Wc029AcceptanceEvidenceError(
-                    f"evidence directory contains non-JSON file {relative}"
-                )
-            try:
-                file_stat = path.lstat()
-            except OSError as exc:
-                raise Wc029AcceptanceEvidenceError(
-                    f"evidence file {relative} cannot be inspected"
-                ) from exc
-            if (
-                not stat.S_ISREG(file_stat.st_mode)
-                or stat.S_ISLNK(file_stat.st_mode)
-                or _is_reparse_point(file_stat)
-                or file_stat.st_nlink != 1
-            ):
-                raise Wc029AcceptanceEvidenceError(
-                    f"evidence file {relative} must be one singly linked regular file"
-                )
-            try:
-                files[relative] = (
-                    _windows_path_identity(path, file_stat)
-                    if os.name == "nt"
-                    else _PathIdentity.from_stat(file_stat)
-                )
-            except OSError as exc:
-                raise Wc029AcceptanceEvidenceError(
-                    f"evidence file {relative} cannot be pinned to platform change identity"
-                ) from exc
+    stack: list[tuple[Path, str, int]] = [(root, ".", 0)]
+    while stack:
+        current, current_relative, current_depth = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    relative = (
+                        entry.name
+                        if current_relative == "."
+                        else f"{current_relative}/{entry.name}"
+                    )
+                    depth = current_depth + 1
+                    account_path(relative, depth=depth)
+                    path = current / entry.name
+                    try:
+                        entry_stat = path.lstat()
+                    except OSError as exc:
+                        raise Wc029AcceptanceEvidenceError(
+                            "evidence directory contains an unreadable entry"
+                        ) from exc
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        if len(directories) >= MAX_EVIDENCE_DIRECTORIES:
+                            raise Wc029AcceptanceEvidenceError(
+                                "evidence directory exceeds its directory-count bound"
+                            )
+                        if stat.S_ISLNK(entry_stat.st_mode) or _is_reparse_point(entry_stat):
+                            raise Wc029AcceptanceEvidenceError(
+                                "evidence directory contains a linked or non-directory entry"
+                            )
+                        if len(stack) >= MAX_EVIDENCE_DIRECTORIES:
+                            raise Wc029AcceptanceEvidenceError(
+                                "evidence traversal stack exceeds its bound"
+                            )
+                        directories[relative] = _PathIdentity.from_stat(entry_stat)
+                        stack.append((path, relative, depth))
+                        continue
+                    if len(files) >= MAX_EVIDENCE_FILES + 1:
+                        raise Wc029AcceptanceEvidenceError(
+                            "evidence directory exceeds its file-count bound"
+                        )
+                    if not relative.endswith(".json"):
+                        raise Wc029AcceptanceEvidenceError(
+                            f"evidence directory contains non-JSON file {relative}"
+                        )
+                    if (
+                        not stat.S_ISREG(entry_stat.st_mode)
+                        or stat.S_ISLNK(entry_stat.st_mode)
+                        or _is_reparse_point(entry_stat)
+                        or entry_stat.st_nlink != 1
+                    ):
+                        raise Wc029AcceptanceEvidenceError(
+                            f"evidence file {relative} must be one singly linked regular file"
+                        )
+                    try:
+                        files[relative] = (
+                            _windows_path_identity(path, entry_stat)
+                            if os.name == "nt"
+                            else _PathIdentity.from_stat(entry_stat)
+                        )
+                    except OSError as exc:
+                        raise Wc029AcceptanceEvidenceError(
+                            f"evidence file {relative} cannot be pinned to platform change identity"
+                        ) from exc
+        except Wc029AcceptanceEvidenceError:
+            raise
+        except OSError as exc:
+            raise Wc029AcceptanceEvidenceError(
+                "evidence directory contains an unreadable subtree"
+            ) from exc
     return directories, files
 
 
@@ -4003,6 +4043,18 @@ def _require_mapping(value: object, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or any(type(key) is not str for key in value):
         raise Wc029AcceptanceEvidenceError(f"{label} must be one JSON object")
     return value
+
+
+def _require_loaded_artifact(
+    artifacts: Mapping[str, _LoadedArtifact],
+    artifact_id: str,
+    *,
+    label: str,
+) -> _LoadedArtifact:
+    artifact = artifacts.get(artifact_id)
+    if artifact is None:
+        raise Wc029AcceptanceEvidenceError(f"{label} references unknown artifact {artifact_id}")
+    return artifact
 
 
 def _require_model[Model: BaseModel](
@@ -4468,7 +4520,11 @@ def _load_public_keys(
         )
     public_keys: dict[str, rsa.RSAPublicKey] = {}
     for key in inventory.keys:
-        artifact = key_artifacts[key.public_key_artifact_id]
+        artifact = key_artifacts.get(key.public_key_artifact_id)
+        if artifact is None:
+            raise Wc029AcceptanceEvidenceError(
+                "trusted key inventory references an unknown public-key artifact"
+            )
         public_key_evidence = _require_model(
             artifact,
             Wc029SigningPublicKeyEvidence,
@@ -4509,7 +4565,11 @@ def _validate_signed_artifacts(
         subject = (
             None
             if artifact.declaration.binds_artifact_id is None
-            else artifacts[artifact.declaration.binds_artifact_id]
+            else _require_loaded_artifact(
+                artifacts,
+                artifact.declaration.binds_artifact_id,
+                label=f"attestation {artifact.declaration.artifact_id}",
+            )
         )
         if evidence_class == "monitoring-evidence":
             handoff = _require_model(artifact, MonitoringEvidenceHandoff)
@@ -5081,7 +5141,11 @@ def _scenario_artifacts_by_class(
     selected: dict[EvidenceClass, _LoadedArtifact] = {}
     for _phase, artifact_ids in scenario.phases.items():
         for artifact_id in artifact_ids:
-            artifact = artifacts[artifact_id]
+            artifact = _require_loaded_artifact(
+                artifacts,
+                artifact_id,
+                label=f"scenario {scenario.scenario_id}",
+            )
             if artifact.declaration.evidence_class in selected:
                 raise Wc029AcceptanceEvidenceError(
                     f"scenario {scenario.scenario_id} has duplicate "
@@ -5369,6 +5433,10 @@ def _validate_signed_scenario_execution(
         selected["scenario-plan"],
         Wc029ScenarioPlanEvidence,
     )
+    request = _require_model(
+        selected["correlation-request"],
+        CorrelationRequest,
+    )
     execution_manifest = _require_model(
         selected["scenario-execution-manifest"],
         Wc029ScenarioExecutionManifest,
@@ -5392,7 +5460,7 @@ def _validate_signed_scenario_execution(
         or execution_manifest.mutation_action_digest != capability.mutation_action_digest
         or execution_manifest.recovery_action_digest != capability.recovery_action_digest
         or execution_manifest.monitoring_request_digest != plan.monitoring_request_digest
-        or execution_manifest.correlation_request_digest != plan.correlation_request_digest
+        or execution_manifest.correlation_request_digest != request.request_digest
         or execution_manifest.change_request_digest != plan.change_request_digest
         or execution_manifest.verification_input_digest != plan.verification_input_digest
         or execution_manifest.plan_digest != plan.plan_digest
@@ -5424,7 +5492,11 @@ def _validate_signed_scenario_execution(
         for artifact_id in artifact_ids
     }
     for artifact_id, binding in bindings.items():
-        bound = artifacts[artifact_id]
+        bound = _require_loaded_artifact(
+            artifacts,
+            artifact_id,
+            label="signed scenario execution manifest",
+        )
         if (
             binding.phase != phase_by_id[artifact_id]
             or binding.content_sha256 != bound.record.content_sha256
@@ -5495,7 +5567,11 @@ def _validate_scenario_lifecycle(
         artifacts,
     )
     authority = _require_model(
-        artifacts[inventory.manifest.authority_artifact_id],
+        _require_loaded_artifact(
+            artifacts,
+            inventory.manifest.authority_artifact_id,
+            label="trusted manifest inventory",
+        ),
         Wc029PublicationAuthorityEvidence,
     ).authority
     expected_statement = _expected_incident_report_statement(
@@ -5514,7 +5590,11 @@ def _validate_scenario_lifecycle(
     )
     manifest = inventory.manifest
     published_manifest = _require_model(
-        artifacts[manifest.manifest_artifact_id],
+        _require_loaded_artifact(
+            artifacts,
+            manifest.manifest_artifact_id,
+            label="trusted manifest inventory",
+        ),
         Wc029PublishedManifestEvidence,
     )
     if (
@@ -5547,10 +5627,61 @@ def _validate_scenario_lifecycle(
         selected["enrichment-manifest"],
         IncidentEnrichmentManifest,
     )
+    try:
+        validate_incident_enrichment_manifest_binding(
+            enrichment,
+            bound_request,
+            report,
+            guidance,
+        )
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "incident enrichment manifest does not bind the exact captured assets"
+        ) from exc
     active_feed = _require_model(
         selected["feed-active"],
         IncidentEnrichmentFeedPointer,
     )
+    guidance_attestation = _require_model(
+        selected["guidance-attestation"],
+        IncidentGuidanceAttestation,
+    )
+    enrichment_attestation = _require_model(
+        selected["enrichment-attestation"],
+        IncidentEnrichmentAttestation,
+    )
+    key_by_purpose = {item.purpose: item for item in inventory.keys}
+    public_keys = _load_public_keys(inventory, artifacts)
+    try:
+        validate_published_correlation_report_assets(
+            enrichment.correlation_report_asset,
+            report,
+            report_attestation,
+            bound_request,
+            expected_authority_proof_digest=(
+                published_manifest.context_binding.publication_authority_reference.content_digest
+            ),
+            trusted_report_key_id=key_by_purpose["report"].key_vault_key_id,
+            report_signature_verifier=_signature_verifier(public_keys["report"]),
+        )
+        validate_incident_guidance_assets(
+            enrichment.guidance_asset,
+            guidance,
+            guidance_attestation,
+            trusted_guidance_key_id=(key_by_purpose["guidance"].key_vault_key_id),
+            guidance_signature_verifier=_signature_verifier(public_keys["guidance"]),
+        )
+        validate_incident_enrichment_assets(
+            active_feed.enrichment_asset,
+            enrichment,
+            enrichment_attestation,
+            trusted_enrichment_key_id=(key_by_purpose["enrichment"].key_vault_key_id),
+            enrichment_signature_verifier=_signature_verifier(public_keys["enrichment"]),
+        )
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "incident report, guidance, or enrichment references do not bind captured attestations"
+        ) from exc
     resolved_feed = _require_model(
         selected["feed-resolved"],
         IncidentEnrichmentFeedPointer,
@@ -5728,6 +5859,42 @@ def _validate_scenario_lifecycle(
         )
 
 
+def _validate_correlation_request_plan_binding(
+    request: CorrelationRequest,
+    plan: Wc029ScenarioPlanEvidence,
+    capability: Wc029ScenarioCapability,
+    execution_manifest: Wc029ScenarioExecutionManifest,
+) -> None:
+    target_resource_id = plan.target_resource_id.casefold().rstrip("/")
+    if (
+        request.incident_anchor.affected_resource_id.casefold().rstrip("/") != target_resource_id
+        or capability.target_resource_id.casefold().rstrip("/") != target_resource_id
+        or plan.correlation_context_binding_digest != request.context_binding.binding_digest
+        or request.issued_at <= plan.planned_at
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "correlation request does not bind the precommitted scenario target and context"
+        )
+    _require_in_phase(
+        execution_manifest,
+        "plan",
+        request.issued_at,
+        label="correlation request issuance",
+    )
+    _require_in_phase(
+        execution_manifest,
+        "observe",
+        request.trusted_as_of,
+        label="correlation request trusted time",
+    )
+    _require_in_phase(
+        execution_manifest,
+        "observe",
+        request.expires_at,
+        label="correlation request expiry",
+    )
+
+
 def _validate_correlation_request_context(
     request: CorrelationRequest,
     report: CorrelationReport,
@@ -5738,7 +5905,15 @@ def _validate_correlation_request_context(
     published_manifest: Wc029PublishedManifestEvidence,
     publication_authority: PublishedContextAuthority,
     plan: Wc029ScenarioPlanEvidence,
+    capability: Wc029ScenarioCapability,
+    execution_manifest: Wc029ScenarioExecutionManifest,
 ) -> None:
+    _validate_correlation_request_plan_binding(
+        request,
+        plan,
+        capability,
+        execution_manifest,
+    )
     try:
         validate_correlation_report_binding(report, request)
     except ValueError as exc:
@@ -5775,10 +5950,8 @@ def _validate_correlation_request_context(
         or report.preview_only
         or report.no_auto_remediation is not True
         or report.context_binding_digest != published_manifest.context_binding.binding_digest
-        or request.request_digest != plan.correlation_request_digest
-        or report.request_digest != plan.correlation_request_digest
-        or report_attestation.statement.correlation_request_digest
-        != plan.correlation_request_digest
+        or report.request_digest != request.request_digest
+        or report_attestation.statement.correlation_request_digest != request.request_digest
         or report_attestation.statement.authority_proof_digest
         != sha256_hex(publication_authority.canonical_bytes())
         or plan.monitoring_request_digest != _monitoring_request_digest(monitoring)
@@ -5980,11 +6153,19 @@ def _validate_scenario_evidence(
             MonitoringEvidenceHandoff,
         )
         published_manifest = _require_model(
-            artifacts[inventory.manifest.manifest_artifact_id],
+            _require_loaded_artifact(
+                artifacts,
+                inventory.manifest.manifest_artifact_id,
+                label="trusted manifest inventory",
+            ),
             Wc029PublishedManifestEvidence,
         )
         publication_authority = _require_model(
-            artifacts[inventory.manifest.authority_artifact_id],
+            _require_loaded_artifact(
+                artifacts,
+                inventory.manifest.authority_artifact_id,
+                label="trusted manifest inventory",
+            ),
             Wc029PublicationAuthorityEvidence,
         ).authority
         _validate_correlation_request_context(
@@ -5995,19 +6176,17 @@ def _validate_scenario_evidence(
             published_manifest,
             publication_authority,
             plan,
+            capability,
+            execution_manifest,
         )
         if scenario.scenario_class == "nsg-connectivity-loss":
             change = _require_model(
                 selected["change-evidence"],
                 ChangeEvidenceArtifact,
             )
-            if (
-                change.evidence.source_digest != plan.change_request_digest
-                or change.evidence.target_resource_id.casefold()
-                != plan.target_resource_id.casefold()
-            ):
+            if change.evidence.source_digest != plan.change_request_digest:
                 raise Wc029AcceptanceEvidenceError(
-                    "change evidence does not bind the trusted scenario request and target"
+                    "change evidence does not bind the trusted scenario request"
                 )
             _require_in_phase(
                 execution_manifest,
@@ -6266,7 +6445,7 @@ def _validate_global_chronology(
         )
         scenario_execution_ids.append(plan.scenario_execution_id)
         correlation_request_ids.append(request.request_id)
-        correlation_request_digests.append(plan.correlation_request_digest)
+        correlation_request_digests.append(request.request_digest)
         monitoring_handoff_digests.append(_monitoring_request_digest(monitoring))
         monitoring_collection_ids.append(monitoring.collection_id)
         verification_input_digests.append(plan.verification_input_digest)
@@ -6424,7 +6603,11 @@ def aggregate_acceptance_evidence(
         loaded[declaration.artifact_id] = loaded_artifact
         remaining_bytes -= len(loaded_artifact.raw)
 
-    inventory_loaded = loaded[index.version_inventory_artifact_id]
+    inventory_loaded = _require_loaded_artifact(
+        loaded,
+        index.version_inventory_artifact_id,
+        label="acceptance index",
+    )
     if not isinstance(inventory_loaded.model, Wc029VersionInventory):
         raise Wc029AcceptanceEvidenceError("version inventory artifact is invalid")
     try:
