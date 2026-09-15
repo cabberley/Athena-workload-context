@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import subprocess
+import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -4293,25 +4294,34 @@ def test_posix_release_ledger_rejects_special_files_without_blocking(
         encoding="utf-8",
     )
     arguments = _what_if_cli_args(input_path)
-    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
-    record_path = ledger_path / f"{_COLLECTION_RUN_ID}.collection.json"
-    active_socket: socket.socket | None = None
-    if record_kind == "fifo":
-        os.mkfifo(record_path)
-    else:
-        active_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        active_socket.bind(os.fspath(record_path))
-    stderr = StringIO()
-    try:
-        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
-        assert (
-            "release ledger record must be a regular file" in stderr.getvalue()
-            or "release ledger record is unavailable" in stderr.getvalue()
+    with tempfile.TemporaryDirectory(prefix="wc029-", dir="/tmp") as root_value:
+        trusted_root = Path(root_value)
+        ledger_path = trusted_root / "l"
+        ledger_path.mkdir()
+        _replace_cli_option(
+            arguments,
+            "--trusted-release-ledger-root",
+            trusted_root,
         )
-    finally:
-        if active_socket is not None:
-            active_socket.close()
-        record_path.unlink()
+        _replace_cli_option(arguments, "--release-ledger", ledger_path)
+        record_path = ledger_path / f"{_COLLECTION_RUN_ID}.collection.json"
+        active_socket: socket.socket | None = None
+        if record_kind == "fifo":
+            os.mkfifo(record_path)
+        else:
+            active_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            active_socket.bind(os.fspath(record_path))
+        stderr = StringIO()
+        try:
+            assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+            assert (
+                "release ledger record must be a regular file" in stderr.getvalue()
+                or "release ledger record is unavailable" in stderr.getvalue()
+            )
+        finally:
+            if active_socket is not None:
+                active_socket.close()
+            record_path.unlink()
 
 
 @pytest.mark.parametrize("record_kind", ["collection", "binding"])
