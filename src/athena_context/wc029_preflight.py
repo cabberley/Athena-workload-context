@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TextIO
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
@@ -18,6 +20,10 @@ MAX_POLICY_ITEMS = 512
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100000
 MAX_JSON_INTEGER_DIGITS = 1024
+MAX_VIOLATIONS = 256
+MAX_RENDER_BYTES = 1024 * 1024
+MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
+MAX_ATTESTATION_CLOCK_SKEW = timedelta(minutes=5)
 
 _BROAD_ROLES = frozenset(
     {
@@ -59,11 +65,23 @@ _STORAGE_CONTAINER_TYPE = "microsoft.storage/storageaccounts/blobservices/contai
 _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
+_RESOURCE_ROOT_PATH = "<resource>"
 _ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
 _GRAPH_MEMBERSHIP_METHODS = frozenset(
     {
         "getmembergroups",
         "transitivememberof",
+    }
+)
+_MANIFEST_BINDING_NAMES = frozenset(
+    {
+        "allowChangeIdsDigest",
+        "deploymentDigest",
+        "parametersDigest",
+        "policyDigest",
+        "rbacEvidenceDigest",
+        "templateDigest",
+        "whatIfDigest",
     }
 )
 _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
@@ -88,6 +106,30 @@ class PreflightViolation:
     code: str
     subject: str
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class AttestationManifest:
+    collection_run_id: str
+    collected_at: datetime
+    expires_at: datetime
+    bindings: dict[str, str]
+    digest: str
+
+
+def _finalize_violations(
+    values: Sequence[PreflightViolation],
+) -> tuple[PreflightViolation, ...]:
+    violations: list[PreflightViolation] = []
+    seen: set[PreflightViolation] = set()
+    for violation in values:
+        if violation in seen:
+            continue
+        if len(violations) >= MAX_VIOLATIONS:
+            raise PreflightInputError(f"violation count exceeds {MAX_VIOLATIONS}")
+        seen.add(violation)
+        violations.append(violation)
+    return tuple(violations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,8 +307,21 @@ def _canonical_property_path(value: str) -> str:
         raise PreflightInputError("property path has ambiguous Unicode case folding")
     if _contains_non_ascii_case_alias(value):
         raise PreflightInputError("property path contains a non-ASCII case alias")
-    prefix = "<resource>."
-    return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
+    if normalized in {"", ".", _RESOURCE_ROOT_PATH, f"{_RESOURCE_ROOT_PATH}."}:
+        return _RESOURCE_ROOT_PATH
+    prefix = f"{_RESOURCE_ROOT_PATH}."
+    if normalized.startswith(prefix):
+        remainder = normalized.removeprefix(prefix).lstrip(".")
+        return remainder or _RESOURCE_ROOT_PATH
+    return normalized
+
+
+def _property_path_contains(ancestor: str, descendant: str) -> bool:
+    return (
+        ancestor == _RESOURCE_ROOT_PATH
+        or descendant == ancestor
+        or descendant.startswith(ancestor + ".")
+    )
 
 
 def _canonical_scope(value: str) -> str:
@@ -333,6 +388,202 @@ def _canonical_guid(value: object, *, field_name: str) -> str:
     return guid
 
 
+def _canonical_json_digest(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
+def _canonical_sha256_digest(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    digest = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+            maximum_length=71,
+        )
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise PreflightInputError(f"{field_name} must be a sha256 digest")
+    return digest
+
+
+def _parse_utc_timestamp(
+    value: object,
+    *,
+    field_name: str,
+) -> datetime:
+    timestamp = _require_string(
+        value,
+        field_name=field_name,
+        maximum_length=64,
+    )
+    try:
+        parsed = datetime.fromisoformat(
+            timestamp.removesuffix("Z") + ("+00:00" if timestamp.endswith("Z") else "")
+        )
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise PreflightInputError(f"{field_name} must use UTC")
+    return parsed.astimezone(UTC)
+
+
+def _current_utc(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise PreflightInputError("current time must be timezone-aware")
+    return now.astimezone(UTC)
+
+
+def _validate_attestation_window(
+    *,
+    collected_at: datetime,
+    expires_at: datetime,
+    now: datetime,
+) -> None:
+    if expires_at <= collected_at or expires_at - collected_at > MAX_ATTESTATION_LIFETIME:
+        raise PreflightInputError("attestation validity window is invalid or too long")
+    if collected_at - now > MAX_ATTESTATION_CLOCK_SKEW:
+        raise PreflightInputError("attestation collectedAt is in the future")
+    if now >= expires_at:
+        raise PreflightInputError("attestation has expired")
+
+
+def _parse_attestation_manifest(
+    value: object,
+    *,
+    expected_collection_run_id: str,
+    expected_manifest_digest: str,
+    now: datetime,
+) -> AttestationManifest:
+    manifest = _mapping(
+        value,
+        field_name="attestation manifest",
+    )
+    collection_run_id = _canonical_guid(
+        _get_case_insensitive(manifest, "collectionRunId"),
+        field_name="manifest collectionRunId",
+    )
+    if collection_run_id != _canonical_guid(
+        expected_collection_run_id,
+        field_name="expected collectionRunId",
+    ):
+        raise PreflightInputError("manifest collectionRunId does not match the reviewed run")
+    collected_at = _parse_utc_timestamp(
+        _get_case_insensitive(manifest, "collectedAt"),
+        field_name="manifest collectedAt",
+    )
+    expires_at = _parse_utc_timestamp(
+        _get_case_insensitive(manifest, "expiresAt"),
+        field_name="manifest expiresAt",
+    )
+    _validate_attestation_window(
+        collected_at=collected_at,
+        expires_at=expires_at,
+        now=now,
+    )
+    digest = _canonical_json_digest(manifest)
+    if digest != _canonical_sha256_digest(
+        expected_manifest_digest,
+        field_name="reviewed attestation manifest digest",
+    ):
+        raise PreflightInputError("attestation manifest digest does not match the reviewed digest")
+    bindings = _mapping(
+        _get_case_insensitive(manifest, "bindings"),
+        field_name="manifest bindings",
+    )
+    if set(bindings) != _MANIFEST_BINDING_NAMES:
+        raise PreflightInputError("attestation manifest bindings are incomplete")
+    normalized_bindings = {
+        binding_name: _canonical_sha256_digest(
+            _get_case_insensitive(bindings, binding_name),
+            field_name=f"manifest {binding_name}",
+        )
+        for binding_name in _MANIFEST_BINDING_NAMES
+    }
+    return AttestationManifest(
+        collection_run_id=collection_run_id,
+        collected_at=collected_at,
+        expires_at=expires_at,
+        bindings=normalized_bindings,
+        digest=digest,
+    )
+
+
+def _validate_artifact_attestation(
+    value: object,
+    *,
+    artifact_kind: PreflightKind,
+    manifest: AttestationManifest,
+    expected_binding_names: frozenset[str],
+) -> None:
+    attestation = _mapping(
+        value,
+        field_name=f"{artifact_kind} attestation",
+    )
+    if (
+        _normalized(
+            _require_string(
+                _get_case_insensitive(attestation, "artifactKind"),
+                field_name="attestation artifactKind",
+                maximum_length=32,
+            )
+        )
+        != artifact_kind
+    ):
+        raise PreflightInputError("attestation artifactKind does not match the check")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(attestation, "collectionRunId"),
+            field_name="attestation collectionRunId",
+        )
+        != manifest.collection_run_id
+        or _parse_utc_timestamp(
+            _get_case_insensitive(attestation, "collectedAt"),
+            field_name="attestation collectedAt",
+        )
+        != manifest.collected_at
+        or _parse_utc_timestamp(
+            _get_case_insensitive(attestation, "expiresAt"),
+            field_name="attestation expiresAt",
+        )
+        != manifest.expires_at
+    ):
+        raise PreflightInputError("artifact attestation does not match the reviewed manifest")
+    if (
+        _canonical_sha256_digest(
+            _get_case_insensitive(attestation, "manifestDigest"),
+            field_name="attestation manifestDigest",
+        )
+        != manifest.digest
+    ):
+        raise PreflightInputError("artifact attestation manifestDigest does not match")
+    bindings = _mapping(
+        _get_case_insensitive(attestation, "bindings"),
+        field_name="attestation bindings",
+    )
+    if set(bindings) != expected_binding_names:
+        raise PreflightInputError("artifact attestation bindings do not match the manifest subset")
+    for binding_name in expected_binding_names:
+        if (
+            _canonical_sha256_digest(
+                _get_case_insensitive(bindings, binding_name),
+                field_name=f"attestation {binding_name}",
+            )
+            != manifest.bindings[binding_name]
+        ):
+            raise PreflightInputError(f"attestation {binding_name} does not match the manifest")
+
+
 def _canonical_management_group_scope(
     value: object,
     *,
@@ -365,6 +616,15 @@ def _resource_group_subscription_id(scope: str) -> str:
 
 def _scope_contains(ancestor: str, descendant: str) -> bool:
     return ancestor == "/" or descendant == ancestor or descendant.startswith(ancestor + "/")
+
+
+def _minimal_scope_prefixes(values: Sequence[str]) -> tuple[str, ...]:
+    unique = sorted(set(values))
+    return tuple(
+        value
+        for value in unique
+        if not any(other != value and _scope_contains(other, value) for other in unique)
+    )
 
 
 def _separation_scope_matches(
@@ -681,6 +941,13 @@ def _walk_delta(
         after_supplied = _has_case_insensitive(item, "after")
         before = _get_case_insensitive(item, "before")
         after = _get_case_insensitive(item, "after")
+        canonical_path = _canonical_property_path(path)
+        if (
+            canonical_path == _RESOURCE_ROOT_PATH
+            and property_change_type not in {"delete", "remove", "noeffect"}
+            and (not after_supplied or not isinstance(after, dict))
+        ):
+            raise PreflightInputError("resource-root delta after value must be an object")
         if (
             property_change_type not in {"delete", "remove", "noeffect"}
             and not after_supplied
@@ -810,6 +1077,18 @@ def _unsafe_property_violations(
     candidates = list(delta_candidates)
     if isinstance(after_payload, (dict, list)):
         candidates.extend(_flatten_after(after_payload))
+    if change_type != "delete" and any(
+        property_change_type in {"delete", "remove"}
+        and _canonical_property_path(raw_path) == _RESOURCE_ROOT_PATH
+        for raw_path, _, property_change_type in delta_candidates
+    ):
+        violations.append(
+            PreflightViolation(
+                code="delete",
+                subject=resource_id,
+                detail=(f"resource-root deletion is never permitted under {change_type}"),
+            )
+        )
     if resource_type == _STORAGE_ACCOUNT_TYPE and change_type == "create":
         values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
 
@@ -884,7 +1163,7 @@ def _unsafe_property_violations(
             )
     if not candidates:
         if violations:
-            return tuple(violations)
+            return _finalize_violations(violations)
         return (
             PreflightViolation(
                 code="uninspectable-change",
@@ -895,7 +1174,10 @@ def _unsafe_property_violations(
 
     def delta_touches(target: str) -> bool:
         return any(
-            (path := _canonical_property_path(raw_path)) == target or target.startswith(path + ".")
+            _property_path_contains(
+                _canonical_property_path(raw_path),
+                target,
+            )
             for raw_path, _, _ in delta_candidates
         )
 
@@ -906,7 +1188,7 @@ def _unsafe_property_violations(
         return any(
             property_change_type in {"delete", "remove"}
             and (path := _canonical_property_path(raw_path)) != target
-            and target.startswith(path + ".")
+            and _property_path_contains(path, target)
             for raw_path, _, property_change_type in delta_candidates
         )
 
@@ -957,18 +1239,21 @@ def _unsafe_property_violations(
         )
     if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
         network_acl_touched = any(
-            (
-                (path := _canonical_property_path(raw_path)) == "properties.networkacls"
-                or path.startswith("properties.networkacls.")
-                or "properties.networkacls".startswith(path + ".")
+            _property_path_contains(
+                (path := _canonical_property_path(raw_path)),
+                "properties.networkacls",
+            )
+            or _property_path_contains(
+                "properties.networkacls",
+                path,
             )
             for raw_path, _, _ in delta_candidates
         )
         if network_acl_touched:
             protected_parent_removed = any(
-                (
-                    (path := _canonical_property_path(raw_path)) == "properties.networkacls"
-                    or "properties.networkacls".startswith(path + ".")
+                _property_path_contains(
+                    (path := _canonical_property_path(raw_path)),
+                    "properties.networkacls",
                 )
                 and property_change_type in {"delete", "remove"}
                 for raw_path, _, property_change_type in delta_candidates
@@ -1027,9 +1312,9 @@ def _unsafe_property_violations(
         related_delta = [
             (raw_path, property_change_type)
             for raw_path, _, property_change_type in delta_candidates
-            if (
-                (path := _canonical_property_path(raw_path)) == target
-                or target.startswith(path + ".")
+            if _property_path_contains(
+                _canonical_property_path(raw_path),
+                target,
             )
         ]
         exact_values = [
@@ -1159,15 +1444,78 @@ def _unsafe_property_violations(
                         detail=f"public container access enabled at {path}",
                     )
                 )
-    return tuple(violations)
+    return _finalize_violations(violations)
 
 
 def evaluate_what_if(
     document: object,
     *,
     allowed_change_ids: frozenset[str] = frozenset(),
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    deployment_digest: str | None = None,
+    template_digest: str | None = None,
+    parameters_digest: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
     normalized_allowlist = frozenset(_normalized(value) for value in allowed_change_ids)
+    if require_attestation:
+        if (
+            expected_collection_run_id is None
+            or attestation_manifest_digest is None
+            or deployment_digest is None
+            or template_digest is None
+            or parameters_digest is None
+        ):
+            raise PreflightInputError("reviewed what-if attestation inputs are required")
+        root = _mapping(
+            document,
+            field_name="attested what-if artifact",
+        )
+        if {key.casefold() for key in root} != {
+            "attestation",
+            "manifest",
+            "whatif",
+        }:
+            raise PreflightInputError("attested what-if artifact has an invalid envelope")
+        what_if_document = _get_case_insensitive(root, "whatIf")
+        manifest = _parse_attestation_manifest(
+            _get_case_insensitive(root, "manifest"),
+            expected_collection_run_id=expected_collection_run_id,
+            expected_manifest_digest=attestation_manifest_digest,
+            now=_current_utc(now),
+        )
+        expected_bindings = {
+            "allowChangeIdsDigest": _canonical_json_digest(
+                {"allowChangeIds": sorted(normalized_allowlist)}
+            ),
+            "deploymentDigest": _canonical_sha256_digest(
+                deployment_digest,
+                field_name="reviewed deployment digest",
+            ),
+            "parametersDigest": _canonical_sha256_digest(
+                parameters_digest,
+                field_name="reviewed parameters digest",
+            ),
+            "templateDigest": _canonical_sha256_digest(
+                template_digest,
+                field_name="reviewed template digest",
+            ),
+            "whatIfDigest": _canonical_json_digest(what_if_document),
+        }
+        for binding_name, expected_digest in expected_bindings.items():
+            if manifest.bindings[binding_name] != expected_digest:
+                raise PreflightInputError(
+                    f"manifest {binding_name} does not match the reviewed input"
+                )
+        _validate_artifact_attestation(
+            _get_case_insensitive(root, "attestation"),
+            artifact_kind="what-if",
+            manifest=manifest,
+            expected_binding_names=frozenset(expected_bindings),
+        )
+        document = what_if_document
     violations: list[PreflightViolation] = []
     changes, potential_changes = _what_if_changes(document)
     for raw_change in potential_changes:
@@ -1246,7 +1594,7 @@ def evaluate_what_if(
                 )
             )
         violations.extend(_unsafe_property_violations(resource_id, change))
-    return tuple(violations)
+    return _finalize_violations(violations)
 
 
 def _parse_rbac_assignment(
@@ -1512,6 +1860,21 @@ def _assignment_key(
     )
 
 
+def _effective_rule_role_matchers(
+    rule: SeparationRule,
+) -> frozenset[str]:
+    matchers = {
+        (
+            f"id:{_ROLE_NAME_TO_ID[role_name]}"
+            if role_name in _ROLE_NAME_TO_ID
+            else f"name:{role_name}"
+        )
+        for role_name in rule.forbidden_role_names
+    }
+    matchers.update(f"id:{role_id}" for role_id in rule.forbidden_role_ids)
+    return frozenset(matchers)
+
+
 def _parse_policy(document: object | None) -> RbacPolicy:
     if document is None:
         return RbacPolicy(
@@ -1562,6 +1925,13 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             allowances.add(allowance)
     raw_rules = _get_case_insensitive(root, "separationRules")
     rules: list[SeparationRule] = []
+    rule_keys: set[
+        tuple[
+            str,
+            frozenset[str],
+            tuple[str, ...],
+        ]
+    ] = set()
     if raw_rules is not None:
         for raw_item in _sequence(
             raw_rules,
@@ -1596,45 +1966,52 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 raise PreflightInputError(
                     "separation rule requires forbidden roles and scope prefixes"
                 )
-            rules.append(
-                SeparationRule(
-                    principal_id=_normalized(
+            rule = SeparationRule(
+                principal_id=_normalized(
+                    _require_string(
+                        _get_case_insensitive(item, "principalId"),
+                        field_name="principalId",
+                    )
+                ),
+                forbidden_role_names=frozenset(
+                    _canonical_role_key(
                         _require_string(
-                            _get_case_insensitive(item, "principalId"),
-                            field_name="principalId",
+                            role,
+                            field_name="forbidden role",
                         )
-                    ),
-                    forbidden_role_names=frozenset(
-                        _canonical_role_key(
+                    )
+                    for role in role_names
+                ),
+                forbidden_role_ids=frozenset(
+                    _canonical_role_id(
+                        _require_string(
+                            role_id,
+                            field_name="forbidden roleDefinitionId",
+                        )
+                    )
+                    for role_id in role_ids
+                ),
+                forbidden_scope_prefixes=_minimal_scope_prefixes(
+                    [
+                        _canonical_scope(
                             _require_string(
-                                role,
-                                field_name="forbidden role",
+                                prefix,
+                                field_name="forbidden scope prefix",
                             )
                         )
-                        for role in role_names
-                    ),
-                    forbidden_role_ids=frozenset(
-                        _canonical_role_id(
-                            _require_string(
-                                role_id,
-                                field_name="forbidden roleDefinitionId",
-                            )
-                        )
-                        for role_id in role_ids
-                    ),
-                    forbidden_scope_prefixes=tuple(
-                        sorted(
-                            _canonical_scope(
-                                _require_string(
-                                    prefix,
-                                    field_name="forbidden scope prefix",
-                                )
-                            )
-                            for prefix in scope_prefixes
-                        )
-                    ),
-                )
+                        for prefix in scope_prefixes
+                    ]
+                ),
             )
+            rule_key = (
+                rule.principal_id,
+                _effective_rule_role_matchers(rule),
+                rule.forbidden_scope_prefixes,
+            )
+            if rule_key in rule_keys:
+                raise PreflightInputError("separationRules contains an equivalent duplicate rule")
+            rule_keys.add(rule_key)
+            rules.append(rule)
     raw_expected_principals = _get_case_insensitive(
         root,
         "expectedPrincipalIds",
@@ -1947,15 +2324,35 @@ def _derive_management_group_ancestry(
         _get_case_insensitive(resource_graph, "body"),
         field_name="Resource Graph hierarchy body",
     )
-    if _get_case_insensitive(body, "skipToken") is not None:
+    if any(
+        key.casefold() in {"skiptoken", "$skiptoken"} and token is not None
+        for key, token in body.items()
+    ):
         raise PreflightInputError("Resource Graph hierarchy evidence is paginated or incomplete")
+    if (
+        not _has_case_insensitive(body, "resultTruncated")
+        or _get_case_insensitive(body, "resultTruncated") is not False
+    ):
+        raise PreflightInputError(
+            "Resource Graph hierarchy result must be explicitly non-truncated"
+        )
     rows = _sequence(
         _get_case_insensitive(body, "data"),
         field_name="Resource Graph hierarchy data",
         maximum_items=2,
     )
-    if len(rows) != 1:
-        raise PreflightInputError("Resource Graph hierarchy evidence must contain one subscription")
+    count = _get_case_insensitive(body, "count")
+    total_records = _get_case_insensitive(body, "totalRecords")
+    if (
+        type(count) is not int
+        or type(total_records) is not int
+        or count != total_records
+        or count != len(rows)
+        or count != 1
+    ):
+        raise PreflightInputError(
+            "Resource Graph hierarchy count and totalRecords must match exactly one result row"
+        )
     row = _mapping(
         rows[0],
         field_name="Resource Graph subscription row",
@@ -2439,6 +2836,70 @@ def _validate_arm_role_assignment_urls(
         )
 
 
+def _validate_principal_id_filter(
+    value: object,
+    *,
+    assigned_principal_id: str,
+    field_name: str,
+) -> str:
+    filter_value = _require_string(
+        value,
+        field_name=field_name,
+    )
+    match = re.fullmatch(
+        rf"principalId\s+eq\s+'({_GUID_PATTERN})'",
+        filter_value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise PreflightInputError(f"{field_name} must use principalId eq assigned-object-id")
+    if match.group(1).casefold() != assigned_principal_id:
+        raise PreflightInputError(f"{field_name} uses a different assigned principal")
+    return filter_value
+
+
+def _validate_descendant_arm_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    assigned_principal_id: str,
+) -> None:
+    expected_path = target.subscription_scope + "/providers/microsoft.authorization/roleassignments"
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM descendant role-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError(
+                "ARM descendant role-assignment requestUrl uses the wrong subscription"
+            )
+        query = {
+            key.casefold(): values
+            for key, values in parse_qs(
+                parts.query,
+                keep_blank_values=True,
+            ).items()
+        }
+        allowed_keys = {"api-version", "$filter"}
+        if index > 0:
+            allowed_keys.add("$skiptoken")
+        if (
+            parts.fragment
+            or set(query) - allowed_keys
+            or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
+            or len(query.get("$filter", [])) != 1
+            or (index == 0 and "$skiptoken" in query)
+            or (index > 0 and len(query.get("$skiptoken", [])) != 1)
+        ):
+            raise PreflightInputError("ARM descendant role-assignment requestUrl is not canonical")
+        _validate_principal_id_filter(
+            query["$filter"][0],
+            assigned_principal_id=assigned_principal_id,
+            field_name="ARM descendant requestUrl filter",
+        )
+
+
 def _parse_arm_role_assignment(
     value: object,
     *,
@@ -2518,6 +2979,7 @@ def _validate_cli_arguments(
     *,
     target: RbacCollection,
     effective_principal_id: str,
+    include_descendants: bool = False,
 ) -> None:
     arguments = [
         _require_string(
@@ -2534,27 +2996,30 @@ def _validate_cli_arguments(
     normalized = [argument.casefold() for argument in arguments]
     if any(argument.startswith("--") and "=" in argument for argument in normalized):
         raise PreflightInputError("Azure CLI role collection does not allow equals-form arguments")
-    switch_flags = {
-        "--include-groups",
-        "--include-inherited",
-        "--only-show-errors",
-    }
+    switch_flags = {"--include-groups", "--only-show-errors"}
+    if include_descendants:
+        switch_flags.add("--all")
+    else:
+        switch_flags.add("--include-inherited")
     expected_values = {
         "--subscription": target.subscription_id,
-        "--scope": target.resource_group_scope,
         "--assignee-object-id": effective_principal_id,
         "--output": "json",
         "--fill-principal-name": "false",
         "--fill-role-definition-name": "true",
     }
+    if not include_descendants:
+        expected_values["--scope"] = target.resource_group_scope
     required_flags = {
         "--assignee-object-id",
         "--include-groups",
-        "--include-inherited",
         "--output",
-        "--scope",
         "--subscription",
     }
+    if include_descendants:
+        required_flags.add("--all")
+    else:
+        required_flags.update({"--include-inherited", "--scope"})
     seen: set[str] = set()
     index = 0
     while index < len(arguments):
@@ -2613,7 +3078,7 @@ def _validate_effective_assignment_principal(
         raise PreflightInputError("ARM group-derived assignment disagrees with Graph membership")
 
 
-def _scope_is_effective_for_target(
+def _scope_is_ancestor_or_target(
     scope: str,
     *,
     collection: RbacCollection,
@@ -2629,7 +3094,19 @@ def _scope_is_effective_for_target(
     )
 
 
-def _parse_effective_role_assignments(
+def _scope_is_within_reviewed_boundary(
+    scope: str,
+    *,
+    collection: RbacCollection,
+) -> bool:
+    return (
+        scope == "/"
+        or scope in collection.management_group_ancestry
+        or _scope_contains(collection.subscription_scope, scope)
+    )
+
+
+def _parse_ancestor_role_assignments(
     value: object,
     *,
     effective_principal_id: str,
@@ -2734,7 +3211,7 @@ def _parse_effective_role_assignments(
             effective_principal_id=effective_principal_id,
             security_group_ids=security_group_ids,
         )
-        if not _scope_is_effective_for_target(
+        if not _scope_is_ancestor_or_target(
             assignment.scope,
             collection=collection,
         ):
@@ -2749,12 +3226,252 @@ def _parse_effective_role_assignments(
     return assignments
 
 
+def _parse_descendant_role_assignments(
+    value: object,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    collection: RbacCollection,
+) -> list[RbacAssignment]:
+    evidence = _mapping(
+        value,
+        field_name="subscription-descendant role-assignment evidence",
+    )
+    raw_method = _require_string(
+        _get_case_insensitive(evidence, "method"),
+        field_name="descendant role-assignment collection method",
+        maximum_length=64,
+    )
+    if not raw_method.isascii():
+        raise PreflightInputError("descendant role-assignment collection method must use ASCII")
+    method = _normalized(raw_method)
+    assignments: list[RbacAssignment] = []
+    if method == "arm":
+        required_principal_ids = {
+            effective_principal_id,
+            *security_group_ids,
+        }
+        collected_principal_ids: set[str] = set()
+        for raw_collection in _sequence(
+            _get_case_insensitive(evidence, "collections"),
+            field_name="ARM descendant role-assignment collections",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            descendant_collection = _mapping(
+                raw_collection,
+                field_name="ARM descendant role-assignment collection",
+            )
+            assigned_principal_id = _canonical_guid(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "assignedToPrincipalId",
+                ),
+                field_name="descendant assignedToPrincipalId",
+            )
+            if (
+                assigned_principal_id not in required_principal_ids
+                or assigned_principal_id in collected_principal_ids
+            ):
+                raise PreflightInputError(
+                    "ARM descendant collections do not exactly cover the "
+                    "effective principal and security groups"
+                )
+            collected_principal_ids.add(assigned_principal_id)
+            api_version = _require_string(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "apiVersion",
+                ),
+                field_name="ARM descendant apiVersion",
+                maximum_length=64,
+            )
+            if api_version != _ARM_ROLE_ASSIGNMENTS_API_VERSION:
+                raise PreflightInputError("ARM descendant evidence requires apiVersion 2022-04-01")
+            scope = _canonical_scope(
+                _require_string(
+                    _get_case_insensitive(
+                        descendant_collection,
+                        "scope",
+                    ),
+                    field_name="ARM descendant request scope",
+                )
+            )
+            if scope != collection.subscription_scope:
+                raise PreflightInputError("ARM descendant evidence uses the wrong subscription")
+            _validate_principal_id_filter(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "filter",
+                ),
+                assigned_principal_id=assigned_principal_id,
+                field_name="ARM descendant role-assignment filter",
+            )
+            raw_assignments, request_urls = _paged_values(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "pages",
+                ),
+                field_name="ARM descendant role-assignment evidence",
+                next_link_field="nextLink",
+                maximum_items=MAX_ASSIGNMENTS,
+                allowed_host="management.azure.com",
+            )
+            _validate_descendant_arm_urls(
+                request_urls,
+                target=collection,
+                assigned_principal_id=assigned_principal_id,
+            )
+            for raw_assignment in raw_assignments:
+                assignment = _parse_arm_role_assignment(
+                    raw_assignment,
+                    effective_principal_id=effective_principal_id,
+                )
+                if assignment.principal_id != assigned_principal_id:
+                    raise PreflightInputError(
+                        "ARM descendant assignment does not match its principal collection"
+                    )
+                if assigned_principal_id == effective_principal_id:
+                    if assignment.principal_type != "serviceprincipal":
+                        raise PreflightInputError(
+                            "effective-principal descendant assignment must be ServicePrincipal"
+                        )
+                elif (
+                    assigned_principal_id not in security_group_ids
+                    or assignment.principal_type != "group"
+                ):
+                    raise PreflightInputError(
+                        "group descendant assignment disagrees with Graph membership"
+                    )
+                assignments.append(assignment)
+        if collected_principal_ids != required_principal_ids:
+            raise PreflightInputError(
+                "ARM descendant collections do not exactly cover the "
+                "effective principal and security groups"
+            )
+    elif method == "azure-cli":
+        exit_code = _get_case_insensitive(evidence, "exitCode")
+        if type(exit_code) is not int or exit_code != 0:
+            raise PreflightInputError("Azure CLI descendant role collection did not succeed")
+        _validate_cli_arguments(
+            _get_case_insensitive(evidence, "arguments"),
+            target=collection,
+            effective_principal_id=effective_principal_id,
+            include_descendants=True,
+        )
+        for raw_assignment in _sequence(
+            _get_case_insensitive(evidence, "value"),
+            field_name="Azure CLI descendant role assignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="Azure CLI descendant role assignment",
+            )
+            if (
+                assignment.effective_principal_id_supplied
+                and assignment.effective_principal_id != effective_principal_id
+            ):
+                raise PreflightInputError(
+                    "Azure CLI descendant assignment effectivePrincipalId "
+                    "disagrees with its collection"
+                )
+            assignments.append(
+                replace(
+                    assignment,
+                    effective_principal_id=effective_principal_id,
+                    effective_principal_id_supplied=True,
+                )
+            )
+    else:
+        raise PreflightInputError(
+            "descendant role-assignment collection method must be arm or azure-cli"
+        )
+
+    unique_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    for assignment in assignments:
+        if not assignment.role_definition_id:
+            raise PreflightInputError("descendant role assignment requires roleDefinitionId")
+        if not assignment.principal_type_supplied:
+            raise PreflightInputError("descendant role assignment requires principalType")
+        _validate_effective_assignment_principal(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+        )
+        if not _scope_is_within_reviewed_boundary(
+            assignment.scope,
+            collection=collection,
+        ):
+            raise PreflightInputError("descendant role assignment is outside the reviewed boundary")
+        key = _assignment_key(assignment)
+        if key in unique_keys:
+            raise PreflightInputError(
+                "descendant role-assignment evidence contains a duplicate assignment"
+            )
+        unique_keys.add(key)
+    return assignments
+
+
 def _derive_guarded_role_assignments(
     document: object,
     *,
     policy: RbacPolicy,
+    policy_document: object,
+    require_attestation: bool,
+    expected_collection_run_id: str | None,
+    attestation_manifest_digest: str | None,
+    now: datetime | None,
 ) -> tuple[list[RbacAssignment], RbacCollection]:
     root = _mapping(document, field_name="guarded RBAC evidence")
+    if require_attestation:
+        if expected_collection_run_id is None or attestation_manifest_digest is None:
+            raise PreflightInputError(
+                "reviewed RBAC collectionRunId and manifest digest are required"
+            )
+        if {key.casefold() for key in root} != {
+            "attestation",
+            "hierarchy",
+            "manifest",
+            "principals",
+            "target",
+        }:
+            raise PreflightInputError("attested RBAC artifact has an invalid envelope")
+        manifest = _parse_attestation_manifest(
+            _get_case_insensitive(root, "manifest"),
+            expected_collection_run_id=expected_collection_run_id,
+            expected_manifest_digest=attestation_manifest_digest,
+            now=_current_utc(now),
+        )
+        rbac_payload = {
+            key: item
+            for key, item in root.items()
+            if key.casefold() not in {"attestation", "manifest"}
+        }
+        expected_bindings = {
+            "policyDigest": _canonical_json_digest(policy_document),
+            "rbacEvidenceDigest": _canonical_json_digest(rbac_payload),
+        }
+        for binding_name, expected_digest in expected_bindings.items():
+            if manifest.bindings[binding_name] != expected_digest:
+                raise PreflightInputError(
+                    f"manifest {binding_name} does not match the reviewed input"
+                )
+        _validate_artifact_attestation(
+            _get_case_insensitive(root, "attestation"),
+            artifact_kind="rbac",
+            manifest=manifest,
+            expected_binding_names=frozenset(expected_bindings),
+        )
     if any(
         _has_case_insensitive(root, legacy_name)
         for legacy_name in ("value", "queries", "collection")
@@ -2820,17 +3537,34 @@ def _derive_guarded_role_assignments(
             effective_principal_id=effective_principal_id,
             target=target,
         )
-        for assignment in _parse_effective_role_assignments(
+        role_assignment_evidence = _mapping(
             _get_case_insensitive(principal, "roleAssignments"),
-            effective_principal_id=effective_principal_id,
-            security_group_ids=security_group_ids,
-            collection=target,
-        ):
+            field_name="principal roleAssignments",
+        )
+        principal_assignments = [
+            *_parse_ancestor_role_assignments(
+                _get_case_insensitive(
+                    role_assignment_evidence,
+                    "ancestors",
+                ),
+                effective_principal_id=effective_principal_id,
+                security_group_ids=security_group_ids,
+                collection=target,
+            ),
+            *_parse_descendant_role_assignments(
+                _get_case_insensitive(
+                    role_assignment_evidence,
+                    "descendants",
+                ),
+                effective_principal_id=effective_principal_id,
+                security_group_ids=security_group_ids,
+                collection=target,
+            ),
+        ]
+        for assignment in principal_assignments:
             key = _assignment_key(assignment)
             if key in unique_assignment_keys:
-                raise PreflightInputError(
-                    "guarded RBAC evidence contains a duplicate effective assignment"
-                )
+                continue
             unique_assignment_keys.add(key)
             assignments.append(assignment)
     if not effective_principal_ids:
@@ -2869,6 +3603,10 @@ def evaluate_role_assignments(
     *,
     policy_document: object | None = None,
     require_separation_rules: bool = False,
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
     policy = _parse_policy(policy_document)
@@ -2904,7 +3642,7 @@ def evaluate_role_assignments(
                 assignment.effective_principal_id,
                 field_name="approved effectivePrincipalId",
             )
-            if not _scope_is_effective_for_target(
+            if not _scope_is_within_reviewed_boundary(
                 assignment.scope,
                 collection=policy.target,
             ):
@@ -2971,6 +3709,11 @@ def evaluate_role_assignments(
         observed_assignments, collection = _derive_guarded_role_assignments(
             document,
             policy=policy,
+            policy_document=policy_document,
+            require_attestation=(require_attestation or require_separation_rules),
+            expected_collection_run_id=expected_collection_run_id,
+            attestation_manifest_digest=attestation_manifest_digest,
+            now=now,
         )
         if not observed_assignments:
             raise PreflightInputError("effective role-assignment evidence must not be empty")
@@ -3077,7 +3820,7 @@ def evaluate_role_assignments(
                         detail=(f"{access_path} is forbidden at scope {scope}"),
                     )
                 )
-    return tuple(violations)
+    return _finalize_violations(violations)
 
 
 def render_preflight_json(
@@ -3085,11 +3828,12 @@ def render_preflight_json(
     kind: PreflightKind,
     violations: tuple[PreflightViolation, ...],
 ) -> str:
+    bounded_violations = _finalize_violations(violations)
     ordered_violations = sorted(
-        violations,
+        bounded_violations,
         key=lambda item: (item.code, item.subject.casefold(), item.detail),
     )
-    return (
+    rendered = (
         json.dumps(
             {
                 "kind": kind,
@@ -3101,6 +3845,9 @@ def render_preflight_json(
         )
         + "\n"
     )
+    if len(rendered.encode("utf-8")) > MAX_RENDER_BYTES:
+        raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
+    return rendered
 
 
 def render_preflight_text(
@@ -3108,8 +3855,9 @@ def render_preflight_text(
     kind: PreflightKind,
     violations: tuple[PreflightViolation, ...],
 ) -> str:
+    bounded_violations = _finalize_violations(violations)
     ordered_violations = sorted(
-        violations,
+        bounded_violations,
         key=lambda item: (item.code, item.subject.casefold(), item.detail),
     )
     lines = [
@@ -3123,7 +3871,10 @@ def render_preflight_text(
         f" | {_escaped_text(item.detail)}"
         for item in ordered_violations
     )
-    return "\n".join(lines) + "\n"
+    rendered = "\n".join(lines) + "\n"
+    if len(rendered.encode("utf-8")) > MAX_RENDER_BYTES:
+        raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
+    return rendered
 
 
 def _escaped_text(value: str) -> str:
@@ -3140,6 +3891,13 @@ def run_preflight_check(
     allowed_change_ids: frozenset[str] = frozenset(),
     policy_path: Path | None = None,
     require_rbac_policy: bool = False,
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    deployment_digest: str | None = None,
+    template_digest: str | None = None,
+    parameters_digest: str | None = None,
+    now: datetime | None = None,
 ) -> int:
     """Run one offline preflight check without adding policy or Azure I/O."""
 
@@ -3149,6 +3907,13 @@ def run_preflight_check(
             violations = evaluate_what_if(
                 document,
                 allowed_change_ids=allowed_change_ids,
+                require_attestation=require_attestation,
+                expected_collection_run_id=(expected_collection_run_id),
+                attestation_manifest_digest=(attestation_manifest_digest),
+                deployment_digest=deployment_digest,
+                template_digest=template_digest,
+                parameters_digest=parameters_digest,
+                now=now,
             )
         elif kind == "rbac":
             if require_rbac_policy and policy_path is None:
@@ -3162,9 +3927,25 @@ def run_preflight_check(
                 document,
                 policy_document=policy_document,
                 require_separation_rules=require_rbac_policy,
+                require_attestation=require_attestation,
+                expected_collection_run_id=(expected_collection_run_id),
+                attestation_manifest_digest=(attestation_manifest_digest),
+                now=now,
             )
         else:
             raise ValueError(f"unsupported preflight kind: {kind}")
+        if output_format == "json":
+            rendered = render_preflight_json(
+                kind=kind,
+                violations=violations,
+            )
+        elif output_format == "text":
+            rendered = render_preflight_text(
+                kind=kind,
+                violations=violations,
+            )
+        else:
+            raise ValueError(f"unsupported output format: {output_format}")
     except PreflightInputError as exc:
         if output_format == "json":
             stderr.write(
@@ -3185,12 +3966,7 @@ def run_preflight_check(
             raise ValueError(f"unsupported output format: {output_format}") from None
         return 3
 
-    if output_format == "json":
-        stdout.write(render_preflight_json(kind=kind, violations=violations))
-    elif output_format == "text":
-        stdout.write(render_preflight_text(kind=kind, violations=violations))
-    else:
-        raise ValueError(f"unsupported output format: {output_format}")
+    stdout.write(rendered)
     return 0 if not violations else 2
 
 

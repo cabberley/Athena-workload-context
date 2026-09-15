@@ -146,9 +146,21 @@ Evaluate each saved full-resource what-if artifact with the repository CLI. Repe
 `--allow-change` for every exact reviewed `Create` or `Modify` resource ID for that root; omit it
 when the only acceptable result is `NoChange`.
 
+Create one run ID for both what-if and RBAC evidence. The collector envelope records UTC
+`collectedAt`/`expiresAt` with a validity window no longer than 30 minutes and SHA-256 bindings for
+the raw what-if, RBAC payload, reviewed policy, deployment, template, parameters, and normalized
+allowlist. Store one shared manifest in both artifacts and have a reviewer approve its SHA-256
+digest independently of the artifacts.
+
 ```powershell
+$CollectionRunId = [guid]::NewGuid().ToString()
 $PreflightJson = & athena-context wc029-preflight what-if `
   .\evidence\wc013.what-if.json `
+  --collection-run-id $CollectionRunId `
+  --attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
+  --deployment-digest 'sha256:<reviewed-deployment-digest>' `
+  --template-digest 'sha256:<reviewed-template-digest>' `
+  --parameters-digest 'sha256:<reviewed-parameters-digest>' `
   --allow-change '/subscriptions/.../providers/Microsoft.App/containerApps/athena-presentation' `
   --format json
 $PreflightExitCode = $LASTEXITCODE
@@ -171,6 +183,7 @@ for exact prepared scope and blockers. It is not deployment approval.
 The gate fails on:
 
 - any `Delete`;
+- any `<resource>`, `<resource>.`, or `.` root `Delete`/`Remove` hidden under a non-delete change;
 - an unapproved `Create` or `Modify`;
 - changes to VNet, subnet, NSG, load balancer, Key Vault, Storage network rules, AMPLS, private DNS,
   or role assignments that are absent from the reviewed change set;
@@ -204,6 +217,10 @@ a leaf-to-root chain and retain the raw responses beside it. Missing nodes, `403
 subscription mismatch, cycles, disconnected nodes, or Resource Graph/ARM disagreement block the
 gate. The policy's `approvedManagementGroupAncestry` is a separately reviewed copy of the expected
 path; a changed path requires new review.
+
+The Resource Graph response must contain no non-null `skipToken` or `$skipToken`, must explicitly
+set `resultTruncated` to `false`, and must satisfy
+`count == totalRecords == data.Count == 1`.
 
 For every expected managed identity, record Graph object identity and complete transitive
 security-group membership:
@@ -266,6 +283,53 @@ while ($null -ne $NextUrl) {
 Do not drop, reorder, or manually splice pages. Each returned `nextLink` must be the following page's
 request URL, and the last response must not contain a next link.
 
+The target-scope query does not cover role assignments on individual workload resources or sibling
+resource groups. Collect a second, complete subscription-descendant inventory for the effective
+service principal and every security group returned by Graph:
+
+```powershell
+$AssignedPrincipalIds = @($PrincipalId) + @($SecurityGroupIds)
+$DescendantCollections = @()
+foreach ($AssignedPrincipalId in $AssignedPrincipalIds) {
+  $DescendantFilter = [uri]::EscapeDataString(
+    "principalId eq '$AssignedPrincipalId'"
+  )
+  $NextUrl = (
+    "https://management.azure.com/subscriptions/$SubscriptionId/" +
+    "providers/Microsoft.Authorization/roleAssignments" +
+    "?api-version=2022-04-01&`$filter=$DescendantFilter"
+  )
+  $Pages = @()
+  while ($null -ne $NextUrl) {
+    $RequestUrl = $NextUrl
+    $ResponseJson = az rest --method get --url $RequestUrl --output json
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed descendant RBAC collection for $AssignedPrincipalId"
+    }
+    $Response = $ResponseJson | ConvertFrom-Json
+    $Pages += [ordered]@{
+      requestUrl = $RequestUrl
+      statusCode = 200
+      value = @($Response.value)
+      nextLink = $Response.nextLink
+    }
+    $NextUrl = $Response.nextLink
+  }
+  $DescendantCollections += [ordered]@{
+    assignedToPrincipalId = $AssignedPrincipalId
+    apiVersion = '2022-04-01'
+    scope = "/subscriptions/$SubscriptionId"
+    filter = "principalId eq '$AssignedPrincipalId'"
+    pages = @($Pages)
+  }
+}
+```
+
+The ARM descendant collection set must exactly cover the service-principal object ID and every
+complete transitive security-group ID, including empty result sets. If the API repeats root,
+management-group, subscription, or target assignments, retain them; the verifier accepts only
+corroborated ancestors or subscription descendants and deduplicates the final union.
+
 When the Azure CLI is used instead, retain the exact successful argument list and raw output. The
 equivalent scoped command is:
 
@@ -284,19 +348,40 @@ az role assignment list `
 Do not use `--assignee`, omit either include flag, combine `--all` with `--scope`, add `--role`,
 `--resource-group`, or `--query`, use equals-form duplicate options, or transform the JSON output.
 
+The CLI equivalent for the separate subscription-descendant inventory is:
+
+```powershell
+az role assignment list `
+  --subscription $SubscriptionId `
+  --assignee-object-id $PrincipalId `
+  --include-groups `
+  --all `
+  --output json
+```
+
+This command must not include `--scope`; its output is unioned with the scoped ancestor/target
+collection.
+
 The verifier derives direct and group-derived effective assignments from the attested hierarchy,
 Graph membership, and ARM/CLI evidence. Direct rows must assign the service-principal object ID.
 Group rows must name a security group present in the complete Graph set. The separately reviewed
 policy uses `approvedAssignments`; never populate it by copying the observed output. Preserve
 `condition`, `conditionVersion`, canonical `roleDefinitionId`, `assignedPrincipalId`,
-`assignedPrincipalType`, and `effectivePrincipalId`. Each separation rule must include the reviewed
-IDs in
+`assignedPrincipalType`, and `effectivePrincipalId`.
+
+The RBAC envelope uses the same `$CollectionRunId`, bounded timestamps, and SHA-256 bindings for the
+reviewed policy, target, hierarchy, membership, and both role-assignment collections. Its embedded
+manifest must be byte-equivalent to the what-if manifest, and the independently reviewed manifest
+digest must not be regenerated after evidence changes. Each separation rule must include the
+reviewed IDs in
 `forbiddenRoleDefinitionIds` as well as their display names:
 
 ```powershell
 $RbacPreflightJson = & athena-context wc029-preflight rbac `
   .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json `
+  --collection-run-id $CollectionRunId `
+  --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>' `
   --format json
 $RbacPreflightExitCode = $LASTEXITCODE
 $RbacPreflightJson | Set-Content -Encoding utf8 .\evidence\rbac.preflight.json

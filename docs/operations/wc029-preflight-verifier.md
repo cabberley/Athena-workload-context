@@ -37,9 +37,27 @@ and leaves whose `before` and `after` values are unchanged do not make a change 
 both complete resource `before` and `after` snapshots are present, the verifier derives the actual
 changed leaves, ignores unchanged metadata, and applies the same protected-property checks to that
 derived delta.
+`<resource>`, `<resource>.`, and `.` are the same canonical resource root. A root `Delete` or
+`Remove` under any non-`Delete` top-level change is still a deletion and always blocks, even when a
+separate `after` snapshot appears safe. A root `after` value must be an object, and root deltas are
+treated as ancestors of every protected property.
+
+Production what-if evidence is an attested envelope containing `whatIf` plus `collectionRunId`,
+`collectedAt`, `expiresAt`, and SHA-256 bindings for the what-if result, deployment, template,
+parameters, and normalized `--allow-change` list. The validity window must be positive and no longer
+than 30 minutes; expired or replayed evidence and a collection time more than five minutes in the
+future fail deterministically. Use the same reviewed `collectionRunId` for the RBAC artifact.
+Both artifacts embed the same manifest covering their payload digests, policy digest, timestamps,
+run ID, and reviewed inputs. The CLI requires the independently reviewed SHA-256 digest of that
+manifest; regenerating the manifest after changing evidence does not satisfy the gate.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
+  --collection-run-id '<collection-run-guid>' `
+--attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
+  --deployment-digest 'sha256:<deployment-digest>' `
+  --template-digest 'sha256:<template-digest>' `
+  --parameters-digest 'sha256:<parameters-digest>' `
   --allow-change '/subscriptions/.../providers/Microsoft.App/containerApps/athena-presentation'
 ```
 
@@ -65,7 +83,9 @@ python -m athena_context.wc029_preflight what-if .\evidence\what-if.json
 
 ```powershell
 athena-context wc029-preflight rbac .\evidence\role-assignments.json `
-  --policy .\evidence\reviewed-rbac-policy.json
+  --policy .\evidence\reviewed-rbac-policy.json `
+  --collection-run-id '<same-collection-run-guid>' `
+  --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>'
 ```
 
 The production wrapper requires `--policy`, a reviewed target tenant/subscription/resource group,
@@ -85,7 +105,14 @@ Guarded evidence contains three raw artifact families:
      `servicePrincipals/{id}/getMemberGroups` with `securityEnabledOnly: true`, or every page of
      `transitiveMemberOf`; and
    - every page of the ARM role assignments API `2022-04-01` query at the target scope using
-     `atScope() and assignedTo('<service-principal-object-id>')`.
+     `atScope() and assignedTo('<service-principal-object-id>')`; and
+   - a separate complete subscription-descendant inventory for the effective principal and every
+     transitive security group, including individual workload resources and sibling resource
+     groups.
+
+Complete subscription responses may repeat root, corroborated management-group, subscription, or
+target assignments. Those rows are accepted only inside the reviewed boundary and deduplicated
+against the target/ancestor collection.
 
 Every page records its request URL, HTTP status, values, and returned next link. The next link must
 match the following page exactly and the final page must have no next link. Missing pages, non-200
@@ -97,6 +124,9 @@ filter on the first page is rejected. Initial ARM role-assignment requests allow
 `api-version=2022-04-01` and the exact `atScope() and assignedTo(...)` filter. Continuations must stay
 on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
 Cross-tenant parameters and caller-added selection filters are rejected.
+
+The Resource Graph response must explicitly report `resultTruncated: false`, no non-null
+`skipToken` or `$skipToken`, and `count == totalRecords == len(data) == 1`.
 
 The verifier derives the management-group path from ARM parent links, rejects missing, disconnected,
 or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the
@@ -116,14 +146,22 @@ assigned and effective object IDs. A group-derived assignment requires
 Graph transitive security-group set. The service-principal object ID must match Graph `id` and must
 not be the Graph `appId` client ID. Graph/ARM disagreement fails closed.
 
-The verifier derives the effective assignment set only from these ancestry, membership, and ARM
-artifacts, then compares it with separately reviewed `approvedAssignments`. The legacy module entry
-point keeps its historical optional-policy and list-input behavior for compatibility and must not be
-used as the guarded deployment gate.
+The verifier derives and deduplicates the union of target/ancestor assignments and the complete
+subscription-descendant inventory, then compares it with separately reviewed
+`approvedAssignments`. The legacy module entry point keeps its historical optional-policy and
+list-input behavior for compatibility and must not be used as the guarded deployment gate.
 
-CLI-equivalent evidence is accepted only for an exact allowlisted argument grammar with scoped JSON
-output. Selection or output transforms such as `--role`, `--resource-group`, or `--query`, `--all`,
-equals-form overrides, duplicate flags, and alternate assignee forms fail closed.
+The RBAC envelope uses the same bounded timestamps, `collectionRunId`, and independently reviewed
+manifest digest as the what-if envelope. The manifest binds the reviewed policy and the complete
+RBAC payload, including target, hierarchy, service-principal and membership inputs, and
+ancestor/descendant assignment collections. Mutating evidence and regenerating only its embedded
+digests fails against the externally supplied manifest digest.
+
+CLI-equivalent evidence requires two exact collections. The target/ancestor command uses
+`--scope`, `--include-inherited`, and `--include-groups` without `--all`. The subscription-descendant
+command uses `--all`, `--assignee-object-id`, and `--include-groups` without `--scope`. Selection or
+output transforms such as `--role`, `--resource-group`, or `--query`, equals-form overrides,
+duplicate flags, and alternate assignee forms fail closed.
 
 The policy is bounded JSON:
 
@@ -221,6 +259,10 @@ entries fail closed. Every production separation rule also requires reviewed
 `forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a
 false display name cannot bypass separation. Oversized integer literals and other parser failures
 are reported as malformed input with exit code `3`.
+
+Equivalent separation rules are rejected before evaluation. Identical violations from distinct
+non-equivalent rules are emitted once, no result may contain more than 256 unique violations, and
+JSON or text output is bounded to 1 MiB.
 
 The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
 Resource Graph, ARM, and Graph responses or the explicitly attested CLI-equivalent collection,
