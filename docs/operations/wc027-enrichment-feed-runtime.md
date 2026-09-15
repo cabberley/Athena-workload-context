@@ -110,15 +110,23 @@ Record the `producerImage`, `deployedRuntimeConfigurationDigest`,
 container/table IDs with the Job resource ID for the root readiness gate. The producer root
 creates no guidance-authority bytes and grants no authority writer role.
 
+Deployment verification requires every Blob Data Reader assignment to retain condition version
+`2.0` and the exact canonical no-`Blob.List` expression; absent, altered, or duplicated condition
+forms fail closed. It also requires the producer trigger, publisher request, and notification
+outbox queues to be `Active`, non-forwarding, and to match their exact stage-specific session,
+duplicate-detection window, TTL, lock, delivery-count, capacity, batching, partitioning, and
+message-size profiles.
+
 For WC-029 deployment, do not deploy this root as an untracked side step. Use the governed
 foundation -> producer -> publisher -> live-acceptance sequence in
 [`wc029-deployment-live-validation.md`](wc029-deployment-live-validation.md). The orchestration
 tool binds this root to the exact WC-013 foundation outputs, verifies that its generated
 configuration digest hashes the deployed JSON, proves the referenced identities, versioned keys,
 feed/activation storage, and empty private guidance-authority container exist, and emits the only
-producer handoff accepted by the publisher and final WC-013 gate. The publisher root must consume
-the exact producer configuration, correlation-storage boundary, and guidance-binding key resource
-from that handoff rather than accepting independently selected replacements.
+producer handoff plus reviewed deployment receipt accepted by the publisher and final WC-013
+gate. The publisher root must consume the exact producer configuration, correlation-storage
+boundary, and guidance-binding key resource from that handoff, while independently verifying the
+receipt digest and its referenced plan, rather than accepting independently selected replacements.
 
 ## Guidance-authority publisher
 

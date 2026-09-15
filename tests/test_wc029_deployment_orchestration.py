@@ -10,6 +10,7 @@ from scripts import wc029_deployment_orchestration as orchestration
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "operations" / "wc029-deployment-live-validation.md"
 WC013_ROOT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
+WC016_ROOT = ROOT / "infra" / "wc016-event-reassessment" / "main.bicep"
 PRODUCER_ROOT = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 PUBLISHER_ROOT = (
     ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
@@ -57,15 +58,27 @@ def _write_handoff(
     outputs: dict[str, object],
     *,
     parameter_bindings: dict[str, object] | None = None,
+    predecessor_receipt_sha256s: dict[str, object] | None = None,
+    plan_manifest_sha256: str | None = None,
 ) -> None:
     bindings = {} if parameter_bindings is None else parameter_bindings
+    predecessor_hashes = (
+        {
+            predecessor: f"sha256:{str(index + 1) * 64}"
+            for index, predecessor in enumerate(
+                orchestration.EXPECTED_PREDECESSOR_STAGES[stage]
+            )
+        }
+        if predecessor_receipt_sha256s is None
+        else predecessor_receipt_sha256s
+    )
     resource_group = (
         RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
     )
     path.write_text(
         json.dumps(
             {
-                "schemaVersion": "athena.wc029DeploymentHandoff.v1",
+                "schemaVersion": orchestration.HANDOFF_SCHEMA_VERSION,
                 "stage": stage,
                 "sourceCommit": orchestration.SOURCE_COMMIT,
                 "subscriptionId": SUBSCRIPTION_ID,
@@ -79,11 +92,120 @@ def _write_handoff(
                 "parameterBindingsSha256": orchestration._sha256_bytes(
                     orchestration._canonical_json_bytes(bindings)
                 ),
-                "planManifestSha256": f"sha256:{'a' * 64}",
+                "planManifestSha256": (
+                    f"sha256:{'a' * 64}"
+                    if plan_manifest_sha256 is None
+                    else plan_manifest_sha256
+                ),
+                "predecessorReceiptSha256s": predecessor_hashes,
             }
         ),
         encoding="utf-8",
     )
+
+
+def _write_plan(
+    path: Path,
+    *,
+    stage: str,
+    parameter_path: Path,
+    what_if_path: Path,
+    predecessor_handoffs: dict[str, Path],
+    predecessor_receipts: dict[str, dict[str, object]],
+) -> None:
+    resource_group = (
+        RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
+    )
+    document: dict[str, object] = {
+        "schemaVersion": orchestration.PLAN_SCHEMA_VERSION,
+        "stage": stage,
+        "sourceCommit": orchestration.SOURCE_COMMIT,
+        "subscriptionId": SUBSCRIPTION_ID,
+        "location": "australiaeast",
+        "resourceGroup": resource_group,
+        "deploymentName": f"synthetic-{stage}",
+        "templatePath": str(
+            orchestration.TEMPLATES[stage].relative_to(ROOT)
+        ).replace("\\", "/"),
+        "templateSha256": orchestration._sha256_file(
+            orchestration.TEMPLATES[stage]
+        ),
+        "orchestratorSha256": orchestration._sha256_file(
+            Path(orchestration.__file__).resolve()
+        ),
+        "preflightSha256": orchestration._sha256_file(
+            orchestration.PREFLIGHT_PATH
+        ),
+        "baseParameterPath": str(parameter_path.resolve()),
+        "baseParameterSha256": orchestration._sha256_file(parameter_path),
+        "effectiveParameterPath": str(parameter_path.resolve()),
+        "effectiveParameterSha256": orchestration._sha256_file(parameter_path),
+        "whatIfPath": str(what_if_path.resolve()),
+        "whatIfSha256": orchestration._sha256_file(what_if_path),
+        "allowedChangeResourceIds": [],
+        "predecessorReceipts": predecessor_receipts,
+    }
+    for predecessor in ("foundation", "producer", "publisher"):
+        handoff_path = predecessor_handoffs.get(predecessor)
+        document[f"{predecessor}HandoffPath"] = (
+            None if handoff_path is None else str(handoff_path.resolve())
+        )
+        document[f"{predecessor}HandoffSha256"] = (
+            None
+            if handoff_path is None
+            else orchestration._sha256_file(handoff_path)
+        )
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _write_receipt(
+    path: Path,
+    *,
+    stage: str,
+    plan_path: Path,
+    handoff_path: Path,
+    predecessor_receipt_sha256s: dict[str, object],
+    reviewed_plan_sha256: str | None = None,
+) -> None:
+    plan_digest = orchestration._sha256_file(plan_path)
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": orchestration.RECEIPT_SCHEMA_VERSION,
+                "stage": stage,
+                "sourceCommit": orchestration.SOURCE_COMMIT,
+                "subscriptionId": SUBSCRIPTION_ID,
+                "resourceGroup": (
+                    RUNTIME_RESOURCE_GROUP
+                    if stage in {"producer", "publisher"}
+                    else None
+                ),
+                "deploymentName": f"synthetic-{stage}",
+                "planManifestPath": str(plan_path.resolve()),
+                "planManifestSha256": plan_digest,
+                "reviewedPlanSha256": (
+                    plan_digest
+                    if reviewed_plan_sha256 is None
+                    else reviewed_plan_sha256
+                ),
+                "handoffPath": str(handoff_path.resolve()),
+                "handoffSha256": orchestration._sha256_file(handoff_path),
+                "predecessorReceiptSha256s": predecessor_receipt_sha256s,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_safe_plan_inputs(tmp_path: Path, stage: str) -> tuple[Path, Path]:
+    parameter_path = tmp_path / f"{stage}.parameters.json"
+    _write_parameters(parameter_path, {})
+    what_if_path = tmp_path / f"{stage}.what-if.json"
+    what_if_path.write_text(
+        json.dumps({"status": "Succeeded", "properties": {"changes": []}}),
+        encoding="utf-8",
+    )
+    return parameter_path, what_if_path
 
 
 def _foundation_outputs() -> dict[str, object]:
@@ -532,6 +654,70 @@ def _publisher_parameter_bindings() -> dict[str, object]:
     }
 
 
+def _write_stage_bundle(
+    tmp_path: Path,
+    *,
+    stage: str,
+    outputs: dict[str, object],
+    parameter_bindings: dict[str, object],
+    predecessors: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    stage_directory = tmp_path / stage
+    stage_directory.mkdir()
+    parameter_path, what_if_path = _write_safe_plan_inputs(
+        stage_directory,
+        stage,
+    )
+    predecessor_handoffs = {
+        predecessor: Path(str(bundle["handoffPath"]))
+        for predecessor, bundle in predecessors.items()
+    }
+    predecessor_receipts = {
+        predecessor: {
+            "path": str(Path(str(bundle["receiptPath"])).resolve()),
+            "sha256": bundle["receiptSha256"],
+            "reviewedSha256": bundle["receiptSha256"],
+        }
+        for predecessor, bundle in predecessors.items()
+    }
+    plan_path = stage_directory / f"{stage}.plan.json"
+    _write_plan(
+        plan_path,
+        stage=stage,
+        parameter_path=parameter_path,
+        what_if_path=what_if_path,
+        predecessor_handoffs=predecessor_handoffs,
+        predecessor_receipts=predecessor_receipts,
+    )
+    predecessor_hashes = {
+        predecessor: bundle["receiptSha256"]
+        for predecessor, bundle in predecessors.items()
+    }
+    handoff_path = stage_directory / f"{stage}.handoff.json"
+    _write_handoff(
+        handoff_path,
+        stage,
+        outputs,
+        parameter_bindings=parameter_bindings,
+        predecessor_receipt_sha256s=predecessor_hashes,
+        plan_manifest_sha256=orchestration._sha256_file(plan_path),
+    )
+    receipt_path = stage_directory / f"{stage}.receipt.json"
+    _write_receipt(
+        receipt_path,
+        stage=stage,
+        plan_path=plan_path,
+        handoff_path=handoff_path,
+        predecessor_receipt_sha256s=predecessor_hashes,
+    )
+    return {
+        "planPath": plan_path,
+        "handoffPath": handoff_path,
+        "receiptPath": receipt_path,
+        "receiptSha256": orchestration._sha256_file(receipt_path),
+    }
+
+
 def _accepted_readiness_outputs(
     producer: dict[str, object],
     publisher: dict[str, object],
@@ -823,6 +1009,129 @@ def test_stage_inputs_require_exact_governed_predecessors_and_scope() -> None:
         )
 
 
+def test_subscription_boundary_rejects_cross_subscription_and_noncanonical_ids() -> None:
+    governed_resource = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena"
+    )
+    orchestration._canonical_subscription_resource_id(
+        governed_resource,
+        subscription_id=SUBSCRIPTION_ID,
+        field="resource",
+    )
+    for invalid in (
+        governed_resource.replace(
+            SUBSCRIPTION_ID,
+            "99999999-9999-9999-9999-999999999999",
+        ),
+        governed_resource.replace("/resourceGroups/", "//resourceGroups/"),
+        f"{governed_resource}/",
+        governed_resource.replace("/providers/", "/Providers/"),
+    ):
+        with pytest.raises(orchestration.OrchestrationError):
+            orchestration._canonical_subscription_resource_id(
+                invalid,
+                subscription_id=SUBSCRIPTION_ID,
+                field="resource",
+            )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="canonical|governed",
+    ):
+        orchestration._validate_subscription_boundary(
+            json.dumps(
+                {
+                    "nestedResourceId": governed_resource.replace(
+                        SUBSCRIPTION_ID,
+                        "99999999-9999-9999-9999-999999999999",
+                    )
+                }
+            ),
+            subscription_id=SUBSCRIPTION_ID,
+            field="embedded configuration",
+        )
+    for invalid_resource_value in (
+        (
+            " /subscriptions/99999999-9999-9999-9999-999999999999/"
+            "resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/x"
+        ),
+        (
+            "prefix/subscriptions/99999999-9999-9999-9999-999999999999/"
+            "resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/x"
+        ),
+    ):
+        with pytest.raises(orchestration.OrchestrationError):
+            orchestration._validate_subscription_boundary(
+                {"brokerIdentityResourceId": invalid_resource_value},
+                subscription_id=SUBSCRIPTION_ID,
+                field="embedded configuration",
+            )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="canonical|governed",
+    ):
+        orchestration._validate_subscription_boundary(
+            {
+                (
+                    "prefix"
+                    + governed_resource.replace(
+                        SUBSCRIPTION_ID,
+                        "99999999-9999-9999-9999-999999999999",
+                    )
+                ): {}
+            },
+            subscription_id=SUBSCRIPTION_ID,
+            field="identity map",
+        )
+
+
+def test_plan_rejects_cross_subscription_parameters_before_azure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameters = tmp_path / "foundation.parameters.json"
+    _write_parameters(
+        parameters,
+        {
+            "wc016RuntimeEnabled": True,
+            "wc016LegacyCleanupConfirmed": True,
+            "targetDemoWorkloadSubscriptionId": SUBSCRIPTION_ID,
+            "brokerIdentityResourceId": (
+                " /subscriptions/99999999-9999-9999-9999-999999999999/"
+                "resourceGroups/rg/providers/Microsoft.ManagedIdentity/"
+                "userAssignedIdentities/cross-subscription"
+            ),
+        },
+    )
+    monkeypatch.setattr(orchestration, "_ensure_clean_worktree", lambda: None)
+    monkeypatch.setattr(
+        orchestration,
+        "_run",
+        lambda _command: pytest.fail("Azure command ran before subscription validation"),
+    )
+    args = orchestration.argparse.Namespace(
+        stage="foundation",
+        subscription=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=None,
+        deployment_name="synthetic-foundation",
+        parameters=parameters,
+        evidence_directory=tmp_path / "evidence",
+        foundation_handoff=None,
+        foundation_receipt=None,
+        foundation_reviewed_receipt_sha256=None,
+        producer_handoff=None,
+        producer_receipt=None,
+        producer_reviewed_receipt_sha256=None,
+        publisher_handoff=None,
+        publisher_receipt=None,
+        publisher_reviewed_receipt_sha256=None,
+        allow_change=[],
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="canonical"):
+        orchestration.plan(args)
+
+
 def test_required_root_outputs_cannot_be_missing_or_mismatched() -> None:
     producer = _producer_outputs()
     orchestration._producer_outputs({"outputs": producer})
@@ -877,6 +1186,119 @@ def test_handoff_schema_rejects_unexpected_fields(tmp_path: Path) -> None:
 
     with pytest.raises(orchestration.OrchestrationError, match="unexpected"):
         orchestration._load_handoff(path, expected_stage="foundation")
+
+
+def test_predecessor_requires_exact_plan_and_trusted_receipt(
+    tmp_path: Path,
+) -> None:
+    foundation = _write_stage_bundle(
+        tmp_path,
+        stage="foundation",
+        outputs=_foundation_outputs(),
+        parameter_bindings=_foundation_parameter_bindings({}),
+        predecessors={},
+    )
+    record = orchestration._load_verified_predecessor(
+        expected_stage="foundation",
+        handoff_path=Path(str(foundation["handoffPath"])),
+        receipt_path=Path(str(foundation["receiptPath"])),
+        reviewed_receipt_sha256=str(foundation["receiptSha256"]),
+    )
+    assert record["receiptSha256"] == foundation["receiptSha256"]
+
+    with pytest.raises(orchestration.OrchestrationError, match="trusted approval"):
+        orchestration._load_verified_predecessor(
+            expected_stage="foundation",
+            handoff_path=Path(str(foundation["handoffPath"])),
+            receipt_path=Path(str(foundation["receiptPath"])),
+            reviewed_receipt_sha256=f"sha256:{'f' * 64}",
+        )
+
+    forged_receipt = tmp_path / "forged-foundation.receipt.json"
+    _write_receipt(
+        forged_receipt,
+        stage="foundation",
+        plan_path=Path(str(foundation["planPath"])),
+        handoff_path=Path(str(foundation["handoffPath"])),
+        predecessor_receipt_sha256s={},
+        reviewed_plan_sha256=f"sha256:{'e' * 64}",
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="reviewed plan"):
+        orchestration._load_verified_predecessor(
+            expected_stage="foundation",
+            handoff_path=Path(str(foundation["handoffPath"])),
+            receipt_path=forged_receipt,
+            reviewed_receipt_sha256=orchestration._sha256_file(forged_receipt),
+        )
+
+
+def test_predecessor_receipts_preserve_exact_approval_order(
+    tmp_path: Path,
+) -> None:
+    foundation = _write_stage_bundle(
+        tmp_path,
+        stage="foundation",
+        outputs=_foundation_outputs(),
+        parameter_bindings=_foundation_parameter_bindings({}),
+        predecessors={},
+    )
+    producer = _write_stage_bundle(
+        tmp_path,
+        stage="producer",
+        outputs=_producer_outputs(),
+        parameter_bindings=_producer_parameter_bindings(),
+        predecessors={"foundation": foundation},
+    )
+    verified = orchestration._load_verified_predecessors(
+        stage="publisher",
+        handoff_paths={
+            "foundation": Path(str(foundation["handoffPath"])),
+            "producer": Path(str(producer["handoffPath"])),
+            "publisher": None,
+        },
+        receipt_paths={
+            "foundation": Path(str(foundation["receiptPath"])),
+            "producer": Path(str(producer["receiptPath"])),
+            "publisher": None,
+        },
+        reviewed_receipt_sha256s={
+            "foundation": str(foundation["receiptSha256"]),
+            "producer": str(producer["receiptSha256"]),
+            "publisher": None,
+        },
+    )
+    assert tuple(verified) == ("foundation", "producer")
+
+    producer_receipt_path = Path(str(producer["receiptPath"]))
+    producer_receipt = json.loads(
+        producer_receipt_path.read_text(encoding="utf-8")
+    )
+    producer_receipt["predecessorReceiptSha256s"]["foundation"] = (
+        f"sha256:{'d' * 64}"
+    )
+    producer_receipt_path.write_text(
+        json.dumps(producer_receipt),
+        encoding="utf-8",
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="receipt chain"):
+        orchestration._load_verified_predecessors(
+            stage="publisher",
+            handoff_paths={
+                "foundation": Path(str(foundation["handoffPath"])),
+                "producer": Path(str(producer["handoffPath"])),
+                "publisher": None,
+            },
+            receipt_paths={
+                "foundation": Path(str(foundation["receiptPath"])),
+                "producer": producer_receipt_path,
+                "publisher": None,
+            },
+            reviewed_receipt_sha256s={
+                "foundation": str(foundation["receiptSha256"]),
+                "producer": orchestration._sha256_file(producer_receipt_path),
+                "publisher": None,
+            },
+        )
 
 
 def test_live_acceptance_requires_exact_job_readback() -> None:
@@ -1127,6 +1549,8 @@ def test_rbac_role_must_match_its_exact_resource_scope(
                     "Microsoft.Authorization/roleDefinitions/"
                     "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
                 ),
+                "conditionVersion": "2.0",
+                "condition": orchestration.BLOB_LIST_DENY_CONDITION,
                 "scope": queue_scope,
             },
         }
@@ -1138,6 +1562,107 @@ def test_rbac_role_must_match_its_exact_resource_scope(
             allowed_principal_ids={principal_id},
             subscription_id=SUBSCRIPTION_ID,
         )
+
+
+@pytest.mark.parametrize(
+    ("condition_version", "condition"),
+    (
+        (None, None),
+        ("2.0", "(!(ActionMatches{'wrong'}))"),
+        (
+            "2.0",
+            (
+                f"{orchestration.BLOB_LIST_DENY_CONDITION} AND "
+                f"{orchestration.BLOB_LIST_DENY_CONDITION}"
+            ),
+        ),
+    ),
+)
+def test_blob_reader_requires_exact_no_list_condition(
+    monkeypatch: pytest.MonkeyPatch,
+    condition_version: str | None,
+    condition: str | None,
+) -> None:
+    container_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+        "containers/wc027-enrichment-feed-v2"
+    )
+    assignment_id = (
+        f"{container_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "10101010-1010-1010-1010-101010101010"
+    )
+    principal_id = "20202020-2020-2020-2020-202020202020"
+    properties: dict[str, object] = {
+        "principalId": principal_id,
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+        ),
+        "scope": container_scope,
+    }
+    if condition_version is not None:
+        properties["conditionVersion"] = condition_version
+    if condition is not None:
+        properties["condition"] = condition
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": properties,
+        },
+    )
+
+    with pytest.raises(orchestration.OrchestrationError, match="no-Blob.List"):
+        orchestration._verify_rbac_resources(
+            {"rbacResourceIds": [assignment_id]},
+            allowed_principal_ids={principal_id},
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_blob_reader_accepts_only_canonical_no_list_condition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+        "containers/wc027-enrichment-feed-v2"
+    )
+    assignment_id = (
+        f"{container_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "30303030-3030-3030-3030-303030303030"
+    )
+    principal_id = "40404040-4040-4040-4040-404040404040"
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+                ),
+                "conditionVersion": "2.0",
+                "condition": orchestration.BLOB_LIST_DENY_CONDITION,
+                "scope": container_scope,
+            },
+        },
+    )
+
+    verified = orchestration._verify_rbac_resources(
+        {"rbacResourceIds": [assignment_id]},
+        allowed_principal_ids={principal_id},
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assert verified == {principal_id: {assignment_id.casefold()}}
 
 
 def test_publisher_trigger_handoff_requires_exact_sender_role(
@@ -1239,13 +1764,12 @@ def test_dependency_security_properties_fail_closed(
         lambda _resource_id, *, subscription_id: {
             "id": queue_id,
             "properties": {
+                **orchestration.PRODUCER_TRIGGER_QUEUE_PROFILE,
                 "requiresSession": False,
-                "requiresDuplicateDetection": True,
-                "deadLetteringOnMessageExpiration": True,
             },
         },
     )
-    with pytest.raises(orchestration.OrchestrationError, match="require sessions"):
+    with pytest.raises(orchestration.OrchestrationError, match="requiresSession"):
         orchestration._verify_service_bus_queue(
             job_resource_id=(
                 f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
@@ -1253,8 +1777,56 @@ def test_dependency_security_properties_fail_closed(
             ),
             namespace_name="athena-wc016-events",
             queue_name="wc027-enrichment-feed-requests",
+            profile_name="producer trigger",
+            expected_profile=orchestration.PRODUCER_TRIGGER_QUEUE_PROFILE,
             subscription_id=SUBSCRIPTION_ID,
         )
+
+
+def test_service_bus_queue_requires_exact_stage_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    properties = dict(orchestration.PRODUCER_TRIGGER_QUEUE_PROFILE)
+
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda _resource_id, *, subscription_id: {
+            "id": queue_id,
+            "properties": properties,
+        },
+    )
+    arguments = {
+        "job_resource_id": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+            "Microsoft.App/jobs/wc027-producer"
+        ),
+        "namespace_name": "athena-wc016-events",
+        "queue_name": "wc027-enrichment-feed-requests",
+        "profile_name": "producer trigger",
+        "expected_profile": orchestration.PRODUCER_TRIGGER_QUEUE_PROFILE,
+        "subscription_id": SUBSCRIPTION_ID,
+    }
+    orchestration._verify_service_bus_queue(**arguments)
+
+    properties["status"] = "SendDisabled"
+    with pytest.raises(orchestration.OrchestrationError, match="status"):
+        orchestration._verify_service_bus_queue(**arguments)
+    properties["status"] = "Active"
+
+    properties["duplicateDetectionHistoryTimeWindow"] = "PT10M"
+    with pytest.raises(orchestration.OrchestrationError, match="duplicateDetection"):
+        orchestration._verify_service_bus_queue(**arguments)
+    properties["duplicateDetectionHistoryTimeWindow"] = "P7D"
+
+    properties["forwardTo"] = "unexpected-forward"
+    with pytest.raises(orchestration.OrchestrationError, match="forwardTo"):
+        orchestration._verify_service_bus_queue(**arguments)
 
 
 def test_external_key_must_match_a_private_governed_vault(
@@ -1442,11 +2014,44 @@ def test_wc027_roots_emit_exact_handoff_outputs() -> None:
         assert f"output {output_name} " in publisher
 
 
+def test_service_bus_stage_profiles_are_explicit_in_iac() -> None:
+    producer = PRODUCER_ROOT.read_text(encoding="utf-8")
+    publisher = PUBLISHER_ROOT.read_text(encoding="utf-8")
+    wc016 = WC016_ROOT.read_text(encoding="utf-8")
+
+    for source, duration, ttl, lock, deliveries, message_size in (
+        (producer, "'P7D'", "'P1D'", "'PT5M'", "10", "12288"),
+        (publisher, "'PT15M'", "'PT5M'", "'PT5M'", "5", "12288"),
+        (wc016, "'P7D'", "'P7D'", "'PT1M'", "10", "1024"),
+    ):
+        for expected in (
+            "status: 'Active'",
+            f"duplicateDetectionHistoryTimeWindow: {duration}",
+            f"defaultMessageTimeToLive: {ttl}",
+            f"lockDuration: {lock}",
+            f"maxDeliveryCount: {deliveries}",
+            f"maxMessageSizeInKilobytes: {message_size}",
+            "maxSizeInMegabytes: 1024",
+            "enableBatchedOperations: true",
+            "enableExpress: false",
+            "enablePartitioning: false",
+        ):
+            assert expected in source
+
+
 def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     source = (
         ROOT / "scripts" / "wc029_deployment_orchestration.py"
     ).read_text(encoding="utf-8")
     assert '--reviewed-plan-sha256", required=True' in source
+    assert '--foundation-receipt", type=Path' in source
+    assert '--foundation-reviewed-receipt-sha256"' in source
+    assert '--producer-reviewed-receipt-sha256"' in source
+    assert '--publisher-reviewed-receipt-sha256"' in source
+    assert "athena.wc029DeploymentReceipt.v1" in source
+    assert "predecessorReceiptSha256s" in source
+    assert "receipt does not prove an independently reviewed plan" in source
+    assert "return receipt_path" in source
     assert "plan manifest does not match the independently reviewed SHA-256" in source
     assert 'operation="what-if"' in source
     assert "current what-if differs from the plan" in source

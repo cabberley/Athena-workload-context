@@ -387,12 +387,18 @@ resource notificationOutbox 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' 
   parent: namespace
   name: notificationOutboxQueueName
   properties: {
+    status: 'Active'
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'P7D'
+    enableBatchedOperations: true
+    enableExpress: false
+    enablePartitioning: false
     deadLetteringOnMessageExpiration: true
     defaultMessageTimeToLive: 'P7D'
     lockDuration: 'PT1M'
     maxDeliveryCount: 10
+    maxMessageSizeInKilobytes: 1024
+    maxSizeInMegabytes: 1024
     requiresSession: true
   }
 }

@@ -388,14 +388,19 @@ resource triggerQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
   parent: serviceBusNamespace
   name: triggerQueueName
   properties: {
+    status: 'Active'
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'P7D'
+    enableBatchedOperations: true
+    enableExpress: false
+    enablePartitioning: false
     deadLetteringOnMessageExpiration: true
     defaultMessageTimeToLive: 'P1D'
     lockDuration: 'PT5M'
     maxDeliveryCount: 10
     maxMessageSizeInKilobytes: 12288
+    maxSizeInMegabytes: 1024
   }
 }
 

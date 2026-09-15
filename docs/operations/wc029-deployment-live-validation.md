@@ -72,18 +72,20 @@ sequence is therefore:
    Job IDs, images, configuration digests, embedded producer digest, and RBAC evidence.
 
 Use `scripts/wc029_deployment_orchestration.py` for these four stages. It creates immutable
-effective-parameter, full-payload what-if, plan, and deployment-handoff artifacts in an
-operator-selected evidence directory outside the repository. `plan` performs ARM validation and
-the repository zero-delete/public-exposure preflight. `apply` accepts only the unchanged reviewed
-plan digest, template, effective parameters, freshly repeated identical what-if, source commit,
-orchestrator/preflight implementation, and predecessor handoffs. It verifies that expected Jobs,
-identities, exact current key versions, and storage/authority resources exist before emitting the
-next handoff. Every handoff is bound to the exact source commit, subscription, deployment scope,
-plan digest, a deliberately narrowed exact stage-output schema, and an exact effective-parameter
-binding. The foundation handoff carries one canonical SHA-256 over every non-WC-027 effective
-parameter rather than an open-ended parameter object. Missing, extra, cross-scope, changed, or
-internally inconsistent handoffs and deployment outputs fail closed. Never call a later stage
-without the complete preceding handoff set.
+effective-parameter, full-payload what-if, plan, deployment-handoff, and deployment-receipt
+artifacts in an operator-selected evidence directory outside the repository. `plan` performs ARM
+validation and the repository zero-delete/public-exposure preflight. `apply` accepts only the
+unchanged reviewed plan digest, template, effective parameters, freshly repeated identical
+what-if, source commit, orchestrator/preflight implementation, and verified predecessor approval
+chain. It verifies that expected Jobs, identities, exact current key versions, and
+storage/authority resources exist before emitting the next handoff and receipt. Every handoff is
+bound to the exact source commit, subscription, deployment scope, reviewed plan digest, verified
+predecessor receipt hashes, a deliberately narrowed exact stage-output schema, and an exact
+effective-parameter binding. The foundation handoff carries one canonical SHA-256 over every
+non-WC-027 effective parameter rather than an open-ended parameter object. Missing, extra,
+cross-scope, changed, unapproved, or internally inconsistent plans, receipts, handoffs, parameters,
+and deployment outputs fail closed. Never call a later stage without the complete preceding
+handoff and independently reviewed receipt set.
 
 This four-stage tool establishes deployment wiring, not a publisher runtime invocation. The
 merged production publisher can publish `PublishedGuidanceAuthorityBinding.v2` to the producer
@@ -258,20 +260,35 @@ python $Orchestrator apply --plan-manifest <reviewed foundation plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
 python $Orchestrator plan --stage producer `
-  --foundation-handoff <foundation handoff> <reviewed producer arguments>
+  --foundation-handoff <foundation handoff> `
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed producer arguments>
 python $Orchestrator apply --plan-manifest <reviewed producer plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
 python $Orchestrator plan --stage publisher `
   --foundation-handoff <foundation handoff> `
-  --producer-handoff <producer handoff> <reviewed publisher arguments>
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  --producer-handoff <producer handoff> `
+  --producer-receipt <producer receipt> `
+  --producer-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed publisher arguments>
 python $Orchestrator apply --plan-manifest <reviewed publisher plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
 python $Orchestrator plan --stage live-acceptance `
   --foundation-handoff <foundation handoff> `
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
   --producer-handoff <producer handoff> `
-  --publisher-handoff <publisher handoff> <reviewed WC-013 arguments>
+  --producer-receipt <producer receipt> `
+  --producer-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  --publisher-handoff <publisher handoff> `
+  --publisher-receipt <publisher receipt> `
+  --publisher-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed WC-013 arguments>
 python $Orchestrator apply --plan-manifest <reviewed live-acceptance plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 ```
@@ -281,9 +298,13 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. The evidence directory must be outside the repository. Planning and apply both
-refuse a dirty working tree, duplicate allowlist entries, the wrong stage scope, or any missing or
-extra predecessor handoff.
+evidence bundle. `apply` writes the immutable deployment handoff and a separate
+`athena.wc029DeploymentReceipt.v1`, then prints the receipt path. Independently record the receipt
+SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
+referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
+self-computed hashes alone are never approval evidence. The evidence directory must be outside the
+repository. Planning and apply both refuse a dirty working tree, duplicate allowlist entries, the
+wrong stage scope, or any missing or extra predecessor handoff/receipt/approval digest.
 
 The two WC-027 roots derive their configuration JSON from live ARM resource references, which ARM
 what-if cannot fully resolve. Their reviewed digest parameters are therefore recomputed against
@@ -295,8 +316,11 @@ scaler, registry, environment, init container, volume, secret, secret reference,
 authentication; a listed RBAC role that does not match its exact resource type; any effective
 broad inherited grant on a governed identity; any unreviewed effective assignment intersecting a
 governed WC-027 scope for any attached, submitter, or reader identity; any public/non-RBAC parent
-Key Vault behind an external trust key; and any final WC-013 readiness readback that differs from
-the two accepted WC-027 handoffs.
+Key Vault behind an external trust key; a Blob Data Reader without the exact canonical
+condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact Active,
+non-forwarding stage profile; a noncanonical/cross-subscription resource ID before validation or
+what-if; and any final WC-013 readiness readback that differs from the two accepted WC-027
+handoffs.
 
 ### Publisher invocation boundary
 

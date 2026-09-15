@@ -206,11 +206,16 @@ resource requestQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
   parent: serviceBus
   name: requestQueueName
   properties: {
+    status: 'Active'
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'PT15M'
+    enableBatchedOperations: true
+    enableExpress: false
+    enablePartitioning: false
     defaultMessageTimeToLive: 'PT5M'
     maxMessageSizeInKilobytes: 12288
+    maxSizeInMegabytes: 1024
     deadLetteringOnMessageExpiration: true
     lockDuration: 'PT5M'
     maxDeliveryCount: 5

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -28,6 +29,12 @@ SOURCE_COMMIT = subprocess.run(  # noqa: S603
 ).stdout.strip()
 
 STAGES = ("foundation", "producer", "publisher", "live-acceptance")
+EXPECTED_PREDECESSOR_STAGES = {
+    "foundation": (),
+    "producer": ("foundation",),
+    "publisher": ("foundation", "producer"),
+    "live-acceptance": ("foundation", "producer", "publisher"),
+}
 TEMPLATES = {
     "foundation": ROOT / "infra" / "wc013-live-acceptance" / "main.bicep",
     "producer": ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep",
@@ -37,6 +44,9 @@ TEMPLATES = {
 SUBSCRIPTION_STAGES = frozenset({"foundation", "live-acceptance"})
 SHA256_PREFIX = "sha256:"
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
+PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v2"
+HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v2"
+RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v1"
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -50,6 +60,59 @@ HANDOFF_FIELDS = frozenset(
         "parameterBindings",
         "parameterBindingsSha256",
         "planManifestSha256",
+        "predecessorReceiptSha256s",
+    }
+)
+PLAN_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "stage",
+        "sourceCommit",
+        "subscriptionId",
+        "location",
+        "resourceGroup",
+        "deploymentName",
+        "templatePath",
+        "templateSha256",
+        "orchestratorSha256",
+        "preflightSha256",
+        "baseParameterPath",
+        "baseParameterSha256",
+        "effectiveParameterPath",
+        "effectiveParameterSha256",
+        "whatIfPath",
+        "whatIfSha256",
+        "allowedChangeResourceIds",
+        "foundationHandoffPath",
+        "foundationHandoffSha256",
+        "producerHandoffPath",
+        "producerHandoffSha256",
+        "publisherHandoffPath",
+        "publisherHandoffSha256",
+        "predecessorReceipts",
+    }
+)
+PREDECESSOR_RECEIPT_REFERENCE_FIELDS = frozenset(
+    {
+        "path",
+        "sha256",
+        "reviewedSha256",
+    }
+)
+RECEIPT_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "stage",
+        "sourceCommit",
+        "subscriptionId",
+        "resourceGroup",
+        "deploymentName",
+        "planManifestPath",
+        "planManifestSha256",
+        "reviewedPlanSha256",
+        "handoffPath",
+        "handoffSha256",
+        "predecessorReceiptSha256s",
     }
 )
 FOUNDATION_OUTPUT_FIELDS = frozenset(
@@ -89,6 +152,51 @@ PUBLISHER_INVOCATION_BOUNDARY = {
     "requiredRequestSchemaVersion": (
         "athena.wc027GuidanceAuthorityPublicationRequest.v1"
     ),
+}
+PRODUCER_TRIGGER_QUEUE_PROFILE = {
+    "status": "Active",
+    "requiresSession": True,
+    "requiresDuplicateDetection": True,
+    "duplicateDetectionHistoryTimeWindow": "P7D",
+    "deadLetteringOnMessageExpiration": True,
+    "defaultMessageTimeToLive": "P1D",
+    "lockDuration": "PT5M",
+    "maxDeliveryCount": 10,
+    "maxMessageSizeInKilobytes": 12288,
+    "maxSizeInMegabytes": 1024,
+    "enableBatchedOperations": True,
+    "enableExpress": False,
+    "enablePartitioning": False,
+}
+PUBLISHER_REQUEST_QUEUE_PROFILE = {
+    "status": "Active",
+    "requiresSession": True,
+    "requiresDuplicateDetection": True,
+    "duplicateDetectionHistoryTimeWindow": "PT15M",
+    "deadLetteringOnMessageExpiration": True,
+    "defaultMessageTimeToLive": "PT5M",
+    "lockDuration": "PT5M",
+    "maxDeliveryCount": 5,
+    "maxMessageSizeInKilobytes": 12288,
+    "maxSizeInMegabytes": 1024,
+    "enableBatchedOperations": True,
+    "enableExpress": False,
+    "enablePartitioning": False,
+}
+NOTIFICATION_QUEUE_PROFILE = {
+    "status": "Active",
+    "requiresSession": True,
+    "requiresDuplicateDetection": True,
+    "duplicateDetectionHistoryTimeWindow": "P7D",
+    "deadLetteringOnMessageExpiration": True,
+    "defaultMessageTimeToLive": "P7D",
+    "lockDuration": "PT1M",
+    "maxDeliveryCount": 10,
+    "maxMessageSizeInKilobytes": 1024,
+    "maxSizeInMegabytes": 1024,
+    "enableBatchedOperations": True,
+    "enableExpress": False,
+    "enablePartitioning": False,
 }
 PRODUCER_OUTPUT_FIELDS = frozenset(
     {
@@ -253,6 +361,224 @@ def _string_list(value: object, *, field: str) -> list[str]:
     return value
 
 
+def _canonical_subscription_id(value: object, *, field: str) -> str:
+    subscription_id = _string(value, field=field)
+    try:
+        canonical = str(UUID(subscription_id))
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} must be one canonical UUID") from exc
+    if subscription_id != canonical:
+        raise OrchestrationError(f"{field} must use canonical lowercase UUID form")
+    return subscription_id
+
+
+def _validate_resource_id_segment(segment: str, *, field: str) -> None:
+    if (
+        not segment
+        or segment in {".", ".."}
+        or segment != segment.strip()
+        or any(character in segment for character in ("\\", "?", "#"))
+    ):
+        raise OrchestrationError(f"{field} contains a noncanonical path segment")
+
+
+def _canonical_subscription_resource_id(
+    value: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> str:
+    resource_id = _string(value, field=field)
+    if resource_id != resource_id.strip() or resource_id.endswith("/"):
+        raise OrchestrationError(f"{field} must be a canonical Azure resource ID")
+    segments = resource_id.split("/")
+    if (
+        len(segments) < 3
+        or segments[0] != ""
+        or segments[1] != "subscriptions"
+    ):
+        raise OrchestrationError(
+            f"{field} must begin with the canonical /subscriptions/ scope"
+        )
+    resource_subscription = _canonical_subscription_id(
+        segments[2],
+        field=f"{field} subscription",
+    )
+    if resource_subscription != subscription_id:
+        raise OrchestrationError(
+            f"{field} is outside the governed deployment subscription"
+        )
+    if len(segments) == 3:
+        return resource_id
+    index = 3
+    if segments[index] == "resourceGroups":
+        if len(segments) < 5:
+            raise OrchestrationError(f"{field} has an incomplete resource-group scope")
+        _validate_resource_id_segment(
+            segments[4],
+            field=f"{field} resource group",
+        )
+        index = 5
+        if index == len(segments):
+            return resource_id
+    if index >= len(segments) or segments[index] != "providers":
+        raise OrchestrationError(
+            f"{field} has a noncanonical provider boundary"
+        )
+    while index < len(segments):
+        if segments[index] != "providers" or index + 3 >= len(segments):
+            raise OrchestrationError(
+                f"{field} has an incomplete provider resource path"
+            )
+        _validate_resource_id_segment(
+            segments[index + 1],
+            field=f"{field} provider namespace",
+        )
+        index += 2
+        resource_pairs = 0
+        while index < len(segments) and segments[index] != "providers":
+            if index + 1 >= len(segments):
+                raise OrchestrationError(
+                    f"{field} has an unmatched resource type/name segment"
+                )
+            _validate_resource_id_segment(
+                segments[index],
+                field=f"{field} resource type",
+            )
+            _validate_resource_id_segment(
+                segments[index + 1],
+                field=f"{field} resource name",
+            )
+            resource_pairs += 1
+            index += 2
+        if resource_pairs == 0:
+            raise OrchestrationError(f"{field} has no resource type/name pair")
+    return resource_id
+
+
+def _validate_subscription_boundary(
+    value: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> None:
+    if isinstance(value, dict):
+        identity_map = field.rsplit(".", 1)[-1].casefold() == (
+            "userassignedidentities"
+        )
+        for key, child in value.items():
+            child_field = f"{field}.{key}"
+            normalized_key = key.casefold()
+            if identity_map or "/subscriptions/" in normalized_key:
+                _canonical_subscription_resource_id(
+                    key,
+                    subscription_id=subscription_id,
+                    field=f"{field} resource ID key",
+                )
+            id_like_value = (
+                isinstance(child, str)
+                and "/subscriptions/" in child.casefold()
+                and (
+                    normalized_key in {"id", "scope"}
+                    or normalized_key.endswith("id")
+                )
+            )
+            declared_resource_id = (
+                normalized_key.endswith("resourceid")
+                and child not in (None, "")
+            )
+            if id_like_value or declared_resource_id:
+                _canonical_subscription_resource_id(
+                    child,
+                    subscription_id=subscription_id,
+                    field=child_field,
+                )
+            elif normalized_key.endswith("resourceids"):
+                if not isinstance(child, list) or any(
+                    not isinstance(item, str) for item in child
+                ):
+                    raise OrchestrationError(
+                        f"{child_field} must be an array of canonical resource IDs"
+                    )
+                for index, resource_id in enumerate(child):
+                    _canonical_subscription_resource_id(
+                        resource_id,
+                        subscription_id=subscription_id,
+                        field=f"{child_field}[{index}]",
+                    )
+            if (
+                key.casefold().endswith("subscriptionid")
+                and isinstance(child, str)
+                and _canonical_subscription_id(child, field=child_field)
+                != subscription_id
+            ):
+                raise OrchestrationError(
+                    f"{child_field} does not match the governed subscription"
+                )
+            _validate_subscription_boundary(
+                child,
+                subscription_id=subscription_id,
+                field=child_field,
+            )
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_subscription_boundary(
+                child,
+                subscription_id=subscription_id,
+                field=f"{field}[{index}]",
+            )
+        return
+    if not isinstance(value, str):
+        return
+    if value.lstrip().casefold().startswith("/subscriptions/"):
+        _canonical_subscription_resource_id(
+            value,
+            subscription_id=subscription_id,
+            field=field,
+        )
+        return
+    stripped = value.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            nested = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise OrchestrationError(
+                f"{field} contains malformed embedded JSON"
+            ) from exc
+        _validate_subscription_boundary(
+            nested,
+            subscription_id=subscription_id,
+            field=f"{field} embedded JSON",
+        )
+
+
+def _validate_effective_parameter_subscription_boundary(
+    parameters: Mapping[str, Mapping[str, object]],
+    *,
+    subscription_id: str,
+) -> None:
+    for name, entry in parameters.items():
+        value = entry["value"]
+        if (
+            name.casefold().endswith("subscriptionid")
+            and isinstance(value, str)
+            and _canonical_subscription_id(
+                value,
+                field=f"parameters.{name}",
+            )
+            != subscription_id
+        ):
+            raise OrchestrationError(
+                f"parameters.{name} does not match the governed subscription"
+            )
+        _validate_subscription_boundary(
+            value,
+            subscription_id=subscription_id,
+            field=f"parameters.{name}",
+        )
+
+
 def _sha256_digest(value: object, *, field: str) -> str:
     digest = _string(value, field=field)
     suffix = digest.removeprefix(SHA256_PREFIX)
@@ -411,7 +737,7 @@ def _digest_json_string(value: str) -> str:
 def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
     handoff = _mapping(_read_json(path), field="handoff")
     _require_exact_fields(handoff, HANDOFF_FIELDS, field="deployment handoff")
-    if handoff.get("schemaVersion") != "athena.wc029DeploymentHandoff.v1":
+    if handoff.get("schemaVersion") != HANDOFF_SCHEMA_VERSION:
         raise OrchestrationError("unsupported WC-029 deployment handoff schema")
     if handoff.get("stage") != expected_stage:
         raise OrchestrationError(
@@ -421,7 +747,10 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
         raise OrchestrationError(
             "deployment handoffs must be produced from the current exact source commit"
         )
-    _string(handoff.get("subscriptionId"), field="handoff.subscriptionId")
+    handoff_subscription = _canonical_subscription_id(
+        handoff.get("subscriptionId"),
+        field="handoff.subscriptionId",
+    )
     resource_group = handoff.get("resourceGroup")
     if expected_stage in {"producer", "publisher"}:
         _string(resource_group, field="handoff.resourceGroup")
@@ -434,7 +763,27 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
         handoff.get("planManifestSha256"),
         field="handoff.planManifestSha256",
     )
+    predecessor_receipt_hashes = _mapping(
+        handoff.get("predecessorReceiptSha256s"),
+        field="handoff.predecessorReceiptSha256s",
+    )
+    expected_predecessors = frozenset(EXPECTED_PREDECESSOR_STAGES[expected_stage])
+    _require_exact_fields(
+        predecessor_receipt_hashes,
+        expected_predecessors,
+        field="handoff predecessor receipt hashes",
+    )
+    for predecessor_stage, digest in predecessor_receipt_hashes.items():
+        _sha256_digest(
+            digest,
+            field=f"handoff predecessor receipt {predecessor_stage}",
+        )
     outputs = _mapping(handoff.get("outputs"), field="handoff.outputs")
+    _validate_subscription_boundary(
+        outputs,
+        subscription_id=handoff_subscription,
+        field="handoff.outputs",
+    )
     expected_digest = _sha256_digest(
         handoff.get("outputsSha256"),
         field="handoff.outputsSha256",
@@ -443,6 +792,11 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
         raise OrchestrationError("handoff outputs digest does not match")
     parameter_bindings = _mapping(
         handoff.get("parameterBindings", {}),
+        field="handoff.parameterBindings",
+    )
+    _validate_subscription_boundary(
+        parameter_bindings,
+        subscription_id=handoff_subscription,
         field="handoff.parameterBindings",
     )
     expected_binding_fields = {
@@ -489,11 +843,15 @@ def _verify_handoff_scope(
     subscription_id: str,
     resource_group: str | None = None,
 ) -> None:
-    handoff_subscription = _string(
+    governed_subscription = _canonical_subscription_id(
+        subscription_id,
+        field="governed subscription",
+    )
+    handoff_subscription = _canonical_subscription_id(
         handoff.get("subscriptionId"),
         field="handoff.subscriptionId",
     )
-    if handoff_subscription.casefold() != subscription_id.casefold():
+    if handoff_subscription != governed_subscription:
         raise OrchestrationError(
             "deployment handoff subscription does not match the current stage"
         )
@@ -544,6 +902,35 @@ def _validate_stage_inputs(
         raise OrchestrationError(f"{stage} requires --resource-group")
 
 
+def _validate_predecessor_receipt_inputs(
+    *,
+    stage: str,
+    receipt_paths: Mapping[str, Path | None],
+    reviewed_receipt_sha256s: Mapping[str, str | None],
+) -> None:
+    expected = frozenset(EXPECTED_PREDECESSOR_STAGES[stage])
+    provided_paths = frozenset(
+        predecessor
+        for predecessor, path in receipt_paths.items()
+        if path is not None
+    )
+    provided_digests = frozenset(
+        predecessor
+        for predecessor, digest in reviewed_receipt_sha256s.items()
+        if digest is not None
+    )
+    if provided_paths != expected or provided_digests != expected:
+        raise OrchestrationError(
+            f"{stage} requires the exact predecessor receipt paths and "
+            "independently reviewed receipt digests"
+        )
+    for predecessor in expected:
+        _sha256_digest(
+            reviewed_receipt_sha256s[predecessor],
+            field=f"{predecessor} reviewed receipt SHA-256",
+        )
+
+
 def _ensure_evidence_directory_outside_repository(path: Path) -> None:
     resolved = path.resolve()
     try:
@@ -553,6 +940,434 @@ def _ensure_evidence_directory_outside_repository(path: Path) -> None:
     raise OrchestrationError(
         "deployment evidence directory must be outside the repository"
     )
+
+
+def _load_plan_manifest(
+    path: Path,
+    *,
+    expected_stage: str | None = None,
+) -> dict[str, Any]:
+    _ensure_evidence_directory_outside_repository(path.parent)
+    manifest = _mapping(_read_json(path), field="plan manifest")
+    _require_exact_fields(manifest, PLAN_FIELDS, field="plan manifest")
+    if manifest.get("schemaVersion") != PLAN_SCHEMA_VERSION:
+        raise OrchestrationError("unsupported WC-029 deployment plan schema")
+    stage = _string(manifest.get("stage"), field="plan stage")
+    if stage not in STAGES or (expected_stage is not None and stage != expected_stage):
+        raise OrchestrationError("plan stage does not match the required predecessor stage")
+    if manifest.get("sourceCommit") != SOURCE_COMMIT:
+        raise OrchestrationError("plan source commit is not the current exact commit")
+    subscription_id = _canonical_subscription_id(
+        manifest.get("subscriptionId"),
+        field="plan subscription",
+    )
+    resource_group_value = manifest.get("resourceGroup")
+    resource_group = (
+        None
+        if resource_group_value is None
+        else _string(resource_group_value, field="plan resource group")
+    )
+    handoff_paths = {
+        predecessor: (
+            None
+            if manifest.get(f"{predecessor}HandoffPath") is None
+            else Path(
+                _string(
+                    manifest.get(f"{predecessor}HandoffPath"),
+                    field=f"plan {predecessor} handoff path",
+                )
+            )
+        )
+        for predecessor in ("foundation", "producer", "publisher")
+    }
+    _validate_stage_inputs(
+        stage=stage,
+        resource_group=resource_group,
+        foundation_handoff_path=handoff_paths["foundation"],
+        producer_handoff_path=handoff_paths["producer"],
+        publisher_handoff_path=handoff_paths["publisher"],
+    )
+    expected_template_path = str(TEMPLATES[stage].relative_to(ROOT)).replace(
+        "\\",
+        "/",
+    )
+    if manifest.get("templatePath") != expected_template_path:
+        raise OrchestrationError("plan template path does not match its exact stage")
+    if _sha256_file(TEMPLATES[stage]) != _sha256_digest(
+        manifest.get("templateSha256"),
+        field="plan template SHA-256",
+    ):
+        raise OrchestrationError("planned Bicep template changed after review")
+    if _sha256_file(Path(__file__).resolve()) != _sha256_digest(
+        manifest.get("orchestratorSha256"),
+        field="plan orchestrator SHA-256",
+    ):
+        raise OrchestrationError("orchestrator implementation changed after review")
+    if _sha256_file(PREFLIGHT_PATH) != _sha256_digest(
+        manifest.get("preflightSha256"),
+        field="plan preflight SHA-256",
+    ):
+        raise OrchestrationError("preflight implementation changed after review")
+    base_parameter_path = Path(
+        _string(manifest.get("baseParameterPath"), field="plan base parameters")
+    )
+    effective_parameter_path = Path(
+        _string(
+            manifest.get("effectiveParameterPath"),
+            field="plan effective parameters",
+        )
+    )
+    what_if_path = Path(
+        _string(manifest.get("whatIfPath"), field="plan what-if path")
+    )
+    _ensure_evidence_directory_outside_repository(
+        effective_parameter_path.parent
+    )
+    _ensure_evidence_directory_outside_repository(what_if_path.parent)
+    for artifact_path, digest_field, field in (
+        (base_parameter_path, "baseParameterSha256", "base parameter artifact"),
+        (
+            effective_parameter_path,
+            "effectiveParameterSha256",
+            "effective parameter artifact",
+        ),
+        (what_if_path, "whatIfSha256", "what-if artifact"),
+    ):
+        expected_digest = _sha256_digest(
+            manifest.get(digest_field),
+            field=f"plan {field} SHA-256",
+        )
+        if _sha256_file(artifact_path) != expected_digest:
+            raise OrchestrationError(f"plan {field} changed after review")
+    effective_parameters = _load_parameters(effective_parameter_path)
+    _validate_effective_parameter_subscription_boundary(
+        effective_parameters,
+        subscription_id=subscription_id,
+    )
+    what_if = _read_json(what_if_path)
+    _validate_subscription_boundary(
+        what_if,
+        subscription_id=subscription_id,
+        field="plan what-if",
+    )
+    raw_allowed_changes = manifest.get("allowedChangeResourceIds")
+    if not isinstance(raw_allowed_changes, list) or any(
+        not isinstance(item, str) for item in raw_allowed_changes
+    ):
+        raise OrchestrationError("plan allowed changes must be a string array")
+    allowed_changes = [
+        _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field=f"plan allowed changes[{index}]",
+        )
+        for index, resource_id in enumerate(raw_allowed_changes)
+    ]
+    if (
+        allowed_changes != sorted(allowed_changes)
+        or len({item.casefold() for item in allowed_changes})
+        != len(allowed_changes)
+    ):
+        raise OrchestrationError(
+            "plan allowed change resource IDs must be sorted and distinct"
+        )
+    violations = evaluate_what_if(
+        what_if,
+        allowed_change_ids=frozenset(allowed_changes),
+    )
+    if violations:
+        raise OrchestrationError("predecessor plan what-if no longer passes")
+    predecessor_receipts = _mapping(
+        manifest.get("predecessorReceipts"),
+        field="plan predecessor receipts",
+    )
+    expected_predecessors = frozenset(EXPECTED_PREDECESSOR_STAGES[stage])
+    _require_exact_fields(
+        predecessor_receipts,
+        expected_predecessors,
+        field="plan predecessor receipts",
+    )
+    for predecessor, raw_reference in predecessor_receipts.items():
+        reference = _mapping(
+            raw_reference,
+            field=f"plan predecessor receipt {predecessor}",
+        )
+        _require_exact_fields(
+            reference,
+            PREDECESSOR_RECEIPT_REFERENCE_FIELDS,
+            field=f"plan predecessor receipt {predecessor}",
+        )
+        _string(reference.get("path"), field=f"{predecessor} receipt path")
+        actual_digest = _sha256_digest(
+            reference.get("sha256"),
+            field=f"{predecessor} receipt SHA-256",
+        )
+        reviewed_digest = _sha256_digest(
+            reference.get("reviewedSha256"),
+            field=f"{predecessor} reviewed receipt SHA-256",
+        )
+        if actual_digest != reviewed_digest:
+            raise OrchestrationError(
+                f"{predecessor} receipt digest was not independently approved"
+            )
+    for predecessor in ("foundation", "producer", "publisher"):
+        handoff_path = handoff_paths[predecessor]
+        handoff_digest_value = manifest.get(f"{predecessor}HandoffSha256")
+        if handoff_path is None:
+            if handoff_digest_value is not None:
+                raise OrchestrationError(
+                    f"plan {predecessor} handoff digest has no path"
+                )
+            continue
+        handoff_digest = _sha256_digest(
+            handoff_digest_value,
+            field=f"plan {predecessor} handoff SHA-256",
+        )
+        if _sha256_file(handoff_path) != handoff_digest:
+            raise OrchestrationError(
+                f"plan {predecessor} handoff changed after review"
+            )
+    _string(manifest.get("location"), field="plan location")
+    _string(manifest.get("deploymentName"), field="plan deployment name")
+    return manifest
+
+
+def _load_verified_predecessor(
+    *,
+    expected_stage: str,
+    handoff_path: Path,
+    receipt_path: Path,
+    reviewed_receipt_sha256: str,
+) -> dict[str, Any]:
+    for artifact in (handoff_path, receipt_path):
+        _ensure_evidence_directory_outside_repository(artifact.parent)
+    reviewed_digest = _sha256_digest(
+        reviewed_receipt_sha256,
+        field=f"{expected_stage} reviewed receipt SHA-256",
+    )
+    actual_receipt_digest = _sha256_file(receipt_path)
+    if actual_receipt_digest != reviewed_digest:
+        raise OrchestrationError(
+            f"{expected_stage} receipt does not match its trusted approval digest"
+        )
+    receipt = _mapping(_read_json(receipt_path), field=f"{expected_stage} receipt")
+    _require_exact_fields(receipt, RECEIPT_FIELDS, field=f"{expected_stage} receipt")
+    if receipt.get("schemaVersion") != RECEIPT_SCHEMA_VERSION:
+        raise OrchestrationError("unsupported WC-029 deployment receipt schema")
+    if receipt.get("stage") != expected_stage:
+        raise OrchestrationError(
+            f"expected {expected_stage} receipt, found {receipt.get('stage')!r}"
+        )
+    if receipt.get("sourceCommit") != SOURCE_COMMIT:
+        raise OrchestrationError(
+            "deployment receipt must be produced from the current exact source commit"
+        )
+    plan_path = Path(
+        _string(
+            receipt.get("planManifestPath"),
+            field=f"{expected_stage} receipt plan path",
+        )
+    )
+    _ensure_evidence_directory_outside_repository(plan_path.parent)
+    receipt_handoff_path = Path(
+        _string(
+            receipt.get("handoffPath"),
+            field=f"{expected_stage} receipt handoff path",
+        )
+    )
+    if plan_path.resolve() == receipt_path.resolve():
+        raise OrchestrationError("deployment receipt cannot be its own plan artifact")
+    if receipt_handoff_path.resolve() != handoff_path.resolve():
+        raise OrchestrationError(
+            f"{expected_stage} handoff path does not match its approved receipt"
+        )
+    plan_digest = _sha256_digest(
+        receipt.get("planManifestSha256"),
+        field=f"{expected_stage} receipt plan SHA-256",
+    )
+    reviewed_plan_digest = _sha256_digest(
+        receipt.get("reviewedPlanSha256"),
+        field=f"{expected_stage} reviewed plan SHA-256",
+    )
+    if plan_digest != reviewed_plan_digest or _sha256_file(plan_path) != plan_digest:
+        raise OrchestrationError(
+            f"{expected_stage} receipt does not prove an independently reviewed plan"
+        )
+    handoff_digest = _sha256_digest(
+        receipt.get("handoffSha256"),
+        field=f"{expected_stage} receipt handoff SHA-256",
+    )
+    if _sha256_file(handoff_path) != handoff_digest:
+        raise OrchestrationError(
+            f"{expected_stage} handoff does not match its deployment receipt"
+        )
+    plan = _load_plan_manifest(plan_path, expected_stage=expected_stage)
+    handoff = _load_handoff(handoff_path, expected_stage=expected_stage)
+    receipt_subscription = _canonical_subscription_id(
+        receipt.get("subscriptionId"),
+        field=f"{expected_stage} receipt subscription",
+    )
+    for document_name, document in (("plan", plan), ("handoff", handoff)):
+        if (
+            document.get("stage") != expected_stage
+            or document.get("sourceCommit") != SOURCE_COMMIT
+            or document.get("subscriptionId") != receipt_subscription
+            or document.get("resourceGroup") != receipt.get("resourceGroup")
+            or document.get("deploymentName") != receipt.get("deploymentName")
+        ):
+            raise OrchestrationError(
+                f"{expected_stage} {document_name} does not match its receipt scope"
+            )
+    if handoff.get("planManifestSha256") != plan_digest:
+        raise OrchestrationError(
+            f"{expected_stage} handoff is not bound to its reviewed plan"
+        )
+    receipt_predecessors = _mapping(
+        receipt.get("predecessorReceiptSha256s"),
+        field=f"{expected_stage} receipt predecessor hashes",
+    )
+    expected_predecessors = frozenset(
+        EXPECTED_PREDECESSOR_STAGES[expected_stage]
+    )
+    _require_exact_fields(
+        receipt_predecessors,
+        expected_predecessors,
+        field=f"{expected_stage} receipt predecessor hashes",
+    )
+    for predecessor, digest in receipt_predecessors.items():
+        _sha256_digest(
+            digest,
+            field=f"{expected_stage} predecessor receipt {predecessor}",
+        )
+    if handoff.get("predecessorReceiptSha256s") != receipt_predecessors:
+        raise OrchestrationError(
+            f"{expected_stage} handoff predecessor receipt chain does not match"
+        )
+    plan_predecessors = _mapping(
+        plan.get("predecessorReceipts"),
+        field=f"{expected_stage} plan predecessor receipts",
+    )
+    plan_predecessor_hashes = {
+        predecessor: _mapping(
+            reference,
+            field=f"{expected_stage} plan predecessor {predecessor}",
+        ).get("sha256")
+        for predecessor, reference in plan_predecessors.items()
+    }
+    if plan_predecessor_hashes != receipt_predecessors:
+        raise OrchestrationError(
+            f"{expected_stage} plan predecessor receipt chain does not match"
+        )
+    return {
+        "handoff": handoff,
+        "handoffPath": handoff_path.resolve(),
+        "handoffSha256": handoff_digest,
+        "plan": plan,
+        "planPath": plan_path.resolve(),
+        "receipt": receipt,
+        "receiptPath": receipt_path.resolve(),
+        "receiptSha256": actual_receipt_digest,
+        "reviewedReceiptSha256": reviewed_digest,
+    }
+
+
+def _load_verified_predecessors(
+    *,
+    stage: str,
+    handoff_paths: Mapping[str, Path | None],
+    receipt_paths: Mapping[str, Path | None],
+    reviewed_receipt_sha256s: Mapping[str, str | None],
+) -> dict[str, dict[str, Any]]:
+    _validate_predecessor_receipt_inputs(
+        stage=stage,
+        receipt_paths=receipt_paths,
+        reviewed_receipt_sha256s=reviewed_receipt_sha256s,
+    )
+    verified: dict[str, dict[str, Any]] = {}
+    expected = EXPECTED_PREDECESSOR_STAGES[stage]
+    for predecessor in expected:
+        handoff_path = handoff_paths[predecessor]
+        receipt_path = receipt_paths[predecessor]
+        reviewed_digest = reviewed_receipt_sha256s[predecessor]
+        if (
+            handoff_path is None
+            or receipt_path is None
+            or reviewed_digest is None
+        ):
+            raise OrchestrationError(
+                f"{stage} predecessor receipt inputs are incomplete"
+            )
+        record = _load_verified_predecessor(
+            expected_stage=predecessor,
+            handoff_path=handoff_path,
+            receipt_path=receipt_path,
+            reviewed_receipt_sha256=reviewed_digest,
+        )
+        expected_prior_hashes = {
+            prior: verified[prior]["receiptSha256"]
+            for prior in EXPECTED_PREDECESSOR_STAGES[predecessor]
+        }
+        receipt = _mapping(
+            record["receipt"],
+            field=f"{predecessor} receipt",
+        )
+        if receipt.get("predecessorReceiptSha256s") != expected_prior_hashes:
+            raise OrchestrationError(
+                f"{predecessor} receipt does not preserve the exact approval chain"
+            )
+        plan = _mapping(record["plan"], field=f"{predecessor} plan")
+        plan_references = _mapping(
+            plan.get("predecessorReceipts"),
+            field=f"{predecessor} plan predecessor receipts",
+        )
+        for prior, prior_record in verified.items():
+            reference = _mapping(
+                plan_references.get(prior),
+                field=f"{predecessor} plan predecessor {prior}",
+            )
+            if (
+                Path(_string(reference.get("path"), field="receipt path")).resolve()
+                != prior_record["receiptPath"]
+                or reference.get("sha256") != prior_record["receiptSha256"]
+                or reference.get("reviewedSha256")
+                != prior_record["reviewedReceiptSha256"]
+                or Path(
+                    _string(
+                        plan.get(f"{prior}HandoffPath"),
+                        field=f"{prior} handoff path",
+                    )
+                ).resolve()
+                != prior_record["handoffPath"]
+                or plan.get(f"{prior}HandoffSha256")
+                != prior_record["handoffSha256"]
+            ):
+                raise OrchestrationError(
+                    f"{predecessor} plan does not preserve the exact {prior} chain"
+                )
+        verified[predecessor] = record
+    return verified
+
+
+def _predecessor_receipt_references(
+    verified: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        stage: {
+            "path": str(record["receiptPath"]),
+            "sha256": record["receiptSha256"],
+            "reviewedSha256": record["reviewedReceiptSha256"],
+        }
+        for stage, record in verified.items()
+    }
+
+
+def _predecessor_receipt_hashes(
+    verified: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        stage: record["receiptSha256"]
+        for stage, record in verified.items()
+    }
 
 
 def _foundation_outputs(
@@ -1430,17 +2245,15 @@ def _run_json(command: Sequence[str], *, field: str) -> object:
 
 
 def _get_resource(resource_id: str, *, subscription_id: str) -> dict[str, Any]:
-    normalized_resource_id = _azure_resource_id(
+    governed_subscription_id = _canonical_subscription_id(
+        subscription_id,
+        field="governed subscription",
+    )
+    normalized_resource_id = _canonical_subscription_resource_id(
         resource_id,
+        subscription_id=governed_subscription_id,
         field="Azure resource ID",
     )
-    resource_subscription_id, _ = _resource_subscription_and_group(
-        normalized_resource_id
-    )
-    if resource_subscription_id.casefold() != subscription_id.casefold():
-        raise OrchestrationError(
-            "Azure resource ID is outside the governed deployment subscription"
-        )
     return _mapping(
         _run_json(
             [
@@ -1448,7 +2261,7 @@ def _get_resource(resource_id: str, *, subscription_id: str) -> dict[str, Any]:
                 "resource",
                 "show",
                 "--subscription",
-                subscription_id,
+                governed_subscription_id,
                 "--ids",
                 normalized_resource_id,
                 "--only-show-errors",
@@ -1612,6 +2425,11 @@ BUILT_IN_DATA_ROLE_IDS = frozenset(
         "76199698-9eea-4c19-bc75-cec21354c6b6",
         "12338af0-0e69-4776-bea7-57ae8d297424",
     }
+)
+BLOB_DATA_READER_ROLE_ID = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+BLOB_LIST_DENY_CONDITION = (
+    "(!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/"
+    "containers/blobs/read'} AND SubOperationMatches{'Blob.List'}))"
 )
 ALLOWED_CUSTOM_DATA_ACTIONS = frozenset(
     {
@@ -1891,6 +2709,13 @@ def _verify_rbac_resources(
             field="role assignment role definition",
         )
         role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+        if role_id == BLOB_DATA_READER_ROLE_ID and (
+            properties.get("conditionVersion") != "2.0"
+            or properties.get("condition") != BLOB_LIST_DENY_CONDITION
+        ):
+            raise OrchestrationError(
+                "Blob Data Reader assignment must use the exact no-Blob.List ABAC condition"
+            )
         scope = _role_assignment_scope(resource_id)
         verified_assignments.add((scope.casefold(), principal_id, role_id))
         if properties.get("scope") is not None:
@@ -2282,6 +3107,8 @@ def _verify_service_bus_queue(
     job_resource_id: str,
     namespace_name: str,
     queue_name: str,
+    profile_name: str,
+    expected_profile: Mapping[str, object],
     subscription_id: str,
 ) -> None:
     queue_id = (
@@ -2301,13 +3128,16 @@ def _verify_service_bus_queue(
         queue.get("properties"),
         field="Service Bus queue properties",
     )
-    if properties.get("requiresSession") is not True:
-        raise OrchestrationError("Service Bus queue must require sessions")
-    if properties.get("requiresDuplicateDetection") is not True:
-        raise OrchestrationError("Service Bus queue must require duplicate detection")
-    if properties.get("deadLetteringOnMessageExpiration") is not True:
-        raise OrchestrationError(
-            "Service Bus queue must dead-letter expired messages"
+    for property_name, expected_value in expected_profile.items():
+        _require_equal(
+            properties.get(property_name),
+            expected_value,
+            field=f"{profile_name} Service Bus queue {property_name}",
+        )
+    for forwarding_property in ("forwardTo", "forwardDeadLetteredMessagesTo"):
+        _require_absent_or_empty(
+            properties.get(forwarding_property),
+            field=f"{profile_name} Service Bus queue {forwarding_property}",
         )
 
 
@@ -2769,13 +3599,22 @@ def _verify_producer_resources(
         namespace_name=namespace_name,
         subscription_id=subscription_id,
     )
-    for queue_name in (trigger_queue_name, notification_queue_name):
-        _verify_service_bus_queue(
-            job_resource_id=producer_job_id,
-            namespace_name=namespace_name,
-            queue_name=queue_name,
-            subscription_id=subscription_id,
-        )
+    _verify_service_bus_queue(
+        job_resource_id=producer_job_id,
+        namespace_name=namespace_name,
+        queue_name=trigger_queue_name,
+        profile_name="producer trigger",
+        expected_profile=PRODUCER_TRIGGER_QUEUE_PROFILE,
+        subscription_id=subscription_id,
+    )
+    _verify_service_bus_queue(
+        job_resource_id=producer_job_id,
+        namespace_name=namespace_name,
+        queue_name=notification_queue_name,
+        profile_name="notification outbox",
+        expected_profile=NOTIFICATION_QUEUE_PROFILE,
+        subscription_id=subscription_id,
+    )
     _require_resource_id_equal(
         validated_outputs["triggerQueueResourceId"],
         (
@@ -3113,13 +3952,22 @@ def _verify_publisher_resources(
         additional_allowed_assignment_ids=additional_allowed_assignment_ids,
         subscription_id=subscription_id,
     )
-    for queue_name in (request_queue_name, trigger_queue_name):
-        _verify_service_bus_queue(
-            job_resource_id=publisher_job_id,
-            namespace_name=namespace_name,
-            queue_name=queue_name,
-            subscription_id=subscription_id,
-        )
+    _verify_service_bus_queue(
+        job_resource_id=publisher_job_id,
+        namespace_name=namespace_name,
+        queue_name=request_queue_name,
+        profile_name="publisher request",
+        expected_profile=PUBLISHER_REQUEST_QUEUE_PROFILE,
+        subscription_id=subscription_id,
+    )
+    _verify_service_bus_queue(
+        job_resource_id=publisher_job_id,
+        namespace_name=namespace_name,
+        queue_name=trigger_queue_name,
+        profile_name="producer trigger",
+        expected_profile=PRODUCER_TRIGGER_QUEUE_PROFILE,
+        subscription_id=subscription_id,
+    )
     for output_name, queue_name in (
         ("requestQueueResourceId", request_queue_name),
         ("triggerQueueResourceId", trigger_queue_name),
@@ -3582,6 +4430,25 @@ def _validate_stage_outputs(
 
 
 def plan(args: argparse.Namespace) -> Path:
+    subscription_id = _canonical_subscription_id(
+        args.subscription,
+        field="subscription",
+    )
+    handoff_paths = {
+        "foundation": args.foundation_handoff,
+        "producer": args.producer_handoff,
+        "publisher": args.publisher_handoff,
+    }
+    receipt_paths = {
+        "foundation": args.foundation_receipt,
+        "producer": args.producer_receipt,
+        "publisher": args.publisher_receipt,
+    }
+    reviewed_receipt_sha256s = {
+        "foundation": args.foundation_reviewed_receipt_sha256,
+        "producer": args.producer_reviewed_receipt_sha256,
+        "publisher": args.publisher_reviewed_receipt_sha256,
+    }
     _validate_stage_inputs(
         stage=args.stage,
         resource_group=args.resource_group,
@@ -3589,9 +4456,19 @@ def plan(args: argparse.Namespace) -> Path:
         producer_handoff_path=args.producer_handoff,
         publisher_handoff_path=args.publisher_handoff,
     )
+    verified_predecessors = _load_verified_predecessors(
+        stage=args.stage,
+        handoff_paths=handoff_paths,
+        receipt_paths=receipt_paths,
+        reviewed_receipt_sha256s=reviewed_receipt_sha256s,
+    )
     _ensure_evidence_directory_outside_repository(args.evidence_directory)
     allowed_changes = [
-        _string(value, field="allowed change resource ID")
+        _canonical_subscription_resource_id(
+            value,
+            subscription_id=subscription_id,
+            field="allowed change resource ID",
+        )
         for value in args.allow_change
     ]
     if len({value.casefold() for value in allowed_changes}) != len(allowed_changes):
@@ -3604,40 +4481,44 @@ def plan(args: argparse.Namespace) -> Path:
         producer_handoff_path=args.producer_handoff,
         publisher_handoff_path=args.publisher_handoff,
     )
+    _validate_effective_parameter_subscription_boundary(
+        effective,
+        subscription_id=subscription_id,
+    )
     if args.stage == "producer":
-        foundation = _load_handoff(
-            args.foundation_handoff,
-            expected_stage="foundation",
+        foundation = _mapping(
+            verified_predecessors["foundation"]["handoff"],
+            field="verified foundation handoff",
         )
         _verify_handoff_scope(
             foundation,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
         _verify_foundation_resources(
             foundation,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
     elif args.stage == "publisher":
-        foundation = _load_handoff(
-            args.foundation_handoff,
-            expected_stage="foundation",
+        foundation = _mapping(
+            verified_predecessors["foundation"]["handoff"],
+            field="verified foundation handoff",
         )
-        producer = _load_handoff(
-            args.producer_handoff,
-            expected_stage="producer",
+        producer = _mapping(
+            verified_predecessors["producer"]["handoff"],
+            field="verified producer handoff",
         )
         _verify_handoff_scope(
             foundation,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
         _verify_handoff_scope(
             producer,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
             resource_group=args.resource_group,
         )
         _verify_foundation_resources(
             foundation,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
         _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
@@ -3645,29 +4526,29 @@ def plan(args: argparse.Namespace) -> Path:
             effective_parameters=_bindings_as_parameters(
                 _handoff_bindings(producer)
             ),
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
         _verify_publisher_binding_key_head(
             effective,
             producer,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
     elif args.stage == "live-acceptance":
-        foundation = _load_handoff(
-            args.foundation_handoff,
-            expected_stage="foundation",
+        foundation = _mapping(
+            verified_predecessors["foundation"]["handoff"],
+            field="verified foundation handoff",
         )
-        producer = _load_handoff(
-            args.producer_handoff,
-            expected_stage="producer",
+        producer = _mapping(
+            verified_predecessors["producer"]["handoff"],
+            field="verified producer handoff",
         )
-        publisher = _load_handoff(
-            args.publisher_handoff,
-            expected_stage="publisher",
+        publisher = _mapping(
+            verified_predecessors["publisher"]["handoff"],
+            field="verified publisher handoff",
         )
         _verify_handoff_scope(
             foundation,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
         producer_resource_group = _string(
             producer.get("resourceGroup"),
@@ -3675,19 +4556,19 @@ def plan(args: argparse.Namespace) -> Path:
         )
         _verify_handoff_scope(
             producer,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
             resource_group=producer_resource_group,
         )
         _verify_handoff_scope(
             publisher,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
             resource_group=producer_resource_group,
         )
         _verify_live_dependencies(
             foundation=foundation,
             producer=producer,
             publisher=publisher,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
         )
     stem = f"{args.stage}-{args.deployment_name}"
     effective_path = args.evidence_directory / f"{stem}.parameters.json"
@@ -3699,7 +4580,7 @@ def plan(args: argparse.Namespace) -> Path:
             operation="validate",
             stage=args.stage,
             deployment_name=args.deployment_name,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
             location=args.location,
             resource_group=args.resource_group,
             parameter_path=effective_path,
@@ -3710,11 +4591,16 @@ def plan(args: argparse.Namespace) -> Path:
             operation="what-if",
             stage=args.stage,
             deployment_name=args.deployment_name,
-            subscription_id=args.subscription,
+            subscription_id=subscription_id,
             location=args.location,
             resource_group=args.resource_group,
             parameter_path=effective_path,
         ),
+        field="what-if",
+    )
+    _validate_subscription_boundary(
+        what_if,
+        subscription_id=subscription_id,
         field="what-if",
     )
     _write_new_json(what_if_path, what_if)
@@ -3728,10 +4614,10 @@ def plan(args: argparse.Namespace) -> Path:
         )
         raise OrchestrationError(f"WC-029 what-if gate failed: {details}")
     manifest = {
-        "schemaVersion": "athena.wc029DeploymentPlan.v1",
+        "schemaVersion": PLAN_SCHEMA_VERSION,
         "stage": args.stage,
         "sourceCommit": SOURCE_COMMIT,
-        "subscriptionId": args.subscription,
+        "subscriptionId": subscription_id,
         "location": args.location,
         "resourceGroup": args.resource_group,
         "deploymentName": args.deployment_name,
@@ -3776,6 +4662,9 @@ def plan(args: argparse.Namespace) -> Path:
             if args.publisher_handoff is None
             else _sha256_file(args.publisher_handoff)
         ),
+        "predecessorReceipts": _predecessor_receipt_references(
+            verified_predecessors
+        ),
     }
     _write_new_json(manifest_path, manifest)
     return manifest_path
@@ -3792,8 +4681,8 @@ def apply(args: argparse.Namespace) -> Path:
         )
     _ensure_evidence_directory_outside_repository(args.plan_manifest.parent)
     _ensure_clean_worktree()
-    manifest = _mapping(_read_json(args.plan_manifest), field="plan manifest")
-    if manifest.get("schemaVersion") != "athena.wc029DeploymentPlan.v1":
+    manifest = _load_plan_manifest(args.plan_manifest)
+    if manifest.get("schemaVersion") != PLAN_SCHEMA_VERSION:
         raise OrchestrationError("unsupported WC-029 deployment plan schema")
     stage = _string(manifest.get("stage"), field="plan stage")
     if stage not in STAGES:
@@ -3830,21 +4719,36 @@ def apply(args: argparse.Namespace) -> Path:
         handoff_path = Path(_string(handoff_path_value, field=f"{prefix} handoff"))
         if _sha256_file(handoff_path) != handoff_digest:
             raise OrchestrationError(f"{prefix} handoff changed after review")
+    subscription_id = _canonical_subscription_id(
+        manifest.get("subscriptionId"),
+        field="subscription",
+    )
     what_if = _read_json(what_if_path)
+    _validate_subscription_boundary(
+        what_if,
+        subscription_id=subscription_id,
+        field="reviewed what-if",
+    )
+    allowed_change_ids = (
+        _string_list(
+            manifest.get("allowedChangeResourceIds"),
+            field="allowed changes",
+        )
+        if manifest.get("allowedChangeResourceIds")
+        else []
+    )
+    for index, resource_id in enumerate(allowed_change_ids):
+        _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field=f"allowed changes[{index}]",
+        )
     violations = evaluate_what_if(
         what_if,
-        allowed_change_ids=frozenset(
-            _string_list(
-                manifest.get("allowedChangeResourceIds"),
-                field="allowed changes",
-            )
-            if manifest.get("allowedChangeResourceIds")
-            else []
-        ),
+        allowed_change_ids=frozenset(allowed_change_ids),
     )
     if violations:
         raise OrchestrationError("reviewed what-if no longer passes the zero-delete gate")
-    subscription_id = _string(manifest.get("subscriptionId"), field="subscription")
     location = _string(manifest.get("location"), field="location")
     resource_group_value = manifest.get("resourceGroup")
     resource_group = (
@@ -3856,34 +4760,90 @@ def apply(args: argparse.Namespace) -> Path:
     foundation_path = manifest.get("foundationHandoffPath")
     producer_path = manifest.get("producerHandoffPath")
     publisher_path = manifest.get("publisherHandoffPath")
+    predecessor_receipt_references = _mapping(
+        manifest.get("predecessorReceipts"),
+        field="plan predecessor receipts",
+    )
+    receipt_paths = {
+        predecessor: (
+            None
+            if predecessor not in predecessor_receipt_references
+            else Path(
+                _string(
+                    _mapping(
+                        predecessor_receipt_references[predecessor],
+                        field=f"plan predecessor receipt {predecessor}",
+                    ).get("path"),
+                    field=f"{predecessor} receipt path",
+                )
+            )
+        )
+        for predecessor in ("foundation", "producer", "publisher")
+    }
+    reviewed_receipt_sha256s = {
+        predecessor: (
+            None
+            if predecessor not in predecessor_receipt_references
+            else _string(
+                _mapping(
+                    predecessor_receipt_references[predecessor],
+                    field=f"plan predecessor receipt {predecessor}",
+                ).get("reviewedSha256"),
+                field=f"{predecessor} reviewed receipt SHA-256",
+            )
+        )
+        for predecessor in ("foundation", "producer", "publisher")
+    }
+    handoff_paths = {
+        "foundation": (
+            None if foundation_path is None else Path(str(foundation_path))
+        ),
+        "producer": None if producer_path is None else Path(str(producer_path)),
+        "publisher": (
+            None if publisher_path is None else Path(str(publisher_path))
+        ),
+    }
     _validate_stage_inputs(
         stage=stage,
         resource_group=resource_group,
-        foundation_handoff_path=(
-            None if foundation_path is None else Path(str(foundation_path))
-        ),
-        producer_handoff_path=(
-            None if producer_path is None else Path(str(producer_path))
-        ),
-        publisher_handoff_path=(
-            None if publisher_path is None else Path(str(publisher_path))
-        ),
+        foundation_handoff_path=handoff_paths["foundation"],
+        producer_handoff_path=handoff_paths["producer"],
+        publisher_handoff_path=handoff_paths["publisher"],
+    )
+    verified_predecessors = _load_verified_predecessors(
+        stage=stage,
+        handoff_paths=handoff_paths,
+        receipt_paths=receipt_paths,
+        reviewed_receipt_sha256s=reviewed_receipt_sha256s,
     )
     effective_parameters = _load_parameters(effective_path)
+    _validate_effective_parameter_subscription_boundary(
+        effective_parameters,
+        subscription_id=subscription_id,
+    )
     foundation = (
         None
-        if foundation_path is None
-        else _load_handoff(Path(foundation_path), expected_stage="foundation")
+        if "foundation" not in verified_predecessors
+        else _mapping(
+            verified_predecessors["foundation"]["handoff"],
+            field="verified foundation handoff",
+        )
     )
     producer = (
         None
-        if producer_path is None
-        else _load_handoff(Path(producer_path), expected_stage="producer")
+        if "producer" not in verified_predecessors
+        else _mapping(
+            verified_predecessors["producer"]["handoff"],
+            field="verified producer handoff",
+        )
     )
     publisher = (
         None
-        if publisher_path is None
-        else _load_handoff(Path(publisher_path), expected_stage="publisher")
+        if "publisher" not in verified_predecessors
+        else _mapping(
+            verified_predecessors["publisher"]["handoff"],
+            field="verified publisher handoff",
+        )
     )
     if stage == "producer":
         if foundation is None:
@@ -3964,6 +4924,11 @@ def apply(args: argparse.Namespace) -> Path:
         ),
         field="current what-if",
     )
+    _validate_subscription_boundary(
+        current_what_if,
+        subscription_id=subscription_id,
+        field="current what-if",
+    )
     if _canonical_json_bytes(current_what_if) != _canonical_json_bytes(what_if):
         raise OrchestrationError(
             "Azure state changed after review; current what-if differs from the plan"
@@ -3981,6 +4946,11 @@ def apply(args: argparse.Namespace) -> Path:
         field="deployment create",
     )
     outputs = _deployment_outputs(result)
+    _validate_subscription_boundary(
+        outputs,
+        subscription_id=subscription_id,
+        field="deployment outputs",
+    )
     _validate_stage_outputs(
         stage,
         outputs,
@@ -4043,8 +5013,11 @@ def apply(args: argparse.Namespace) -> Path:
         )
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
+    predecessor_receipt_hashes = _predecessor_receipt_hashes(
+        verified_predecessors
+    )
     handoff = {
-        "schemaVersion": "athena.wc029DeploymentHandoff.v1",
+        "schemaVersion": HANDOFF_SCHEMA_VERSION,
         "stage": stage,
         "sourceCommit": SOURCE_COMMIT,
         "subscriptionId": subscription_id,
@@ -4057,12 +5030,31 @@ def apply(args: argparse.Namespace) -> Path:
             _canonical_json_bytes(bindings)
         ),
         "planManifestSha256": _sha256_file(args.plan_manifest),
+        "predecessorReceiptSha256s": predecessor_receipt_hashes,
     }
     handoff_path = args.plan_manifest.with_name(
         f"{stage}-{deployment_name}.handoff.json"
     )
     _write_new_json(handoff_path, handoff)
-    return handoff_path
+    receipt = {
+        "schemaVersion": RECEIPT_SCHEMA_VERSION,
+        "stage": stage,
+        "sourceCommit": SOURCE_COMMIT,
+        "subscriptionId": subscription_id,
+        "resourceGroup": resource_group,
+        "deploymentName": deployment_name,
+        "planManifestPath": str(args.plan_manifest.resolve()),
+        "planManifestSha256": _sha256_file(args.plan_manifest),
+        "reviewedPlanSha256": reviewed_digest,
+        "handoffPath": str(handoff_path.resolve()),
+        "handoffSha256": _sha256_file(handoff_path),
+        "predecessorReceiptSha256s": predecessor_receipt_hashes,
+    }
+    receipt_path = args.plan_manifest.with_name(
+        f"{stage}-{deployment_name}.receipt.json"
+    )
+    _write_new_json(receipt_path, receipt)
+    return receipt_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -4082,8 +5074,14 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--parameters", type=Path, required=True)
     plan_parser.add_argument("--evidence-directory", type=Path, required=True)
     plan_parser.add_argument("--foundation-handoff", type=Path)
+    plan_parser.add_argument("--foundation-receipt", type=Path)
+    plan_parser.add_argument("--foundation-reviewed-receipt-sha256")
     plan_parser.add_argument("--producer-handoff", type=Path)
+    plan_parser.add_argument("--producer-receipt", type=Path)
+    plan_parser.add_argument("--producer-reviewed-receipt-sha256")
     plan_parser.add_argument("--publisher-handoff", type=Path)
+    plan_parser.add_argument("--publisher-receipt", type=Path)
+    plan_parser.add_argument("--publisher-reviewed-receipt-sha256")
     plan_parser.add_argument("--allow-change", action="append", default=[])
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--plan-manifest", type=Path, required=True)
