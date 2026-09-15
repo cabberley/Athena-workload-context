@@ -32,6 +32,8 @@ from athena_context.contracts import (
     CanonicalWorkloadManifest,
     ChangeEvidenceArtifact,
     CorrelationReport,
+    CorrelationRequest,
+    IncidentBoundCorrelationRequest,
     IncidentEnrichmentAttestation,
     IncidentEnrichmentFeedPointer,
     IncidentEnrichmentFeedPointerAttestation,
@@ -50,9 +52,11 @@ from athena_context.contracts import (
     UtcDateTime,
     canonicalize_json,
     compute_artifact_digest,
+    incident_correlation_subject_signature_preimage,
     incident_state_signature_preimage,
     resolve_manifest_profile,
     sha256_hex,
+    validate_correlation_report_binding,
     validate_incident_feed_index_assets,
 )
 from athena_context.contracts.change_ingestion import change_evidence_attestation_preimage
@@ -129,8 +133,10 @@ type EvidenceClass = Literal[
     "mutation-receipt",
     "monitoring-evidence",
     "change-evidence",
+    "correlation-request",
     "correlation-report",
     "correlation-report-attestation",
+    "incident-bound-request",
     "incident-omission",
     "incident-state-active",
     "incident-state-active-attestation",
@@ -169,6 +175,35 @@ REQUIRED_SCENARIO_CLASSES: tuple[ScenarioClass, ...] = (
     "nsg-connectivity-loss",
     "vm-failure",
     "web-tier-failure",
+)
+REQUIRED_DEPLOYMENT_ROOTS: frozenset[tuple[DeploymentStage, str, str]] = frozenset(
+    {
+        (
+            "live-acceptance",
+            "infra/wc013-live-acceptance/main.bicep",
+            "subscription",
+        ),
+        (
+            "foundation",
+            "infra/wc024-monitoring-connectivity/main.bicep",
+            "subscription",
+        ),
+        (
+            "foundation",
+            "infra/wc024-monitoring-foundation/main.bicep",
+            "subscription",
+        ),
+        (
+            "producer",
+            "infra/wc025-change-ingestion/main.bicep",
+            "subscription",
+        ),
+        (
+            "foundation",
+            "infra/wc029-monitoring-prerequisites/main.bicep",
+            "subscription",
+        ),
+    }
 )
 
 _DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -219,6 +254,7 @@ _INCIDENT_ONLY_CLASSES: frozenset[EvidenceClass] = frozenset(
     {
         "incident-state-active",
         "incident-state-active-attestation",
+        "incident-bound-request",
         "incident-state-resolved",
         "incident-state-resolved-attestation",
         "manifest-citation",
@@ -298,8 +334,10 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "mutation-receipt": MUTATION_RECEIPT_SCHEMA_VERSION,
     "monitoring-evidence": "athena.wc024MonitoringEvidenceHandoff.v1",
     "change-evidence": "athena.changeEvidenceArtifact.v1",
+    "correlation-request": "athena.wc026CorrelationRequest.v2",
     "correlation-report": "athena.wc026CorrelationReport.v1",
     "correlation-report-attestation": ("athena.wc027PublishedCorrelationReportAttestation.v1"),
+    "incident-bound-request": "athena.wc027IncidentBoundCorrelationRequest.v1",
     "incident-omission": INCIDENT_OMISSION_SCHEMA_VERSION,
     "incident-state-active": "athena.incidentState.v1",
     "incident-state-active-attestation": "athena.incidentStateAttestation.v1",
@@ -344,6 +382,25 @@ class _StrictAcceptanceModel(BaseModel):
         populate_by_name=True,
         json_schema_extra={"additionalProperties": False},
     )
+
+    @model_validator(mode="after")
+    def reject_external_zero_digests(self) -> _StrictAcceptanceModel:
+        stack: list[object] = [
+            self.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            )
+        ]
+        while stack:
+            item = stack.pop()
+            if item == _ZERO_DIGEST:
+                raise ValueError("external evidence must not contain the zero digest")
+            if isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, list | tuple):
+                stack.extend(item)
+        return self
 
     def canonical_json(self) -> str:
         return canonicalize_json(self.model_dump(mode="json", by_alias=True, exclude_none=True))
@@ -539,8 +596,6 @@ class Wc029DeploymentVersion(_StrictAcceptanceModel):
 
     @model_validator(mode="after")
     def validate_scope_and_dependencies(self) -> Wc029DeploymentVersion:
-        if (self.stage in {"foundation", "live-acceptance"}) != (self.resource_group is None):
-            raise ValueError("trusted deployment scope does not match its stage")
         keys = tuple((item.stage, item.deployment_id) for item in self.upstream_handoffs)
         stage_rank = {"foundation": 0, "producer": 1, "publisher": 2}
         if keys != tuple(sorted(keys, key=lambda item: (stage_rank[item[0]], item[1]))) or len(
@@ -800,6 +855,7 @@ class Wc029PublishedManifestEvidence(_StrictAcceptanceModel):
         if (
             self.manifest_document.manifest_id != self.manifest_id
             or self.manifest_document.manifest_version != self.manifest_version
+            or self.manifest_document.audit.published_at != self.published_at
         ):
             raise ValueError("published manifest coordinates do not match its document")
         if self.manifest_digest != self.manifest_document.compatibility.artifact_digest:
@@ -808,7 +864,6 @@ class Wc029PublishedManifestEvidence(_StrictAcceptanceModel):
             self.manifest_document,
             self.profile_id,
             as_of=self.published_at,
-            _validate_complete_graph=False,
         )
         dependency_graph_digest = compute_artifact_digest(
             {
@@ -883,6 +938,11 @@ class Wc029PublishedManifestEvidence(_StrictAcceptanceModel):
             )
             for item in resolved_profile.controls
         }
+        supplied_clause_keys = {(item.clause_kind, item.clause_id) for item in self.cited_clauses}
+        if supplied_clause_keys != set(effective_clauses):
+            raise ValueError(
+                "citedClauses must contain the exact effective constraint and control map"
+            )
         for clause in self.cited_clauses:
             resolved_clause = _resolve_json_pointer(
                 document,
@@ -1189,6 +1249,21 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             "live-acceptance": 3,
         }
         deployment_by_id = {item.deployment_id: item for item in self.deployments}
+        actual_roots = frozenset(
+            (
+                item.stage,
+                item.template_path,
+                "subscription" if item.resource_group is None else "resource-group",
+            )
+            for item in self.deployments
+        )
+        if (
+            len(self.deployments) != len(REQUIRED_DEPLOYMENT_ROOTS)
+            or actual_roots != REQUIRED_DEPLOYMENT_ROOTS
+        ):
+            raise ValueError(
+                "trusted inventory must contain the exact authoritative deployment roots"
+            )
         for deployment in self.deployments:
             if any(
                 upstream.deployment_id not in deployment_ids
@@ -1200,6 +1275,19 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
                 raise ValueError("trusted deployment upstream roots are missing or out of order")
         if self.capability_deployment_id not in deployment_ids:
             raise ValueError("capabilityDeploymentId must identify one trusted deployment root")
+        capability_root = deployment_by_id[self.capability_deployment_id]
+        if (
+            capability_root.stage,
+            capability_root.template_path,
+            "subscription" if capability_root.resource_group is None else "resource-group",
+        ) != (
+            "live-acceptance",
+            "infra/wc013-live-acceptance/main.bicep",
+            "subscription",
+        ):
+            raise ValueError(
+                "capabilityDeploymentId must identify the authoritative live-acceptance root"
+            )
         if tuple(item.purpose for item in self.keys) != tuple(
             sorted(item.purpose for item in self.keys)
         ):
@@ -1369,8 +1457,7 @@ class Wc029DeploymentPlanEvidence(_StrictAcceptanceModel):
     def validate_plan(self) -> Wc029DeploymentPlanEvidence:
         if self.source_commit == "0" * 40:
             raise ValueError("deployment plan sourceCommit must not be all zero")
-        if (self.stage in {"foundation", "live-acceptance"}) != (self.resource_group is None):
-            raise ValueError("deployment plan scope does not match its stage")
+        _validate_portable_relative_path(self.template_path)
         if tuple(item.casefold() for item in self.allowed_change_resource_ids) != tuple(
             sorted(item.casefold() for item in self.allowed_change_resource_ids)
         ) or len({item.casefold() for item in self.allowed_change_resource_ids}) != len(
@@ -1438,8 +1525,6 @@ class Wc029DeploymentHandoffEvidence(_StrictAcceptanceModel):
             raise ValueError("outputsSha256 does not bind deployment outputs")
         if self.parameter_bindings_sha256 != sha256_hex(canonicalize_json(self.parameter_bindings)):
             raise ValueError("parameterBindingsSha256 does not bind deployment parameters")
-        if (self.stage in {"foundation", "live-acceptance"}) != (self.resource_group is None):
-            raise ValueError("deployment handoff scope does not match its stage")
         return self
 
 
@@ -2725,7 +2810,11 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             for phase, artifact_ids in scenario.phases.items()
         }
         required_common: dict[ScenarioPhase, tuple[EvidenceClass, ...]] = {
-            "plan": ("scenario-plan", "baseline-state"),
+            "plan": (
+                "scenario-plan",
+                "baseline-state",
+                "correlation-request",
+            ),
             "apply": ("mutation-receipt",),
             "observe": (
                 "monitoring-evidence",
@@ -2777,6 +2866,7 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
         required_incident_observe: set[EvidenceClass] = {
             "incident-state-active",
             "incident-state-active-attestation",
+            "incident-bound-request",
             "manifest-citation",
             "guidance",
             "guidance-attestation",
@@ -2953,9 +3043,11 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     URL_PROBE_SCHEMA_VERSION: Wc029UrlProbeEvidence,
     "athena.wc024MonitoringEvidenceHandoff.v1": MonitoringEvidenceHandoff,
     "athena.changeEvidenceArtifact.v1": ChangeEvidenceArtifact,
+    "athena.wc026CorrelationRequest.v2": CorrelationRequest,
     "athena.wc026CorrelationReport.v1": CorrelationReport,
     "athena.incidentState.v1": IncidentState,
     "athena.incidentStateAttestation.v1": IncidentStateAttestation,
+    "athena.wc027IncidentBoundCorrelationRequest.v1": (IncidentBoundCorrelationRequest),
     "athena.wc027PublishedCorrelationReportAttestation.v1": (PublishedCorrelationReportAttestation),
     "athena.wc027IncidentGuidance.v1": IncidentGuidance,
     "athena.wc027IncidentGuidanceAttestation.v1": IncidentGuidanceAttestation,
@@ -3046,6 +3138,17 @@ def _parse_strict_json(raw: bytes, *, label: str) -> tuple[object, bytes]:
             parse_constant=_reject_json_constant,
         )
         _validate_json_shape(parsed)
+        stack = [parsed]
+        while stack:
+            item = stack.pop()
+            if item == _ZERO_DIGEST:
+                raise Wc029AcceptanceEvidenceError(
+                    f"{label} contains the externally forbidden zero digest"
+                )
+            if isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
         canonical = canonicalize_json(parsed).encode("utf-8")
     except Wc029AcceptanceEvidenceError:
         raise
@@ -3838,6 +3941,8 @@ def _validate_rbac_policy(
         list,
     ):
         raise Wc029AcceptanceEvidenceError("RBAC policy collections must be arrays")
+    if policy["allowedbroadassignments"]:
+        raise Wc029AcceptanceEvidenceError("RBAC policy broad-assignment allowances must be empty")
     rules = policy["separationrules"]
     if not rules:
         raise Wc029AcceptanceEvidenceError(
@@ -4324,6 +4429,8 @@ def _validate_signed_artifacts(
                 statement.report_id != report.report_id
                 or statement.report_digest != report.report_digest
                 or statement.report_content_digest != sha256_hex(report.canonical_bytes())
+                or statement.correlation_request_digest != report.request_digest
+                or statement.correlation_transition_digest != report.transition_digest
                 or report_attestation.key_vault_key_id.casefold() != key.key_vault_key_id.casefold()
                 or report_attestation.signed_preimage_digest
                 != sha256_hex(statement.canonical_bytes())
@@ -4860,6 +4967,8 @@ def _scenario_artifact_input_digest(
         return plan.monitoring_request_digest
     if isinstance(model, ChangeEvidenceArtifact):
         return model.evidence.source_digest
+    if isinstance(model, CorrelationRequest):
+        return model.request_digest
     if isinstance(model, CorrelationReport):
         return model.request_digest
     if isinstance(model, PublishedCorrelationReportAttestation):
@@ -4870,6 +4979,8 @@ def _scenario_artifact_input_digest(
         return model.result_digest
     if isinstance(model, IncidentStateAttestation):
         return model.result_digest
+    if isinstance(model, IncidentBoundCorrelationRequest):
+        return model.binding_digest
     if isinstance(model, Wc029ManifestCitationEvidence):
         return model.citation_digest
     if isinstance(model, IncidentGuidance):
@@ -4931,6 +5042,86 @@ def _require_incident_state_digest(state: IncidentState) -> None:
         raise Wc029AcceptanceEvidenceError(
             "IncidentState resultDigest does not bind its signature preimage"
         )
+
+
+def _validate_incident_manifest_coverage(
+    published_manifest: Wc029PublishedManifestEvidence,
+    citation: Wc029ManifestCitationEvidence,
+    active_state: IncidentState,
+    resolved_state: IncidentState,
+) -> None:
+    published_clause_ids = {item.clause_id for item in published_manifest.cited_clauses}
+    finding_clause_ids = {
+        finding.clause_id for state in (active_state, resolved_state) for finding in state.findings
+    }
+    if (
+        not finding_clause_ids
+        or not finding_clause_ids.issubset(published_clause_ids)
+        or set(citation.clause_ids) != finding_clause_ids
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "IncidentState findings are not covered by the exact effective manifest clauses"
+        )
+
+
+def _validate_incident_bound_request(
+    bound_request: IncidentBoundCorrelationRequest,
+    request: CorrelationRequest,
+    active_state: IncidentState,
+    active_state_attestation: IncidentStateAttestation,
+    report_attestation: PublishedCorrelationReportAttestation,
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> None:
+    subject = bound_request.incident_subject
+    subject_preimage = incident_correlation_subject_signature_preimage(subject)
+    binding_payload = bound_request.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "request_id",
+            "binding_digest",
+            "binding_attestation",
+        },
+    )
+    binding_preimage = canonicalize_json(binding_payload).encode("utf-8")
+    keys = {item.purpose: item for item in inventory.keys}
+    public_keys = _load_public_keys(inventory, artifacts)
+    if (
+        bound_request.correlation_request.canonical_bytes() != request.canonical_bytes()
+        or subject.incident_state.canonical_bytes() != active_state.canonical_bytes()
+        or subject.incident_state_attestation.canonical_bytes()
+        != active_state_attestation.canonical_bytes()
+        or subject.subject_attestation.key_vault_key_id.casefold()
+        != keys["incident"].key_vault_key_id.casefold()
+        or subject.subject_attestation.signed_preimage_digest != sha256_hex(subject_preimage)
+        or bound_request.binding_attestation.key_vault_key_id.casefold()
+        != keys["report"].key_vault_key_id.casefold()
+        or bound_request.binding_attestation.signed_preimage_digest != sha256_hex(binding_preimage)
+        or report_attestation.statement.incident_subject_id != subject.subject_id
+        or report_attestation.statement.incident_subject_digest != subject.subject_digest
+        or report_attestation.statement.incident_bound_request_id != bound_request.request_id
+        or report_attestation.statement.incident_bound_request_digest
+        != bound_request.binding_digest
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "incident-bound request does not bind the accepted correlation context"
+        )
+    _verify_signature(
+        public_keys["incident"],
+        preimage=subject_preimage,
+        signature=subject.subject_attestation.detached_signature,
+        standard_base64=False,
+        artifact_id="incident correlation subject",
+    )
+    _verify_signature(
+        public_keys["report"],
+        preimage=binding_preimage,
+        signature=bound_request.binding_attestation.detached_signature,
+        standard_base64=False,
+        artifact_id="incident-bound correlation request",
+    )
 
 
 def _validate_signed_scenario_execution(
@@ -5020,6 +5211,10 @@ def _validate_scenario_lifecycle(
         selected["incident-state-active"],
         IncidentState,
     )
+    active_state_attestation = _require_model(
+        selected["incident-state-active-attestation"],
+        IncidentStateAttestation,
+    )
     resolved_state = _require_model(
         selected["incident-state-resolved"],
         IncidentState,
@@ -5047,6 +5242,23 @@ def _validate_scenario_lifecycle(
         selected["correlation-report-attestation"],
         PublishedCorrelationReportAttestation,
     )
+    request = _require_model(
+        selected["correlation-request"],
+        CorrelationRequest,
+    )
+    bound_request = _require_model(
+        selected["incident-bound-request"],
+        IncidentBoundCorrelationRequest,
+    )
+    _validate_incident_bound_request(
+        bound_request,
+        request,
+        active_state,
+        active_state_attestation,
+        report_attestation,
+        inventory,
+        artifacts,
+    )
     authority = _require_model(
         artifacts[inventory.manifest.authority_artifact_id],
         Wc029PublicationAuthorityEvidence,
@@ -5070,7 +5282,6 @@ def _validate_scenario_lifecycle(
         artifacts[manifest.manifest_artifact_id],
         Wc029PublishedManifestEvidence,
     )
-    published_clauses = {item.clause_id for item in published_manifest.cited_clauses}
     if (
         citation.scenario_id != scenario.scenario_id
         or citation.scenario_execution_id
@@ -5085,11 +5296,16 @@ def _validate_scenario_lifecycle(
         or citation.correlation_report_id != report.report_id
         or citation.correlation_report_digest != report.report_digest
         or citation.incident_state_result_digest != active_state.result_digest
-        or not set(citation.clause_ids).issubset(published_clauses)
     ):
         raise Wc029AcceptanceEvidenceError(
             "manifest citation does not match the exact published inventory"
         )
+    _validate_incident_manifest_coverage(
+        published_manifest,
+        citation,
+        active_state,
+        resolved_state,
+    )
 
     guidance = _require_model(selected["guidance"], IncidentGuidance)
     enrichment = _require_model(
@@ -5277,6 +5493,51 @@ def _validate_scenario_lifecycle(
         )
 
 
+def _validate_correlation_request_context(
+    request: CorrelationRequest,
+    report: CorrelationReport,
+    report_attestation: PublishedCorrelationReportAttestation,
+    monitoring: MonitoringEvidenceHandoff,
+    published_manifest: Wc029PublishedManifestEvidence,
+    publication_authority: PublishedContextAuthority,
+    plan: Wc029ScenarioPlanEvidence,
+) -> None:
+    try:
+        validate_correlation_report_binding(report, request)
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "correlation report does not bind the exact captured request"
+        ) from exc
+    if (
+        not isinstance(
+            request.context_binding,
+            PublishedRuntimeContextBinding,
+        )
+        or request.context_binding.canonical_bytes()
+        != published_manifest.context_binding.canonical_bytes()
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "captured correlation request context does not match accepted publication"
+        )
+    if (
+        request.monitoring_handoff != monitoring
+        or report.binding_mode != "publishedRuntime"
+        or report.preview_only
+        or report.no_auto_remediation is not True
+        or report.context_binding_digest != published_manifest.context_binding.binding_digest
+        or request.request_digest != plan.correlation_request_digest
+        or report.request_digest != plan.correlation_request_digest
+        or report_attestation.statement.correlation_request_digest
+        != plan.correlation_request_digest
+        or report_attestation.statement.authority_proof_digest
+        != sha256_hex(publication_authority.canonical_bytes())
+        or plan.monitoring_request_digest != _monitoring_request_digest(monitoring)
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "scenario correlation report context does not match accepted publication"
+        )
+
+
 def _validate_scenario_evidence(
     index: Wc029AcceptanceEvidenceIndex,
     inventory: Wc029VersionInventory,
@@ -5447,20 +5708,35 @@ def _validate_scenario_evidence(
             )
 
         report = _require_model(selected["correlation-report"], CorrelationReport)
+        report_attestation = _require_model(
+            selected["correlation-report-attestation"],
+            PublishedCorrelationReportAttestation,
+        )
+        request = _require_model(
+            selected["correlation-request"],
+            CorrelationRequest,
+        )
         monitoring = _require_model(
             selected["monitoring-evidence"],
             MonitoringEvidenceHandoff,
         )
-        if (
-            report.binding_mode != "publishedRuntime"
-            or report.preview_only
-            or report.no_auto_remediation is not True
-            or report.request_digest != plan.correlation_request_digest
-            or plan.monitoring_request_digest != _monitoring_request_digest(monitoring)
-        ):
-            raise Wc029AcceptanceEvidenceError(
-                "scenario correlation report is not a published read-only result"
-            )
+        published_manifest = _require_model(
+            artifacts[inventory.manifest.manifest_artifact_id],
+            Wc029PublishedManifestEvidence,
+        )
+        publication_authority = _require_model(
+            artifacts[inventory.manifest.authority_artifact_id],
+            Wc029PublicationAuthorityEvidence,
+        ).authority
+        _validate_correlation_request_context(
+            request,
+            report,
+            report_attestation,
+            monitoring,
+            published_manifest,
+            publication_authority,
+            plan,
+        )
         if scenario.scenario_class == "nsg-connectivity-loss":
             change = _require_model(
                 selected["change-evidence"],
@@ -5649,6 +5925,26 @@ def _validate_scenario_evidence(
         )
 
 
+def _validate_scenario_execution_set(
+    intervals: Sequence[tuple[UtcDateTime, UtcDateTime, str]],
+    identity_groups: Sequence[tuple[str, Sequence[str]]],
+) -> tuple[UtcDateTime, UtcDateTime]:
+    for label, values in identity_groups:
+        if len(values) != len(set(values)):
+            raise Wc029AcceptanceEvidenceError(f"global scenarios must use unique {label}")
+    ordered_intervals = sorted(intervals)
+    if any(
+        current[1] >= following[0]
+        for current, following in zip(
+            ordered_intervals,
+            ordered_intervals[1:],
+            strict=False,
+        )
+    ):
+        raise Wc029AcceptanceEvidenceError("signed scenario execution intervals must not overlap")
+    return ordered_intervals[0][0], ordered_intervals[-1][1]
+
+
 def _validate_global_chronology(
     index: Wc029AcceptanceEvidenceIndex,
     inventory: Wc029VersionInventory,
@@ -5666,34 +5962,67 @@ def _validate_global_chronology(
         if item.declaration.evidence_class == "queue-state"
         and item.declaration.queue_scope == "final"
     )
-    capability_readback = next(
+    deployment_readbacks = tuple(
         _require_model(item, Wc029DeploymentReadbackEvidence)
         for item in artifacts.values()
         if item.declaration.evidence_class == "deployment-readback"
-        and item.declaration.deployment_id == inventory.capability_deployment_id
     )
-    scenario_starts: list[UtcDateTime] = []
-    scenario_completions: list[UtcDateTime] = []
+    intervals: list[tuple[UtcDateTime, UtcDateTime, str]] = []
+    scenario_execution_ids: list[str] = []
+    correlation_request_ids: list[str] = []
+    correlation_request_digests: list[str] = []
+    verification_input_digests: list[str] = []
+    report_ids: list[str] = []
+    change_request_digests: list[str] = []
     for scenario in index.scenarios:
         selected = _scenario_artifacts_by_class(scenario, artifacts)
         plan = _require_model(
             selected["scenario-plan"],
             Wc029ScenarioPlanEvidence,
         )
-        baseline_state = _require_model(
-            selected["baseline-state"],
-            Wc029ResourceStateEvidence,
+        execution_manifest = _require_model(
+            selected["scenario-execution-manifest"],
+            Wc029ScenarioExecutionManifest,
         )
-        proof = _require_model(
-            selected["recovery-proof"],
-            Wc029RecoveryProof,
+        report = _require_model(
+            selected["correlation-report"],
+            CorrelationReport,
         )
-        scenario_starts.append(min(plan.planned_at, baseline_state.captured_at))
-        scenario_completions.append(proof.verified_at)
+        request = _require_model(
+            selected["correlation-request"],
+            CorrelationRequest,
+        )
+        intervals.append(
+            (
+                execution_manifest.phase_windows[0].started_at,
+                execution_manifest.phase_windows[-1].completed_at,
+                scenario.scenario_id,
+            )
+        )
+        scenario_execution_ids.append(plan.scenario_execution_id)
+        correlation_request_ids.append(request.request_id)
+        correlation_request_digests.append(plan.correlation_request_digest)
+        verification_input_digests.append(plan.verification_input_digest)
+        report_ids.append(report.report_id)
+        if plan.change_request_digest is not None:
+            change_request_digests.append(plan.change_request_digest)
+    identity_groups = (
+        ("scenario execution IDs", scenario_execution_ids),
+        ("correlation request IDs", correlation_request_ids),
+        ("correlation request digests", correlation_request_digests),
+        ("verification input digests", verification_input_digests),
+        ("correlation report IDs", report_ids),
+        ("change request digests", change_request_digests),
+    )
+    earliest_scenario_start, latest_scenario_completion = _validate_scenario_execution_set(
+        intervals, identity_groups
+    )
+    latest_deployment_readback = max(item.observed_at for item in deployment_readbacks)
     if (
-        capability_readback.observed_at >= baseline_queue.captured_at
-        or baseline_queue.captured_at >= min(scenario_starts)
-        or final_queue.captured_at <= max(scenario_completions)
+        latest_deployment_readback >= baseline_queue.captured_at
+        or latest_deployment_readback >= earliest_scenario_start
+        or baseline_queue.captured_at >= earliest_scenario_start
+        or final_queue.captured_at <= latest_scenario_completion
     ):
         raise Wc029AcceptanceEvidenceError(
             "global deployment, baseline, scenario, and final chronology is invalid"
@@ -6058,6 +6387,7 @@ __all__ = [
     "QUEUE_STATE_SCHEMA_VERSION",
     "RECOVERY_ACTION_SCHEMA_VERSION",
     "RECOVERY_PROOF_SCHEMA_VERSION",
+    "REQUIRED_DEPLOYMENT_ROOTS",
     "REQUIRED_SCENARIO_CLASSES",
     "RESOURCE_STATE_SCHEMA_VERSION",
     "SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION",
