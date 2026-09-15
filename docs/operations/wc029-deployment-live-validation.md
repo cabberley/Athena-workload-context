@@ -174,6 +174,10 @@ The command reads only the saved JSON file. It does not authenticate to Azure, s
 deployment, or modify resources. Exit `2` means the policy blocked the saved plan; exit `3` means
 the evidence could not be safely evaluated. Either result stops the runbook. Use the default text
 format for an operator-readable summary and retain `--format json` output as release evidence.
+Every `NoChange` row must retain complete identical `before` and `after` resource objects and no
+effective delta. Preserve matching `id`, `name`, `type`, and object-valued `properties`, and retain
+only `NoEffect` entries that exactly reconcile with both snapshots; do not reduce unchanged rows to
+resource IDs.
 
 The checked-in WC-029 artifact is preparation-only: it validates the existing baseline and leaves
 Dependency Agent and Network Watcher Agent deployment disabled. See
@@ -195,6 +199,10 @@ The gate fails on:
   identity assignment; management-group roles still undergo descendant separation checks; or
 - overlap between context, evidence, presentation, collector, publication, and notification
   identities.
+
+ARM resource and role-definition IDs, scopes, reviewed allowlist values, and request URLs must
+remain ASCII. Do not normalize or transliterate Unicode lookalikes; Kelvin sign `K`, long-s `ſ`, and
+percent-encoded Unicode aliases fail the gate.
 
 Do not continue by manually ignoring a failed preflight result. Update IaC or the reviewed
 allowlist and rerun the gate.
@@ -219,7 +227,7 @@ gate. The policy's `approvedManagementGroupAncestry` is a separately reviewed co
 path; a changed path requires new review.
 
 The Resource Graph response must contain no non-null `skipToken` or `$skipToken`, must explicitly
-set `resultTruncated` to `false`, and must satisfy
+set `resultTruncated` to JSON `false` or the exact transport string `"false"`, and must satisfy
 `count == totalRecords == data.Count == 1`.
 
 For every expected managed identity, record Graph object identity and complete transitive

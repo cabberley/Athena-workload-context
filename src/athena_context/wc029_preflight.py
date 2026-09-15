@@ -203,7 +203,8 @@ def _normalized(value: str) -> str:
 
 
 def _resource_type(resource_id: str) -> str:
-    segments = [segment for segment in resource_id.strip("/").casefold().split("/") if segment]
+    canonical_resource_id = _canonical_scope(resource_id)
+    segments = [segment for segment in canonical_resource_id.strip("/").split("/") if segment]
     if len(segments) >= 5 and segments[0] == "subscriptions":
         initial_provider_index = 4 if segments[2] == "resourcegroups" else 2
     elif segments and segments[0] == "providers":
@@ -281,12 +282,15 @@ def _contains_non_ascii_case_alias(value: str) -> bool:
 
 
 def _canonical_role_id(value: str) -> str:
-    normalized = _normalized(value)
+    stripped = value.strip()
+    if not stripped.isascii():
+        raise PreflightInputError("roleDefinitionId contains non-ASCII characters")
+    normalized = stripped.lower()
     if "/" not in normalized:
         if _GUID.fullmatch(normalized) is None:
             raise PreflightInputError("roleDefinitionId must end in a role GUID")
         return normalized
-    canonical = _canonical_scope(normalized)
+    canonical = _canonical_scope(stripped)
     segments = canonical.strip("/").split("/")
     if (
         len(segments) < 4
@@ -311,8 +315,9 @@ def _canonical_property_path(value: str) -> str:
         return _RESOURCE_ROOT_PATH
     prefix = f"{_RESOURCE_ROOT_PATH}."
     if normalized.startswith(prefix):
-        remainder = normalized.removeprefix(prefix).lstrip(".")
-        return remainder or _RESOURCE_ROOT_PATH
+        normalized = normalized.removeprefix(prefix)
+    if any(not component for component in normalized.split(".")):
+        raise PreflightInputError("property path contains an empty component")
     return normalized
 
 
@@ -325,7 +330,10 @@ def _property_path_contains(ancestor: str, descendant: str) -> bool:
 
 
 def _canonical_scope(value: str) -> str:
-    normalized = _normalized(value)
+    stripped = value.strip()
+    if not stripped.isascii():
+        raise PreflightInputError("scope contains non-ASCII characters")
+    normalized = stripped.lower()
     canonical = normalized.rstrip("/") or "/"
     if (
         not canonical.startswith("/")
@@ -614,6 +622,33 @@ def _resource_group_subscription_id(scope: str) -> str:
     return segments[1]
 
 
+def _allow_change_binding(
+    values: frozenset[str],
+) -> tuple[frozenset[str], str]:
+    records: list[dict[str, str]] = []
+    canonical_values: set[str] = set()
+    for value in values:
+        raw_value = _require_string(
+            value,
+            field_name="allow-change resource ID",
+        )
+        if not raw_value.isascii():
+            raise PreflightInputError("allow-change resource ID contains non-ASCII characters")
+        canonical_value = _canonical_scope(raw_value)
+        records.append(
+            {
+                "canonical": canonical_value,
+                "raw": raw_value,
+            }
+        )
+        canonical_values.add(canonical_value)
+    records.sort(key=lambda item: (item["raw"], item["canonical"]))
+    return (
+        frozenset(canonical_values),
+        _canonical_json_digest({"allowChangeIds": records}),
+    )
+
+
 def _scope_contains(ancestor: str, descendant: str) -> bool:
     return ancestor == "/" or descendant == ancestor or descendant.startswith(ancestor + "/")
 
@@ -846,7 +881,18 @@ def _property_child_path(parent: str, key: str) -> str:
 
 
 def _json_values_equal(left: object, right: object) -> bool:
-    return type(left) is type(right) and left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _derive_snapshot_delta(
@@ -996,6 +1042,192 @@ def _walk_delta(
         if child_items:
             stack.extend((child, path) for child in reversed(child_items))
     return values
+
+
+def _snapshot_value_at_path(
+    snapshot: dict[str, Any],
+    path: str,
+) -> tuple[bool, object]:
+    canonical_path = _canonical_property_path(path)
+    if canonical_path == _RESOURCE_ROOT_PATH:
+        return True, snapshot
+    current: object = snapshot
+    for component in canonical_path.split("."):
+        key_match = re.match(r"^[^\[]*", component)
+        assert key_match is not None
+        raw_key = key_match.group(0)
+        remainder = component[len(raw_key) :]
+        if raw_key:
+            if not isinstance(current, dict):
+                return False, None
+            key = raw_key.replace("~1", ".").replace("~0", "~")
+            matched_key = next(
+                (candidate for candidate in current if candidate.lower() == key),
+                None,
+            )
+            if matched_key is None:
+                return False, None
+            current = current[matched_key]
+        while remainder:
+            index_match = re.match(r"^\[(\d+)\]", remainder)
+            if index_match is None or not isinstance(current, list):
+                return False, None
+            index = int(index_match.group(1))
+            if index >= len(current):
+                return False, None
+            current = current[index]
+            remainder = remainder[index_match.end() :]
+    return True, current
+
+
+def _validate_no_change_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    resource_id: str,
+    field_name: str,
+) -> None:
+    snapshot_id = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(snapshot, "id"),
+            field_name=f"{field_name} id",
+        )
+    )
+    canonical_resource_id = _canonical_scope(resource_id)
+    if snapshot_id != canonical_resource_id:
+        raise PreflightInputError(f"{field_name} id does not match resourceId")
+    snapshot_name = _require_string(
+        _get_case_insensitive(snapshot, "name"),
+        field_name=f"{field_name} name",
+    )
+    if (
+        not snapshot_name.isascii()
+        or snapshot_name.lower() != canonical_resource_id.rsplit("/", 1)[-1]
+    ):
+        raise PreflightInputError(f"{field_name} name does not match resourceId")
+    snapshot_type = _require_string(
+        _get_case_insensitive(snapshot, "type"),
+        field_name=f"{field_name} type",
+    )
+    if not snapshot_type.isascii() or snapshot_type.lower() != _resource_type(resource_id):
+        raise PreflightInputError(f"{field_name} type does not match resourceId")
+    _mapping(
+        _get_case_insensitive(snapshot, "properties"),
+        field_name=f"{field_name} properties",
+    )
+
+
+def _validate_no_change(
+    resource_id: str,
+    change: dict[str, Any],
+) -> None:
+    if not _has_case_insensitive(
+        change,
+        "before",
+    ) or not _has_case_insensitive(change, "after"):
+        raise PreflightInputError("NoChange requires complete before and after snapshots")
+    before = _get_case_insensitive(change, "before")
+    after = _get_case_insensitive(change, "after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise PreflightInputError("NoChange before and after snapshots must be objects")
+    _validate_no_change_snapshot(
+        before,
+        resource_id=resource_id,
+        field_name="NoChange before snapshot",
+    )
+    _validate_no_change_snapshot(
+        after,
+        resource_id=resource_id,
+        field_name="NoChange after snapshot",
+    )
+    if not _json_values_equal(before, after):
+        raise PreflightInputError("NoChange before and after snapshots conflict")
+    delta = _delta_entries(change)
+    stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(delta)]
+    seen_paths: set[str] = set()
+    while stack:
+        item, parent_path = stack.pop()
+        own_path = _require_string(
+            _get_case_insensitive(item, "path"),
+            field_name="delta path",
+        )
+        path = ".".join(part for part in (parent_path, own_path) if part)
+        canonical_path = _canonical_property_path(path)
+        if canonical_path in seen_paths:
+            raise PreflightInputError("NoChange contains duplicate delta paths")
+        seen_paths.add(canonical_path)
+        children = _get_case_insensitive(item, "children")
+        raw_change_type = _get_case_insensitive(
+            item,
+            "propertyChangeType",
+        )
+        property_change_type = (
+            "array"
+            if raw_change_type is None and children is not None
+            else _normalized(
+                _require_string(
+                    raw_change_type,
+                    field_name="propertyChangeType",
+                    maximum_length=64,
+                )
+            )
+        )
+        if property_change_type not in {"array", "noeffect"}:
+            raise PreflightInputError("NoChange contains a non-NoEffect property delta")
+        before_supplied = _has_case_insensitive(item, "before")
+        after_supplied = _has_case_insensitive(item, "after")
+        if not before_supplied and not after_supplied and children is None:
+            raise PreflightInputError("NoChange delta omits before and after evidence")
+        if before_supplied != after_supplied or (
+            before_supplied
+            and not _json_values_equal(
+                _get_case_insensitive(item, "before"),
+                _get_case_insensitive(item, "after"),
+            )
+        ):
+            raise PreflightInputError("NoChange delta conflicts with its snapshots")
+        before_exists, snapshot_before = _snapshot_value_at_path(
+            before,
+            canonical_path,
+        )
+        after_exists, snapshot_after = _snapshot_value_at_path(
+            after,
+            canonical_path,
+        )
+        if (
+            not before_exists
+            or not after_exists
+            or not _json_values_equal(
+                snapshot_before,
+                snapshot_after,
+            )
+        ):
+            raise PreflightInputError("NoChange delta path is absent or inconsistent in snapshots")
+        if before_supplied and (
+            not _json_values_equal(
+                _get_case_insensitive(item, "before"),
+                snapshot_before,
+            )
+            or not _json_values_equal(
+                _get_case_insensitive(item, "after"),
+                snapshot_after,
+            )
+        ):
+            raise PreflightInputError("NoChange delta conflicts with root snapshots")
+        if children is not None:
+            child_items = [
+                _mapping(child, field_name="delta child")
+                for child in _sequence(
+                    children,
+                    field_name="delta children",
+                    maximum_items=MAX_CHANGES,
+                )
+            ]
+            if not child_items:
+                raise PreflightInputError("delta item contains no inspectable children")
+            stack.extend((child, path) for child in reversed(child_items))
+    if _walk_delta(delta):
+        raise PreflightInputError("NoChange contains an effective property delta")
+    _canonical_scope(resource_id)
 
 
 def _flatten_after(
@@ -1459,7 +1691,7 @@ def evaluate_what_if(
     parameters_digest: str | None = None,
     now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
-    normalized_allowlist = frozenset(_normalized(value) for value in allowed_change_ids)
+    normalized_allowlist, allow_change_ids_digest = _allow_change_binding(allowed_change_ids)
     if require_attestation:
         if (
             expected_collection_run_id is None
@@ -1487,9 +1719,7 @@ def evaluate_what_if(
             now=_current_utc(now),
         )
         expected_bindings = {
-            "allowChangeIdsDigest": _canonical_json_digest(
-                {"allowChangeIds": sorted(normalized_allowlist)}
-            ),
+            "allowChangeIdsDigest": allow_change_ids_digest,
             "deploymentDigest": _canonical_sha256_digest(
                 deployment_digest,
                 field_name="reviewed deployment digest",
@@ -1527,6 +1757,7 @@ def evaluate_what_if(
             _get_case_insensitive(potential_change, "resourceId"),
             field_name="potential change resourceId",
         )
+        _canonical_scope(resource_id)
         violations.append(
             PreflightViolation(
                 code="unpredictable-change",
@@ -1540,6 +1771,7 @@ def evaluate_what_if(
             _get_case_insensitive(change, "resourceId"),
             field_name="resourceId",
         )
+        canonical_resource_id = _canonical_scope(resource_id)
         change_type = _normalized(
             _require_string(
                 _get_case_insensitive(change, "changeType"),
@@ -1548,6 +1780,7 @@ def evaluate_what_if(
             )
         )
         if change_type == "nochange":
+            _validate_no_change(resource_id, change)
             continue
         if change_type == "ignore":
             violations.append(
@@ -1585,7 +1818,7 @@ def evaluate_what_if(
                 )
             )
             continue
-        if _normalized(resource_id) not in normalized_allowlist:
+        if canonical_resource_id not in normalized_allowlist:
             violations.append(
                 PreflightViolation(
                     code="unapproved-change",
@@ -2142,6 +2375,8 @@ def _validate_guarded_assignment_binding(
 
 
 def _split_url(value: str, *, field_name: str) -> SplitResult:
+    if not value.isascii() or not unquote(value).isascii():
+        raise PreflightInputError(f"{field_name} contains non-ASCII characters")
     try:
         return urlsplit(value)
     except ValueError as exc:
@@ -2329,9 +2564,12 @@ def _derive_management_group_ancestry(
         for key, token in body.items()
     ):
         raise PreflightInputError("Resource Graph hierarchy evidence is paginated or incomplete")
-    if (
-        not _has_case_insensitive(body, "resultTruncated")
-        or _get_case_insensitive(body, "resultTruncated") is not False
+    result_truncated = _get_case_insensitive(
+        body,
+        "resultTruncated",
+    )
+    if not (
+        result_truncated is False or (type(result_truncated) is str and result_truncated == "false")
     ):
         raise PreflightInputError(
             "Resource Graph hierarchy result must be explicitly non-truncated"

@@ -27,10 +27,18 @@ Container Apps network values are type checked independently: ingress `external`
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
 resources were not resolved into the reviewed `changes` collection.
+`NoChange` is accepted only with complete, object-valued, type-exact, structurally identical
+`before` and `after` snapshots and no effective delta. Each snapshot must contain matching `id`,
+`name`, `type`, and
+object-valued `properties`. Every `NoEffect` path and value is resolved against both root snapshots;
+missing, duplicate, contradictory, nested type-changing, or out-of-snapshot entries fail. Nested or
+root deletion/removal, conflicting snapshots, or any non-empty effective property change makes the
+artifact malformed rather than silently safe.
 Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
 one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
-names cannot impersonate structurally nested protected settings. Unicode characters whose case fold
-or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths.
+names cannot impersonate structurally nested protected settings. Leading, trailing, or repeated
+non-root path separators are rejected rather than treated as aliases. Unicode characters whose case
+fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths.
 Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
 missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
 and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
@@ -50,6 +58,12 @@ future fail deterministically. Use the same reviewed `collectionRunId` for the R
 Both artifacts embed the same manifest covering their payload digests, policy digest, timestamps,
 run ID, and reviewed inputs. The CLI requires the independently reviewed SHA-256 digest of that
 manifest; regenerating the manifest after changing evidence does not satisfy the gate.
+
+Security-bound ARM resource and role-definition IDs, scopes, allowlist values, and request URLs must
+be ASCII. Unicode aliases such as Kelvin sign `K` or long-s `ſ` are rejected before normalization,
+including percent-encoded URL forms. The allowlist binding records both raw and canonical ASCII
+identifiers, so reviewed manifest digests preserve spelling distinctions rather than hashing only
+case-folded values.
 
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
@@ -125,8 +139,9 @@ filter on the first page is rejected. Initial ARM role-assignment requests allow
 on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
 Cross-tenant parameters and caller-added selection filters are rejected.
 
-The Resource Graph response must explicitly report `resultTruncated: false`, no non-null
-`skipToken` or `$skipToken`, and `count == totalRecords == len(data) == 1`.
+The Resource Graph response must explicitly report `resultTruncated` as JSON `false` or the exact
+transport string `"false"`, no non-null `skipToken` or `$skipToken`, and
+`count == totalRecords == len(data) == 1`. Other strings, numbers, null, and missing values fail.
 
 The verifier derives the management-group path from ARM parent links, rejects missing, disconnected,
 or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the

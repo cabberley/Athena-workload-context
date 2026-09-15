@@ -124,10 +124,19 @@ def _attested_what_if(
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
-    normalized_allowlist = sorted(value.strip().casefold() for value in allowed_change_ids)
+    allowlist_records = sorted(
+        (
+            {
+                "canonical": value.strip().lower().rstrip("/"),
+                "raw": value.strip(),
+            }
+            for value in allowed_change_ids
+        ),
+        key=lambda item: (item["raw"], item["canonical"]),
+    )
     manifest = _manifest(
         {
-            "allowChangeIdsDigest": _json_digest({"allowChangeIds": normalized_allowlist}),
+            "allowChangeIdsDigest": _json_digest({"allowChangeIds": allowlist_records}),
             "deploymentDigest": _DEPLOYMENT_DIGEST,
             "parametersDigest": _PARAMETERS_DIGEST,
             "policyDigest": _EMPTY_DIGEST,
@@ -262,6 +271,16 @@ def _what_if(*changes: object) -> dict[str, object]:
     }
 
 
+def _resource_type_for_test(resource_id: str) -> str:
+    segments = resource_id.strip("/").split("/")
+    provider_index = max(
+        index for index, segment in enumerate(segments) if segment.casefold() == "providers"
+    )
+    namespace = segments[provider_index + 1]
+    type_segments = segments[provider_index + 2 :: 2]
+    return "/".join((namespace, *type_segments))
+
+
 def _change(
     resource_id: str,
     change_type: str,
@@ -273,6 +292,15 @@ def _change(
         "resourceId": resource_id,
         "changeType": change_type,
     }
+    if change_type.casefold() == "nochange":
+        snapshot = {
+            "id": resource_id,
+            "name": resource_id.rstrip("/").rsplit("/", 1)[-1],
+            "type": _resource_type_for_test(resource_id),
+            "properties": {},
+        }
+        value["before"] = copy.deepcopy(snapshot)
+        value["after"] = snapshot
     if path is not None:
         value["delta"] = [
             {
@@ -802,6 +830,199 @@ def test_what_if_accepts_no_change_and_exact_allowlist() -> None:
     )
 
     assert violations == ()
+
+
+def test_no_change_requires_complete_consistent_zero_delta_evidence() -> None:
+    no_change = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(no_change["before"], dict)
+    assert isinstance(no_change["after"], dict)
+    no_change["before"]["properties"] = {"allowSharedKeyAccess": False}
+    no_change["after"]["properties"] = {"allowSharedKeyAccess": False}
+    no_change["delta"] = [
+        {
+            "path": "properties.allowSharedKeyAccess",
+            "propertyChangeType": "NoEffect",
+            "before": False,
+            "after": False,
+        }
+    ]
+
+    assert evaluate_what_if(_what_if(no_change)) == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda change: change.pop("before"),
+            "requires complete before and after",
+        ),
+        (
+            lambda change: (
+                change["before"]["properties"].update({"allowSharedKeyAccess": False}),
+                change["after"]["properties"].update({"allowSharedKeyAccess": True}),
+            ),
+            "snapshots conflict",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "<resource>",
+                            "propertyChangeType": "Delete",
+                        }
+                    ]
+                }
+            ),
+            "non-NoEffect property delta",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "<resource>.",
+                            "propertyChangeType": "Remove",
+                        }
+                    ]
+                }
+            ),
+            "non-NoEffect property delta",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "properties",
+                            "children": [
+                                {
+                                    "path": "allowSharedKeyAccess",
+                                    "propertyChangeType": "Remove",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            "non-NoEffect property delta",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "properties",
+                            "children": [
+                                {
+                                    "path": "allowSharedKeyAccess",
+                                    "propertyChangeType": "Delete",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            "non-NoEffect property delta",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "properties.publicNetworkAccess",
+                            "propertyChangeType": "NoEffect",
+                            "before": "Disabled",
+                            "after": "Enabled",
+                        }
+                    ]
+                }
+            ),
+            "delta conflicts with its snapshots",
+        ),
+        (
+            lambda change: change.update(
+                {
+                    "delta": [
+                        {
+                            "path": "properties..allowSharedKeyAccess",
+                            "propertyChangeType": "NoEffect",
+                        }
+                    ]
+                }
+            ),
+            "empty component",
+        ),
+    ],
+)
+def test_no_change_rejects_hidden_or_conflicting_effects(
+    mutation,
+    message: str,
+) -> None:
+    change = _change(_STORAGE_ID, "NoChange")
+    mutation(change)
+
+    with pytest.raises(PreflightInputError, match=message):
+        evaluate_what_if(_what_if(change))
+
+
+def test_no_change_reconciles_snapshot_identity_and_delta_values() -> None:
+    incomplete = _change(_STORAGE_ID, "NoChange")
+    incomplete["before"] = {}
+    incomplete["after"] = {}
+    with pytest.raises(PreflightInputError, match="snapshot id"):
+        evaluate_what_if(_what_if(incomplete))
+
+    wrong_id = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(wrong_id["before"], dict)
+    assert isinstance(wrong_id["after"], dict)
+    wrong_id["before"]["id"] = _KEY_VAULT_ID
+    wrong_id["after"]["id"] = _KEY_VAULT_ID
+    with pytest.raises(PreflightInputError, match="does not match resourceId"):
+        evaluate_what_if(_what_if(wrong_id))
+
+    contradictory = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(contradictory["before"], dict)
+    assert isinstance(contradictory["after"], dict)
+    contradictory["before"]["properties"] = {"allowSharedKeyAccess": False}
+    contradictory["after"]["properties"] = {"allowSharedKeyAccess": False}
+    contradictory["delta"] = [
+        {
+            "path": "properties.allowSharedKeyAccess",
+            "propertyChangeType": "NoEffect",
+            "before": True,
+            "after": True,
+        }
+    ]
+    with pytest.raises(
+        PreflightInputError,
+        match="conflicts with root snapshots",
+    ):
+        evaluate_what_if(_what_if(contradictory))
+
+    nested_type_change = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(nested_type_change["before"], dict)
+    assert isinstance(nested_type_change["after"], dict)
+    nested_type_change["before"]["properties"] = {"allowSharedKeyAccess": False}
+    nested_type_change["after"]["properties"] = {"allowSharedKeyAccess": 0}
+    with pytest.raises(PreflightInputError, match="snapshots conflict"):
+        evaluate_what_if(_what_if(nested_type_change))
+
+    object_delta = _change(_STORAGE_ID, "NoChange")
+    object_delta["delta"] = [
+        {
+            "path": "properties",
+            "propertyChangeType": "NoEffect",
+            "before": {"enabled": False},
+            "after": {"enabled": 0},
+        }
+    ]
+    with pytest.raises(
+        PreflightInputError,
+        match="delta conflicts with its snapshots",
+    ):
+        evaluate_what_if(_what_if(object_delta))
 
 
 def test_what_if_requires_successful_complete_result() -> None:
@@ -1738,6 +1959,134 @@ def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:
         evaluate_what_if(
             kelvin_alias,
             allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "property_change_type"),
+    [
+        ("properties.", "Remove"),
+        (".properties.allowSharedKeyAccess", "Modify"),
+        ("properties..allowSharedKeyAccess", "Modify"),
+        ("properties.allowSharedKeyAccess.", "Modify"),
+        ("<resource>..properties.allowSharedKeyAccess", "Modify"),
+    ],
+)
+def test_property_paths_reject_empty_non_root_components(
+    path: str,
+    property_change_type: str,
+) -> None:
+    change = _change(
+        _STORAGE_ID,
+        "Modify",
+        path=path,
+        after=True,
+    )
+    delta = change["delta"]
+    assert isinstance(delta, list)
+    item = delta[0]
+    assert isinstance(item, dict)
+    item["propertyChangeType"] = property_change_type
+
+    with pytest.raises(PreflightInputError, match="empty component"):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_security_identifiers_reject_kelvin_aliases_and_bind_raw_allowlists() -> None:
+    kelvin_scope = _RG_SCOPE.replace("workload", "wor\u212aload")
+    with pytest.raises(PreflightInputError, match="non-ASCII"):
+        evaluate_what_if(
+            _what_if(
+                _change(
+                    kelvin_scope + "/providers/Microsoft.Storage/storageAccounts/synthetic",
+                    "Create",
+                    path="tags.release",
+                    after="wc029",
+                )
+            ),
+        )
+
+    ascii_artifact = _attested_what_if(
+        _what_if(_change(_KEY_VAULT_ID, "NoChange")),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+    kelvin_allowlist_id = _KEY_VAULT_ID.replace(
+        "KeyVault",
+        "\u212aeyVault",
+    )
+    kelvin_artifact = _attested_what_if(
+        _what_if(_change(_KEY_VAULT_ID, "NoChange")),
+        allowed_change_ids=frozenset({kelvin_allowlist_id}),
+    )
+    ascii_manifest = ascii_artifact["manifest"]
+    kelvin_manifest = kelvin_artifact["manifest"]
+    assert isinstance(ascii_manifest, dict)
+    assert isinstance(kelvin_manifest, dict)
+    ascii_bindings = ascii_manifest["bindings"]
+    kelvin_bindings = kelvin_manifest["bindings"]
+    assert isinstance(ascii_bindings, dict)
+    assert isinstance(kelvin_bindings, dict)
+    assert ascii_bindings["allowChangeIdsDigest"] != kelvin_bindings["allowChangeIdsDigest"]
+
+    with pytest.raises(
+        PreflightInputError,
+        match="allowChangeIdsDigest does not match",
+    ):
+        evaluate_what_if(
+            ascii_artifact,
+            allowed_change_ids=frozenset({_KEY_VAULT_ID.upper()}),
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            attestation_manifest_digest=_json_digest(ascii_artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="allow-change resource ID contains non-ASCII",
+    ):
+        evaluate_what_if(
+            ascii_artifact,
+            allowed_change_ids=frozenset({kelvin_allowlist_id}),
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            attestation_manifest_digest=_json_digest(ascii_artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    with pytest.raises(PreflightInputError, match="non-ASCII"):
+        evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="Reader",
+                    scope=kelvin_scope,
+                )
+            ]
+        )
+
+    spoofed_role_id = _TEST_ROLE_IDS["acrpull"].replace(
+        "Microsoft.Authorization",
+        "Micro\u017foft.Authorization",
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="roleDefinitionId contains non-ASCII",
+    ):
+        evaluate_role_assignments(
+            [
+                _assignment(
+                    role_name="AcrPull",
+                    role_id=spoofed_role_id,
+                    scope=_RG_SCOPE,
+                )
+            ]
         )
 
 
@@ -3728,6 +4077,38 @@ def test_public_cli_reports_malformed_evidence_url(tmp_path) -> None:
     assert "is not a valid URL" in stderr.getvalue()
 
 
+def test_guarded_rbac_rejects_percent_encoded_kelvin_url_alias() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    ancestors = role_assignments["ancestors"]
+    assert isinstance(ancestors, dict)
+    pages = ancestors["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["requestUrl"] = str(page["requestUrl"]).replace(
+        "workload",
+        "wor%E2%84%AAload",
+    )
+
+    with pytest.raises(PreflightInputError, match="non-ASCII"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
 def test_guarded_rbac_rejects_inconsistent_hierarchy_sources() -> None:
     principal_id = "11111111-1111-1111-1111-111111111111"
     assignment = _guarded_assignment(
@@ -3772,6 +4153,16 @@ def test_guarded_rbac_rejects_inconsistent_hierarchy_sources() -> None:
         ("$skipToken", "synthetic", "paginated or incomplete"),
         ("resultTruncated", True, "explicitly non-truncated"),
         ("resultTruncated", None, "explicitly non-truncated"),
+        ("resultTruncated", "False", "explicitly non-truncated"),
+        ("resultTruncated", "FALSE", "explicitly non-truncated"),
+        ("resultTruncated", " false", "explicitly non-truncated"),
+        ("resultTruncated", "false ", "explicitly non-truncated"),
+        ("resultTruncated", "true", "explicitly non-truncated"),
+        ("resultTruncated", "0", "explicitly non-truncated"),
+        ("resultTruncated", 0, "explicitly non-truncated"),
+        ("resultTruncated", 0.0, "explicitly non-truncated"),
+        ("resultTruncated", 1, "explicitly non-truncated"),
+        ("resultTruncated", [], "explicitly non-truncated"),
         ("count", 0, "count and totalRecords"),
         ("totalRecords", 2, "count and totalRecords"),
     ],
@@ -3804,6 +4195,60 @@ def test_guarded_rbac_requires_complete_resource_graph_result(
                 expected_assignments=[assignment],
             ),
         )
+
+
+def test_guarded_rbac_requires_resource_graph_truncation_marker() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    hierarchy = evidence["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    resource_graph = hierarchy["resourceGraph"]
+    assert isinstance(resource_graph, dict)
+    body = resource_graph["body"]
+    assert isinstance(body, dict)
+    body.pop("resultTruncated")
+
+    with pytest.raises(PreflightInputError, match="explicitly non-truncated"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_accepts_resource_graph_string_false_transport() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    hierarchy = evidence["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    resource_graph = hierarchy["resourceGraph"]
+    assert isinstance(resource_graph, dict)
+    body = resource_graph["body"]
+    assert isinstance(body, dict)
+    body["resultTruncated"] = "false"
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
 
 
 def test_guarded_rbac_rejects_cyclic_or_missing_arm_hierarchy() -> None:
