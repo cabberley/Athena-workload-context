@@ -466,6 +466,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
     )
     what_if_parser.add_argument(
+        "--trusted-release-ledger-root",
+        required=True,
+        type=Path,
+    )
+    what_if_parser.add_argument(
         "--attestation-manifest-digest",
         required=True,
     )
@@ -502,6 +507,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rbac_parser.add_argument(
         "--release-ledger",
+        required=True,
+        type=Path,
+    )
+    rbac_parser.add_argument(
+        "--trusted-release-ledger-root",
         required=True,
         type=Path,
     )
@@ -1102,6 +1112,7 @@ def main(
                     args.parameters_digest if args.preflight_kind == "what-if" else None
                 ),
                 release_ledger_path=args.release_ledger,
+                trusted_release_ledger_root=(args.trusted_release_ledger_root),
                 output_format=args.format,
                 stdout=output,
                 stderr=errors,

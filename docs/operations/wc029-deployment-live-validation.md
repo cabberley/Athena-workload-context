@@ -149,9 +149,13 @@ Evaluate each saved full-resource what-if artifact with the repository CLI. Repe
 when the only acceptable result is `NoChange`.
 
 Create one collection run ID and one immutable deployment execution ID for both what-if and RBAC
-evidence. Prepare one persistent release-ledger directory in the protected release workspace; it
-must not be a symlink, temporary directory, or artifact-controlled path. Do not delete, clone, or
-replace it after a preflight consumes evidence.
+evidence. Prepare one fixed trusted ledger root and one persistent release-ledger directory beneath
+it in the protected release workspace. No component in either path may be a POSIX symlink or a
+Windows symlink, junction, or other reparse point, including redirected parent directories. Do not
+delete, clone, replace, or redirect either path after a preflight consumes evidence.
+Containment is checked before the candidate ledger is touched. On Windows, the verifier holds a
+non-reparse ledger-directory handle and verifies each record handle before writing, so replacing a
+validated directory with a junction cannot redirect a successful consumption.
 
 The versioned `athena.wc029PreflightManifest.v1` records UTC `collectedAt`/`expiresAt` with a
 validity window no longer than 30 minutes, the deployment execution ID, and a reviewed
@@ -175,12 +179,14 @@ collection rather than operator interpretation.
 ```powershell
 $CollectionRunId = [guid]::NewGuid().ToString()
 $DeploymentExecutionId = [guid]::NewGuid().ToString()
+$TrustedReleaseLedgerRoot = (Resolve-Path .\evidence).Path
 $ReleaseLedgerPath = (Resolve-Path .\evidence\release-ledger).Path
 $PreflightJson = & athena-context wc029-preflight what-if `
   .\evidence\wc013.what-if.json `
   --collection-run-id $CollectionRunId `
   --deployment-execution-id $DeploymentExecutionId `
   --release-ledger $ReleaseLedgerPath `
+  --trusted-release-ledger-root $TrustedReleaseLedgerRoot `
   --attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
   --deployment-digest 'sha256:<reviewed-deployment-digest>' `
   --template-digest 'sha256:<reviewed-template-digest>' `
@@ -241,8 +247,10 @@ remain ASCII. Do not normalize or transliterate Unicode lookalikes; Kelvin sign 
 percent-encoded Unicode aliases fail the gate.
 
 Property paths are individually limited to 4096 characters and share one aggregate generated-path
-work budget. Nested delta hierarchies or wide snapshots that exceed either bound fail before
-candidate materialization.
+work budget. Complete snapshot pairs are indexed once by canonical lowercase path, and every
+`NoEffect` lookup/token is charged to a deterministic aggregate budget. Nested delta hierarchies,
+wide snapshots, or lookup work that exceeds a bound fail before candidate materialization.
+`NoChange` uses one delta traversal and retains explicit root-object and inspectable-array checks.
 
 Do not continue by manually ignoring a failed preflight result. Update IaC or the reviewed
 allowlist and rerun the gate.
@@ -435,6 +443,7 @@ $RbacPreflightJson = & athena-context wc029-preflight rbac `
   --collection-run-id $CollectionRunId `
   --deployment-execution-id $DeploymentExecutionId `
   --release-ledger $ReleaseLedgerPath `
+  --trusted-release-ledger-root $TrustedReleaseLedgerRoot `
   --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>' `
   --format json
 $RbacPreflightExitCode = $LASTEXITCODE

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -27,6 +29,7 @@ MAX_RENDER_BYTES = 1024 * 1024
 MAX_PROPERTY_PATH_LENGTH = 4096
 MAX_PROPERTY_PATH_ITEMS = 50000
 MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
+MAX_PROPERTY_LOOKUP_WORK = 500000
 MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
 MAX_ATTESTATION_CLOCK_SKEW = timedelta(minutes=5)
 
@@ -160,6 +163,7 @@ class DeploymentTarget:
 class _PropertyPathBudget:
     items: int = 0
     characters: int = 0
+    lookup_work: int = 0
 
     def charge(self, path: str) -> None:
         if len(path) > MAX_PROPERTY_PATH_LENGTH:
@@ -170,6 +174,11 @@ class _PropertyPathBudget:
         self.characters += len(path)
         if self.items > MAX_PROPERTY_PATH_ITEMS or self.characters > MAX_PROPERTY_PATH_CHARACTERS:
             raise PreflightInputError("property path generation exceeds its aggregate work budget")
+
+    def charge_lookup(self, work: int) -> None:
+        self.lookup_work += work
+        if self.lookup_work > MAX_PROPERTY_LOOKUP_WORK:
+            raise PreflightInputError("property snapshot lookup exceeds its aggregate work budget")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1479,8 +1488,7 @@ def _walk_delta(
     items: list[dict[str, Any]],
     *,
     budget: _PropertyPathBudget,
-    snapshot_before: dict[str, Any] | None = None,
-    snapshot_after: dict[str, Any] | None = None,
+    snapshot_index: _SnapshotPairIndex | None = None,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(items)]
@@ -1560,8 +1568,8 @@ def _walk_delta(
             _validate_no_effect_entry(
                 item,
                 canonical_path=canonical_path,
-                snapshot_before=snapshot_before,
-                snapshot_after=snapshot_after,
+                snapshot_index=snapshot_index,
+                budget=budget,
             )
         elif after_supplied:
             if before_supplied:
@@ -1594,38 +1602,83 @@ def _walk_delta(
     return values
 
 
-def _snapshot_value_at_path(
+@dataclass(frozen=True, slots=True)
+class _SnapshotPairIndex:
+    before: dict[str, object]
+    after: dict[str, object]
+
+
+def _build_snapshot_index(
     snapshot: dict[str, Any],
-    path: str,
-) -> tuple[bool, object]:
-    tokens = _property_path_tokens(path)
-    if not tokens:
-        return True, snapshot
-    current: object = snapshot
-    for token in tokens:
-        if isinstance(token, str):
-            if not isinstance(current, dict):
-                return False, None
-            matched_key = next(
-                (candidate for candidate in current if candidate.lower() == token),
-                None,
+    *,
+    budget: _PropertyPathBudget,
+) -> dict[str, object]:
+    values: dict[str, object] = {}
+    stack: list[tuple[object, str]] = [(snapshot, _RESOURCE_ROOT_PATH)]
+    while stack:
+        item, path = stack.pop()
+        budget.charge_lookup(1)
+        values[path] = item
+        if isinstance(item, dict):
+            budget.charge_lookup(len(item))
+            lowered = {key.lower(): (key, child) for key, child in item.items()}
+            for key, child in reversed(list(lowered.values())):
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
+                if child_path is not None:
+                    stack.append((child, child_path))
+        elif isinstance(item, list):
+            budget.charge_lookup(len(item))
+            stack.extend(
+                (
+                    child,
+                    _property_index_path(
+                        path,
+                        index,
+                        budget=budget,
+                    ),
+                )
+                for index, child in reversed(list(enumerate(item)))
             )
-            if matched_key is None:
-                return False, None
-            current = current[matched_key]
-        else:
-            if not isinstance(current, list) or token >= len(current):
-                return False, None
-            current = current[token]
-    return True, current
+    return values
+
+
+def _build_snapshot_pair_index(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
+) -> _SnapshotPairIndex:
+    return _SnapshotPairIndex(
+        before=_build_snapshot_index(before, budget=budget),
+        after=_build_snapshot_index(after, budget=budget),
+    )
+
+
+def _snapshot_pair_values(
+    snapshot_index: _SnapshotPairIndex,
+    canonical_path: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, object, bool, object]:
+    budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+    return (
+        canonical_path in snapshot_index.before,
+        snapshot_index.before.get(canonical_path),
+        canonical_path in snapshot_index.after,
+        snapshot_index.after.get(canonical_path),
+    )
 
 
 def _validate_no_effect_entry(
     item: dict[str, Any],
     *,
     canonical_path: str,
-    snapshot_before: dict[str, Any] | None,
-    snapshot_after: dict[str, Any] | None,
+    snapshot_index: _SnapshotPairIndex | None,
+    budget: _PropertyPathBudget,
 ) -> None:
     if not _has_case_insensitive(item, "before") or not _has_case_insensitive(
         item,
@@ -1636,15 +1689,12 @@ def _validate_no_effect_entry(
     after = _get_case_insensitive(item, "after")
     if not _json_values_equal(before, after):
         raise PreflightInputError("NoEffect before and after values conflict")
-    if snapshot_before is None or snapshot_after is None:
+    if snapshot_index is None:
         raise PreflightInputError("NoEffect requires complete resource snapshots")
-    before_exists, root_before = _snapshot_value_at_path(
-        snapshot_before,
+    before_exists, root_before, after_exists, root_after = _snapshot_pair_values(
+        snapshot_index,
         canonical_path,
-    )
-    after_exists, root_after = _snapshot_value_at_path(
-        snapshot_after,
-        canonical_path,
+        budget=budget,
     )
     if (
         not before_exists
@@ -1727,6 +1777,11 @@ def _validate_no_change(
     )
     if not _json_values_equal(before, after):
         raise PreflightInputError("NoChange before and after snapshots conflict")
+    snapshot_index = _build_snapshot_pair_index(
+        before,
+        after,
+        budget=budget,
+    )
     delta = _delta_entries(change)
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(delta)]
     seen_paths: set[str] = set()
@@ -1766,11 +1821,20 @@ def _validate_no_change(
             _validate_no_effect_entry(
                 item,
                 canonical_path=canonical_path,
-                snapshot_before=before,
-                snapshot_after=after,
+                snapshot_index=snapshot_index,
+                budget=budget,
             )
         before_supplied = _has_case_insensitive(item, "before")
         after_supplied = _has_case_insensitive(item, "after")
+        item_after = _get_case_insensitive(item, "after")
+        if (
+            canonical_path == _RESOURCE_ROOT_PATH
+            and property_change_type == "array"
+            and (not after_supplied or not isinstance(item_after, dict))
+        ):
+            raise PreflightInputError("resource-root delta after value must be an object")
+        if property_change_type == "array" and not after_supplied and children is None:
+            raise PreflightInputError("delta item lacks inspectable after value or children")
         if property_change_type == "array" and (
             before_supplied != after_supplied
             or (
@@ -1782,13 +1846,10 @@ def _validate_no_change(
             )
         ):
             raise PreflightInputError("NoChange delta conflicts with its snapshots")
-        before_exists, snapshot_before = _snapshot_value_at_path(
-            before,
+        before_exists, snapshot_before, after_exists, snapshot_after = _snapshot_pair_values(
+            snapshot_index,
             canonical_path,
-        )
-        after_exists, snapshot_after = _snapshot_value_at_path(
-            after,
-            canonical_path,
+            budget=budget,
         )
         if (
             not before_exists
@@ -1826,13 +1887,6 @@ def _validate_no_change(
             if not child_items:
                 raise PreflightInputError("delta item contains no inspectable children")
             stack.extend((child, canonical_path) for child in reversed(child_items))
-    if _walk_delta(
-        delta,
-        budget=budget,
-        snapshot_before=before,
-        snapshot_after=after,
-    ):
-        raise PreflightInputError("NoChange contains an effective property delta")
     _canonical_scope(resource_id)
 
 
@@ -1893,8 +1947,7 @@ def _unsafe_property_violations(
     before_payload = _get_case_insensitive(change, "before")
     after_payload = _get_case_insensitive(change, "after")
     snapshot_delta_candidates: list[tuple[str, object, str]] = []
-    snapshot_before_payload: dict[str, Any] | None = None
-    snapshot_after_payload: dict[str, Any] | None = None
+    snapshot_index: _SnapshotPairIndex | None = None
     complete_snapshots = (
         change_type == "modify" and before_payload_supplied and after_payload_supplied
     )
@@ -1914,8 +1967,11 @@ def _unsafe_property_violations(
             resource_id=resource_id,
             field_name="Modify after snapshot",
         )
-        snapshot_before_payload = before_payload
-        snapshot_after_payload = after_payload
+        snapshot_index = _build_snapshot_pair_index(
+            before_payload,
+            after_payload,
+            budget=budget,
+        )
         snapshot_delta_candidates = _derive_snapshot_delta(
             before_payload,
             after_payload,
@@ -1925,8 +1981,7 @@ def _unsafe_property_violations(
         _walk_delta(
             delta,
             budget=budget,
-            snapshot_before=snapshot_before_payload,
-            snapshot_after=snapshot_after_payload,
+            snapshot_index=snapshot_index,
         )
         if delta
         else []
@@ -4855,34 +4910,388 @@ def _escaped_text(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)[1:-1]
 
 
-def _write_release_ledger_json(path: Path, payload: dict[str, object]) -> None:
-    rendered = (
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
-        + "\n"
+def _is_link_or_reparse_point(path: Path, path_stat: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    is_junction = getattr(os.path, "isjunction", None)
+    return (
+        stat.S_ISLNK(path_stat.st_mode)
+        or bool(file_attributes & reparse_attribute)
+        or (is_junction is not None and is_junction(path))
     )
-    with path.open("x", encoding="utf-8", newline="\n") as stream:
-        stream.write(rendered)
 
 
-def _validate_release_ledger_directory(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
-        raise PreflightInputError("release ledger must be an existing non-symlink directory")
+def _validated_directory_without_links(path: Path, *, field_name: str) -> Path:
+    absolute_path = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute_path.anchor)
+    try:
+        current_stat = os.lstat(current)
+    except OSError as exc:
+        raise PreflightInputError(f"{field_name} anchor is unavailable") from exc
+    if _is_link_or_reparse_point(current, current_stat):
+        raise PreflightInputError(
+            f"{field_name} must not contain a symlink, junction, or reparse point"
+        )
+    if not stat.S_ISDIR(current_stat.st_mode):
+        raise PreflightInputError(f"{field_name} anchor must be a directory")
+    components = absolute_path.parts[1:]
+    for component in components:
+        current /= component
+        try:
+            current_stat = os.lstat(current)
+        except OSError as exc:
+            raise PreflightInputError(f"{field_name} component is unavailable") from exc
+        if _is_link_or_reparse_point(current, current_stat):
+            raise PreflightInputError(
+                f"{field_name} must not contain a symlink, junction, or reparse point"
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise PreflightInputError(f"{field_name} components must be directories")
+    return absolute_path
+
+
+def _validated_release_ledger_paths(
+    ledger_path: Path,
+    trusted_root: Path,
+) -> tuple[Path, Path]:
+    root_candidate = Path(os.path.abspath(os.fspath(trusted_root)))
+    ledger_candidate = Path(os.path.abspath(os.fspath(ledger_path)))
+    root_key = os.path.normcase(os.fspath(root_candidate))
+    ledger_key = os.path.normcase(os.fspath(ledger_candidate))
+    try:
+        common = os.path.commonpath((root_key, ledger_key))
+    except ValueError as exc:
+        raise PreflightInputError(
+            "release ledger is outside the trusted release-ledger root"
+        ) from exc
+    if common != root_key or ledger_key == root_key:
+        raise PreflightInputError("release ledger must be beneath the trusted release-ledger root")
+    root = _validated_directory_without_links(
+        root_candidate,
+        field_name="trusted release-ledger root",
+    )
+    ledger = _validated_directory_without_links(
+        ledger_candidate,
+        field_name="release ledger",
+    )
+    return root, ledger
+
+
+def _secure_directory_handles_supported() -> bool:
+    return (
+        os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def _normalized_windows_handle_path(path: str) -> str:
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _windows_handle_details(handle: int) -> tuple[str, bool]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    information = FileAttributeTagInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        wintypes.HANDLE(handle),
+        9,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx failed")
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        wintypes.HANDLE(handle),
+        buffer,
+        len(buffer),
+        0,
+    )
+    if length == 0 or length >= len(buffer):
+        raise OSError(ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+    return (
+        _normalized_windows_handle_path(buffer.value),
+        bool(information.FileAttributes & stat.FILE_ATTRIBUTE_REPARSE_POINT),
+    )
+
+
+def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        0,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+    handle_value = int(handle)
+    try:
+        final_path, is_reparse = _windows_handle_details(handle_value)
+        if is_reparse:
+            raise PreflightInputError("release ledger directory handle resolves to a reparse point")
+        expected_path = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if final_path != expected_path:
+            raise PreflightInputError("release ledger directory escaped the trusted path")
+        return handle_value, final_path
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+        raise
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+
+
+def _validate_windows_file_descriptor(
+    file_descriptor: int,
+    *,
+    expected_directory: str,
+    name: str,
+) -> None:
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(file_descriptor)
+    final_path, is_reparse = _windows_handle_details(handle)
+    if is_reparse:
+        raise PreflightInputError("release ledger record handle resolves to a reparse point")
+    expected_path = os.path.normcase(os.path.abspath(os.path.join(expected_directory, name)))
+    if final_path != expected_path:
+        raise PreflightInputError("release ledger record escaped the securely opened directory")
+
+
+class _SecureLedgerDirectory:
+    def __init__(self, ledger_path: Path, trusted_root: Path) -> None:
+        self._requested_ledger_path = ledger_path
+        self._requested_trusted_root = trusted_root
+        self._ledger_path: Path | None = None
+        self._trusted_root: Path | None = None
+        self._directory_fd: int | None = None
+        self._windows_directory_handle: int | None = None
+        self._windows_final_path: str | None = None
+
+    def __enter__(self) -> _SecureLedgerDirectory:
+        trusted_root, ledger_path = _validated_release_ledger_paths(
+            self._requested_ledger_path,
+            self._requested_trusted_root,
+        )
+        self._trusted_root = trusted_root
+        self._ledger_path = ledger_path
+        if _secure_directory_handles_supported():
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            current_fd = os.open(trusted_root.anchor, flags)
+            try:
+                relative_components = [
+                    *trusted_root.parts[1:],
+                    *Path(os.path.relpath(ledger_path, trusted_root)).parts,
+                ]
+                for component in relative_components:
+                    next_fd = os.open(
+                        component,
+                        flags,
+                        dir_fd=current_fd,
+                    )
+                    os.close(current_fd)
+                    current_fd = next_fd
+            except BaseException:
+                os.close(current_fd)
+                raise
+            self._directory_fd = current_fd
+        elif os.name == "nt":
+            (
+                self._windows_directory_handle,
+                self._windows_final_path,
+            ) = _open_windows_directory_handle(ledger_path)
+        else:
+            raise PreflightInputError("secure release-ledger directory operations are unsupported")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        if self._directory_fd is not None:
+            os.close(self._directory_fd)
+            self._directory_fd = None
+        if self._windows_directory_handle is not None:
+            _close_windows_handle(self._windows_directory_handle)
+            self._windows_directory_handle = None
+            self._windows_final_path = None
+
+    def _fallback_file_path(self, name: str, *, require_existing: bool) -> Path:
+        trusted_root, ledger_path = _validated_release_ledger_paths(
+            self._requested_ledger_path,
+            self._requested_trusted_root,
+        )
+        self._trusted_root = trusted_root
+        self._ledger_path = ledger_path
+        file_path = ledger_path / name
+        if require_existing:
+            try:
+                file_stat = os.lstat(file_path)
+            except OSError as exc:
+                raise PreflightInputError("release ledger record is unavailable") from exc
+            if _is_link_or_reparse_point(file_path, file_stat):
+                raise PreflightInputError(
+                    "release ledger record must not be a symlink or reparse point"
+                )
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise PreflightInputError("release ledger record must be a regular file")
+        return file_path
+
+    def _verify_file_descriptor(self, file_descriptor: int, name: str) -> None:
+        if os.name != "nt":
+            return
+        if self._windows_final_path is None:
+            raise PreflightInputError("release ledger Windows directory handle is unavailable")
+        _validate_windows_file_descriptor(
+            file_descriptor,
+            expected_directory=self._windows_final_path,
+            name=name,
+        )
+
+    def create_json(self, name: str, payload: dict[str, object]) -> None:
+        if Path(name).name != name:
+            raise PreflightInputError("release ledger record name is invalid")
+        rendered = (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if self._directory_fd is None:
+            file_descriptor = os.open(
+                self._fallback_file_path(name, require_existing=False),
+                flags,
+                0o600,
+            )
+        else:
+            file_descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=self._directory_fd,
+            )
+        try:
+            self._verify_file_descriptor(file_descriptor, name)
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as stream:
+            stream.write(rendered)
+
+    def read_json(self, name: str, *, maximum_bytes: int) -> object:
+        if Path(name).name != name:
+            raise PreflightInputError("release ledger record name is invalid")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        file_descriptor: int | None = None
+        try:
+            try:
+                if self._directory_fd is None:
+                    file_descriptor = os.open(
+                        self._fallback_file_path(name, require_existing=True),
+                        flags,
+                    )
+                else:
+                    file_descriptor = os.open(
+                        name,
+                        flags,
+                        dir_fd=self._directory_fd,
+                    )
+            except PreflightInputError:
+                raise
+            except OSError as exc:
+                raise PreflightInputError("release ledger record is unavailable") from exc
+            self._verify_file_descriptor(file_descriptor, name)
+            with os.fdopen(file_descriptor, "r", encoding="utf-8") as stream:
+                file_descriptor = None
+                content = stream.read(maximum_bytes + 1)
+            if not 1 <= len(content.encode("utf-8")) <= maximum_bytes:
+                raise PreflightInputError("release ledger record exceeds its byte bound")
+            document = json.loads(
+                content,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_json_decimal,
+                parse_int=_parse_json_integer,
+                object_pairs_hook=_reject_ambiguous_object_pairs,
+            )
+            _validate_json_shape(document)
+            return document
+        except PreflightInputError:
+            raise
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+        ) as exc:
+            raise PreflightInputError("release ledger record is not valid JSON") from exc
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+
+
+def _validate_release_ledger_directory(
+    ledger_path: Path,
+    trusted_root: Path,
+) -> None:
+    _validated_release_ledger_paths(ledger_path, trusted_root)
 
 
 def _consume_release_ledger(
     *,
     ledger_path: Path,
+    trusted_root: Path,
     manifest: AttestationManifest,
     kind: PreflightKind,
     rendered: str,
     safe: bool,
 ) -> None:
-    _validate_release_ledger_directory(ledger_path)
     collection_binding: dict[str, object] = {
         "schemaVersion": "athena.wc029CollectionBinding.v1",
         "collectionRunId": manifest.collection_run_id,
@@ -4890,29 +5299,6 @@ def _consume_release_ledger(
         "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
         "manifestDigest": manifest.digest,
     }
-    collection_binding_path = ledger_path / (f"{manifest.collection_run_id}.collection.json")
-    try:
-        _write_release_ledger_json(collection_binding_path, collection_binding)
-    except FileExistsError:
-        if collection_binding_path.is_symlink():
-            raise PreflightInputError(
-                "release ledger collection binding must not be a symlink"
-            ) from None
-        existing_collection_binding = load_json_file(
-            collection_binding_path,
-            maximum_bytes=64 * 1024,
-        )
-        if not _json_values_equal(
-            existing_collection_binding,
-            collection_binding,
-        ):
-            raise PreflightInputError(
-                "release ledger collectionRunId is already bound to another "
-                "deployment execution or manifest"
-            ) from None
-    except OSError as exc:
-        raise PreflightInputError("release ledger collection binding could not be created") from exc
-
     binding: dict[str, object] = {
         "schemaVersion": "athena.wc029ReleaseBinding.v1",
         "collectionRunId": manifest.collection_run_id,
@@ -4920,23 +5306,6 @@ def _consume_release_ledger(
         "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
         "manifestDigest": manifest.digest,
     }
-    binding_path = ledger_path / (f"{manifest.deployment_execution_id}.binding.json")
-    try:
-        _write_release_ledger_json(binding_path, binding)
-    except FileExistsError:
-        if binding_path.is_symlink():
-            raise PreflightInputError("release ledger binding must not be a symlink") from None
-        existing_binding = load_json_file(
-            binding_path,
-            maximum_bytes=64 * 1024,
-        )
-        if not _json_values_equal(existing_binding, binding):
-            raise PreflightInputError(
-                "release ledger deployment binding does not match this manifest"
-            ) from None
-    except OSError as exc:
-        raise PreflightInputError("release ledger binding could not be created") from exc
-
     consumption: dict[str, object] = {
         **binding,
         "schemaVersion": "athena.wc029ReleaseConsumption.v1",
@@ -4944,15 +5313,49 @@ def _consume_release_ledger(
         "resultDigest": "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
         "safe": safe,
     }
-    consumption_path = ledger_path / (f"{manifest.deployment_execution_id}.{kind}.consumed.json")
     try:
-        _write_release_ledger_json(consumption_path, consumption)
-    except FileExistsError as exc:
-        raise PreflightInputError(
-            f"release ledger already consumed {kind} for this deployment execution"
-        ) from exc
+        with _SecureLedgerDirectory(ledger_path, trusted_root) as secure_ledger:
+            for name, payload, mismatch_message, create_message in (
+                (
+                    f"{manifest.collection_run_id}.collection.json",
+                    collection_binding,
+                    "release ledger collectionRunId is already bound to another "
+                    "deployment execution or manifest",
+                    "release ledger collection binding could not be created",
+                ),
+                (
+                    f"{manifest.deployment_execution_id}.binding.json",
+                    binding,
+                    "release ledger deployment binding does not match this manifest",
+                    "release ledger binding could not be created",
+                ),
+            ):
+                try:
+                    secure_ledger.create_json(name, payload)
+                except FileExistsError:
+                    existing = secure_ledger.read_json(
+                        name,
+                        maximum_bytes=64 * 1024,
+                    )
+                    if not _json_values_equal(existing, payload):
+                        raise PreflightInputError(mismatch_message) from None
+                except OSError as exc:
+                    raise PreflightInputError(create_message) from exc
+            try:
+                secure_ledger.create_json(
+                    f"{manifest.deployment_execution_id}.{kind}.consumed.json",
+                    consumption,
+                )
+            except FileExistsError as exc:
+                raise PreflightInputError(
+                    f"release ledger already consumed {kind} for this deployment execution"
+                ) from exc
+            except OSError as exc:
+                raise PreflightInputError(
+                    "release ledger consumption could not be recorded"
+                ) from exc
     except OSError as exc:
-        raise PreflightInputError("release ledger consumption could not be recorded") from exc
+        raise PreflightInputError("release ledger directory could not be opened securely") from exc
 
 
 def run_preflight_check(
@@ -4973,6 +5376,7 @@ def run_preflight_check(
     template_digest: str | None = None,
     parameters_digest: str | None = None,
     release_ledger_path: Path | None = None,
+    trusted_release_ledger_root: Path | None = None,
     now: datetime | None = None,
 ) -> int:
     """Run one offline preflight check without adding policy or Azure I/O."""
@@ -4986,11 +5390,15 @@ def run_preflight_check(
                 or expected_deployment_execution_id is None
                 or attestation_manifest_digest is None
                 or release_ledger_path is None
+                or trusted_release_ledger_root is None
             ):
                 raise PreflightInputError(
                     "reviewed deployment execution, manifest, and release ledger are required"
                 )
-            _validate_release_ledger_directory(release_ledger_path)
+            _validate_release_ledger_directory(
+                release_ledger_path,
+                trusted_release_ledger_root,
+            )
         if kind == "what-if":
             violations = evaluate_what_if(
                 document,
@@ -5041,6 +5449,7 @@ def run_preflight_check(
             assert expected_deployment_execution_id is not None
             assert attestation_manifest_digest is not None
             assert release_ledger_path is not None
+            assert trusted_release_ledger_root is not None
             artifact_root = _mapping(
                 document,
                 field_name=f"attested {kind} artifact",
@@ -5054,6 +5463,7 @@ def run_preflight_check(
             )
             _consume_release_ledger(
                 ledger_path=release_ledger_path,
+                trusted_root=trusted_release_ledger_root,
                 manifest=reviewed_manifest,
                 kind=kind,
                 rendered=rendered,

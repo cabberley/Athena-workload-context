@@ -72,6 +72,17 @@ Use the following guarded preflight contract:
    uses exact ASCII option names and case-sensitive fixed values.
 10. Canonical paths have a 4096-character limit and one evaluation-wide generated-path item and
     character budget, checked before concatenation or candidate materialization.
+11. The release ledger must be beneath a separately supplied fixed trusted root. Every existing path
+    component is rejected if it is a POSIX symlink or Windows symlink, junction, or other reparse
+    point. Where supported, directory components are opened with no-follow semantics and ledger
+    files are created/read relative to the securely opened directory handle. Windows keeps a
+    non-reparse ledger-directory handle and verifies the final path and attributes of every opened
+    record handle before any content is written or read. Trusted-root containment is checked before
+    accessing the candidate ledger path.
+12. Complete snapshot pairs are indexed once by canonical lowercase path. `NoEffect`
+    reconciliation uses constant-time indexed lookups, removes the second delta walk, and charges
+    deterministic index/path-token work to an aggregate lookup budget. The single `NoChange` pass
+    retains inspectable-array and resource-root after-object requirements.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -81,7 +92,8 @@ blocked output is returned.
 
 - Existing guarded artifacts must add `schemaVersion`, `deploymentExecutionId`, and
   `deploymentTarget`, and their attestations must carry the same deployment execution ID.
-- Guarded CLI invocations must add `--deployment-execution-id` and `--release-ledger`.
+- Guarded CLI invocations must add `--deployment-execution-id`, `--release-ledger`, and
+  `--trusted-release-ledger-root`.
 - What-if and RBAC checks must use the same exact manifest and ledger. Separate manifests sharing
   only a collection run ID are invalid for one deployment execution.
 - A policy-blocked but otherwise valid artifact is consumed. Any corrected deployment requires new
@@ -90,6 +102,10 @@ blocked output is returned.
   regenerates an otherwise valid manifest.
 - The release ledger is trusted workflow state. Operators must keep it persistent and protected and
   must not delete, clone, replace, or redirect it to reuse evidence.
+- Windows reparse points and junctions are treated as redirections, not directories. POSIX and
+  Windows path validation covers the trusted root, ledger, and every parent component.
+- Corrupted or non-UTF-8 existing ledger records produce a bounded preflight failure rather than an
+  uncaught decoder error.
 - Guarded what-if artifacts must add exact request provenance and regenerate the reviewed shared
   manifest because `whatIfRequestDigest` is mandatory.
 - The legacy module entry point remains available for compatibility but is not the guarded
@@ -123,4 +139,7 @@ and rendered-output bounds remain in the full test suite. Additional adversarial
 transforms/exclusions, diagnostics, expanded authorization and imperative families, decoded query
 key collisions, fuzzy/non-ASCII CLI tokens, wide decimals, integer-versus-decimal digest identity,
 surrounding-whitespace aliases, JSON and `.bicepparam` request modes, required
-`--no-pretty-print`, and nested/aggregate path amplification.
+`--no-pretty-print`, Windows junction/reparse paths, POSIX symlink/no-follow behavior, and a
+14,000-leaf deterministic linear-work snapshot regression. Windows tests include a synchronized
+junction swap between validation and file open; ledger tests also cover outside nonexistent paths
+and invalid UTF-8 collection/binding records.

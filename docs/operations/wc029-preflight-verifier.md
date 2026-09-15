@@ -69,7 +69,11 @@ non-numeric or malformed brackets, and leading-zero indexes are rejected. Unicod
 case fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property
 paths. Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
 generated-path count and character work. Nested path accumulation and wide generated snapshots fail
-deterministically before an unbounded candidate set is materialized.
+deterministically before an unbounded candidate set is materialized. Complete snapshot pairs build
+one canonical lowercase-key index per snapshot; all `NoEffect` paths use constant-time indexed
+lookups, and index/token work is charged to the same deterministic evaluation budget. The
+`NoChange` path is walked once; its previous second delta traversal is removed while retaining root
+object and inspectable-array validation.
 Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
 missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
 and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
@@ -96,8 +100,19 @@ minutes in the future fails deterministically. Time validity alone is not replay
 artifacts must embed the same byte-equivalent manifest and use the same independently reviewed
 manifest digest, `collectionRunId`, and `deploymentExecutionId`.
 
-The guarded CLI also requires one trusted, persistent `--release-ledger` directory controlled by the
-release workflow. It creates one immutable deployment binding and one create-only consumption record
+The guarded CLI also requires a fixed, persistent `--trusted-release-ledger-root` controlled by the
+release workflow and a `--release-ledger` directory beneath it. Every existing component from the
+filesystem root through both paths must be a real directory: POSIX symlinks and Windows symlinks,
+junctions, and all other reparse points are rejected, including redirected parents. On platforms
+with directory-relative and no-follow support, the verifier securely opens each directory component
+and performs create-only/read operations relative to the ledger handle. Windows retains a
+non-reparse ledger-directory handle and validates every newly opened record handle against that
+directory before writing or reading, so a junction swap after path validation fails closed. Lexical
+trusted-root containment is checked before any candidate-ledger filesystem access. Existing records
+must be regular, valid UTF-8 JSON; decoding or schema failure is reported deterministically with
+exit `3`.
+
+The ledger creates one immutable deployment binding and one create-only consumption record
 for each artifact kind. It also creates an immutable collection-run binding so one
 `collectionRunId` cannot be wrapped in a new manifest or rebound to a second deployment execution.
 The first valid what-if and first valid RBAC evaluation may consume the shared manifest; any repeated
@@ -116,6 +131,7 @@ athena-context wc029-preflight what-if .\evidence\what-if.json `
   --collection-run-id '<collection-run-guid>' `
   --deployment-execution-id '<deployment-execution-guid>' `
   --release-ledger .\evidence\release-ledger `
+  --trusted-release-ledger-root .\evidence `
   --attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
   --deployment-digest 'sha256:<deployment-digest>' `
   --template-digest 'sha256:<template-digest>' `
@@ -149,6 +165,7 @@ athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --collection-run-id '<same-collection-run-guid>' `
   --deployment-execution-id '<same-deployment-execution-guid>' `
   --release-ledger .\evidence\release-ledger `
+  --trusted-release-ledger-root .\evidence `
   --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>'
 ```
 
@@ -341,6 +358,6 @@ JSON or text output is bounded to 1 MiB.
 The verifier is an offline review gate, not proof of Azure deployment success. It performs no Azure
 network call, but the guarded wrapper writes create-only local release-ledger records. Preserve the
 raw Resource Graph, ARM, and Graph responses or the explicitly attested CLI-equivalent collection,
-exact repeated `--allow-change` values, reviewed policy, shared manifest, ledger directory, and
-machine-readable verifier output beside the release evidence. Run both the what-if and RBAC checks;
-a successful result from one does not waive the other.
+exact repeated `--allow-change` values, reviewed policy, shared manifest, trusted ledger root,
+ledger directory, and machine-readable verifier output beside the release evidence. Run both the
+what-if and RBAC checks; a successful result from one does not waive the other.

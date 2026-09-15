@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -15,7 +17,11 @@ from athena_context.cli import main as cli_main
 from athena_context.wc029_preflight import (
     PreflightInputError,
     PreflightViolation,
+    _build_snapshot_pair_index,
     _canonical_json_digest,
+    _PropertyPathBudget,
+    _SecureLedgerDirectory,
+    _walk_delta,
     evaluate_role_assignments,
     evaluate_what_if,
     load_json_file,
@@ -353,8 +359,9 @@ def _what_if_cli_args(
     *extra: str,
     deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
 ) -> list[str]:
-    release_ledger = Path(str(input_path)).parent / "release-ledger"
-    release_ledger.mkdir(exist_ok=True)
+    trusted_root = Path(str(input_path)).parent / "trusted-release-ledger-root"
+    release_ledger = trusted_root / "release-ledger"
+    release_ledger.mkdir(parents=True, exist_ok=True)
     return [
         "wc029-preflight",
         "what-if",
@@ -365,6 +372,8 @@ def _what_if_cli_args(
         deployment_execution_id,
         "--release-ledger",
         str(release_ledger),
+        "--trusted-release-ledger-root",
+        str(trusted_root),
         "--attestation-manifest-digest",
         _artifact_manifest_digest(input_path),
         "--deployment-digest",
@@ -383,8 +392,9 @@ def _rbac_cli_args(
     *extra: str,
     deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
 ) -> list[str]:
-    release_ledger = Path(str(input_path)).parent / "release-ledger"
-    release_ledger.mkdir(exist_ok=True)
+    trusted_root = Path(str(input_path)).parent / "trusted-release-ledger-root"
+    release_ledger = trusted_root / "release-ledger"
+    release_ledger.mkdir(parents=True, exist_ok=True)
     return [
         "wc029-preflight",
         "rbac",
@@ -397,10 +407,33 @@ def _rbac_cli_args(
         deployment_execution_id,
         "--release-ledger",
         str(release_ledger),
+        "--trusted-release-ledger-root",
+        str(trusted_root),
         "--attestation-manifest-digest",
         _artifact_manifest_digest(input_path),
         *extra,
     ]
+
+
+def _replace_cli_option(arguments: list[str], option: str, value: Path) -> None:
+    arguments[arguments.index(option) + 1] = str(value)
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(link),
+            str(target),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _evaluate_guarded_rbac(
@@ -1197,6 +1230,39 @@ def test_no_change_reconciles_snapshot_identity_and_delta_values() -> None:
         match="NoEffect before and after values conflict",
     ):
         evaluate_what_if(_what_if(object_delta))
+
+
+def test_no_change_single_pass_retains_array_and_root_validation() -> None:
+    uninspectable = _change(_STORAGE_ID, "NoChange")
+    uninspectable["delta"] = [
+        {
+            "path": "properties",
+            "propertyChangeType": "Array",
+        }
+    ]
+    with pytest.raises(PreflightInputError, match="lacks inspectable after"):
+        evaluate_what_if(_what_if(uninspectable))
+
+    missing_root_after = _change(_STORAGE_ID, "NoChange")
+    missing_root_after["delta"] = [
+        {
+            "path": "<resource>",
+            "propertyChangeType": "Array",
+            "children": [
+                {
+                    "path": "properties",
+                    "before": {},
+                    "after": {},
+                    "propertyChangeType": "NoEffect",
+                }
+            ],
+        }
+    ]
+    with pytest.raises(
+        PreflightInputError,
+        match="resource-root delta after value must be an object",
+    ):
+        evaluate_what_if(_what_if(missing_root_after))
 
 
 def test_what_if_requires_successful_complete_result() -> None:
@@ -2522,6 +2588,42 @@ def test_delta_path_generation_has_an_aggregate_work_budget() -> None:
         )
 
 
+def test_noeffect_wide_snapshot_lookup_work_is_linear_and_bounded() -> None:
+    leaf_count = 14000
+    properties = {f"leaf{index:05d}": f"value-{index:05d}" for index in range(leaf_count)}
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties=properties,
+    )
+    after = copy.deepcopy(before)
+    delta = [
+        {
+            "path": f"properties.leaf{index:05d}",
+            "propertyChangeType": "NoEffect",
+            "before": f"value-{index:05d}",
+            "after": f"value-{index:05d}",
+        }
+        for index in range(leaf_count)
+    ]
+    budget = _PropertyPathBudget()
+
+    snapshot_index = _build_snapshot_pair_index(
+        before,
+        after,
+        budget=budget,
+    )
+    assert (
+        _walk_delta(
+            delta,
+            budget=budget,
+            snapshot_index=snapshot_index,
+        )
+        == []
+    )
+    assert budget.lookup_work == 112018
+    assert budget.items == 42008
+
+
 def test_security_identifiers_reject_kelvin_aliases_and_bind_raw_allowlists() -> None:
     kelvin_scope = _RG_SCOPE.replace("workload", "wor\u212aload")
     with pytest.raises(PreflightInputError, match="non-ASCII"):
@@ -3680,13 +3782,235 @@ def test_public_cli_consumes_shared_manifest_once_per_artifact_kind(
     )
     assert "already consumed rbac" in rbac_error.getvalue()
 
-    ledger_files = sorted(path.name for path in (tmp_path / "release-ledger").iterdir())
+    ledger_files = sorted(
+        path.name
+        for path in (tmp_path / "trusted-release-ledger-root" / "release-ledger").iterdir()
+    )
     assert ledger_files == [
         f"{_COLLECTION_RUN_ID}.collection.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.binding.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.rbac.consumed.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json",
     ]
+
+
+def test_public_cli_requires_ledger_beneath_trusted_root(tmp_path) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    outside_ledger = tmp_path / "outside-ledger"
+    outside_ledger.mkdir()
+    for candidate in (
+        outside_ledger,
+        tmp_path / "missing-outside-parent" / "ledger",
+    ):
+        arguments = _what_if_cli_args(input_path)
+        _replace_cli_option(arguments, "--release-ledger", candidate)
+        stderr = StringIO()
+
+        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+        assert "beneath the trusted release-ledger root" in stderr.getvalue()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize(
+    "redirect_mode",
+    ["ledger", "ledger-parent", "trusted-root-parent"],
+)
+def test_windows_release_ledger_rejects_junctions_and_redirected_parents(
+    tmp_path,
+    redirect_mode: str,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if redirect_mode == "trusted-root-parent":
+        (outside / "trusted-root" / "ledger").mkdir(parents=True)
+        junction = tmp_path / "redirected-root-parent"
+        trusted_root = junction / "trusted-root"
+        ledger_path = trusted_root / "ledger"
+    else:
+        trusted_root = tmp_path / "trusted-root"
+        trusted_root.mkdir()
+        junction = trusted_root / (
+            "redirected-parent" if redirect_mode == "ledger-parent" else "ledger"
+        )
+    if redirect_mode == "ledger-parent":
+        (outside / "ledger").mkdir()
+        ledger_path = junction / "ledger"
+    elif redirect_mode == "ledger":
+        ledger_path = junction
+    _create_windows_junction(junction, outside)
+    try:
+        arguments = _what_if_cli_args(input_path)
+        _replace_cli_option(
+            arguments,
+            "--trusted-release-ledger-root",
+            trusted_root,
+        )
+        _replace_cli_option(arguments, "--release-ledger", ledger_path)
+        stderr = StringIO()
+
+        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+        assert "symlink, junction, or reparse point" in stderr.getvalue()
+    finally:
+        os.rmdir(junction)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction-swap regression")
+def test_windows_release_ledger_detects_junction_swap_after_validation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    outside = tmp_path / "outside-race-target"
+    outside.mkdir()
+    original = _SecureLedgerDirectory._fallback_file_path
+    swapped = False
+
+    def swap_after_validation(
+        ledger: _SecureLedgerDirectory,
+        name: str,
+        *,
+        require_existing: bool,
+    ) -> Path:
+        nonlocal swapped
+        file_path = original(
+            ledger,
+            name,
+            require_existing=require_existing,
+        )
+        if not require_existing and not swapped:
+            os.rmdir(ledger_path)
+            _create_windows_junction(ledger_path, outside)
+            swapped = True
+        return file_path
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_fallback_file_path",
+        swap_after_validation,
+    )
+    stderr = StringIO()
+    try:
+        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+        assert "escaped the securely opened directory" in stderr.getvalue()
+    finally:
+        if ledger_path.exists():
+            os.rmdir(ledger_path)
+        for outside_file in outside.iterdir():
+            outside_file.unlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink regression")
+@pytest.mark.parametrize(
+    "redirect_mode",
+    ["ledger", "ledger-parent", "trusted-root-parent"],
+)
+def test_posix_release_ledger_rejects_symlinks_and_redirected_parents(
+    tmp_path,
+    redirect_mode: str,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if redirect_mode == "trusted-root-parent":
+        (outside / "trusted-root" / "ledger").mkdir(parents=True)
+        link = tmp_path / "redirected-root-parent"
+        trusted_root = link / "trusted-root"
+        ledger_path = trusted_root / "ledger"
+    else:
+        trusted_root = tmp_path / "trusted-root"
+        trusted_root.mkdir()
+        link = trusted_root / (
+            "redirected-parent" if redirect_mode == "ledger-parent" else "ledger"
+        )
+    if redirect_mode == "ledger-parent":
+        (outside / "ledger").mkdir()
+        ledger_path = link / "ledger"
+    elif redirect_mode == "ledger":
+        ledger_path = link
+    link.symlink_to(outside, target_is_directory=True)
+    try:
+        arguments = _what_if_cli_args(input_path)
+        _replace_cli_option(
+            arguments,
+            "--trusted-release-ledger-root",
+            trusted_root,
+        )
+        _replace_cli_option(arguments, "--release-ledger", ledger_path)
+        stderr = StringIO()
+
+        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+        assert "symlink, junction, or reparse point" in stderr.getvalue()
+    finally:
+        link.unlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow regression")
+def test_posix_release_ledger_does_not_follow_existing_record_symlink(
+    tmp_path,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    outside = tmp_path / "outside.json"
+    outside.write_text("unchanged", encoding="utf-8")
+    record_link = ledger_path / f"{_COLLECTION_RUN_ID}.collection.json"
+    record_link.symlink_to(outside)
+    stderr = StringIO()
+
+    assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+    assert "release ledger record is unavailable" in stderr.getvalue()
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize("record_kind", ["collection", "binding"])
+def test_public_cli_reports_invalid_utf8_existing_ledger_records(
+    tmp_path,
+    record_kind: str,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    collection_path = ledger_path / f"{_COLLECTION_RUN_ID}.collection.json"
+    binding_path = ledger_path / f"{_DEPLOYMENT_EXECUTION_ID}.binding.json"
+    consumption_path = ledger_path / f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json"
+    if record_kind == "collection":
+        collection_path.write_bytes(b"\xff")
+    else:
+        assert cli_main(arguments, stdout=StringIO(), stderr=StringIO()) == 0
+        binding_path.unlink()
+        consumption_path.unlink()
+        binding_path.write_bytes(b"\xff")
+    stderr = StringIO()
+
+    assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+    assert "release ledger record is not valid JSON" in stderr.getvalue()
 
 
 def test_public_cli_rejects_cross_artifact_manifest_rebinding(tmp_path) -> None:
