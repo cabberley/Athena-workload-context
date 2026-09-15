@@ -39,6 +39,7 @@ from athena_context.contracts import (
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringIdentityProof,
+    MonitoringObservation,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
@@ -53,6 +54,13 @@ from athena_context.contracts import (
     validate_published_monitoring_intent_assets,
 )
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
+from athena_context.contracts.monitoring import (
+    MonitoringEffectiveRbacInventory,
+    MonitoringIncidentHealthSampleBinding,
+)
+from athena_context.contracts.monitoring import (
+    MonitoringIncidentSelection as SignedMonitoringIncidentSelection,
+)
 from athena_context.monitoring_collection import (
     AmaHeartbeatRecord,
     CommittedMonitoringCollection,
@@ -69,6 +77,12 @@ from athena_context.monitoring_collection import (
     ResourceHealthRecord,
     VmConnectionHealthRecord,
     compute_monitoring_query_execution_digest,
+)
+from athena_context.monitoring_incident import (
+    MonitoringIncidentSample,
+    MonitoringIncidentSelectionError,
+    monitoring_health_source_record_reference,
+    select_monitoring_incident,
 )
 
 MAX_ACQUISITION_ROWS = 500
@@ -236,6 +250,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         "athena.wc028MonitoringAcquisitionAuthority.v2",
         "athena.wc028MonitoringAcquisitionAuthority.v3",
         "athena.wc028MonitoringAcquisitionAuthority.v4",
+        "athena.wc028MonitoringAcquisitionAuthority.v5",
     ] = Field(alias="schemaVersion")
     authority_id: str = Field(
         alias="authorityId",
@@ -336,9 +351,18 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     monitoring_reader_has_read_only_workload_access: Literal[True] | None = Field(
         default=None, alias="monitoringReaderHasReadOnlyWorkloadAccess"
     )
-    read_only: Literal[True] = Field(alias="readOnly")
-    athena_context_has_workload_reader: Literal[False] = Field(
-        alias="athenaContextHasWorkloadReader"
+    read_only: Literal[True] | None = Field(default=None, alias="readOnly")
+    athena_context_has_workload_reader: Literal[False] | None = Field(
+        default=None,
+        alias="athenaContextHasWorkloadReader",
+    )
+    effective_rbac_inventory_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacInventoryDigest",
+    )
+    effective_rbac_source_manifest_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacSourceManifestDigest",
     )
     deployment_identity_contract_digest: Sha256Digest | None = Field(
         default=None, alias="deploymentIdentityContractDigest"
@@ -416,14 +440,18 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             raise ValueError(
                 "monitoring acquisition identity must be separate from the Athena context identity"
             )
-        receipt_fields = (
+        common_receipt_fields = (
             self.max_acquisition_calls,
             self.receipt_signing_key_id,
-            self.monitoring_reader_has_read_only_workload_access,
             self.deployment_identity_contract_digest,
             self.monitoring_reader_principal_id,
             self.athena_context_principal_id,
             self.required_control_ids,
+        )
+        legacy_assertion_fields = (
+            self.monitoring_reader_has_read_only_workload_access,
+            self.read_only,
+            self.athena_context_has_workload_reader,
         )
         credential_and_scope_fields = (
             self.monitoring_reader_client_id,
@@ -439,42 +467,70 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             self.identity_proof_required_role,
             self.identity_proof_maximum_lifetime_seconds,
         )
+        effective_rbac_fields = (
+            self.effective_rbac_inventory_digest,
+            self.effective_rbac_source_manifest_digest,
+        )
         if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1":
             if any(
                 item is not None
                 for item in (
-                    *receipt_fields,
+                    *common_receipt_fields,
                     *credential_and_scope_fields,
                     *identity_proof_fields,
+                    *effective_rbac_fields,
                 )
-            ):
+            ) or legacy_assertion_fields != (None, True, False):
                 raise ValueError("v1 acquisition authority cannot contain receipt policy")
         elif self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2":
-            if any(item is None for item in receipt_fields) or any(
-                item is not None for item in (*credential_and_scope_fields, *identity_proof_fields)
+            if any(
+                item is None for item in (*common_receipt_fields, *legacy_assertion_fields)
+            ) or any(
+                item is not None
+                for item in (
+                    *credential_and_scope_fields,
+                    *identity_proof_fields,
+                    *effective_rbac_fields,
+                )
             ):
                 raise ValueError("v2 acquisition authority requires only legacy receipt policy")
         elif self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3":
-            if any(item is None for item in (*receipt_fields, *credential_and_scope_fields)) or any(
-                item is not None for item in identity_proof_fields
-            ):
+            if any(
+                item is None
+                for item in (
+                    *common_receipt_fields,
+                    *legacy_assertion_fields,
+                    *credential_and_scope_fields,
+                )
+            ) or any(item is not None for item in (*identity_proof_fields, *effective_rbac_fields)):
                 raise ValueError(
                     "v3 acquisition authority requires legacy credential and runtime-scope policy"
                 )
+        elif self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v4":
+            if any(
+                item is None
+                for item in (
+                    *common_receipt_fields,
+                    *legacy_assertion_fields,
+                    *credential_and_scope_fields,
+                    *identity_proof_fields,
+                )
+            ) or any(item is not None for item in effective_rbac_fields):
+                raise ValueError("v4 acquisition authority requires legacy identity assertions")
         elif any(
             item is None
             for item in (
-                *receipt_fields,
+                *common_receipt_fields,
                 *credential_and_scope_fields,
                 *identity_proof_fields,
+                *effective_rbac_fields,
             )
-        ):
-            raise ValueError(
-                "v4 acquisition authority requires Athena identity proof and runtime-scope policy"
-            )
+        ) or any(item is not None for item in legacy_assertion_fields):
+            raise ValueError("v5 acquisition authority requires measured effective RBAC evidence")
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionAuthority.v3",
             "athena.wc028MonitoringAcquisitionAuthority.v4",
+            "athena.wc028MonitoringAcquisitionAuthority.v5",
         }:
             required_control_ids = cast(tuple[str, ...], self.required_control_ids)
             required_coverage = cast(
@@ -514,7 +570,10 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 raise ValueError(
                     "controlSelectionDigest does not bind required controls and coverage"
                 )
-        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v4" and (
+        if self.schema_version in {
+            "athena.wc028MonitoringAcquisitionAuthority.v4",
+            "athena.wc028MonitoringAcquisitionAuthority.v5",
+        } and (
             self.identity_proof_audience != MONITORING_IDENTITY_PROOF_AUDIENCE
             or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
             or self.identity_proof_required_role != MONITORING_IDENTITY_PROOF_REQUIRED_ROLE
@@ -528,22 +587,38 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 "monitoringReaderPrincipalId": self.monitoring_reader_principal_id,
                 "athenaContextIdentityId": self.athena_context_identity_id,
                 "athenaContextPrincipalId": self.athena_context_principal_id,
-                "monitoringReaderHasReadOnlyWorkloadAccess": (
-                    self.monitoring_reader_has_read_only_workload_access
-                ),
-                "athenaContextHasWorkloadReader": self.athena_context_has_workload_reader,
-                "readOnly": self.read_only,
             }
-            if self.schema_version in {
-                "athena.wc028MonitoringAcquisitionAuthority.v3",
-                "athena.wc028MonitoringAcquisitionAuthority.v4",
-            }:
+            if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v5":
                 deployment_payload.update(
                     {
                         "monitoringReaderClientId": self.monitoring_reader_client_id,
                         "monitoringReaderTenantId": self.monitoring_reader_tenant_id,
+                        "effectiveRbacInventoryDigest": (self.effective_rbac_inventory_digest),
+                        "effectiveRbacSourceManifestDigest": (
+                            self.effective_rbac_source_manifest_digest
+                        ),
                     }
                 )
+            else:
+                deployment_payload.update(
+                    {
+                        "monitoringReaderHasReadOnlyWorkloadAccess": (
+                            self.monitoring_reader_has_read_only_workload_access
+                        ),
+                        "athenaContextHasWorkloadReader": (self.athena_context_has_workload_reader),
+                        "readOnly": self.read_only,
+                    }
+                )
+                if self.schema_version in {
+                    "athena.wc028MonitoringAcquisitionAuthority.v3",
+                    "athena.wc028MonitoringAcquisitionAuthority.v4",
+                }:
+                    deployment_payload.update(
+                        {
+                            "monitoringReaderClientId": self.monitoring_reader_client_id,
+                            "monitoringReaderTenantId": self.monitoring_reader_tenant_id,
+                        }
+                    )
             deployment_digest = compute_artifact_digest(deployment_payload)
             if (
                 self.monitoring_reader_principal_id == self.athena_context_principal_id
@@ -1065,7 +1140,6 @@ type LogAnalyticsRow = Annotated[
     Field(discriminator="row_kind"),
 ]
 type _HealthState = Literal["healthy", "degraded", "unhealthy", "unavailable"]
-type _HealthSample = tuple[str, str, str, datetime, datetime, _HealthState]
 
 
 class LogCoverageDescriptor(_StrictAcquisitionModel):
@@ -1641,7 +1715,7 @@ def _validated_azure_client_contract(
         raise TypeError("Azure acquisition client requires an exact collector contract")
     if reviewed_contract.schema_version != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
         raise MonitoringAcquisitionError(
-            "Azure acquisition client requires collector contract schema v6"
+            "Azure acquisition client requires collector contract schema v7"
         )
     return reviewed_contract
 
@@ -1881,7 +1955,6 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
             raise TypeError("Azure Log Analytics requires an exact query request")
         self._require_request_contract(request)
         allowed_targets = {
-            self._reviewed_contract.workspace_resource_id.casefold().rstrip("/"),
             *(
                 item.casefold().rstrip("/")
                 for item in self._reviewed_contract.signal_read_scope_ids
@@ -1890,6 +1963,15 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
         if (
             request.table not in self._reviewed_contract.log_analytics_allowed_tables
             or request.query_target_resource_id not in allowed_targets
+            or self._reviewed_contract.workspace_access_control_mode
+            != "workspaceAndResourceContext"
+            or self._reviewed_contract.resource_log_allowed_operations
+            != (
+                "Microsoft.Insights/logs/Heartbeat/read",
+                "Microsoft.Insights/logs/NTANetAnalytics/read",
+                "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
+                "Microsoft.Insights/logs/VMConnection/read",
+            )
             or request.collector_execution_time is None
             or request.coverage_scope is None
         ):
@@ -2848,7 +2930,7 @@ class AzureMonitoringAdapter:
             != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
         ):
             raise MonitoringAcquisitionError(
-                "Azure monitoring acquisition requires collector contract schema v6"
+                "Azure monitoring acquisition requires collector contract schema v7"
             )
         self._credential = ManagedIdentityCredential(
             client_id=self._reviewed_contract.collector_identity_client_id
@@ -2933,39 +3015,56 @@ class _AcquisitionExecution:
     adapter: AzureMonitoringAdapter
     identity_proof: MonitoringIdentityProof
     max_calls: int
+    max_freshness_seconds: int
     started_at: datetime
     exchanges: list[MonitoringAcquisitionExchange]
 
-    def invoke[RequestT: _AcquisitionRequest, ResultT: _StrictAcquisitionModel](
+    def _capture_call_start(
         self,
-        request: RequestT,
-        operation: Callable[[RequestT], ResultT],
-        *,
-        requested_at_override: datetime | None = None,
-    ) -> ResultT:
+        requested_at_override: datetime | None,
+    ) -> datetime:
         if len(self.exchanges) >= self.max_calls:
             raise MonitoringAcquisitionError(
                 "monitoring acquisition exceeded its total call budget"
             )
-        requested_at = (
-            self.adapter.utc_now()
-            if requested_at_override is None
-            else _trusted_runtime_time(requested_at_override)
-        )
-        if requested_at >= self.identity_proof.expires_at:
+        requested_at = self.adapter.utc_now()
+        if (
+            requested_at < self.started_at
+            or requested_at >= self.identity_proof.expires_at
+            or (requested_at - self.started_at).total_seconds() > self.max_freshness_seconds
+        ):
             raise MonitoringAcquisitionError(
-                "verified monitoring credential expired before Azure source I/O"
+                "verified monitoring credential is stale before Azure source I/O"
             )
-        result = operation(request)
-        received_at = self.adapter.utc_now()
-        if requested_at < self.started_at or received_at < requested_at:
-            raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
-        source = cast(AcquisitionSource, request.source)
+        if (
+            requested_at_override is not None
+            and _trusted_runtime_time(requested_at_override) != requested_at
+        ):
+            raise MonitoringAcquisitionError(
+                "caller-supplied acquisition time does not equal live call start"
+            )
+        return requested_at
+
+    def _invoke_at[
+        RequestT: _AcquisitionRequest,
+        ResultT: _StrictAcquisitionModel,
+    ](
+        self,
+        request: RequestT,
+        operation: Callable[[RequestT], ResultT],
+        *,
+        requested_at: datetime,
+    ) -> ResultT:
         checked_at = request.checked_at if isinstance(request, IpFlowVerifyRequest) else None
         if checked_at is not None and checked_at != requested_at:
             raise MonitoringAcquisitionError(
                 "IP Flow checkedAt must equal the collector-owned call start"
             )
+        result = operation(request)
+        received_at = self.adapter.utc_now()
+        if received_at < requested_at:
+            raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        source = cast(AcquisitionSource, request.source)
         self.exchanges.append(
             MonitoringAcquisitionExchange(
                 sequence=len(self.exchanges) + 1,
@@ -2979,6 +3078,35 @@ class _AcquisitionExecution:
             )
         )
         return result
+
+    def invoke[RequestT: _AcquisitionRequest, ResultT: _StrictAcquisitionModel](
+        self,
+        request: RequestT,
+        operation: Callable[[RequestT], ResultT],
+        *,
+        requested_at_override: datetime | None = None,
+    ) -> ResultT:
+        return self._invoke_at(
+            request,
+            operation,
+            requested_at=self._capture_call_start(requested_at_override),
+        )
+
+    def invoke_with_call_start[
+        RequestT: _AcquisitionRequest,
+        ResultT: _StrictAcquisitionModel,
+    ](
+        self,
+        request_factory: Callable[[datetime], RequestT],
+        operation: Callable[[RequestT], ResultT],
+    ) -> tuple[RequestT, ResultT]:
+        requested_at = self._capture_call_start(None)
+        request = request_factory(requested_at)
+        return request, self._invoke_at(
+            request,
+            operation,
+            requested_at=requested_at,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3010,6 +3138,115 @@ def _source_table(signal: LogQueryMonitoringSignal) -> str:
             "published log query does not use a supported reviewed source table"
         )
     return table
+
+
+def _resource_is_contract_published(
+    resource_id: str,
+    contract: MonitoringCollectorContract,
+) -> bool:
+    normalized = _canonical_resource_id(resource_id)
+    exact_scopes = {
+        contract.workspace_resource_id.casefold().rstrip("/"),
+        contract.data_collection_rule_resource_id.casefold().rstrip("/"),
+        contract.data_collection_endpoint_resource_id.casefold().rstrip("/"),
+        contract.workload_virtual_network_resource_id.casefold().rstrip("/"),
+        *(item.casefold().rstrip("/") for item in contract.signal_read_scope_ids),
+        *(item.casefold().rstrip("/") for item in contract.resource_read_scope_ids),
+        *(
+            item.casefold().rstrip("/")
+            for item in cast(tuple[str, ...], contract.resource_health_scope_ids)
+        ),
+        cast(str, contract.ip_flow_verify_scope_id).casefold().rstrip("/"),
+    }
+    return (
+        normalized in exact_scopes
+        or _resource_is_within(normalized, contract.workload_resource_group_id)
+        or _resource_is_within(normalized, contract.monitoring_resource_group_id)
+    )
+
+
+def _required_control_authority_scope(
+    controls: tuple[PublishedMonitoringIntentControl, ...],
+    contract: MonitoringCollectorContract,
+) -> tuple[tuple[AcquisitionSource, ...], tuple[str, ...]]:
+    required_sources: set[AcquisitionSource] = set()
+    required_resources: set[str] = set()
+    signal_scopes = {item.casefold().rstrip("/") for item in contract.signal_read_scope_ids}
+    health_scopes = {
+        item.casefold().rstrip("/")
+        for item in cast(tuple[str, ...], contract.resource_health_scope_ids)
+    }
+    for control in controls:
+        control_resources = {
+            *control.scope.resource_ids,
+            *(control.scope.evidence_resource_ids or ()),
+        }
+        signal = control.signal
+        if isinstance(signal, LogQueryMonitoringSignal):
+            table = _source_table(signal)
+            query_target = _canonical_resource_id(signal.query_target_resource_id)
+            required_sources.add("logAnalytics")
+            required_resources.add(query_target)
+            if query_target not in signal_scopes:
+                raise MonitoringAcquisitionError(
+                    "log query target is outside exact collector VM scopes"
+                )
+            if table == "NTANetAnalytics":
+                required_sources.add("ipFlowVerify")
+            for resource_id in control.scope.resource_ids:
+                normalized = _canonical_resource_id(resource_id)
+                if _is_virtual_machine_resource_id(normalized):
+                    if normalized not in signal_scopes:
+                        raise MonitoringAcquisitionError(
+                            "log control references a VM outside collector signal scopes"
+                        )
+                elif not _resource_is_within(
+                    normalized,
+                    contract.workload_resource_group_id,
+                ):
+                    raise MonitoringAcquisitionError(
+                        "log control resource is outside the reviewed workload scope"
+                    )
+            for resource_id in control.scope.evidence_resource_ids or ():
+                normalized = _canonical_resource_id(resource_id)
+                if not _resource_is_within(
+                    normalized,
+                    contract.monitoring_resource_group_id,
+                ):
+                    raise MonitoringAcquisitionError(
+                        "log evidence resource is outside the reviewed monitoring scope"
+                    )
+        elif isinstance(signal, ActivityLogMonitoringSignal):
+            required_sources.update({"activityLog", "resourceGraph"})
+            if any(
+                not _resource_is_within(
+                    resource_id,
+                    contract.workload_resource_group_id,
+                )
+                for resource_id in control.scope.resource_ids
+            ):
+                raise MonitoringAcquisitionError(
+                    "change control is outside the reviewed workload scope"
+                )
+        elif isinstance(signal, ResourceHealthMonitoringSignal):
+            required_sources.add("resourceHealth")
+            if set(control.scope.resource_ids) - health_scopes:
+                raise MonitoringAcquisitionError(
+                    "Resource Health control is outside exact approved VM scopes"
+                )
+        else:
+            raise MonitoringAcquisitionError(
+                "published monitoring signal has no reviewed acquisition source"
+            )
+        if any(
+            not _resource_is_contract_published(resource_id, contract)
+            for resource_id in control_resources
+        ):
+            raise MonitoringAcquisitionError(
+                "monitoring control references an unpublished collector scope"
+            )
+        required_resources.update(_canonical_resource_id(item) for item in control_resources)
+    return tuple(sorted(required_sources)), tuple(sorted(required_resources))
 
 
 def _control_binding_matches(
@@ -3171,6 +3408,8 @@ def _record_scope_resources(record: MonitoringCollectionRecord) -> set[str]:
         }
         if record.rule_resource_id is not None:
             resources.add(_canonical_resource_id(record.rule_resource_id))
+        if record.ip_flow_rule_resource_id is not None:
+            resources.add(_canonical_resource_id(record.ip_flow_rule_resource_id))
         return resources
     if isinstance(record, ResourceHealthRecord):
         return {_canonical_resource_id(record.resource_id)}
@@ -3348,6 +3587,137 @@ def _health_state(
     return None
 
 
+def _incident_sample_binding(
+    source_record_id: str,
+    *,
+    batch: MonitoringCollectionBatch,
+    prepared: PreparedMonitoringCollection,
+    controls: Mapping[str, PublishedMonitoringIntentControl],
+) -> MonitoringIncidentHealthSampleBinding:
+    records = {
+        item.source_record_id: item
+        for item in batch.records
+        if isinstance(
+            item,
+            (
+                AmaHeartbeatRecord,
+                VmConnectionHealthRecord,
+                ResourceHealthRecord,
+            ),
+        )
+    }
+    try:
+        record = records[source_record_id]
+        control = controls[record.control_id]
+    except KeyError as exc:
+        raise MonitoringAcquisitionError(
+            "signed incident selection references an unknown health record"
+        ) from exc
+    if isinstance(record, AmaHeartbeatRecord):
+        record_kind: Literal[
+            "amaHeartbeat",
+            "vmConnectionHealth",
+            "resourceHealth",
+        ] = "amaHeartbeat"
+        resource_id = record.resource_id
+    elif isinstance(record, VmConnectionHealthRecord):
+        record_kind = "vmConnectionHealth"
+        resource_id = record.subject_resource_id
+    else:
+        record_kind = "resourceHealth"
+        resource_id = record.resource_id
+    state = _health_state(record, control)
+    if state is None:
+        raise MonitoringAcquisitionError(
+            "signed incident selection cannot reference unknown health"
+        )
+    source_reference = monitoring_health_source_record_reference(
+        record_kind,
+        source_record_id,
+    )
+    observations: tuple[MonitoringObservation, ...] = tuple(
+        item
+        for item in prepared.monitoring_bundle.observations
+        if item.source_record_reference == source_reference
+    )
+    if len(observations) != 1:
+        raise MonitoringAcquisitionError(
+            "signed incident health record must map to exactly one persisted observation"
+        )
+    observation = observations[0]
+    provenance = observation.control_provenance
+    if (
+        observation.subject_resource_id != _canonical_resource_id(resource_id)
+        or observation.observed_start != record.observed_start
+        or observation.observed_end != record.observed_end
+        or provenance is None
+        or provenance.control_id != record.control_id
+    ):
+        raise MonitoringAcquisitionError(
+            "signed incident health record does not match persisted observation"
+        )
+    payload: dict[str, object] = {
+        "recordKind": record_kind,
+        "sourceRecordId": source_record_id,
+        "sourceRecordReference": source_reference,
+        "observationId": observation.observation_id,
+        "controlId": record.control_id,
+        "resourceId": resource_id,
+        "state": state,
+        "observedStart": record.observed_start,
+        "observedEnd": record.observed_end,
+    }
+    return MonitoringIncidentHealthSampleBinding.model_validate(
+        {
+            **payload,
+            "sampleDigest": compute_artifact_digest(_json_value(payload)),
+        }
+    )
+
+
+def _signed_incident_selection(
+    *,
+    batch: MonitoringCollectionBatch,
+    prepared: PreparedMonitoringCollection,
+    monitoring_intent: PublishedMonitoringIntent,
+) -> SignedMonitoringIncidentSelection:
+    controls = {item.control_id: item for item in monitoring_intent.controls}
+    previous = _incident_sample_binding(
+        prepared.previous_health_source_record_id,
+        batch=batch,
+        prepared=prepared,
+        controls=controls,
+    )
+    current = tuple(
+        sorted(
+            (
+                _incident_sample_binding(
+                    source_record_id,
+                    batch=batch,
+                    prepared=prepared,
+                    controls=controls,
+                )
+                for source_record_id in prepared.current_health_source_record_ids
+            ),
+            key=lambda item: (
+                item.source_record_reference,
+                item.observation_id,
+            ),
+        )
+    )
+    payload: dict[str, object] = {
+        "incidentResourceId": prepared.incident_resource_id,
+        "previousHealth": previous,
+        "currentHealth": current,
+    }
+    return SignedMonitoringIncidentSelection.model_validate(
+        {
+            **payload,
+            "transitionDigest": compute_artifact_digest(_json_value(payload)),
+        }
+    )
+
+
 def _activity_key(
     row: ActivityLogRow | ResourceGraphChangeRow,
 ) -> tuple[str, str, datetime, str, str]:
@@ -3425,13 +3795,16 @@ class MonitoringAcquisitionCoordinator:
             )
         if (
             self._acquisition_authority.schema_version
-            != "athena.wc028MonitoringAcquisitionAuthority.v4"
+            != "athena.wc028MonitoringAcquisitionAuthority.v5"
         ):
             raise MonitoringAcquisitionError(
-                "Athena-proven acquisition requires authority schema v4"
+                "Athena-proven acquisition requires authority schema v5"
             )
+        effective_rbac_inventory = self._collector_contract.effective_rbac_inventory
         if (
-            self._acquisition_authority.collector_contract_digest != self._collector_contract_digest
+            effective_rbac_inventory is None
+            or self._acquisition_authority.collector_contract_digest
+            != self._collector_contract_digest
             or self._acquisition_authority.monitoring_reader_identity_id
             != self._collector_contract.collector_identity_resource_id.casefold().rstrip("/")
             or self._acquisition_authority.monitoring_reader_principal_id
@@ -3454,6 +3827,17 @@ class MonitoringAcquisitionCoordinator:
             != self._collector_contract.identity_proof_required_role
             or self._acquisition_authority.identity_proof_maximum_lifetime_seconds
             != self._collector_contract.identity_proof_maximum_lifetime_seconds
+            or self._acquisition_authority.effective_rbac_inventory_digest
+            != effective_rbac_inventory.inventory_digest
+            or self._acquisition_authority.effective_rbac_source_manifest_digest
+            != effective_rbac_inventory.source_manifest_digest
+            or any(
+                not _resource_is_contract_published(
+                    resource_id,
+                    self._collector_contract,
+                )
+                for resource_id in self._acquisition_authority.allowed_resource_ids
+            )
         ):
             raise MonitoringAcquisitionError(
                 "acquisition authority does not bind the reviewed credential contract"
@@ -3473,6 +3857,8 @@ class MonitoringAcquisitionCoordinator:
         execution: _AcquisitionExecution,
         monitoring_intent: PublishedMonitoringIntent,
         context_binding: PublishedRuntimeContextBinding,
+        batch: MonitoringCollectionBatch,
+        prepared: PreparedMonitoringCollection,
         collection_batch_digest: str,
         normalized_evidence_digest: str,
     ) -> MonitoringAcquisitionReceipt:
@@ -3507,6 +3893,11 @@ class MonitoringAcquisitionCoordinator:
             "contextBindingDigest": context_binding.binding_digest,
             "collectionBatchDigest": collection_batch_digest,
             "normalizedEvidenceDigest": normalized_evidence_digest,
+            "incidentSelection": _signed_incident_selection(
+                batch=batch,
+                prepared=prepared,
+                monitoring_intent=monitoring_intent,
+            ),
             "executionStartedAt": execution.started_at,
             "executionCompletedAt": execution_completed_at,
             "receiptIssuedAt": receipt_issued_at,
@@ -3616,41 +4007,36 @@ class MonitoringAcquisitionCoordinator:
                 context_binding,
                 expected_active_context_authority_digest=(expected_active_context_authority_digest),
             )
-            authorized_resources = set(self._acquisition_authority.allowed_resource_ids)
-            authorized_sources = set(self._acquisition_authority.allowed_sources)
-            for control in selected_controls:
-                required_resources = {
-                    *control.scope.resource_ids,
-                    *(control.scope.evidence_resource_ids or ()),
-                }
-                if isinstance(control.signal, LogQueryMonitoringSignal):
-                    required_resources.add(control.signal.query_target_resource_id)
-                    required_sources: set[AcquisitionSource] = {"logAnalytics"}
-                    if _source_table(control.signal) == "NTANetAnalytics":
-                        required_sources.add("ipFlowVerify")
-                elif isinstance(control.signal, ActivityLogMonitoringSignal):
-                    required_sources = {"activityLog", "resourceGraph"}
-                elif isinstance(control.signal, ResourceHealthMonitoringSignal):
-                    required_sources = {"resourceHealth"}
-                else:
-                    raise MonitoringAcquisitionError(
-                        "published monitoring signal has no reviewed acquisition source"
-                    )
-                if not {_canonical_resource_id(item) for item in required_resources}.issubset(
-                    authorized_resources
-                ):
-                    raise MonitoringAcquisitionError(
-                        "published monitoring intent escapes acquisition authority scope"
-                    )
-                if not required_sources.issubset(authorized_sources):
-                    raise MonitoringAcquisitionError(
-                        "published monitoring intent uses an unauthorized acquisition source"
-                    )
+            required_sources, required_resources = _required_control_authority_scope(
+                selected_controls,
+                self._collector_contract,
+            )
+            if (
+                self._acquisition_authority.allowed_resource_ids != required_resources
+                or self._acquisition_authority.allowed_sources != required_sources
+            ):
+                raise MonitoringAcquisitionError(
+                    "acquisition authority does not exactly match source-specific contract scope"
+                )
         except (TypeError, ValueError) as exc:
             raise MonitoringAcquisitionError(
                 "monitoring intent authority is invalid before acquisition"
             ) from exc
 
+        effective_rbac_inventory = cast(
+            MonitoringEffectiveRbacInventory,
+            self._collector_contract.effective_rbac_inventory,
+        )
+        inventory_checked_at = self._acquisition_adapter.utc_now()
+        if (
+            effective_rbac_inventory.collected_at > inventory_checked_at
+            or effective_rbac_inventory.expires_at <= inventory_checked_at
+            or (inventory_checked_at - effective_rbac_inventory.collected_at).total_seconds()
+            > self._acquisition_authority.max_freshness_seconds
+        ):
+            raise MonitoringAcquisitionError(
+                "effective RBAC inventory is stale or invalid before credential acquisition"
+            )
         identity_proof = self._acquisition_adapter.verify_identity()
         if (
             identity_proof.principal_id
@@ -3666,6 +4052,10 @@ class MonitoringAcquisitionCoordinator:
         ):
             raise MonitoringAcquisitionError(
                 "Athena identity proof violates acquisition identity policy"
+            )
+        if identity_proof.verified_at >= effective_rbac_inventory.expires_at:
+            raise MonitoringAcquisitionError(
+                "effective RBAC inventory expired before Azure source I/O"
             )
         collected_at = identity_proof.verified_at
         if (
@@ -3684,6 +4074,7 @@ class MonitoringAcquisitionCoordinator:
             adapter=self._acquisition_adapter,
             identity_proof=identity_proof,
             max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
+            max_freshness_seconds=self._acquisition_authority.max_freshness_seconds,
             started_at=collected_at,
             exchanges=[],
         )
@@ -3828,6 +4219,8 @@ class MonitoringAcquisitionCoordinator:
             execution=execution,
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
+            batch=batch,
+            prepared=preliminary,
             collection_batch_digest=sha256_hex(batch.canonical_bytes()),
             normalized_evidence_digest=(
                 preliminary.monitoring_bundle.compute_normalized_evidence_digest_value()
@@ -4398,39 +4791,42 @@ class MonitoringAcquisitionCoordinator:
                 "Traffic Analytics row could not represent the complete published "
                 "network-flow persistence scope",
             )
-        checked_at = execution.adapter.utc_now()
-        verification_request = _build_request(
-            IpFlowVerifyRequest,
-            {
-                "schemaVersion": "athena.wc028IpFlowVerifyRequest.v1",
-                "source": "ipFlowVerify",
-                "monitoringReaderIdentityId": self._monitoring_reader_identity_id,
-                "acquisitionAuthorityId": request.acquisition_authority_id,
-                "acquisitionAuthorityDigest": request.acquisition_authority_digest,
-                "collectorContractDigest": request.collector_contract_digest,
-                "intentId": request.intent_id,
-                "intentDigest": request.intent_digest,
-                "controlId": request.control_id,
-                "controlDigest": request.control_digest,
-                "scopeDigest": request.scope_digest,
-                "windowStart": checked_at - timedelta(seconds=60),
-                "windowEnd": checked_at,
-                "maxRows": self._acquisition_authority.max_rows,
-                "maxBytes": self._acquisition_authority.max_bytes,
-                "checkedAt": checked_at,
-                "targetResourceId": local_target_resource_id,
-                "direction": row.direction,
-                "protocol": row.protocol,
-                "sourceAddress": row.source_address,
-                "destinationAddress": row.destination_address,
-                "sourcePort": row.source_port,
-                "destinationPort": row.destination_port,
-            },
-        )
-        verification = execution.invoke(
-            verification_request,
+
+        def build_verification_request(
+            checked_at: datetime,
+        ) -> IpFlowVerifyRequest:
+            return _build_request(
+                IpFlowVerifyRequest,
+                {
+                    "schemaVersion": "athena.wc028IpFlowVerifyRequest.v1",
+                    "source": "ipFlowVerify",
+                    "monitoringReaderIdentityId": self._monitoring_reader_identity_id,
+                    "acquisitionAuthorityId": request.acquisition_authority_id,
+                    "acquisitionAuthorityDigest": request.acquisition_authority_digest,
+                    "collectorContractDigest": request.collector_contract_digest,
+                    "intentId": request.intent_id,
+                    "intentDigest": request.intent_digest,
+                    "controlId": request.control_id,
+                    "controlDigest": request.control_digest,
+                    "scopeDigest": request.scope_digest,
+                    "windowStart": checked_at - timedelta(seconds=60),
+                    "windowEnd": checked_at,
+                    "maxRows": self._acquisition_authority.max_rows,
+                    "maxBytes": self._acquisition_authority.max_bytes,
+                    "checkedAt": checked_at,
+                    "targetResourceId": local_target_resource_id,
+                    "direction": row.direction,
+                    "protocol": row.protocol,
+                    "sourceAddress": row.source_address,
+                    "destinationAddress": row.destination_address,
+                    "sourcePort": row.source_port,
+                    "destinationPort": row.destination_port,
+                },
+            )
+
+        verification_request, verification = execution.invoke_with_call_start(
+            build_verification_request,
             execution.adapter.query_ip_flow_verify,
-            requested_at_override=checked_at,
         )
         if type(verification) is not IpFlowVerifyResult:
             raise MonitoringAcquisitionError("IP Flow Verify returned an unexpected response type")
@@ -4479,24 +4875,30 @@ class MonitoringAcquisitionCoordinator:
             if (matched_change is not None and attribution_rule_id is not None)
             else None
         )
-        retained_record = base_record
+        retained_payload = {
+            **base_record.model_dump(
+                mode="python",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "ipFlowAccess": verification.access,
+            "ipFlowRuleResourceId": verification.rule_resource_id,
+            "ipFlowCheckedAt": verification.checked_at,
+            "ipFlowResultDigest": sha256_hex(verification.canonical_bytes()),
+        }
         if matched_change is not None and attribution is not None:
-            retained_record = NetworkWatcherFlowRecord.model_validate(
+            retained_payload.update(
                 {
-                    **base_record.model_dump(
-                        mode="python",
-                        by_alias=True,
-                        exclude_none=True,
-                    ),
                     "changeCorrelationId": matched_change.correlation_id,
                     "attributionMethod": "ipFlowVerify",
                     "attributionEvidence": attribution,
                 }
             )
+        retained_record = NetworkWatcherFlowRecord.model_validate(retained_payload)
         return (
             retained_record,
-            "IP Flow Verify result was retained only as a point-in-time limitation and "
-            "was combined with change evidence only when one exact rule match existed",
+            "IP Flow Verify access was retained as point-in-time semantic evidence and "
+            "was combined with change evidence only when one exact denied rule matched",
         )
 
     def _acquire_change_control(
@@ -4759,107 +5161,50 @@ class MonitoringAcquisitionCoordinator:
         records: list[MonitoringCollectionRecord],
         controls: dict[str, PublishedMonitoringIntentControl],
     ) -> tuple[str, tuple[str, ...], str]:
-        samples: list[_HealthSample] = []
+        samples: list[MonitoringIncidentSample] = []
         for record in records:
             state = _health_state(record, controls[record.control_id])
             if state is None:
                 continue
             resource_id: str
+            record_kind: Literal[
+                "amaHeartbeat",
+                "vmConnectionHealth",
+                "resourceHealth",
+            ]
             if isinstance(record, AmaHeartbeatRecord):
                 resource_id = record.resource_id
+                record_kind = "amaHeartbeat"
             elif isinstance(record, VmConnectionHealthRecord):
                 resource_id = record.subject_resource_id
+                record_kind = "vmConnectionHealth"
             elif isinstance(record, ResourceHealthRecord):
                 resource_id = record.resource_id
+                record_kind = "resourceHealth"
             else:
                 continue
             samples.append(
-                (
-                    resource_id,
-                    record.control_id,
-                    record.source_record_id,
-                    record.observed_start,
-                    record.observed_end,
-                    state,
+                MonitoringIncidentSample(
+                    resource_id=resource_id,
+                    control_id=record.control_id,
+                    payload_id=record.source_record_id,
+                    selection_key=monitoring_health_source_record_reference(
+                        record_kind,
+                        record.source_record_id,
+                    ),
+                    observed_start=record.observed_start,
+                    observed_end=record.observed_end,
+                    state=state,
                 )
             )
-        state_rank = {"degraded": 1, "unhealthy": 2, "unavailable": 3}
-        candidates: dict[str, list[tuple[_HealthSample, tuple[_HealthSample, ...]]]] = {}
-        groups = sorted({(item[0], item[1]) for item in samples})
-        for resource_id, control_id in groups:
-            group_samples = tuple(
-                item for item in samples if item[0] == resource_id and item[1] == control_id
-            )
-            latest_end = max(item[4] for item in group_samples)
-            terminal = tuple(item for item in group_samples if item[4] == latest_end)
-            terminal_states = {item[5] for item in terminal}
-            if len(terminal_states) > 1:
-                raise MonitoringAcquisitionError(
-                    "latest health evidence is contradictory and requires manual investigation"
-                )
-            adverse_terminal = tuple(item for item in terminal if item[5] != "healthy")
-            if not adverse_terminal:
-                continue
-            selected_state = max(
-                (item[5] for item in adverse_terminal),
-                key=lambda item: state_rank[item],
-            )
-            seed = max(
-                (item for item in adverse_terminal if item[5] == selected_state),
-                key=lambda item: (item[3], item[2]),
-            )
-            episode = {seed}
-            episode_start = seed[3]
-            episode_end = seed[4]
-            changed = True
-            while changed:
-                changed = False
-                for item in group_samples:
-                    if (
-                        item in episode
-                        or item[5] != selected_state
-                        or item[3] > episode_end
-                        or item[4] < episode_start
-                    ):
-                        continue
-                    episode.add(item)
-                    episode_start = min(episode_start, item[3])
-                    episode_end = max(episode_end, item[4])
-                    changed = True
-            if any(
-                item[5] == "healthy" and item[3] < episode_end and item[4] > episode_start
-                for item in group_samples
-            ):
-                raise MonitoringAcquisitionError(
-                    "current health episode conflicts with overlapping healthy evidence"
-                )
-            predecessors = tuple(
-                item for item in group_samples if item[5] == "healthy" and item[4] <= episode_start
-            )
-            if predecessors:
-                candidates.setdefault(resource_id, []).append(
-                    (
-                        max(predecessors, key=lambda item: (item[4], item[2])),
-                        tuple(sorted(episode, key=lambda item: item[2])),
-                    )
-                )
-        if len(candidates) != 1:
-            raise MonitoringAcquisitionError(
-                "acquired evidence must identify exactly one unambiguous health transition"
-            )
-        incident_resource_id, resource_candidates = candidates.popitem()
-        selected_previous, current = max(
-            resource_candidates,
-            key=lambda item: (
-                state_rank[item[1][0][5]],
-                max(sample[4] for sample in item[1]),
-                item[1][0][1],
-            ),
-        )
+        try:
+            selection = select_monitoring_incident(tuple(samples))
+        except MonitoringIncidentSelectionError as exc:
+            raise MonitoringAcquisitionError(str(exc)) from exc
         return (
-            selected_previous[2],
-            tuple(sorted(item[2] for item in current)),
-            incident_resource_id,
+            selection.previous.payload_id,
+            tuple(item.payload_id for item in selection.current),
+            selection.incident_resource_id,
         )
 
 

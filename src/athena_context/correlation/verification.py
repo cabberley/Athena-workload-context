@@ -8,7 +8,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from athena_context.artifacts import ArtifactReadRequest
 from athena_context.azure_adapters import (
@@ -28,6 +28,7 @@ from athena_context.contracts.common import (
 from athena_context.contracts.correlation import (
     CORRELATION_MAX_CANONICAL_BYTES,
     CORRELATION_REPORT_SCHEMA_VERSION,
+    ConnectionMonitorObservation,
     CorrelationReport,
     CorrelationRequest,
     EndpointHealthObservation,
@@ -72,6 +73,11 @@ from athena_context.eventing.change_ingestion import (
     MAX_CHANGE_EVIDENCE_AGE,
     KeyVaultChangeEvidenceSigner,
 )
+from athena_context.monitoring_incident import (
+    MonitoringIncidentSample,
+    MonitoringIncidentSelectionError,
+    select_monitoring_incident,
+)
 
 _MAX_COLLECTION_TRUST_DELAY = timedelta(minutes=20)
 
@@ -98,6 +104,12 @@ class MonitoringHandoffVerifier(Protocol):
         *,
         as_of: UtcDateTime,
     ) -> str: ...
+
+    def verify_persisted_scope(
+        self,
+        bundle: MonitoringEvidenceBundle,
+        intent: PublishedMonitoringIntent,
+    ) -> None: ...
 
 
 class ChangeArtifactVerifier(Protocol):
@@ -219,6 +231,17 @@ class TrustedMonitoringHandoffVerifier:
             maximum_receipt_age_seconds=(self.acquisition_receipt_maximum_age_seconds),
         )
         return receipt.receipt_digest
+
+    def verify_persisted_scope(
+        self,
+        bundle: MonitoringEvidenceBundle,
+        intent: PublishedMonitoringIntent,
+    ) -> None:
+        _verify_persisted_monitoring_scope(
+            bundle,
+            intent,
+            self.reviewed_contract,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +365,126 @@ def _verify_signed_monitoring_intent(
     return intent
 
 
+def _scope_contains(scope_id: str, resource_id: str) -> bool:
+    scope = scope_id.casefold().rstrip("/")
+    resource = resource_id.casefold().rstrip("/")
+    return resource == scope or resource.startswith(scope + "/")
+
+
+def _verify_persisted_monitoring_scope(
+    bundle: MonitoringEvidenceBundle,
+    intent: PublishedMonitoringIntent,
+    contract: MonitoringCollectorContract,
+) -> None:
+    if contract.workspace_access_control_mode != "workspaceAndResourceContext":
+        raise ValueError("production monitoring evidence requires resource-context Log Analytics")
+    controls = {item.control_id: item for item in intent.controls}
+    signal_scopes = {item.casefold().rstrip("/") for item in contract.signal_read_scope_ids}
+    health_scopes = {
+        item.casefold().rstrip("/") for item in contract.resource_health_scope_ids or ()
+    }
+    for control in intent.controls:
+        signal = control.signal
+        if isinstance(signal, LogQueryMonitoringSignal):
+            if signal.query_target_resource_id.casefold().rstrip("/") not in signal_scopes:
+                raise ValueError("signed log query target is outside exact collector VM scopes")
+        elif isinstance(signal, ResourceHealthMonitoringSignal) and (
+            set(control.scope.resource_ids) - health_scopes
+        ):
+            raise ValueError("signed Resource Health control escapes exact collector VM scopes")
+    for observation in bundle.observations:
+        provenance = observation.control_provenance
+        if provenance is None:
+            raise ValueError("persisted monitoring observation lacks control provenance")
+        control = controls[provenance.control_id]
+        workload_resources = set(control.scope.resource_ids)
+        evidence_resources = set(control.scope.evidence_resource_ids or ())
+        if isinstance(observation, GuestSignalObservation):
+            if (
+                observation.subject_resource_id not in workload_resources
+                or observation.subject_resource_id not in signal_scopes
+            ):
+                raise ValueError("persisted guest observation escapes exact collector VM scopes")
+        elif isinstance(observation, EndpointHealthObservation):
+            resources = {
+                observation.subject_resource_id,
+                *observation.backend_resource_ids,
+            }
+            if not resources.issubset(workload_resources) or not resources.issubset(signal_scopes):
+                raise ValueError("persisted endpoint observation escapes exact collector VM scopes")
+        elif isinstance(observation, PlatformHealthObservation):
+            if (
+                observation.subject_resource_id not in workload_resources
+                or observation.subject_resource_id not in health_scopes
+            ):
+                raise ValueError("persisted Resource Health observation escapes exact VM scopes")
+        elif isinstance(observation, ConnectionMonitorObservation):
+            workload = {
+                observation.subject_resource_id,
+                observation.source_resource_id,
+                observation.destination_resource_id,
+            }
+            if (
+                not workload.issubset(workload_resources)
+                or not workload.issubset(signal_scopes)
+                or observation.monitor_resource_id not in evidence_resources
+                or not _scope_contains(
+                    contract.monitoring_resource_group_id,
+                    observation.monitor_resource_id,
+                )
+            ):
+                raise ValueError(
+                    "persisted Connection Monitor observation escapes collector scopes"
+                )
+        elif isinstance(observation, NetworkFlowObservation):
+            vm_resources = {
+                observation.subject_resource_id,
+                observation.source_resource_id,
+                observation.destination_resource_id,
+            }
+            network_resources = {
+                observation.enforcement_resource_id,
+                *(() if observation.rule_resource_id is None else (observation.rule_resource_id,)),
+                *(
+                    ()
+                    if observation.ip_flow_rule_resource_id is None
+                    else (observation.ip_flow_rule_resource_id,)
+                ),
+            }
+            if (
+                not vm_resources.issubset(workload_resources)
+                or not vm_resources.issubset(signal_scopes)
+                or not network_resources.issubset(workload_resources)
+                or any(
+                    not _scope_contains(
+                        contract.workload_resource_group_id,
+                        resource_id,
+                    )
+                    for resource_id in network_resources
+                )
+            ):
+                raise ValueError("persisted network-flow observation escapes collector scopes")
+    for coverage in bundle.coverage:
+        provenance = coverage.control_provenance
+        if provenance is None:
+            raise ValueError("persisted monitoring coverage lacks control provenance")
+        control = controls[provenance.control_id]
+        resources = set(coverage.scope.resource_ids)
+        if not resources.issubset(control.scope.resource_ids):
+            raise ValueError("persisted monitoring coverage escapes signed control scope")
+        if coverage.family == "platformHealth":
+            if not resources.issubset(health_scopes):
+                raise ValueError("persisted Resource Health coverage escapes exact VM scopes")
+        else:
+            for resource_id in resources:
+                if resource_id in signal_scopes or _scope_contains(
+                    contract.workload_resource_group_id,
+                    resource_id,
+                ):
+                    continue
+                raise ValueError("persisted query coverage escapes collector contract scope")
+
+
 def _verify_request_source_freshness(
     request: CorrelationRequest,
     intent: PublishedMonitoringIntent,
@@ -449,6 +592,7 @@ class _CorrelationVerificationService:
         persisted_bundle = MonitoringEvidenceBundle.model_validate_json(monitoring_bytes)
         if persisted_bundle != request.monitoring_bundle:
             raise ValueError("monitoring bundle does not match the immutable Blob")
+        verified_intent: PublishedMonitoringIntent | None = None
         if self.require_signed_monitoring_intent:
             verified_intent = _verify_signed_monitoring_intent(
                 request,
@@ -456,6 +600,10 @@ class _CorrelationVerificationService:
                 verifier=self.monitoring_intent_verifier,
             )
             _verify_request_source_freshness(request, verified_intent)
+            self.monitoring_verifier.verify_persisted_scope(
+                request.monitoring_bundle,
+                verified_intent,
+            )
         _verify_canonical_incident_anchor(request)
         _verify_network_rule_parents(request)
         if (
@@ -496,6 +644,7 @@ class _CorrelationVerificationService:
                 != acquisition_receipt.receipt_digest
             ):
                 raise ValueError("acquisition receipt verification proof is invalid")
+            _verify_collector_incident_selection(request, acquisition_receipt)
 
         for artifact, handoff in zip(
             request.change_artifacts,
@@ -961,21 +1110,103 @@ def _verify_canonical_incident_anchor(request: CorrelationRequest) -> None:
         )
 
 
+def _verify_collector_incident_selection(
+    request: CorrelationRequest,
+    receipt: MonitoringAcquisitionReceipt,
+) -> None:
+    signed_selection = receipt.incident_selection
+    if signed_selection is None:
+        raise ValueError("production acquisition receipt omits collector incident selection")
+    observations = {item.observation_id: item for item in request.monitoring_bundle.observations}
+    samples: list[MonitoringIncidentSample] = []
+    for observation in request.monitoring_bundle.observations:
+        state = _observation_health_state(observation)
+        provenance = observation.control_provenance
+        if state not in {"healthy", "degraded", "unhealthy", "unavailable"} or provenance is None:
+            continue
+        samples.append(
+            MonitoringIncidentSample(
+                resource_id=observation.subject_resource_id,
+                control_id=provenance.control_id,
+                payload_id=observation.observation_id,
+                selection_key=observation.source_record_reference,
+                observed_start=observation.observed_start,
+                observed_end=observation.observed_end,
+                state=cast(
+                    Literal["healthy", "degraded", "unhealthy", "unavailable"],
+                    state,
+                ),
+            )
+        )
+    try:
+        reconstructed = select_monitoring_incident(tuple(samples))
+    except MonitoringIncidentSelectionError as exc:
+        raise ValueError(
+            "persisted observations cannot reconstruct collector incident selection"
+        ) from exc
+    signed_samples = (
+        signed_selection.previous_health,
+        *signed_selection.current_health,
+    )
+    for sample in signed_samples:
+        signed_observation = observations.get(sample.observation_id)
+        if signed_observation is None:
+            raise ValueError("collector incident selection references a missing observation")
+        provenance = signed_observation.control_provenance
+        if (
+            signed_observation.source_record_reference != sample.source_record_reference
+            or signed_observation.subject_resource_id != sample.resource_id
+            or signed_observation.observed_start != sample.observed_start
+            or signed_observation.observed_end != sample.observed_end
+            or _observation_health_state(signed_observation) != sample.state
+            or provenance is None
+            or provenance.control_id != sample.control_id
+        ):
+            raise ValueError("collector incident selection does not match persisted observations")
+    reconstructed_current = tuple(
+        (item.selection_key, item.payload_id) for item in reconstructed.current
+    )
+    signed_current = tuple(
+        (item.source_record_reference, item.observation_id)
+        for item in signed_selection.current_health
+    )
+    anchor = request.incident_anchor
+    anchor_previous_ids = tuple(item.evidence_id for item in anchor.previous_state_evidence)
+    anchor_current_ids = {item.evidence_id for item in anchor.current_state_evidence}
+    signed_current_ids = {item.observation_id for item in signed_selection.current_health}
+    if (
+        reconstructed.incident_resource_id != signed_selection.incident_resource_id
+        or reconstructed.previous.selection_key
+        != signed_selection.previous_health.source_record_reference
+        or reconstructed.previous.payload_id != signed_selection.previous_health.observation_id
+        or reconstructed_current != signed_current
+        or anchor.affected_resource_id != signed_selection.incident_resource_id
+        or anchor.previous_state != "healthy"
+        or anchor.current_state != reconstructed.current_state
+        or anchor_previous_ids != (signed_selection.previous_health.observation_id,)
+        or not signed_current_ids.issubset(anchor_current_ids)
+    ):
+        raise ValueError("correlation incident anchor does not match signed collector selection")
+
+
 def _verify_network_rule_parents(request: CorrelationRequest) -> None:
     marker = "/securityrules/"
     for observation in request.monitoring_bundle.observations:
-        if (
-            not isinstance(observation, NetworkFlowObservation)
-            or observation.rule_resource_id is None
-        ):
+        if not isinstance(observation, NetworkFlowObservation):
             continue
-        parent_nsg_id, separator, _ = observation.rule_resource_id.rpartition(marker)
-        if (
-            not separator
-            or not parent_nsg_id
-            or observation.enforcement_resource_id != parent_nsg_id
+        for rule_resource_id in (
+            observation.rule_resource_id,
+            observation.ip_flow_rule_resource_id,
         ):
-            raise ValueError("network flow rule does not belong to the enforcement NSG")
+            if rule_resource_id is None:
+                continue
+            parent_nsg_id, separator, _ = rule_resource_id.rpartition(marker)
+            if (
+                not separator
+                or not parent_nsg_id
+                or observation.enforcement_resource_id != parent_nsg_id
+            ):
+                raise ValueError("network flow rule does not belong to the enforcement NSG")
 
 
 def _observation_health_state(

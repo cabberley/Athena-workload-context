@@ -62,14 +62,14 @@ from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
 from athena_context.eventing.change_ingestion import normalize_resource_graph_change
 
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
-RESOURCE_GROUP = "rg-synthetic-wc026"
+RESOURCE_GROUP = "rg-athena-demo-workload"
 WEB_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/"
-    "providers/Microsoft.Compute/virtualMachines/synthetic-web-01"
+    "providers/Microsoft.Compute/virtualMachines/athena-hackathon-web-01"
 )
 DB_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}/"
-    "providers/Microsoft.Compute/virtualMachines/synthetic-db-01"
+    "providers/Microsoft.Compute/virtualMachines/athena-hackathon-sqlvm-01"
 )
 NOW = datetime(2026, 9, 10, 2, 0, tzinfo=UTC)
 DIGEST_A = "sha256:" + "a" * 64

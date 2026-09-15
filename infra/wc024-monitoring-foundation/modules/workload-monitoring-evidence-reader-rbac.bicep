@@ -25,6 +25,13 @@ var readerRoleDefinitionId = subscriptionResourceId(
   'acdd72a7-3385-48ef-bd42-f606fba81ae7'
 )
 var signalReaderRoleDefinitionGuid = '2fda1d90-37da-55d9-8ac3-132fb7bdca5d'
+var resourceLogReaderRoleDefinitionGuid = 'f33a4363-5d9a-5d50-9871-c08582234978'
+var resourceLogAllowedOperations = [
+  'Microsoft.Insights/logs/Heartbeat/read'
+  'Microsoft.Insights/logs/NTANetAnalytics/read'
+  'Microsoft.Insights/logs/NWConnectionMonitorTestResult/read'
+  'Microsoft.Insights/logs/VMConnection/read'
+]
 var expectedSignalReaderActions = [
   'microsoft.compute/virtualmachines/instanceview/read'
   'microsoft.insights/metrics/read'
@@ -37,6 +44,26 @@ var resourceHealthAllowedOperations = [
 resource signalReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' existing = {
   name: signalReaderRoleDefinitionGuid
   scope: subscription()
+}
+
+resource resourceLogReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: resourceLogReaderRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC-028 VM Resource Log Reader'
+    description: 'Read only the four reviewed Log Analytics tables through resource-scoped queries at exact approved workload VMs.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: resourceLogAllowedOperations
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
 }
 
 resource resourceHealthRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
@@ -113,6 +140,18 @@ resource collectorVmSignalReaders 'Microsoft.Authorization/roleAssignments@2022-
   }
 ]
 
+resource collectorVmResourceLogReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for (vmName, index) in approvedVmNames: {
+    name: guid(approvedVms[index].id, collectorPrincipalId, resourceLogReaderRoleDefinition.id)
+    scope: approvedVms[index]
+    properties: {
+      principalId: collectorPrincipalId
+      principalType: 'ServicePrincipal'
+      roleDefinitionId: resourceLogReaderRoleDefinition.id
+    }
+  }
+]
+
 resource collectorVmResourceHealthReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for (vmName, index) in approvedVmNames: {
     name: guid(approvedVms[index].id, collectorPrincipalId, resourceHealthRoleDefinition.id)
@@ -151,7 +190,16 @@ resource collectorDceAssociationReaders 'Microsoft.Authorization/roleAssignments
 
 output readerRoleDefinitionId string = readerRoleDefinitionId
 output signalReaderRoleDefinitionId string = validatedSignalReaderRoleDefinitionId
+output signalReaderRoleName string = signalReaderRoleDefinition.properties.roleName
+output resourceLogReaderRoleDefinitionId string = resourceLogReaderRoleDefinition.id
+output resourceLogReaderRoleName string = resourceLogReaderRoleDefinition.properties.roleName
+output resourceLogAllowedOperations array = resourceLogAllowedOperations
+output resourceLogReadScopeIds array = map(
+  approvedVmNames,
+  vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)
+)
 output resourceHealthRoleDefinitionId string = resourceHealthRoleDefinition.id
+output resourceHealthRoleName string = resourceHealthRoleDefinition.properties.roleName
 output resourceHealthScopeIds array = map(
   approvedVmNames,
   vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)

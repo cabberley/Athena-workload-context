@@ -321,7 +321,7 @@ def _enforce_candidate_budget(
                 observation
                 for observation in observations
                 if isinstance(observation, NetworkFlowObservation)
-                and observation.decision == "denied"
+                and _flow_is_denied(observation)
                 and observation.observed_start <= request.incident_anchor.observed_start
                 and _overlaps_incident(observation, request)
                 and (
@@ -370,7 +370,7 @@ def _enforce_candidate_budget(
         if observation.observed_start <= request.incident_anchor.observed_start
         and _overlaps_incident(observation, request)
         and (
-            (isinstance(observation, NetworkFlowObservation) and observation.decision == "denied")
+            (isinstance(observation, NetworkFlowObservation) and _flow_is_denied(observation))
             or (
                 isinstance(observation, ConnectionMonitorObservation)
                 and observation.status == "failed"
@@ -418,7 +418,7 @@ def _network_security_hypotheses(
     for observation in request.monitoring_bundle.observations:
         if not (
             isinstance(observation, NetworkFlowObservation)
-            and observation.decision == "denied"
+            and _flow_is_denied(observation)
             and observation.observed_start <= request.incident_anchor.observed_start
             and _overlaps_incident(observation, request)
             and (
@@ -1059,6 +1059,10 @@ def _change_hypothesis(
     )
 
 
+def _flow_is_denied(flow: NetworkFlowObservation) -> bool:
+    return flow.decision == "denied" and flow.ip_flow_access != "Allow"
+
+
 def _dependency_hypotheses(
     *,
     request: CorrelationRequest,
@@ -1073,7 +1077,7 @@ def _dependency_hypotheses(
             or not _overlaps_incident(observation, request)
         ):
             continue
-        if isinstance(observation, NetworkFlowObservation) and observation.decision == "denied":
+        if isinstance(observation, NetworkFlowObservation) and _flow_is_denied(observation):
             flow_groups.setdefault(_network_tuple_key(observation), []).append(observation)
         elif (
             isinstance(observation, ConnectionMonitorObservation) and observation.status == "failed"
@@ -1613,7 +1617,7 @@ def _network_observation_contradictions(
             (coverage, observation)
             for observation in request.monitoring_bundle.observations
             if isinstance(observation, NetworkFlowObservation)
-            and observation.decision == "allowed"
+            and (observation.decision == "allowed" or observation.ip_flow_access == "Allow")
             and any(
                 _nsg_chain_key(observation) == _nsg_chain_key(denied_flow)
                 for denied_flow in claimed_flows
@@ -1690,7 +1694,7 @@ def _chain_has_hard_conflict(
 ) -> bool:
     if any(
         isinstance(item, NetworkFlowObservation)
-        and item.decision == "allowed"
+        and (item.decision == "allowed" or item.ip_flow_access == "Allow")
         and _same_flow(item, flow)
         and _overlaps_incident(item, request)
         and _matching_flow_coverage(request, item) is not None
@@ -1772,7 +1776,7 @@ def _flow_binds_change(
     change = artifact.evidence
     return (
         flow.effective_rule_attribution
-        and flow.decision == "denied"
+        and _flow_is_denied(flow)
         and flow.rule_resource_id == change.target_resource_id
         and flow.enforcement_resource_id == _parent_nsg_id(change.target_resource_id)
         and flow.matched_change_evidence_id == change.evidence_id
@@ -1959,11 +1963,7 @@ def _has_complete_nsg_coverage(
 def _has_complete_coverage(
     request: CorrelationRequest,
     *,
-    observation: (
-        GuestSignalObservation
-        | EndpointHealthObservation
-        | PlatformHealthObservation
-    ),
+    observation: (GuestSignalObservation | EndpointHealthObservation | PlatformHealthObservation),
     path: DependencyPath | None,
 ) -> bool:
     family = (
@@ -1996,18 +1996,14 @@ def _coverage_binds_query_observation(
         | PlatformHealthObservation
     ),
 ) -> bool:
-    if (
-        request.monitoring_bundle.schema_version
-        == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
-    ):
+    if request.monitoring_bundle.schema_version == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION:
         return True
     if isinstance(observation, PlatformHealthObservation):
         return True
     return (
         observation.query_execution_digest is not None
         and coverage.query_execution_digests is not None
-        and observation.query_execution_digest
-        in coverage.query_execution_digests
+        and observation.query_execution_digest in coverage.query_execution_digests
     )
 
 
@@ -2270,7 +2266,7 @@ def _is_adverse_observation(observation: object) -> bool:
     if isinstance(observation, GuestSignalObservation):
         return observation.state in {"degraded", "unhealthy", "unavailable"}
     if isinstance(observation, NetworkFlowObservation):
-        return observation.decision == "denied"
+        return _flow_is_denied(observation)
     if isinstance(observation, ConnectionMonitorObservation):
         return observation.status in {"failed", "degraded"}
     if isinstance(observation, EndpointHealthObservation):

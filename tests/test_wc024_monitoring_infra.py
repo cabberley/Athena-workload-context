@@ -605,7 +605,7 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert not (WC024_ROOT / "modules" / "monitoring-evidence-reader-role.bicep").exists()
     assert "3b03c2da-16b3-4a49-8834-0f8130efdd3b" in READER_RBAC
     assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" in READER_RBAC
-    assert "conditionVersion: '2.0'" in READER_RBAC
+    assert "conditionVersion: '2.0'" not in READER_RBAC
     assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in READER_RBAC
     for table in (
         "Heartbeat",
@@ -635,7 +635,8 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         COLLECTOR_CONTRACT
     )
     assert "AzureNetworkAnalytics_CL" not in COLLECTOR_CONTRACT
-    assert "scope: workspace" in READER_RBAC
+    assert "scope: workspace" not in READER_RBAC
+    assert "resource collectorWorkspaceDataReader" not in READER_RBAC
     assert "scope: dataCollectionEndpoint" in READER_RBAC
     assert "scope: dataCollectionRule" in READER_RBAC
     assert "scope: privateLinkScopes[index]" in READER_RBAC
@@ -676,6 +677,24 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
+    for operation in (
+        "Microsoft.Insights/logs/Heartbeat/read",
+        "Microsoft.Insights/logs/NTANetAnalytics/read",
+        "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
+        "Microsoft.Insights/logs/VMConnection/read",
+    ):
+        assert operation in WORKLOAD_READER_RBAC
+    assert "Microsoft.Insights/logs/*/read" not in WORKLOAD_READER_RBAC
+    assert "f33a4363-5d9a-5d50-9871-c08582234978" in WORKLOAD_READER_RBAC
+    resource_log_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorVmResourceLogReaders",
+        maxsplit=1,
+    )[1].split("resource collectorVmResourceHealthReaders", maxsplit=1)[0]
+    assert "scope: approvedVms[index]" in resource_log_assignment
+    assert "roleDefinitionId: resourceLogReaderRoleDefinition.id" in (
+        resource_log_assignment
+    )
+    assert "scope: resourceGroup()" not in resource_log_assignment
     assert "signalReaderAssignableScopes" in WORKLOAD_READER_RBAC
     assert "length(signalReaderRoleDefinition.properties.permissions) == 1" in (
         WORKLOAD_READER_RBAC
@@ -769,8 +788,16 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     )
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringCollectorContract.v6" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringAcquisitionReceipt.v4" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v7" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringAcquisitionReceipt.v5" in COLLECTOR_CONTRACT
+    assert "validatedAcquisitionWorkspaceAccessControlMode" in COLLECTOR_CONTRACT
+    assert "resource-context Log Analytics mode" in COLLECTOR_CONTRACT
+    assert "effectiveRbacInventory: effectiveRbacInventory" in COLLECTOR_CONTRACT
+    assert "monitoringEffectiveRbacInventory" in MAIN
+    assert "validatedMonitoringEffectiveRbacInventory" in MAIN
+    assert "loadJsonContent('effective-rbac-inventory.example.json')" in (
+        (WC024_ROOT / "main.example.bicepparam").read_text(encoding="utf-8")
+    )
     assert "ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId" in (
         COLLECTOR_CONTRACT
     )

@@ -28,6 +28,7 @@ param collectorPrivateEndpointSubnetResourceId = '/subscriptions/00000000-0000-0
 param monitoringStorageAccountName = 'athenademomonstore'
 param monitoringCollectorKeyVaultName = 'athenademomonkv'
 param athenaContextIdentityResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-context/providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-demo-context'
+param monitoringEffectiveRbacInventory = loadJsonContent('effective-rbac-inventory.example.json')
 param retentionDays = 30
 param maximumEvidenceAgeSeconds = 600
 param connectionMonitorDeploymentEnabled = false

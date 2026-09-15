@@ -60,6 +60,7 @@ from athena_context.eventing.change_ingestion import (
     build_change_evidence_artifact,
     normalize_resource_graph_change,
 )
+from athena_context.monitoring_incident import monitoring_source_record_reference
 
 MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
 MAX_MONITORING_COLLECTION_BYTES = 512 * 1024
@@ -348,6 +349,24 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
         min_length=1,
         max_length=2048,
     )
+    ip_flow_access: Literal["Allow", "Deny"] | None = Field(
+        default=None,
+        alias="ipFlowAccess",
+    )
+    ip_flow_rule_resource_id: str | None = Field(
+        default=None,
+        alias="ipFlowRuleResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    ip_flow_checked_at: UtcDateTime | None = Field(
+        default=None,
+        alias="ipFlowCheckedAt",
+    )
+    ip_flow_result_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="ipFlowResultDigest",
+    )
     change_correlation_id: str | None = Field(
         default=None,
         alias="changeCorrelationId",
@@ -366,6 +385,21 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
 
     @model_validator(mode="after")
     def validate_attribution_pair(self) -> NetworkWatcherFlowRecord:
+        ip_flow_values = (
+            self.ip_flow_access,
+            self.ip_flow_checked_at,
+            self.ip_flow_result_digest,
+        )
+        if any(value is not None for value in ip_flow_values) and not all(
+            value is not None for value in ip_flow_values
+        ):
+            raise ValueError(
+                "network flow IP Flow evidence requires access, checkedAt, and result digest"
+            )
+        if self.ip_flow_rule_resource_id is not None and self.ip_flow_access is None:
+            raise ValueError("network flow IP Flow rule cannot exist without point-in-time access")
+        if self.ip_flow_checked_at is not None and self.ip_flow_checked_at < self.observed_end:
+            raise ValueError("network flow IP Flow checkedAt must not predate historical evidence")
         values = (
             self.change_correlation_id,
             self.attribution_method,
@@ -375,6 +409,18 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
             value is not None for value in values
         ):
             raise ValueError("flow attribution requires correlation ID, method, and exact evidence")
+        if (
+            self.attribution_method == "ipFlowVerify"
+            and self.ip_flow_access is not None
+            and (
+                self.ip_flow_access != "Deny"
+                or self.ip_flow_rule_resource_id is None
+                or self.rule_resource_id is None
+                or self.ip_flow_rule_resource_id.casefold().rstrip("/")
+                != self.rule_resource_id.casefold().rstrip("/")
+            )
+        ):
+            raise ValueError("IP Flow attribution requires an exact denied point-in-time rule")
         return self
 
 
@@ -580,6 +626,8 @@ class PreparedMonitoringCollection:
     monitoring_bundle: MonitoringEvidenceBundle
     change_artifacts: tuple[ChangeEvidenceArtifact, ...]
     incident_resource_id: str
+    previous_health_source_record_id: str
+    current_health_source_record_ids: tuple[str, ...]
     previous_health_observation_id: str
     current_health_observation_ids: tuple[str, ...]
     current_health_state: Literal["degraded", "unhealthy", "unavailable"]
@@ -642,7 +690,7 @@ def _monitoring_intent_evidence_reference(
 
 
 def _record_reference(prefix: str, source_record_id: str) -> str:
-    return _opaque_reference(prefix, source_record_id)
+    return monitoring_source_record_reference(prefix, source_record_id)
 
 
 def _json_value(value: object) -> object:
@@ -1352,6 +1400,12 @@ def _network_flow_observation(
     destination_id = normalized[2]
     enforcement_id = normalized[3]
     rule_id = normalized[4] if len(normalized) == 5 else None
+    ip_flow_rule_id = None
+    if record.ip_flow_rule_resource_id is not None:
+        (ip_flow_rule_id,) = _require_resources(
+            control,
+            record.ip_flow_rule_resource_id,
+        )
     _require_path(control, record.path_id, context, normalized)
     tuple_payload = _tuple_payload(
         record,
@@ -1386,12 +1440,20 @@ def _network_flow_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
-        "summaryCode": f"network.flow-{record.decision}",
+        "summaryCode": (
+            f"network.flow-{record.decision}"
+            if record.ip_flow_access is None
+            else (f"network.flow-{record.decision}-ipflow-{record.ip_flow_access.casefold()}")
+        ),
         "pathId": record.path_id,
         "decision": record.decision,
         **tuple_payload,
         "enforcementResourceId": enforcement_id,
         "ruleResourceId": rule_id,
+        "ipFlowAccess": record.ip_flow_access,
+        "ipFlowRuleResourceId": ip_flow_rule_id,
+        "ipFlowCheckedAt": record.ip_flow_checked_at,
+        "ipFlowResultDigest": record.ip_flow_result_digest,
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "effectiveRuleAttribution": attributed,
         "attributionMethod": record.attribution_method if attributed else None,
@@ -2025,6 +2087,8 @@ class _MonitoringCollectionTransactionCore:
             monitoring_bundle=bundle,
             change_artifacts=artifacts,
             incident_resource_id=incident_resource_id,
+            previous_health_source_record_id=(batch.previous_health_source_record_id),
+            current_health_source_record_ids=(batch.current_health_source_record_ids),
             previous_health_observation_id=previous.observation_id,
             current_health_observation_ids=tuple(
                 sorted(item.observation_id for item in expanded_current)

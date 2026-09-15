@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from athena_context.contracts import (
     MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
@@ -23,9 +23,12 @@ from athena_context.contracts import (
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
+    MonitoringEffectiveRbacInventory,
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
     MonitoringIdentityProof,
+    MonitoringIncidentHealthSampleBinding,
+    MonitoringIncidentSelection,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     VersionPinnedBlobReference,
@@ -37,6 +40,9 @@ from athena_context.contracts import (
     verify_monitoring_acquisition_receipt_attestation,
     verify_monitoring_evidence_handoff_attestation,
 )
+from athena_context.monitoring_incident import (
+    monitoring_health_source_record_reference,
+)
 
 COLLECTOR_CONTRACT_MODULE = (
     Path(__file__).parents[1]
@@ -44,6 +50,12 @@ COLLECTOR_CONTRACT_MODULE = (
     / "wc024-monitoring-foundation"
     / "modules"
     / "monitoring-collector-contract.bicep"
+)
+EFFECTIVE_RBAC_INVENTORY_EXAMPLE = (
+    Path(__file__).parents[1]
+    / "infra"
+    / "wc024-monitoring-foundation"
+    / "effective-rbac-inventory.example.json"
 )
 MONITORING_FOUNDATION_MAIN = (
     Path(__file__).parents[1] / "infra" / "wc024-monitoring-foundation" / "main.bicep"
@@ -87,6 +99,10 @@ SIGNAL_READER_ROLE_DEFINITION_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
     "roleDefinitions/2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
 )
+RESOURCE_LOG_READER_ROLE_DEFINITION_ID = (
+    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Authorization/"
+    "roleDefinitions/f33a4363-5d9a-5d50-9871-c08582234978"
+)
 LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
     "roleDefinitions/3b03c2da-16b3-4a49-8834-0f8130efdd3b"
@@ -109,7 +125,61 @@ RESOURCE_HEALTH_ROLE_DEFINITION_ID = (
     "roleDefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072"
 )
 RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/read",)
+RESOURCE_LOG_OPERATIONS = (
+    "Microsoft.Insights/logs/Heartbeat/read",
+    "Microsoft.Insights/logs/NTANetAnalytics/read",
+    "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
+    "Microsoft.Insights/logs/VMConnection/read",
+)
+MEASURED_RBAC_FIELDS = (
+    "signalReaderRoleName",
+    "resourceLogReaderRoleDefinitionId",
+    "resourceLogReaderRoleName",
+    "resourceLogAllowedOperations",
+    "resourceLogReadScopeIds",
+    "ipFlowVerifyRoleName",
+    "resourceHealthRoleName",
+    "signingKeyArmResourceId",
+    "signingKeyCryptoUserRoleDefinitionId",
+    "evidenceContainerResourceId",
+    "evidenceWriterRoleDefinitionId",
+    "effectiveRbacInventory",
+)
+SIGNAL_READER_ROLE_NAME = "Athena WC016 Approved Signal Reader synthetic00000"
+RESOURCE_LOG_READER_ROLE_NAME = "Athena WC-028 VM Resource Log Reader"
+IP_FLOW_VERIFY_ROLE_NAME = "Athena WC-028 Network Watcher IP Flow Verify"
+RESOURCE_HEALTH_ROLE_NAME = "Athena WC-028 VM Resource Health Reader"
+EVIDENCE_CONTAINER_RESOURCE_ID = (
+    f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Storage/storageAccounts/"
+    "athenademomonstore/blobServices/default/containers/monitoring-evidence"
+)
+EVIDENCE_WRITER_ROLE_DEFINITION_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+)
+SIGNING_KEY_ARM_RESOURCE_ID = (
+    f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.KeyVault/vaults/"
+    "athenademomonkv/keys/monitoring-evidence-signing"
+)
+SIGNING_KEY_CRYPTO_USER_ROLE_DEFINITION_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleDefinitions/12338af0-0e69-4776-bea7-57ae8d297424"
+)
 COLLECTOR_TENANT_ID = "00000000-0000-0000-0000-000000000003"
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items() if item is not None}
+    return value
+
+
 REVIEWED_LOG_TABLES = (
     "Heartbeat",
     "Perf",
@@ -318,6 +388,150 @@ def _collector_contract() -> MonitoringCollectorContract:
     )
 
 
+def _effective_rbac_grant(
+    *,
+    principal_id: str,
+    role_definition_id: str,
+    role_definition_name: str,
+    assignment_scope_ids: tuple[str, ...],
+    condition: str | None = None,
+    condition_version: str | None = None,
+    assigned_principal_id: str | None = None,
+    assigned_principal_type: str = "ServicePrincipal",
+    inheritance: str = "direct",
+    group_derived: bool = False,
+) -> dict[str, object]:
+    assigned_principal_id = principal_id if assigned_principal_id is None else assigned_principal_id
+    payload: dict[str, object] = {
+        "assignedPrincipalId": assigned_principal_id,
+        "assignedPrincipalType": assigned_principal_type,
+        "effectivePrincipalId": principal_id,
+        "roleDefinitionId": role_definition_id.casefold(),
+        "roleDefinitionName": role_definition_name,
+        "assignmentScopeIds": tuple(sorted(item.casefold() for item in assignment_scope_ids)),
+        "inheritance": inheritance,
+        "groupDerived": group_derived,
+    }
+    if condition is not None:
+        payload["condition"] = condition
+        payload["conditionVersion"] = condition_version
+    return {
+        **payload,
+        "grantDigest": compute_artifact_digest(_json_value(payload)),
+    }
+
+
+def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
+    principal_id = str(payload["monitoringReaderPrincipalId"])
+    grants = (
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=str(payload["readerRoleDefinitionId"]),
+            role_definition_name="Reader",
+            assignment_scope_ids=tuple(payload["resourceReadScopeIds"]),
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=str(payload["signalReaderRoleDefinitionId"]),
+            role_definition_name=SIGNAL_READER_ROLE_NAME,
+            assignment_scope_ids=tuple(payload["signalReadScopeIds"]),
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=RESOURCE_LOG_READER_ROLE_DEFINITION_ID,
+            role_definition_name=RESOURCE_LOG_READER_ROLE_NAME,
+            assignment_scope_ids=SIGNAL_READ_SCOPE_IDS,
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=RESOURCE_HEALTH_ROLE_DEFINITION_ID,
+            role_definition_name=RESOURCE_HEALTH_ROLE_NAME,
+            assignment_scope_ids=SIGNAL_READ_SCOPE_IDS,
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=IP_FLOW_VERIFY_ROLE_DEFINITION_ID,
+            role_definition_name=IP_FLOW_VERIFY_ROLE_NAME,
+            assignment_scope_ids=(NETWORK_WATCHER_RESOURCE_ID,),
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=EVIDENCE_WRITER_ROLE_DEFINITION_ID,
+            role_definition_name="Storage Blob Data Contributor",
+            assignment_scope_ids=(EVIDENCE_CONTAINER_RESOURCE_ID,),
+        ),
+        _effective_rbac_grant(
+            principal_id=principal_id,
+            role_definition_id=SIGNING_KEY_CRYPTO_USER_ROLE_DEFINITION_ID,
+            role_definition_name="Key Vault Crypto User",
+            assignment_scope_ids=(SIGNING_KEY_ARM_RESOURCE_ID,),
+        ),
+    )
+    ordered_grants = tuple(sorted(grants, key=lambda item: str(item["grantDigest"])))
+    inventory_payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v1",
+        "collectionRunId": "monitoring-rbac-" + "a" * 32,
+        "tenantId": COLLECTOR_TENANT_ID,
+        "subscriptionId": SUBSCRIPTION_ID,
+        "collectorPrincipalId": principal_id,
+        "athenaContextPrincipalId": str(payload["athenaContextPrincipalId"]),
+        "collectedAt": datetime(2026, 9, 10, 1, 55, tzinfo=UTC),
+        "expiresAt": datetime(2026, 9, 10, 2, 10, tzinfo=UTC),
+        "managementGroupAncestry": (
+            "/providers/microsoft.management/managementgroups/synthetic-root",
+        ),
+        "ancestorScopeCollectionComplete": True,
+        "subscriptionDescendantCollectionComplete": True,
+        "groupMembershipCollectionComplete": True,
+        "roleDefinitionCollectionComplete": True,
+        "signalReaderRoleActions": tuple(
+            sorted(
+                (
+                    "microsoft.compute/virtualmachines/instanceview/read",
+                    "microsoft.insights/metrics/read",
+                )
+            )
+        ),
+        "resourceLogReaderRoleActions": tuple(
+            sorted(item.casefold() for item in RESOURCE_LOG_OPERATIONS)
+        ),
+        "ipFlowVerifyRoleActions": tuple(
+            sorted(item.casefold() for item in IP_FLOW_VERIFY_OPERATIONS)
+        ),
+        "resourceHealthRoleActions": tuple(item.casefold() for item in RESOURCE_HEALTH_OPERATIONS),
+        "collectorSecurityGroupIds": (),
+        "athenaContextSecurityGroupIds": (),
+        "collectorGrants": ordered_grants,
+        "athenaContextGrants": (),
+        "assignmentCount": sum(len(tuple(item["assignmentScopeIds"])) for item in ordered_grants),
+        "sourceReference": VersionPinnedBlobReference(
+            name=("monitoring-rbac/monitoring-rbac-" + "a" * 32 + "/effective-rbac-inventory.json"),
+            version="2026-09-10T01:55:00.0000000Z",
+            contentDigest="sha256:" + "e" * 64,
+        ),
+        "sourceManifestDigest": "sha256:" + "e" * 64,
+    }
+    return {
+        **inventory_payload,
+        "inventoryDigest": compute_artifact_digest(_json_value(inventory_payload)),
+    }
+
+
+def _recompute_effective_rbac_inventory(
+    inventory: dict[str, object],
+) -> None:
+    grants = tuple(
+        sorted(
+            tuple(inventory["collectorGrants"]),
+            key=lambda item: str(item["grantDigest"]),
+        )
+    )
+    inventory["collectorGrants"] = grants
+    inventory["assignmentCount"] = sum(len(tuple(item["assignmentScopeIds"])) for item in grants)
+    inventory.pop("inventoryDigest", None)
+    inventory["inventoryDigest"] = compute_artifact_digest(_json_value(inventory))
+
+
 def _acquisition_collector_contract() -> MonitoringCollectorContract:
     payload = _collector_contract().model_dump(mode="python", by_alias=True)
     payload.update(
@@ -331,7 +545,13 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             ),
             "athenaContextPrincipalId": "22222222-2222-2222-2222-222222222222",
             "physicalIdentitySeparationEnforced": True,
+            "signalReaderRoleName": SIGNAL_READER_ROLE_NAME,
+            "resourceLogReaderRoleDefinitionId": (RESOURCE_LOG_READER_ROLE_DEFINITION_ID),
+            "resourceLogReaderRoleName": RESOURCE_LOG_READER_ROLE_NAME,
+            "resourceLogAllowedOperations": RESOURCE_LOG_OPERATIONS,
+            "resourceLogReadScopeIds": SIGNAL_READ_SCOPE_IDS,
             "ipFlowVerifyRoleDefinitionId": IP_FLOW_VERIFY_ROLE_DEFINITION_ID,
+            "ipFlowVerifyRoleName": IP_FLOW_VERIFY_ROLE_NAME,
             "ipFlowVerifyScopeId": NETWORK_WATCHER_RESOURCE_ID,
             "ipFlowVerifyAllowedOperations": IP_FLOW_VERIFY_OPERATIONS,
             "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
@@ -341,17 +561,28 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
                 MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
             ),
             "resourceHealthRoleDefinitionId": RESOURCE_HEALTH_ROLE_DEFINITION_ID,
+            "resourceHealthRoleName": RESOURCE_HEALTH_ROLE_NAME,
             "resourceHealthScopeIds": SIGNAL_READ_SCOPE_IDS,
             "resourceHealthAllowedOperations": RESOURCE_HEALTH_OPERATIONS,
             "allowedReadOperations": (
-                *payload["allowedReadOperations"],
+                *(
+                    operation
+                    for operation in payload["allowedReadOperations"]
+                    if not operation.startswith("Microsoft.OperationalInsights/workspaces")
+                ),
                 *IP_FLOW_VERIFY_OPERATIONS,
                 *RESOURCE_HEALTH_OPERATIONS,
+                *RESOURCE_LOG_OPERATIONS,
             ),
+            "signingKeyArmResourceId": SIGNING_KEY_ARM_RESOURCE_ID,
+            "signingKeyCryptoUserRoleDefinitionId": (SIGNING_KEY_CRYPTO_USER_ROLE_DEFINITION_ID),
+            "evidenceContainerResourceId": EVIDENCE_CONTAINER_RESOURCE_ID,
+            "evidenceWriterRoleDefinitionId": EVIDENCE_WRITER_ROLE_DEFINITION_ID,
             "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
             "acquisitionReceiptSchemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         }
     )
+    payload["effectiveRbacInventory"] = _effective_rbac_inventory(payload)
     return MonitoringCollectorContract(**payload)
 
 
@@ -412,6 +643,25 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     assert "Microsoft.Network/networkWatchers/read" not in contract.allowed_read_operations
     assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
     assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
+    assert contract.workspace_access_control_mode == "workspaceAndResourceContext"
+    assert contract.resource_log_allowed_operations == RESOURCE_LOG_OPERATIONS
+    assert contract.effective_rbac_inventory is not None
+    assert not any(
+        operation.startswith("Microsoft.OperationalInsights/workspaces")
+        for operation in contract.allowed_read_operations
+    )
+    assert all(
+        item.role_definition_name != "Log Analytics Data Reader"
+        for item in contract.effective_rbac_inventory.collector_grants
+    )
+
+
+def test_effective_rbac_inventory_example_matches_reviewed_contract() -> None:
+    inventory = MonitoringEffectiveRbacInventory.model_validate_json(
+        EFFECTIVE_RBAC_INVENTORY_EXAMPLE.read_text(encoding="utf-8")
+    )
+
+    assert inventory == _acquisition_collector_contract().effective_rbac_inventory
 
 
 def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
@@ -435,6 +685,7 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
         "resourceHealthScopeIds",
         "resourceHealthAllowedOperations",
         "acquisitionReceiptSchemaVersion",
+        *MEASURED_RBAC_FIELDS,
     ):
         payload.pop(field)
 
@@ -452,10 +703,9 @@ def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
     )
     payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v4"
     payload["acquisitionReceiptSchemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v3"
-    payload["allowedReadOperations"] = tuple(
-        operation
-        for operation in payload["allowedReadOperations"]
-        if operation not in RESOURCE_HEALTH_OPERATIONS
+    payload["allowedReadOperations"] = (
+        *_collector_contract().allowed_read_operations,
+        *IP_FLOW_VERIFY_OPERATIONS,
     )
     for field in (
         "identityProofAudience",
@@ -465,6 +715,7 @@ def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
         "resourceHealthRoleDefinitionId",
         "resourceHealthScopeIds",
         "resourceHealthAllowedOperations",
+        *MEASURED_RBAC_FIELDS,
     ):
         payload.pop(field)
 
@@ -481,15 +732,16 @@ def test_legacy_v5_acquisition_collector_contract_remains_readable() -> None:
         exclude_none=True,
     )
     payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v5"
-    payload["allowedReadOperations"] = tuple(
-        operation
-        for operation in payload["allowedReadOperations"]
-        if operation not in RESOURCE_HEALTH_OPERATIONS
+    payload["acquisitionReceiptSchemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v4"
+    payload["allowedReadOperations"] = (
+        *_collector_contract().allowed_read_operations,
+        *IP_FLOW_VERIFY_OPERATIONS,
     )
     for field in (
         "resourceHealthRoleDefinitionId",
         "resourceHealthScopeIds",
         "resourceHealthAllowedOperations",
+        *MEASURED_RBAC_FIELDS,
     ):
         payload.pop(field)
 
@@ -497,6 +749,29 @@ def test_legacy_v5_acquisition_collector_contract_remains_readable() -> None:
 
     assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v5"
     assert legacy.resource_health_role_definition_id is None
+
+
+def test_legacy_v6_acquisition_collector_contract_remains_readable() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v6"
+    payload["acquisitionReceiptSchemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v4"
+    payload["allowedReadOperations"] = (
+        *_collector_contract().allowed_read_operations,
+        *IP_FLOW_VERIFY_OPERATIONS,
+        *RESOURCE_HEALTH_OPERATIONS,
+    )
+    for field in MEASURED_RBAC_FIELDS:
+        payload.pop(field)
+
+    legacy = MonitoringCollectorContract(**payload)
+
+    assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v6"
+    assert legacy.resource_health_role_definition_id == (RESOURCE_HEALTH_ROLE_DEFINITION_ID)
+    assert legacy.effective_rbac_inventory is None
 
 
 @pytest.mark.parametrize(
@@ -519,6 +794,12 @@ def test_legacy_v5_acquisition_collector_contract_remains_readable() -> None:
         ("resourceHealthRoleDefinitionId", READER_ROLE_DEFINITION_ID),
         ("resourceHealthScopeIds", SIGNAL_READ_SCOPE_IDS[:-1]),
         ("resourceHealthAllowedOperations", ("Microsoft.ResourceHealth/events/read",)),
+        ("workspaceAccessControlMode", "workspaceOnly"),
+        (
+            "resourceLogAllowedOperations",
+            ("Microsoft.Insights/logs/*/read",) * 4,
+        ),
+        ("effectiveRbacInventory", None),
         ("acquisitionReceiptSchemaVersion", None),
     ),
 )
@@ -533,6 +814,97 @@ def test_acquisition_contract_rejects_missing_or_incorrect_ip_flow_permission(
     payload[field] = value
 
     with pytest.raises(ValidationError):
+        MonitoringCollectorContract(**payload)
+
+
+def test_acquisition_contract_rejects_unexpected_effective_rbac_paths() -> None:
+    base_contract = _acquisition_collector_contract()
+    principal_id = str(base_contract.monitoring_reader_principal_id)
+    group_id = "33333333-3333-3333-3333-333333333333"
+    cases = (
+        (
+            _effective_rbac_grant(
+                principal_id=principal_id,
+                role_definition_id=(
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+                ),
+                role_definition_name="Owner",
+                assignment_scope_ids=(f"/subscriptions/{SUBSCRIPTION_ID}",),
+                inheritance="inherited",
+            ),
+            (),
+        ),
+        (
+            _effective_rbac_grant(
+                principal_id=principal_id,
+                assigned_principal_id=group_id,
+                assigned_principal_type="Group",
+                group_derived=True,
+                role_definition_id=READER_ROLE_DEFINITION_ID,
+                role_definition_name="Reader",
+                assignment_scope_ids=(WORKLOAD_RESOURCE_GROUP_ROOT,),
+            ),
+            (group_id,),
+        ),
+        (
+            _effective_rbac_grant(
+                principal_id=principal_id,
+                role_definition_id=READER_ROLE_DEFINITION_ID,
+                role_definition_name="Reader",
+                assignment_scope_ids=(WORKLOAD_RESOURCE_GROUP_ROOT,),
+                condition="synthetic-unreviewed-condition",
+                condition_version="2.0",
+            ),
+            (),
+        ),
+    )
+    for extra_grant, security_group_ids in cases:
+        payload = base_contract.model_dump(mode="python", by_alias=True)
+        inventory = payload["effectiveRbacInventory"]
+        assert isinstance(inventory, dict)
+        inventory["collectorGrants"] = (
+            *tuple(inventory["collectorGrants"]),
+            extra_grant,
+        )
+        inventory["collectorSecurityGroupIds"] = security_group_ids
+        _recompute_effective_rbac_inventory(inventory)
+
+        with pytest.raises(
+            ValidationError,
+            match="effective RBAC inventory does not match",
+        ):
+            MonitoringCollectorContract(**payload)
+
+
+def test_acquisition_contract_rejects_incomplete_effective_rbac_inventory() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["subscriptionDescendantCollectionComplete"] = False
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError):
+        MonitoringCollectorContract(**payload)
+
+
+def test_acquisition_contract_rejects_unbound_effective_rbac_source() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    source_reference = inventory["sourceReference"]
+    assert isinstance(source_reference, dict)
+    source_reference["contentDigest"] = "sha256:" + "f" * 64
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError, match="effective RBAC inventory"):
         MonitoringCollectorContract(**payload)
 
 
@@ -553,7 +925,7 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     for operation in _collector_contract().allowed_read_operations:
         assert f"'{operation}'" in source
     assert "output collectorContract object = collectorContract" in source
-    assert "athena.wc028MonitoringCollectorContract.v6" in source
+    assert "athena.wc028MonitoringCollectorContract.v7" in source
     assert "athena.wc028MonitoringEvidenceHandoff.v2" in source
 
 
@@ -721,6 +1093,36 @@ def _trusted_signed_handoff() -> tuple[
     return signed_handoff, _collector_contract(), anchor, record
 
 
+def _incident_sample(
+    *,
+    source_record_id: str,
+    observation_id: str,
+    state: str,
+    observed_start: datetime,
+    observed_end: datetime,
+) -> MonitoringIncidentHealthSampleBinding:
+    payload: dict[str, object] = {
+        "recordKind": "amaHeartbeat",
+        "sourceRecordId": source_record_id,
+        "sourceRecordReference": monitoring_health_source_record_reference(
+            "amaHeartbeat",
+            source_record_id,
+        ),
+        "observationId": observation_id,
+        "controlId": "monitoring-control-" + "9" * 32,
+        "resourceId": SIGNAL_READ_SCOPE_IDS[0].casefold(),
+        "state": state,
+        "observedStart": observed_start,
+        "observedEnd": observed_end,
+    }
+    return MonitoringIncidentHealthSampleBinding.model_validate(
+        {
+            **payload,
+            "sampleDigest": compute_artifact_digest(_json_value(payload)),
+        }
+    )
+
+
 def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     contract = _acquisition_collector_contract()
@@ -734,6 +1136,8 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
     assert reader_tenant is not None
     assert context_identity is not None
     assert context_principal is not None
+    effective_rbac_inventory = contract.effective_rbac_inventory
+    assert effective_rbac_inventory is not None
     deployment_digest = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": reader_identity.casefold(),
@@ -742,14 +1146,13 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             "monitoringReaderTenantId": reader_tenant,
             "athenaContextIdentityId": context_identity.casefold(),
             "athenaContextPrincipalId": context_principal,
-            "monitoringReaderHasReadOnlyWorkloadAccess": True,
-            "athenaContextHasWorkloadReader": False,
-            "readOnly": True,
+            "effectiveRbacInventoryDigest": effective_rbac_inventory.inventory_digest,
+            "effectiveRbacSourceManifestDigest": (effective_rbac_inventory.source_manifest_digest),
         }
     )
     authority_digest = "sha256:" + "c" * 64
     collector_digest = contract.compute_artifact_digest_value()
-    observed_at = datetime(2026, 9, 6, 6, 0, tzinfo=UTC)
+    observed_at = datetime(2026, 9, 10, 2, 0, tzinfo=UTC)
     proof_payload: dict[str, object] = {
         "schemaVersion": "athena.wc028MonitoringIdentityProof.v1",
         "tokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
@@ -765,7 +1168,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         "keyId": "synthetic-kid",
         "issuedAt": observed_at,
         "notBefore": observed_at,
-        "expiresAt": observed_at.replace(hour=7),
+        "expiresAt": observed_at.replace(hour=3),
         "verifiedAt": observed_at,
     }
     proof = MonitoringIdentityProof(
@@ -785,6 +1188,31 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         checkedAt=observed_at,
         identityProofDigest=proof.proof_digest,
     )
+    previous_sample = _incident_sample(
+        source_record_id="heartbeat-previous",
+        observation_id="obs-" + "7" * 32,
+        state="healthy",
+        observed_start=observed_at.replace(minute=55, hour=1),
+        observed_end=observed_at.replace(minute=56, hour=1),
+    )
+    current_sample = _incident_sample(
+        source_record_id="heartbeat-current",
+        observation_id="obs-" + "8" * 32,
+        state="unhealthy",
+        observed_start=observed_at.replace(minute=57, hour=1),
+        observed_end=observed_at.replace(minute=58, hour=1),
+    )
+    selection_payload: dict[str, object] = {
+        "incidentResourceId": SIGNAL_READ_SCOPE_IDS[0].casefold(),
+        "previousHealth": previous_sample,
+        "currentHealth": (current_sample,),
+    }
+    incident_selection = MonitoringIncidentSelection.model_validate(
+        {
+            **selection_payload,
+            "transitionDigest": compute_artifact_digest(_json_value(selection_payload)),
+        }
+    )
     payload: dict[str, object] = {
         "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         "authenticatedPrincipalId": reader_principal,
@@ -801,6 +1229,10 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         "contextBindingDigest": "sha256:" + "3" * 64,
         "collectionBatchDigest": "sha256:" + "4" * 64,
         "normalizedEvidenceDigest": "sha256:" + "5" * 64,
+        "incidentSelection": incident_selection.model_dump(
+            mode="json",
+            by_alias=True,
+        ),
         "executionStartedAt": observed_at,
         "executionCompletedAt": observed_at,
         "receiptIssuedAt": observed_at,
@@ -834,6 +1266,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             **signed_payload,
             "exchanges": (exchange,),
             "identityProof": proof,
+            "incidentSelection": incident_selection,
         },
         collectorAttestation=MonitoringEvidenceAttestation(
             signatureAlgorithm="RS256",
@@ -904,6 +1337,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             "monitoringReaderIdentityId",
             "athenaContextPrincipalId",
             "identityProof",
+            "incidentSelection",
         }
     }
     legacy_payload.update(
@@ -944,7 +1378,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         ),
     )
     assert legacy_receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v1"
-    with pytest.raises(ValueError, match="requires Athena-proven acquisition receipt v4"):
+    with pytest.raises(ValueError, match="requires incident-bound acquisition receipt v5"):
         verify_monitoring_acquisition_receipt_attestation(
             legacy_receipt,
             as_of=observed_at,

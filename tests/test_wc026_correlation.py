@@ -122,6 +122,9 @@ class _MonitoringVerifier:
         self._calls.append(f"acquisition:{as_of.isoformat()}")
         return receipt.receipt_digest
 
+    def verify_persisted_scope(self, bundle, intent):
+        del bundle, intent
+
 
 class _ChangeVerifier:
     def __init__(self, calls: list[str]) -> None:
@@ -1032,7 +1035,7 @@ def test_nsg_chain_prefers_post_change_monitor_and_endpoint() -> None:
         observed_end=current_endpoint.observed_start,
         status="degraded",
     )
-    assert historical_monitor.observation_id < current_monitor.observation_id
+    assert historical_monitor.observed_start < current_monitor.observed_start
     combined = _bundle(
         observations=tuple(
             sorted(

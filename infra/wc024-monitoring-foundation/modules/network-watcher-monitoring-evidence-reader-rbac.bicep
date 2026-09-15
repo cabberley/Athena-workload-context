@@ -73,5 +73,6 @@ output resourceReadScopeIds array = [
   '${networkWatcher.id}/flowLogs/${flowLogName}'
 ]
 output ipFlowVerifyRoleDefinitionId string = ipFlowVerifyRoleDefinition.id
+output ipFlowVerifyRoleName string = ipFlowVerifyRoleDefinition.properties.roleName
 output ipFlowVerifyScopeId string = networkWatcher.id
 output ipFlowVerifyAllowedOperations array = ipFlowVerifyAllowedOperations

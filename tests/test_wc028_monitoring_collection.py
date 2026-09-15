@@ -70,7 +70,7 @@ from test_wc026_correlation_contract import (
 )
 
 MONITOR_ID = (
-    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-synthetic-monitoring/"
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring/"
     "providers/Microsoft.Network/networkWatchers/synthetic-watcher/"
     "connectionMonitors/synthetic-web-db"
 )
@@ -2116,7 +2116,7 @@ def test_downstream_verification_rejects_reissued_stale_source_evidence() -> Non
     object.__setattr__(service, "_require_signed_monitoring_intent", True)
 
     assert reissued_request.trusted_as_of == trusted_as_of
-    with pytest.raises(ValueError, match="query-derived evidence exceeds"):
+    with pytest.raises(ValueError, match="evidence exceeds"):
         service.correlate(reissued_request)
 
 

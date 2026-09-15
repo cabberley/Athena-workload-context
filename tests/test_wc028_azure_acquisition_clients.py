@@ -388,6 +388,24 @@ def test_log_analytics_client_preserves_duplicate_rows_for_ambiguity_checks() ->
     assert result.rows[0] == result.rows[1]
 
 
+def test_log_analytics_client_rejects_workspace_context_fallback() -> None:
+    transport = _MockTransport()
+    client = AzureLogAnalyticsAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(MonitoringAcquisitionError, match="resource scope"):
+        client.query_log_analytics(
+            _log_request(
+                target_resource_id=(_acquisition_collector_contract().workspace_resource_id)
+            )
+        )
+
+    assert transport.requests == []
+
+
 def test_activity_log_client_uses_exact_resource_filter_and_service_values() -> None:
     request = _activity_request()
     transport = _MockTransport(

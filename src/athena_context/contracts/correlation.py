@@ -18,6 +18,7 @@ from athena_context.contracts.common import compute_artifact_digest, sha256_hex
 from athena_context.contracts.eventing import IncidentState, IncidentStateAttestation
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.monitoring import (
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
     MonitoringEvidenceHandoff,
@@ -562,6 +563,24 @@ class NetworkFlowObservation(_MonitoringObservation):
         min_length=1,
         max_length=2048,
     )
+    ip_flow_access: Literal["Allow", "Deny"] | None = Field(
+        default=None,
+        alias="ipFlowAccess",
+    )
+    ip_flow_rule_resource_id: str | None = Field(
+        default=None,
+        alias="ipFlowRuleResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    ip_flow_checked_at: UtcDateTime | None = Field(
+        default=None,
+        alias="ipFlowCheckedAt",
+    )
+    ip_flow_result_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="ipFlowResultDigest",
+    )
     five_tuple_digest: Sha256Digest = Field(alias="fiveTupleDigest")
     effective_rule_attribution: bool = Field(alias="effectiveRuleAttribution")
     attribution_method: NetworkAttributionMethod | None = Field(
@@ -597,6 +616,7 @@ class NetworkFlowObservation(_MonitoringObservation):
 
     @field_validator(
         "rule_resource_id",
+        "ip_flow_rule_resource_id",
     )
     @classmethod
     def normalize_optional_resource_id(cls, value: str | None) -> str | None:
@@ -622,6 +642,28 @@ class NetworkFlowObservation(_MonitoringObservation):
 
     @model_validator(mode="after")
     def validate_attribution(self) -> NetworkFlowObservation:
+        ip_flow_values = (
+            self.ip_flow_access,
+            self.ip_flow_checked_at,
+            self.ip_flow_result_digest,
+        )
+        if any(value is not None for value in ip_flow_values) and not all(
+            value is not None for value in ip_flow_values
+        ):
+            raise ValueError(
+                "network flow IP Flow evidence requires access, checkedAt, and result digest"
+            )
+        if self.ip_flow_rule_resource_id is not None and self.ip_flow_access is None:
+            raise ValueError(
+                "network flow IP Flow rule cannot exist without point-in-time access"
+            )
+        if (
+            self.ip_flow_checked_at is not None
+            and self.ip_flow_checked_at < self.observed_end
+        ):
+            raise ValueError(
+                "network flow IP Flow checkedAt must not predate historical evidence"
+            )
         if self.protocol in {"Tcp", "Udp"} and (
             self.source_port is None or self.destination_port is None
         ):
@@ -667,6 +709,19 @@ class NetworkFlowObservation(_MonitoringObservation):
         ):
             raise ValueError(
                 "effective rule attribution requires direct proof and change binding"
+            )
+        if (
+            self.attribution_method == "ipFlowVerify"
+            and self.ip_flow_access is not None
+            and (
+                self.ip_flow_access != "Deny"
+                or self.ip_flow_rule_resource_id is None
+                or self.rule_resource_id is None
+                or self.ip_flow_rule_resource_id != self.rule_resource_id
+            )
+        ):
+            raise ValueError(
+                "IP Flow attribution requires the exact denied point-in-time rule"
             )
         if not self.effective_rule_attribution and any(
             value is not None
@@ -1171,6 +1226,22 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     raise ValueError(
                         "acquisition receipt does not bind the monitoring bundle"
                     )
+                if (
+                    self.acquisition_receipt.schema_version
+                    == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+                    and any(
+                        isinstance(item, NetworkFlowObservation)
+                        and (
+                            item.ip_flow_access is None
+                            or item.ip_flow_checked_at is None
+                            or item.ip_flow_result_digest is None
+                        )
+                        for item in self.observations
+                    )
+                ):
+                    raise ValueError(
+                        "current acquisition bundle requires semantic IP Flow evidence"
+                    )
             elif (
                 self.acquisition_receipt is not None
                 or self.acquisition_manifest is not None
@@ -1273,6 +1344,8 @@ def _observation_resource_ids(
             resource_ids.add(observation.destination_resource_id)
         if observation.rule_resource_id is not None:
             resource_ids.add(observation.rule_resource_id)
+        if observation.ip_flow_rule_resource_id is not None:
+            resource_ids.add(observation.ip_flow_rule_resource_id)
     elif isinstance(observation, ConnectionMonitorObservation):
         resource_ids.update(
             {

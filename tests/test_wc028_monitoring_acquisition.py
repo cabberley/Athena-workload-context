@@ -17,12 +17,18 @@ from athena_context.contracts import (
     MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
     MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+    CorrelationEvidenceInventory,
+    CorrelationRequest,
     EvidenceCoverageScope,
+    IncidentHealthTransition,
+    MonitoringCollectorContract,
+    NetworkFlowObservation,
     ResourceHealthMonitoringSignal,
     build_published_monitoring_intent,
     compute_artifact_digest,
     sha256_hex,
 )
+from athena_context.correlation.verification import TrustedMonitoringHandoffVerifier
 from athena_context.monitoring_acquisition import (
     MAX_ACQUISITION_RESPONSE_BYTES,
     MAX_ACQUISITION_ROWS,
@@ -63,6 +69,7 @@ from test_wc024_monitoring_contract import (
     COLLECTOR_TENANT_ID,
     _acquisition_collector_contract,
 )
+from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import (
     DB_ID,
     NOW,
@@ -277,17 +284,8 @@ def _acquisition_authority(
     required_control_bindings: tuple[MonitoringAcquisitionControlBinding, ...] | None = None,
     context_binding=None,
     controls=None,
+    collector_contract=None,
 ) -> MonitoringAcquisitionAuthority:
-    allowed_sources = (
-        "activityLog",
-        "ipFlowVerify",
-        "logAnalytics",
-        "resourceGraph",
-        "resourceHealth",
-    )
-    allowed_resources = tuple(
-        sorted(item.casefold() for item in (WEB_ID, DB_ID, NSG_ID, NSG_RULE_ID, MONITOR_ID))
-    )
     if context_binding is None or controls is None:
         context_binding, _, controls = _authority()
     if required_control_bindings is None:
@@ -297,15 +295,28 @@ def _acquisition_authority(
         )
     if required_control_ids is None:
         required_control_ids = tuple(item.control_id for item in required_control_bindings)
+    contract = (
+        _acquisition_collector_contract() if collector_contract is None else collector_contract
+    )
+    controls_by_id = {item.control_id: item for item in controls.values()}
+    selected_controls = tuple(controls_by_id[control_id] for control_id in required_control_ids)
+    allowed_sources, allowed_resources = (
+        monitoring_acquisition_module._required_control_authority_scope(
+            selected_controls,
+            contract,
+        )
+    )
+    effective_rbac_inventory = contract.effective_rbac_inventory
+    assert effective_rbac_inventory is not None
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v4",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v5",
         "monitoringReaderIdentityId": reader_identity_id.casefold(),
         "monitoringReaderPrincipalId": reader_principal_id,
         "monitoringReaderClientId": reader_client_id,
         "monitoringReaderTenantId": reader_tenant_id,
         "athenaContextIdentityId": context_identity_id.casefold(),
         "athenaContextPrincipalId": context_principal_id,
-        "collectorContractDigest": COLLECTOR_CONTRACT_DIGEST,
+        "collectorContractDigest": contract.compute_artifact_digest_value(),
         "allowedSources": list(allowed_sources),
         "allowedResourceIds": list(allowed_resources),
         "requiredControlIds": list(required_control_ids),
@@ -332,10 +343,9 @@ def _acquisition_authority(
         "maxWindowSeconds": 86400,
         "maxFreshnessSeconds": max_freshness_seconds,
         "maxAcquisitionCalls": max_acquisition_calls,
-        "receiptSigningKeyId": (_acquisition_collector_contract().signing_key_resource_id),
-        "monitoringReaderHasReadOnlyWorkloadAccess": True,
-        "readOnly": True,
-        "athenaContextHasWorkloadReader": False,
+        "receiptSigningKeyId": contract.signing_key_resource_id,
+        "effectiveRbacInventoryDigest": effective_rbac_inventory.inventory_digest,
+        "effectiveRbacSourceManifestDigest": (effective_rbac_inventory.source_manifest_digest),
     }
     payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
         {
@@ -345,9 +355,8 @@ def _acquisition_authority(
             "monitoringReaderTenantId": reader_tenant_id,
             "athenaContextIdentityId": context_identity_id.casefold(),
             "athenaContextPrincipalId": context_principal_id,
-            "monitoringReaderHasReadOnlyWorkloadAccess": True,
-            "athenaContextHasWorkloadReader": False,
-            "readOnly": True,
+            "effectiveRbacInventoryDigest": effective_rbac_inventory.inventory_digest,
+            "effectiveRbacSourceManifestDigest": (effective_rbac_inventory.source_manifest_digest),
         }
     )
     digest = compute_artifact_digest(payload)
@@ -501,6 +510,8 @@ class _AcquisitionPort:
         traffic_destination_resource_id: str = DB_ID,
         traffic_enforcement_resource_id: str = NSG_ID,
         traffic_rule_resource_id: str | None = NSG_RULE_ID,
+        ip_flow_access: str = "Deny",
+        ip_flow_rule_resource_id: str | None = NSG_RULE_ID,
         backdated_ip_flow: bool = False,
         mismatched_aggregate_proof: bool = False,
         future_aggregate_proof: bool = False,
@@ -534,6 +545,8 @@ class _AcquisitionPort:
         self.traffic_destination_resource_id = traffic_destination_resource_id
         self.traffic_enforcement_resource_id = traffic_enforcement_resource_id
         self.traffic_rule_resource_id = traffic_rule_resource_id
+        self.ip_flow_access = ip_flow_access
+        self.ip_flow_rule_resource_id = ip_flow_rule_resource_id
         self.backdated_ip_flow = backdated_ip_flow
         self.mismatched_aggregate_proof = mismatched_aggregate_proof
         self.future_aggregate_proof = future_aggregate_proof
@@ -732,8 +745,8 @@ class _AcquisitionPort:
                 if self.backdated_ip_flow
                 else request.checked_at
             ),
-            access="Deny",
-            ruleResourceId=NSG_RULE_ID,
+            access=self.ip_flow_access,
+            ruleResourceId=self.ip_flow_rule_resource_id,
             responseBytes=1024,
             limitation="pointInTimeNotHistorical",
         )
@@ -945,9 +958,13 @@ def _synthetic_client_factory(port: _AcquisitionPort):
 
 def _adapter(
     port: _AcquisitionPort,
+    *,
+    collector_contract=None,
 ):
     adapter = AzureMonitoringAdapter(
-        reviewed_collector_contract=_acquisition_collector_contract(),
+        reviewed_collector_contract=(
+            _acquisition_collector_contract() if collector_contract is None else collector_contract
+        ),
     )
     adapter._client_factory = _synthetic_client_factory(port)
     return adapter
@@ -959,16 +976,23 @@ def _coordinator(
     *,
     expected_authority_digest: str | None = None,
     signature_verifier=None,
+    collector_contract=None,
 ) -> MonitoringAcquisitionCoordinator:
+    reviewed_contract = (
+        _acquisition_collector_contract() if collector_contract is None else collector_contract
+    )
     return MonitoringAcquisitionCoordinator(
-        acquisition_adapter=_adapter(port),
+        acquisition_adapter=_adapter(
+            port,
+            collector_contract=reviewed_contract,
+        ),
         acquisition_authority=authority,
         expected_acquisition_authority_digest=(
             authority.authority_digest
             if expected_authority_digest is None
             else expected_authority_digest
         ),
-        expected_collector_contract_digest=COLLECTOR_CONTRACT_DIGEST,
+        expected_collector_contract_digest=(reviewed_contract.compute_artifact_digest_value()),
         monitoring_intent_trusted_key_id=INTENT_KEY_ID,
         monitoring_intent_signature_verifier=(
             (lambda _payload, signature: signature == INTENT_SIGNATURE)
@@ -987,6 +1011,7 @@ def _execute(
     authority=None,
     collected_at: datetime = NOW,
     acquisition_authority: MonitoringAcquisitionAuthority | None = None,
+    collector_contract=None,
 ):
     context, intent, controls = _authority() if authority is None else authority
     commit = _CommitPort()
@@ -995,6 +1020,7 @@ def _execute(
             required_control_ids=_required_control_ids(context, controls),
             context_binding=context,
             controls=controls,
+            collector_contract=collector_contract,
         )
         if acquisition_authority is None
         else acquisition_authority
@@ -1002,6 +1028,7 @@ def _execute(
     outcome = _coordinator(
         port,
         acquisition_authority,
+        collector_contract=collector_contract,
     ).execute(
         monitoring_intent=intent,
         context_binding=context,
@@ -1030,6 +1057,16 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         required_control_ids=_required_control_ids(context, controls),
         context_binding=context,
         controls=controls,
+    )
+    effective_rbac_inventory = _acquisition_collector_contract().effective_rbac_inventory
+    assert effective_rbac_inventory is not None
+    assert acquisition_authority.schema_version == ("athena.wc028MonitoringAcquisitionAuthority.v5")
+    assert acquisition_authority.read_only is None
+    assert acquisition_authority.athena_context_has_workload_reader is None
+    assert acquisition_authority.monitoring_reader_has_read_only_workload_access is None
+    assert (
+        acquisition_authority.effective_rbac_inventory_digest
+        == effective_rbac_inventory.inventory_digest
     )
     assert all(
         request.monitoring_reader_identity_id == READER_ID.casefold()
@@ -1100,7 +1137,16 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         outcome.committed.monitoring_handoff.schema_version
         == "athena.wc028MonitoringEvidenceHandoff.v2"
     )
-    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v4"
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v5"
+    assert receipt.incident_selection is not None
+    assert receipt.incident_selection.incident_resource_id == (outcome.batch.incident_resource_id)
+    assert receipt.incident_selection.previous_health.source_record_id == (
+        outcome.batch.previous_health_source_record_id
+    )
+    assert (
+        tuple(item.source_record_id for item in receipt.incident_selection.current_health)
+        == outcome.batch.current_health_source_record_ids
+    )
     assert receipt.authenticated_principal_id == READER_PRINCIPAL_ID
     assert receipt.authenticated_client_id == READER_CLIENT_ID
     assert receipt.authenticated_tenant_id == COLLECTOR_TENANT_ID
@@ -1171,6 +1217,102 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
         type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_evidence))
+
+
+def test_signed_receipt_blocks_recomputed_alternate_incident_anchor() -> None:
+    outcome, _, _ = _execute(_AcquisitionPort())
+    request = outcome.correlation_request
+    selected_previous_id = request.incident_anchor.previous_state_evidence[0].evidence_id
+    alternate_previous = next(
+        citation
+        for citation in request.evidence_index
+        if citation.evidence_id != selected_previous_id
+        and citation.summary_code.endswith("healthy")
+        and request.incident_anchor.affected_resource_id in citation.resource_ids
+        and citation.observed_end <= request.incident_anchor.observed_start
+    )
+    transition_payload = request.incident_anchor.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"transition_id", "transition_digest"},
+    )
+    transition_payload["previousStateEvidence"] = (alternate_previous,)
+    transition_digest = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(transition_payload)
+    )
+    alternate_transition = IncidentHealthTransition.model_validate(
+        {
+            **transition_payload,
+            "transitionId": (f"transition-{transition_digest.removeprefix('sha256:')[:32]}"),
+            "transitionDigest": transition_digest,
+        }
+    )
+    inventory_payload = request.evidence_inventory.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"inventory_digest"},
+    )
+    inventory_payload["incidentTransitionDigest"] = alternate_transition.transition_digest
+    alternate_inventory = CorrelationEvidenceInventory.model_validate(
+        {
+            **inventory_payload,
+            "inventoryDigest": compute_artifact_digest(
+                monitoring_acquisition_module._json_value(inventory_payload)
+            ),
+        }
+    )
+    request_payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"request_id", "request_digest"},
+    )
+    request_payload["incidentAnchor"] = alternate_transition
+    request_payload["evidenceInventory"] = alternate_inventory
+    request_digest = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(request_payload)
+    )
+    tampered_request = CorrelationRequest.model_validate(
+        {
+            **request_payload,
+            "requestId": f"request-{request_digest.removeprefix('sha256:')[:32]}",
+            "requestDigest": request_digest,
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match signed collector selection",
+    ):
+        _test_service(tampered_request).correlate(tampered_request)
+
+
+def test_correlation_revalidates_persisted_observation_contract_scope() -> None:
+    outcome, _, intent = _execute(_AcquisitionPort())
+    bundle = outcome.prepared.monitoring_bundle
+    flow = next(item for item in bundle.observations if isinstance(item, NetworkFlowObservation))
+    tampered_flow = flow.model_copy(update={"source_resource_id": OUT_OF_SCOPE_ID.casefold()})
+    tampered_bundle = bundle.model_copy(
+        update={
+            "observations": tuple(
+                sorted(
+                    (
+                        tampered_flow if item.observation_id == flow.observation_id else item
+                        for item in bundle.observations
+                    ),
+                    key=lambda item: item.observation_id,
+                )
+            )
+        }
+    )
+    verifier = object.__new__(TrustedMonitoringHandoffVerifier)
+    object.__setattr__(
+        verifier,
+        "reviewed_contract",
+        _acquisition_collector_contract(),
+    )
+
+    with pytest.raises(ValueError, match="escapes collector scopes"):
+        verifier.verify_persisted_scope(tampered_bundle, intent)
 
 
 def test_production_adapter_passes_one_managed_identity_object_to_every_client() -> None:
@@ -1881,6 +2023,162 @@ def test_acquisition_identity_must_be_separate_from_context_identity() -> None:
         )
 
 
+def test_authority_unpublished_resource_fails_before_identity_or_source_io() -> None:
+    current = _acquisition_authority()
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"authority_id", "authority_digest"},
+    )
+    payload["allowedResourceIds"] = sorted(
+        (*current.allowed_resource_ids, OUT_OF_SCOPE_ID.casefold())
+    )
+    digest = compute_artifact_digest(payload)
+    authority = MonitoringAcquisitionAuthority(
+        **{
+            **payload,
+            "allowedSources": current.allowed_sources,
+            "allowedResourceIds": tuple(payload["allowedResourceIds"]),
+            "requiredControlIds": current.required_control_ids,
+            "requiredControlBindings": current.required_control_bindings,
+            "requiredCoverageScopeDigests": (current.required_coverage_scope_digests),
+        },
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+    port = _AcquisitionPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="reviewed credential contract",
+    ):
+        _coordinator(port, authority)
+
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
+    assert port.requests == []
+
+
+def test_authority_extra_published_resource_fails_exact_scope_before_identity() -> None:
+    current = _acquisition_authority()
+    contract = _acquisition_collector_contract()
+    extra_resource = next(
+        item.casefold()
+        for item in contract.signal_read_scope_ids
+        if item.casefold() not in current.allowed_resource_ids
+    )
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"authority_id", "authority_digest"},
+    )
+    payload["allowedResourceIds"] = sorted((*current.allowed_resource_ids, extra_resource))
+    digest = compute_artifact_digest(payload)
+    authority = MonitoringAcquisitionAuthority(
+        **{
+            **payload,
+            "allowedSources": current.allowed_sources,
+            "allowedResourceIds": tuple(payload["allowedResourceIds"]),
+            "requiredControlIds": current.required_control_ids,
+            "requiredControlBindings": current.required_control_bindings,
+            "requiredCoverageScopeDigests": (current.required_coverage_scope_digests),
+        },
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+    port = _AcquisitionPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="source-specific contract scope",
+    ):
+        _execute(port, acquisition_authority=authority)
+
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
+    assert port.requests == []
+
+
+def test_effective_rbac_inventory_expiry_blocks_credential_and_source_io() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory.update(
+        {
+            "collectedAt": NOW - timedelta(minutes=20),
+            "expiresAt": NOW - timedelta(minutes=10),
+        }
+    )
+    inventory.pop("inventoryDigest")
+    inventory["inventoryDigest"] = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(inventory)
+    )
+    contract = MonitoringCollectorContract(**payload)
+    port = _AcquisitionPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="effective RBAC inventory is stale",
+    ):
+        _execute(port, collector_contract=contract)
+
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
+    assert port.requests == []
+
+
+def test_authority_effective_rbac_digest_mismatch_fails_before_identity() -> None:
+    current = _acquisition_authority()
+    contract = _acquisition_collector_contract()
+    inventory = contract.effective_rbac_inventory
+    assert inventory is not None
+    wrong_inventory_digest = "sha256:" + "0" * 64
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"authority_id", "authority_digest"},
+    )
+    payload["effectiveRbacInventoryDigest"] = wrong_inventory_digest
+    payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
+        {
+            "monitoringReaderIdentityId": current.monitoring_reader_identity_id,
+            "monitoringReaderPrincipalId": current.monitoring_reader_principal_id,
+            "monitoringReaderClientId": current.monitoring_reader_client_id,
+            "monitoringReaderTenantId": current.monitoring_reader_tenant_id,
+            "athenaContextIdentityId": current.athena_context_identity_id,
+            "athenaContextPrincipalId": current.athena_context_principal_id,
+            "effectiveRbacInventoryDigest": wrong_inventory_digest,
+            "effectiveRbacSourceManifestDigest": inventory.source_manifest_digest,
+        }
+    )
+    digest = compute_artifact_digest(payload)
+    authority = MonitoringAcquisitionAuthority(
+        **{
+            **payload,
+            "allowedSources": current.allowed_sources,
+            "allowedResourceIds": current.allowed_resource_ids,
+            "requiredControlIds": current.required_control_ids,
+            "requiredControlBindings": current.required_control_bindings,
+            "requiredCoverageScopeDigests": (current.required_coverage_scope_digests),
+        },
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+    port = _AcquisitionPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="reviewed credential contract",
+    ):
+        _coordinator(port, authority)
+
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
+    assert port.requests == []
+
+
 def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> None:
     payload = _acquisition_authority().model_dump(
         mode="json",
@@ -1905,9 +2203,13 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
             "identity_proof_token_version",
             "identity_proof_required_role",
             "identity_proof_maximum_lifetime_seconds",
+            "effective_rbac_inventory_digest",
+            "effective_rbac_source_manifest_digest",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v1"
+    payload["readOnly"] = True
+    payload["athenaContextHasWorkloadReader"] = False
     digest = compute_artifact_digest(payload)
     payload["allowedSources"] = tuple(payload["allowedSources"])
     payload["allowedResourceIds"] = tuple(payload["allowedResourceIds"])
@@ -1918,7 +2220,7 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -1941,9 +2243,14 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
             "identity_proof_token_version",
             "identity_proof_required_role",
             "identity_proof_maximum_lifetime_seconds",
+            "effective_rbac_inventory_digest",
+            "effective_rbac_source_manifest_digest",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v2"
+    payload["monitoringReaderHasReadOnlyWorkloadAccess"] = True
+    payload["readOnly"] = True
+    payload["athenaContextHasWorkloadReader"] = False
     payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": current.monitoring_reader_identity_id,
@@ -1966,7 +2273,7 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -1983,9 +2290,27 @@ def test_v3_acquisition_authority_remains_readable_but_not_executable() -> None:
             "identity_proof_token_version",
             "identity_proof_required_role",
             "identity_proof_maximum_lifetime_seconds",
+            "effective_rbac_inventory_digest",
+            "effective_rbac_source_manifest_digest",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v3"
+    payload["monitoringReaderHasReadOnlyWorkloadAccess"] = True
+    payload["readOnly"] = True
+    payload["athenaContextHasWorkloadReader"] = False
+    payload["deploymentIdentityContractDigest"] = compute_artifact_digest(
+        {
+            "monitoringReaderIdentityId": current.monitoring_reader_identity_id,
+            "monitoringReaderPrincipalId": current.monitoring_reader_principal_id,
+            "monitoringReaderClientId": current.monitoring_reader_client_id,
+            "monitoringReaderTenantId": current.monitoring_reader_tenant_id,
+            "athenaContextIdentityId": current.athena_context_identity_id,
+            "athenaContextPrincipalId": current.athena_context_principal_id,
+            "monitoringReaderHasReadOnlyWorkloadAccess": True,
+            "athenaContextHasWorkloadReader": False,
+            "readOnly": True,
+        }
+    )
     digest = compute_artifact_digest(payload)
     payload["allowedSources"] = tuple(payload["allowedSources"])
     payload["allowedResourceIds"] = tuple(payload["allowedResourceIds"])
@@ -1999,7 +2324,60 @@ def test_v3_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
+        _coordinator(_AcquisitionPort(), authority)
+
+
+def test_v4_acquisition_authority_remains_readable_but_not_executable() -> None:
+    current = _acquisition_authority()
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "authority_id",
+            "authority_digest",
+            "effective_rbac_inventory_digest",
+            "effective_rbac_source_manifest_digest",
+        },
+    )
+    payload.update(
+        {
+            "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v4",
+            "monitoringReaderHasReadOnlyWorkloadAccess": True,
+            "readOnly": True,
+            "athenaContextHasWorkloadReader": False,
+            "deploymentIdentityContractDigest": compute_artifact_digest(
+                {
+                    "monitoringReaderIdentityId": current.monitoring_reader_identity_id,
+                    "monitoringReaderPrincipalId": current.monitoring_reader_principal_id,
+                    "monitoringReaderClientId": current.monitoring_reader_client_id,
+                    "monitoringReaderTenantId": current.monitoring_reader_tenant_id,
+                    "athenaContextIdentityId": current.athena_context_identity_id,
+                    "athenaContextPrincipalId": current.athena_context_principal_id,
+                    "monitoringReaderHasReadOnlyWorkloadAccess": True,
+                    "athenaContextHasWorkloadReader": False,
+                    "readOnly": True,
+                }
+            ),
+        }
+    )
+    digest = compute_artifact_digest(payload)
+    authority = MonitoringAcquisitionAuthority(
+        **{
+            **payload,
+            "allowedSources": tuple(payload["allowedSources"]),
+            "allowedResourceIds": tuple(payload["allowedResourceIds"]),
+            "requiredControlIds": tuple(payload["requiredControlIds"]),
+            "requiredControlBindings": current.required_control_bindings,
+            "requiredCoverageScopeDigests": (current.required_coverage_scope_digests),
+        },
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+
+    assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v4"
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -2129,6 +2507,49 @@ def test_backdated_ip_flow_result_is_rejected() -> None:
     with pytest.raises(MonitoringAcquisitionError, match="IP Flow Verify response is stale"):
         _execute(port)
     assert port.ip_flow_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("live_time", "message"),
+    (
+        (NOW + timedelta(seconds=1), "does not equal live call start"),
+        (NOW + timedelta(hours=1), "credential is stale"),
+    ),
+)
+def test_ip_flow_override_is_rejected_before_operation(
+    live_time: datetime,
+    message: str,
+) -> None:
+    source_port = _AcquisitionPort()
+    _execute(source_port)
+    request = next(item for item in source_port.requests if isinstance(item, IpFlowVerifyRequest))
+    adapter = _adapter(_AcquisitionPort())
+    proof = adapter.verify_identity()
+    execution = monitoring_acquisition_module._AcquisitionExecution(
+        adapter=adapter,
+        identity_proof=proof,
+        max_calls=32,
+        max_freshness_seconds=900,
+        started_at=proof.verified_at,
+        exchanges=[],
+    )
+    operation_calls = 0
+
+    def operation(_request):
+        nonlocal operation_calls
+        operation_calls += 1
+        raise AssertionError("stale or mismatched call time must fail before I/O")
+
+    _SyntheticClock.now = live_time
+    with pytest.raises(MonitoringAcquisitionError, match=message):
+        execution.invoke(
+            request,
+            operation,
+            requested_at_override=request.checked_at,
+        )
+
+    assert operation_calls == 0
+    assert execution.exchanges == []
 
 
 def test_unproven_empty_aggregate_is_unavailable_not_healthy() -> None:
@@ -2308,7 +2729,8 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     second_receipt = second.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
     assert second_receipt is not None
-    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v4"
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v5"
+    assert receipt.incident_selection is not None
     assert receipt.collector_contract_digest == COLLECTOR_CONTRACT_DIGEST
     assert receipt.credential_proofs is None
     assert receipt.identity_proof is not None
@@ -2333,6 +2755,50 @@ def test_each_ip_flow_exchange_maps_one_retained_network_flow_record() -> None:
     assert receipt is not None
     exchanges = tuple(item for item in receipt.exchanges if item.source == "ipFlowVerify")
     assert len(exchanges) == len(retained) == 1
+
+
+def test_ip_flow_allow_and_deny_change_persisted_and_correlated_semantics() -> None:
+    denied, _, _ = _execute(_AcquisitionPort(ip_flow_access="Deny"))
+    allowed, _, _ = _execute(_AcquisitionPort(ip_flow_access="Allow"))
+
+    denied_record = next(
+        item for item in denied.batch.records if isinstance(item, NetworkWatcherFlowRecord)
+    )
+    allowed_record = next(
+        item for item in allowed.batch.records if isinstance(item, NetworkWatcherFlowRecord)
+    )
+    denied_observation = next(
+        item
+        for item in denied.prepared.monitoring_bundle.observations
+        if isinstance(item, NetworkFlowObservation)
+    )
+    allowed_observation = next(
+        item
+        for item in allowed.prepared.monitoring_bundle.observations
+        if isinstance(item, NetworkFlowObservation)
+    )
+    denied_report = (
+        _test_service(denied.correlation_request).correlate(denied.correlation_request).report
+    )
+    allowed_report = (
+        _test_service(allowed.correlation_request).correlate(allowed.correlation_request).report
+    )
+
+    assert denied_record.ip_flow_access == "Deny"
+    assert allowed_record.ip_flow_access == "Allow"
+    assert denied.batch.canonical_bytes() != allowed.batch.canonical_bytes()
+    assert denied_observation.ip_flow_access == "Deny"
+    assert allowed_observation.ip_flow_access == "Allow"
+    assert any(
+        denied_observation.observation_id
+        in {item.evidence_id for item in hypothesis.supporting_evidence}
+        for hypothesis in denied_report.hypotheses
+    )
+    assert all(
+        allowed_observation.observation_id
+        not in {item.evidence_id for item in hypothesis.supporting_evidence}
+        for hypothesis in allowed_report.hypotheses
+    )
 
 
 @pytest.mark.parametrize(

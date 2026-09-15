@@ -86,6 +86,9 @@ param monitoringCollectorKeyVaultName string
 @description('Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI.')
 param athenaContextIdentityResourceId string
 
+@description('Externally collected hierarchy-complete effective RBAC inventory for the collector and Athena context identities.')
+param monitoringEffectiveRbacInventory object
+
 var athenaContextIdentitySegments = split(toLower(athenaContextIdentityResourceId), '/')
 resource athenaContextIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   scope: resourceGroup(athenaContextIdentitySegments[2], athenaContextIdentitySegments[4])
@@ -385,7 +388,6 @@ module monitoringEvidenceReaderAssignments 'modules/monitoring-evidence-reader-r
   scope: monitoringResourceGroup
   params: {
     collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-    workspaceName: workspaceName
     dataCollectionEndpointName: dataCollectionEndpointName
     dataCollectionRuleName: dataCollectionRuleName
     privateLinkScopeNames: [
@@ -494,11 +496,18 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
       : 'workspaceOnly'
     readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
     signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
+    signalReaderRoleName: workloadEvidenceReaderAssignments.outputs.signalReaderRoleName
+    resourceLogReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleDefinitionId
+    resourceLogReaderRoleName: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleName
+    resourceLogAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceLogAllowedOperations
+    resourceLogReadScopeIds: workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds
     logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
     ipFlowVerifyRoleDefinitionId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleDefinitionId
+    ipFlowVerifyRoleName: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleName
     ipFlowVerifyScopeId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyScopeId
     ipFlowVerifyAllowedOperations: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyAllowedOperations
     resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
+    resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
     resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
     resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
     logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
@@ -510,7 +519,12 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     )
     signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
     signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
+    signingKeyArmResourceId: monitoringEvidenceSeams.outputs.signingKeyArmResourceId
+    signingKeyCryptoUserRoleDefinitionId: monitoringEvidenceSeams.outputs.signingKeyCryptoUserRoleDefinitionId
     evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+    evidenceContainerResourceId: monitoringEvidenceSeams.outputs.evidenceContainerResourceId
+    evidenceWriterRoleDefinitionId: monitoringEvidenceSeams.outputs.evidenceWriterRoleDefinitionId
+    effectiveRbacInventory: validatedMonitoringEffectiveRbacInventory
     maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds
     connectionMonitorDeploymentMode: connectionMonitorCapability.outputs.deploymentMode
   }
@@ -519,6 +533,7 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
 @description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
 output monitoringCollectorContract object = collectorContract.outputs.collectorContract
 var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) ? true : fail('monitoring collector and Athena context identities must be physically separate UAMIs with distinct principal IDs')
+var validatedMonitoringEffectiveRbacInventory = monitoringEffectiveRbacInventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v1' && toLower(monitoringEffectiveRbacInventory.collectorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.athenaContextPrincipalId) == toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEffectiveRbacInventory.tenantId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityTenantId) ? monitoringEffectiveRbacInventory : fail('monitoring acquisition requires an externally collected effective RBAC inventory bound to both deployed identities and tenant')
 
 output monitoringAcquisitionCollectorContract object = union(collectorContract.outputs.acquisitionCollectorContract, {
   monitoringReaderPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId

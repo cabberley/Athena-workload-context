@@ -63,18 +63,32 @@ The coordinator:
   allowlist, payload limits, freshness limit, total acquisition-call budget, receipt signing key,
   managed-identity tenant/client/object IDs, and a digest of the deployment identity-separation
   contract;
-- requires acquisition-authority v4 to bind the current `contextBindingDigest`, the exact sorted
+- requires acquisition-authority v5 to bind the current `contextBindingDigest`, the exact sorted
   `requiredCoverageScopeDigests`, and a sorted one-to-one binding from every required coverage
   digest to one selected control ID, control digest, and scope digest; the same exact control IDs
   are separately pinned, and all bindings are verified before credential acquisition or entry into
   any source-call loop, so stale, added-control, or omitted-control authority produces zero Azure
   evidence calls;
+- requires authority `allowedSources` and `allowedResourceIds` to equal the exact selected
+  source-specific collector-contract scope before identity acquisition: resource-context log
+  targets and VM evidence use exact approved VM scopes, Resource Health uses its exact VM
+  assignments, workload network/change resources stay under the reviewed workload resource group,
+  and monitoring evidence resources stay under the reviewed monitoring resource group;
+- replaces self-asserted read-only RBAC booleans with a digest-bound, externally collected
+  effective RBAC inventory covering management-group ancestry, subscription descendants, direct
+  and inherited assignments, assignment conditions, transitive group-derived grants, and measured
+  custom-role actions; the inventory cites one immutable version-pinned source artifact and external
+  manifest digest, the contract derives its expected collector grants from reviewed role IDs,
+  conditions, and exact scopes, and acquisition rejects stale, incomplete, missing, or unexpected
+  inventory before identity proof or source I/O;
 - emits an immutable signed acquisition receipt containing collector-owned execution, call, result
   receipt, and issuance times plus every exact request/result digest; IP Flow entries also bind the
-  collector-owned `checkedAt`, and the receipt binds the exact normalized collection-batch digest
-  plus a deterministic digest of the normalized observations and coverage so it cannot be replayed
-  with altered persisted evidence; receipt v4 additionally binds the Athena identity proof and its
-  tenant, client, object, app-only role, token-version, issuer, and audience policy;
+  collector-owned `checkedAt`; receipt v5 additionally signs the collector-selected incident
+  resource plus exact previous/current source-record and observation bindings with a deterministic
+  transition digest, and binds the exact normalized collection-batch digest plus a deterministic
+  digest of normalized observations and coverage so neither persisted evidence nor the incident
+  anchor can be replaced; it also binds the Athena identity proof and its tenant, client, object,
+  app-only role, token-version, issuer, and audience policy;
 - persists that receipt plus an independently digest-bound batch/request/result manifest in the
   WC-028 evidence bundle, binds the receipt digest into the signed monitoring handoff, and requires
   production correlation verification to revalidate the receipt signature, manifest, signed
@@ -113,6 +127,13 @@ The coordinator:
 - when a selected Traffic Analytics query returns no usable flow row, emits unavailable network
   coverage and its actual Log Analytics exchange only; no IP Flow call or source-specific proof is
   created, while the acquisition-wide Athena identity proof remains bound to every emitted exchange;
+- persists IP Flow access, exact returned rule resource when available, collector-owned check time,
+  and result digest into the retained flow record and normalized observation; a point-in-time
+  `Allow` result no longer contributes denied-flow support in correlation, while a `Deny` result
+  can support the historical denied flow and exact-rule attribution;
+- captures every source call start inside the execution boundary, validates proof lifetime,
+  execution freshness, and monotonicity before invoking transport, constructs IP Flow requests from
+  that captured instant, and rejects any caller override that differs from the live call start;
 - always marks Traffic Analytics coverage partial and records both its aggregation limitation and
   IP Flow Verify's point-in-time limitation;
 - marks missing, truncated, ambiguous, or otherwise incomplete results as unavailable, truncated,
@@ -131,13 +152,21 @@ The coordinator:
   `NetworkWatcher_australiaeast` resource; the existing built-in Reader assignment remains scoped
   only to the canonical flow-log child;
 - publishes the exact IP Flow role-definition ID, Network Watcher assignment scope, and two-action
-  allowlist in production collector contract v6, alongside the collector tenant/client/object
-  identity, Athena proof audience/version/role/lifetime, acquisition receipt v4 schema, and the
+  allowlist in production collector contract v7, alongside the collector tenant/client/object
+  identity, Athena proof audience/version/role/lifetime, acquisition receipt v5 schema, and the
   Resource Health permission contract;
 - provisions a separate Resource Health custom role containing only
   `Microsoft.ResourceHealth/AvailabilityStatuses/read`, makes it assignable only in
   `rg-athena-demo-workload`, and assigns it independently at each exact approved VM; built-in
   Reader remains limited to the already reviewed DCR/DCE-association and flow-log child resources.
+- provisions a separate WC-028 resource-log role with only
+  `Microsoft.Insights/logs/Heartbeat/read`,
+  `Microsoft.Insights/logs/VMConnection/read`,
+  `Microsoft.Insights/logs/NWConnectionMonitorTestResult/read`, and
+  `Microsoft.Insights/logs/NTANetAnalytics/read`, assigns it only at the 11 exact approved VMs, and
+  leaves the shared WC-016 resource-group signal role unchanged; collector contract v7 carries no
+  effective workspace data-reader assignment, and production clients accept only resource-context
+  targets so they cannot fall back to workspace-context queries.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -147,6 +176,10 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - The Context API, policy, presentation, and correlation identities do not receive workload or
   monitoring Reader access.
 - Query authority remains human-owned through the immutable published intent.
+- Acquisition contract publication is a guarded second phase after infrastructure and role
+  assignments exist: an external hierarchy-complete RBAC collection supplies the short-lived
+  inventory and source-manifest digest, and acquisition remains blocked until that measured
+  inventory is refreshed and matches the deployed identities and exact expected grants.
 - Reordered source rows produce identical batch bytes.
 - Source `sourceIdentityId` values remain untrusted compatibility fields and cannot replace adapter
   proof; a fake source client cannot alter the identity stamped into exchanges or receipts.
@@ -166,18 +199,21 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Receipt-bearing acquisitions use `athena.wc028MonitoringEvidenceBundle.v3` and
   `athena.wc028MonitoringEvidenceHandoff.v2`; legacy collection paths remain on their existing
   versioned contracts and cannot silently add receipt fields.
-- The deployment publishes `athena.wc028MonitoringCollectorContract.v6` while retaining parse
-  support for WC-024 v2 and legacy WC-028 v3-v5 contracts. Production verification requires the
-  full reviewed v6 contract and its exact proof and Resource Health policies.
-- Legacy acquisition-authority v1-v3 documents remain readable, but only v4 authorities can execute
-  production acquisition. Production receipt verification requires receipt v4 and derives deployed
+- The deployment publishes `athena.wc028MonitoringCollectorContract.v7` while retaining parse
+  support for WC-024 v2 and legacy WC-028 v3-v6 contracts. Production verification requires the
+  full reviewed v7 contract, resource-context log role, measured effective RBAC inventory, identity
+  proof, and Resource Health policies.
+- Legacy acquisition-authority v1-v4 documents remain readable, but only v5 authorities can execute
+  production acquisition. Production receipt verification requires receipt v5 and derives deployed
   tenant/client/object/resource identity, proof policy, and IP Flow policy from the full reviewed
   collector contract rather than caller assertions.
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
-- This slice adds the narrow IP Flow role and exact Network Watcher assignment plus one separate
-  narrow Resource Health role with exact per-VM assignments. It adds no Reader broadening,
-  diagnostic setting, alert, query deployment, Connection Monitor mutation, or write permission.
+- This slice adds the narrow IP Flow role and exact Network Watcher assignment, one separate narrow
+  Resource Health role, and one separate four-table resource-log role with exact per-VM
+  assignments. It leaves the shared WC-016 resource-group role unchanged and adds no Reader
+  broadening, diagnostic setting, alert, query deployment, Connection Monitor mutation, or write
+  permission.
 
 ## Alternatives considered
 
@@ -231,7 +267,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - IP Flow Verify has an independent exact request/result binding and cannot be smuggled inside
   Traffic Analytics rows.
 - Empty or unusable Traffic Analytics results produce deterministic unavailable coverage, no IP
-  Flow exchange, and a valid receipt v4 with no orphan source proof.
+  Flow exchange, and a valid receipt v5 with no orphan source proof.
 - Mismatched Traffic Analytics port, protocol, direction, or non-VM local target produces
   unavailable coverage and zero IP Flow calls before any point-in-time verification request.
 - Missing `ruleResourceId` or a row whose retained fields cannot represent the full published flow
@@ -243,6 +279,16 @@ ambiguous incident transitions fail before the persistence transaction is entere
   11 approved VM scopes while proving Reader was not broadened.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
   correlation boundary.
+- Replacing the incident anchor and recomputing unsigned correlation request and inventory digests
+  fails because correlation reconstructs the canonical collector selection from signed persisted
+  observations and requires the receipt's exact source-record, observation, resource, state, and
+  interval bindings.
+- Extra authority resources, stale effective RBAC evidence, inherited or group-derived unexpected
+  roles, changed assignment conditions, incomplete hierarchy evidence, workspace-context query
+  targets, and persisted out-of-contract resources all fail before trusted use.
+- Identical Traffic Analytics input with IP Flow `Allow` versus `Deny` produces different signed
+  batches and correlation support, and a stale or backdated call override executes zero transport
+  calls.
 - Forged source identity claims, caller-backdated collection/IP Flow time, unproved aggregate zero,
   optional incident controls, excessive Traffic Analytics cardinality, and acquisition-call budget
   exhaustion all fail closed in adversarial tests.

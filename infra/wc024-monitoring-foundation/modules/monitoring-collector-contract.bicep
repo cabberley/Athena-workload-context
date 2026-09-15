@@ -51,11 +51,33 @@ param readerRoleDefinitionId string
 @description('Existing narrow VM signal-reader role definition resource ID.')
 param signalReaderRoleDefinitionId string
 
+@description('Exact deployed narrow VM signal-reader role name.')
+param signalReaderRoleName string
+
+@description('Exact custom role definition for resource-context Log Analytics reads.')
+param resourceLogReaderRoleDefinitionId string
+
+@description('Exact custom role name for resource-context Log Analytics reads.')
+param resourceLogReaderRoleName string
+
+@description('Exact resource-context log-table actions granted only at approved VMs.')
+@minLength(4)
+@maxLength(4)
+param resourceLogAllowedOperations array
+
+@description('Exact approved VM scopes receiving the resource-context log role.')
+@minLength(11)
+@maxLength(11)
+param resourceLogReadScopeIds array
+
 @description('Built-in Log Analytics Data Reader role definition resource ID.')
 param logAnalyticsDataReaderRoleDefinitionId string
 
 @description('Exact custom role definition resource ID for Network Watcher IP Flow Verify.')
 param ipFlowVerifyRoleDefinitionId string
+
+@description('Exact custom role name for Network Watcher IP Flow Verify.')
+param ipFlowVerifyRoleName string
 
 @description('Exact regional Network Watcher resource receiving the IP Flow Verify role assignment.')
 param ipFlowVerifyScopeId string
@@ -67,6 +89,9 @@ param ipFlowVerifyAllowedOperations array
 
 @description('Exact custom role definition resource ID for Resource Health availability reads.')
 param resourceHealthRoleDefinitionId string
+
+@description('Exact custom role name for Resource Health availability reads.')
+param resourceHealthRoleName string
 
 @description('Exact approved VM resource IDs receiving Resource Health availability-read assignments.')
 @minLength(11)
@@ -99,8 +124,23 @@ param signalReadScopeIds array
 @description('Resource ID of the non-exportable collector signing key.')
 param signingKeyResourceId string
 
+@description('ARM resource ID of the non-exportable collector signing key.')
+param signingKeyArmResourceId string
+
+@description('Exact Key Vault Crypto User role definition resource ID.')
+param signingKeyCryptoUserRoleDefinitionId string
+
 @description('Resource ID of the monitoring-owned immutable evidence storage account.')
 param evidenceStorageAccountResourceId string
+
+@description('Exact monitoring evidence container receiving immutable evidence writes.')
+param evidenceContainerResourceId string
+
+@description('Exact Storage Blob Data Contributor role definition resource ID.')
+param evidenceWriterRoleDefinitionId string
+
+@description('Externally collected, hierarchy-complete effective RBAC inventory for both identities.')
+param effectiveRbacInventory object
 
 @description('Maximum accepted age for a signed evidence handoff.')
 @minValue(60)
@@ -168,12 +208,23 @@ var collectorContract = {
 
 output collectorContract object = collectorContract
 
+var validatedAcquisitionWorkspaceAccessControlMode = workspaceAccessControlMode == 'workspaceAndResourceContext'
+  ? workspaceAccessControlMode
+  : fail('production monitoring acquisition requires resource-context Log Analytics mode')
+
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v6'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v7'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
-  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v4'
+  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v5'
+  workspaceAccessControlMode: validatedAcquisitionWorkspaceAccessControlMode
   collectorTenantId: collectorTenantId
+  signalReaderRoleName: signalReaderRoleName
+  resourceLogReaderRoleDefinitionId: resourceLogReaderRoleDefinitionId
+  resourceLogReaderRoleName: resourceLogReaderRoleName
+  resourceLogAllowedOperations: resourceLogAllowedOperations
+  resourceLogReadScopeIds: resourceLogReadScopeIds
   ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId
+  ipFlowVerifyRoleName: ipFlowVerifyRoleName
   ipFlowVerifyScopeId: ipFlowVerifyScopeId
   ipFlowVerifyAllowedOperations: ipFlowVerifyAllowedOperations
   identityProofAudience: 'api://athena-monitoring-identity-proof'
@@ -181,11 +232,21 @@ output acquisitionCollectorContract object = union(collectorContract, {
   identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'
   identityProofMaximumLifetimeSeconds: 7200
   resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
+  resourceHealthRoleName: resourceHealthRoleName
   resourceHealthScopeIds: resourceHealthScopeIds
   resourceHealthAllowedOperations: resourceHealthAllowedOperations
+  signingKeyArmResourceId: signingKeyArmResourceId
+  signingKeyCryptoUserRoleDefinitionId: signingKeyCryptoUserRoleDefinitionId
+  evidenceContainerResourceId: evidenceContainerResourceId
+  evidenceWriterRoleDefinitionId: evidenceWriterRoleDefinitionId
+  effectiveRbacInventory: effectiveRbacInventory
   allowedReadOperations: concat(
-    collectorContract.allowedReadOperations,
+    filter(
+      collectorContract.allowedReadOperations,
+      operation => !startsWith(toLower(operation), 'microsoft.operationalinsights/workspaces')
+    ),
     ipFlowVerifyAllowedOperations,
-    resourceHealthAllowedOperations
+    resourceHealthAllowedOperations,
+    resourceLogAllowedOperations
   )
 })

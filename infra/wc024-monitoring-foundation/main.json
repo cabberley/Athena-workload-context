@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "11415682578614611303"
+      "templateHash": "12003343252640378418"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -145,6 +145,12 @@
       "type": "string",
       "metadata": {
         "description": "Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI."
+      }
+    },
+    "monitoringEffectiveRbacInventory": {
+      "type": "object",
+      "metadata": {
+        "description": "Externally collected hierarchy-complete effective RBAC inventory for the collector and Athena context identities."
       }
     },
     "retentionDays": {
@@ -1323,7 +1329,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "16997771631998750668"
+              "templateHash": "2677903006420629558"
             }
           },
           "parameters": {
@@ -1473,9 +1479,25 @@
               "type": "string",
               "value": "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
             },
+            "signingKeyArmResourceId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing')]"
+            },
             "signingKeyResourceId": {
               "type": "string",
               "value": "[reference(resourceId('Microsoft.KeyVault/vaults/keys', parameters('keyVaultName'), 'monitoring-evidence-signing'), '2024-11-01').keyUriWithVersion]"
+            },
+            "signingKeyCryptoUserRoleDefinitionId": {
+              "type": "string",
+              "value": "[variables('keyVaultCryptoUserRoleDefinitionId')]"
+            },
+            "evidenceContainerResourceId": {
+              "type": "string",
+              "value": "[variables('validatedMonitoringEvidenceContainerResourceId')]"
+            },
+            "evidenceWriterRoleDefinitionId": {
+              "type": "string",
+              "value": "[variables('storageBlobDataContributorRoleDefinitionId')]"
             }
           }
         }
@@ -2135,9 +2157,6 @@
           "collectorPrincipalId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
           },
-          "workspaceName": {
-            "value": "[parameters('workspaceName')]"
-          },
           "dataCollectionEndpointName": {
             "value": "[parameters('dataCollectionEndpointName')]"
           },
@@ -2159,7 +2178,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "10522317729845480334"
+              "templateHash": "3756952251749225369"
             }
           },
           "parameters": {
@@ -2167,12 +2186,6 @@
               "type": "string",
               "metadata": {
                 "description": "Principal ID of the only identity permitted to read generic monitoring evidence."
-              }
-            },
-            "workspaceName": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact adopted Log Analytics workspace name."
               }
             },
             "dataCollectionEndpointName": {
@@ -2218,12 +2231,6 @@
             "allowedLogTableCondition": "[format('((!(ActionMatches{{''Microsoft.OperationalInsights/workspaces/tables/data/read''}})) OR ({0}))', join(variables('allowedLogTableExpressions'), ' OR '))]"
           },
           "resources": {
-            "workspace": {
-              "existing": true,
-              "type": "Microsoft.OperationalInsights/workspaces",
-              "apiVersion": "2025-02-01",
-              "name": "[parameters('workspaceName')]"
-            },
             "dataCollectionEndpoint": {
               "existing": true,
               "type": "Microsoft.Insights/dataCollectionEndpoints",
@@ -2245,19 +2252,6 @@
               "type": "Microsoft.Insights/privateLinkScopes",
               "apiVersion": "2021-09-01",
               "name": "[parameters('privateLinkScopeNames')[copyIndex()]]"
-            },
-            "collectorWorkspaceDataReader": {
-              "type": "Microsoft.Authorization/roleAssignments",
-              "apiVersion": "2022-04-01",
-              "scope": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]",
-              "name": "[guid(resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName')), parameters('collectorPrincipalId'), variables('logAnalyticsDataReaderRoleDefinitionId'))]",
-              "properties": {
-                "principalId": "[parameters('collectorPrincipalId')]",
-                "principalType": "ServicePrincipal",
-                "roleDefinitionId": "[variables('logAnalyticsDataReaderRoleDefinitionId')]",
-                "condition": "[variables('allowedLogTableCondition')]",
-                "conditionVersion": "2.0"
-              }
             },
             "collectorDataCollectionEndpointReader": {
               "type": "Microsoft.Authorization/roleAssignments",
@@ -2356,7 +2350,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "5039094878902086843"
+              "templateHash": "15015203765212874063"
             }
           },
           "parameters": {
@@ -2396,6 +2390,13 @@
           "variables": {
             "readerRoleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')]",
             "signalReaderRoleDefinitionGuid": "2fda1d90-37da-55d9-8ac3-132fb7bdca5d",
+            "resourceLogReaderRoleDefinitionGuid": "f33a4363-5d9a-5d50-9871-c08582234978",
+            "resourceLogAllowedOperations": [
+              "Microsoft.Insights/logs/Heartbeat/read",
+              "Microsoft.Insights/logs/NTANetAnalytics/read",
+              "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
+              "Microsoft.Insights/logs/VMConnection/read"
+            ],
             "expectedSignalReaderActions": [
               "microsoft.compute/virtualmachines/instanceview/read",
               "microsoft.insights/metrics/read"
@@ -2406,6 +2407,27 @@
             ]
           },
           "resources": [
+            {
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[variables('resourceLogReaderRoleDefinitionGuid')]",
+              "properties": {
+                "roleName": "Athena WC-028 VM Resource Log Reader",
+                "description": "Read only the four reviewed Log Analytics tables through resource-scoped queries at exact approved workload VMs.",
+                "type": "CustomRole",
+                "permissions": [
+                  {
+                    "actions": "[variables('resourceLogAllowedOperations')]",
+                    "notActions": [],
+                    "dataActions": [],
+                    "notDataActions": []
+                  }
+                ],
+                "assignableScopes": [
+                  "[resourceGroup().id]"
+                ]
+              }
+            },
             {
               "type": "Microsoft.Authorization/roleDefinitions",
               "apiVersion": "2022-04-01",
@@ -2441,6 +2463,24 @@
                 "principalType": "ServicePrincipal",
                 "roleDefinitionId": "[if(and(and(and(and(and(and(equals(length(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].dataActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notDataActions)), contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
               }
+            },
+            {
+              "copy": {
+                "name": "collectorVmResourceLogReaders",
+                "count": "[length(parameters('approvedVmNames'))]"
+              },
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Compute/virtualMachines', parameters('approvedVmNames')[copyIndex()])]",
+              "name": "[guid(resourceId('Microsoft.Compute/virtualMachines', parameters('approvedVmNames')[copyIndex()]), parameters('collectorPrincipalId'), resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceLogReaderRoleDefinitionGuid')))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceLogReaderRoleDefinitionGuid'))]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceLogReaderRoleDefinitionGuid'))]"
+              ]
             },
             {
               "copy": {
@@ -2500,9 +2540,33 @@
               "type": "string",
               "value": "[if(and(and(and(and(and(and(equals(length(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions), 1), empty(filter(variables('expectedSignalReaderActions'), lambda('action', not(contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambdaVariables('action'))))))), empty(filter(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].actions, lambda('action', toLower(lambdaVariables('action')))), lambda('action', not(contains(variables('expectedSignalReaderActions'), lambdaVariables('action'))))))), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].dataActions)), empty(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').permissions[0].notDataActions)), contains(map(reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').assignableScopes, lambda('assignableScope', toLower(lambdaVariables('assignableScope')))), toLower(resourceGroup().id))), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), fail('WC-024 requires the exact existing WC-016 signal-reader role and workload resource-group assignable scope.'))]"
             },
+            "signalReaderRoleName": {
+              "type": "string",
+              "value": "[reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('signalReaderRoleDefinitionGuid')), '2022-04-01').roleName]"
+            },
+            "resourceLogReaderRoleDefinitionId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceLogReaderRoleDefinitionGuid'))]"
+            },
+            "resourceLogReaderRoleName": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceLogReaderRoleDefinitionGuid')), '2022-04-01').roleName]"
+            },
+            "resourceLogAllowedOperations": {
+              "type": "array",
+              "value": "[variables('resourceLogAllowedOperations')]"
+            },
+            "resourceLogReadScopeIds": {
+              "type": "array",
+              "value": "[map(parameters('approvedVmNames'), lambda('vmName', resourceId('Microsoft.Compute/virtualMachines', lambdaVariables('vmName'))))]"
+            },
             "resourceHealthRoleDefinitionId": {
               "type": "string",
               "value": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceHealthRoleDefinitionGuid'))]"
+            },
+            "resourceHealthRoleName": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceHealthRoleDefinitionGuid')), '2022-04-01').roleName]"
             },
             "resourceHealthScopeIds": {
               "type": "array",
@@ -2773,7 +2837,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "5014791689174897470"
+              "templateHash": "8698487409585692782"
             }
           },
           "parameters": {
@@ -2866,6 +2930,10 @@
             "ipFlowVerifyRoleDefinitionId": {
               "type": "string",
               "value": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid'))]"
+            },
+            "ipFlowVerifyRoleName": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Authorization/roleDefinitions', variables('ipFlowVerifyRoleDefinitionGuid')), '2022-04-01').roleName]"
             },
             "ipFlowVerifyScopeId": {
               "type": "string",
@@ -3250,11 +3318,29 @@
           "signalReaderRoleDefinitionId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleDefinitionId.value]"
           },
+          "signalReaderRoleName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleName.value]"
+          },
+          "resourceLogReaderRoleDefinitionId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleDefinitionId.value]"
+          },
+          "resourceLogReaderRoleName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleName.value]"
+          },
+          "resourceLogAllowedOperations": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogAllowedOperations.value]"
+          },
+          "resourceLogReadScopeIds": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReadScopeIds.value]"
+          },
           "logAnalyticsDataReaderRoleDefinitionId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsDataReaderRoleDefinitionId.value]"
           },
           "ipFlowVerifyRoleDefinitionId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyRoleDefinitionId.value]"
+          },
+          "ipFlowVerifyRoleName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyRoleName.value]"
           },
           "ipFlowVerifyScopeId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.ipFlowVerifyScopeId.value]"
@@ -3264,6 +3350,9 @@
           },
           "resourceHealthRoleDefinitionId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleDefinitionId.value]"
+          },
+          "resourceHealthRoleName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]"
           },
           "resourceHealthScopeIds": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]"
@@ -3286,9 +3375,22 @@
           "signingKeyResourceId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyResourceId.value]"
           },
+          "signingKeyArmResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyArmResourceId.value]"
+          },
+          "signingKeyCryptoUserRoleDefinitionId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyCryptoUserRoleDefinitionId.value]"
+          },
           "evidenceStorageAccountResourceId": {
             "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
           },
+          "evidenceContainerResourceId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceContainerResourceId.value]"
+          },
+          "evidenceWriterRoleDefinitionId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceWriterRoleDefinitionId.value]"
+          },
+          "effectiveRbacInventory": "[if(and(and(and(equals(parameters('monitoringEffectiveRbacInventory').schemaVersion, 'athena.wc028MonitoringEffectiveRbacInventory.v1'), equals(toLower(parameters('monitoringEffectiveRbacInventory').collectorPrincipalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').athenaContextPrincipalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId))), equals(toLower(parameters('monitoringEffectiveRbacInventory').tenantId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value))), createObject('value', parameters('monitoringEffectiveRbacInventory')), createObject('value', fail('monitoring acquisition requires an externally collected effective RBAC inventory bound to both deployed identities and tenant')))]",
           "maximumEvidenceAgeSeconds": {
             "value": "[parameters('maximumEvidenceAgeSeconds')]"
           },
@@ -3303,7 +3405,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "4086371312349076778"
+              "templateHash": "15134890825805572369"
             }
           },
           "parameters": {
@@ -3400,6 +3502,40 @@
                 "description": "Existing narrow VM signal-reader role definition resource ID."
               }
             },
+            "signalReaderRoleName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact deployed narrow VM signal-reader role name."
+              }
+            },
+            "resourceLogReaderRoleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact custom role definition for resource-context Log Analytics reads."
+              }
+            },
+            "resourceLogReaderRoleName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact custom role name for resource-context Log Analytics reads."
+              }
+            },
+            "resourceLogAllowedOperations": {
+              "type": "array",
+              "minLength": 4,
+              "maxLength": 4,
+              "metadata": {
+                "description": "Exact resource-context log-table actions granted only at approved VMs."
+              }
+            },
+            "resourceLogReadScopeIds": {
+              "type": "array",
+              "minLength": 11,
+              "maxLength": 11,
+              "metadata": {
+                "description": "Exact approved VM scopes receiving the resource-context log role."
+              }
+            },
             "logAnalyticsDataReaderRoleDefinitionId": {
               "type": "string",
               "metadata": {
@@ -3410,6 +3546,12 @@
               "type": "string",
               "metadata": {
                 "description": "Exact custom role definition resource ID for Network Watcher IP Flow Verify."
+              }
+            },
+            "ipFlowVerifyRoleName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact custom role name for Network Watcher IP Flow Verify."
               }
             },
             "ipFlowVerifyScopeId": {
@@ -3430,6 +3572,12 @@
               "type": "string",
               "metadata": {
                 "description": "Exact custom role definition resource ID for Resource Health availability reads."
+              }
+            },
+            "resourceHealthRoleName": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact custom role name for Resource Health availability reads."
               }
             },
             "resourceHealthScopeIds": {
@@ -3484,10 +3632,40 @@
                 "description": "Resource ID of the non-exportable collector signing key."
               }
             },
+            "signingKeyArmResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "ARM resource ID of the non-exportable collector signing key."
+              }
+            },
+            "signingKeyCryptoUserRoleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact Key Vault Crypto User role definition resource ID."
+              }
+            },
             "evidenceStorageAccountResourceId": {
               "type": "string",
               "metadata": {
                 "description": "Resource ID of the monitoring-owned immutable evidence storage account."
+              }
+            },
+            "evidenceContainerResourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact monitoring evidence container receiving immutable evidence writes."
+              }
+            },
+            "evidenceWriterRoleDefinitionId": {
+              "type": "string",
+              "metadata": {
+                "description": "Exact Storage Blob Data Contributor role definition resource ID."
+              }
+            },
+            "effectiveRbacInventory": {
+              "type": "object",
+              "metadata": {
+                "description": "Externally collected, hierarchy-complete effective RBAC inventory for both identities."
               }
             },
             "maximumEvidenceAgeSeconds": {
@@ -3557,7 +3735,8 @@
               "evidenceStorageAccountResourceId": "[parameters('evidenceStorageAccountResourceId')]",
               "evidenceContainerName": "monitoring-evidence",
               "connectionMonitorDeploymentMode": "[variables('validatedConnectionMonitorDeploymentMode')]"
-            }
+            },
+            "validatedAcquisitionWorkspaceAccessControlMode": "[if(equals(parameters('workspaceAccessControlMode'), 'workspaceAndResourceContext'), parameters('workspaceAccessControlMode'), fail('production monitoring acquisition requires resource-context Log Analytics mode'))]"
           },
           "resources": [],
           "outputs": {
@@ -3567,7 +3746,7 @@
             },
             "acquisitionCollectorContract": {
               "type": "object",
-              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v6', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v4', 'collectorTenantId', parameters('collectorTenantId'), 'ipFlowVerifyRoleDefinitionId', parameters('ipFlowVerifyRoleDefinitionId'), 'ipFlowVerifyScopeId', parameters('ipFlowVerifyScopeId'), 'ipFlowVerifyAllowedOperations', parameters('ipFlowVerifyAllowedOperations'), 'identityProofAudience', 'api://athena-monitoring-identity-proof', 'identityProofTokenVersion', '1.0', 'identityProofRequiredRole', 'Athena.MonitoringAcquisition.ProveIdentity', 'identityProofMaximumLifetimeSeconds', 7200, 'resourceHealthRoleDefinitionId', parameters('resourceHealthRoleDefinitionId'), 'resourceHealthScopeIds', parameters('resourceHealthScopeIds'), 'resourceHealthAllowedOperations', parameters('resourceHealthAllowedOperations'), 'allowedReadOperations', concat(variables('collectorContract').allowedReadOperations, parameters('ipFlowVerifyAllowedOperations'), parameters('resourceHealthAllowedOperations'))))]"
+              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v7', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v5', 'workspaceAccessControlMode', variables('validatedAcquisitionWorkspaceAccessControlMode'), 'collectorTenantId', parameters('collectorTenantId'), 'signalReaderRoleName', parameters('signalReaderRoleName'), 'resourceLogReaderRoleDefinitionId', parameters('resourceLogReaderRoleDefinitionId'), 'resourceLogReaderRoleName', parameters('resourceLogReaderRoleName'), 'resourceLogAllowedOperations', parameters('resourceLogAllowedOperations'), 'resourceLogReadScopeIds', parameters('resourceLogReadScopeIds'), 'ipFlowVerifyRoleDefinitionId', parameters('ipFlowVerifyRoleDefinitionId'), 'ipFlowVerifyRoleName', parameters('ipFlowVerifyRoleName'), 'ipFlowVerifyScopeId', parameters('ipFlowVerifyScopeId'), 'ipFlowVerifyAllowedOperations', parameters('ipFlowVerifyAllowedOperations'), 'identityProofAudience', 'api://athena-monitoring-identity-proof', 'identityProofTokenVersion', '1.0', 'identityProofRequiredRole', 'Athena.MonitoringAcquisition.ProveIdentity', 'identityProofMaximumLifetimeSeconds', 7200, 'resourceHealthRoleDefinitionId', parameters('resourceHealthRoleDefinitionId'), 'resourceHealthRoleName', parameters('resourceHealthRoleName'), 'resourceHealthScopeIds', parameters('resourceHealthScopeIds'), 'resourceHealthAllowedOperations', parameters('resourceHealthAllowedOperations'), 'signingKeyArmResourceId', parameters('signingKeyArmResourceId'), 'signingKeyCryptoUserRoleDefinitionId', parameters('signingKeyCryptoUserRoleDefinitionId'), 'evidenceContainerResourceId', parameters('evidenceContainerResourceId'), 'evidenceWriterRoleDefinitionId', parameters('evidenceWriterRoleDefinitionId'), 'effectiveRbacInventory', parameters('effectiveRbacInventory'), 'allowedReadOperations', concat(filter(variables('collectorContract').allowedReadOperations, lambda('operation', not(startsWith(toLower(lambdaVariables('operation')), 'microsoft.operationalinsights/workspaces')))), parameters('ipFlowVerifyAllowedOperations'), parameters('resourceHealthAllowedOperations'), parameters('resourceLogAllowedOperations'))))]"
             }
           }
         }
