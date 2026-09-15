@@ -1,0 +1,81 @@
+{
+  "id": "global-hackathon-2min",
+  "title": "Athena Workload Intelligence",
+  "audience": "Global Hackathon 2026 | AI in Action: Operational Excellence",
+  "maxDurationSeconds": 120,
+  "outputStem": "athena-global-hackathon-2min",
+  "scenes": [
+    {
+      "duration": 9,
+      "kicker": "AI IN ACTION: OPERATIONAL EXCELLENCE",
+      "title": "Azure sees resources.",
+      "subtitle": "Who understands the workload?",
+      "bullets": ["Alerts are evidence.", "Operational meaning depends on context."],
+      "visual": "title"
+    },
+    {
+      "duration": 15,
+      "kicker": "THE CUSTOMER PROBLEM",
+      "title": "Signals are not meaning.",
+      "subtitle": "Operators manually reconstruct the workload during every incident.",
+      "bullets": ["Health", "Topology", "Network", "Changes", "Runbooks"],
+      "visual": "signals"
+    },
+    {
+      "duration": 15,
+      "kicker": "ATHENA WORKLOAD INTELLIGENCE",
+      "title": "We taught Azure what a workload actually is.",
+      "subtitle": "Customer-hosted governed context plus live Azure evidence.",
+      "bullets": ["Primary customers: Azure product teams and workload SREs", "Working Azure proof"],
+      "visual": "context"
+    },
+    {
+      "duration": 18,
+      "kicker": "CONTEXT CHANGES THE ANSWER",
+      "title": "One topology. Three environments.",
+      "subtitle": "Different, correct operational judgments.",
+      "bullets": ["Production", "Development", "Training"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with three-profile comparison"
+    },
+    {
+      "duration": 20,
+      "kicker": "LIVE AZURE PROOF",
+      "title": "From component fault to contextual impact.",
+      "subtitle": "Affected role, contained web tier, operator attention, and evidence lineage.",
+      "bullets": ["Healthy", "Faulted", "Contained impact"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with fault and impact montage"
+    },
+    {
+      "duration": 19,
+      "kicker": "EVIDENCE, NOT GUESSES",
+      "title": "Ranked hypotheses with inspectable confidence.",
+      "subtitle": "Athena shows why it reached a conclusion and what is still unknown.",
+      "bullets": ["Supporting evidence", "Contradictions", "Missing confirmation", "Confidence"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with causality and evidence capture"
+    },
+    {
+      "duration": 13,
+      "kicker": "SAFE OPERATIONAL JUDGMENT",
+      "title": "Verified guidance when available. Human decision.",
+      "subtitle": "Unavailable guidance is explicit. Athena never auto-remediates.",
+      "bullets": ["Guidance state", "Fail closed", "Verified recovery"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with guidance state and recovery"
+    },
+    {
+      "duration": 8,
+      "kicker": "BUSINESS VALUE",
+      "title": "Fragmented Azure signals",
+      "subtitle": "become trusted workload decisions.",
+      "bullets": ["[MEASURED RESULT OR APPROVED TARGET]"],
+      "visual": "close"
+    }
+  ]
+}

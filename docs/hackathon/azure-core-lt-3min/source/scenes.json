@@ -1,0 +1,97 @@
+{
+  "id": "azure-core-lt-3min",
+  "title": "Athena Workload Intelligence",
+  "audience": "Azure Core | Specialized Engineering LT",
+  "maxDurationSeconds": 180,
+  "outputStem": "athena-azure-core-lt-3min",
+  "scenes": [
+    {
+      "duration": 12,
+      "kicker": "ATHENA WORKLOAD INTELLIGENCE",
+      "title": "Azure understands resources.",
+      "subtitle": "Athena understands the workload.",
+      "bullets": ["We taught Azure what a workload actually is."],
+      "visual": "title"
+    },
+    {
+      "duration": 18,
+      "kicker": "THE AZURE-WIDE GAP",
+      "title": "Evidence is distributed. Judgment remains manual.",
+      "subtitle": "Every product team reconstructs workload meaning during incidents.",
+      "bullets": ["Monitoring", "Topology", "Network", "Changes", "Intent", "Guidance"],
+      "visual": "signals"
+    },
+    {
+      "duration": 18,
+      "kicker": "THE MISSING OPERATIONAL LAYER",
+      "title": "Human-owned workload intent.",
+      "subtitle": "Versioned, governed, and bound to live evidence.",
+      "bullets": ["Declared", "Observed", "Inferred", "Exception"],
+      "visual": "context"
+    },
+    {
+      "duration": 20,
+      "kicker": "CONTEXT CHANGES JUDGMENT",
+      "title": "Same evidence. Different environment.",
+      "subtitle": "Production, Development, and Training receive different correct decisions.",
+      "bullets": ["Preserve real risk", "Suppress unsupported advice"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with three-profile policy proof"
+    },
+    {
+      "duration": 23,
+      "kicker": "LIVE AZURE-HOSTED PROOF",
+      "title": "Healthy → Faulted → Contained impact → Recovered",
+      "subtitle": "A complete verified operational lifecycle.",
+      "bullets": ["Affected role", "Contained web tier", "Operator attention", "Evidence lineage"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with lifecycle and impact montage"
+    },
+    {
+      "duration": 21,
+      "kicker": "DETERMINISTIC CORRELATION",
+      "title": "Explainable hypotheses, not generated certainty.",
+      "subtitle": "Every judgment exposes its evidence and limits.",
+      "bullets": ["Supporting", "Contradicting", "Missing", "Confidence"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with network causality and evidence"
+    },
+    {
+      "duration": 20,
+      "kicker": "ENTERPRISE GOVERNANCE",
+      "title": "Athena proposes and explains. Humans decide.",
+      "subtitle": "Exact approved context, explicit guidance state, and no auto-remediation.",
+      "bullets": ["Governed context", "Guidance availability", "Fail closed"],
+      "visual": "capture",
+      "capture": true,
+      "captureLabel": "Replace with governed context and guidance state"
+    },
+    {
+      "duration": 18,
+      "kicker": "AZURE PLATFORM LEVERAGE",
+      "title": "Use existing Azure evidence. Add workload meaning.",
+      "subtitle": "Athena complements Azure MCP and authoritative operational systems.",
+      "bullets": ["Evidence systems", "Workload context", "Trusted judgment"],
+      "visual": "platform"
+    },
+    {
+      "duration": 18,
+      "kicker": "BOUNDED PRODUCT PILOT",
+      "title": "Validate Athena against a second architecture.",
+      "subtitle": "One Azure product. One workload boundary. Measurable outcomes.",
+      "bullets": ["[PRODUCT GROUP]", "[PILOT DURATION]", "[APPROVED OUTCOME]"],
+      "visual": "ask"
+    },
+    {
+      "duration": 8,
+      "kicker": "THE ASK",
+      "title": "Sponsor the pilot.",
+      "subtitle": "Partner on integration. Provide approved operational evidence.",
+      "bullets": ["Azure signals → trusted workload decisions"],
+      "visual": "close"
+    }
+  ]
+}
