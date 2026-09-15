@@ -1,7 +1,7 @@
 targetScope = 'resourceGroup'
 
 metadata name = 'Athena WC-028 monitoring acquisition job'
-metadata description = 'Runs the identity-isolated WC-028 monitoring acquisition coordinator on a bounded schedule or by explicit manual job start.'
+metadata description = 'Runs one freshly reviewed identity-isolated WC-028 monitoring acquisition execution.'
 
 @description('Azure region of the existing private Container Apps managed environment.')
 param location string = resourceGroup().location
@@ -9,8 +9,8 @@ param location string = resourceGroup().location
 @description('Existing internal Container Apps managed environment resource ID.')
 param managedEnvironmentResourceId string
 
-@description('Existing ACR name containing the digest-pinned Athena runtime image.')
-param registryName string
+@description('Existing ACR resource ID containing the digest-pinned Athena runtime image.')
+param registryResourceId string
 
 @description('Existing ACR login server.')
 param registryServer string
@@ -20,6 +20,9 @@ param acquisitionImage string
 
 @description('Existing WC-024 collector user-assigned identity resource ID.')
 param collectorIdentityResourceId string
+
+@description('Existing runtime-support user-assigned identity used only for ACR pull and monitoring-intent public-key reads.')
+param runtimeSupportIdentityResourceId string
 
 @description('Athena context identity resource ID, supplied only for fail-closed separation validation.')
 param athenaContextIdentityResourceId string
@@ -45,33 +48,36 @@ param sourceAuthorityStorageAccountResourceId string
 @description('Exact workload resource group whose Activity Log and Resource Graph change history may be read.')
 param workloadResourceGroupResourceId string
 
-@description('Exact existing Network Watcher resource used only for IP Flow Verify.')
-param networkWatcherResourceId string
-
-@description('Existing WC-025 change-evidence storage account resource ID.')
-param changeEvidenceStorageAccountResourceId string
-
-@description('Existing WC-025 change-evidence container resource ID.')
-param changeEvidenceContainerResourceId string
-
 @description('SHA-256 digest of the reviewed runtime configuration supplied as a secret.')
 @minLength(71)
 @maxLength(71)
 param acquisitionRuntimeConfigurationDigest string
 
+@description('SHA-256 digest emitted by remove-obsolete-collector-rbac.ps1 after exact legacy assignment cleanup.')
+@minLength(71)
+@maxLength(71)
+param legacyCollectorRbacCleanupDigest string
+
 @secure()
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
 
-@description('Bounded five-minute default schedule. The same job may also be started manually.')
-param scheduleCronExpression string = '*/5 * * * *'
-
 @description('Tags applied to the WC-028 job.')
 param tags object = {}
 
-var validatedRegistryName = registryName == toLower(registryName)
-  ? registryName
-  : fail('registryName must be lowercase')
+var registrySegments = split(registryResourceId, '/')
+var registryResourceGroupName = length(registrySegments) == 9 && toLower(
+  registrySegments[1]
+) == 'subscriptions' && toLower(registrySegments[2]) == toLower(
+  subscription().subscriptionId
+) && toLower(registrySegments[3]) == 'resourcegroups' && toLower(
+  registrySegments[5]
+) == 'providers' && toLower(registrySegments[6]) == 'microsoft.containerregistry' && toLower(
+  registrySegments[7]
+) == 'registries' && !empty(registrySegments[4]) && !empty(registrySegments[8])
+  ? registrySegments[4]
+  : fail('registryResourceId must identify one ACR in the deployment subscription')
+var validatedRegistryName = toLower(registrySegments[8])
 var expectedRegistryServer = '${validatedRegistryName}.azurecr.io'
 var validatedRegistryServer = registryServer == toLower(registryServer) && registryServer == expectedRegistryServer
   ? registryServer
@@ -100,13 +106,67 @@ var validatedAcquisitionImage = acquisitionImage == toLower(acquisitionImage) &&
   : fail('acquisitionImage must use the exact registryServer/athena/wc028-monitoring-acquisition repository and a real lowercase sha256 digest')
 var normalizedCollectorIdentityResourceId = toLower(collectorIdentityResourceId)
 var normalizedContextIdentityResourceId = toLower(athenaContextIdentityResourceId)
-var collectorIdentityName = last(split(collectorIdentityResourceId, '/'))
+var normalizedRuntimeSupportIdentityResourceId = toLower(runtimeSupportIdentityResourceId)
+var collectorIdentitySegments = split(collectorIdentityResourceId, '/')
+var collectorIdentityResourceGroupName = length(
+  collectorIdentitySegments
+) == 9 && toLower(collectorIdentitySegments[1]) == 'subscriptions' && toLower(
+  collectorIdentitySegments[2]
+) == toLower(subscription().subscriptionId) && toLower(
+  collectorIdentitySegments[3]
+) == 'resourcegroups' && toLower(collectorIdentitySegments[5]) == 'providers' && toLower(
+  collectorIdentitySegments[6]
+) == 'microsoft.managedidentity' && toLower(
+  collectorIdentitySegments[7]
+) == 'userassignedidentities' && !empty(collectorIdentitySegments[4]) && !empty(
+  collectorIdentitySegments[8]
+)
+  ? collectorIdentitySegments[4]
+  : fail('collectorIdentityResourceId must identify one user-assigned identity in the deployment subscription')
+var collectorIdentityName = collectorIdentitySegments[8]
+resource collectorIdentityResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: collectorIdentityResourceGroupName
+  scope: subscription()
+}
 resource collectorIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: collectorIdentityName
+  scope: collectorIdentityResourceGroup
 }
-var validatedCollectorIdentityResourceId = normalizedCollectorIdentityResourceId == toLower(collectorIdentity.id) && normalizedCollectorIdentityResourceId != normalizedContextIdentityResourceId
+var runtimeSupportIdentitySegments = split(runtimeSupportIdentityResourceId, '/')
+var runtimeSupportIdentityResourceGroupName = length(
+  runtimeSupportIdentitySegments
+) == 9 && toLower(runtimeSupportIdentitySegments[1]) == 'subscriptions' && toLower(
+  runtimeSupportIdentitySegments[2]
+) == toLower(subscription().subscriptionId) && toLower(
+  runtimeSupportIdentitySegments[3]
+) == 'resourcegroups' && toLower(runtimeSupportIdentitySegments[5]) == 'providers' && toLower(
+  runtimeSupportIdentitySegments[6]
+) == 'microsoft.managedidentity' && toLower(
+  runtimeSupportIdentitySegments[7]
+) == 'userassignedidentities' && !empty(runtimeSupportIdentitySegments[4]) && !empty(
+  runtimeSupportIdentitySegments[8]
+)
+  ? runtimeSupportIdentitySegments[4]
+  : fail('runtimeSupportIdentityResourceId must identify one user-assigned identity in the deployment subscription')
+var runtimeSupportIdentityName = runtimeSupportIdentitySegments[8]
+resource runtimeSupportIdentityResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: runtimeSupportIdentityResourceGroupName
+  scope: subscription()
+}
+resource runtimeSupportIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: runtimeSupportIdentityName
+  scope: runtimeSupportIdentityResourceGroup
+}
+var validatedCollectorIdentityResourceId = normalizedCollectorIdentityResourceId == toLower(
+  collectorIdentity.id
+) && normalizedCollectorIdentityResourceId != normalizedContextIdentityResourceId && normalizedCollectorIdentityResourceId != normalizedRuntimeSupportIdentityResourceId
   ? collectorIdentity.id
-  : fail('WC-028 monitoring acquisition must not attach the Athena context identity')
+  : fail('WC-028 collector identity must remain separate from support and Athena context identities')
+var validatedRuntimeSupportIdentityResourceId = normalizedRuntimeSupportIdentityResourceId == toLower(
+  runtimeSupportIdentity.id
+) && normalizedRuntimeSupportIdentityResourceId != normalizedContextIdentityResourceId && normalizedRuntimeSupportIdentityResourceId != normalizedCollectorIdentityResourceId
+  ? runtimeSupportIdentity.id
+  : fail('WC-028 runtime support identity must remain separate from collector and Athena context identities')
 var validatedEvidenceStorageAccountResourceId = toLower(monitoringEvidenceStorageAccountResourceId) != toLower(sourceAuthorityStorageAccountResourceId)
   ? monitoringEvidenceStorageAccountResourceId
   : fail('WC-028 source authority and monitoring evidence must use separate storage accounts')
@@ -116,12 +176,6 @@ var validatedEvidenceContainerResourceId = startsWith(
 ) && endsWith(toLower(monitoringEvidenceContainerResourceId), '/monitoring-evidence')
   ? monitoringEvidenceContainerResourceId
   : fail('WC-028 must reuse the WC-024 monitoring-evidence container')
-var validatedChangeEvidenceContainerResourceId = startsWith(
-  toLower(changeEvidenceContainerResourceId),
-  '${toLower(changeEvidenceStorageAccountResourceId)}/blobservices/default/containers/'
-) && endsWith(toLower(changeEvidenceContainerResourceId), '/change-evidence')
-  ? changeEvidenceContainerResourceId
-  : fail('WC-028 change artifacts must use the WC-025 change-evidence container')
 var validatedSigningKeyUri = contains(
   toLower(monitoringCollectorSigningKeyUriWithVersion),
   '/keys/monitoring-evidence-signing/'
@@ -174,19 +228,33 @@ var validatedConfigurationDigest = acquisitionRuntimeConfigurationDigest == toLo
 ) == 64 && empty(configurationDigestInvalidCharacters)
   ? acquisitionRuntimeConfigurationDigest
   : fail('acquisitionRuntimeConfigurationDigest must be a lowercase SHA-256 digest')
-var validatedSchedule = scheduleCronExpression == '*/5 * * * *'
-  ? scheduleCronExpression
-  : fail('WC-028 production acquisition uses the reviewed bounded five-minute schedule')
+var cleanupDigestCandidate = replace(legacyCollectorRbacCleanupDigest, 'sha256:', '')
+var cleanupDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  cleanupDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var cleanupDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  cleanupDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedLegacyCollectorRbacCleanupDigest = legacyCollectorRbacCleanupDigest == toLower(
+  legacyCollectorRbacCleanupDigest
+) && startsWith(legacyCollectorRbacCleanupDigest, 'sha256:') && length(
+  cleanupDigestCandidate
+) == 64 && empty(cleanupDigestInvalidCharacters)
+  ? legacyCollectorRbacCleanupDigest
+  : fail('legacyCollectorRbacCleanupDigest must be a lowercase SHA-256 digest from the reviewed cleanup script')
 var resourceTags = union(tags, {
   component: 'wc028-monitoring-acquisition'
   dataBoundary: 'customer'
   managedBy: 'bicep'
   autoRemediation: 'disabled'
   runtimeConfigurationDigest: validatedConfigurationDigest
+  legacyCollectorRbacCleanupDigest: validatedLegacyCollectorRbacCleanupDigest
   evidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
   evidenceContainerResourceId: validatedEvidenceContainerResourceId
-  changeEvidenceStorageAccountResourceId: changeEvidenceStorageAccountResourceId
-  changeEvidenceContainerResourceId: validatedChangeEvidenceContainerResourceId
   signingKeyUri: validatedSigningKeyUri
   monitoringIntentSigningKeyUri: validatedMonitoringIntentSigningKeyUri
 })
@@ -195,29 +263,41 @@ var acrPullRoleDefinitionId = subscriptionResourceId(
   '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 )
 
+resource registryResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: registryResourceGroupName
+  scope: subscription()
+}
+
 resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: validatedRegistryName
+  scope: registryResourceGroup
 }
+
+var validatedRegistryResourceId = toLower(registry.id) == toLower(registryResourceId)
+  ? registry.id
+  : fail('registryResourceId does not resolve to the reviewed ACR')
 
 module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
   name: 'wc028-monitoring-acquisition-rbac'
   scope: subscription()
   params: {
     collectorPrincipalId: collectorIdentity.properties.principalId
-    workloadResourceGroupResourceId: workloadResourceGroupResourceId
-    changeEvidenceStorageAccountResourceId: changeEvidenceStorageAccountResourceId
-    changeEvidenceContainerResourceId: validatedChangeEvidenceContainerResourceId
+    runtimeSupportPrincipalId: runtimeSupportIdentity.properties.principalId
+    monitoringEvidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
+    monitoringEvidenceContainerResourceId: validatedEvidenceContainerResourceId
     monitoringIntentSigningKeyResourceId: validatedMonitoringIntentSigningKeyResourceId
   }
 }
 
-resource collectorImagePull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(registry.id, collectorIdentity.id, acrPullRoleDefinitionId)
-  scope: registry
-  properties: {
-    principalId: collectorIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: acrPullRoleDefinitionId
+module runtimeSupportImagePull 'modules/acr-pull-assignment.bicep' = {
+  name: 'wc028-runtime-support-acr-pull'
+  scope: registryResourceGroup
+  params: {
+    registryName: validatedRegistryName
+    expectedRegistryResourceId: validatedRegistryResourceId
+    runtimeSupportPrincipalId: runtimeSupportIdentity.properties.principalId
+    runtimeSupportIdentityResourceId: validatedRuntimeSupportIdentityResourceId
+    acrPullRoleDefinitionId: acrPullRoleDefinitionId
   }
 }
 
@@ -229,23 +309,23 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
     type: 'UserAssigned'
     userAssignedIdentities: {
       '${validatedCollectorIdentityResourceId}': {}
+      '${validatedRuntimeSupportIdentityResourceId}': {}
     }
   }
   properties: {
     environmentId: managedEnvironmentResourceId
     configuration: {
-      triggerType: 'Schedule'
+      triggerType: 'Manual'
       replicaTimeout: 600
-      replicaRetryLimit: 1
-      scheduleTriggerConfig: {
-        cronExpression: validatedSchedule
+      replicaRetryLimit: 0
+      manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
       }
       registries: [
         {
           server: validatedRegistryServer
-          identity: validatedCollectorIdentityResourceId
+          identity: validatedRuntimeSupportIdentityResourceId
         }
       ]
       secrets: [
@@ -272,6 +352,10 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
               value: collectorIdentity.properties.clientId
             }
             {
+              name: 'ATHENA_WC028_RUNTIME_SUPPORT_CLIENT_ID'
+              value: runtimeSupportIdentity.properties.clientId
+            }
+            {
               name: 'ATHENA_WC028_DEPLOYED_COLLECTOR_IDENTITY_RESOURCE_ID'
               value: validatedCollectorIdentityResourceId
             }
@@ -282,6 +366,18 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
             {
               name: 'ATHENA_WC028_DEPLOYED_ATHENA_CONTEXT_IDENTITY_RESOURCE_ID'
               value: athenaContextIdentityResourceId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_RESOURCE_ID'
+              value: validatedRuntimeSupportIdentityResourceId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_CLIENT_ID'
+              value: runtimeSupportIdentity.properties.clientId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_PRINCIPAL_ID'
+              value: runtimeSupportIdentity.properties.principalId
             }
             {
               name: 'ATHENA_WC028_DEPLOYED_SOURCE_STORAGE_ACCOUNT_RESOURCE_ID'
@@ -308,24 +404,16 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
               value: workloadResourceGroupResourceId
             }
             {
-              name: 'ATHENA_WC028_DEPLOYED_NETWORK_WATCHER_RESOURCE_ID'
-              value: networkWatcherResourceId
-            }
-            {
-              name: 'ATHENA_WC028_DEPLOYED_CHANGE_EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID'
-              value: changeEvidenceStorageAccountResourceId
-            }
-            {
-              name: 'ATHENA_WC028_DEPLOYED_CHANGE_EVIDENCE_CONTAINER_RESOURCE_ID'
-              value: validatedChangeEvidenceContainerResourceId
-            }
-            {
               name: 'ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_JSON'
               secretRef: 'wc028-runtime-configuration'
             }
             {
               name: 'ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_DIGEST'
               value: validatedConfigurationDigest
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_LEGACY_COLLECTOR_RBAC_CLEANUP_DIGEST'
+              value: validatedLegacyCollectorRbacCleanupDigest
             }
           ]
           resources: {
@@ -338,7 +426,7 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
   }
   dependsOn: [
     acquisitionRbac
-    collectorImagePull
+    runtimeSupportImagePull
   ]
 }
 

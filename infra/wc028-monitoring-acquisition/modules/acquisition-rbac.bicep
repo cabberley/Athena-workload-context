@@ -3,34 +3,27 @@ targetScope = 'subscription'
 @description('Principal ID of the reused WC-024 monitoring collector identity.')
 param collectorPrincipalId string
 
-@description('Exact workload resource group whose Activity Log and Resource Graph change history may be read.')
-param workloadResourceGroupResourceId string
+@description('Principal ID of the separate WC-028 runtime-support identity.')
+param runtimeSupportPrincipalId string
 
-@description('Existing WC-025 change-evidence storage account resource ID.')
-param changeEvidenceStorageAccountResourceId string
+@description('Existing WC-024 monitoring evidence storage account resource ID.')
+param monitoringEvidenceStorageAccountResourceId string
 
-@description('Existing WC-025 change-evidence container resource ID.')
-param changeEvidenceContainerResourceId string
+@description('Existing WC-024 monitoring evidence container resource ID.')
+param monitoringEvidenceContainerResourceId string
 
 @description('Exact monitoring-intent signing key resource ID whose public key may be read.')
 param monitoringIntentSigningKeyResourceId string
 
 var subscriptionPrefix = toLower('/subscriptions/${subscription().subscriptionId}/')
-var workloadSegments = split(toLower(workloadResourceGroupResourceId), '/')
-var workloadResourceGroupName = length(workloadSegments) == 5 && startsWith(
-  toLower(workloadResourceGroupResourceId),
+var evidenceStorageSegments = split(toLower(monitoringEvidenceStorageAccountResourceId), '/')
+var evidenceStorageResourceGroupName = length(evidenceStorageSegments) == 9 && startsWith(
+  toLower(monitoringEvidenceStorageAccountResourceId),
   '${subscriptionPrefix}resourcegroups/'
-) && !empty(workloadSegments[4])
-  ? workloadSegments[4]
-  : fail('workloadResourceGroupResourceId must be one resource group in the deployment subscription')
-var changeStorageSegments = split(toLower(changeEvidenceStorageAccountResourceId), '/')
-var changeStorageResourceGroupName = length(changeStorageSegments) == 9 && startsWith(
-  toLower(changeEvidenceStorageAccountResourceId),
-  '${subscriptionPrefix}resourcegroups/'
-) && changeStorageSegments[5] == 'providers' && changeStorageSegments[6] == 'microsoft.storage' && changeStorageSegments[7] == 'storageaccounts' && !empty(changeStorageSegments[8])
-  ? changeStorageSegments[4]
-  : fail('changeEvidenceStorageAccountResourceId must be one storage account in the deployment subscription')
-var changeStorageAccountName = changeStorageSegments[8]
+) && evidenceStorageSegments[5] == 'providers' && evidenceStorageSegments[6] == 'microsoft.storage' && evidenceStorageSegments[7] == 'storageaccounts' && !empty(evidenceStorageSegments[8])
+  ? evidenceStorageSegments[4]
+  : fail('monitoringEvidenceStorageAccountResourceId must be one storage account in the deployment subscription')
+var evidenceStorageAccountName = evidenceStorageSegments[8]
 var intentKeySegments = split(toLower(monitoringIntentSigningKeyResourceId), '/')
 var intentKeyResourceGroupName = length(intentKeySegments) == 11 && startsWith(
   toLower(monitoringIntentSigningKeyResourceId),
@@ -41,31 +34,27 @@ var intentKeyResourceGroupName = length(intentKeySegments) == 11 && startsWith(
 var intentKeyVaultName = intentKeySegments[8]
 var intentKeyName = intentKeySegments[10]
 
-resource workloadResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
-  name: workloadResourceGroupName
-}
-
-resource changeStorageResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
-  name: changeStorageResourceGroupName
+resource evidenceStorageResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: evidenceStorageResourceGroupName
 }
 
 resource intentKeyResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
   name: intentKeyResourceGroupName
 }
 
-resource changeEvidenceStorage 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
-  name: changeStorageAccountName
-  scope: changeStorageResourceGroup
+resource monitoringEvidenceStorage 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
+  name: evidenceStorageAccountName
+  scope: evidenceStorageResourceGroup
 }
 
-resource changeEvidenceBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-06-01' existing = {
-  parent: changeEvidenceStorage
+resource monitoringEvidenceBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-06-01' existing = {
+  parent: monitoringEvidenceStorage
   name: 'default'
 }
 
-resource changeEvidenceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-06-01' existing = {
-  parent: changeEvidenceBlobService
-  name: 'change-evidence'
+resource monitoringEvidenceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-06-01' existing = {
+  parent: monitoringEvidenceBlobService
+  name: 'monitoring-evidence'
 }
 
 resource intentKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing = {
@@ -78,61 +67,28 @@ resource monitoringIntentSigningKey 'Microsoft.KeyVault/vaults/keys@2024-11-01' 
   name: intentKeyName
 }
 
-var validatedWorkloadResourceGroupId = toLower(workloadResourceGroup.id) == toLower(
-  workloadResourceGroupResourceId
-)
-  ? workloadResourceGroup.id
-  : fail('workloadResourceGroupResourceId does not resolve to the reviewed resource group')
-var validatedChangeEvidenceContainerResourceId = toLower(
-  changeEvidenceStorage.id
-) == toLower(changeEvidenceStorageAccountResourceId) && toLower(
-  changeEvidenceContainer.id
-) == toLower(changeEvidenceContainerResourceId) && changeEvidenceBlobService.properties.isVersioningEnabled == true
-  ? changeEvidenceContainer.id
-  : fail('change evidence storage bindings must resolve to the versioned WC-025 container')
+var validatedMonitoringEvidenceContainerResourceId = toLower(
+  monitoringEvidenceStorage.id
+) == toLower(monitoringEvidenceStorageAccountResourceId) && toLower(
+  monitoringEvidenceContainer.id
+) == toLower(monitoringEvidenceContainerResourceId)
+  ? monitoringEvidenceContainer.id
+  : fail('monitoring evidence storage bindings must resolve to the exact WC-024 container')
 var validatedMonitoringIntentSigningKeyResourceId = toLower(
   monitoringIntentSigningKey.id
 ) == toLower(monitoringIntentSigningKeyResourceId)
   ? monitoringIntentSigningKey.id
   : fail('monitoring intent key binding does not resolve to the reviewed Key Vault key')
 
-resource boundedAcquisitionReaderRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+resource monitoringEvidenceCreateOnlyRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(
     subscription().id,
-    'athena-wc028-bounded-acquisition-reader',
-    validatedWorkloadResourceGroupId
+    'athena-wc028-monitoring-evidence-create-only',
+    toLower(validatedMonitoringEvidenceContainerResourceId)
   )
   properties: {
-    roleName: 'Athena WC028 Bounded Acquisition Reader'
-    description: 'Read only Activity Log events and Resource Graph change history for the one approved workload resource group.'
-    type: 'CustomRole'
-    permissions: [
-      {
-        actions: [
-          'Microsoft.Insights/eventtypes/values/read'
-          'Microsoft.ResourceGraph/resources/read'
-          'Microsoft.Resources/changes/read'
-        ]
-        notActions: []
-        dataActions: []
-        notDataActions: []
-      }
-    ]
-    assignableScopes: [
-      validatedWorkloadResourceGroupId
-    ]
-  }
-}
-
-resource createOnlyChangeEvidenceRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(
-    subscription().id,
-    'athena-wc028-change-evidence-create-only',
-    toLower(changeEvidenceContainerResourceId)
-  )
-  properties: {
-    roleName: 'Athena WC028 Change Evidence Create-Only Writer'
-    description: 'Read one known Blob and create one conditionally named change-evidence Blob without list or delete permissions.'
+    roleName: 'Athena WC028 Monitoring Evidence Create-Only Writer'
+    description: 'Read exact known monitoring evidence Blobs and create new Blobs without overwrite, list, or delete permission.'
     type: 'CustomRole'
     permissions: [
       {
@@ -140,13 +96,13 @@ resource createOnlyChangeEvidenceRole 'Microsoft.Authorization/roleDefinitions@2
         notActions: []
         dataActions: [
           'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
-          'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
+          'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'
         ]
         notDataActions: []
       }
     ]
     assignableScopes: [
-      changeStorageResourceGroup.id
+      evidenceStorageResourceGroup.id
     ]
   }
 }
@@ -177,31 +133,22 @@ resource monitoringIntentKeyReaderRole 'Microsoft.Authorization/roleDefinitions@
   }
 }
 
-module collectorBoundedAcquisitionReader 'workload-reader-assignment.bicep' = {
-  name: 'wc028-workload-reader-assignment'
-  scope: workloadResourceGroup
-  params: {
-    collectorPrincipalId: collectorPrincipalId
-    roleDefinitionId: boundedAcquisitionReaderRole.id
-  }
-}
-
-module collectorChangeEvidenceWriter 'change-evidence-writer-assignment.bicep' = {
-  name: 'wc028-change-evidence-writer-assignment'
-  scope: changeStorageResourceGroup
+module collectorMonitoringEvidenceWriter 'monitoring-evidence-writer-assignment.bicep' = {
+  name: 'wc028-monitoring-evidence-writer-assignment'
+  scope: evidenceStorageResourceGroup
   params: {
     principalId: collectorPrincipalId
-    roleDefinitionId: createOnlyChangeEvidenceRole.id
-    storageAccountName: changeEvidenceStorage.name
-    expectedContainerResourceId: validatedChangeEvidenceContainerResourceId
+    roleDefinitionId: monitoringEvidenceCreateOnlyRole.id
+    storageAccountName: monitoringEvidenceStorage.name
+    expectedContainerResourceId: validatedMonitoringEvidenceContainerResourceId
   }
 }
 
-module collectorMonitoringIntentKeyReader 'key-reader-assignment.bicep' = {
+module runtimeSupportMonitoringIntentKeyReader 'key-reader-assignment.bicep' = {
   name: 'wc028-monitoring-intent-key-reader-assignment'
   scope: intentKeyResourceGroup
   params: {
-    principalId: collectorPrincipalId
+    principalId: runtimeSupportPrincipalId
     roleDefinitionId: monitoringIntentKeyReaderRole.id
     vaultName: intentKeyVault.name
     keyName: monitoringIntentSigningKey.name
@@ -209,6 +156,5 @@ module collectorMonitoringIntentKeyReader 'key-reader-assignment.bicep' = {
   }
 }
 
-output boundedAcquisitionReaderRoleDefinitionId string = boundedAcquisitionReaderRole.id
-output createOnlyChangeEvidenceRoleDefinitionId string = createOnlyChangeEvidenceRole.id
+output monitoringEvidenceCreateOnlyRoleDefinitionId string = monitoringEvidenceCreateOnlyRole.id
 output monitoringIntentKeyReaderRoleDefinitionId string = monitoringIntentKeyReaderRole.id
