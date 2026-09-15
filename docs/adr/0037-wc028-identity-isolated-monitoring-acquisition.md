@@ -11,10 +11,10 @@ does not define how Azure evidence is requested. Allowing callers to supply KQL,
 source-specific filters would bypass published monitoring intent. Independently persisting source
 results could also expose partial evidence as complete.
 
-Azure Monitor and Network Watcher sources have important uncertainty. Missing rows are not proof
-of zero events. Traffic Analytics is aggregated rather than packet-level evidence. IP Flow Verify
-is a point-in-time test rather than historical proof. VMConnection addresses can map to more than
-one resource.
+Azure Monitor sources have important uncertainty. Missing rows are not proof of zero events.
+Resource-context authorization applies only to registered resource-side table actions, while
+Traffic Analytics and custom flow tables generally require workspace-context data access. A table
+role exposes every row in that table; KQL filtering is not an authorization boundary.
 
 ## Decision
 
@@ -29,20 +29,19 @@ The coordinator:
 - exposes no caller-supplied query, table, column, filter, resource-scope, or time-window input;
 - derives exact Log Analytics queries, Activity Log filters, Resource Graph scopes, Resource
   Health filters, and bounded windows from the verified intent plus reviewed constants;
-- emits Log Analytics request v2 with the collector execution timestamp and the exact
-  authority-selected `EvidenceCoverageScope`; source clients return raw rows plus bounded response
-  metadata while `collectedAt` and coverage remain explicit request-bound values, including prior
-  windows and zero-row network queries;
+- emits Log Analytics request v3 with the collector execution timestamp, exact
+  authority-selected `EvidenceCoverageScope`, required `_ResourceId`, and
+  `Prefer: include-permissions=true`; current responses must retain exact resource/workspace
+  permission evidence with no denied tables or silent exclusions;
 - accepts only the production `AzureMonitoringAdapter`, which internally creates one direct
   `ManagedIdentityCredential(client_id=<reviewed client ID>)`; after identity proof succeeds, the
   adapter passes that exact credential object to each Azure client so the SDK can legitimately
   acquire its own service-audience token without exposing or parsing ARM or Log Analytics tokens;
-- implements those five production clients over Azure Core authenticated transports with fixed
-  public Azure endpoints and audiences: resource-centric Azure Monitor Logs, exact-resource
-  Activity Log filters, generated bounded Resource Graph change queries, per-VM Resource Health
-  availability history, and the contract-pinned Network Watcher IP Flow operation; redirects,
-  caller-selected endpoints, unbounded pagination, malformed JSON, partial query errors, oversized
-  payloads, and unsuccessful responses fail closed;
+- implements credential-bound clients over Azure Core authenticated transports with fixed public
+  Azure endpoints and audiences: resource-centric Azure Monitor Logs, exact-resource Activity Log
+  filters, generated bounded Resource Graph change queries, and the per-VM Resource Health current
+  endpoint. The historical IP Flow client remains parseable but current contract v8 rejects it
+  before transport;
 - normalizes Azure service values, resource IDs, UTC timestamps, enums, dynamic resource-candidate
   arrays, row ordering, truncation markers, and response byte counts into the existing strict
   acquisition result contracts while retaining duplicate source rows for downstream ambiguity
@@ -110,32 +109,21 @@ The coordinator:
   timestamp, operation, and result, rejecting duplicate pair keys;
 - omits ambiguous VMConnection and Traffic Analytics IP-to-resource mappings rather than selecting
   a candidate or claiming causality;
-- issues IP Flow Verify as its own identity-bound, request-digest-bound point-in-time read after
-  an unambiguous Traffic Analytics mapping, and permits direct NSG attribution only when one
-  successful, earlier, deny-introducing change matches its exact denied rule result;
-- before an IP Flow call, requires the Traffic Analytics row to match the selected authority
-  binding's exact path, direction, five-tuple digest, and absent endpoint-test fields, permits only
-  TCP or UDP, derives the local target from direction, and requires that target to be an approved
-  in-scope VM; mismatched ports, protocols, directions, or non-VM targets become unavailable
-  coverage with zero IP Flow calls;
-- before that call, also constructs the complete persistable network-flow record, requires a
-  retained `ruleResourceId`, and proves that every retained field represents exactly the complete
-  published resource scope; unusable rows therefore issue zero IP Flow calls, and every successful
-  IP Flow exchange is required to map one-to-one to a retained network-flow record;
-- rejects Traffic Analytics responses with more than one row before issuing any IP Flow calls, and
-  rejects all further reads once the authority's total acquisition-call budget is exhausted;
-- when a selected Traffic Analytics query returns no usable flow row, emits unavailable network
-  coverage and its actual Log Analytics exchange only; no IP Flow call or source-specific proof is
-  created, while the acquisition-wide Athena identity proof remains bound to every emitted exchange;
-- persists IP Flow access, exact returned rule resource when available, collector-owned check time,
-  and result digest into the retained flow record and normalized observation; a point-in-time
-  `Allow` result no longer contributes denied-flow support in correlation, while a `Deny` result
-  can support the historical denied flow and exact-rule attribution;
-- captures every source call start inside the execution boundary, validates proof lifetime,
-  execution freshness, and monotonicity before invoking transport, constructs IP Flow requests from
-  that captured instant, and rejects any caller override that differs from the live call start;
-- always marks Traffic Analytics coverage partial and records both its aggregation limitation and
-  IP Flow Verify's point-in-time limitation;
+- treats `NTANetAnalytics`, `AzureNetworkAnalytics_CL`, and Connection Monitor workspace tables as
+  unsupported for current acquisition because the design has no dedicated or ABAC-isolated
+  workspace/table boundary; each control emits deterministic unavailable coverage with zero Log
+  Analytics and zero IP Flow calls;
+- does not grant or publish any IP Flow Verify role, assignment, or current collector operation;
+  KQL `_ResourceId` predicates are retained only as an exact query/output binding and are never
+  treated as authorization for workspace-context flow tables;
+- requires the adopted workspace to have
+  `enableLogAccessUsingOnlyResourcePermissions=true`, the exact supported tables to use the
+  `Analytics` plan, and every returned `_ResourceId` to equal the reviewed VM target;
+- retains the normalized Logs `permissions` payload in signed coverage, binds it to each resulting
+  observation, and fails closed if the response omits the target resource, workspace data source,
+  or reports any denied table;
+- captures every actual source call start inside the execution boundary and validates proof
+  lifetime, execution freshness, and monotonicity before invoking transport;
 - marks missing, truncated, ambiguous, or otherwise incomplete results as unavailable, truncated,
   or partial coverage with an explicit manual-investigation reason rather than producing a zero;
   and
@@ -145,28 +133,20 @@ The coordinator:
   budgeting, then requires those controls to satisfy exactly `requiredCoverageScopeDigests`; records,
   observations, coverage, and incident selection therefore remain one governed unit. Supporting
   Activity Log controls without their own required coverage are not executed.
-- provisions one custom Network Watcher role with only
-  `Microsoft.Network/networkWatchers/ipFlowVerify/action` and
-  `Microsoft.Network/networkWatchers/ipFlowVerify/read`, makes it assignable only in
-  `NetworkWatcherRG`, and assigns it only at the exact
-  `NetworkWatcher_australiaeast` resource; the existing built-in Reader assignment remains scoped
-  only to the canonical flow-log child;
-- publishes the exact IP Flow role-definition ID, Network Watcher assignment scope, and two-action
-  allowlist in production collector contract v7, alongside the collector tenant/client/object
-  identity, Athena proof audience/version/role/lifetime, acquisition receipt v5 schema, and the
-  Resource Health permission contract;
 - provisions a separate Resource Health custom role containing only
-  `Microsoft.ResourceHealth/AvailabilityStatuses/read`, makes it assignable only in
+  `Microsoft.ResourceHealth/AvailabilityStatuses/current/read`, makes it assignable only in
   `rg-athena-demo-workload`, and assigns it independently at each exact approved VM; built-in
   Reader remains limited to the already reviewed DCR/DCE-association and flow-log child resources.
 - provisions a separate WC-028 resource-log role with only
-  `Microsoft.Insights/logs/Heartbeat/read`,
-  `Microsoft.Insights/logs/VMConnection/read`,
-  `Microsoft.Insights/logs/NWConnectionMonitorTestResult/read`, and
-  `Microsoft.Insights/logs/NTANetAnalytics/read`, assigns it only at the 11 exact approved VMs, and
-  leaves the shared WC-016 resource-group signal role unchanged; collector contract v7 carries no
-  effective workspace data-reader assignment, and production clients accept only resource-context
-  targets so they cannot fall back to workspace-context queries.
+  `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
+  `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA
+  or Connection Monitor table action.
+- provisions a physically separate RBAC attestor UAMI with only
+  `roleAssignments/read`, `roleDefinitions/read`, `denyAssignments/read`, and
+  `roleAssignmentScheduleInstances/read` at the subscription. Effective RBAC inventory v2 binds
+  exact-target `atScope() and assignedTo(principalId)` results for collector and context
+  principals, complete role definitions, applicable denies, active PIM instances, transitive
+  groups, raw page hashes, freshness, and repeated-read stability.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -189,7 +169,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
   adapter or emit production receipts.
 - Empty aggregate defaults cannot become healthy or complete evidence.
 - Optional controls cannot select an incident outside the required runtime coverage unit.
-- Traffic Analytics cardinality cannot amplify one query into unbounded IP Flow calls.
+- Traffic Analytics cardinality cannot trigger any current acquisition call.
 - A source failure cannot commit a partial monitoring bundle.
 - Coverage and returned acquisition outcomes preserve limitations for operator investigation.
 - Only coverage scopes required by the exact published runtime binding enter the atomic batch;
@@ -199,19 +179,20 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Receipt-bearing acquisitions use `athena.wc028MonitoringEvidenceBundle.v3` and
   `athena.wc028MonitoringEvidenceHandoff.v2`; legacy collection paths remain on their existing
   versioned contracts and cannot silently add receipt fields.
-- The deployment publishes `athena.wc028MonitoringCollectorContract.v7` while retaining parse
-  support for WC-024 v2 and legacy WC-028 v3-v6 contracts. Production verification requires the
-  full reviewed v7 contract, resource-context log role, measured effective RBAC inventory, identity
-  proof, and Resource Health policies.
+- The deployment publishes `athena.wc028MonitoringCollectorContract.v8` while retaining parse
+  support for WC-024 v2 and legacy WC-028 v3-v7 contracts. Production verification requires the
+  full reviewed v8 contract, permission-attested resource-context logs, effective RBAC inventory
+  v2, separate attestor identity, identity proof, and current Resource Health policy.
 - Legacy acquisition-authority v1-v4 documents remain readable, but only v5 authorities can execute
   production acquisition. Production receipt verification requires receipt v5 and derives deployed
-  tenant/client/object/resource identity, proof policy, and IP Flow policy from the full reviewed
+  tenant/client/object/resource identity and proof policy from the full reviewed
   collector contract rather than caller assertions.
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
-- This slice adds the narrow IP Flow role and exact Network Watcher assignment, one separate narrow
-  Resource Health role, and one separate four-table resource-log role with exact per-VM
-  assignments. It leaves the shared WC-016 resource-group role unchanged and adds no Reader
+- This slice removes the IP Flow role and Network Watcher assignment, adds one separate narrow
+  Resource Health current-status role, one separate five-table resource-log role with exact per-VM
+  assignments, and one separate read-only RBAC attestor role. It leaves the shared WC-016
+  resource-group role unchanged and adds no Reader
   broadening, diagnostic setting, alert, query deployment, Connection Monitor mutation, or write
   permission.
 
@@ -230,8 +211,9 @@ ambiguous incident transitions fail before the persistence transaction is entere
   validated.
 - **Use `DefaultAzureCredential` in production:** rejected because a local or chained credential
   can select an identity other than the reviewed managed identity.
-- **Assign Reader at the Network Watcher:** rejected because IP Flow Verify needs only two exact
-  actions and broad Reader would enlarge the management-plane read surface.
+- **Assign Reader or IP Flow permissions at the Network Watcher:** rejected because current
+  acquisition does not execute flow verification and the existing Reader remains scoped only to
+  the canonical flow-log child.
 - **Treat no rows as zero:** rejected because ingestion gaps, latency, retention, and truncation are
   indistinguishable from a genuine zero without additional proof.
 - **Use Traffic Analytics or IP Flow Verify alone as historical causality:** rejected because one
@@ -259,22 +241,17 @@ ambiguous incident transitions fail before the persistence transaction is entere
   shared mutable fixture state.
 - An authority issued for another context binding, required-coverage set, or control selection
   fails before credential acquisition and produces zero source calls.
-- Missing or incorrect IP Flow role ID, exact Network Watcher scope, two-action allowlist, or
-  receipt schema fails collector-contract validation before external I/O.
+- Any current IP Flow role, unregistered resource-side table action, missing Analytics plan,
+  disabled resource-only workspace access, or missing permissions response fails before trusted
+  use.
 - Source schema, freshness, time, row, and byte bounds fail closed.
 - Missing and truncated data produce manual-investigation coverage.
 - Ambiguous VMConnection mappings do not become endpoint evidence.
-- IP Flow Verify has an independent exact request/result binding and cannot be smuggled inside
-  Traffic Analytics rows.
-- Empty or unusable Traffic Analytics results produce deterministic unavailable coverage, no IP
-  Flow exchange, and a valid receipt v5 with no orphan source proof.
-- Mismatched Traffic Analytics port, protocol, direction, or non-VM local target produces
-  unavailable coverage and zero IP Flow calls before any point-in-time verification request.
-- Missing `ruleResourceId` or a row whose retained fields cannot represent the full published flow
-  scope produces unavailable coverage, zero IP Flow calls, zero IP Flow exchanges, and no retained
-  network-flow record; valid calls retain exactly one record per exchange.
-- Log request v2 tests bind current and prior windows, collector execution time, and exact
-  authority coverage without module globals; zero-row network queries retain that exact scope.
+- Every Traffic Analytics or custom flow-table control produces deterministic unavailable
+  coverage, zero Log Analytics calls, zero IP Flow calls, and no retained network-flow record.
+- Log request v3 tests bind current and prior windows, collector execution time, `_ResourceId`,
+  exact authority coverage, the permissions response, and the `Prefer` header without module
+  globals.
 - IaC and contract tests require the exact Resource Health role ID, one allowed operation, and all
   11 approved VM scopes while proving Reader was not broadened.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
@@ -286,10 +263,9 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Extra authority resources, stale effective RBAC evidence, inherited or group-derived unexpected
   roles, changed assignment conditions, incomplete hierarchy evidence, workspace-context query
   targets, and persisted out-of-contract resources all fail before trusted use.
-- Identical Traffic Analytics input with IP Flow `Allow` versus `Deny` produces different signed
-  batches and correlation support, and a stale or backdated call override executes zero transport
-  calls.
-- Forged source identity claims, caller-backdated collection/IP Flow time, unproved aggregate zero,
+- Identical unsupported flow input produces identical unavailable signed evidence regardless of
+  hypothetical IP Flow results, with zero transport calls.
+- Forged source identity claims, caller-backdated collection time, unproved aggregate zero,
   optional incident controls, excessive Traffic Analytics cardinality, and acquisition-call budget
   exhaustion all fail closed in adversarial tests.
 - More than one persistable row from one exact query execution fails closed rather than weakening

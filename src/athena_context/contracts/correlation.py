@@ -23,6 +23,7 @@ from athena_context.contracts.monitoring import (
     MonitoringAcquisitionReceipt,
     MonitoringEvidenceHandoff,
     MonitoringIpFlowProvenance,
+    MonitoringLogPermissionEvidence,
     MonitoringSelectedIncident,
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
@@ -470,6 +471,10 @@ class _MonitoringObservation(_StrictCorrelationModel):
     query_execution_digest: Sha256Digest | None = Field(
         default=None,
         alias="queryExecutionDigest",
+    )
+    permission_evidence_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="permissionEvidenceDigest",
     )
     observation_digest: Sha256Digest = Field(alias="observationDigest")
 
@@ -1011,6 +1016,10 @@ class EvidenceCoverage(_StrictCorrelationModel):
         alias="queryExecutionDigests",
         max_length=1440,
     )
+    log_permission_evidence: MonitoringLogPermissionEvidence | None = Field(
+        default=None,
+        alias="logPermissionEvidence",
+    )
     status: CoverageStatus
     detail: str | None = Field(default=None, min_length=1, max_length=500)
     coverage_digest: Sha256Digest = Field(alias="coverageDigest")
@@ -1080,7 +1089,7 @@ class MonitoringAcquisitionEvidenceManifest(_StrictCorrelationModel):
         alias="normalizedEvidenceDigest"
     )
     exchanges: tuple[MonitoringAcquisitionExchange, ...] = Field(
-        min_length=1,
+        min_length=0,
         max_length=32,
     )
     manifest_digest: Sha256Digest = Field(alias="manifestDigest")
@@ -1311,6 +1320,15 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                             raise ValueError(
                                 "IP Flow provenance does not bind its exact signed exchange"
                             )
+                    if any(
+                        item.family in {"guest", "endpointHealth"}
+                        and item.log_permission_evidence is None
+                        for item in self.coverage
+                    ):
+                        raise ValueError(
+                            "current resource-context coverage requires retained Logs "
+                            "permission evidence"
+                        )
                 if (
                     self.acquisition_receipt.collector_contract_digest
                     != self.monitoring_contract_digest
@@ -1369,6 +1387,13 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                 raise ValueError(
                     "every query observation must be covered exactly once"
                 )
+            current_permission_evidence_required = (
+                self.schema_version
+                == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                and self.acquisition_receipt is not None
+                and self.acquisition_receipt.schema_version
+                == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+            )
             for digest, observation in observations_by_execution.items():
                 coverage_item = coverage_by_execution[digest][0]
                 observation_provenance = observation.control_provenance
@@ -1386,6 +1411,15 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                 ):
                     raise ValueError(
                         "query observation coverage is incompatible with its scope or control"
+                    )
+                if current_permission_evidence_required and (
+                    observation.permission_evidence_digest is None
+                    or coverage_item.log_permission_evidence is None
+                    or observation.permission_evidence_digest
+                    != coverage_item.log_permission_evidence.evidence_digest
+                ):
+                    raise ValueError(
+                        "current query observation lacks exact persisted Logs permission evidence"
                     )
                 if isinstance(
                     observation,

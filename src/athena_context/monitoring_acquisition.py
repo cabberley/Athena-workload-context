@@ -56,6 +56,9 @@ from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDa
 from athena_context.contracts.monitoring import (
     MonitoringEffectiveRbacInventory,
     MonitoringIpFlowProvenance,
+    MonitoringLogPermissionDataSource,
+    MonitoringLogPermissionEvidence,
+    MonitoringLogPermissionResource,
     MonitoringSelectedIncident,
 )
 from athena_context.monitoring_collection import (
@@ -167,6 +170,24 @@ _LOG_COLUMNS: dict[str, tuple[str, ...]] = {
         "observedEnd",
     ),
 }
+_SUPPORTED_RESOURCE_CONTEXT_QUERY_TABLES = frozenset(
+    {
+        "Heartbeat",
+        "VMConnection",
+    }
+)
+_UNSUPPORTED_FLOW_QUERY_TABLES = frozenset(
+    {
+        "AzureNetworkAnalytics_CL",
+        "NTANetAnalytics",
+    }
+)
+_UNSUPPORTED_WORKSPACE_QUERY_TABLES = frozenset(
+    {
+        "NWConnectionMonitorTestResult",
+        *_UNSUPPORTED_FLOW_QUERY_TABLES,
+    }
+)
 _ACTIVITY_COLUMNS = (
     "category",
     "operationName",
@@ -272,12 +293,12 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     collector_contract_digest: Sha256Digest = Field(alias="collectorContractDigest")
     allowed_sources: tuple[AcquisitionSource, ...] = Field(
         alias="allowedSources",
-        min_length=1,
+        min_length=0,
         max_length=5,
     )
     allowed_resource_ids: tuple[str, ...] = Field(
         alias="allowedResourceIds",
-        min_length=1,
+        min_length=0,
         max_length=256,
     )
     required_control_ids: tuple[str, ...] | None = Field(
@@ -801,6 +822,7 @@ class LogAnalyticsQueryRequest(_AcquisitionRequest):
     schema_version: Literal[
         "athena.wc028LogAnalyticsQueryRequest.v1",
         "athena.wc028LogAnalyticsQueryRequest.v2",
+        "athena.wc028LogAnalyticsQueryRequest.v3",
     ] = Field(alias="schemaVersion")
     source: Literal["logAnalytics"]
     table: Literal[
@@ -825,6 +847,14 @@ class LogAnalyticsQueryRequest(_AcquisitionRequest):
         default=None,
         alias="coverageScope",
     )
+    resource_id_column: Literal["_ResourceId"] | None = Field(
+        default=None,
+        alias="resourceIdColumn",
+    )
+    prefer_header: Literal["include-permissions=true"] | None = Field(
+        default=None,
+        alias="preferHeader",
+    )
 
     @field_validator("query_target_resource_id")
     @classmethod
@@ -833,21 +863,55 @@ class LogAnalyticsQueryRequest(_AcquisitionRequest):
 
     @model_validator(mode="after")
     def validate_query_request(self) -> LogAnalyticsQueryRequest:
-        if self.expected_columns != _LOG_COLUMNS[self.table]:
+        expected_columns = (
+            ("_ResourceId", *_LOG_COLUMNS[self.table])
+            if self.schema_version == "athena.wc028LogAnalyticsQueryRequest.v3"
+            else _LOG_COLUMNS[self.table]
+        )
+        if self.expected_columns != expected_columns:
             raise ValueError("log query expected columns do not match the reviewed source schema")
         if self.query_digest != sha256_hex(self.query.encode("utf-8")):
             raise ValueError("queryDigest does not bind the exact reviewed query")
         if self.schema_version == "athena.wc028LogAnalyticsQueryRequest.v1":
-            if self.collector_execution_time is not None or self.coverage_scope is not None:
+            if (
+                self.collector_execution_time is not None
+                or self.coverage_scope is not None
+                or self.resource_id_column is not None
+                or self.prefer_header is not None
+            ):
                 raise ValueError("legacy log query request cannot contain execution scope")
+        elif self.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2":
+            if (
+                self.collector_execution_time is None
+                or self.coverage_scope is None
+                or self.resource_id_column is not None
+                or self.prefer_header is not None
+                or self.window_end > self.collector_execution_time
+                or self.coverage_scope.query_scope_digest != self.control_digest
+            ):
+                raise ValueError(
+                    "historical production log query request has invalid execution scope"
+                )
         elif (
             self.collector_execution_time is None
             or self.coverage_scope is None
+            or self.resource_id_column != "_ResourceId"
+            or self.prefer_header != "include-permissions=true"
             or self.window_end > self.collector_execution_time
             or self.coverage_scope.query_scope_digest != self.control_digest
+            or self.table not in {"Heartbeat", "VMConnection"}
+            or re.search(
+                (
+                    r"(?i)\bwhere\s+_ResourceId\s*=~\s*'"
+                    + re.escape(self.query_target_resource_id)
+                    + r"'"
+                ),
+                self.query,
+            )
+            is None
         ):
             raise ValueError(
-                "production log query request requires exact execution time and coverage scope"
+                "current log query request requires exact resource-context permission scope"
             )
         return self
 
@@ -1290,7 +1354,10 @@ class LogAggregateCompletenessProof(_StrictAcquisitionModel):
 
 
 class LogAnalyticsQueryResult(_AcquisitionResult):
-    schema_version: Literal["athena.wc028LogAnalyticsQueryResult.v1"] = Field(alias="schemaVersion")
+    schema_version: Literal[
+        "athena.wc028LogAnalyticsQueryResult.v1",
+        "athena.wc028LogAnalyticsQueryResult.v2",
+    ] = Field(alias="schemaVersion")
     source: Literal["logAnalytics"]
     table: Literal[
         "Heartbeat",
@@ -1305,6 +1372,10 @@ class LogAnalyticsQueryResult(_AcquisitionResult):
     aggregate_completeness_proof: LogAggregateCompletenessProof | None = Field(
         default=None,
         alias="aggregateCompletenessProof",
+    )
+    permission_evidence: MonitoringLogPermissionEvidence | None = Field(
+        default=None,
+        alias="permissionEvidence",
     )
     rows: tuple[LogAnalyticsRow, ...] = Field(max_length=MAX_ACQUISITION_ROWS)
 
@@ -1330,6 +1401,20 @@ class LogAnalyticsQueryResult(_AcquisitionResult):
         }:
             raise ValueError(
                 "aggregate completeness proof is only valid for reviewed aggregate queries"
+            )
+        if (
+            self.schema_version == "athena.wc028LogAnalyticsQueryResult.v1"
+            and self.permission_evidence is not None
+        ) or (
+            self.schema_version == "athena.wc028LogAnalyticsQueryResult.v2"
+            and (
+                self.permission_evidence is None
+                or self.table not in {"Heartbeat", "VMConnection"}
+                or self.permission_evidence.table != self.table
+            )
+        ):
+            raise ValueError(
+                "current Log Analytics result requires exact retained permission evidence"
             )
         return self
 
@@ -1786,6 +1871,15 @@ def _normalize_log_analytics_row(
             "Log Analytics row does not match the reviewed column count"
         )
     row = dict(zip(request.expected_columns, row_values, strict=True))
+    if request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v3":
+        row_resource_id = _canonical_resource_id(
+            _azure_text(
+                row["_ResourceId"],
+                "Log Analytics _ResourceId",
+            )
+        )
+        if row_resource_id != request.query_target_resource_id:
+            raise MonitoringAcquisitionError("Log Analytics row escaped the exact _ResourceId")
     if request.table == "Heartbeat":
         return HeartbeatRow(
             rowKind="heartbeat",
@@ -1937,6 +2031,97 @@ def _normalize_log_analytics_row(
     )
 
 
+def _azure_permission_tables(value: object | None, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(
+        sorted(
+            (_azure_text(item, name, maximum=256) for item in _azure_list(value, name)),
+            key=str.casefold,
+        )
+    )
+
+
+def _log_permission_evidence(
+    value: object,
+    *,
+    request: LogAnalyticsQueryRequest,
+    workspace_resource_id: str,
+) -> MonitoringLogPermissionEvidence:
+    normalized_workspace_resource_id = workspace_resource_id.casefold().rstrip("/")
+    permissions = _azure_mapping(value, "Log Analytics permissions")
+    raw_resources = _azure_list(
+        permissions.get("resources"),
+        "Log Analytics permission resources",
+    )
+    raw_data_sources = _azure_list(
+        permissions.get("dataSources"),
+        "Log Analytics permission dataSources",
+    )
+    if len(raw_resources) != 1 or len(raw_data_sources) != 1:
+        raise MonitoringAcquisitionError(
+            "Log Analytics permissions omitted an exact resource or workspace"
+        )
+    resource = _azure_mapping(
+        raw_resources[0],
+        "Log Analytics permission resource",
+    )
+    data_source = _azure_mapping(
+        raw_data_sources[0],
+        "Log Analytics permission data source",
+    )
+    normalized_resource = MonitoringLogPermissionResource(
+        resourceId=_azure_text(
+            resource.get("resourceId"),
+            "Log Analytics permission resourceId",
+        ),
+        dataSourceIds=tuple(
+            _azure_text(
+                item,
+                "Log Analytics permission resource dataSource",
+            )
+            for item in _azure_list(
+                resource.get("dataSources"),
+                "Log Analytics permission resource dataSources",
+            )
+        ),
+        denyTables=_azure_permission_tables(
+            resource.get("denyTables"),
+            "Log Analytics permission resource denyTable",
+        ),
+    )
+    normalized_data_source = MonitoringLogPermissionDataSource(
+        resourceId=_azure_text(
+            data_source.get("resourceId"),
+            "Log Analytics permission data source resourceId",
+        ),
+        denyTables=_azure_permission_tables(
+            data_source.get("denyTables"),
+            "Log Analytics permission data source denyTable",
+        ),
+    )
+    evidence_payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringLogPermissionEvidence.v1",
+        "queryTargetResourceId": request.query_target_resource_id,
+        "workspaceResourceId": normalized_workspace_resource_id,
+        "table": request.table,
+        "resources": (normalized_resource,),
+        "dataSources": (normalized_data_source,),
+        "rawPermissionsDigest": compute_artifact_digest(_json_value(permissions)),
+    }
+    try:
+        return MonitoringLogPermissionEvidence.model_validate(
+            {
+                **evidence_payload,
+                "evidenceDigest": compute_artifact_digest(_json_value(evidence_payload)),
+            }
+        )
+    except ValueError as exc:
+        raise MonitoringAcquisitionError(
+            "Log Analytics permissions reported silent exclusions"
+        ) from exc
+
+
 class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
     """Credential-bound resource-centric Azure Monitor Logs client."""
 
@@ -1968,20 +2153,33 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
                 for item in self._reviewed_contract.signal_read_scope_ids
             ),
         }
+        table_plans: dict[str, str] = {
+            str(item.table): item.plan
+            for item in self._reviewed_contract.resource_context_table_plans or ()
+        }
         if (
-            request.table not in self._reviewed_contract.log_analytics_allowed_tables
+            request.schema_version != "athena.wc028LogAnalyticsQueryRequest.v3"
+            or request.table not in self._reviewed_contract.log_analytics_allowed_tables
+            or table_plans.get(request.table) != "Analytics"
             or request.query_target_resource_id not in allowed_targets
             or self._reviewed_contract.workspace_access_control_mode
             != "workspaceAndResourceContext"
+            or self._reviewed_contract.workspace_resource_context_access_enabled is not True
+            or self._reviewed_contract.workspace_sku_name != "PerGB2018"
+            or self._reviewed_contract.resource_id_column != "_ResourceId"
+            or self._reviewed_contract.log_query_prefer_header != "include-permissions=true"
             or self._reviewed_contract.resource_log_allowed_operations
             != (
-                "Microsoft.Insights/logs/Heartbeat/read",
-                "Microsoft.Insights/logs/NTANetAnalytics/read",
-                "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
-                "Microsoft.Insights/logs/VMConnection/read",
+                "Microsoft.Insights/Logs/Heartbeat/Read",
+                "Microsoft.Insights/Logs/Perf/Read",
+                "Microsoft.Insights/Logs/InsightsMetrics/Read",
+                "Microsoft.Insights/Logs/Syslog/Read",
+                "Microsoft.Insights/Logs/VMConnection/Read",
             )
             or request.collector_execution_time is None
             or request.coverage_scope is None
+            or request.resource_id_column != "_ResourceId"
+            or request.prefer_header != "include-permissions=true"
         ):
             raise MonitoringAcquisitionError(
                 "Log Analytics request escaped the reviewed table or resource scope"
@@ -1999,11 +2197,17 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
                     f"{_azure_datetime_text(request.window_end)}"
                 ),
             },
+            headers={"Prefer": "include-permissions=true"},
             max_bytes=request.max_bytes,
         )
         payload = _azure_mapping(response.payload, "Log Analytics response")
         if payload.get("error") is not None:
             raise MonitoringAcquisitionError("Log Analytics returned a partial or failed query")
+        permission_evidence = _log_permission_evidence(
+            payload.get("permissions"),
+            request=request,
+            workspace_resource_id=self._reviewed_contract.workspace_resource_id,
+        )
         tables = _azure_list(payload.get("tables"), "Log Analytics tables")
         if len(tables) != 1:
             raise MonitoringAcquisitionError(
@@ -2029,7 +2233,7 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
         truncated = len(raw_rows) > request.max_rows
         rows = normalized_rows[: request.max_rows]
         return LogAnalyticsQueryResult(
-            schemaVersion="athena.wc028LogAnalyticsQueryResult.v1",
+            schemaVersion="athena.wc028LogAnalyticsQueryResult.v2",
             source="logAnalytics",
             table=request.table,
             requestDigest=request.request_digest,
@@ -2038,6 +2242,7 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
             columns=request.expected_columns,
             coverageDescriptor=_log_coverage_descriptor(request.coverage_scope),
             aggregateCompletenessProof=None,
+            permissionEvidence=permission_evidence,
             truncated=truncated,
             responseBytes=response.response_bytes,
             rows=rows,
@@ -2366,6 +2571,21 @@ def _normalize_resource_health_row(
         row.get("properties"),
         "Resource Health properties",
     )
+    expected_status_id = (
+        f"{requested_resource_id}/providers/microsoft.resourcehealth/availabilitystatuses/current"
+    )
+    status_id = (
+        _azure_text(
+            row.get("id"),
+            "Resource Health status id",
+        )
+        .casefold()
+        .rstrip("/")
+    )
+    if status_id != expected_status_id:
+        raise MonitoringAcquisitionError(
+            "Resource Health response did not identify the exact current endpoint"
+        )
     response_resource_id = properties.get("targetResourceId")
     resource_id = (
         requested_resource_id
@@ -2387,10 +2607,28 @@ def _normalize_resource_health_row(
         properties.get("availabilityState"),
         "Resource Health availabilityState",
     )
-    previous_status = _azure_health_status(
-        properties.get("previousAvailabilityState"),
-        "Resource Health previousAvailabilityState",
-    )
+    previous_value = properties.get("previousAvailabilityState")
+    previous_status: Literal[
+        "Available",
+        "Degraded",
+        "Unavailable",
+        "Unknown",
+    ]
+    recently_resolved_properties: Mapping[str, object] | None = None
+    if previous_value is None:
+        recently_resolved = properties.get("recentlyResolved")
+        if current_status != "Available" or recently_resolved is None:
+            return None
+        recently_resolved_properties = _azure_mapping(
+            recently_resolved,
+            "Resource Health recentlyResolved",
+        )
+        previous_status = "Unavailable"
+    else:
+        previous_status = _azure_health_status(
+            previous_value,
+            "Resource Health previousAvailabilityState",
+        )
     event_status = _resource_health_event_status(current_status, previous_status)
     reason_type = _azure_reason_type(
         properties.get("healthEventCause", properties.get("reasonType"))
@@ -2403,7 +2641,17 @@ def _normalize_resource_health_row(
     ):
         return None
     occurred_at = _azure_datetime(
-        properties.get("occurredTime"),
+        properties.get(
+            "occurredTime",
+            properties.get(
+                "occuredTime",
+                (
+                    recently_resolved_properties.get("resolvedTime")
+                    if recently_resolved_properties is not None
+                    else None
+                ),
+            ),
+        ),
         "Resource Health occurredTime",
     )
     if not request.window_start <= occurred_at <= request.window_end:
@@ -2463,25 +2711,20 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
                 method="GET",
                 path=(
                     f"{quote(resource_id, safe='/')}/providers/"
-                    "Microsoft.ResourceHealth/availabilityStatuses"
+                    "Microsoft.ResourceHealth/availabilityStatuses/current"
                     f"?api-version={_RESOURCE_HEALTH_API_VERSION}"
                 ),
                 max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
             )
             response_bytes += response.response_bytes
             payload = _azure_mapping(response.payload, "Resource Health response")
-            next_link = payload.get("nextLink")
-            if next_link is not None:
-                _azure_text(next_link, "Resource Health nextLink", maximum=4096)
-                truncated = True
-            for item in _azure_list(payload.get("value"), "Resource Health value"):
-                normalized = _normalize_resource_health_row(
-                    item,
-                    requested_resource_id=resource_id,
-                    request=request,
-                )
-                if normalized is not None:
-                    rows.append(normalized)
+            normalized = _normalize_resource_health_row(
+                payload,
+                requested_resource_id=resource_id,
+                request=request,
+            )
+            if normalized is not None:
+                rows.append(normalized)
         normalized_rows = _sorted_rows(rows)
         if len(normalized_rows) > request.max_rows:
             truncated = True
@@ -2542,6 +2785,14 @@ class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
         if type(request) is not IpFlowVerifyRequest:
             raise TypeError("Azure IP Flow Verify requires an exact query request")
         self._require_request_contract(request)
+        if (
+            self._reviewed_contract.flow_table_acquisition_mode == "unsupportedUnavailable"
+            or self._reviewed_contract.ip_flow_verify_scope_id is None
+            or self._reviewed_contract.ip_flow_verify_allowed_operations is None
+        ):
+            raise MonitoringAcquisitionError(
+                "IP Flow Verify is unsupported without an authorized retained flow-table boundary"
+            )
         approved_targets = {
             item.casefold().rstrip("/") for item in self._reviewed_contract.signal_read_scope_ids
         }
@@ -3152,7 +3403,7 @@ def _build_request[RequestT: _AcquisitionRequest](
 def _source_table(signal: LogQueryMonitoringSignal) -> str:
     match = re.match(r"^[A-Za-z][A-Za-z0-9_]*", signal.query)
     table = "" if match is None else match.group(0)
-    if table not in _LOG_COLUMNS:
+    if table not in {*_LOG_COLUMNS, *_UNSUPPORTED_WORKSPACE_QUERY_TABLES}:
         raise MonitoringAcquisitionError(
             "published log query does not use a supported reviewed source table"
         )
@@ -3175,8 +3426,9 @@ def _resource_is_contract_published(
             item.casefold().rstrip("/")
             for item in cast(tuple[str, ...], contract.resource_health_scope_ids)
         ),
-        cast(str, contract.ip_flow_verify_scope_id).casefold().rstrip("/"),
     }
+    if contract.ip_flow_verify_scope_id is not None:
+        exact_scopes.add(contract.ip_flow_verify_scope_id.casefold().rstrip("/"))
     return (
         normalized in exact_scopes
         or _resource_is_within(normalized, contract.workload_resource_group_id)
@@ -3196,6 +3448,7 @@ def _required_control_authority_scope(
         for item in cast(tuple[str, ...], contract.resource_health_scope_ids)
     }
     for control in controls:
+        control_requires_io = True
         control_resources = {
             *control.scope.resource_ids,
             *(control.scope.evidence_resource_ids or ()),
@@ -3204,14 +3457,15 @@ def _required_control_authority_scope(
         if isinstance(signal, LogQueryMonitoringSignal):
             table = _source_table(signal)
             query_target = _canonical_resource_id(signal.query_target_resource_id)
-            required_sources.add("logAnalytics")
-            required_resources.add(query_target)
             if query_target not in signal_scopes:
                 raise MonitoringAcquisitionError(
                     "log query target is outside exact collector VM scopes"
                 )
-            if table == "NTANetAnalytics":
-                required_sources.add("ipFlowVerify")
+            if table in _SUPPORTED_RESOURCE_CONTEXT_QUERY_TABLES:
+                required_sources.add("logAnalytics")
+                required_resources.add(query_target)
+            else:
+                control_requires_io = False
             for resource_id in control.scope.resource_ids:
                 normalized = _canonical_resource_id(resource_id)
                 if _is_virtual_machine_resource_id(normalized):
@@ -3264,7 +3518,8 @@ def _required_control_authority_scope(
             raise MonitoringAcquisitionError(
                 "monitoring control references an unpublished collector scope"
             )
-        required_resources.update(_canonical_resource_id(item) for item in control_resources)
+        if control_requires_io:
+            required_resources.update(_canonical_resource_id(item) for item in control_resources)
     return tuple(sorted(required_sources)), tuple(sorted(required_resources))
 
 
@@ -3448,7 +3703,11 @@ def _validate_result(
     expected_collection_time = (
         request.collector_execution_time
         if isinstance(request, LogAnalyticsQueryRequest)
-        and request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        and request.schema_version
+        in {
+            "athena.wc028LogAnalyticsQueryRequest.v2",
+            "athena.wc028LogAnalyticsQueryRequest.v3",
+        }
         else collector_collection_time
     )
     if result.collected_at != expected_collection_time:
@@ -3457,7 +3716,11 @@ def _validate_result(
         )
     if (
         isinstance(request, LogAnalyticsQueryRequest)
-        and request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        and request.schema_version
+        in {
+            "athena.wc028LogAnalyticsQueryRequest.v2",
+            "athena.wc028LogAnalyticsQueryRequest.v3",
+        }
         and (
             not isinstance(result, LogAnalyticsQueryResult)
             or request.coverage_scope is None
@@ -4202,6 +4465,58 @@ class MonitoringAcquisitionCoordinator:
         signal = cast(LogQueryMonitoringSignal, control.signal)
         table = _source_table(signal)
         current_start = collected_at - timedelta(seconds=signal.evaluation_window_seconds)
+        if table in _UNSUPPORTED_WORKSPACE_QUERY_TABLES:
+            coverage_scope = control_binding.coverage_scope
+            if table in _UNSUPPORTED_FLOW_QUERY_TABLES:
+                family: Literal[
+                    "guest",
+                    "networkFlow",
+                    "connectionMonitor",
+                    "endpointHealth",
+                    "platformHealth",
+                ] = "networkFlow"
+                unsupported_detail = (
+                    "Flow-table acquisition is unsupported without a dedicated or "
+                    "ABAC-isolated workspace/table boundary with retained permission "
+                    "evidence; no Log Analytics or IP Flow call was issued"
+                )
+            else:
+                family = "connectionMonitor"
+                unsupported_detail = (
+                    "Connection Monitor table acquisition is unsupported under the "
+                    "exact VM resource-context permission contract; no Log Analytics "
+                    "call was issued"
+                )
+            coverage_digest = compute_artifact_digest(
+                {
+                    "controlId": control.control_id,
+                    "table": table,
+                    "status": "unavailable",
+                    "observedStart": current_start,
+                    "observedEnd": collected_at,
+                }
+            )
+            coverage = MonitoringCoverageRecord(
+                controlId=control.control_id,
+                sourceRecordId=(f"coverage-{coverage_digest.removeprefix('sha256:')[:32]}"),
+                family=family,
+                resourceIds=control.scope.resource_ids,
+                pathId=coverage_scope.path_id,
+                direction=coverage_scope.direction,
+                fiveTupleDigest=coverage_scope.five_tuple_digest,
+                endpointTestReference=coverage_scope.endpoint_test_reference,
+                endpointTestDigest=coverage_scope.endpoint_test_digest,
+                observedStart=current_start,
+                observedEnd=collected_at,
+                queryDigest=signal.query_digest,
+                queryTargetResourceId=signal.query_target_resource_id,
+                evaluationWindowSeconds=signal.evaluation_window_seconds,
+                frequencySeconds=signal.frequency_seconds,
+                queryExecutionDigests=(),
+                status="unavailable",
+                detail=unsupported_detail,
+            )
+            return (), (coverage,), (unsupported_detail,)
         windows = (
             (
                 (
@@ -4217,7 +4532,7 @@ class MonitoringAcquisitionCoordinator:
             _build_request(
                 LogAnalyticsQueryRequest,
                 {
-                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v3",
                     "source": "logAnalytics",
                     "monitoringReaderIdentityId": self._monitoring_reader_identity_id,
                     "acquisitionAuthorityId": self._acquisition_authority.authority_id,
@@ -4240,9 +4555,11 @@ class MonitoringAcquisitionCoordinator:
                     "queryTargetResourceId": _canonical_resource_id(
                         signal.query_target_resource_id
                     ),
-                    "expectedColumns": _LOG_COLUMNS[table],
+                    "expectedColumns": ("_ResourceId", *_LOG_COLUMNS[table]),
                     "collectorExecutionTime": collected_at,
                     "coverageScope": control_binding.coverage_scope,
+                    "resourceIdColumn": "_ResourceId",
+                    "preferHeader": "include-permissions=true",
                 },
             )
             for window_start, window_end in windows
@@ -4263,10 +4580,21 @@ class MonitoringAcquisitionCoordinator:
                 result,
                 request,
                 collector_collection_time=collected_at,
-                expected_columns=_LOG_COLUMNS[table],
+                expected_columns=request.expected_columns,
             )
             if result.table != table:
                 raise MonitoringAcquisitionError("log response table does not match the request")
+            if (
+                result.schema_version != "athena.wc028LogAnalyticsQueryResult.v2"
+                or result.permission_evidence is None
+                or result.permission_evidence.query_target_resource_id
+                != request.query_target_resource_id
+                or result.permission_evidence.workspace_resource_id
+                != self._collector_contract.workspace_resource_id.casefold().rstrip("/")
+            ):
+                raise MonitoringAcquisitionError(
+                    "log response omitted exact resource permission evidence"
+                )
             responses.append((request, result))
 
         ip_flow_exchanges_before = sum(
@@ -4276,6 +4604,10 @@ class MonitoringAcquisitionCoordinator:
         partial = False
         reasons: list[str] = []
         for request, result in responses:
+            permission_evidence = cast(
+                MonitoringLogPermissionEvidence,
+                result.permission_evidence,
+            )
             aggregate_complete = _has_positive_aggregate_completeness(
                 result,
                 request,
@@ -4315,6 +4647,7 @@ class MonitoringAcquisitionCoordinator:
                                 observed_start=row.observed_start,
                                 observed_end=row.observed_end,
                             ),
+                            permissionEvidenceDigest=permission_evidence.evidence_digest,
                             heartbeatCount=row.heartbeat_count,
                         )
                     )
@@ -4370,6 +4703,7 @@ class MonitoringAcquisitionCoordinator:
                                 observed_start=row.observed_start,
                                 observed_end=row.observed_end,
                             ),
+                            permissionEvidenceDigest=permission_evidence.evidence_digest,
                             failedConnectionCount=row.failed_connection_count,
                         )
                     )
@@ -4625,6 +4959,10 @@ class MonitoringAcquisitionCoordinator:
                     frequencySeconds=signal.frequency_seconds,
                     queryExecutionDigests=tuple(
                         item.query_execution_digest for item in request_records
+                    ),
+                    logPermissionEvidence=cast(
+                        MonitoringLogPermissionEvidence,
+                        result.permission_evidence,
                     ),
                     status=status,
                     detail=detail,

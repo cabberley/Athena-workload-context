@@ -39,6 +39,7 @@ from athena_context.contracts import (
     MonitoringEvidenceHandoff,
     MonitoringIntentEvidenceReference,
     MonitoringIpFlowProvenance,
+    MonitoringLogPermissionEvidence,
     MonitoringObservation,
     MonitoringSelectedIncident,
     NetworkFlowObservation,
@@ -175,6 +176,10 @@ class _LogQueryCollectionRecord(_WindowedCollectionRecord):
         le=3600,
     )
     query_execution_digest: Sha256Digest = Field(alias="queryExecutionDigest")
+    permission_evidence_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="permissionEvidenceDigest",
+    )
 
     @model_validator(mode="after")
     def validate_query_window(self) -> _LogQueryCollectionRecord:
@@ -530,6 +535,10 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
         alias="queryExecutionDigests",
         max_length=1440,
     )
+    log_permission_evidence: MonitoringLogPermissionEvidence | None = Field(
+        default=None,
+        alias="logPermissionEvidence",
+    )
     status: Literal["complete", "partial", "unavailable", "truncated"]
     detail: str | None = Field(default=None, min_length=1, max_length=500)
 
@@ -542,7 +551,11 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
             self.frequency_seconds,
         )
         if self.family == "platformHealth":
-            if any(value is not None for value in query_values) or self.query_execution_digests:
+            if (
+                any(value is not None for value in query_values)
+                or self.query_execution_digests
+                or self.log_permission_evidence is not None
+            ):
                 raise ValueError("platform health coverage cannot claim query execution")
             return self
         if any(value is None for value in query_values):
@@ -768,6 +781,8 @@ def _coverage(
     }
     if record.query_execution_digests:
         payload["queryExecutionDigests"] = record.query_execution_digests
+    if record.log_permission_evidence is not None:
+        payload["logPermissionEvidence"] = record.log_permission_evidence
     digest = compute_artifact_digest(_json_value(payload))
     return EvidenceCoverage.model_validate(
         {
@@ -984,6 +999,7 @@ def _heartbeat_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": (
             "guest.heartbeat-review"
             if condition is None
@@ -1042,6 +1058,7 @@ def _endpoint_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": (
             "endpoint.vm-connection-review"
             if condition is None
@@ -1212,6 +1229,11 @@ def _validate_coverage_query_binding(
         for record in executions
     ):
         raise MonitoringCollectionError("coverage does not bind exact query executions and scope")
+    if coverage.log_permission_evidence is not None and any(
+        record.permission_evidence_digest != coverage.log_permission_evidence.evidence_digest
+        for record in executions
+    ):
+        raise MonitoringCollectionError("coverage does not bind exact Logs permission evidence")
     ordered = tuple(
         sorted(
             executions,
@@ -1291,6 +1313,7 @@ def _connection_monitor_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": f"network.connection-monitor-{record.status}",
         "pathId": record.path_id,
         "monitorResourceId": monitor_id,
@@ -1433,6 +1456,7 @@ def _network_flow_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": (
             f"network.flow-{record.decision}"
             if provenance is None
@@ -1886,7 +1910,19 @@ class _MonitoringCollectionTransactionCore:
                 for item in acquisition_receipt.exchanges
                 if item.source in {"logAnalytics", "resourceHealth"}
             }
-            if receipt_coverage_ids != {item.source_record_id for item in batch.coverage}:
+            coverage_by_id = {item.source_record_id: item for item in batch.coverage}
+            unsupported_coverage = tuple(
+                item
+                for coverage_id, item in coverage_by_id.items()
+                if coverage_id not in receipt_coverage_ids
+            )
+            if not receipt_coverage_ids.issubset(coverage_by_id) or any(
+                item.status != "unavailable"
+                or item.family not in {"networkFlow", "connectionMonitor"}
+                or item.query_execution_digests
+                or item.log_permission_evidence is not None
+                for item in unsupported_coverage
+            ):
                 raise MonitoringCollectionError(
                     "acquisition receipt does not exactly bind collection coverage"
                 )

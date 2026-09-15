@@ -9,6 +9,7 @@ import pytest
 from azure.core.credentials import AccessToken
 from azure.core.pipeline import Pipeline
 from azure.core.pipeline.transport import HttpRequest, HttpResponse, HttpTransport
+from pydantic import ValidationError
 
 import athena_context.monitoring_acquisition as monitoring_acquisition_module
 from athena_context.contracts import EvidenceCoverageScope, compute_artifact_digest, sha256_hex
@@ -183,15 +184,19 @@ def _log_request(
     target_resource_id: str = PRODUCTION_WEB_ID,
 ) -> LogAnalyticsQueryRequest:
     target_resource_id = target_resource_id.casefold()
-    query = "Heartbeat | project resourceId, observedStart, observedEnd, heartbeatCount"
+    query = (
+        f"Heartbeat | where _ResourceId =~ '{target_resource_id}' "
+        "| project _ResourceId, resourceId, observedStart, observedEnd, heartbeatCount"
+    )
     payload = {
         **_common_payload("logAnalytics", resource_ids=(target_resource_id,)),
-        "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
+        "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v3",
         "table": "Heartbeat",
         "query": query,
         "queryDigest": sha256_hex(query.encode("utf-8")),
         "queryTargetResourceId": target_resource_id,
         "expectedColumns": (
+            "_ResourceId",
             "resourceId",
             "observedStart",
             "observedEnd",
@@ -199,12 +204,43 @@ def _log_request(
         ),
         "collectorExecutionTime": NOW,
         "coverageScope": _coverage_scope((target_resource_id,)),
+        "resourceIdColumn": "_ResourceId",
+        "preferHeader": "include-permissions=true",
     }
     payload.pop("resourceIds")
     return monitoring_acquisition_module._build_request(
         LogAnalyticsQueryRequest,
         payload,
     )
+
+
+def _log_permissions(
+    request: LogAnalyticsQueryRequest,
+    *,
+    resource_deny_tables: tuple[str, ...] = (),
+    workspace_deny_tables: tuple[str, ...] = (),
+    workspace_resource_id: str | None = None,
+) -> dict[str, object]:
+    workspace_id = (
+        _acquisition_collector_contract().workspace_resource_id
+        if workspace_resource_id is None
+        else workspace_resource_id
+    )
+    return {
+        "resources": [
+            {
+                "resourceId": request.query_target_resource_id,
+                "dataSources": [workspace_id],
+                "denyTables": list(resource_deny_tables),
+            }
+        ],
+        "dataSources": [
+            {
+                "resourceId": workspace_id,
+                "denyTables": list(workspace_deny_tables),
+            }
+        ],
+    }
 
 
 def _activity_request(
@@ -312,6 +348,7 @@ def test_log_analytics_client_uses_bound_resource_endpoint_and_normalizes_rows()
     transport = _MockTransport(
         _ResponseSpec(
             {
+                "permissions": _log_permissions(request),
                 "tables": [
                     {
                         "name": "PrimaryResult",
@@ -321,13 +358,14 @@ def test_log_analytics_client_uses_bound_resource_endpoint_and_normalizes_rows()
                         "rows": [
                             [
                                 PRODUCTION_WEB_ID.upper(),
+                                PRODUCTION_WEB_ID.upper(),
                                 (NOW - timedelta(minutes=10)).isoformat(),
                                 NOW.isoformat(),
                                 2,
                             ]
                         ],
                     }
-                ]
+                ],
             }
         )
     )
@@ -344,9 +382,12 @@ def test_log_analytics_client_uses_bound_resource_endpoint_and_normalizes_rows()
     assert len(result.rows) == 1
     assert result.rows[0].resource_id == PRODUCTION_WEB_ID.casefold()
     assert result.rows[0].heartbeat_count == 2
+    assert result.permission_evidence is not None
+    assert result.permission_evidence.resources[0].deny_tables == ()
     sent = transport.requests[0]
     assert sent.url == (f"https://api.loganalytics.io/v1{PRODUCTION_WEB_ID.casefold()}/query")
     assert sent.headers["Authorization"] == "Bearer synthetic-azure-access-token"
+    assert sent.headers["Prefer"] == "include-permissions=true"
     assert json.loads(sent.body) == {
         "query": request.query,
         "timespan": (f"{_utc_text(request.window_start)}/{_utc_text(request.window_end)}"),
@@ -357,6 +398,7 @@ def test_log_analytics_client_preserves_duplicate_rows_for_ambiguity_checks() ->
     request = _log_request()
     source_row = [
         PRODUCTION_WEB_ID,
+        PRODUCTION_WEB_ID,
         (NOW - timedelta(minutes=10)).isoformat(),
         NOW.isoformat(),
         2,
@@ -364,6 +406,7 @@ def test_log_analytics_client_preserves_duplicate_rows_for_ambiguity_checks() ->
     transport = _MockTransport(
         _ResponseSpec(
             {
+                "permissions": _log_permissions(request),
                 "tables": [
                     {
                         "name": "PrimaryResult",
@@ -372,7 +415,7 @@ def test_log_analytics_client_preserves_duplicate_rows_for_ambiguity_checks() ->
                         ],
                         "rows": [source_row, source_row],
                     }
-                ]
+                ],
             }
         )
     )
@@ -386,6 +429,111 @@ def test_log_analytics_client_preserves_duplicate_rows_for_ambiguity_checks() ->
 
     assert len(result.rows) == 2
     assert result.rows[0] == result.rows[1]
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    (
+        None,
+        "resource-deny",
+        "workspace-deny",
+        "wrong-workspace",
+    ),
+)
+def test_log_analytics_client_fails_closed_on_missing_or_denied_permissions(
+    permissions: str | None,
+) -> None:
+    request = _log_request()
+    payload: dict[str, object] = {
+        "tables": [
+            {
+                "name": "PrimaryResult",
+                "columns": [{"name": name, "type": "string"} for name in request.expected_columns],
+                "rows": [],
+            }
+        ]
+    }
+    if permissions == "resource-deny":
+        payload["permissions"] = _log_permissions(
+            request,
+            resource_deny_tables=("Heartbeat",),
+        )
+    elif permissions == "workspace-deny":
+        payload["permissions"] = _log_permissions(
+            request,
+            workspace_deny_tables=("Heartbeat",),
+        )
+    elif permissions == "wrong-workspace":
+        payload["permissions"] = _log_permissions(
+            request,
+            workspace_resource_id=(
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg-athena-demo-monitoring/providers/"
+                "Microsoft.OperationalInsights/workspaces/unreviewed"
+            ),
+        )
+    transport = _MockTransport(_ResponseSpec(payload))
+    client = AzureLogAnalyticsAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(MonitoringAcquisitionError, match="permissions|silent exclusions"):
+        client.query_log_analytics(request)
+
+
+def test_log_query_request_rejects_missing_exact_resource_filter() -> None:
+    request = _log_request()
+    payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"request_digest", "query_digest"},
+    )
+    payload["query"] = "Heartbeat | summarize heartbeatCount=count()"
+    payload["queryDigest"] = sha256_hex(str(payload["query"]).encode("utf-8"))
+
+    with pytest.raises(ValidationError, match="resource-context permission scope"):
+        monitoring_acquisition_module._build_request(
+            LogAnalyticsQueryRequest,
+            payload,
+        )
+
+
+def test_log_analytics_client_rejects_row_outside_exact_resource_id() -> None:
+    request = _log_request()
+    transport = _MockTransport(
+        _ResponseSpec(
+            {
+                "permissions": _log_permissions(request),
+                "tables": [
+                    {
+                        "name": "PrimaryResult",
+                        "columns": [
+                            {"name": name, "type": "string"} for name in request.expected_columns
+                        ],
+                        "rows": [
+                            [
+                                PRODUCTION_DB_ID,
+                                PRODUCTION_WEB_ID,
+                                (NOW - timedelta(minutes=10)).isoformat(),
+                                NOW.isoformat(),
+                                2,
+                            ]
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    client = AzureLogAnalyticsAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(MonitoringAcquisitionError, match="exact _ResourceId"):
+        client.query_log_analytics(request)
 
 
 def test_log_analytics_client_rejects_workspace_context_fallback() -> None:
@@ -515,31 +663,22 @@ def test_resource_graph_client_uses_generated_bounded_change_query() -> None:
     assert "| take 501" in body["query"]
 
 
-def test_resource_health_client_reads_historical_availability_transitions() -> None:
+def test_resource_health_client_reads_exact_current_availability_status() -> None:
     request = _resource_health_request()
     transport = _MockTransport(
         _ResponseSpec(
             {
-                "value": [
-                    {
-                        "properties": {
-                            "targetResourceId": PRODUCTION_WEB_ID.upper(),
-                            "occurredTime": (NOW - timedelta(minutes=2)).isoformat(),
-                            "previousAvailabilityState": "Available",
-                            "availabilityState": "Unavailable",
-                            "reasonType": "PlatformInitiated",
-                        }
-                    },
-                    {
-                        "properties": {
-                            "targetResourceId": PRODUCTION_WEB_ID,
-                            "occurredTime": (NOW - timedelta(minutes=8)).isoformat(),
-                            "previousAvailabilityState": "Unavailable",
-                            "availabilityState": "Available",
-                            "reasonType": "PlatformInitiated",
-                        }
-                    },
-                ]
+                "id": (
+                    f"{PRODUCTION_WEB_ID}/providers/"
+                    "Microsoft.ResourceHealth/availabilityStatuses/current"
+                ),
+                "properties": {
+                    "targetResourceId": PRODUCTION_WEB_ID.upper(),
+                    "occurredTime": (NOW - timedelta(minutes=2)).isoformat(),
+                    "previousAvailabilityState": "Available",
+                    "availabilityState": "Unavailable",
+                    "reasonType": "PlatformInitiated",
+                },
             }
         )
     )
@@ -553,122 +692,61 @@ def test_resource_health_client_reads_historical_availability_transitions() -> N
     result = client.query_resource_health(request)
 
     assert credential.scopes == [("https://management.azure.com/.default",)]
-    assert {row.event_status for row in result.rows} == {"Active", "Resolved"}
-    assert {row.current_status for row in result.rows} == {"Available", "Unavailable"}
+    assert len(result.rows) == 1
+    assert result.rows[0].event_status == "Active"
+    assert result.rows[0].current_status == "Unavailable"
     assert transport.requests[0].url == (
         f"https://management.azure.com{PRODUCTION_WEB_ID.casefold()}/providers/"
-        "Microsoft.ResourceHealth/availabilityStatuses?api-version=2025-05-01"
+        "Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01"
     )
 
 
-def test_ip_flow_client_maps_local_tuple_and_polls_only_bound_arm_location() -> None:
-    request = _ip_flow_request()
-    operation_url = (
-        "https://management.azure.com/subscriptions/"
-        "00000000-0000-0000-0000-000000000000/providers/Microsoft.Network/"
-        "locations/australiaeast/operations/synthetic"
-        "?api-version=2025-09-01"
-    )
+def test_resource_health_current_endpoint_retains_recently_resolved_transition() -> None:
+    request = _resource_health_request()
     transport = _MockTransport(
         _ResponseSpec(
-            None,
-            status_code=202,
-            headers={"Location": operation_url, "Retry-After": "0"},
-        ),
-        _ResponseSpec(
-            {"access": "Deny", "ruleName": PRODUCTION_NSG_RULE_ID},
-            headers={"x-ms-correlation-request-id": ("93e948cc-df1e-4caf-8a91-c31aa3803793")},
-        ),
-    )
-    credential = _Credential()
-    contract = _acquisition_collector_contract()
-    client = AzureIpFlowVerifyAcquisitionClient(
-        credential=credential,
-        reviewed_contract=contract,
-        _transport=transport,
-    )
-
-    result = client.query_ip_flow_verify(request)
-
-    assert credential.scopes == [("https://management.azure.com/.default",)]
-    assert result.access == "Deny"
-    assert result.rule_resource_id == PRODUCTION_NSG_RULE_ID.casefold()
-    assert result.correlation_request_id == "93e948cc-df1e-4caf-8a91-c31aa3803793"
-    assert transport.sleeps == [0]
-    assert len(transport.requests) == 2
-    initial = transport.requests[0]
-    assert initial.url == (
-        f"https://management.azure.com{contract.ip_flow_verify_scope_id.casefold()}/"
-        "ipFlowVerify?api-version=2025-09-01"
-    )
-    assert json.loads(initial.body) == {
-        "targetResourceId": PRODUCTION_DB_ID.casefold(),
-        "direction": "Inbound",
-        "protocol": "TCP",
-        "localPort": "1433",
-        "remotePort": "443",
-        "localIPAddress": "192.0.2.20",
-        "remoteIPAddress": "192.0.2.10",
-    }
-    assert transport.requests[1].url == operation_url
-
-
-def test_ip_flow_client_normalizes_request_id_fallback() -> None:
-    transport = _MockTransport(
-        _ResponseSpec(
-            {"access": "Allow"},
-            headers={"x-ms-request-id": "84BA07FB-0911-4D67-946A-67A9EAC90506"},
-        )
-    )
-    client = AzureIpFlowVerifyAcquisitionClient(
-        credential=_Credential(),
-        reviewed_contract=_acquisition_collector_contract(),
-        _transport=transport,
-    )
-
-    result = client.query_ip_flow_verify(_ip_flow_request())
-
-    assert result.correlation_request_id == "84ba07fb-0911-4d67-946a-67a9eac90506"
-
-
-def test_ip_flow_client_rejects_missing_request_id() -> None:
-    transport = _MockTransport(_ResponseSpec({"access": "Allow"}))
-    client = AzureIpFlowVerifyAcquisitionClient(
-        credential=_Credential(),
-        reviewed_contract=_acquisition_collector_contract(),
-        _transport=transport,
-    )
-
-    with pytest.raises(MonitoringAcquisitionError, match="correlation request ID"):
-        client.query_ip_flow_verify(_ip_flow_request())
-
-
-def test_ip_flow_client_rejects_polling_endpoint_escape_before_follow() -> None:
-    transport = _MockTransport(
-        _ResponseSpec(
-            None,
-            status_code=202,
-            headers={
-                "Location": (
-                    "https://example.invalid/subscriptions/"
-                    "00000000-0000-0000-0000-000000000000/providers/"
-                    "Microsoft.Network/locations/australiaeast/operations/synthetic"
-                    "?api-version=2025-09-01"
+            {
+                "id": (
+                    f"{PRODUCTION_WEB_ID}/providers/"
+                    "Microsoft.ResourceHealth/availabilityStatuses/current"
                 ),
-                "Retry-After": "0",
-            },
+                "properties": {
+                    "targetResourceId": PRODUCTION_WEB_ID,
+                    "availabilityState": "Available",
+                    "reasonType": "PlatformInitiated",
+                    "recentlyResolved": {
+                        "resolvedTime": (NOW - timedelta(minutes=2)).isoformat(),
+                    },
+                },
+            }
         )
     )
+    client = AzureResourceHealthAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    result = client.query_resource_health(request)
+
+    assert len(result.rows) == 1
+    assert result.rows[0].event_status == "Resolved"
+    assert result.rows[0].previous_status == "Unavailable"
+    assert result.rows[0].current_status == "Available"
+
+
+def test_ip_flow_client_is_unsupported_before_transport() -> None:
+    transport = _MockTransport()
     client = AzureIpFlowVerifyAcquisitionClient(
         credential=_Credential(),
         reviewed_contract=_acquisition_collector_contract(),
         _transport=transport,
     )
 
-    with pytest.raises(MonitoringAcquisitionError, match="polling escaped"):
+    with pytest.raises(MonitoringAcquisitionError, match="unsupported"):
         client.query_ip_flow_verify(_ip_flow_request())
 
-    assert len(transport.requests) == 1
+    assert transport.requests == []
 
 
 def test_production_clients_reject_unreviewed_scopes_before_transport() -> None:
@@ -692,11 +770,6 @@ def test_production_clients_reject_unreviewed_scopes_before_transport() -> None:
             AzureResourceHealthAcquisitionClient,
             "query_resource_health",
             _resource_health_request(resource_id=OUT_OF_SCOPE_VM_ID),
-        ),
-        (
-            AzureIpFlowVerifyAcquisitionClient,
-            "query_ip_flow_verify",
-            _ip_flow_request(target_resource_id=OUT_OF_SCOPE_VM_ID),
         ),
     )
     for client_type, method_name, request in cases:

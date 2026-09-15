@@ -95,10 +95,11 @@ canonical incident resource, exact previous/current normalized source-record IDs
 state, and transition digest. Correlation request v4 carries the same value and reconstructs both
 the selection and canonical citation-bearing transition from persisted evidence.
 
-Each retained network-flow observation also carries signed IP Flow provenance bound one-to-one to
-its acquisition exchange, Traffic Analytics request, exact tuple, point-in-time decision and rule,
-Azure correlation/request ID, and collector-owned timestamps. Only an exact denied rule with
-causal change, chronology, scope, and freshness bindings can support direct attribution.
+Current production acquisition does not query Traffic Analytics, custom flow tables, Connection
+Monitor workspace tables, or IP Flow Verify. Without a dedicated or ABAC-isolated workspace/table
+boundary, those controls persist deterministic unavailable coverage with zero source calls and no
+network-flow observation. Historical v3 requests may retain their prior versioned flow evidence,
+but production request v4 accepts only permission-attested resource-context log evidence.
 
 `athena.wc028MonitoringEvidenceBundle.v2` with
 `athena.wc028CorrelationRequest.v3`, plus the legacy WC-026 v1/v2 pair, remain parseable for

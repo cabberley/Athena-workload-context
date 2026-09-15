@@ -450,6 +450,14 @@ module networkWatcherEvidenceReaderAssignment 'modules/network-watcher-monitorin
   }
 }
 
+module monitoringRbacAttestor 'modules/monitoring-rbac-attestor.bicep' = {
+  name: 'monitoring-effective-rbac-attestor'
+  scope: subscription()
+  params: {
+    attestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
+  }
+}
+
 module legacyFlowLogMigration 'modules/legacy-flow-log-migration.bicep' = {
   name: 'disable-redundant-legacy-flow-logs'
   scope: resourceGroup(networkWatcherResourceGroupName)
@@ -494,6 +502,11 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
       ? 'workspaceAndResourceContext'
       : 'workspaceOnly'
+    workspaceResourceContextAccessEnabled: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+    workspaceSkuName: monitoringDataPlatform.outputs.workspaceSkuName == 'PerGB2018'
+      ? 'PerGB2018'
+      : fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.')
+    resourceContextTablePlans: monitoringDataPlatform.outputs.resourceContextTablePlans
     readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
     signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
     signalReaderRoleName: workloadEvidenceReaderAssignments.outputs.signalReaderRoleName
@@ -502,10 +515,14 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     resourceLogAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceLogAllowedOperations
     resourceLogReadScopeIds: workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds
     logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
-    ipFlowVerifyRoleDefinitionId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleDefinitionId
-    ipFlowVerifyRoleName: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleName
-    ipFlowVerifyScopeId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyScopeId
-    ipFlowVerifyAllowedOperations: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyAllowedOperations
+    rbacAttestorIdentityResourceId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId
+    rbacAttestorIdentityClientId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId
+    rbacAttestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
+    rbacAttestorTenantId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId
+    rbacAttestorRoleDefinitionId: monitoringRbacAttestor.outputs.attestorRoleDefinitionId
+    rbacAttestorRoleName: monitoringRbacAttestor.outputs.attestorRoleName
+    rbacAttestorScopeId: monitoringRbacAttestor.outputs.attestorScopeId
+    rbacAttestorAllowedOperations: monitoringRbacAttestor.outputs.attestorAllowedOperations
     resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
     resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
     resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
@@ -532,8 +549,8 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
 
 @description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
 output monitoringCollectorContract object = collectorContract.outputs.collectorContract
-var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) ? true : fail('monitoring collector and Athena context identities must be physically separate UAMIs with distinct principal IDs')
-var validatedMonitoringEffectiveRbacInventory = monitoringEffectiveRbacInventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v1' && toLower(monitoringEffectiveRbacInventory.collectorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.athenaContextPrincipalId) == toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEffectiveRbacInventory.tenantId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityTenantId) ? monitoringEffectiveRbacInventory : fail('monitoring acquisition requires an externally collected effective RBAC inventory bound to both deployed identities and tenant')
+var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(athenaContextIdentity.id) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) && toLower(athenaContextIdentity.properties.principalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) ? true : fail('monitoring collector, Athena context, and RBAC attestor must be physically separate UAMIs with distinct principal IDs')
+var validatedMonitoringEffectiveRbacInventory = monitoringEffectiveRbacInventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v2' && toLower(monitoringEffectiveRbacInventory.collectorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.athenaContextPrincipalId) == toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEffectiveRbacInventory.attestorIdentityResourceId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(monitoringEffectiveRbacInventory.attestorClientId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId) && toLower(monitoringEffectiveRbacInventory.attestorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.attestorTenantId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId) && toLower(monitoringEffectiveRbacInventory.tenantId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityTenantId) ? monitoringEffectiveRbacInventory : fail('monitoring acquisition requires stable effective RBAC inventory v2 bound to all three isolated identities and tenant')
 
 output monitoringAcquisitionCollectorContract object = union(collectorContract.outputs.acquisitionCollectorContract, {
   monitoringReaderPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId

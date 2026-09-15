@@ -19,9 +19,12 @@ from athena_context.contracts import (
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     CorrelationRequest,
     EvidenceCoverageScope,
+    GuestSignalObservation,
     IncidentHealthTransition,
     MonitoringCollectorContract,
-    NetworkFlowObservation,
+    MonitoringLogPermissionDataSource,
+    MonitoringLogPermissionEvidence,
+    MonitoringLogPermissionResource,
     ResourceHealthMonitoringSignal,
     build_published_monitoring_intent,
     compute_artifact_digest,
@@ -249,6 +252,55 @@ class _ReceiptSigner:
     def sign_preimage(self, canonical_preimage: bytes) -> str:
         assert canonical_preimage
         return base64.b64encode(b"synthetic-acquisition-receipt").decode("ascii")
+
+
+def _permission_evidence(
+    request: LogAnalyticsQueryRequest,
+) -> MonitoringLogPermissionEvidence:
+    workspace_id = (
+        _acquisition_collector_contract()
+        .workspace_resource_id.casefold()
+        .rstrip("/")
+    )
+    resources = (
+        MonitoringLogPermissionResource(
+            resourceId=request.query_target_resource_id,
+            dataSourceIds=(workspace_id,),
+            denyTables=(),
+        ),
+    )
+    data_sources = (
+        MonitoringLogPermissionDataSource(
+            resourceId=workspace_id,
+            denyTables=(),
+        ),
+    )
+    raw_payload = {
+        "resources": [
+            {
+                "resourceId": request.query_target_resource_id,
+                "dataSources": [workspace_id],
+            }
+        ],
+        "dataSources": [{"resourceId": workspace_id}],
+    }
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringLogPermissionEvidence.v1",
+        "queryTargetResourceId": request.query_target_resource_id,
+        "workspaceResourceId": workspace_id,
+        "table": request.table,
+        "resources": resources,
+        "dataSources": data_sources,
+        "rawPermissionsDigest": compute_artifact_digest(raw_payload),
+    }
+    return MonitoringLogPermissionEvidence.model_validate(
+        {
+            **payload,
+            "evidenceDigest": compute_artifact_digest(
+                monitoring_acquisition_module._json_value(payload)
+            ),
+        }
+    )
 
 
 def _aggregate_proof(
@@ -710,7 +762,7 @@ class _AcquisitionPort:
                 proofDigest=compute_artifact_digest(proof_payload),
             )
         return LogAnalyticsQueryResult(
-            schemaVersion="athena.wc028LogAnalyticsQueryResult.v1",
+            schemaVersion="athena.wc028LogAnalyticsQueryResult.v2",
             source="logAnalytics",
             table=request.table,
             requestDigest=request.request_digest,
@@ -723,6 +775,7 @@ class _AcquisitionPort:
             columns=request.expected_columns,
             coverageDescriptor=coverage_descriptor,
             aggregateCompletenessProof=aggregate_proof,
+            permissionEvidence=_permission_evidence(request),
             truncated=(self.truncated_flow and request.table == "NTANetAnalytics")
             or (self.truncated_heartbeat and request.table == "Heartbeat"),
             responseBytes=4096,
@@ -1068,6 +1121,8 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert acquisition_authority.read_only is None
     assert acquisition_authority.athena_context_has_workload_reader is None
     assert acquisition_authority.monitoring_reader_has_read_only_workload_access is None
+    assert "ipFlowVerify" not in acquisition_authority.allowed_sources
+    assert MONITOR_ID.casefold() not in acquisition_authority.allowed_resource_ids
     assert (
         acquisition_authority.effective_rbac_inventory_digest
         == effective_rbac_inventory.inventory_digest
@@ -1096,9 +1151,11 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         item.control_id: item for item in (acquisition_authority.required_control_bindings or ())
     }
     assert all(
-        request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v3"
         and request.collector_execution_time == NOW
         and request.coverage_scope == bindings_by_id[request.control_id].coverage_scope
+        and request.resource_id_column == "_ResourceId"
+        and request.prefer_header == "include-permissions=true"
         for request in log_requests
     )
     assert not any(
@@ -1118,15 +1175,24 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     tampered_request["query"] = f"{tampered_request['query']} | take 1"
     with pytest.raises(ValidationError, match="requestDigest"):
         LogAnalyticsQueryRequest.model_validate(tampered_request)
-    assert any("Traffic Analytics" in item for item in outcome.manual_investigation_reasons)
-    assert any("IP Flow Verify" in item for item in outcome.manual_investigation_reasons)
-    flow = next(
-        item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
+    assert any(
+        "Flow-table acquisition is unsupported" in item
+        for item in outcome.manual_investigation_reasons
     )
-    assert flow.attribution_evidence is None
-    assert flow.change_correlation_id is None
-    assert flow.ip_flow_provenance is not None
-    assert flow.ip_flow_provenance.causal_change_correlation_id is None
+    assert any(
+        "Connection Monitor table acquisition is unsupported" in item
+        for item in outcome.manual_investigation_reasons
+    )
+    assert not any(
+        isinstance(item, NetworkWatcherFlowRecord)
+        for item in outcome.batch.records
+    )
+    assert not any(isinstance(item, IpFlowVerifyRequest) for item in port.requests)
+    assert all(
+        item.log_permission_evidence is not None
+        for item in outcome.batch.coverage
+        if item.family in {"guest", "endpointHealth"}
+    )
     assert any(
         "supporting control has no required coverage scope" in item
         for item in outcome.manual_investigation_reasons
@@ -1184,10 +1250,7 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert tuple(item.request_digest for item in receipt.exchanges) == tuple(
         request.request_digest for request in port.requests
     )
-    ip_flow_exchange = next(item for item in receipt.exchanges if item.source == "ipFlowVerify")
-    ip_flow_request = next(item for item in port.requests if isinstance(item, IpFlowVerifyRequest))
-    assert ip_flow_exchange.checked_at == NOW
-    assert ip_flow_request.target_resource_id == DB_ID.casefold()
+    assert not any(item.source == "ipFlowVerify" for item in receipt.exchanges)
     assert outcome.committed.monitoring_handoff.acquisition_receipt_digest == receipt.receipt_digest
     tampered_bundle = outcome.prepared.monitoring_bundle.model_dump(
         mode="json",
@@ -1357,14 +1420,22 @@ def test_every_selected_incident_field_is_independently_tamper_evident(
 def test_correlation_revalidates_persisted_observation_contract_scope() -> None:
     outcome, _, intent = _execute(_AcquisitionPort())
     bundle = outcome.prepared.monitoring_bundle
-    flow = next(item for item in bundle.observations if isinstance(item, NetworkFlowObservation))
-    tampered_flow = flow.model_copy(update={"source_resource_id": OUT_OF_SCOPE_ID.casefold()})
+    heartbeat = next(
+        item
+        for item in bundle.observations
+        if isinstance(item, GuestSignalObservation)
+    )
+    tampered_heartbeat = heartbeat.model_copy(
+        update={"subject_resource_id": OUT_OF_SCOPE_ID.casefold()}
+    )
     tampered_bundle = bundle.model_copy(
         update={
             "observations": tuple(
                 sorted(
                     (
-                        tampered_flow if item.observation_id == flow.observation_id else item
+                        tampered_heartbeat
+                        if item.observation_id == heartbeat.observation_id
+                        else item
                         for item in bundle.observations
                     ),
                     key=lambda item: item.observation_id,
@@ -1379,7 +1450,7 @@ def test_correlation_revalidates_persisted_observation_contract_scope() -> None:
         _acquisition_collector_contract(),
     )
 
-    with pytest.raises(ValueError, match="escapes collector scopes"):
+    with pytest.raises(ValueError, match="escapes exact collector VM scopes"):
         verifier.verify_persisted_scope(tampered_bundle, intent)
 
 
@@ -1471,8 +1542,7 @@ def test_synthetic_client_factories_are_isolated_per_adapter() -> None:
     second = execute(second_coordinator, second_commit)
 
     assert first_commit.calls == second_commit.calls == 1
-    assert first_port.ip_flow_calls == 1
-    assert second_port.ip_flow_calls == 0
+    assert first_port.ip_flow_calls == second_port.ip_flow_calls == 0
     assert len(first_port.azure_client_credentials) == 5
     assert len(second_port.azure_client_credentials) == 5
     assert len({id(item) for item in first_port.azure_client_credentials}) == 1
@@ -1482,7 +1552,7 @@ def test_synthetic_client_factories_are_isolated_per_adapter() -> None:
     second_receipt = second.prepared.monitoring_bundle.acquisition_receipt
     assert first_receipt is not None
     assert second_receipt is not None
-    assert any(item.source == "ipFlowVerify" for item in first_receipt.exchanges)
+    assert not any(item.source == "ipFlowVerify" for item in first_receipt.exchanges)
     assert not any(item.source == "ipFlowVerify" for item in second_receipt.exchanges)
 
 
@@ -1533,10 +1603,9 @@ def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
     assert endpoint_coverage.detail is not None
     assert "ambiguous" in endpoint_coverage.detail
     assert "ambiguous" in " ".join(outcome.manual_investigation_reasons)
-    assert flow_coverage.status == "truncated"
+    assert flow_coverage.status == "unavailable"
     assert flow_coverage.detail is not None
-    assert "Traffic Analytics is aggregated" in flow_coverage.detail
-    assert "IP Flow Verify is point-in-time" in flow_coverage.detail
+    assert "Flow-table acquisition is unsupported" in flow_coverage.detail
 
 
 def test_fully_ambiguous_vm_mapping_is_unavailable_without_false_evidence() -> None:
@@ -1633,33 +1702,28 @@ def test_resource_health_previous_status_filter_cannot_replace_prior_evidence() 
         )
 
 
-def test_ip_flow_verify_must_bind_the_exact_network_tuple() -> None:
-    context, intent, controls = _authority()
-    commit = _CommitPort()
+def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls() -> None:
     port = _AcquisitionPort(mismatched_ip_flow=True)
-    acquisition_authority = _acquisition_authority(
-        required_control_ids=_required_control_ids(context, controls),
-        context_binding=context,
-        controls=controls,
-    )
-    coordinator = _coordinator(port, acquisition_authority)
+    outcome, commit, _ = _execute(port)
 
-    with pytest.raises(MonitoringAcquisitionError, match="exact request"):
-        coordinator.execute(
-            monitoring_intent=intent,
-            context_binding=context,
-            expected_active_context_authority_digest=(
-                context.publication_authority.authority_digest
-            ),
-            collected_at=NOW,
-            change_scope=_scope_contract(),
-            commit_port=commit,
-            incident_revision=1,
-            issued_at=NOW,
-            trusted_as_of=NOW + timedelta(minutes=1),
-            expires_at=NOW + timedelta(minutes=10),
+    flow_coverage = next(
+        item
+        for item in outcome.batch.coverage
+        if item.family == "networkFlow"
+    )
+    assert commit.calls == 1
+    assert port.ip_flow_calls == 0
+    assert not any(
+        isinstance(item, LogAnalyticsQueryRequest)
+        and item.table == "NTANetAnalytics"
+        for item in port.requests
+    )
+    assert flow_coverage.status == "unavailable"
+    assert flow_coverage.query_execution_digests == ()
+    assert (
+        flow_coverage.detail is not None
+        and "ABAC-isolated workspace/table boundary" in flow_coverage.detail
         )
-    assert commit.calls == 0
 
 
 def test_healthy_guest_signal_does_not_block_endpoint_incident() -> None:
@@ -1682,11 +1746,10 @@ def test_optional_change_controls_are_not_executed_or_attributed() -> None:
         isinstance(request, (ActivityLogQueryRequest, ResourceGraphChangeQueryRequest))
         for request in port.requests
     )
-    flow = next(
-        item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
+    assert not any(
+        isinstance(item, NetworkWatcherFlowRecord)
+        for item in outcome.batch.records
     )
-    assert flow.attribution_evidence is None
-    assert flow.change_correlation_id is None
     assert any(
         "supporting control has no required coverage scope and was not executed" in item
         for item in outcome.manual_investigation_reasons
@@ -2062,7 +2125,7 @@ def test_added_replaced_or_omitted_control_binding_fails_before_external_io() ->
         assert port.requests == []
 
 
-def test_incorrect_ip_flow_permission_contract_fails_before_external_io() -> None:
+def test_current_contract_rejects_ip_flow_authorization_before_external_io() -> None:
     reviewed = _acquisition_collector_contract()
     invalid = reviewed.model_copy(
         update={
@@ -2074,7 +2137,7 @@ def test_incorrect_ip_flow_permission_contract_fails_before_external_io() -> Non
     )
     port = _AcquisitionPort()
 
-    with pytest.raises(ValidationError, match="IP Flow Verify operations"):
+    with pytest.raises(ValidationError, match="without IP Flow authorization"):
         AzureMonitoringAdapter(
             reviewed_collector_contract=invalid,
         )
@@ -2570,54 +2633,25 @@ def test_caller_collection_time_cannot_backdate_collector_receipt() -> None:
     assert outcome.batch.collected_at == NOW
 
 
-def test_backdated_ip_flow_result_is_rejected() -> None:
-    port = _AcquisitionPort(backdated_ip_flow=True)
-    with pytest.raises(MonitoringAcquisitionError, match="IP Flow Verify response is stale"):
-        _execute(port)
-    assert port.ip_flow_calls == 1
-
-
 @pytest.mark.parametrize(
-    ("live_time", "message"),
+    "port",
     (
-        (NOW + timedelta(seconds=1), "does not equal live call start"),
-        (NOW + timedelta(hours=1), "credential is stale"),
+        _AcquisitionPort(backdated_ip_flow=True),
+        _AcquisitionPort(mismatched_ip_flow=True),
     ),
 )
-def test_ip_flow_override_is_rejected_before_operation(
-    live_time: datetime,
-    message: str,
+def test_ip_flow_result_paths_are_never_invoked_without_flow_boundary(
+    port: _AcquisitionPort,
 ) -> None:
-    source_port = _AcquisitionPort()
-    _execute(source_port)
-    request = next(item for item in source_port.requests if isinstance(item, IpFlowVerifyRequest))
-    adapter = _adapter(_AcquisitionPort())
-    proof = adapter.verify_identity()
-    execution = monitoring_acquisition_module._AcquisitionExecution(
-        adapter=adapter,
-        identity_proof=proof,
-        max_calls=32,
-        max_freshness_seconds=900,
-        started_at=proof.verified_at,
-        exchanges=[],
-    )
-    operation_calls = 0
+    outcome, commit, _ = _execute(port)
 
-    def operation(_request):
-        nonlocal operation_calls
-        operation_calls += 1
-        raise AssertionError("stale or mismatched call time must fail before I/O")
-
-    _SyntheticClock.now = live_time
-    with pytest.raises(MonitoringAcquisitionError, match=message):
-        execution.invoke(
-            request,
-            operation,
-            requested_at_override=request.checked_at,
-        )
-
-    assert operation_calls == 0
-    assert execution.exchanges == []
+    assert commit.calls == 1
+    assert port.ip_flow_calls == 0
+    assert not any(item.source == "ipFlowVerify" for item in (
+        outcome.prepared.monitoring_bundle.acquisition_receipt.exchanges
+        if outcome.prepared.monitoring_bundle.acquisition_receipt is not None
+        else ()
+    ))
 
 
 def test_unproven_empty_aggregate_is_unavailable_not_healthy() -> None:
@@ -2772,15 +2806,22 @@ def test_production_transaction_rejects_forged_receipt_signature() -> None:
         )
 
 
-def test_traffic_analytics_cardinality_is_rejected_before_ip_flow_calls() -> None:
+def test_traffic_analytics_cardinality_is_not_queried_without_flow_boundary() -> None:
     port = _AcquisitionPort(traffic_analytics_rows=500)
-    with pytest.raises(
-        MonitoringAcquisitionError,
-        match="Traffic Analytics returned multiple rows",
-    ):
-        _execute(port)
+    outcome, commit, _ = _execute(port)
+
+    assert commit.calls == 1
     assert port.ip_flow_calls == 0
-    assert len(port.requests) <= 32
+    assert not any(
+        isinstance(item, LogAnalyticsQueryRequest)
+        and item.table == "NTANetAnalytics"
+        for item in port.requests
+    )
+    assert next(
+        item
+        for item in outcome.batch.coverage
+        if item.family == "networkFlow"
+    ).status == "unavailable"
 
 
 def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> None:
@@ -2812,7 +2853,7 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     assert receipt.canonical_json() == second_receipt.canonical_json()
 
 
-def test_each_ip_flow_exchange_maps_one_retained_network_flow_record() -> None:
+def test_flow_table_unavailable_has_no_exchange_or_retained_network_record() -> None:
     outcome, commit, _ = _execute(_AcquisitionPort())
 
     assert commit.calls == 1
@@ -2822,46 +2863,13 @@ def test_each_ip_flow_exchange_maps_one_retained_network_flow_record() -> None:
     receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
     exchanges = tuple(item for item in receipt.exchanges if item.source == "ipFlowVerify")
-    assert len(exchanges) == len(retained) == 1
-    provenance = retained[0].ip_flow_provenance
-    assert provenance is not None
-    assert provenance.exchange_sequence == exchanges[0].sequence
-    assert provenance.ip_flow_request_digest == exchanges[0].request_digest
-    assert provenance.ip_flow_result_digest == exchanges[0].result_digest
-    assert provenance.requested_at == exchanges[0].requested_at
-    assert provenance.checked_at == exchanges[0].checked_at
-    assert provenance.received_at == exchanges[0].received_at
+    assert exchanges == ()
+    assert retained == ()
 
 
-@pytest.mark.parametrize(
-    ("field_name", "replacement", "expected_error"),
-    (
-        (
-            "ipFlowRequestDigest",
-            "sha256:" + "f" * 64,
-            "exact signed exchange",
-        ),
-        (
-            "ipFlowResultDigest",
-            "sha256:" + "e" * 64,
-            "exact signed exchange",
-        ),
-        (
-            "exchangeSequence",
-            32,
-            "map each exchange",
-        ),
-        (
-            "correlationRequestId",
-            "84ba07fb-0911-4d67-946a-67a9eac90506",
-            "receipt does not bind the monitoring bundle",
-        ),
-    ),
-)
-def test_ip_flow_provenance_tampering_is_rejected(
-    field_name: str,
-    replacement: object,
-    expected_error: str,
+@pytest.mark.parametrize("permission_section", ("resources", "dataSources"))
+def test_persisted_log_permission_evidence_rejects_silent_exclusions(
+    permission_section: str,
 ) -> None:
     outcome, _, _ = _execute(_AcquisitionPort())
     bundle_payload = outcome.prepared.monitoring_bundle.model_dump(
@@ -2869,124 +2877,46 @@ def test_ip_flow_provenance_tampering_is_rejected(
         by_alias=True,
         exclude_none=True,
     )
-    flow_payload = next(
-        item for item in bundle_payload["observations"] if item["observationKind"] == "networkFlow"
+    coverage_payload = next(
+        item
+        for item in bundle_payload["coverage"]
+        if item.get("logPermissionEvidence") is not None
     )
-    provenance_payload = flow_payload["ipFlowProvenance"]
-    provenance_payload[field_name] = replacement
-    provenance_payload["provenanceDigest"] = compute_artifact_digest(
-        {key: value for key, value in provenance_payload.items() if key != "provenanceDigest"}
-    )
-    observation_digest = compute_artifact_digest(
-        {
-            key: value
-            for key, value in flow_payload.items()
-            if key not in {"observationId", "observationDigest"}
-        }
-    )
-    flow_payload["observationId"] = f"obs-{observation_digest.removeprefix('sha256:')[:32]}"
-    flow_payload["observationDigest"] = observation_digest
-    bundle_payload["observations"] = sorted(
-        bundle_payload["observations"],
-        key=lambda item: item["observationId"],
-    )
+    permission_payload = coverage_payload["logPermissionEvidence"]
+    permission_payload[permission_section][0]["denyTables"] = ["Heartbeat"]
 
-    with pytest.raises(ValidationError, match=expected_error):
+    with pytest.raises(ValidationError, match="silent resource, workspace, or table exclusion"):
         type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(bundle_payload))
 
 
-def test_production_bundle_rejects_historical_loose_ip_flow_fields() -> None:
+def test_production_bundle_requires_persisted_log_permission_evidence() -> None:
     outcome, _, _ = _execute(_AcquisitionPort())
-    bundle_payload = outcome.prepared.monitoring_bundle.model_dump(
-        mode="json",
-        by_alias=True,
-        exclude_none=True,
+    bundle = outcome.prepared.monitoring_bundle
+    selected = next(
+        item for item in bundle.coverage if item.log_permission_evidence is not None
     )
-    flow_payload = next(
-        item
-        for item in bundle_payload["observations"]
-        if item["observationKind"] == "networkFlow"
-    )
-    provenance = flow_payload.pop("ipFlowProvenance")
-    flow_payload.update(
-        {
-            "ipFlowAccess": provenance["access"],
-            "ipFlowRuleResourceId": provenance["resultRuleResourceId"],
-            "ipFlowCheckedAt": provenance["checkedAt"],
-            "ipFlowResultDigest": provenance["ipFlowResultDigest"],
+    tampered = selected.model_copy(update={"log_permission_evidence": None})
+    tampered_bundle = bundle.model_copy(
+        update={
+            "coverage": tuple(
+                tampered if item.coverage_id == selected.coverage_id else item
+                for item in bundle.coverage
+            )
         }
     )
-    observation_digest = compute_artifact_digest(
-        {
-            key: value
-            for key, value in flow_payload.items()
-            if key not in {"observationId", "observationDigest"}
-        }
-    )
-    flow_payload["observationId"] = (
-        f"obs-{observation_digest.removeprefix('sha256:')[:32]}"
-    )
-    flow_payload["observationDigest"] = observation_digest
-    bundle_payload["observations"] = sorted(
-        bundle_payload["observations"],
-        key=lambda item: item["observationId"],
-    )
 
-    with pytest.raises(ValidationError, match="exactly one semantic IP Flow provenance"):
-        type(outcome.prepared.monitoring_bundle).model_validate_json(
-            json.dumps(bundle_payload)
-        )
+    with pytest.raises(ValueError, match="retained Logs permission evidence"):
+        tampered_bundle.validate_bundle()
 
 
-def test_ip_flow_allow_and_deny_change_persisted_and_correlated_semantics() -> None:
+def test_ip_flow_result_variations_cannot_change_unsupported_flow_evidence() -> None:
     denied, _, _ = _execute(_AcquisitionPort(ip_flow_access="Deny"))
     allowed, _, _ = _execute(_AcquisitionPort(ip_flow_access="Allow"))
 
-    denied_record = next(
-        item for item in denied.batch.records if isinstance(item, NetworkWatcherFlowRecord)
-    )
-    allowed_record = next(
-        item for item in allowed.batch.records if isinstance(item, NetworkWatcherFlowRecord)
-    )
-    denied_observation = next(
-        item
-        for item in denied.prepared.monitoring_bundle.observations
-        if isinstance(item, NetworkFlowObservation)
-    )
-    allowed_observation = next(
-        item
-        for item in allowed.prepared.monitoring_bundle.observations
-        if isinstance(item, NetworkFlowObservation)
-    )
-    denied_report = (
-        _test_service(denied.correlation_request).correlate(denied.correlation_request).report
-    )
-    allowed_report = (
-        _test_service(allowed.correlation_request).correlate(allowed.correlation_request).report
-    )
-
-    assert denied_record.ip_flow_provenance is not None
-    assert allowed_record.ip_flow_provenance is not None
-    assert denied_record.ip_flow_provenance.access == "Deny"
-    assert allowed_record.ip_flow_provenance.access == "Allow"
-    assert denied.batch.canonical_bytes() != allowed.batch.canonical_bytes()
-    assert denied_observation.ip_flow_provenance is not None
-    assert allowed_observation.ip_flow_provenance is not None
-    assert denied_observation.ip_flow_provenance.access == "Deny"
-    assert allowed_observation.ip_flow_provenance.access == "Allow"
+    assert denied.batch.canonical_bytes() == allowed.batch.canonical_bytes()
     assert (
         denied.prepared.monitoring_bundle.compute_normalized_evidence_digest_value()
-        != allowed.prepared.monitoring_bundle.compute_normalized_evidence_digest_value()
-    )
-    assert any(
-        denied_observation.observation_id
-        in {item.evidence_id for item in hypothesis.supporting_evidence}
-        for hypothesis in denied_report.hypotheses
-    )
-    assert all(
-        allowed_observation.observation_id
-        not in {item.evidence_id for item in hypothesis.supporting_evidence}
-        for hypothesis in allowed_report.hypotheses
+        == allowed.prepared.monitoring_bundle.compute_normalized_evidence_digest_value()
     )
 
 

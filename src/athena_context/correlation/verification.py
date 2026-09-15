@@ -493,6 +493,17 @@ def _verify_persisted_monitoring_scope(
                 ):
                     continue
                 raise ValueError("persisted query coverage escapes collector contract scope")
+        permission_evidence = coverage.log_permission_evidence
+        if permission_evidence is not None and (
+            permission_evidence.workspace_resource_id
+            != contract.workspace_resource_id.casefold().rstrip("/")
+            or permission_evidence.query_target_resource_id not in signal_scopes
+            or permission_evidence.table
+            not in {item.table for item in contract.resource_context_table_plans or ()}
+        ):
+            raise ValueError(
+                "persisted Logs permission evidence escapes the reviewed resource context"
+            )
 
 
 def _verify_request_source_freshness(

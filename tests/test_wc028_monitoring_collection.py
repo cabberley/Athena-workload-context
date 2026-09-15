@@ -216,7 +216,11 @@ def _controls(
             resources=(WEB_ID,),
             dry_run_only=dry_run_only,
             signal=_query_signal(
-                "Heartbeat | summarize heartbeatCount=count()",
+                (
+                    "Heartbeat "
+                    f"| where _ResourceId =~ '{WEB_ID.lower()}' "
+                    "| summarize heartbeatCount=count() by _ResourceId"
+                ),
                 operator="lessThan",
                 threshold=1,
             ),
@@ -226,7 +230,11 @@ def _controls(
             resources=(WEB_ID, DB_ID),
             dry_run_only=dry_run_only,
             signal=_query_signal(
-                "VMConnection | summarize failedConnectionCount=count()",
+                (
+                    "VMConnection "
+                    f"| where _ResourceId =~ '{WEB_ID.lower()}' "
+                    "| summarize failedConnectionCount=count() by _ResourceId"
+                ),
                 operator="greaterThan",
                 threshold=0,
             ),

@@ -27,10 +27,11 @@ var readerRoleDefinitionId = subscriptionResourceId(
 var signalReaderRoleDefinitionGuid = '2fda1d90-37da-55d9-8ac3-132fb7bdca5d'
 var resourceLogReaderRoleDefinitionGuid = 'f33a4363-5d9a-5d50-9871-c08582234978'
 var resourceLogAllowedOperations = [
-  'Microsoft.Insights/logs/Heartbeat/read'
-  'Microsoft.Insights/logs/NTANetAnalytics/read'
-  'Microsoft.Insights/logs/NWConnectionMonitorTestResult/read'
-  'Microsoft.Insights/logs/VMConnection/read'
+  'Microsoft.Insights/Logs/Heartbeat/Read'
+  'Microsoft.Insights/Logs/Perf/Read'
+  'Microsoft.Insights/Logs/InsightsMetrics/Read'
+  'Microsoft.Insights/Logs/Syslog/Read'
+  'Microsoft.Insights/Logs/VMConnection/Read'
 ]
 var expectedSignalReaderActions = [
   'microsoft.compute/virtualmachines/instanceview/read'
@@ -38,7 +39,7 @@ var expectedSignalReaderActions = [
 ]
 var resourceHealthRoleDefinitionGuid = '0790d6f2-9553-5b63-84ac-56596b7e4072'
 var resourceHealthAllowedOperations = [
-  'Microsoft.ResourceHealth/AvailabilityStatuses/read'
+  'Microsoft.ResourceHealth/AvailabilityStatuses/current/read'
 ]
 
 resource signalReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' existing = {
@@ -50,7 +51,7 @@ resource resourceLogReaderRoleDefinition 'Microsoft.Authorization/roleDefinition
   name: resourceLogReaderRoleDefinitionGuid
   properties: {
     roleName: 'Athena WC-028 VM Resource Log Reader'
-    description: 'Read only the four reviewed Log Analytics tables through resource-scoped queries at exact approved workload VMs.'
+    description: 'Read only the five registered resource-context Log Analytics tables at exact approved workload VMs.'
     type: 'CustomRole'
     permissions: [
       {
