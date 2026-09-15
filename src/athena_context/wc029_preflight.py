@@ -102,6 +102,19 @@ _UNSUPPORTED_IMPERATIVE_TYPES = frozenset(
 )
 _MANIFEST_SCHEMA_VERSION = "athena.wc029PreflightManifest.v1"
 _ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
+_ARM_ROLE_ASSIGNMENT_QUERY_KEYS = frozenset(
+    {
+        "$filter",
+        "$skipToken",
+        "api-version",
+    }
+)
+_GRAPH_MEMBERSHIP_QUERY_KEYS = frozenset(
+    {
+        "$skip",
+        "$skiptoken",
+    }
+)
 _GRAPH_MEMBERSHIP_METHODS = frozenset(
     {
         "getmembergroups",
@@ -1318,6 +1331,7 @@ def _validate_what_if_request(
     allowed_options = {
         "--location",
         "--name",
+        "--no-prompt",
         "--output",
         "--parameters",
         "--resource-group",
@@ -1359,6 +1373,7 @@ def _validate_what_if_request(
         "--result-format",
         "--subscription",
         "--validation-level",
+        "--no-prompt",
         "--location" if deployment_scope == "sub" else "--resource-group",
     }
     parameters_value = parsed.get("--parameters", "")
@@ -1373,6 +1388,8 @@ def _validate_what_if_request(
         raise PreflightInputError("what-if command requires FullResourcePayloads")
     if parsed["--validation-level"] != "Provider":
         raise PreflightInputError("what-if command requires full Provider validation")
+    if parsed["--no-prompt"] != "true":
+        raise PreflightInputError("what-if command requires exact --no-prompt true")
     if parsed["--output"] != "json":
         raise PreflightInputError("what-if command output must be exact json")
     if _DEPLOYMENT_NAME.fullmatch(parsed["--name"]) is None:
@@ -3288,6 +3305,7 @@ def _parse_exact_query(
     parts: SplitResult,
     *,
     field_name: str,
+    allowed_keys: frozenset[str],
 ) -> dict[str, list[str]]:
     try:
         pairs = parse_qsl(
@@ -3301,10 +3319,12 @@ def _parse_exact_query(
     seen: set[str] = set()
     for key, value in pairs:
         folded_key = key.casefold()
-        if not key.isascii() or key != folded_key:
-            raise PreflightInputError(f"{field_name} query keys must use exact lowercase ASCII")
+        if not key.isascii():
+            raise PreflightInputError(f"{field_name} query keys must use ASCII")
         if folded_key in seen:
             raise PreflightInputError(f"{field_name} query contains a duplicate decoded key")
+        if key not in allowed_keys:
+            raise PreflightInputError(f"{field_name} query key is not canonical for this endpoint")
         if not value.isascii():
             raise PreflightInputError(f"{field_name} query values must use ASCII")
         seen.add(folded_key)
@@ -3428,11 +3448,13 @@ def _validate_arm_get_url(
         or parts.fragment
     ):
         raise PreflightInputError(f"{field_name} is not canonical")
-    query = _parse_exact_query(parts, field_name=field_name)
-    normalized_expected = {
-        key.casefold(): [expected_value] for key, expected_value in expected_query.items()
-    }
-    if query != normalized_expected:
+    query = _parse_exact_query(
+        parts,
+        field_name=field_name,
+        allowed_keys=frozenset(expected_query),
+    )
+    expected = {key: [expected_value] for key, expected_value in expected_query.items()}
+    if query != expected:
         raise PreflightInputError(f"{field_name} is not canonical")
 
 
@@ -3590,8 +3612,8 @@ def _derive_management_group_ancestry(
     )
     if (
         _canonical_guid(
-            _get_case_insensitive(subscription_properties, "tenantId"),
-            field_name="ARM subscription tenantId",
+            _get_case_insensitive(subscription_properties, "tenant"),
+            field_name="ARM subscription tenant",
         )
         != target.tenant_id
     ):
@@ -3786,11 +3808,13 @@ def _validate_graph_urls(
         query = _parse_exact_query(
             parts,
             field_name="Graph membership requestUrl",
+            allowed_keys=_GRAPH_MEMBERSHIP_QUERY_KEYS,
         )
         if parts.fragment or (index == 0 and query):
             raise PreflightInputError("initial Graph membership requestUrl must be unfiltered")
         if index > 0 and (
             not query
+            or len(query) != 1
             or not set(query).issubset({"$skiptoken", "$skip"})
             or any(len(values) != 1 for values in query.values())
         ):
@@ -3961,17 +3985,18 @@ def _validate_arm_role_assignment_urls(
         query = _parse_exact_query(
             parts,
             field_name="ARM role-assignment requestUrl",
+            allowed_keys=_ARM_ROLE_ASSIGNMENT_QUERY_KEYS,
         )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
-            allowed_keys.add("$skiptoken")
+            allowed_keys.add("$skipToken")
         if (
             parts.fragment
             or set(query) - allowed_keys
             or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
             or len(query.get("$filter", [])) != 1
-            or (index == 0 and "$skiptoken" in query)
-            or (index > 0 and len(query.get("$skiptoken", [])) != 1)
+            or (index == 0 and "$skipToken" in query)
+            or (index > 0 and len(query.get("$skipToken", [])) != 1)
         ):
             raise PreflightInputError("ARM role-assignment requestUrl is not canonical")
         _validate_assigned_to_filter(
@@ -4022,17 +4047,18 @@ def _validate_descendant_arm_urls(
         query = _parse_exact_query(
             parts,
             field_name="ARM descendant role-assignment requestUrl",
+            allowed_keys=_ARM_ROLE_ASSIGNMENT_QUERY_KEYS,
         )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
-            allowed_keys.add("$skiptoken")
+            allowed_keys.add("$skipToken")
         if (
             parts.fragment
             or set(query) - allowed_keys
             or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
             or len(query.get("$filter", [])) != 1
-            or (index == 0 and "$skiptoken" in query)
-            or (index > 0 and len(query.get("$skiptoken", [])) != 1)
+            or (index == 0 and "$skipToken" in query)
+            or (index > 0 and len(query.get("$skipToken", [])) != 1)
         ):
             raise PreflightInputError("ARM descendant role-assignment requestUrl is not canonical")
         _validate_principal_id_filter(

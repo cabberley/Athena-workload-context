@@ -124,11 +124,31 @@ def _what_if_request(
             "FullResourcePayloads",
             "--validation-level",
             "Provider",
+            "--no-prompt",
+            "true",
             "--no-pretty-print",
             "--output",
             "json",
         ],
     }
+
+
+def _group_what_if_request(
+    *,
+    deployment_target: dict[str, object] | None = None,
+) -> dict[str, object]:
+    request = _what_if_request(deployment_target=deployment_target)
+    command = request["command"]
+    arguments = request["arguments"]
+    assert isinstance(command, list)
+    assert isinstance(arguments, list)
+    command[2] = "group"
+    location_index = arguments.index("--location")
+    arguments[location_index : location_index + 2] = [
+        "--resource-group",
+        _RG_SCOPE.rsplit("/", 1)[-1],
+    ]
+    return request
 
 
 def _json_digest(value: object) -> str:
@@ -686,8 +706,10 @@ def _hierarchy_evidence() -> dict[str, object]:
                     "type": ("Microsoft.Management/managementGroups/subscriptions"),
                     "name": _SUBSCRIPTION_ID,
                     "properties": {
-                        "tenantId": _TENANT_ID,
+                        "displayName": "Synthetic Workload Subscription",
                         "parent": {"id": _MG_LEAF_SCOPE},
+                        "state": "Active",
+                        "tenant": _TENANT_ID,
                     },
                 },
             },
@@ -959,6 +981,72 @@ def _first_principal_artifact(
     principal = principals[0]
     assert isinstance(principal, dict)
     return principal
+
+
+def _management_group_subscription_properties(
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    hierarchy = evidence["hierarchy"]
+    assert isinstance(hierarchy, dict)
+    arm = hierarchy["arm"]
+    assert isinstance(arm, dict)
+    subscription = arm["subscription"]
+    assert isinstance(subscription, dict)
+    body = subscription["body"]
+    assert isinstance(body, dict)
+    properties = body["properties"]
+    assert isinstance(properties, dict)
+    return properties
+
+
+def _arm_role_assignment_pages(
+    evidence: dict[str, object],
+    *,
+    collection_kind: str,
+) -> list[object]:
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    if collection_kind == "ancestors":
+        collection = role_assignments["ancestors"]
+    else:
+        assert collection_kind == "descendants"
+        descendants = role_assignments["descendants"]
+        assert isinstance(descendants, dict)
+        collections = descendants["collections"]
+        assert isinstance(collections, list)
+        collection = collections[0]
+    assert isinstance(collection, dict)
+    pages = collection["pages"]
+    assert isinstance(pages, list)
+    return pages
+
+
+def _set_two_page_arm_role_assignments(
+    evidence: dict[str, object],
+    *,
+    collection_kind: str,
+    continuation_query: str = "%24skipToken=synthetic",
+) -> None:
+    pages = _arm_role_assignment_pages(
+        evidence,
+        collection_kind=collection_kind,
+    )
+    first_page = pages[0]
+    assert isinstance(first_page, dict)
+    first_values = first_page["value"]
+    assert isinstance(first_values, list)
+    continuation_url = f"{first_page['requestUrl']}&{continuation_query}"
+    first_page["value"] = []
+    first_page["nextLink"] = continuation_url
+    pages.append(
+        {
+            "requestUrl": continuation_url,
+            "statusCode": 200,
+            "value": first_values,
+            "nextLink": None,
+        }
+    )
 
 
 def _cli_assignment(
@@ -4692,6 +4780,104 @@ def test_attested_what_if_requires_exact_full_analysis_request() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "deployment_scope",
+    ["sub", "group"],
+)
+def test_attested_what_if_accepts_exact_no_prompt_true(
+    deployment_scope: str,
+) -> None:
+    resource_id = _STORAGE_ID if deployment_scope == "sub" else _WORKLOAD_RESOURCE_SCOPE
+    document = _what_if(_change(resource_id, "NoChange"))
+    request = _what_if_request() if deployment_scope == "sub" else _group_what_if_request()
+    artifact = _attested_what_if(
+        document,
+        what_if_request=request,
+    )
+
+    assert (
+        evaluate_what_if(
+            artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "deployment_scope",
+    ["sub", "group"],
+)
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "omitted",
+        "false",
+        "uppercase-value",
+        "interactive-value",
+        "numeric-value",
+        "padded-value",
+        "duplicate",
+        "alias",
+        "equals-form",
+        "missing-value",
+    ],
+)
+def test_attested_what_if_rejects_non_exact_no_prompt_pair(
+    deployment_scope: str,
+    mutation: str,
+) -> None:
+    resource_id = _STORAGE_ID if deployment_scope == "sub" else _WORKLOAD_RESOURCE_SCOPE
+    document = _what_if(_change(resource_id, "NoChange"))
+    request = _what_if_request() if deployment_scope == "sub" else _group_what_if_request()
+    arguments = request["arguments"]
+    assert isinstance(arguments, list)
+    option_index = arguments.index("--no-prompt")
+    if mutation == "omitted":
+        del arguments[option_index : option_index + 2]
+    elif mutation == "false":
+        arguments[option_index + 1] = "false"
+    elif mutation == "uppercase-value":
+        arguments[option_index + 1] = "True"
+    elif mutation == "interactive-value":
+        arguments[option_index + 1] = "yes"
+    elif mutation == "numeric-value":
+        arguments[option_index + 1] = "1"
+    elif mutation == "padded-value":
+        arguments[option_index + 1] = " true "
+    elif mutation == "duplicate":
+        arguments.extend(["--no-prompt", "true"])
+    elif mutation == "alias":
+        arguments[option_index] = "--noPrompt"
+    elif mutation == "equals-form":
+        arguments[option_index : option_index + 2] = ["--no-prompt=true"]
+    else:
+        assert mutation == "missing-value"
+        del arguments[option_index + 1]
+    artifact = _attested_what_if(
+        document,
+        what_if_request=request,
+    )
+
+    with pytest.raises(PreflightInputError, match="what-if command"):
+        evaluate_what_if(
+            artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+
 def test_attested_what_if_binds_request_and_rejects_diagnostics() -> None:
     document = _what_if(_change(_STORAGE_ID, "NoChange"))
     artifact = _attested_what_if(document)
@@ -5040,7 +5226,13 @@ def test_rbac_attestation_binds_manifest_deployment_target(
 
 @pytest.mark.parametrize(
     "binding_input",
-    ["policy", "hierarchy", "membership", "roleAssignments"],
+    [
+        "policy",
+        "hierarchy",
+        "subscriptionTenant",
+        "membership",
+        "roleAssignments",
+    ],
 )
 def test_rbac_attestation_binds_reviewed_inputs(
     binding_input: str,
@@ -5072,6 +5264,10 @@ def test_rbac_attestation_binds_reviewed_inputs(
         request = resource_graph["request"]
         assert isinstance(request, dict)
         request["query"] = str(request["query"]) + " "
+    elif binding_input == "subscriptionTenant":
+        _management_group_subscription_properties(evidence)["tenant"] = (
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
     else:
         principal = _first_principal_artifact(evidence)
         artifact_name = "groupMembership" if binding_input == "membership" else "roleAssignments"
@@ -5849,17 +6045,154 @@ def test_guarded_rbac_rejects_pagination_gaps(
 
 
 @pytest.mark.parametrize(
+    "collection_kind",
+    ["ancestors", "descendants"],
+)
+def test_guarded_rbac_accepts_exact_arm_skip_token_pagination(
+    collection_kind: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    _set_two_page_arm_role_assignments(
+        evidence,
+        collection_kind=collection_kind,
+    )
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("continuation_query", "message"),
+    [
+        ("%24skiptoken=synthetic", "not canonical for this endpoint"),
+        ("%24SkipToken=synthetic", "not canonical for this endpoint"),
+        (
+            "%24skipToken=synthetic&%24skipToken=duplicate",
+            "duplicate decoded key",
+        ),
+        (
+            "%24skipToken=synthetic&%24skiptoken=collision",
+            "duplicate decoded key",
+        ),
+    ],
+)
+def test_guarded_rbac_rejects_arm_skip_token_spelling_and_collisions(
+    continuation_query: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    _set_two_page_arm_role_assignments(
+        evidence,
+        collection_kind="ancestors",
+        continuation_query=continuation_query,
+    )
+
+    with pytest.raises(PreflightInputError, match=message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("continuation_query", "message"),
+    [
+        ("%24skipToken=synthetic", "not canonical for this endpoint"),
+        ("%24Skiptoken=synthetic", "not canonical for this endpoint"),
+        (
+            "%24skiptoken=synthetic&%24skiptoken=duplicate",
+            "duplicate decoded key",
+        ),
+        (
+            "%24skiptoken=synthetic&%24skipToken=collision",
+            "duplicate decoded key",
+        ),
+        (
+            "%24skiptoken=synthetic&%24skip=1",
+            "continuation URL is not canonical",
+        ),
+    ],
+)
+def test_guarded_rbac_rejects_graph_skiptoken_spelling_and_collisions(
+    continuation_query: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    initial_url = (
+        f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal_id}/transitiveMemberOf"
+    )
+    continuation_url = f"{initial_url}?{continuation_query}"
+    principal["groupMembership"] = {
+        "tenantId": _TENANT_ID,
+        "method": "transitiveMemberOf",
+        "pages": [
+            {
+                "requestUrl": initial_url,
+                "statusCode": 200,
+                "value": [],
+                "@odata.nextLink": continuation_url,
+            },
+            {
+                "requestUrl": continuation_url,
+                "statusCode": 200,
+                "value": [],
+                "@odata.nextLink": None,
+            },
+        ],
+    }
+
+    with pytest.raises(PreflightInputError, match=message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
     ("evidence_kind", "query_suffix", "message"),
     [
         (
             "arm",
             "&%24skipToken=synthetic",
-            "exact lowercase ASCII",
+            "not canonical",
         ),
         (
             "arm",
             "&tenantId=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            "exact lowercase ASCII",
+            "not canonical for this endpoint",
         ),
         (
             "graph",
@@ -5869,7 +6202,7 @@ def test_guarded_rbac_rejects_pagination_gaps(
         (
             "graph",
             "?%24filter=securityEnabled%20eq%20true",
-            "must be unfiltered",
+            "not canonical for this endpoint",
         ),
     ],
 )
@@ -5988,7 +6321,7 @@ def test_guarded_rbac_rejects_percent_encoded_kelvin_url_alias() -> None:
     ("query_suffix", "message"),
     [
         ("&%61pi-version=2022-04-01", "duplicate decoded key"),
-        ("&API-VERSION=2022-04-01", "exact lowercase ASCII"),
+        ("&API-VERSION=2022-04-01", "duplicate decoded key"),
         ("&%24filter=duplicate", "duplicate decoded key"),
     ],
 )
@@ -6013,6 +6346,68 @@ def test_guarded_rbac_rejects_query_key_aliases(
     page = pages[0]
     assert isinstance(page, dict)
     page["requestUrl"] = str(page["requestUrl"]) + query_suffix
+
+    with pytest.raises(PreflightInputError, match=message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_accepts_official_management_group_subscription_shape() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+
+    assert _management_group_subscription_properties(evidence) == {
+        "displayName": "Synthetic Workload Subscription",
+        "parent": {"id": _MG_LEAF_SCOPE},
+        "state": "Active",
+        "tenant": _TENANT_ID,
+    }
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("mismatch", "crosses tenants"),
+        ("legacy-tenant-id", "ARM subscription tenant"),
+    ],
+)
+def test_guarded_rbac_rejects_invalid_management_group_subscription_tenant(
+    mutation: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    properties = _management_group_subscription_properties(evidence)
+    if mutation == "mismatch":
+        properties["tenant"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    else:
+        assert mutation == "legacy-tenant-id"
+        properties["tenantId"] = properties.pop("tenant")
 
     with pytest.raises(PreflightInputError, match=message):
         _evaluate_guarded_rbac(

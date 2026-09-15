@@ -125,6 +125,7 @@ az deployment sub what-if `
   --parameters '@.azure/wc013.parameters.json' `
   --result-format FullResourcePayloads `
   --validation-level Provider `
+  --no-prompt true `
   --no-pretty-print `
   --output json
 ```
@@ -171,8 +172,10 @@ must match its tenant, subscription, and resource group exactly.
 
 The attested request must prove exact `az deployment sub what-if` or
 `az deployment group what-if` execution with `FullResourcePayloads`, full `Provider` validation,
-exact `--no-pretty-print` and `--output json`, and no query, output transform, exclusion,
-short-circuit, or unknown option. JSON mode uses one local `--template-file` and one
+the exact separate pair `--no-prompt true`, exact `--no-pretty-print` and `--output json`, and no
+query, output transform, exclusion, short-circuit, or unknown option. Omission, `false`, interactive
+values, aliases, equals form, and duplicate `--no-prompt` options fail for both subscription and
+resource-group commands. JSON mode uses one local `--template-file` and one
 `--parameters @file.json`. Reviewed `.bicepparam` mode passes the `.bicepparam` path directly and
 omits `--template-file`; do not prefix Bicep parameter files with `@`. Reject every non-empty
 diagnostic anywhere in the response; warnings and incomplete-analysis diagnostics require a new
@@ -275,11 +278,14 @@ $TargetResourceGroupId = (
 
 First save the target subscription's Resource Graph `managementGroupAncestorsChain`. Corroborate it
 with successful ARM reads for the target subscription, target resource group, and every management
-group in the chain, retaining each management group's ARM parent ID. Normalize the final artifact as
-a leaf-to-root chain and retain the raw responses beside it. Missing nodes, `403`/`404`, a tenant or
-subscription mismatch, cycles, disconnected nodes, or Resource Graph/ARM disagreement block the
-gate. The policy's `approvedManagementGroupAncestry` is a separately reviewed copy of the expected
-path; a changed path requires new review.
+group in the chain, retaining each management group's ARM parent ID. Retain the raw responses
+unchanged. In particular, Management Groups Get Subscription API `2020-05-01` reports the tenant in
+`properties.tenant`; do not rename it to `tenantId` inside the retained response. The verifier
+validates that raw field and derives the leaf-to-root chain in memory, so no normalized duplicate is
+needed. Missing nodes, `403`/`404`, a tenant or subscription mismatch, cycles, disconnected nodes,
+or Resource Graph/ARM disagreement block the gate. The policy's
+`approvedManagementGroupAncestry` is a separately reviewed copy of the expected path; a changed path
+requires new review.
 
 The Resource Graph response must contain no non-null `skipToken` or `$skipToken`, must explicitly
 set `resultTruncated` to JSON `false` or the exact transport string `"false"`, and must satisfy
@@ -344,7 +350,8 @@ while ($null -ne $NextUrl) {
 ```
 
 Do not drop, reorder, or manually splice pages. Each returned `nextLink` must be the following page's
-request URL, and the last response must not contain a next link.
+request URL, and the last response must not contain a next link. Preserve the service-issued query
+key spelling: Role Assignments API `2022-04-01` continuation URLs use exact `$skipToken`.
 
 The target-scope query does not cover role assignments on individual workload resources or sibling
 resource groups. Collect a second, complete subscription-descendant inventory for the effective
@@ -411,8 +418,11 @@ az role assignment list `
 Do not use `--assignee`, omit either include flag, combine `--all` with `--scope`, add `--role`,
 `--resource-group`, or `--query`, use equals-form duplicate options, or transform the JSON output.
 Option names must be exact lowercase ASCII and fixed values such as `--output json` are
-case-sensitive. Decoded request-URL query keys must also be exact lowercase ASCII and unique after
-percent decoding. Single-dash-prefixed values are rejected rather than treated as positional data.
+case-sensitive. Decoded request-URL query keys must use the exact spelling defined by their
+endpoint and remain unique after percent decoding. ARM Role Assignments continuations use
+`$skipToken`; Graph continuations use `$skiptoken` where documented. Aliases, duplicates, and case
+variants fail closed. Single-dash-prefixed values are rejected rather than treated as positional
+data.
 
 The CLI equivalent for the separate subscription-descendant inventory is:
 

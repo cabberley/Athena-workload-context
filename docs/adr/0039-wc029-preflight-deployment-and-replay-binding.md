@@ -23,6 +23,15 @@ request, diagnostics could be ignored, additional authorization/imperative resou
 not blocked, decimal hashing was non-injective under active context, RBAC URL/CLI tokens admitted
 aliases, and nested path generation had no aggregate work budget.
 
+The latest exact-SHA review found three remaining provenance and compatibility gaps:
+
+- what-if provenance could omit `--no-prompt true` and therefore did not prove a non-interactive
+  collection;
+- Management Groups Get Subscription API `2020-05-01` raw evidence was read from the undocumented
+  `properties.tenantId` alias instead of documented `properties.tenant`; and
+- one global lowercase query-key rule rejected the documented ARM `$skipToken` continuation while
+  Graph requires the distinct `$skiptoken` spelling.
+
 Freshness does not prove single use, and the pure what-if evaluator does not yet derive the
 post-deployment principal, role, condition, and inherited scope needed to apply the reviewed
 separation policy to an authorization mutation.
@@ -61,15 +70,17 @@ Use the following guarded preflight contract:
    floating-point values are rejected.
 7. The what-if envelope carries the exact Azure CLI command and arguments. The manifest binds their
    digest. Only direct subscription/group what-if commands with `FullResourcePayloads`, full
-   `Provider` validation, exact `--no-pretty-print` and JSON output, and no exclusions, transforms,
-   or unknown options are valid. JSON mode requires one template file and one `@file.json`;
-   `.bicepparam` mode passes one direct `.bicepparam` path and forbids `--template-file`. Any
-   non-empty diagnostic blocks release.
+   `Provider` validation, the exact separate pair `--no-prompt true`, exact `--no-pretty-print` and
+   JSON output, and no exclusions, transforms, or unknown options are valid. JSON mode requires one
+   template file and one `@file.json`; `.bicepparam` mode passes one direct `.bicepparam` path and
+   forbids `--template-file`. Any non-empty diagnostic blocks release.
 8. Creates or modifies under any `Microsoft.Authorization` or `Microsoft.ManagedServices` family,
    plus `Microsoft.Resources/deploymentScripts`, remain blocked until their post-deployment effects
    are fully evaluated.
-9. RBAC provenance URL query keys are unique after decoding and exact lowercase ASCII. CLI evidence
-   uses exact ASCII option names and case-sensitive fixed values.
+9. RBAC provenance URL query keys are unique after decoding and use exact endpoint-specific ASCII
+   spelling. ARM Role Assignments API `2022-04-01` continuations use `$skipToken`; Graph
+   continuations retain exact `$skiptoken` where documented. CLI evidence uses exact ASCII option
+   names and case-sensitive fixed values.
 10. Canonical paths have a 4096-character limit and one evaluation-wide generated-path item and
     character budget, checked before concatenation or candidate materialization.
 11. The release ledger must be beneath a separately supplied fixed trusted root. Every existing path
@@ -94,6 +105,10 @@ Use the following guarded preflight contract:
     become bounded preflight input failures.
 16. POSIX ledger reads add nonblocking/no-follow flags and require a regular file from `fstat`.
     Writer and reader share one 64-KiB record bound checked before file creation.
+17. Management Groups Get Subscription API `2020-05-01` evidence is retained in its documented raw
+    shape and validated from `properties.tenant`. The manifest binds the complete raw RBAC payload;
+    the verifier derives hierarchy metadata in memory rather than inserting an unbound normalized
+    tenant alias into the response.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -120,7 +135,12 @@ blocked output is returned.
 - FIFO, socket, device, symlink, junction, and reparse entries cannot be consumed as ledger records.
 - A ledger record accepted by the create-only writer is guaranteed to fit the paired reader's bound.
 - Guarded what-if artifacts must add exact request provenance and regenerate the reviewed shared
-  manifest because `whatIfRequestDigest` is mandatory.
+  manifest because `whatIfRequestDigest` is mandatory. The reviewed request includes exact
+  `--no-prompt true` for both subscription and resource-group what-if commands.
+- Guarded RBAC artifacts must retain Management Groups Get Subscription `properties.tenant`
+  unchanged and regenerate the raw-evidence binding when that response changes.
+- ARM and Graph continuation query keys are validated against their own endpoint contracts rather
+  than one global lowercase rule.
 - The legacy module entry point remains available for compatibility but is not the guarded
   deployment gate.
 - Authorization mutations remain deliberately unavailable rather than being accepted without
@@ -152,10 +172,14 @@ and rendered-output bounds remain in the full test suite. Additional adversarial
 transforms/exclusions, diagnostics, expanded authorization and imperative families, decoded query
 key collisions, fuzzy/non-ASCII CLI tokens, wide decimals, integer-versus-decimal digest identity,
 surrounding-whitespace aliases, JSON and `.bicepparam` request modes, required
-`--no-pretty-print`, Windows junction/reparse paths, POSIX symlink/no-follow behavior, and a
-14,000-leaf deterministic linear-work snapshot regression. Windows tests include a synchronized
-junction swap between validation and file open; ledger tests also cover outside nonexistent paths
-invalid UTF-8 collection/binding records, POSIX FIFO/socket rejection, and symmetric record-size
-bounds. Scope regressions cover parent/child management groups and management-group-to-resource
-matching in both directions. Token tests cover whitespace and Unicode aliases, lone surrogates,
-single-dash values, and exact deployment/file grammars.
+`--no-pretty-print`, exact `--no-prompt true` for both deployment scopes, Windows junction/reparse
+paths, POSIX symlink/no-follow behavior, and a 14,000-leaf deterministic linear-work snapshot
+regression. RBAC compatibility tests use the official Management Groups subscription
+`properties.tenant` shape and exact two-page ARM `$skipToken` continuations, while rejecting the
+legacy tenant alias, tenant mismatches, Graph/ARM cursor spelling swaps, duplicates, and casefold
+collisions. Windows tests include a synchronized junction swap between validation and file open;
+ledger tests also cover outside nonexistent paths, invalid UTF-8 collection/binding records, POSIX
+FIFO/socket rejection, and symmetric record-size bounds. Scope regressions cover parent/child
+management groups and management-group-to-resource matching in both directions. Token tests cover
+whitespace and Unicode aliases, lone surrogates, single-dash values, and exact deployment/file
+grammars.

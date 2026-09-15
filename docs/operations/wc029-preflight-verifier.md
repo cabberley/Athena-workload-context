@@ -27,10 +27,12 @@ Container Apps network values are type checked independently: ingress `external`
 The attested artifact also contains `whatIfRequest`, the exact Azure CLI command token array and
 argument array used to obtain the result. The release gate accepts only `az deployment sub what-if`
 or `az deployment group what-if` with one exact subscription, name,
-`--no-pretty-print`, exact JSON output, `FullResourcePayloads`, and full `Provider` validation.
-JSON mode requires one local template file and one `@parameters.json` file. A separately exact
-`.bicepparam` mode passes one direct `.bicepparam` path and omits `--template-file`, because the
-Bicep parameter artifact declares its template with `using`.
+the exact separate pair `--no-prompt true`, `--no-pretty-print`, exact JSON output,
+`FullResourcePayloads`, and full `Provider` validation. Omission, `false`, interactive values,
+aliases, equals form, and duplicate `--no-prompt` options fail for both subscription and
+resource-group commands. JSON mode requires one local template file and one `@parameters.json`
+file. A separately exact `.bicepparam` mode passes one direct `.bicepparam` path and omits
+`--template-file`, because the Bicep parameter artifact declares its template with `using`.
 Subscription requests require a canonical location; group requests require one resource group from
 the reviewed deployment boundary. Unknown or duplicate options, equals-form options, case or
 Unicode aliases, `--query`, output transforms, excluded change types, weaker validation, and
@@ -214,13 +216,21 @@ Initial Graph requests must use the unfiltered service-principal membership endp
 filter on the first page is rejected. Initial ARM role-assignment requests allow only
 `api-version=2022-04-01` and the exact `atScope() and assignedTo(...)` filter. Continuations must stay
 on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
-Cross-tenant parameters and caller-added selection filters are rejected. Decoded query keys must be
-exact lowercase ASCII and unique; exact duplicates, percent-decoded duplicates, casefold aliases,
-and fuzzy spellings fail before query comparison.
+Cross-tenant parameters and caller-added selection filters are rejected. Decoded query keys must use
+the exact endpoint spelling and be unique after percent decoding. ARM Role Assignments API
+`2022-04-01` continuations use `$skipToken`; Graph continuations use exact `$skiptoken` where
+documented. Exact duplicates, percent-decoded duplicates, casefold collisions, aliases, and other
+case variants fail before query comparison.
 
 The Resource Graph response must explicitly report `resultTruncated` as JSON `false` or the exact
 transport string `"false"`, no non-null `skipToken` or `$skipToken`, and
 `count == totalRecords == len(data) == 1`. Other strings, numbers, null, and missing values fail.
+
+The retained Management Groups Get Subscription API `2020-05-01` response must keep its documented
+raw `properties.tenant` field. The verifier validates it directly against the reviewed target tenant
+and derives hierarchy metadata in memory; a caller-renamed `properties.tenantId` is not accepted as
+the raw response. Because the complete raw RBAC payload is manifest-bound, no unbound normalized
+copy is used as provenance.
 
 The verifier derives the management-group path from ARM parent links, rejects missing, disconnected,
 or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the
