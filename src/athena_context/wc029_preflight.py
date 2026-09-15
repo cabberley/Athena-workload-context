@@ -5001,7 +5001,8 @@ def _windows_handle_details(handle: int) -> tuple[str, bool]:
             ("ReparseTag", wintypes.DWORD),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
     information = FileAttributeTagInfo()
     if not kernel32.GetFileInformationByHandleEx(
         wintypes.HANDLE(handle),
@@ -5009,7 +5010,7 @@ def _windows_handle_details(handle: int) -> tuple[str, bool]:
         ctypes.byref(information),
         ctypes.sizeof(information),
     ):
-        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx failed")
+        raise OSError(get_last_error(), "GetFileInformationByHandleEx failed")
     buffer = ctypes.create_unicode_buffer(32768)
     length = kernel32.GetFinalPathNameByHandleW(
         wintypes.HANDLE(handle),
@@ -5018,7 +5019,7 @@ def _windows_handle_details(handle: int) -> tuple[str, bool]:
         0,
     )
     if length == 0 or length >= len(buffer):
-        raise OSError(ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        raise OSError(get_last_error(), "GetFinalPathNameByHandleW failed")
     return (
         _normalized_windows_handle_path(buffer.value),
         bool(information.FileAttributes & stat.FILE_ATTRIBUTE_REPARSE_POINT),
@@ -5029,7 +5030,8 @@ def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
     kernel32.CreateFileW.restype = wintypes.HANDLE
     handle = kernel32.CreateFileW(
         os.fspath(path),
@@ -5042,7 +5044,7 @@ def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
     )
     invalid_handle = ctypes.c_void_p(-1).value
     if handle == invalid_handle:
-        raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        raise OSError(get_last_error(), "CreateFileW failed")
     handle_value = int(handle)
     try:
         final_path, is_reparse = _windows_handle_details(handle_value)
@@ -5061,9 +5063,10 @@ def _close_windows_handle(handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
     if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
-        raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+        raise OSError(get_last_error(), "CloseHandle failed")
 
 
 def _validate_windows_file_descriptor(
@@ -5074,7 +5077,7 @@ def _validate_windows_file_descriptor(
 ) -> None:
     import msvcrt
 
-    handle = msvcrt.get_osfhandle(file_descriptor)
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
     final_path, is_reparse = _windows_handle_details(handle)
     if is_reparse:
         raise PreflightInputError("release ledger record handle resolves to a reparse point")
