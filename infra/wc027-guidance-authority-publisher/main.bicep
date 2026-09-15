@@ -79,12 +79,16 @@ var triggerQueueName = 'wc027-enrichment-feed-requests'
 var requestOutboxContainerName = 'wc027-guidance-request-outbox'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
-var guidancePublisherPollingIntervalSeconds = 30
-var guidancePublisherStartupProcessingMarginSeconds = 60
-var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherPollingIntervalSeconds + guidancePublisherStartupProcessingMarginSeconds
+var guidancePublisherKedaPollingIntervalSeconds = 30
+var guidancePublisherColdStartSeconds = 30
+var guidancePublisherConnectionSetupSeconds = 30
+var guidancePublisherProcessingSeconds = 60
+var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
 var guidancePublicationDeliveryBudget = {
-  publisherPollingIntervalSeconds: guidancePublisherPollingIntervalSeconds
-  publisherStartupProcessingMarginSeconds: guidancePublisherStartupProcessingMarginSeconds
+  publisherKedaPollingIntervalSeconds: guidancePublisherKedaPollingIntervalSeconds
+  publisherColdStartSeconds: guidancePublisherColdStartSeconds
+  publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
+  publisherProcessingSeconds: guidancePublisherProcessingSeconds
   minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
 }
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
@@ -612,7 +616,7 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
         scale: {
           minExecutions: 0
           maxExecutions: 1
-          pollingInterval: guidancePublisherPollingIntervalSeconds
+          pollingInterval: guidancePublisherKedaPollingIntervalSeconds
           rules: [
             {
               name: 'wc027-guidance-authority-request'

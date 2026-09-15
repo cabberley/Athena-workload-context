@@ -215,21 +215,27 @@ def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> N
 
     for source in (producer, publisher):
         for expected in (
-            "guidancePublisherPollingIntervalSeconds = 30",
-            "guidancePublisherStartupProcessingMarginSeconds = 60",
+            "guidancePublisherKedaPollingIntervalSeconds = 30",
+            "guidancePublisherColdStartSeconds = 30",
+            "guidancePublisherConnectionSetupSeconds = 30",
+            "guidancePublisherProcessingSeconds = 60",
             (
                 "guidanceMinimumRemainingLifetimeSeconds = "
-                "guidancePublisherPollingIntervalSeconds + "
-                "guidancePublisherStartupProcessingMarginSeconds"
+                "guidancePublisherKedaPollingIntervalSeconds + "
+                "guidancePublisherColdStartSeconds + "
+                "guidancePublisherConnectionSetupSeconds + "
+                "guidancePublisherProcessingSeconds"
             ),
             "deliveryBudget: guidancePublicationDeliveryBudget",
         ):
             assert expected in source
 
-    assert "pollingInterval: guidancePublisherPollingIntervalSeconds" in publisher
+    assert "pollingInterval: guidancePublisherKedaPollingIntervalSeconds" in publisher
     for expected in (
-        "wc027ReviewedPublisherPollingIntervalSeconds = 30",
-        "wc027ReviewedPublisherStartupProcessingMarginSeconds = 60",
+        "wc027ReviewedPublisherKedaPollingIntervalSeconds = 30",
+        "wc027ReviewedPublisherColdStartSeconds = 30",
+        "wc027ReviewedPublisherConnectionSetupSeconds = 30",
+        "wc027ReviewedPublisherProcessingSeconds = 60",
         "wc027ReviewedMinimumRemainingLifetimeSeconds",
         "wc027RequestProducerDeliveryBudgetValid",
         "wc027PublisherDeliveryBudgetValid",
@@ -237,7 +243,7 @@ def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> N
         "producer and publisher delivery budgets do not match",
         (
             "eventTriggerConfig.scale.pollingInterval == "
-            "wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds"
+            "wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds"
         ),
     ):
         assert expected in root
@@ -537,7 +543,7 @@ def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -
             else (
                 f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale."
                 "pollingInterval == "
-                "wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds"
+                "wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds"
             )
         )
         assert expected_polling_interval in root

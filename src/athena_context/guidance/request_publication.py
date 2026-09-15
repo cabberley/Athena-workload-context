@@ -52,11 +52,15 @@ WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION = (
 _REQUEST_OUTBOX_PREFIX = "guidance-publication-requests"
 _MAX_DETACHED_SIGNATURE_CHARS = 8192
 _MAX_PUBLICATION_REQUEST_LIFETIME = timedelta(minutes=5)
-WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS = 30
-WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS = 60
+WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS = 60
 WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS = (
-    WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS
-    + WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS
+    WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS
 )
 _ALLOWED_REQUESTED_ACTIONS = frozenset(
     {
@@ -73,8 +77,10 @@ type BrokerPropertyValue = int | float | bytes | bool | str | UUID
 
 @dataclass(frozen=True, slots=True)
 class GuidancePublicationRequestDeliveryBudget:
-    publisher_polling_interval_seconds: int
-    publisher_startup_processing_margin_seconds: int
+    publisher_keda_polling_interval_seconds: int
+    publisher_cold_start_seconds: int
+    publisher_connection_setup_seconds: int
+    publisher_processing_seconds: int
     minimum_remaining_lifetime_seconds: int
 
     @classmethod
@@ -83,39 +89,49 @@ class GuidancePublicationRequestDeliveryBudget:
         value: object,
     ) -> GuidancePublicationRequestDeliveryBudget:
         if type(value) is not dict or set(value) != {
-            "publisherPollingIntervalSeconds",
-            "publisherStartupProcessingMarginSeconds",
+            "publisherKedaPollingIntervalSeconds",
+            "publisherColdStartSeconds",
+            "publisherConnectionSetupSeconds",
+            "publisherProcessingSeconds",
             "minimumRemainingLifetimeSeconds",
         }:
             raise ValueError("guidance publication delivery budget fields are invalid")
         values = (
-            value["publisherPollingIntervalSeconds"],
-            value["publisherStartupProcessingMarginSeconds"],
+            value["publisherKedaPollingIntervalSeconds"],
+            value["publisherColdStartSeconds"],
+            value["publisherConnectionSetupSeconds"],
+            value["publisherProcessingSeconds"],
             value["minimumRemainingLifetimeSeconds"],
         )
         if any(type(item) is not int for item in values):
             raise ValueError("guidance publication delivery budget values must be integers")
         return cls(
-            publisher_polling_interval_seconds=values[0],
-            publisher_startup_processing_margin_seconds=values[1],
-            minimum_remaining_lifetime_seconds=values[2],
+            publisher_keda_polling_interval_seconds=values[0],
+            publisher_cold_start_seconds=values[1],
+            publisher_connection_setup_seconds=values[2],
+            publisher_processing_seconds=values[3],
+            minimum_remaining_lifetime_seconds=values[4],
         )
 
     def __post_init__(self) -> None:
         if (
-            self.publisher_polling_interval_seconds
-            != WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS
-            or self.publisher_startup_processing_margin_seconds
-            != WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS
+            self.publisher_keda_polling_interval_seconds
+            != WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
+            or self.publisher_cold_start_seconds != WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS
+            or self.publisher_connection_setup_seconds
+            != WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
+            or self.publisher_processing_seconds != WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS
             or self.minimum_remaining_lifetime_seconds
             != WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS
             or self.minimum_remaining_lifetime_seconds
-            != self.publisher_polling_interval_seconds
-            + self.publisher_startup_processing_margin_seconds
+            != self.publisher_keda_polling_interval_seconds
+            + self.publisher_cold_start_seconds
+            + self.publisher_connection_setup_seconds
+            + self.publisher_processing_seconds
         ):
             raise ValueError(
                 "guidance publication delivery budget does not match the reviewed "
-                "publisher polling and processing allowance"
+                "publisher KEDA polling, cold-start, connection-setup, and processing allowances"
             )
 
     @property
@@ -123,15 +139,15 @@ class GuidancePublicationRequestDeliveryBudget:
         return timedelta(seconds=self.minimum_remaining_lifetime_seconds)
 
     @property
-    def publisher_startup_processing_margin(self) -> timedelta:
-        return timedelta(seconds=self.publisher_startup_processing_margin_seconds)
+    def publisher_processing_budget(self) -> timedelta:
+        return timedelta(seconds=self.publisher_processing_seconds)
 
     def broker_properties(self) -> dict[str, int]:
         return {
-            "publisherPollingIntervalSeconds": self.publisher_polling_interval_seconds,
-            "publisherStartupProcessingMarginSeconds": (
-                self.publisher_startup_processing_margin_seconds
-            ),
+            "publisherKedaPollingIntervalSeconds": self.publisher_keda_polling_interval_seconds,
+            "publisherColdStartSeconds": self.publisher_cold_start_seconds,
+            "publisherConnectionSetupSeconds": self.publisher_connection_setup_seconds,
+            "publisherProcessingSeconds": self.publisher_processing_seconds,
             "minimumRemainingLifetimeSeconds": self.minimum_remaining_lifetime_seconds,
         }
 
@@ -432,7 +448,7 @@ class GuidancePublicationRequestProducer:
         remaining = request.expires_at - at
         if not (
             self.delivery_budget.minimum_remaining_lifetime
-            < remaining
+            <= remaining
             <= _MAX_PUBLICATION_REQUEST_LIFETIME
         ):
             raise GuidanceAuthoritySourceNotReadyError(
@@ -661,8 +677,10 @@ __all__ = [
     "WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION",
     "WC027_GUIDANCE_REQUEST_INPUT_SCHEMA_VERSION",
     "WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS",
-    "WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS",
-    "WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS",
     "guidance_publication_request_broker_properties",
     "guidance_publication_request_outbox_path",
     "parse_wc027_guidance_request_input",

@@ -147,10 +147,12 @@ versioned Key Vault URI.
 Production publication requests arrive only from the separate request-producer sender identity,
 carry the exact occurrence-keyed outbox reference in their broker metadata, and are rejected unless
 the publisher can exact-read matching immutable outbox bytes. No direct authority-request submit
-command is exposed. Producer and publisher configurations bind the same reviewed 90-second
-downstream budget: 30 seconds for the publisher's scale-to-zero polling interval and 60 seconds for
-startup and processing. The broker metadata carries the same values, and publisher startup rejects
-a request that has consumed its processing allowance.
+command is exposed. Producer and publisher configurations bind the same reviewed 150-second
+downstream budget: 30 seconds for KEDA scale-to-zero polling, 30 seconds for publisher cold start,
+30 seconds for managed-identity Service Bus client/receiver/sender setup, and 60 seconds for
+publisher processing. The broker metadata carries the same values. After startup and transport
+setup have completed, the publisher accepts the exact 60-second processing boundary and rejects
+less.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -218,12 +220,15 @@ equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
 To assert producer readiness, supply
 `wc027EnrichmentFeedProducerJobResourceId` with the exact deployed `Microsoft.App/jobs` resource
 ID, `wc027EnrichmentFeedProducerConfigurationDigest` and
-`wc027EnrichmentFeedProducerConfigurationJson` from the producer module output. The root
-deployment derives the expected attached identity resource IDs and RBAC evidence ID from that
-exact deployed configuration; it does not accept independent identity arrays or evidence values.
-It reads the existing Job and fails closed unless the deployed configuration value and digest
-tag, derived broker identity, exact attached user-assigned identities, and RBAC evidence tag all
-match, the publisher is ready, and the WC-016 runtime is enabled.
+`wc027EnrichmentFeedProducerConfigurationJson`, and `wc027EnrichmentFeedProducerImage` from the
+producer module outputs. The root deployment derives the expected attached identity resource IDs
+and RBAC evidence ID from that exact deployed configuration; it does not accept independent
+identity arrays or evidence values. It reads the existing Job and fails closed unless the canonical
+Job ID, user-assigned-only identity mode, exact one-container image, command, arguments,
+environment, and resources, empty probes/init containers/volumes/volume mounts/secrets/identity
+lifecycle settings, complete replica/concurrency and Service Bus scaler metadata/auth, exact
+registry identity and shape, deployed configuration and binding-evidence tags, attached identities,
+and RBAC evidence all match. The publisher must also be ready and the WC-016 runtime enabled.
 
 ## Failure and retry
 

@@ -89,15 +89,17 @@ The occurrence-keyed path means:
 - concurrent workers converge on one request identity.
 
 Immediately before persistence and again immediately before enqueue, the worker consults its
-trusted clock and requires more than 90 seconds of remaining request lifetime. The reviewed budget
-is the publisher's 30-second scale-to-zero polling interval plus a 60-second startup and processing
-margin. A request at or inside the first boundary is abandoned without reserving or writing its
-occurrence-keyed outbox path. If revalidation consumes the budget, the persisted request is not
-sent and the input is abandoned. After persistence, the worker revalidates lifecycle and context
-authority, establishes the managed-identity Service Bus sender, resamples the trusted clock, and
-only then calculates TTL and constructs/sends the message. Sender creation cannot complete the
-input delivery. The request is sent to the existing `wc027-guidance-authority-requests` queue with
-a distinct sender identity:
+trusted clock and requires at least 150 seconds of remaining request lifetime. The reviewed
+downstream budget is 30 seconds for KEDA scale-to-zero polling, 30 seconds for the publisher cold
+start, 30 seconds for managed-identity Service Bus client/receiver/sender setup, and 60 seconds for
+publisher processing. A request below the first boundary is abandoned without reserving or writing
+its occurrence-keyed outbox path. If revalidation or producer sender setup consumes the budget, the
+persisted request is not sent and the input is abandoned. A request with exactly 150 seconds
+remaining is eligible to persist and send. After persistence, the worker revalidates lifecycle and
+context authority, establishes the managed-identity Service Bus sender, resamples the trusted
+clock, and only then calculates TTL and constructs/sends the message. Sender creation cannot
+complete the input delivery. The request is sent to the existing
+`wc027-guidance-authority-requests` queue with a distinct sender identity:
 
 | Field | Value |
 |---|---|
@@ -105,7 +107,7 @@ a distinct sender identity:
 | Session ID | signed incident ID |
 | TTL | remaining bounded request lifetime, at most five minutes |
 | Body | exact canonical request bytes |
-| Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, and exact 30/60/90-second delivery-budget bindings plus `noAutoRemediation=true` |
+| Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, and exact 30/30/30/60/150-second delivery-budget bindings plus `noAutoRemediation=true` |
 
 If send completion is uncertain, the input delivery is abandoned. A retry recovers identical
 outbox bytes and sends the same `MessageId`; Service Bus duplicate detection safely suppresses a
@@ -135,9 +137,10 @@ that runtime boundary. Resource IDs are normalized before uniqueness and overlap
 aliases cannot bypass the separation.
 
 The strict producer and publisher configurations both carry the same reviewed delivery budget.
-The publisher's KEDA polling interval is derived from that configuration, broker metadata binds all
-three budget values, and the publisher rejects a request that reaches it without the remaining
-60-second startup and processing allowance.
+The publisher's KEDA polling interval is derived from that configuration, broker metadata binds
+all five budget values, and the publisher checks only the remaining 60-second processing budget
+after cold start and Service Bus connection setup have completed. Exactly 60 seconds is accepted;
+less is rejected.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that

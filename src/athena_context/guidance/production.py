@@ -673,6 +673,7 @@ def run_wc027_guidance_authority_publisher_worker(
         if not messages:
             return False
         message = messages[0]
+        processing_started_at = _utc_now_milliseconds()
         try:
             request = parse_guidance_authority_publication_request(
                 b"".join(bytes(part) for part in message.body)
@@ -689,16 +690,16 @@ def run_wc027_guidance_authority_publisher_worker(
                 request,
                 expected_delivery_budget=configuration.delivery_budget,
             )
-            current = _utc_now_milliseconds()
+            current = processing_started_at
             if current < request.evaluated_at:
                 raise ValueError("guidance publication request is not yet valid")
             if (
                 request.expires_at - current
-                <= configuration.delivery_budget.publisher_startup_processing_margin
+                < configuration.delivery_budget.publisher_processing_budget
             ):
                 raise ValueError(
                     "guidance publication request lacks the reviewed publisher "
-                    "startup and processing margin"
+                    "processing budget after cold start and connection setup"
                 )
             verify_guidance_publication_request_outbox(
                 request,

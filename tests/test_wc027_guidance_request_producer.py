@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -58,9 +58,11 @@ from test_wc027_incident_subject_contract import (
 
 _REQUEST_KEY_ID = "synthetic-key://athena/wc027-guidance-request-rs256-v1"
 _DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget(
-    publisher_polling_interval_seconds=30,
-    publisher_startup_processing_margin_seconds=60,
-    minimum_remaining_lifetime_seconds=90,
+    publisher_keda_polling_interval_seconds=30,
+    publisher_cold_start_seconds=30,
+    publisher_connection_setup_seconds=30,
+    publisher_processing_seconds=60,
+    minimum_remaining_lifetime_seconds=150,
 )
 
 
@@ -379,7 +381,7 @@ def test_invalid_key_signature_draft_or_stale_input_has_zero_output_io(
     assert sender.open_calls == 0
 
 
-def test_end_to_end_budget_boundary_has_zero_outbox_writes_and_sends() -> None:
+def test_end_to_end_budget_below_minimum_has_zero_outbox_writes_and_sends() -> None:
     fixture = _fixture()
     request = fixture.guidance_binding.incident_bound_request
     evaluated_at = _stable_evaluated_at(
@@ -402,7 +404,7 @@ def test_end_to_end_budget_boundary_has_zero_outbox_writes_and_sends() -> None:
         sender,
     ) = _producer(
         request=request,
-        clock=lambda: expires_at - timedelta(seconds=90),
+        clock=lambda: expires_at - timedelta(seconds=149),
     )
 
     with pytest.raises(
@@ -413,6 +415,65 @@ def test_end_to_end_budget_boundary_has_zero_outbox_writes_and_sends() -> None:
 
     assert outbox.calls == []
     assert sender.calls == []
+
+
+def test_end_to_end_budget_accepts_exact_minimum_before_persistence_and_send() -> None:
+    fixture = _fixture()
+    request = fixture.guidance_binding.incident_bound_request
+    evaluated_at = _stable_evaluated_at(
+        request,
+        fixture.incident_publication.occurrence,
+    )
+    expires_at = min(
+        evaluated_at + timedelta(minutes=5),
+        request.correlation_request.expires_at,
+    )
+    operation_times = iter(
+        (
+            expires_at - timedelta(seconds=150),
+            expires_at - timedelta(seconds=150),
+        )
+    )
+    (
+        _fixture_value,
+        _request_value,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        outbox,
+        sender,
+    ) = _producer(
+        request=request,
+        clock=lambda: next(operation_times),
+    )
+
+    receipt = producer.produce(request, now=evaluated_at)
+
+    assert len(outbox.calls) == 1
+    assert len(sender.calls) == 1
+    assert sender.calls[0][0] == receipt.request
+    assert sender.calls[0][2] == 150
+    assert sender.calls[0][3] == _DELIVERY_BUDGET
+
+
+def test_reviewed_delivery_budget_timeline_leaves_exact_processing_phase() -> None:
+    expires_at = datetime(2026, 1, 1, 0, 5, tzinfo=UTC)
+    enqueued_at = expires_at - _DELIVERY_BUDGET.minimum_remaining_lifetime
+    after_keda_polling = enqueued_at + timedelta(
+        seconds=_DELIVERY_BUDGET.publisher_keda_polling_interval_seconds
+    )
+    after_cold_start = after_keda_polling + timedelta(
+        seconds=_DELIVERY_BUDGET.publisher_cold_start_seconds
+    )
+    after_connection_setup = after_cold_start + timedelta(
+        seconds=_DELIVERY_BUDGET.publisher_connection_setup_seconds
+    )
+
+    assert expires_at - enqueued_at == timedelta(seconds=150)
+    assert expires_at - after_connection_setup == (_DELIVERY_BUDGET.publisher_processing_budget)
+    assert _DELIVERY_BUDGET.publisher_processing_budget == timedelta(seconds=60)
 
 
 def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
@@ -428,8 +489,8 @@ def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
     )
     operation_times = iter(
         (
-            expires_at - timedelta(seconds=91),
-            expires_at - timedelta(seconds=90),
+            expires_at - timedelta(seconds=150),
+            expires_at - timedelta(seconds=149),
         )
     )
     events: list[str] = []
@@ -806,7 +867,7 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
     adapter.enqueue(
         receipt.request,
         outbox_reference=receipt.outbox_reference,
-        time_to_live_seconds=90,
+        time_to_live_seconds=150,
         delivery_budget=_DELIVERY_BUDGET,
     )
 
@@ -814,7 +875,7 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
     assert str(message.message_id) == receipt.request.request_id
     assert str(message.session_id) == request.incident_subject.incident_id
     assert message.content_type == "application/json"
-    assert int(message.time_to_live.total_seconds()) == 90
+    assert int(message.time_to_live.total_seconds()) == 150
     assert message.application_properties == (
         guidance_publication_request_broker_properties(
             receipt.request,
@@ -834,12 +895,12 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
         adapter.enqueue(
             receipt.request,
             outbox_reference=receipt.outbox_reference,
-            time_to_live_seconds=89,
+            time_to_live_seconds=149,
             delivery_budget=_DELIVERY_BUDGET,
         )
     assert len(raw_sender.messages) == 1
     valid_properties = dict(message.application_properties)
-    message.application_properties["minimumRemainingLifetimeSeconds"] = 89
+    message.application_properties["minimumRemainingLifetimeSeconds"] = 149
     with pytest.raises(ValueError, match="broker metadata"):
         validate_guidance_publication_request_broker_metadata(
             message,
@@ -992,9 +1053,11 @@ def _producer_configuration_payload() -> dict[str, object]:
         },
         "requestedActions": ["investigationCheck"],
         "deliveryBudget": {
-            "publisherPollingIntervalSeconds": 30,
-            "publisherStartupProcessingMarginSeconds": 60,
-            "minimumRemainingLifetimeSeconds": 90,
+            "publisherKedaPollingIntervalSeconds": 30,
+            "publisherColdStartSeconds": 30,
+            "publisherConnectionSetupSeconds": 30,
+            "publisherProcessingSeconds": 60,
+            "minimumRemainingLifetimeSeconds": 150,
         },
         "deploymentBinding": {
             "bindingEvidenceId": ("20000000-0000-0000-0000-000000000099"),
@@ -1070,7 +1133,7 @@ def test_production_configuration_rejects_boundary_reuse(
             "requestSigningKey"
         ]["keyVaultKeyId"]  # type: ignore[index]
     elif mutation == "delivery-budget":
-        payload["deliveryBudget"]["minimumRemainingLifetimeSeconds"] = 89  # type: ignore[index]
+        payload["deliveryBudget"]["minimumRemainingLifetimeSeconds"] = 149  # type: ignore[index]
     else:
         payload["serviceBus"]["outputQueueName"] = "other-output"  # type: ignore[index]
 
@@ -1274,7 +1337,8 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
         ("missing", None, 300, 0, False),
         ("valid", b"{}", 300, 1, False),
         ("valid", None, 300, 1, True),
-        ("valid", None, 60, 0, False),
+        ("valid", None, 60, 1, True),
+        ("valid", None, 59, 0, False),
     ),
 )
 def test_publisher_worker_requires_exact_immutable_outbox_evidence(
@@ -1394,6 +1458,8 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
 
     outbox_reader = _OutboxReader()
     publisher = _Publisher()
+    events: list[str] = []
+    parse_request = guidance_production.parse_guidance_authority_publication_request
     configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
         json.dumps(_bicep_generated_publisher_configuration())
     )
@@ -1415,8 +1481,19 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
     )
     monkeypatch.setattr(
         guidance_production,
+        "parse_guidance_authority_publication_request",
+        lambda payload: (events.append("parse"), parse_request(payload))[1],
+    )
+    clock_samples = iter((remaining_seconds, max(remaining_seconds - 1, 0)))
+
+    def trusted_clock():
+        events.append("clock")
+        return request.expires_at - timedelta(seconds=next(clock_samples))
+
+    monkeypatch.setattr(
+        guidance_production,
         "_utc_now_milliseconds",
-        lambda: request.expires_at - timedelta(seconds=remaining_seconds),
+        trusted_clock,
     )
 
     processed = run_wc027_guidance_authority_publisher_worker(
@@ -1434,6 +1511,7 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
         assert len(receiver.dead_lettered) == 1
         assert publisher.calls == []
     assert len(outbox_reader.calls) == expected_outbox_reads
+    assert events[:2] == ["clock", "parse"]
 
 
 @pytest.mark.parametrize("failure_point", ("trigger", "completion"))

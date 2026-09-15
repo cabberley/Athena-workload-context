@@ -433,9 +433,11 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         "requestKey": request_key,
         "bindingSigningKey": binding_signing_key,
         "deliveryBudget": {
-            "publisherPollingIntervalSeconds": 30,
-            "publisherStartupProcessingMarginSeconds": 60,
-            "minimumRemainingLifetimeSeconds": 90,
+            "publisherKedaPollingIntervalSeconds": 30,
+            "publisherColdStartSeconds": 30,
+            "publisherConnectionSetupSeconds": 30,
+            "publisherProcessingSeconds": 60,
+            "minimumRemainingLifetimeSeconds": 150,
         },
         "enrichmentRuntimeConfiguration": runtime,
         "deploymentBinding": {
@@ -473,17 +475,21 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         configuration.binding_signing_key.key_fingerprint
         == configuration.enrichment_runtime.guidance_binding_key.key_fingerprint
     )
-    assert configuration.delivery_budget.publisher_polling_interval_seconds == 30
-    assert configuration.delivery_budget.publisher_startup_processing_margin_seconds == 60
-    assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 90
+    assert configuration.delivery_budget.publisher_keda_polling_interval_seconds == 30
+    assert configuration.delivery_budget.publisher_cold_start_seconds == 30
+    assert configuration.delivery_budget.publisher_connection_setup_seconds == 30
+    assert configuration.delivery_budget.publisher_processing_seconds == 60
+    assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 150
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("publisherPollingIntervalSeconds", 31),
-        ("publisherStartupProcessingMarginSeconds", 59),
-        ("minimumRemainingLifetimeSeconds", 89),
+        ("publisherKedaPollingIntervalSeconds", 31),
+        ("publisherColdStartSeconds", 29),
+        ("publisherConnectionSetupSeconds", 29),
+        ("publisherProcessingSeconds", 59),
+        ("minimumRemainingLifetimeSeconds", 149),
     ),
 )
 def test_publisher_configuration_rejects_delivery_budget_drift(

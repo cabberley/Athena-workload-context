@@ -1137,6 +1137,7 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
               name: 'wc027-signed-binding'
               type: 'azure-servicebus'
               identity: brokerIdentity.id
+              auth: []
               metadata: {
                 namespace: serviceBusNamespaceName
                 queueName: triggerQueueName
@@ -1192,6 +1193,9 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
 
 @description('Resource ID proving that the WC-027 producer Job/config was deployed.')
 output producerJobResourceId string = producerJob.id
+
+@description('Exact digest-pinned image deployed to the WC-027 producer Job.')
+output producerImage string = validatedProducerImage
 
 @description('Digest of the exact non-secret runtime configuration deployed to the Job.')
 output deployedRuntimeConfigurationDigest string = startsWith(runtimeConfigurationDigest, 'sha256:')
