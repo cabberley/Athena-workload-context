@@ -30,6 +30,7 @@ MAX_PROPERTY_PATH_LENGTH = 4096
 MAX_PROPERTY_PATH_ITEMS = 50000
 MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
 MAX_PROPERTY_LOOKUP_WORK = 500000
+MAX_RELEASE_LEDGER_RECORD_BYTES = 64 * 1024
 MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
 MAX_ATTESTATION_CLOCK_SKEW = timedelta(minutes=5)
 
@@ -88,6 +89,8 @@ _PROPERTY_COMPONENT = re.compile(
     r"(?P<indexes>(?:\[(?:0|[1-9][0-9]*)\])*)$"
 )
 _PROPERTY_INDEX = re.compile(r"\[(0|[1-9][0-9]*)\]")
+_DEPLOYMENT_NAME = re.compile(r"^[A-Za-z0-9_.()-]{1,64}$")
+_ATTESTED_FILE_COMPONENT = re.compile(r"^[A-Za-z0-9_.()-]+$")
 _UNSUPPORTED_MUTATION_PREFIXES = (
     "microsoft.authorization/",
     "microsoft.managedservices/",
@@ -198,6 +201,9 @@ def _finalize_violations(
     violations: list[PreflightViolation] = []
     seen: set[PreflightViolation] = set()
     for violation in values:
+        _strict_utf8_bytes(violation.code, field_name="violation code")
+        _strict_utf8_bytes(violation.subject, field_name="violation subject")
+        _strict_utf8_bytes(violation.detail, field_name="violation detail")
         if violation in seen:
             continue
         if len(violations) >= MAX_VIOLATIONS:
@@ -276,6 +282,59 @@ type PropertyPathToken = str | int
 
 def _normalized(value: str) -> str:
     return value.strip().casefold()
+
+
+def _strict_utf8_bytes(value: str, *, field_name: str) -> bytes:
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise PreflightInputError(f"{field_name} must be strict UTF-8") from exc
+
+
+def _require_exact_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > maximum_length
+        or not value.isascii()
+        or not value.isprintable()
+    ):
+        raise PreflightInputError(f"{field_name} must be an exact trimmed ASCII token")
+    return value
+
+
+def _normalized_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    return _require_exact_ascii_token(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    ).lower()
+
+
+def _optional_normalized_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 64,
+) -> str:
+    if value is None:
+        return ""
+    return _normalized_ascii_token(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    )
 
 
 def _resource_type(resource_id: str) -> str:
@@ -370,7 +429,10 @@ def _reject_ambiguous_object_pairs(
 
 
 def _canonical_role_key(value: str) -> str:
-    normalized = _normalized(value).rsplit("/", 1)[-1]
+    normalized = _normalized_ascii_token(
+        value,
+        field_name="roleDefinitionName",
+    ).rsplit("/", 1)[-1]
     return _ROLE_ID_TO_NAME.get(normalized, normalized)
 
 
@@ -572,7 +634,10 @@ def _canonical_json_bytes(value: object) -> bytes:
         payload = f"{decimal_tuple.sign}:{decimal_tuple.exponent}:{digits}".encode("ascii")
         return _length_prefixed(b"d", payload)
     if type(value) is str:
-        return _length_prefixed(b"s", value.encode("utf-8"))
+        return _length_prefixed(
+            b"s",
+            _strict_utf8_bytes(value, field_name="canonical JSON string"),
+        )
     if isinstance(value, list):
         payload = b"".join(_canonical_json_bytes(item) for item in value)
         return b"l" + str(len(value)).encode("ascii") + b":" + payload
@@ -724,7 +789,7 @@ def _parse_attestation_manifest(
     if {key.casefold() for key in manifest} != _MANIFEST_FIELD_NAMES:
         raise PreflightInputError("attestation manifest has an invalid envelope")
     if (
-        _require_string(
+        _require_exact_ascii_token(
             _get_case_insensitive(manifest, "schemaVersion"),
             field_name="manifest schemaVersion",
             maximum_length=64,
@@ -810,12 +875,10 @@ def _validate_artifact_attestation(
         field_name=f"{artifact_kind} attestation",
     )
     if (
-        _normalized(
-            _require_string(
-                _get_case_insensitive(attestation, "artifactKind"),
-                field_name="attestation artifactKind",
-                maximum_length=32,
-            )
+        _normalized_ascii_token(
+            _get_case_insensitive(attestation, "artifactKind"),
+            field_name="attestation artifactKind",
+            maximum_length=32,
         )
         != artifact_kind
     ):
@@ -998,6 +1061,8 @@ def _minimal_scope_prefixes(values: Sequence[str]) -> tuple[str, ...]:
 def _separation_scope_matches(
     assignment_scope: str,
     forbidden_scope_prefix: str,
+    *,
+    collection: RbacCollection | None,
 ) -> bool:
     if _scope_contains(
         assignment_scope,
@@ -1007,9 +1072,25 @@ def _separation_scope_matches(
         assignment_scope,
     ):
         return True
-    return _MANAGEMENT_GROUP_SCOPE.fullmatch(
-        assignment_scope
-    ) is not None and forbidden_scope_prefix.startswith("/subscriptions/")
+    if collection is None:
+        return False
+    assignment_is_management_group = assignment_scope in collection.management_group_ancestry
+    forbidden_is_management_group = forbidden_scope_prefix in collection.management_group_ancestry
+    assignment_is_subscription_descendant = _scope_contains(
+        collection.subscription_scope,
+        assignment_scope,
+    )
+    forbidden_is_subscription_descendant = _scope_contains(
+        collection.subscription_scope,
+        forbidden_scope_prefix,
+    )
+    return (
+        assignment_is_management_group
+        and (forbidden_is_management_group or forbidden_is_subscription_descendant)
+    ) or (
+        forbidden_is_management_group
+        and (assignment_is_management_group or assignment_is_subscription_descendant)
+    )
 
 
 def _allowance_matches(
@@ -1096,10 +1177,10 @@ def _validate_json_shape(value: object) -> None:
         if depth > MAX_JSON_DEPTH or nodes > MAX_JSON_NODES:
             raise PreflightInputError("JSON structure exceeds depth or node bounds")
         if isinstance(item, dict):
-            if any(
-                type(key) is not str or len(key) > 4096 or not key.isprintable() for key in item
-            ):
-                raise PreflightInputError("JSON object keys are invalid")
+            for key in item:
+                if type(key) is not str or len(key) > 4096 or not key.isprintable():
+                    raise PreflightInputError("JSON object keys are invalid")
+                _strict_utf8_bytes(key, field_name="JSON object key")
             lowered_keys = [key.lower() for key in item]
             if any(key.lower() != key.casefold() for key in item):
                 raise PreflightInputError("JSON object key has ambiguous Unicode case folding")
@@ -1113,6 +1194,7 @@ def _validate_json_shape(value: object) -> None:
         elif isinstance(item, str):
             if len(item) > MAX_INPUT_BYTES:
                 raise PreflightInputError("JSON string exceeds its bound")
+            _strict_utf8_bytes(item, field_name="JSON string")
         elif isinstance(item, Decimal):
             if not item.is_finite():
                 raise PreflightInputError("JSON contains a non-finite number")
@@ -1162,6 +1244,30 @@ def _require_exact_cli_token(
         field_name=field_name,
         maximum_length=maximum_length,
     )
+
+
+def _validate_attested_relative_file(
+    value: str,
+    *,
+    field_name: str,
+    suffix: str,
+) -> None:
+    normalized = value.replace("\\", "/")
+    if (
+        value.startswith("-")
+        or normalized.startswith("/")
+        or "://" in normalized
+        or ":" in normalized
+        or "?" in normalized
+        or "#" in normalized
+    ):
+        raise PreflightInputError(f"{field_name} is not a canonical relative file")
+    components = normalized.split("/")
+    if any(
+        component in {"", ".", ".."} or _ATTESTED_FILE_COMPONENT.fullmatch(component) is None
+        for component in components
+    ) or not components[-1].casefold().endswith(suffix):
+        raise PreflightInputError(f"{field_name} is not a canonical relative file")
 
 
 def _validate_what_if_request(
@@ -1242,7 +1348,7 @@ def _validate_what_if_request(
                 "what-if command contains an unsupported, duplicate, or incomplete option"
             )
         option_value = arguments[index + 1]
-        if option_value.startswith("--"):
+        if option_value.startswith("-"):
             raise PreflightInputError("what-if command option is missing its value")
         parsed[option] = option_value
         index += 2
@@ -1269,18 +1375,33 @@ def _validate_what_if_request(
         raise PreflightInputError("what-if command requires full Provider validation")
     if parsed["--output"] != "json":
         raise PreflightInputError("what-if command output must be exact json")
+    if _DEPLOYMENT_NAME.fullmatch(parsed["--name"]) is None:
+        raise PreflightInputError("what-if command deployment name is invalid")
     if json_parameters:
-        if (
-            len(parameters_value) == 1
-            or not parameters_value.casefold().endswith(".json")
-            or parsed["--template-file"].startswith("-")
-        ):
+        parameters_file = parameters_value[1:]
+        if len(parameters_value) == 1 or not parameters_value.casefold().endswith(".json"):
             raise PreflightInputError(
                 "what-if JSON parameters require one @file and one template file"
             )
+        _validate_attested_relative_file(
+            parameters_file,
+            field_name="what-if JSON parameters file",
+            suffix=".json",
+        )
+        _validate_attested_relative_file(
+            parsed["--template-file"],
+            field_name="what-if template file",
+            suffix=".bicep",
+        )
     elif not parameters_value.casefold().endswith(".bicepparam") or "--template-file" in parsed:
         raise PreflightInputError(
             "what-if bicepparam mode requires one direct .bicepparam path without --template-file"
+        )
+    else:
+        _validate_attested_relative_file(
+            parameters_value,
+            field_name="what-if bicepparam file",
+            suffix=".bicepparam",
         )
     if deployment_scope == "sub":
         if re.fullmatch(r"[a-z0-9-]+", parsed["--location"]) is None:
@@ -1316,12 +1437,10 @@ def _what_if_changes(
     _validate_json_shape(document)
     _reject_nonempty_what_if_diagnostics(document)
     root = _mapping(document, field_name="what-if document")
-    status = _normalized(
-        _require_string(
-            _get_case_insensitive(root, "status"),
-            field_name="status",
-            maximum_length=64,
-        )
+    status = _normalized_ascii_token(
+        _get_case_insensitive(root, "status"),
+        field_name="status",
+        maximum_length=64,
     )
     error = _get_case_insensitive(root, "error")
     if status != "succeeded" or (error is not None and error != {}):
@@ -1511,12 +1630,10 @@ def _walk_delta(
         property_change_type = (
             "array"
             if raw_change_type is None and children is not None
-            else _normalized(
-                _require_string(
-                    raw_change_type,
-                    field_name="propertyChangeType",
-                    maximum_length=64,
-                )
+            else _normalized_ascii_token(
+                raw_change_type,
+                field_name="propertyChangeType",
+                maximum_length=64,
             )
         )
         if property_change_type not in {
@@ -1729,7 +1846,7 @@ def _validate_resource_snapshot(
     canonical_resource_id = _canonical_scope(resource_id)
     if snapshot_id != canonical_resource_id:
         raise PreflightInputError(f"{field_name} id does not match resourceId")
-    snapshot_name = _require_string(
+    snapshot_name = _require_exact_ascii_token(
         _get_case_insensitive(snapshot, "name"),
         field_name=f"{field_name} name",
     )
@@ -1738,7 +1855,7 @@ def _validate_resource_snapshot(
         or snapshot_name.lower() != canonical_resource_id.rsplit("/", 1)[-1]
     ):
         raise PreflightInputError(f"{field_name} name does not match resourceId")
-    snapshot_type = _require_string(
+    snapshot_type = _require_exact_ascii_token(
         _get_case_insensitive(snapshot, "type"),
         field_name=f"{field_name} type",
     )
@@ -1807,12 +1924,10 @@ def _validate_no_change(
         property_change_type = (
             "array"
             if raw_change_type is None and children is not None
-            else _normalized(
-                _require_string(
-                    raw_change_type,
-                    field_name="propertyChangeType",
-                    maximum_length=64,
-                )
+            else _normalized_ascii_token(
+                raw_change_type,
+                field_name="propertyChangeType",
+                maximum_length=64,
             )
         )
         if property_change_type not in {"array", "noeffect"}:
@@ -1933,12 +2048,10 @@ def _unsafe_property_violations(
     budget: _PropertyPathBudget,
 ) -> tuple[PreflightViolation, ...]:
     resource_type = _resource_type(resource_id)
-    change_type = _normalized(
-        _require_string(
-            _get_case_insensitive(change, "changeType"),
-            field_name="changeType",
-            maximum_length=64,
-        )
+    change_type = _normalized_ascii_token(
+        _get_case_insensitive(change, "changeType"),
+        field_name="changeType",
+        maximum_length=64,
     )
     violations: list[PreflightViolation] = []
     delta = _delta_entries(change)
@@ -2033,8 +2146,16 @@ def _unsafe_property_violations(
         if (
             shared_key is not False
             or public_blob_access is not False
-            or _normalized(str(public_network or "")) != "disabled"
-            or _normalized(str(default_action or "")) != "deny"
+            or _optional_normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
+            or _optional_normalized_ascii_token(
+                default_action,
+                field_name="networkAcls.defaultAction",
+            )
+            != "deny"
         ):
             violations.append(
                 PreflightViolation(
@@ -2052,8 +2173,16 @@ def _unsafe_property_violations(
         public_network = values_by_path.get("properties.publicnetworkaccess")
         default_action = values_by_path.get("properties.networkacls.defaultaction")
         if (
-            _normalized(str(public_network or "")) != "disabled"
-            or _normalized(str(default_action or "")) != "deny"
+            _optional_normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
+            or _optional_normalized_ascii_token(
+                default_action,
+                field_name="networkAcls.defaultAction",
+            )
+            != "deny"
         ):
             violations.append(
                 PreflightViolation(
@@ -2071,7 +2200,11 @@ def _unsafe_property_violations(
         internal = values_by_path.get("properties.vnetconfiguration.internal")
         if (
             not isinstance(public_network, str)
-            or _normalized(public_network) != "disabled"
+            or _normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
             or internal is not True
         ):
             violations.append(
@@ -2087,7 +2220,13 @@ def _unsafe_property_violations(
     if resource_type == _STORAGE_CONTAINER_TYPE and change_type == "create":
         values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
         public_access = values_by_path.get("properties.publicaccess")
-        if _normalized(str(public_access or "")) != "none":
+        if (
+            _optional_normalized_ascii_token(
+                public_access,
+                field_name="publicAccess",
+            )
+            != "none"
+        ):
             violations.append(
                 PreflightViolation(
                     code="storage-container-public-access",
@@ -2209,14 +2348,22 @@ def _unsafe_property_violations(
                     for after, property_change_type in matching
                     if property_change_type not in {"delete", "remove"}
                     and isinstance(after, str)
-                    and _normalized(after) == expected_value
+                    and _normalized_ascii_token(
+                        after,
+                        field_name=protected_path,
+                    )
+                    == expected_value
                 ]
                 unsafe_values = [
                     after
                     for after, property_change_type in matching
                     if property_change_type in {"delete", "remove"}
                     or not isinstance(after, str)
-                    or _normalized(after) != expected_value
+                    or _normalized_ascii_token(
+                        after,
+                        field_name=protected_path,
+                    )
+                    != expected_value
                 ]
                 complete_safe = complete_safe and bool(safe_values) and not unsafe_values
                 explicit_unsafe = explicit_unsafe or bool(unsafe_values)
@@ -2285,12 +2432,10 @@ def _unsafe_property_violations(
                     )
                 unsafe_container_network = not after
             elif not removed and path == "properties.publicnetworkaccess":
-                public_network_access = _normalized(
-                    _require_string(
-                        after,
-                        field_name="publicNetworkAccess",
-                        maximum_length=64,
-                    )
+                public_network_access = _normalized_ascii_token(
+                    after,
+                    field_name="publicNetworkAccess",
+                    maximum_length=64,
                 )
                 if public_network_access not in {"disabled", "enabled"}:
                     raise PreflightInputError("Container Apps publicNetworkAccess is unsupported")
@@ -2332,12 +2477,10 @@ def _unsafe_property_violations(
             if removed:
                 unsafe_network_value = True
             else:
-                value = _normalized(
-                    _require_string(
-                        after,
-                        field_name=path,
-                        maximum_length=64,
-                    )
+                value = _normalized_ascii_token(
+                    after,
+                    field_name=path,
+                    maximum_length=64,
                 )
                 allowed_values = (
                     {"disabled", "enabled", "securedbyperimeter"}
@@ -2361,12 +2504,10 @@ def _unsafe_property_violations(
             if removed:
                 public_access = ""
             else:
-                public_access = _normalized(
-                    _require_string(
-                        after,
-                        field_name="publicAccess",
-                        maximum_length=64,
-                    )
+                public_access = _normalized_ascii_token(
+                    after,
+                    field_name="publicAccess",
+                    maximum_length=64,
                 )
                 if public_access not in {"none", "blob", "container"}:
                     raise PreflightInputError("publicAccess has an unsupported value")
@@ -2514,12 +2655,10 @@ def evaluate_what_if(
             canonical_resource_id=canonical_resource_id,
             deployment_target=deployment_target,
         )
-        change_type = _normalized(
-            _require_string(
-                _get_case_insensitive(change, "changeType"),
-                field_name="changeType",
-                maximum_length=64,
-            )
+        change_type = _normalized_ascii_token(
+            _get_case_insensitive(change, "changeType"),
+            field_name="changeType",
+            maximum_length=64,
         )
         if change_type == "nochange":
             _validate_no_change(
@@ -2670,16 +2809,14 @@ def _parse_rbac_assignment(
     if raw_principal_type is None:
         principal_type = ""
     else:
-        principal_type_value = _require_string(
+        principal_type_value = _require_exact_ascii_token(
             raw_principal_type,
             field_name=(
                 "assignedPrincipalType" if assigned_principal_fields_supplied else "principalType"
             ),
             maximum_length=64,
         )
-        if not principal_type_value.isascii():
-            raise PreflightInputError("principalType must use ASCII")
-        principal_type = _normalized(principal_type_value)
+        principal_type = principal_type_value.lower()
     raw_role_name = _get_case_insensitive(
         assignment,
         "roleDefinitionName",
@@ -2692,7 +2829,7 @@ def _parse_rbac_assignment(
         ""
         if raw_role_name is None
         else _canonical_role_key(
-            _require_string(
+            _require_exact_ascii_token(
                 raw_role_name,
                 field_name="roleDefinitionName",
             )
@@ -2738,7 +2875,7 @@ def _parse_rbac_assignment(
     condition_version = (
         None
         if raw_condition_version is None
-        else _require_string(
+        else _require_exact_ascii_token(
             raw_condition_version,
             field_name="conditionVersion",
             maximum_length=64,
@@ -2972,7 +3109,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 ),
                 forbidden_role_names=frozenset(
                     _canonical_role_key(
-                        _require_string(
+                        _require_exact_ascii_token(
                             role,
                             field_name="forbidden role",
                         )
@@ -3476,12 +3613,10 @@ def _derive_management_group_ancestry(
             )
         )
         != expected_subscription_id
-        or _normalized(
-            _require_string(
-                _get_case_insensitive(subscription_body, "type"),
-                field_name="ARM subscription association type",
-                maximum_length=128,
-            )
+        or _normalized_ascii_token(
+            _get_case_insensitive(subscription_body, "type"),
+            field_name="ARM subscription association type",
+            maximum_length=128,
         )
         != "microsoft.management/managementgroups/subscriptions"
         or _canonical_guid(
@@ -3518,12 +3653,10 @@ def _derive_management_group_ancestry(
             )
         )
         != target.resource_group_scope
-        or _normalized(
-            _require_string(
-                _get_case_insensitive(resource_group_body, "type"),
-                field_name="ARM resource-group type",
-                maximum_length=128,
-            )
+        or _normalized_ascii_token(
+            _get_case_insensitive(resource_group_body, "type"),
+            field_name="ARM resource-group type",
+            maximum_length=128,
         )
         != "microsoft.resources/resourcegroups"
     ):
@@ -3558,12 +3691,10 @@ def _derive_management_group_ancestry(
             field_name="ARM management-group id",
         )
         if (
-            _normalized(
-                _require_string(
-                    _get_case_insensitive(management_group, "type"),
-                    field_name="ARM management-group type",
-                    maximum_length=128,
-                )
+            _normalized_ascii_token(
+                _get_case_insensitive(management_group, "type"),
+                field_name="ARM management-group type",
+                maximum_length=128,
             )
             != "microsoft.management/managementgroups"
         ):
@@ -3681,14 +3812,12 @@ def _parse_security_group_membership(
         != target.tenant_id
     ):
         raise PreflightInputError("Graph group-membership evidence crosses tenants")
-    raw_method = _require_string(
+    raw_method = _require_exact_ascii_token(
         _get_case_insensitive(membership, "method"),
         field_name="Graph membership method",
         maximum_length=64,
     )
-    if not raw_method.isascii():
-        raise PreflightInputError("Graph membership method must use ASCII")
-    method = _normalized(raw_method)
+    method = raw_method.lower()
     if method not in _GRAPH_MEMBERSHIP_METHODS:
         raise PreflightInputError("Graph membership method is unsupported")
     values, request_urls = _paged_values(
@@ -3725,12 +3854,10 @@ def _parse_security_group_membership(
                 raw_item,
                 field_name="Graph transitiveMemberOf item",
             )
-            object_type = _normalized(
-                _require_string(
-                    _get_case_insensitive(item, "@odata.type"),
-                    field_name="Graph transitiveMemberOf @odata.type",
-                    maximum_length=128,
-                )
+            object_type = _normalized_ascii_token(
+                _get_case_insensitive(item, "@odata.type"),
+                field_name="Graph transitiveMemberOf @odata.type",
+                maximum_length=128,
             )
             object_id = _canonical_guid(
                 _get_case_insensitive(item, "id"),
@@ -3924,12 +4051,10 @@ def _parse_arm_role_assignment(
         value,
         field_name="ARM role assignment",
     )
-    resource_type = _normalized(
-        _require_string(
-            _get_case_insensitive(resource, "type"),
-            field_name="ARM role-assignment type",
-            maximum_length=128,
-        )
+    resource_type = _normalized_ascii_token(
+        _get_case_insensitive(resource, "type"),
+        field_name="ARM role-assignment type",
+        maximum_length=128,
     )
     if resource_type != "microsoft.authorization/roleassignments":
         raise PreflightInputError("ARM role-assignment resource has the wrong type")
@@ -4054,7 +4179,7 @@ def _validate_cli_arguments(
             raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
         seen.add(argument)
         actual_value = arguments[index + 1]
-        if actual_value.startswith("--"):
+        if actual_value.startswith("-"):
             raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
         if argument == "--scope":
             actual_value = _canonical_scope(actual_value)
@@ -4131,17 +4256,15 @@ def _parse_ancestor_role_assignments(
         value,
         field_name="effective role-assignment evidence",
     )
-    raw_method = _require_string(
+    raw_method = _require_exact_ascii_token(
         _get_case_insensitive(evidence, "method"),
         field_name="role-assignment collection method",
         maximum_length=64,
     )
-    if not raw_method.isascii():
-        raise PreflightInputError("role-assignment collection method must use ASCII")
-    method = _normalized(raw_method)
+    method = raw_method.lower()
     assignments: list[RbacAssignment] = []
     if method == "arm":
-        api_version = _require_string(
+        api_version = _require_exact_ascii_token(
             _get_case_insensitive(evidence, "apiVersion"),
             field_name="ARM role-assignment apiVersion",
             maximum_length=64,
@@ -4251,14 +4374,12 @@ def _parse_descendant_role_assignments(
         value,
         field_name="subscription-descendant role-assignment evidence",
     )
-    raw_method = _require_string(
+    raw_method = _require_exact_ascii_token(
         _get_case_insensitive(evidence, "method"),
         field_name="descendant role-assignment collection method",
         maximum_length=64,
     )
-    if not raw_method.isascii():
-        raise PreflightInputError("descendant role-assignment collection method must use ASCII")
-    method = _normalized(raw_method)
+    method = raw_method.lower()
     assignments: list[RbacAssignment] = []
     if method == "arm":
         required_principal_ids = {
@@ -4291,7 +4412,7 @@ def _parse_descendant_role_assignments(
                     "effective principal and security groups"
                 )
             collected_principal_ids.add(assigned_principal_id)
-            api_version = _require_string(
+            api_version = _require_exact_ascii_token(
                 _get_case_insensitive(
                     descendant_collection,
                     "apiVersion",
@@ -4638,6 +4759,7 @@ def evaluate_role_assignments(
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
     policy = _parse_policy(policy_document)
+    collection = policy.target
     if require_separation_rules:
         if not policy.separation_rules:
             raise PreflightInputError("RBAC policy requires at least one separation rule")
@@ -4838,7 +4960,11 @@ def evaluate_role_assignments(
                     or role_id in rule.forbidden_role_ids
                 )
                 and any(
-                    _separation_scope_matches(scope, prefix)
+                    _separation_scope_matches(
+                        scope,
+                        prefix,
+                        collection=collection,
+                    )
                     for prefix in rule.forbidden_scope_prefixes
                 )
             ):
@@ -4874,7 +5000,7 @@ def render_preflight_json(
         )
         + "\n"
     )
-    if len(rendered.encode("utf-8")) > MAX_RENDER_BYTES:
+    if len(_strict_utf8_bytes(rendered, field_name="rendered JSON output")) > MAX_RENDER_BYTES:
         raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
     return rendered
 
@@ -4901,7 +5027,7 @@ def render_preflight_text(
         for item in ordered_violations
     )
     rendered = "\n".join(lines) + "\n"
-    if len(rendered.encode("utf-8")) > MAX_RENDER_BYTES:
+    if len(_strict_utf8_bytes(rendered, field_name="rendered text output")) > MAX_RENDER_BYTES:
         raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
     return rendered
 
@@ -5192,6 +5318,16 @@ class _SecureLedgerDirectory:
             )
             + "\n"
         )
+        if (
+            len(
+                _strict_utf8_bytes(
+                    rendered,
+                    field_name="release ledger record",
+                )
+            )
+            > MAX_RELEASE_LEDGER_RECORD_BYTES
+        ):
+            raise PreflightInputError("release ledger record exceeds its byte bound")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -5223,10 +5359,12 @@ class _SecureLedgerDirectory:
         ) as stream:
             stream.write(rendered)
 
-    def read_json(self, name: str, *, maximum_bytes: int) -> object:
+    def read_json(self, name: str) -> object:
         if Path(name).name != name:
             raise PreflightInputError("release ledger record name is invalid")
         flags = os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
@@ -5250,10 +5388,16 @@ class _SecureLedgerDirectory:
             except OSError as exc:
                 raise PreflightInputError("release ledger record is unavailable") from exc
             self._verify_file_descriptor(file_descriptor, name)
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise PreflightInputError("release ledger record must be a regular file")
             with os.fdopen(file_descriptor, "r", encoding="utf-8") as stream:
                 file_descriptor = None
-                content = stream.read(maximum_bytes + 1)
-            if not 1 <= len(content.encode("utf-8")) <= maximum_bytes:
+                content = stream.read(MAX_RELEASE_LEDGER_RECORD_BYTES + 1)
+            if (
+                not 1
+                <= len(_strict_utf8_bytes(content, field_name="release ledger record"))
+                <= MAX_RELEASE_LEDGER_RECORD_BYTES
+            ):
                 raise PreflightInputError("release ledger record exceeds its byte bound")
             document = json.loads(
                 content,
@@ -5313,7 +5457,10 @@ def _consume_release_ledger(
         **binding,
         "schemaVersion": "athena.wc029ReleaseConsumption.v1",
         "artifactKind": kind,
-        "resultDigest": "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "resultDigest": "sha256:"
+        + hashlib.sha256(
+            _strict_utf8_bytes(rendered, field_name="rendered preflight output")
+        ).hexdigest(),
         "safe": safe,
     }
     try:
@@ -5338,7 +5485,6 @@ def _consume_release_ledger(
                 except FileExistsError:
                     existing = secure_ledger.read_json(
                         name,
-                        maximum_bytes=64 * 1024,
                     )
                     if not _json_values_equal(existing, payload):
                         raise PreflightInputError(mismatch_message) from None

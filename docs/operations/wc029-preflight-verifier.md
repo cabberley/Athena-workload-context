@@ -34,8 +34,11 @@ Bicep parameter artifact declares its template with `using`.
 Subscription requests require a canonical location; group requests require one resource group from
 the reviewed deployment boundary. Unknown or duplicate options, equals-form options, case or
 Unicode aliases, `--query`, output transforms, excluded change types, weaker validation, and
-short-circuit/create commands fail closed. The shared manifest binds `whatIfRequestDigest`, so a
-valid-looking request cannot be substituted after review.
+short-circuit/create commands fail closed. Values beginning with either `-` are never accepted as
+option values. Deployment names use only the bounded Azure deployment-name character set. Template,
+JSON parameter, and `.bicepparam` values are relative ASCII file paths with no URI, drive, absolute,
+empty, dot, or parent segment. The shared manifest binds `whatIfRequestDigest`, so a valid-looking
+request cannot be substituted after review.
 
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
@@ -74,6 +77,10 @@ one canonical lowercase-key index per snapshot; all `NoEffect` paths use constan
 lookups, and index/token work is charged to the same deterministic evaluation budget. The
 `NoChange` path is walked once; its previous second delta traversal is removed while retaining root
 object and inspectable-array validation.
+Status, change type, property-change type, role/principal type, collection method, resource type,
+public network access, network default action, public access, and every other protected enum or
+security decision are normalized only after the raw token is proven trimmed ASCII. Surrounding
+whitespace, long-s, Kelvin sign, and other Unicode/lookalike forms are malformed rather than aliases.
 Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
 missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
 and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
@@ -110,7 +117,10 @@ non-reparse ledger-directory handle and validates every newly opened record hand
 directory before writing or reading, so a junction swap after path validation fails closed. Lexical
 trusted-root containment is checked before any candidate-ledger filesystem access. Existing records
 must be regular, valid UTF-8 JSON; decoding or schema failure is reported deterministically with
-exit `3`.
+exit `3`. POSIX reads use `O_NONBLOCK|O_NOFOLLOW`, then `fstat` the opened descriptor and reject
+FIFO, socket, device, or any non-regular entry before reading. Writer and reader use the same
+64-KiB serialized-record limit, checked before create, so a successful first record is always
+readable by the paired artifact.
 
 The ledger creates one immutable deployment binding and one create-only consumption record
 for each artifact kind. It also creates an immutable collection-run binding so one
@@ -216,6 +226,11 @@ The verifier derives the management-group path from ARM parent links, rejects mi
 or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the
 policy's reviewed `approvedManagementGroupAncestry`. A hierarchy change therefore requires a new
 human review rather than silently changing assignment inheritance.
+Separation scope matching uses that validated chain in both directions. A forbidden management-group
+prefix matches child management groups in the chain and every descendant subscription,
+resource-group, and resource scope. An assignment at a parent management group likewise matches a
+forbidden child-management-group or workload prefix only when both are connected by the reviewed
+ancestry. Unreviewed management groups are never inferred as ancestors.
 
 ARM supplies the assigned principal. The normalized policy and output preserve:
 
@@ -249,7 +264,8 @@ command uses `--all`, `--assignee-object-id`, and `--include-groups` without `--
 output transforms such as `--role`, `--resource-group`, or `--query`, equals-form overrides,
 duplicate flags, and alternate assignee forms fail closed. Every option token is exact lowercase
 ASCII, and fixed values such as `--output json`, principal IDs, and boolean fill values are
-case-sensitive; Unicode/casefold aliases and fuzzy option spelling are invalid.
+case-sensitive; Unicode/casefold aliases, surrounding whitespace, fuzzy option spelling, and
+single-dash-prefixed values are invalid.
 
 The policy is bounded JSON:
 
@@ -349,7 +365,9 @@ false display name cannot bypass separation. Oversized integer literals and othe
 are reported as malformed input with exit code `3`. JSON decimals are parsed into bounded exact
 values and hashed from their lossless `Decimal.as_tuple()` representation without active-context
 rounding. Integer and decimal representation classes remain distinct, so wide decimals and `1`
-versus `1.0` cannot collapse before `NoEffect` or manifest-digest comparison.
+versus `1.0` cannot collapse before `NoEffect` or manifest-digest comparison. Every JSON key and
+string must round-trip through strict UTF-8; escaped lone surrogates and any defensive encoding
+failure produce a bounded `PreflightInputError`/exit `3`, never a traceback.
 
 Equivalent separation rules are rejected before evaluation. Identical violations from distinct
 non-equivalent rules are emitted once, no result may contain more than 256 unique violations, and

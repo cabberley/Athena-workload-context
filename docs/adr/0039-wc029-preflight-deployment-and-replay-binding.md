@@ -83,6 +83,17 @@ Use the following guarded preflight contract:
     reconciliation uses constant-time indexed lookups, removes the second delta walk, and charges
     deterministic index/path-token work to an aggregate lookup budget. The single `NoChange` pass
     retains inspectable-array and resource-root after-object requirements.
+13. Separation matching uses the corroborated leaf-to-root management-group ancestry in both
+    directions. Reviewed management-group prefixes cover connected child management groups and
+    subscription descendants; parent assignments cover connected child prefixes. No unreviewed
+    management-group ancestry is inferred.
+14. Security decision strings are normalized only after exact trimmed ASCII validation. Azure CLI
+    values beginning with `-`, malformed deployment names, and non-canonical relative
+    template/parameter paths are rejected.
+15. JSON keys and strings must encode as strict UTF-8. Lone surrogates and defensive encode failures
+    become bounded preflight input failures.
+16. POSIX ledger reads add nonblocking/no-follow flags and require a regular file from `fstat`.
+    Writer and reader share one 64-KiB record bound checked before file creation.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -106,6 +117,8 @@ blocked output is returned.
   Windows path validation covers the trusted root, ledger, and every parent component.
 - Corrupted or non-UTF-8 existing ledger records produce a bounded preflight failure rather than an
   uncaught decoder error.
+- FIFO, socket, device, symlink, junction, and reparse entries cannot be consumed as ledger records.
+- A ledger record accepted by the create-only writer is guaranteed to fit the paired reader's bound.
 - Guarded what-if artifacts must add exact request provenance and regenerate the reviewed shared
   manifest because `whatIfRequestDigest` is mandatory.
 - The legacy module entry point remains available for compatibility but is not the guarded
@@ -142,4 +155,7 @@ surrounding-whitespace aliases, JSON and `.bicepparam` request modes, required
 `--no-pretty-print`, Windows junction/reparse paths, POSIX symlink/no-follow behavior, and a
 14,000-leaf deterministic linear-work snapshot regression. Windows tests include a synchronized
 junction swap between validation and file open; ledger tests also cover outside nonexistent paths
-and invalid UTF-8 collection/binding records.
+invalid UTF-8 collection/binding records, POSIX FIFO/socket rejection, and symmetric record-size
+bounds. Scope regressions cover parent/child management groups and management-group-to-resource
+matching in both directions. Token tests cover whitespace and Unicode aliases, lone surrogates,
+single-dash values, and exact deployment/file grammars.

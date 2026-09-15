@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import socket
 import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ import pytest
 
 from athena_context.cli import main as cli_main
 from athena_context.wc029_preflight import (
+    MAX_RELEASE_LEDGER_RECORD_BYTES,
     PreflightInputError,
     PreflightViolation,
     _build_snapshot_pair_index,
@@ -2494,6 +2496,169 @@ def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:
         )
 
 
+def test_security_decision_tokens_require_exact_trimmed_ascii() -> None:
+    malformed_what_if_documents = [
+        {
+            "status": "ſucceeded",
+            "properties": {"changes": []},
+        },
+        _what_if(
+            {
+                "resourceId": _CONTAINER_APP_ID,
+                "changeType": " Modify ",
+                "delta": [],
+            }
+        ),
+        _what_if(
+            {
+                "resourceId": _CONTAINER_APP_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": "tags.release",
+                        "propertyChangeType": "Modify ",
+                        "after": "wc029",
+                    }
+                ],
+            }
+        ),
+        _what_if(
+            {
+                "resourceId": _STORAGE_ID,
+                "changeType": "Create",
+                "after": {
+                    "properties": {
+                        "allowSharedKeyAccess": False,
+                        "allowBlobPublicAccess": False,
+                        "publicNetworkAccess": "Diſabled",
+                        "networkAcls": {"defaultAction": "Deny"},
+                    }
+                },
+            }
+        ),
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Create",
+                "after": {
+                    "properties": {
+                        "publicNetworkAccess": "DisabledK",
+                        "networkAcls": {"defaultAction": "Deny "},
+                    }
+                },
+            }
+        ),
+        _what_if(
+            {
+                "resourceId": _STORAGE_CONTAINER_ID,
+                "changeType": "Create",
+                "after": {"properties": {"publicAccess": " None"}},
+            }
+        ),
+    ]
+    for document in malformed_what_if_documents:
+        with pytest.raises(
+            PreflightInputError,
+            match="exact trimmed ASCII token",
+        ):
+            evaluate_what_if(
+                document,
+                allowed_change_ids=frozenset(
+                    {
+                        _CONTAINER_APP_ID,
+                        _STORAGE_ID,
+                        _KEY_VAULT_ID,
+                        _STORAGE_CONTAINER_ID,
+                    }
+                ),
+            )
+
+    for invalid_role_name in (
+        "Uſer Access Administrator",
+        " Reader ",
+    ):
+        spoofed_role = _assignment(
+            role_name=invalid_role_name,
+            scope=_RG_SCOPE,
+        )
+        with pytest.raises(
+            PreflightInputError,
+            match="exact trimmed ASCII token",
+        ):
+            evaluate_role_assignments([spoofed_role])
+
+    padded_principal_type = _assignment(
+        role_name="Reader",
+        scope=_RG_SCOPE,
+    )
+    padded_principal_type["principalType"] = " ServicePrincipal"
+    with pytest.raises(
+        PreflightInputError,
+        match="exact trimmed ASCII token",
+    ):
+        evaluate_role_assignments([padded_principal_type])
+
+    padded_forbidden_role_policy = {
+        "separationRules": [
+            {
+                "principalId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "forbiddenRoleNames": [" Reader "],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ]
+    }
+    with pytest.raises(
+        PreflightInputError,
+        match="exact trimmed ASCII token",
+    ):
+        evaluate_role_assignments(
+            [],
+            policy_document=padded_forbidden_role_policy,
+        )
+
+    padded_snapshot_type = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(padded_snapshot_type["before"], dict)
+    assert isinstance(padded_snapshot_type["after"], dict)
+    padded_snapshot_type["before"]["type"] = " Microsoft.Storage/storageAccounts "
+    padded_snapshot_type["after"]["type"] = " Microsoft.Storage/storageAccounts "
+    with pytest.raises(
+        PreflightInputError,
+        match="exact trimmed ASCII token",
+    ):
+        evaluate_what_if(_what_if(padded_snapshot_type))
+
+    padded_schema = _attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))
+    manifest = padded_schema["manifest"]
+    assert isinstance(manifest, dict)
+    manifest["schemaVersion"] = " athena.wc029PreflightManifest.v1 "
+    padded_schema["attestation"] = _attestation(
+        "what-if",
+        manifest,
+        (
+            "allowChangeIdsDigest",
+            "deploymentDigest",
+            "parametersDigest",
+            "templateDigest",
+            "whatIfDigest",
+            "whatIfRequestDigest",
+        ),
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="exact trimmed ASCII token",
+    ):
+        evaluate_what_if(
+            padded_schema,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(manifest),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+
 @pytest.mark.parametrize(
     ("path", "property_change_type"),
     [
@@ -3069,7 +3234,7 @@ def test_ancestor_deletion_blocks_despite_separate_safe_after_payload(
             _STORAGE_CONTAINER_ID,
             "properties.publicAccess",
             {},
-            "publicAccess must be a bounded string",
+            "publicAccess must be an exact trimmed ASCII token",
         ),
     ],
 )
@@ -3397,7 +3562,7 @@ def test_rbac_separation_applies_to_ancestor_assignments() -> None:
     assert "identity-separation" in {item.code for item in violations}
 
 
-def test_rbac_management_group_assignment_is_conservative_ancestor() -> None:
+def test_rbac_management_group_assignment_requires_reviewed_hierarchy() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     management_group_scope = "/providers/Microsoft.Management/managementGroups/synthetic-parent"
     assignment = _assignment(
@@ -3421,7 +3586,7 @@ def test_rbac_management_group_assignment_is_conservative_ancestor() -> None:
         policy_document=policy,
     )
 
-    assert {item.code for item in violations} == {"identity-separation"}
+    assert violations == ()
 
 
 def test_guarded_rbac_management_group_assignment_cannot_bypass_separation() -> None:
@@ -3454,6 +3619,85 @@ def test_guarded_rbac_management_group_assignment_cannot_bypass_separation() -> 
     )
 
     assert {item.code for item in violations} == {"identity-separation"}
+
+
+@pytest.mark.parametrize(
+    ("assignment_scope", "forbidden_scope"),
+    [
+        (_MG_LEAF_SCOPE, _MG_ROOT_SCOPE),
+        (_MG_ROOT_SCOPE, _MG_LEAF_SCOPE),
+        (_SUBSCRIPTION_SCOPE, _MG_ROOT_SCOPE),
+        (_RG_SCOPE, _MG_LEAF_SCOPE),
+        (_WORKLOAD_RESOURCE_SCOPE, _MG_ROOT_SCOPE),
+    ],
+)
+def test_guarded_rbac_separation_uses_management_group_hierarchy_both_directions(
+    assignment_scope: str,
+    forbidden_scope: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="Reader",
+        scope=assignment_scope,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["allowedBroadAssignments"] = [assignment]
+    policy["separationRules"] = [
+        {
+            "principalId": principal_id,
+            "forbiddenRoleNames": ["Reader"],
+            "forbiddenRoleDefinitionIds": [_TEST_ROLE_IDS["reader"]],
+            "forbiddenScopePrefixes": [forbidden_scope],
+        }
+    ]
+
+    violations = _evaluate_guarded_rbac(
+        _guarded_evidence(
+            [assignment],
+            effective_principal_ids=[principal_id],
+        ),
+        policy,
+    )
+
+    assert {item.code for item in violations} == {"identity-separation"}
+
+
+def test_guarded_rbac_does_not_invent_unreviewed_management_group_ancestry() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    unrelated_management_group = "/providers/Microsoft.Management/managementGroups/unrelated"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="Reader",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    policy["allowedBroadAssignments"] = [assignment]
+    policy["separationRules"] = [
+        {
+            "principalId": principal_id,
+            "forbiddenRoleNames": ["Reader"],
+            "forbiddenRoleDefinitionIds": [_TEST_ROLE_IDS["reader"]],
+            "forbiddenScopePrefixes": [unrelated_management_group],
+        }
+    ]
+
+    assert (
+        _evaluate_guarded_rbac(
+            _guarded_evidence(
+                [assignment],
+                effective_principal_ids=[principal_id],
+            ),
+            policy,
+        )
+        == ()
+    )
 
 
 def test_rbac_id_only_assignments_match_named_separation_rules() -> None:
@@ -3664,6 +3908,58 @@ def test_json_decimals_remain_exact_for_digest_and_noeffect(
         match="NoEffect before and after values conflict",
     ):
         evaluate_what_if(load_json_file(exact_path))
+
+
+def test_json_and_rendering_reject_lone_surrogates_deterministically(
+    tmp_path,
+) -> None:
+    surrogate_value = tmp_path / "surrogate-value.json"
+    surrogate_key = tmp_path / "surrogate-key.json"
+    surrogate_value.write_text('{"value":"\\ud800"}', encoding="utf-8")
+    surrogate_key.write_text('{"\\ud800":"value"}', encoding="utf-8")
+
+    with pytest.raises(PreflightInputError, match="strict UTF-8"):
+        load_json_file(surrogate_value)
+    with pytest.raises(PreflightInputError, match="JSON object keys are invalid"):
+        load_json_file(surrogate_key)
+
+    with pytest.raises(PreflightInputError, match="strict UTF-8"):
+        evaluate_what_if(
+            _what_if(
+                _change(
+                    _CONTAINER_APP_ID,
+                    "Modify",
+                    path="tags.release",
+                    after="\ud800",
+                )
+            ),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+    with pytest.raises(PreflightInputError, match="strict UTF-8"):
+        render_preflight_json(
+            kind="what-if",
+            violations=(
+                PreflightViolation(
+                    code="synthetic",
+                    subject="\ud800",
+                    detail="synthetic",
+                ),
+            ),
+        )
+
+    stdout = StringIO()
+    stderr = StringIO()
+    assert (
+        cli_main(
+            _what_if_cli_args(surrogate_value),
+            stdout=stdout,
+            stderr=stderr,
+        )
+        == 3
+    )
+    assert stdout.getvalue() == ""
+    assert "strict UTF-8" in stderr.getvalue()
 
 
 def test_cli_exit_codes_and_json_output(tmp_path, capsys) -> None:
@@ -3985,6 +4281,39 @@ def test_posix_release_ledger_does_not_follow_existing_record_symlink(
     assert outside.read_text(encoding="utf-8") == "unchanged"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special-file regression")
+@pytest.mark.parametrize("record_kind", ["fifo", "socket"])
+def test_posix_release_ledger_rejects_special_files_without_blocking(
+    tmp_path,
+    record_kind: str,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    record_path = ledger_path / f"{_COLLECTION_RUN_ID}.collection.json"
+    active_socket: socket.socket | None = None
+    if record_kind == "fifo":
+        os.mkfifo(record_path)
+    else:
+        active_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        active_socket.bind(os.fspath(record_path))
+    stderr = StringIO()
+    try:
+        assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+        assert (
+            "release ledger record must be a regular file" in stderr.getvalue()
+            or "release ledger record is unavailable" in stderr.getvalue()
+        )
+    finally:
+        if active_socket is not None:
+            active_socket.close()
+        record_path.unlink()
+
+
 @pytest.mark.parametrize("record_kind", ["collection", "binding"])
 def test_public_cli_reports_invalid_utf8_existing_ledger_records(
     tmp_path,
@@ -4011,6 +4340,31 @@ def test_public_cli_reports_invalid_utf8_existing_ledger_records(
 
     assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
     assert "release ledger record is not valid JSON" in stderr.getvalue()
+
+
+def test_release_ledger_writer_and_reader_share_one_record_bound(
+    tmp_path,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    readable_payload = {
+        "value": "x" * (MAX_RELEASE_LEDGER_RECORD_BYTES - 128),
+    }
+    oversized_payload = {
+        "value": "x" * MAX_RELEASE_LEDGER_RECORD_BYTES,
+    }
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        ledger.create_json("readable.json", readable_payload)
+        assert ledger.read_json("readable.json") == readable_payload
+        with pytest.raises(
+            PreflightInputError,
+            match="release ledger record exceeds its byte bound",
+        ):
+            ledger.create_json("oversized.json", oversized_payload)
+
+    assert not (ledger_path / "oversized.json").exists()
 
 
 def test_public_cli_rejects_cross_artifact_manifest_rebinding(tmp_path) -> None:
@@ -4224,12 +4578,47 @@ def test_attested_what_if_requires_exact_full_analysis_request() -> None:
     padded_value_arguments[padded_value_arguments.index("--output") + 1] = " json "
     invalid_requests.append(padded_value)
 
+    single_dash_value = _what_if_request()
+    replace_value(single_dash_value, "--output", "-json")
+    invalid_requests.append(single_dash_value)
+
+    for invalid_name in ("bad/name", "x" * 65):
+        request = _what_if_request()
+        replace_value(request, "--name", invalid_name)
+        invalid_requests.append(request)
+
+    for invalid_parameters in (
+        "-main.bicepparam",
+        "../main.bicepparam",
+        "https://example.invalid/main.bicepparam",
+        "main bicepparam",
+        "infra/main.json",
+    ):
+        request = _what_if_request()
+        replace_value(request, "--parameters", invalid_parameters)
+        invalid_requests.append(request)
+
+    for invalid_json_parameters, invalid_template in (
+        ("@../main.parameters.json", "infra/main.bicep"),
+        ("@infra/main.parameters.json", "../main.bicep"),
+    ):
+        request = _what_if_request()
+        request_arguments = request["arguments"]
+        assert isinstance(request_arguments, list)
+        parameters_index = request_arguments.index("--parameters")
+        request_arguments[parameters_index + 1] = invalid_json_parameters
+        request_arguments[parameters_index:parameters_index] = [
+            "--template-file",
+            invalid_template,
+        ]
+        invalid_requests.append(request)
+
     for request in invalid_requests:
         artifact = _attested_what_if(
             document,
             what_if_request=request,
         )
-        with pytest.raises(PreflightInputError, match="what-if command"):
+        with pytest.raises(PreflightInputError, match="what-if"):
             evaluate_what_if(
                 artifact,
                 require_attestation=True,
@@ -4261,6 +4650,30 @@ def test_attested_what_if_requires_exact_full_analysis_request() -> None:
             expected_collection_run_id=_COLLECTION_RUN_ID,
             expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(json_artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+        == ()
+    )
+
+    windows_path_request = _what_if_request()
+    replace_value(
+        windows_path_request,
+        "--parameters",
+        "infra\\main.preparation.bicepparam",
+    )
+    windows_path_artifact = _attested_what_if(
+        document,
+        what_if_request=windows_path_request,
+    )
+    assert (
+        evaluate_what_if(
+            windows_path_artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(windows_path_artifact["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
             parameters_digest=_PARAMETERS_DIGEST,
@@ -6207,6 +6620,16 @@ def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
             "--all",
             "--output",
             " json ",
+        ],
+        [
+            "--subscription",
+            _SUBSCRIPTION_ID,
+            "--assignee-object-id",
+            principal_id,
+            "--include-groups",
+            "--all",
+            "--output",
+            "-json",
         ],
         [
             "--subscription",

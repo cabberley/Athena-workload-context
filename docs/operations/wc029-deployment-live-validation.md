@@ -156,6 +156,8 @@ delete, clone, replace, or redirect either path after a preflight consumes evide
 Containment is checked before the candidate ledger is touched. On Windows, the verifier holds a
 non-reparse ledger-directory handle and verifies each record handle before writing, so replacing a
 validated directory with a junction cannot redirect a successful consumption.
+POSIX ledger reads are nonblocking and no-follow, then require a regular file by `fstat`; FIFOs,
+sockets, and devices fail deterministically. Ledger writes and reads share one 64-KiB record bound.
 
 The versioned `athena.wc029PreflightManifest.v1` records UTC `collectedAt`/`expiresAt` with a
 validity window no longer than 30 minutes, the deployment execution ID, and a reviewed
@@ -175,6 +177,9 @@ short-circuit, or unknown option. JSON mode uses one local `--template-file` and
 omits `--template-file`; do not prefix Bicep parameter files with `@`. Reject every non-empty
 diagnostic anywhere in the response; warnings and incomplete-analysis diagnostics require a new
 collection rather than operator interpretation.
+Option values may not begin with `-`. Deployment names and relative template/parameter paths must
+use the exact bounded grammar documented by the verifier; absolute, drive-qualified, URI, dot,
+parent, empty, padded, Unicode, or malformed values fail closed.
 
 ```powershell
 $CollectionRunId = [guid]::NewGuid().ToString()
@@ -251,6 +256,8 @@ work budget. Complete snapshot pairs are indexed once by canonical lowercase pat
 `NoEffect` lookup/token is charged to a deterministic aggregate budget. Nested delta hierarchies,
 wide snapshots, or lookup work that exceeds a bound fail before candidate materialization.
 `NoChange` uses one delta traversal and retains explicit root-object and inspectable-array checks.
+All status, change, method, principal/role type, and protected network/access values must be exact
+trimmed ASCII tokens before normalization. Do not repair whitespace or Unicode lookalikes manually.
 
 Do not continue by manually ignoring a failed preflight result. Update IaC or the reviewed
 allowlist and rerun the gate.
@@ -405,7 +412,7 @@ Do not use `--assignee`, omit either include flag, combine `--all` with `--scope
 `--resource-group`, or `--query`, use equals-form duplicate options, or transform the JSON output.
 Option names must be exact lowercase ASCII and fixed values such as `--output json` are
 case-sensitive. Decoded request-URL query keys must also be exact lowercase ASCII and unique after
-percent decoding.
+percent decoding. Single-dash-prefixed values are rejected rather than treated as positional data.
 
 The CLI equivalent for the separate subscription-descendant inventory is:
 
