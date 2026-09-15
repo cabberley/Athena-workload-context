@@ -659,6 +659,70 @@ def _raw_arm_assignment(
     }
 
 
+def _raw_arm_deny_assignment(
+    *,
+    scope: str = _RG_SCOPE,
+    principals: list[tuple[str, str]] | None = None,
+    exclude_principals: list[tuple[str, str]] | None = None,
+    do_not_apply_to_child_scopes: bool = False,
+    condition: str | None = None,
+    index: int = 0,
+) -> dict[str, object]:
+    reviewed_principals = (
+        [("11111111-1111-1111-1111-111111111111", "ServicePrincipal")]
+        if principals is None
+        else principals
+    )
+    reviewed_exclusions = [] if exclude_principals is None else exclude_principals
+    assignment_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        (
+            f"deny:{scope}:{reviewed_principals}:{reviewed_exclusions}:"
+            f"{do_not_apply_to_child_scopes}:{condition}:{index}"
+        ),
+    )
+    resource_id = (
+        f"/providers/Microsoft.Authorization/denyAssignments/{assignment_id}"
+        if scope == "/"
+        else f"{scope}/providers/Microsoft.Authorization/denyAssignments/{assignment_id}"
+    )
+    properties: dict[str, object] = {
+        "permissions": [
+            {
+                "actions": ["Microsoft.Storage/storageAccounts/read"],
+                "notActions": [],
+                "dataActions": [],
+                "notDataActions": [],
+            }
+        ],
+        "scope": scope,
+        "doNotApplyToChildScopes": do_not_apply_to_child_scopes,
+        "principals": [
+            {
+                "id": principal_id,
+                "type": principal_type,
+            }
+            for principal_id, principal_type in reviewed_principals
+        ],
+        "excludePrincipals": [
+            {
+                "id": principal_id,
+                "type": principal_type,
+            }
+            for principal_id, principal_type in reviewed_exclusions
+        ],
+        "isSystemProtected": True,
+    }
+    if condition is not None:
+        properties["condition"] = condition
+        properties["conditionVersion"] = "2.0"
+    return {
+        "id": resource_id,
+        "type": "Microsoft.Authorization/denyAssignments",
+        "properties": properties,
+    }
+
+
 def _hierarchy_evidence() -> dict[str, object]:
     subscription_association_id = f"{_MG_LEAF_SCOPE}/subscriptions/{_SUBSCRIPTION_ID}"
     return {
@@ -781,6 +845,102 @@ def _group_membership_evidence(
             }
         ],
     }
+
+
+def _deny_assignment_evidence() -> dict[str, object]:
+    target_query = urlencode(
+        {
+            "api-version": "2022-04-01",
+            "$filter": "atScope()",
+        }
+    )
+    subscription_query = urlencode(
+        {
+            "api-version": "2022-04-01",
+        }
+    )
+    return {
+        "method": "arm",
+        "collections": [
+            {
+                "collectionType": "target-and-ancestors",
+                "apiVersion": "2022-04-01",
+                "scope": _RG_SCOPE,
+                "filter": "atScope()",
+                "pages": [
+                    {
+                        "requestUrl": (
+                            "https://management.azure.com"
+                            f"{_RG_SCOPE}/providers/Microsoft.Authorization/"
+                            f"denyAssignments?{target_query}"
+                        ),
+                        "statusCode": 200,
+                        "value": [],
+                        "nextLink": None,
+                    }
+                ],
+            },
+            {
+                "collectionType": "subscription-inventory",
+                "apiVersion": "2022-04-01",
+                "scope": _SUBSCRIPTION_SCOPE,
+                "pages": [
+                    {
+                        "requestUrl": (
+                            "https://management.azure.com"
+                            f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.Authorization/"
+                            f"denyAssignments?{subscription_query}"
+                        ),
+                        "statusCode": 200,
+                        "value": [],
+                        "nextLink": None,
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _deny_assignment_collection(
+    evidence: dict[str, object],
+    collection_type: str,
+) -> dict[str, object]:
+    principal = _first_principal_artifact(evidence)
+    deny_assignments = principal["denyAssignments"]
+    assert isinstance(deny_assignments, dict)
+    collections = deny_assignments["collections"]
+    assert isinstance(collections, list)
+    for raw_collection in collections:
+        assert isinstance(raw_collection, dict)
+        if raw_collection["collectionType"] == collection_type:
+            return raw_collection
+    raise AssertionError(f"missing deny-assignment collection {collection_type}")
+
+
+def _add_deny_assignment(
+    evidence: dict[str, object],
+    assignment: dict[str, object],
+    *,
+    target_and_ancestors: bool,
+    subscription_inventory: bool,
+) -> None:
+    for collection_type, include in (
+        ("target-and-ancestors", target_and_ancestors),
+        ("subscription-inventory", subscription_inventory),
+    ):
+        if not include:
+            continue
+        collection = _deny_assignment_collection(
+            evidence,
+            collection_type,
+        )
+        pages = collection["pages"]
+        assert isinstance(pages, list)
+        page = pages[0]
+        assert isinstance(page, dict)
+        values = page["value"]
+        assert isinstance(values, list)
+        values.append(copy.deepcopy(assignment))
 
 
 def _guarded_evidence(
@@ -926,6 +1086,7 @@ def _guarded_evidence(
                     effective_principal_id,
                     group_ids,
                 ),
+                "denyAssignments": _deny_assignment_evidence(),
                 "roleAssignments": {
                     "ancestors": {
                         "method": "arm",
@@ -1459,6 +1620,46 @@ def test_what_if_rejects_malformed_potential_changes() -> None:
             f"{_RG_SCOPE}/providers/Microsoft.Resources/deploymentScripts/synthetic-script",
             "Modify",
         ),
+        (
+            f"{_KEY_VAULT_ID}/accessPolicies/add",
+            "Create",
+        ),
+        (
+            f"{_KEY_VAULT_ID}/accessPolicies/replace",
+            "Modify",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+            "synthetic-identity/federatedIdentityCredentials/synthetic-federation",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+            "synthetic-identity/federatedIdentityCredentials/synthetic-federation",
+            "Modify",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Graph/applications/"
+            "14141414-1414-1414-1414-141414141414/federatedIdentityCredentials/"
+            "synthetic-federation",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Graph/oauth2PermissionGrants/"
+            "15151515-1515-1515-1515-151515151515",
+            "Modify",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Graph/servicePrincipals/"
+            "16161616-1616-1616-1616-161616161616/appRoleAssignedTo/"
+            "17171717-1717-1717-1717-171717171717",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Synthetic.Identity/workloadIdentities/"
+            "synthetic/federatedIdentityCredentials/synthetic-federation",
+            "Modify",
+        ),
     ],
 )
 def test_what_if_fails_closed_on_authorization_mutations(
@@ -1478,6 +1679,131 @@ def test_what_if_fails_closed_on_authorization_mutations(
     )
 
     assert {violation.code for violation in violations} == {"authorization-change-unsupported"}
+
+
+@pytest.mark.parametrize(
+    ("change_type", "path", "after"),
+    [
+        (
+            "Modify",
+            "properties.accessPolicies",
+            [],
+        ),
+        (
+            "Modify",
+            "properties.accessPolicies[0].objectId",
+            "11111111-1111-1111-1111-111111111111",
+        ),
+        ("Modify", "properties.enableRbacAuthorization", True),
+        (
+            "Modify",
+            "properties",
+            {
+                "accessPolicies": [],
+                "enableRbacAuthorization": True,
+            },
+        ),
+    ],
+)
+def test_what_if_fails_closed_on_key_vault_authorization_property_mutations(
+    change_type: str,
+    path: str,
+    after: object,
+) -> None:
+    violations = evaluate_what_if(
+        _what_if(
+            _change(
+                _KEY_VAULT_ID,
+                change_type,
+                path=path,
+                after=after,
+            )
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("accessPolicies", []),
+        ("enableRbacAuthorization", True),
+    ],
+)
+def test_what_if_fails_closed_on_key_vault_create_authorization_properties(
+    field_name: str,
+    field_value: object,
+) -> None:
+    properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: field_value,
+    }
+
+    violations = evaluate_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Create",
+                "after": {"properties": properties},
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert {violation.code for violation in violations} == {"authorization-change-unsupported"}
+
+
+def test_what_if_fails_closed_on_partial_key_vault_authorization_snapshot() -> None:
+    change = _change(
+        _KEY_VAULT_ID,
+        "Modify",
+        path="tags.release",
+        after="wc029",
+    )
+    change["after"] = {
+        "properties": {
+            "enableRbacAuthorization": True,
+        }
+    }
+
+    violations = evaluate_what_if(
+        _what_if(change),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+def test_what_if_allows_unchanged_key_vault_authorization_mode() -> None:
+    before = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties={
+            "enableRbacAuthorization": True,
+            "publicNetworkAccess": "Disabled",
+            "networkAcls": {"defaultAction": "Deny"},
+        },
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+
+    assert (
+        evaluate_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "before": before,
+                    "after": after,
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+        == ()
+    )
 
 
 def test_what_if_rejects_mixed_result_envelopes() -> None:
@@ -3149,7 +3475,10 @@ def test_what_if_network_acl_change_accepts_complete_private_after_state(
         ),
         (
             _KEY_VAULT_ID,
-            {"public-data-plane-access"},
+            {
+                "authorization-change-unsupported",
+                "public-data-plane-access",
+            },
         ),
     ],
 )
@@ -3902,6 +4231,121 @@ def test_inputs_are_strict_and_bounded(tmp_path) -> None:
     nested.write_text(json.dumps(deeply_nested), encoding="utf-8")
     with pytest.raises(PreflightInputError, match="depth or node"):
         load_json_file(nested)
+
+
+def test_load_json_file_uses_one_bounded_binary_descriptor(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text('{"value":"synthetic"}', encoding="utf-8")
+    real_open = os.open
+    open_flags: list[int] = []
+
+    def tracked_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        open_flags.append(flags)
+        return real_open(path, flags, mode)
+
+    def unexpected_path_read(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("path-level stat/read must not be used")
+
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(Path, "stat", unexpected_path_read)
+    monkeypatch.setattr(Path, "read_text", unexpected_path_read)
+
+    assert load_json_file(artifact) == {"value": "synthetic"}
+    assert len(open_flags) == 1
+    for flag_name in ("O_BINARY", "O_NOFOLLOW", "O_NONBLOCK"):
+        flag = getattr(os, flag_name, 0)
+        if flag:
+            assert open_flags[0] & flag
+
+
+def test_load_json_file_rejects_descriptor_growth_beyond_bound(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "growing.json"
+    initial_payload = b'{"value":"synthetic"}'
+    artifact.write_bytes(initial_payload)
+    simulated_growth = initial_payload + (b"x" * 64)
+    offset = 0
+    requested_bytes = 0
+
+    def growing_read(_descriptor: int, count: int) -> bytes:
+        nonlocal offset, requested_bytes
+        requested_bytes += count
+        chunk = simulated_growth[offset : offset + count]
+        offset += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(os, "read", growing_read)
+
+    with pytest.raises(PreflightInputError, match="between 1 and 32 bytes"):
+        load_json_file(artifact, maximum_bytes=32)
+    assert offset == 33
+    assert requested_bytes == 33
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX replacement semantics")
+def test_load_json_file_reads_open_descriptor_across_path_replacement(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "artifact.json"
+    replacement = tmp_path / "replacement.json"
+    artifact.write_text('{"value":"opened"}', encoding="utf-8")
+    replacement.write_text('{"value":"replacement"}', encoding="utf-8")
+    real_open = os.open
+    replaced = False
+
+    def replacing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        nonlocal replaced
+        descriptor = real_open(path, flags, mode)
+        if Path(path) == artifact:
+            os.replace(replacement, artifact)
+            replaced = True
+        return descriptor
+
+    monkeypatch.setattr(os, "open", replacing_open)
+
+    assert load_json_file(artifact) == {"value": "opened"}
+    assert replaced
+    assert json.loads(artifact.read_text(encoding="utf-8")) == {"value": "replacement"}
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "O_NOFOLLOW"),
+    reason="POSIX no-follow regression",
+)
+def test_load_json_file_rejects_final_symlink(tmp_path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text('{"value":"target"}', encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+
+    with pytest.raises(PreflightInputError, match="cannot read"):
+        load_json_file(link)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX nonblocking special-file regression",
+)
+def test_load_json_file_rejects_fifo_without_blocking(tmp_path) -> None:
+    fifo = tmp_path / "artifact.fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(PreflightInputError, match="cannot read"):
+        load_json_file(fifo)
 
 
 def test_json_parser_rejects_exact_duplicate_keys(tmp_path) -> None:
@@ -5231,6 +5675,7 @@ def test_rbac_attestation_binds_manifest_deployment_target(
         "hierarchy",
         "subscriptionTenant",
         "membership",
+        "denyAssignments",
         "roleAssignments",
     ],
 )
@@ -5270,7 +5715,7 @@ def test_rbac_attestation_binds_reviewed_inputs(
         )
     else:
         principal = _first_principal_artifact(evidence)
-        artifact_name = "groupMembership" if binding_input == "membership" else "roleAssignments"
+        artifact_name = "groupMembership" if binding_input == "membership" else binding_input
         artifact = principal[artifact_name]
         assert isinstance(artifact, dict)
         artifact["syntheticMutation"] = True
@@ -6045,6 +6490,106 @@ def test_guarded_rbac_rejects_pagination_gaps(
 
 
 @pytest.mark.parametrize(
+    ("evidence_kind", "alias_field"),
+    [
+        ("arm", "@odata.nextLink"),
+        ("arm", "NextLink"),
+        ("graph", "nextLink"),
+        ("graph", "@odata.nextlink"),
+    ],
+)
+@pytest.mark.parametrize(
+    "mutation",
+    ["replacement", "collision"],
+)
+def test_guarded_rbac_rejects_endpoint_inappropriate_next_link_fields(
+    evidence_kind: str,
+    alias_field: str,
+    mutation: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    if evidence_kind == "arm":
+        role_assignments = principal["roleAssignments"]
+        assert isinstance(role_assignments, dict)
+        container = role_assignments["ancestors"]
+        expected_field = "nextLink"
+    else:
+        container = principal["groupMembership"]
+        expected_field = "@odata.nextLink"
+    assert isinstance(container, dict)
+    pages = container["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    if mutation == "replacement":
+        page[alias_field] = page.pop(expected_field)
+    else:
+        assert mutation == "collision"
+        page[alias_field] = None
+
+    with pytest.raises(
+        PreflightInputError,
+        match="must contain only the exact|case-insensitive key collision",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence_kind",
+    ["arm", "graph"],
+)
+def test_guarded_rbac_rejects_whitespace_next_link_values(
+    evidence_kind: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    if evidence_kind == "arm":
+        role_assignments = principal["roleAssignments"]
+        assert isinstance(role_assignments, dict)
+        container = role_assignments["ancestors"]
+        next_link_field = "nextLink"
+        padded_url = " https://management.azure.com/synthetic"
+    else:
+        container = principal["groupMembership"]
+        next_link_field = "@odata.nextLink"
+        padded_url = "https://graph.microsoft.com/synthetic "
+    assert isinstance(container, dict)
+    pages = container["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page[next_link_field] = padded_url
+
+    with pytest.raises(PreflightInputError, match="whitespace"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
     "collection_kind",
     ["ancestors", "descendants"],
 )
@@ -6078,6 +6623,9 @@ def test_guarded_rbac_accepts_exact_arm_skip_token_pagination(
 @pytest.mark.parametrize(
     ("continuation_query", "message"),
     [
+        ("%24skipToken=", "requestUrl is not canonical"),
+        ("%24skipToken=%20", "requestUrl is not canonical"),
+        ("%24skipToken=synthetic%20token", "requestUrl is not canonical"),
         ("%24skiptoken=synthetic", "not canonical for this endpoint"),
         ("%24SkipToken=synthetic", "not canonical for this endpoint"),
         (
@@ -6120,6 +6668,9 @@ def test_guarded_rbac_rejects_arm_skip_token_spelling_and_collisions(
 @pytest.mark.parametrize(
     ("continuation_query", "message"),
     [
+        ("%24skiptoken=", "continuation URL is not canonical"),
+        ("%24skiptoken=%20", "continuation URL is not canonical"),
+        ("%24skiptoken=synthetic%20token", "continuation URL is not canonical"),
         ("%24skipToken=synthetic", "not canonical for this endpoint"),
         ("%24Skiptoken=synthetic", "not canonical for this endpoint"),
         (
@@ -6132,7 +6683,7 @@ def test_guarded_rbac_rejects_arm_skip_token_spelling_and_collisions(
         ),
         (
             "%24skiptoken=synthetic&%24skip=1",
-            "continuation URL is not canonical",
+            "not canonical for this endpoint",
         ),
     ],
 )
@@ -6179,6 +6730,382 @@ def test_guarded_rbac_rejects_graph_skiptoken_spelling_and_collisions(
                 expected_assignments=[assignment],
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "missing-target",
+        "missing-subscription",
+        "duplicate-target",
+        "filtered-subscription",
+        "unfiltered-target",
+    ],
+)
+def test_guarded_rbac_requires_complete_deny_assignment_evidence(
+    mutation: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    deny_assignments = principal["denyAssignments"]
+    assert isinstance(deny_assignments, dict)
+    collections = deny_assignments["collections"]
+    assert isinstance(collections, list)
+    if mutation == "missing":
+        principal.pop("denyAssignments")
+    elif mutation == "missing-target":
+        collections[:] = [
+            item
+            for item in collections
+            if isinstance(item, dict) and item["collectionType"] != "target-and-ancestors"
+        ]
+    elif mutation == "missing-subscription":
+        collections[:] = [
+            item
+            for item in collections
+            if isinstance(item, dict) and item["collectionType"] != "subscription-inventory"
+        ]
+    elif mutation == "duplicate-target":
+        collections[1] = copy.deepcopy(collections[0])
+    elif mutation == "filtered-subscription":
+        subscription = _deny_assignment_collection(
+            evidence,
+            "subscription-inventory",
+        )
+        subscription["filter"] = "atScope()"
+    else:
+        assert mutation == "unfiltered-target"
+        target = _deny_assignment_collection(
+            evidence,
+            "target-and-ancestors",
+        )
+        target.pop("filter")
+
+    with pytest.raises(PreflightInputError, match="deny"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_requires_identical_deny_evidence_for_all_principals() -> None:
+    first_principal_id = "11111111-1111-1111-1111-111111111111"
+    second_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignments = [
+        _guarded_assignment(
+            principal_id=first_principal_id,
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+        ),
+        _guarded_assignment(
+            principal_id=second_principal_id,
+            role_name="Storage Blob Data Reader",
+            scope=_RG_SCOPE,
+        ),
+    ]
+    evidence = _guarded_evidence(assignments)
+    principals = evidence["principals"]
+    assert isinstance(principals, list)
+    second_principal = principals[1]
+    assert isinstance(second_principal, dict)
+    deny_assignments = second_principal["denyAssignments"]
+    assert isinstance(deny_assignments, dict)
+    deny_assignments["syntheticMutation"] = True
+
+    with pytest.raises(
+        PreflightInputError,
+        match="principals disagree on complete deny-assignment evidence",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                first_principal_id,
+                second_principal_id,
+                expected_assignments=assignments,
+            ),
+        )
+
+
+def test_guarded_rbac_accepts_complete_paged_empty_deny_assignment_evidence() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    target = _deny_assignment_collection(
+        evidence,
+        "target-and-ancestors",
+    )
+    pages = target["pages"]
+    assert isinstance(pages, list)
+    first_page = pages[0]
+    assert isinstance(first_page, dict)
+    continuation_url = f"{first_page['requestUrl']}&%24skipToken=synthetic"
+    first_page["nextLink"] = continuation_url
+    pages.append(
+        {
+            "requestUrl": continuation_url,
+            "statusCode": 200,
+            "value": [],
+            "nextLink": None,
+        }
+    )
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("continuation_query", "message"),
+    [
+        ("%24skipToken=", "requestUrl is not canonical"),
+        ("%24skipToken=%20", "requestUrl is not canonical"),
+        ("%24skiptoken=synthetic", "not canonical for this endpoint"),
+        (
+            "%24skipToken=synthetic&%24skipToken=duplicate",
+            "duplicate decoded key",
+        ),
+    ],
+)
+def test_guarded_rbac_rejects_invalid_deny_assignment_cursors(
+    continuation_query: str,
+    message: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    target = _deny_assignment_collection(
+        evidence,
+        "target-and-ancestors",
+    )
+    pages = target["pages"]
+    assert isinstance(pages, list)
+    first_page = pages[0]
+    assert isinstance(first_page, dict)
+    continuation_url = f"{first_page['requestUrl']}&{continuation_query}"
+    first_page["nextLink"] = continuation_url
+    pages.append(
+        {
+            "requestUrl": continuation_url,
+            "statusCode": 200,
+            "value": [],
+            "nextLink": None,
+        }
+    )
+
+    with pytest.raises(PreflightInputError, match=message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_odata_next_link_in_deny_assignment_pages() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    target = _deny_assignment_collection(
+        evidence,
+        "target-and-ancestors",
+    )
+    pages = target["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    page["@odata.nextLink"] = page.pop("nextLink")
+
+    with pytest.raises(PreflightInputError, match="only the exact nextLink"):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("deny_kind", "do_not_apply_to_child_scopes", "condition"),
+    [
+        ("direct", False, None),
+        ("group", False, None),
+        ("all-principals", False, None),
+        ("direct", False, "@Resource[Microsoft.Storage/storageAccounts:name] StringEquals 'x'"),
+    ],
+)
+def test_guarded_rbac_fails_when_deny_might_invalidate_approved_access(
+    deny_kind: str,
+    do_not_apply_to_child_scopes: bool,
+    condition: str | None,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    group_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_id if deny_kind == "group" else principal_id,
+        effective_principal_id=principal_id,
+        principal_type="Group" if deny_kind == "group" else "ServicePrincipal",
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    if deny_kind == "group":
+        principals = [(group_id, "Group")]
+        deny_scope = _RG_SCOPE
+    elif deny_kind == "all-principals":
+        principals = [("00000000-0000-0000-0000-000000000000", "SystemDefined")]
+        deny_scope = _RG_SCOPE
+    else:
+        principals = [(principal_id, "ServicePrincipal")]
+        deny_scope = _RG_SCOPE if not do_not_apply_to_child_scopes else _SUBSCRIPTION_SCOPE
+    deny = _raw_arm_deny_assignment(
+        scope=deny_scope,
+        principals=principals,
+        do_not_apply_to_child_scopes=do_not_apply_to_child_scopes,
+        condition=condition,
+    )
+    _add_deny_assignment(
+        evidence,
+        deny,
+        target_and_ancestors=True,
+        subscription_inventory=True,
+    )
+
+    expected_message = "with a condition" if condition is not None else "may invalidate"
+    with pytest.raises(PreflightInputError, match=expected_message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "exclusion_kind",
+    ["principal", "group"],
+)
+def test_guarded_rbac_honors_all_principals_exclusion(
+    exclusion_kind: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    group_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_id if exclusion_kind == "group" else principal_id,
+        effective_principal_id=principal_id,
+        principal_type="Group" if exclusion_kind == "group" else "ServicePrincipal",
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    exclusion = (
+        (group_id, "Group") if exclusion_kind == "group" else (principal_id, "ServicePrincipal")
+    )
+    deny = _raw_arm_deny_assignment(
+        principals=[("00000000-0000-0000-0000-000000000000", "SystemDefined")],
+        exclude_principals=[exclusion],
+    )
+    _add_deny_assignment(
+        evidence,
+        deny,
+        target_and_ancestors=True,
+        subscription_inventory=True,
+    )
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
+
+
+def test_guarded_rbac_honors_non_inherited_and_unrelated_denies() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    non_inherited = _raw_arm_deny_assignment(
+        scope=_SUBSCRIPTION_SCOPE,
+        principals=[(principal_id, "ServicePrincipal")],
+        do_not_apply_to_child_scopes=True,
+    )
+    unrelated_principal = _raw_arm_deny_assignment(
+        principals=[("33333333-3333-3333-3333-333333333333", "ServicePrincipal")],
+        index=1,
+    )
+    unrelated_scope = _raw_arm_deny_assignment(
+        scope=_SIBLING_RG_SCOPE,
+        principals=[(principal_id, "ServicePrincipal")],
+        index=2,
+    )
+    _add_deny_assignment(
+        evidence,
+        non_inherited,
+        target_and_ancestors=True,
+        subscription_inventory=True,
+    )
+    _add_deny_assignment(
+        evidence,
+        unrelated_principal,
+        target_and_ancestors=True,
+        subscription_inventory=True,
+    )
+    _add_deny_assignment(
+        evidence,
+        unrelated_scope,
+        target_and_ancestors=False,
+        subscription_inventory=True,
+    )
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize(
@@ -6388,7 +7315,10 @@ def test_guarded_rbac_accepts_official_management_group_subscription_shape() -> 
     ("mutation", "message"),
     [
         ("mismatch", "crosses tenants"),
-        ("legacy-tenant-id", "ARM subscription tenant"),
+        ("case-alias", "literal tenant key"),
+        ("legacy-tenant-id", "literal tenant key"),
+        ("case-collision", "case-insensitive key collision"),
+        ("legacy-conflict", "literal tenant key"),
     ],
 )
 def test_guarded_rbac_rejects_invalid_management_group_subscription_tenant(
@@ -6405,9 +7335,15 @@ def test_guarded_rbac_rejects_invalid_management_group_subscription_tenant(
     properties = _management_group_subscription_properties(evidence)
     if mutation == "mismatch":
         properties["tenant"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-    else:
-        assert mutation == "legacy-tenant-id"
+    elif mutation == "case-alias":
+        properties["Tenant"] = properties.pop("tenant")
+    elif mutation == "legacy-tenant-id":
         properties["tenantId"] = properties.pop("tenant")
+    elif mutation == "case-collision":
+        properties["Tenant"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    else:
+        assert mutation == "legacy-conflict"
+        properties["tenantId"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
     with pytest.raises(PreflightInputError, match=message):
         _evaluate_guarded_rbac(
@@ -6417,6 +7353,20 @@ def test_guarded_rbac_rejects_invalid_management_group_subscription_tenant(
                 expected_assignments=[assignment],
             ),
         )
+
+
+def test_json_parser_rejects_duplicate_literal_subscription_tenant(tmp_path) -> None:
+    artifact = tmp_path / "duplicate-tenant.json"
+    artifact.write_text(
+        (
+            '{"properties":{"tenant":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",'
+            '"tenant":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}}'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PreflightInputError, match="duplicate key"):
+        load_json_file(artifact)
 
 
 def test_guarded_rbac_rejects_inconsistent_hierarchy_sources() -> None:

@@ -49,9 +49,13 @@ Any non-empty `diagnostics` or `validationDiagnostics` value anywhere in the res
 analysis incomplete for release and fails closed. Planned creates or modifies under any
 `Microsoft.Authorization` or `Microsoft.ManagedServices` resource family also block, including PIM
 assignment/eligibility schedule requests and Lighthouse registration assignments/definitions.
-`Microsoft.Resources/deploymentScripts` and descendants block as unsupported imperative execution.
-These changes remain blocked even when allowlisted because the gate does not yet derive their full
-post-deployment authorization or execution effects.
+`Microsoft.KeyVault/vaults/accessPolicies`, changes to a vault's `properties.accessPolicies` or
+`properties.enableRbacAuthorization`, `Microsoft.ManagedIdentity/.../federatedIdentityCredentials`,
+Microsoft Graph directory grants and credential resources, and equivalent federated identity,
+app-role, or delegated-permission grant types also block. `Microsoft.Resources/deploymentScripts`
+and descendants block as unsupported imperative execution. These changes remain blocked even when
+allowlisted because the gate does not yet derive their full post-deployment authorization,
+credential, or execution effects.
 `NoChange` is accepted only with complete, object-valued, type-exact, structurally identical
 `before` and `after` snapshots and no effective delta. Each snapshot must contain matching `id`,
 `name`, `type`, and object-valued `properties`. Every `NoEffect` entry must contain both `before`
@@ -157,6 +161,13 @@ Exit codes:
 - `2`: policy violations; and
 - `3`: malformed, empty, unreadable, or oversized input.
 
+Every input file is opened once as a binary descriptor. POSIX uses no-follow and nonblocking flags;
+all platforms require a regular file from `fstat`. The verifier reads at most the configured byte
+limit plus one from that same descriptor, rejects growth or metadata change during the read, and
+only then performs strict UTF-8 decoding and bounded JSON parsing. Replacing the pathname after open
+cannot redirect the descriptor, oversized growth fails without an unbounded read, and POSIX
+symlinks, FIFOs, and other special files are rejected.
+
 The default `text` format is intended for an operator terminal. Use `--format json` for a compact,
 key-sorted machine-readable result. Violations are ordered by code, normalized subject, and detail
 in both formats so repeated evaluation of the same saved inputs is byte-stable. Missing command-line
@@ -201,36 +212,41 @@ Guarded evidence contains three raw artifact families:
      `atScope() and assignedTo('<service-principal-object-id>')`; and
    - a separate complete subscription-descendant inventory for the effective principal and every
      transitive security group, including individual workload resources and sibling resource
-     groups.
+     groups; and
+   - one byte-equivalent ARM deny-assignment evidence set containing both the unfiltered
+     subscription inventory and the target-resource-group `atScope()` collection.
 
 Complete subscription responses may repeat root, corroborated management-group, subscription, or
 target assignments. Those rows are accepted only inside the reviewed boundary and deduplicated
 against the target/ancestor collection.
 
-Every page records its request URL, HTTP status, values, and returned next link. The next link must
-match the following page exactly and the final page must have no next link. Missing pages, non-200
-responses including `403`/`404`, repeated pages, mixed subscriptions or tenants, and malformed
-request URLs fail closed.
+Every page records its request URL, HTTP status, values, and one endpoint-exact next-link field. ARM
+pages require literal `nextLink` and reject `@odata.nextLink`; Graph pages require literal
+`@odata.nextLink` and reject `nextLink`. The next link must match the following page exactly and the
+final page must have a null next link. Missing pages, aliases, ambiguous next-link fields, non-200
+responses including `403`/`404`, repeated pages, mixed subscriptions or tenants, whitespace, and
+malformed request URLs fail closed.
 
 Initial Graph requests must use the unfiltered service-principal membership endpoint; a cursor or
 filter on the first page is rejected. Initial ARM role-assignment requests allow only
 `api-version=2022-04-01` and the exact `atScope() and assignedTo(...)` filter. Continuations must stay
 on the same host, endpoint, target scope, and principal and may add only the service-issued cursor.
 Cross-tenant parameters and caller-added selection filters are rejected. Decoded query keys must use
-the exact endpoint spelling and be unique after percent decoding. ARM Role Assignments API
-`2022-04-01` continuations use `$skipToken`; Graph continuations use exact `$skiptoken` where
-documented. Exact duplicates, percent-decoded duplicates, casefold collisions, aliases, and other
-case variants fail before query comparison.
+the exact endpoint spelling and be unique after percent decoding. ARM authorization continuations
+require exactly one non-empty, non-whitespace `$skipToken`; Graph continuations require exactly one
+non-empty, non-whitespace `$skiptoken` and never accept `$skip`. Exact duplicates,
+percent-decoded duplicates, casefold collisions, aliases, and other case variants fail before query
+comparison.
 
 The Resource Graph response must explicitly report `resultTruncated` as JSON `false` or the exact
 transport string `"false"`, no non-null `skipToken` or `$skipToken`, and
 `count == totalRecords == len(data) == 1`. Other strings, numbers, null, and missing values fail.
 
-The retained Management Groups Get Subscription API `2020-05-01` response must keep its documented
-raw `properties.tenant` field. The verifier validates it directly against the reviewed target tenant
-and derives hierarchy metadata in memory; a caller-renamed `properties.tenantId` is not accepted as
-the raw response. Because the complete raw RBAC payload is manifest-bound, no unbound normalized
-copy is used as provenance.
+The retained Management Groups Get Subscription API `2020-05-01` response must keep one literal,
+case-sensitive raw `properties.tenant` field. `Tenant`, `tenantId`, duplicate keys, case aliases,
+and conflicting tenant fields are rejected. The verifier validates the literal raw field directly
+against the reviewed target tenant and derives hierarchy metadata in memory. Because the complete
+raw RBAC payload is manifest-bound, no unbound normalized copy is used as provenance.
 
 The verifier derives the management-group path from ARM parent links, rejects missing, disconnected,
 or cyclic nodes, and requires the leaf-to-root ARM path to exactly match Resource Graph and the
@@ -260,13 +276,23 @@ subscription-descendant inventory, then compares it with separately reviewed
 `approvedAssignments`. The legacy module entry point keeps its historical optional-policy and
 list-input behavior for compatibility and must not be used as the guarded deployment gate.
 
+Approved grants are not considered ready without complete deny-assignment evidence. Every principal
+artifact carries the same two paged ARM collections: all deny assignments effective at the target
+resource group and its ancestors via exact `atScope()`, plus the unfiltered subscription inventory
+covering descendant scopes. The verifier evaluates the effective service-principal object ID,
+complete transitive security-group IDs, All Principals, exclusions, scope inheritance, and
+`doNotApplyToChildScopes`. Any applicable conditional deny is conservatively treated as potentially
+effective because the verifier does not evaluate Azure ABAC expressions. A deny that might
+invalidate any approved access blocks the gate; unrelated principals, excluded identities,
+non-inherited ancestor denies, and disjoint scopes do not.
+
 The RBAC envelope uses the same bounded timestamps, `collectionRunId`, `deploymentExecutionId`,
 `deploymentTarget`, independently reviewed manifest digest, and trusted release ledger as the
 what-if envelope. The manifest binds the reviewed policy and the complete RBAC payload, including
 target, hierarchy, service-principal and membership inputs, and ancestor/descendant assignment
-collections. Mutating evidence and regenerating only its embedded digests fails against the
-externally supplied manifest digest. A second RBAC evaluation for the same execution fails even
-while the manifest remains within its validity window.
+collections, including the complete deny-assignment evidence. Mutating evidence and regenerating
+only its embedded digests fails against the externally supplied manifest digest. A second RBAC
+evaluation for the same execution fails even while the manifest remains within its validity window.
 
 CLI-equivalent evidence requires two exact collections. The target/ancestor command uses
 `--scope`, `--include-inherited`, and `--include-groups` without `--all`. The subscription-descendant

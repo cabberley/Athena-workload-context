@@ -8,6 +8,7 @@ import re
 import stat
 import sys
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -93,7 +94,23 @@ _DEPLOYMENT_NAME = re.compile(r"^[A-Za-z0-9_.()-]{1,64}$")
 _ATTESTED_FILE_COMPONENT = re.compile(r"^[A-Za-z0-9_.()-]+$")
 _UNSUPPORTED_MUTATION_PREFIXES = (
     "microsoft.authorization/",
+    "microsoft.graph/",
     "microsoft.managedservices/",
+)
+_UNSUPPORTED_AUTHORIZATION_RESOURCE_TYPES = frozenset(
+    {
+        "microsoft.keyvault/vaults/accesspolicies",
+        "microsoft.managedidentity/userassignedidentities/federatedidentitycredentials",
+    }
+)
+_UNSUPPORTED_IDENTITY_CREDENTIAL_TYPE_SEGMENTS = frozenset(
+    {
+        "approleassignedto",
+        "approleassignments",
+        "delegatedpermissiongrants",
+        "federatedidentitycredentials",
+        "oauth2permissiongrants",
+    }
 )
 _UNSUPPORTED_IMPERATIVE_TYPES = frozenset(
     {
@@ -102,17 +119,39 @@ _UNSUPPORTED_IMPERATIVE_TYPES = frozenset(
 )
 _MANIFEST_SCHEMA_VERSION = "athena.wc029PreflightManifest.v1"
 _ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
-_ARM_ROLE_ASSIGNMENT_QUERY_KEYS = frozenset(
+_ARM_DENY_ASSIGNMENTS_API_VERSION = "2022-04-01"
+_ARM_AUTHORIZATION_QUERY_KEYS = frozenset(
     {
         "$filter",
         "$skipToken",
         "api-version",
     }
 )
+_ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
+_DENY_ASSIGNMENT_COLLECTION_TYPES = frozenset(
+    {
+        "subscription-inventory",
+        "target-and-ancestors",
+    }
+)
+_DENY_PRINCIPAL_TYPES = frozenset(
+    {
+        "group",
+        "serviceprincipal",
+        "systemdefined",
+        "user",
+    }
+)
 _GRAPH_MEMBERSHIP_QUERY_KEYS = frozenset(
     {
-        "$skip",
         "$skiptoken",
+    }
+)
+_PAGED_NEXT_LINK_KEY_CASEFOLDS = frozenset(
+    {
+        "@odata.nextlink",
+        "nextlink",
+        "odata.nextlink",
     }
 )
 _GRAPH_MEMBERSHIP_METHODS = frozenset(
@@ -259,6 +298,17 @@ class RbacAssignment:
 
 
 @dataclass(frozen=True, slots=True)
+class DenyAssignment:
+    assignment_id: str
+    scope: str
+    do_not_apply_to_child_scopes: bool
+    principal_ids: frozenset[str]
+    excluded_principal_ids: frozenset[str]
+    condition: str | None
+    condition_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RbacCollection:
     tenant_id: str
     subscription_id: str
@@ -384,9 +434,19 @@ def _resource_type(resource_id: str) -> str:
 
 
 def _is_unsupported_authorization_or_imperative_type(resource_type: str) -> bool:
-    return resource_type.startswith(_UNSUPPORTED_MUTATION_PREFIXES) or any(
-        resource_type == imperative_type or resource_type.startswith(imperative_type + "/")
-        for imperative_type in _UNSUPPORTED_IMPERATIVE_TYPES
+    type_segments = frozenset(resource_type.split("/"))
+    return (
+        resource_type.startswith(_UNSUPPORTED_MUTATION_PREFIXES)
+        or any(
+            resource_type == authorization_type
+            or resource_type.startswith(authorization_type + "/")
+            for authorization_type in _UNSUPPORTED_AUTHORIZATION_RESOURCE_TYPES
+        )
+        or bool(type_segments & _UNSUPPORTED_IDENTITY_CREDENTIAL_TYPE_SEGMENTS)
+        or any(
+            resource_type == imperative_type or resource_type.startswith(imperative_type + "/")
+            for imperative_type in _UNSUPPORTED_IMPERATIVE_TYPES
+        )
     )
 
 
@@ -1153,15 +1213,51 @@ def load_json_file(
 ) -> object:
     if type(maximum_bytes) is not int or maximum_bytes < 1:
         raise ValueError("maximum_bytes must be a positive integer")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        size = path.stat().st_size
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise PreflightInputError(f"cannot read {path}") from exc
-    if size < 1 or size > maximum_bytes:
+    try:
+        initial_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            raise PreflightInputError(f"cannot read {path}")
+        payload = bytearray()
+        while len(payload) <= maximum_bytes:
+            remaining = maximum_bytes + 1 - len(payload)
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        final_stat = os.fstat(descriptor)
+    except PreflightInputError:
+        raise
+    except OSError as exc:
+        raise PreflightInputError(f"cannot read {path}") from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+    if len(payload) < 1 or len(payload) > maximum_bytes:
         raise PreflightInputError(f"{path} must contain between 1 and {maximum_bytes} bytes")
+    if (
+        initial_stat.st_dev != final_stat.st_dev
+        or initial_stat.st_ino != final_stat.st_ino
+        or initial_stat.st_size != final_stat.st_size
+        or initial_stat.st_mtime_ns != final_stat.st_mtime_ns
+        or initial_stat.st_ctime_ns != final_stat.st_ctime_ns
+        or final_stat.st_size != len(payload)
+    ):
+        raise PreflightInputError(f"{path} changed while being read")
     try:
         document = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8", errors="strict"),
             parse_constant=_reject_json_constant,
             parse_float=_parse_json_decimal,
             parse_int=_parse_json_integer,
@@ -1242,6 +1338,15 @@ def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
         if key.lower() == expected:
             return value
     return None
+
+
+def _require_literal_subscription_tenant(properties: dict[str, Any]) -> object:
+    tenant_keys = [key for key in properties if key.casefold() in {"tenant", "tenantid"}]
+    if tenant_keys != ["tenant"]:
+        raise PreflightInputError(
+            "ARM subscription properties must contain only the literal tenant key"
+        )
+    return properties["tenant"]
 
 
 def _require_exact_cli_token(
@@ -2141,6 +2246,74 @@ def _unsafe_property_violations(
                 budget=budget,
             )
         )
+    if resource_type == _KEY_VAULT_TYPE:
+        authorization_targets = (
+            "properties.accesspolicies",
+            "properties.enablerbacauthorization",
+        )
+        authorization_mutation = any(
+            _property_path_contains(
+                (path := _canonical_property_path(raw_path)),
+                target,
+            )
+            or _property_path_contains(
+                target,
+                path,
+            )
+            for raw_path, _, _ in delta_candidates
+            for target in authorization_targets
+        )
+        if not complete_snapshots:
+            for raw_payload in (before_payload, after_payload):
+                if not isinstance(raw_payload, dict):
+                    continue
+                raw_properties = _get_case_insensitive(raw_payload, "properties")
+                if isinstance(raw_properties, dict):
+                    authorization_mutation = authorization_mutation or any(
+                        _has_case_insensitive(raw_properties, field_name)
+                        for field_name in ("accessPolicies", "enableRbacAuthorization")
+                    )
+        elif complete_snapshots:
+            before_snapshot = _mapping(
+                before_payload,
+                field_name="Modify before snapshot",
+            )
+            after_snapshot = _mapping(
+                after_payload,
+                field_name="Modify after snapshot",
+            )
+            before_properties = _mapping(
+                _get_case_insensitive(before_snapshot, "properties"),
+                field_name="Modify before snapshot properties",
+            )
+            after_properties = _mapping(
+                _get_case_insensitive(after_snapshot, "properties"),
+                field_name="Modify after snapshot properties",
+            )
+            for field_name in ("accessPolicies", "enableRbacAuthorization"):
+                before_has_field = _has_case_insensitive(before_properties, field_name)
+                after_has_field = _has_case_insensitive(after_properties, field_name)
+                authorization_mutation = authorization_mutation or (
+                    before_has_field != after_has_field
+                    or (
+                        before_has_field
+                        and not _json_values_equal(
+                            _get_case_insensitive(before_properties, field_name),
+                            _get_case_insensitive(after_properties, field_name),
+                        )
+                    )
+                )
+        if authorization_mutation:
+            violations.append(
+                PreflightViolation(
+                    code="authorization-change-unsupported",
+                    subject=resource_id,
+                    detail=(
+                        "Key Vault access-policy or RBAC-mode mutations require "
+                        "a future separation-aware evaluator"
+                    ),
+                )
+            )
     if change_type != "delete" and any(
         property_change_type in {"delete", "remove"}
         and _canonical_property_path(raw_path) == _RESOURCE_ROOT_PATH
@@ -3332,6 +3505,48 @@ def _parse_exact_query(
     return query
 
 
+def _require_exact_page_next_link(
+    page: dict[str, Any],
+    *,
+    expected_field: str,
+    field_name: str,
+) -> object:
+    matching_fields = [key for key in page if key.casefold() in _PAGED_NEXT_LINK_KEY_CASEFOLDS]
+    if matching_fields != [expected_field]:
+        raise PreflightInputError(
+            f"{field_name} must contain only the exact {expected_field} field"
+        )
+    return page[expected_field]
+
+
+def _require_exact_url_value(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    url = _require_exact_cli_token(
+        value,
+        field_name=field_name,
+    )
+    if not url.isascii() or any(character.isspace() for character in url):
+        raise PreflightInputError(f"{field_name} must be an exact non-whitespace ASCII URL")
+    return url
+
+
+def _has_exact_nonempty_cursor(
+    query: dict[str, list[str]],
+    key: str,
+) -> bool:
+    values = query.get(key)
+    return (
+        values is not None
+        and len(values) == 1
+        and bool(values[0])
+        and values[0].isprintable()
+        and not any(character.isspace() for character in values[0])
+    )
+
+
 def _paged_values(
     value: object,
     *,
@@ -3353,7 +3568,7 @@ def _paged_values(
     seen_request_urls: set[str] = set()
     for index, raw_page in enumerate(pages):
         page = _mapping(raw_page, field_name=f"{field_name} page")
-        request_url = _require_string(
+        request_url = _require_exact_url_value(
             _get_case_insensitive(page, "requestUrl"),
             field_name=f"{field_name} requestUrl",
         )
@@ -3381,11 +3596,15 @@ def _paged_values(
         if len(values) + len(page_values) > maximum_items:
             raise PreflightInputError(f"{field_name} must contain at most {maximum_items} items")
         values.extend(page_values)
-        raw_next_link = _get_case_insensitive(page, next_link_field)
+        raw_next_link = _require_exact_page_next_link(
+            page,
+            expected_field=next_link_field,
+            field_name=f"{field_name} page",
+        )
         expected_request_url = (
             None
             if raw_next_link is None
-            else _require_string(
+            else _require_exact_url_value(
                 raw_next_link,
                 field_name=f"{field_name} nextLink",
             )
@@ -3612,7 +3831,7 @@ def _derive_management_group_ancestry(
     )
     if (
         _canonical_guid(
-            _get_case_insensitive(subscription_properties, "tenant"),
+            _require_literal_subscription_tenant(subscription_properties),
             field_name="ARM subscription tenant",
         )
         != target.tenant_id
@@ -3813,10 +4032,7 @@ def _validate_graph_urls(
         if parts.fragment or (index == 0 and query):
             raise PreflightInputError("initial Graph membership requestUrl must be unfiltered")
         if index > 0 and (
-            not query
-            or len(query) != 1
-            or not set(query).issubset({"$skiptoken", "$skip"})
-            or any(len(values) != 1 for values in query.values())
+            set(query) != {"$skiptoken"} or not _has_exact_nonempty_cursor(query, "$skiptoken")
         ):
             raise PreflightInputError("Graph membership continuation URL is not canonical")
 
@@ -3985,7 +4201,7 @@ def _validate_arm_role_assignment_urls(
         query = _parse_exact_query(
             parts,
             field_name="ARM role-assignment requestUrl",
-            allowed_keys=_ARM_ROLE_ASSIGNMENT_QUERY_KEYS,
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
         )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
@@ -3996,7 +4212,13 @@ def _validate_arm_role_assignment_urls(
             or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
             or len(query.get("$filter", [])) != 1
             or (index == 0 and "$skipToken" in query)
-            or (index > 0 and len(query.get("$skipToken", [])) != 1)
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
         ):
             raise PreflightInputError("ARM role-assignment requestUrl is not canonical")
         _validate_assigned_to_filter(
@@ -4047,7 +4269,7 @@ def _validate_descendant_arm_urls(
         query = _parse_exact_query(
             parts,
             field_name="ARM descendant role-assignment requestUrl",
-            allowed_keys=_ARM_ROLE_ASSIGNMENT_QUERY_KEYS,
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
         )
         allowed_keys = {"api-version", "$filter"}
         if index > 0:
@@ -4058,7 +4280,13 @@ def _validate_descendant_arm_urls(
             or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
             or len(query.get("$filter", [])) != 1
             or (index == 0 and "$skipToken" in query)
-            or (index > 0 and len(query.get("$skipToken", [])) != 1)
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
         ):
             raise PreflightInputError("ARM descendant role-assignment requestUrl is not canonical")
         _validate_principal_id_filter(
@@ -4066,6 +4294,455 @@ def _validate_descendant_arm_urls(
             assigned_principal_id=assigned_principal_id,
             field_name="ARM descendant requestUrl filter",
         )
+
+
+def _validate_arm_deny_assignment_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    collection_type: str,
+) -> None:
+    if collection_type == "target-and-ancestors":
+        expected_scope = target.resource_group_scope
+        expected_filter = "atScope()"
+    else:
+        if collection_type != "subscription-inventory":
+            raise PreflightInputError("deny-assignment collection type is unsupported")
+        expected_scope = target.subscription_scope
+        expected_filter = None
+    expected_path = expected_scope + "/providers/microsoft.authorization/denyassignments"
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM deny-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError("ARM deny-assignment requestUrl uses the wrong scope")
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM deny-assignment requestUrl",
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
+        )
+        expected_keys = {"api-version"}
+        if expected_filter is not None:
+            expected_keys.add("$filter")
+        if index > 0:
+            expected_keys.add("$skipToken")
+        if (
+            parts.fragment
+            or set(query) != expected_keys
+            or query.get("api-version") != [_ARM_DENY_ASSIGNMENTS_API_VERSION]
+            or (expected_filter is not None and query.get("$filter") != [expected_filter])
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
+        ):
+            raise PreflightInputError("ARM deny-assignment requestUrl is not canonical")
+
+
+def _parse_deny_principal_ids(
+    value: object,
+    *,
+    field_name: str,
+) -> frozenset[str]:
+    principal_ids: set[str] = set()
+    for raw_principal in _sequence(
+        value,
+        field_name=field_name,
+        maximum_items=MAX_ASSIGNMENTS,
+    ):
+        principal = _mapping(
+            raw_principal,
+            field_name=f"{field_name} entry",
+        )
+        principal_id = _canonical_guid(
+            _get_case_insensitive(principal, "id"),
+            field_name=f"{field_name} id",
+        )
+        principal_type = _normalized_ascii_token(
+            _get_case_insensitive(principal, "type"),
+            field_name=f"{field_name} type",
+            maximum_length=64,
+        )
+        if principal_type not in _DENY_PRINCIPAL_TYPES:
+            raise PreflightInputError(f"{field_name} contains an unsupported principal type")
+        if (principal_id == _ALL_PRINCIPALS_ID) != (principal_type == "systemdefined"):
+            raise PreflightInputError(f"{field_name} uses an inconsistent All Principals identity")
+        if principal_id in principal_ids:
+            raise PreflightInputError(f"{field_name} contains a duplicate principal")
+        principal_ids.add(principal_id)
+    return frozenset(principal_ids)
+
+
+def _parse_optional_deny_condition(
+    value: dict[str, Any],
+    *,
+    field_name: str,
+) -> tuple[str | None, str | None]:
+    raw_condition = _get_case_insensitive(value, "condition")
+    raw_condition_version = _get_case_insensitive(
+        value,
+        "conditionVersion",
+    )
+    if raw_condition is None:
+        if raw_condition_version is not None:
+            raise PreflightInputError(f"{field_name} conditionVersion requires condition")
+        return None, None
+    condition = _require_exact_cli_token(
+        raw_condition,
+        field_name=f"{field_name} condition",
+    )
+    condition_version = _require_exact_ascii_token(
+        raw_condition_version,
+        field_name=f"{field_name} conditionVersion",
+        maximum_length=32,
+    )
+    if condition_version != "2.0":
+        raise PreflightInputError(f"{field_name} conditionVersion must be exact 2.0")
+    return condition, condition_version
+
+
+def _validate_deny_permissions(value: object) -> None:
+    permissions = _sequence(
+        value,
+        field_name="ARM deny-assignment permissions",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    if not permissions:
+        raise PreflightInputError("ARM deny-assignment permissions must not be empty")
+    has_denied_operation = False
+    for raw_permission in permissions:
+        permission = _mapping(
+            raw_permission,
+            field_name="ARM deny-assignment permission",
+        )
+        _parse_optional_deny_condition(
+            permission,
+            field_name="ARM deny-assignment permission",
+        )
+        permission_values: dict[str, list[object]] = {}
+        for field_name in ("actions", "notActions", "dataActions", "notDataActions"):
+            raw_values = _sequence(
+                _get_case_insensitive(permission, field_name),
+                field_name=f"ARM deny-assignment permission {field_name}",
+                maximum_items=MAX_POLICY_ITEMS,
+            )
+            for raw_value in raw_values:
+                value_text = _require_exact_cli_token(
+                    raw_value,
+                    field_name=f"ARM deny-assignment permission {field_name} value",
+                    maximum_length=512,
+                )
+                if not value_text.isascii():
+                    raise PreflightInputError(
+                        "ARM deny-assignment permission values must use ASCII"
+                    )
+            permission_values[field_name] = raw_values
+        has_denied_operation = has_denied_operation or bool(
+            permission_values["actions"] or permission_values["dataActions"]
+        )
+    if not has_denied_operation:
+        raise PreflightInputError(
+            "ARM deny-assignment permissions must deny at least one action or data action"
+        )
+
+
+def _parse_arm_deny_assignment(
+    value: object,
+    *,
+    collection: RbacCollection,
+) -> DenyAssignment:
+    resource = _mapping(
+        value,
+        field_name="ARM deny-assignment resource",
+    )
+    resource_type = _normalized_ascii_token(
+        _get_case_insensitive(resource, "type"),
+        field_name="ARM deny-assignment type",
+        maximum_length=128,
+    )
+    if resource_type != "microsoft.authorization/denyassignments":
+        raise PreflightInputError("ARM deny-assignment resource has the wrong type")
+    assignment_id = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(resource, "id"),
+            field_name="ARM deny-assignment id",
+        )
+    )
+    marker = "/providers/microsoft.authorization/denyassignments/"
+    marker_index = assignment_id.rfind(marker)
+    if marker_index < 0:
+        raise PreflightInputError("ARM deny-assignment id is malformed")
+    assignment_name = assignment_id[marker_index + len(marker) :]
+    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
+        raise PreflightInputError("ARM deny-assignment id must end in an assignment GUID")
+    id_scope = assignment_id[:marker_index] if marker_index > 0 else "/"
+    id_scope = _canonical_scope(id_scope)
+    properties = _mapping(
+        _get_case_insensitive(resource, "properties"),
+        field_name="ARM deny-assignment properties",
+    )
+    scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(properties, "scope"),
+            field_name="ARM deny-assignment scope",
+        )
+    )
+    if scope != id_scope:
+        raise PreflightInputError("ARM deny-assignment id and properties.scope disagree")
+    if not _scope_is_within_reviewed_boundary(
+        scope,
+        collection=collection,
+    ):
+        raise PreflightInputError("ARM deny-assignment scope is outside the reviewed boundary")
+    do_not_apply = _get_case_insensitive(
+        properties,
+        "doNotApplyToChildScopes",
+    )
+    if type(do_not_apply) is not bool:
+        raise PreflightInputError("ARM deny-assignment doNotApplyToChildScopes must be boolean")
+    is_system_protected = _get_case_insensitive(
+        properties,
+        "isSystemProtected",
+    )
+    if type(is_system_protected) is not bool:
+        raise PreflightInputError("ARM deny-assignment isSystemProtected must be boolean")
+    principal_ids = _parse_deny_principal_ids(
+        _get_case_insensitive(properties, "principals"),
+        field_name="ARM deny-assignment principals",
+    )
+    if not principal_ids:
+        raise PreflightInputError("ARM deny-assignment principals must not be empty")
+    excluded_principal_ids = _parse_deny_principal_ids(
+        _get_case_insensitive(properties, "excludePrincipals"),
+        field_name="ARM deny-assignment excludePrincipals",
+    )
+    if principal_ids & excluded_principal_ids:
+        raise PreflightInputError("ARM deny-assignment principals and exclusions must not overlap")
+    _validate_deny_permissions(
+        _get_case_insensitive(properties, "permissions"),
+    )
+    condition, condition_version = _parse_optional_deny_condition(
+        properties,
+        field_name="ARM deny-assignment",
+    )
+    return DenyAssignment(
+        assignment_id=assignment_id,
+        scope=scope,
+        do_not_apply_to_child_scopes=do_not_apply,
+        principal_ids=principal_ids,
+        excluded_principal_ids=excluded_principal_ids,
+        condition=condition,
+        condition_version=condition_version,
+    )
+
+
+def _deny_scope_might_invalidate_access(
+    deny: DenyAssignment,
+    access_scope: str,
+    *,
+    collection: RbacCollection,
+) -> bool:
+    if deny.scope == access_scope or _scope_contains(access_scope, deny.scope):
+        return True
+    if _scope_contains(deny.scope, access_scope):
+        return not deny.do_not_apply_to_child_scopes
+    deny_management_group_index = (
+        collection.management_group_ancestry.index(deny.scope)
+        if deny.scope in collection.management_group_ancestry
+        else None
+    )
+    access_management_group_index = (
+        collection.management_group_ancestry.index(access_scope)
+        if access_scope in collection.management_group_ancestry
+        else None
+    )
+    if deny_management_group_index is not None:
+        if access_management_group_index is not None:
+            if deny_management_group_index < access_management_group_index:
+                return True
+            return not deny.do_not_apply_to_child_scopes
+        if _scope_contains(collection.subscription_scope, access_scope):
+            return not deny.do_not_apply_to_child_scopes
+    return access_management_group_index is not None and _scope_contains(
+        collection.subscription_scope, deny.scope
+    )
+
+
+def _deny_targets_effective_principal(
+    deny: DenyAssignment,
+    *,
+    relevant_principal_ids: frozenset[str],
+) -> bool:
+    if deny.excluded_principal_ids & relevant_principal_ids:
+        return False
+    return _ALL_PRINCIPALS_ID in deny.principal_ids or bool(
+        deny.principal_ids & relevant_principal_ids
+    )
+
+
+def _parse_deny_assignment_evidence(
+    value: object,
+    *,
+    collection: RbacCollection,
+) -> tuple[DenyAssignment, ...]:
+    evidence = _mapping(
+        value,
+        field_name="principal denyAssignments",
+    )
+    method = _require_exact_ascii_token(
+        _get_case_insensitive(evidence, "method"),
+        field_name="deny-assignment collection method",
+        maximum_length=64,
+    )
+    if method != "arm":
+        raise PreflightInputError("deny-assignment evidence must use exact arm method")
+    collection_types: set[str] = set()
+    assignments_by_id: dict[str, tuple[str, DenyAssignment]] = {}
+    for raw_collection in _sequence(
+        _get_case_insensitive(evidence, "collections"),
+        field_name="ARM deny-assignment collections",
+        maximum_items=2,
+    ):
+        deny_collection = _mapping(
+            raw_collection,
+            field_name="ARM deny-assignment collection",
+        )
+        collection_type = _require_exact_ascii_token(
+            _get_case_insensitive(deny_collection, "collectionType"),
+            field_name="ARM deny-assignment collectionType",
+            maximum_length=64,
+        )
+        if (
+            collection_type not in _DENY_ASSIGNMENT_COLLECTION_TYPES
+            or collection_type in collection_types
+        ):
+            raise PreflightInputError(
+                "ARM deny-assignment collections must exactly cover target and subscription"
+            )
+        collection_types.add(collection_type)
+        api_version = _require_exact_ascii_token(
+            _get_case_insensitive(deny_collection, "apiVersion"),
+            field_name="ARM deny-assignment apiVersion",
+            maximum_length=64,
+        )
+        if api_version != _ARM_DENY_ASSIGNMENTS_API_VERSION:
+            raise PreflightInputError("ARM deny-assignment evidence requires apiVersion 2022-04-01")
+        expected_scope = (
+            collection.resource_group_scope
+            if collection_type == "target-and-ancestors"
+            else collection.subscription_scope
+        )
+        scope = _canonical_scope(
+            _require_string(
+                _get_case_insensitive(deny_collection, "scope"),
+                field_name="ARM deny-assignment collection scope",
+            )
+        )
+        if scope != expected_scope:
+            raise PreflightInputError("ARM deny-assignment evidence uses the wrong scope")
+        if collection_type == "target-and-ancestors":
+            if (
+                _require_exact_cli_token(
+                    _get_case_insensitive(deny_collection, "filter"),
+                    field_name="ARM deny-assignment filter",
+                    maximum_length=64,
+                )
+                != "atScope()"
+            ):
+                raise PreflightInputError(
+                    "ARM target deny-assignment evidence requires exact atScope() filter"
+                )
+        elif _has_case_insensitive(deny_collection, "filter"):
+            raise PreflightInputError(
+                "ARM subscription deny-assignment inventory must be unfiltered"
+            )
+        raw_assignments, request_urls = _paged_values(
+            _get_case_insensitive(deny_collection, "pages"),
+            field_name="ARM deny-assignment evidence",
+            next_link_field="nextLink",
+            maximum_items=MAX_ASSIGNMENTS,
+            allowed_host="management.azure.com",
+        )
+        _validate_arm_deny_assignment_urls(
+            request_urls,
+            target=collection,
+            collection_type=collection_type,
+        )
+        collection_assignment_ids: set[str] = set()
+        for raw_assignment in raw_assignments:
+            assignment = _parse_arm_deny_assignment(
+                raw_assignment,
+                collection=collection,
+            )
+            if assignment.assignment_id in collection_assignment_ids:
+                raise PreflightInputError(
+                    "ARM deny-assignment collection contains a duplicate assignment"
+                )
+            collection_assignment_ids.add(assignment.assignment_id)
+            digest = _canonical_json_digest(raw_assignment)
+            previous = assignments_by_id.get(assignment.assignment_id)
+            if previous is not None and previous[0] != digest:
+                raise PreflightInputError(
+                    "ARM deny-assignment collections disagree on an assignment"
+                )
+            if previous is None and len(assignments_by_id) >= MAX_ASSIGNMENTS:
+                raise PreflightInputError(
+                    f"ARM deny assignments must contain at most {MAX_ASSIGNMENTS} items"
+                )
+            assignments_by_id[assignment.assignment_id] = (digest, assignment)
+    if collection_types != _DENY_ASSIGNMENT_COLLECTION_TYPES:
+        raise PreflightInputError(
+            "ARM deny-assignment collections must exactly cover target and subscription"
+        )
+    return tuple(assignment for _, assignment in assignments_by_id.values())
+
+
+def _validate_deny_assignments_for_principal(
+    assignments: tuple[DenyAssignment, ...],
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    collection: RbacCollection,
+    approved_assignments: frozenset[RbacAssignment],
+) -> None:
+    relevant_principal_ids = frozenset(
+        {
+            effective_principal_id,
+            *security_group_ids,
+        }
+    )
+    access_scopes = {
+        collection.resource_group_scope,
+        *(
+            assignment.scope
+            for assignment in approved_assignments
+            if assignment.effective_principal_id == effective_principal_id
+        ),
+    }
+    for deny in assignments:
+        if not _deny_targets_effective_principal(
+            deny,
+            relevant_principal_ids=relevant_principal_ids,
+        ):
+            continue
+        if any(
+            _deny_scope_might_invalidate_access(
+                deny,
+                access_scope,
+                collection=collection,
+            )
+            for access_scope in access_scopes
+        ):
+            qualifier = " with a condition" if deny.condition is not None else ""
+            raise PreflightInputError(
+                "ARM deny assignment "
+                f"{deny.assignment_id}{qualifier} may invalidate approved access"
+            )
 
 
 def _parse_arm_role_assignment(
@@ -4674,6 +5351,8 @@ def _derive_guarded_role_assignments(
     )
     assignments: list[RbacAssignment] = []
     effective_principal_ids: set[str] = set()
+    deny_assignment_evidence_digest: str | None = None
+    deny_assignments: tuple[DenyAssignment, ...] | None = None
     unique_assignment_keys: set[
         tuple[
             str,
@@ -4710,6 +5389,32 @@ def _derive_guarded_role_assignments(
             _get_case_insensitive(principal, "groupMembership"),
             effective_principal_id=effective_principal_id,
             target=target,
+        )
+        deny_assignment_evidence = _get_case_insensitive(
+            principal,
+            "denyAssignments",
+        )
+        current_deny_assignment_digest = _canonical_json_digest(
+            deny_assignment_evidence,
+        )
+        if deny_assignment_evidence_digest is None:
+            deny_assignment_evidence_digest = current_deny_assignment_digest
+            deny_assignments = _parse_deny_assignment_evidence(
+                deny_assignment_evidence,
+                collection=target,
+            )
+        elif deny_assignment_evidence_digest != current_deny_assignment_digest:
+            raise PreflightInputError(
+                "RBAC principals disagree on complete deny-assignment evidence"
+            )
+        if deny_assignments is None:
+            raise PreflightInputError("complete deny-assignment evidence is missing")
+        _validate_deny_assignments_for_principal(
+            deny_assignments,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+            collection=target,
+            approved_assignments=policy.approved_assignments,
         )
         role_assignment_evidence = _mapping(
             _get_case_insensitive(principal, "roleAssignments"),

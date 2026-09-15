@@ -212,6 +212,11 @@ The command reads only the saved JSON file. It does not authenticate to Azure, s
 deployment, or modify resources. Exit `2` means the policy blocked the saved plan; exit `3` means
 the evidence could not be safely evaluated. Either result stops the runbook. Use the default text
 format for an operator-readable summary and retain `--format json` output as release evidence.
+Each input path is opened once as a bounded binary descriptor; POSIX uses no-follow and nonblocking
+flags. The verifier reads at most the configured limit plus one from that descriptor, rejects
+non-regular files, overflow, and concurrent metadata changes, and only then performs strict UTF-8
+decoding. Do not replace, grow, truncate, symlink, or redirect an evidence path while it is being
+consumed.
 Every `NoChange` row must retain complete identical `before` and `after` resource objects and no
 effective delta. Preserve matching `id`, `name`, `type`, and object-valued `properties`, and retain
 only `NoEffect` entries that exactly reconcile with both snapshots; do not reduce unchanged rows to
@@ -236,7 +241,10 @@ The gate fails on:
 - any `<resource>`, `<resource>.`, or `.` root `Delete`/`Remove` hidden under a non-delete change;
 - any planned `Microsoft.Authorization/roleAssignments` or `roleDefinitions` create or modify,
   any PIM assignment/eligibility schedule request, any `Microsoft.ManagedServices` registration
-  assignment/definition, or any `Microsoft.Resources/deploymentScripts` mutation, even if its
+  assignment/definition, any Key Vault `vaults/accessPolicies` resource or
+  `properties.accessPolicies`/`properties.enableRbacAuthorization` mutation, any managed-identity
+  federated credential, Microsoft Graph app-role/delegated-permission/credential grant, equivalent
+  identity-granting resource, or any `Microsoft.Resources/deploymentScripts` mutation, even if its
   resource ID is allowlisted, until post-deployment effects are fully evaluated;
 - an unapproved `Create` or `Modify`;
 - changes to VNet, subnet, NSG, load balancer, Key Vault, Storage network rules, AMPLS, private DNS,
@@ -280,10 +288,11 @@ First save the target subscription's Resource Graph `managementGroupAncestorsCha
 with successful ARM reads for the target subscription, target resource group, and every management
 group in the chain, retaining each management group's ARM parent ID. Retain the raw responses
 unchanged. In particular, Management Groups Get Subscription API `2020-05-01` reports the tenant in
-`properties.tenant`; do not rename it to `tenantId` inside the retained response. The verifier
-validates that raw field and derives the leaf-to-root chain in memory, so no normalized duplicate is
-needed. Missing nodes, `403`/`404`, a tenant or subscription mismatch, cycles, disconnected nodes,
-or Resource Graph/ARM disagreement block the gate. The policy's
+one literal, case-sensitive `properties.tenant` key. Do not rename it to `Tenant` or `tenantId`, add
+an alias, or retain conflicting tenant fields inside the raw response. The verifier derives the
+leaf-to-root chain in memory, so no normalized duplicate is needed. Missing nodes, `403`/`404`, a
+tenant or subscription mismatch, cycles, disconnected nodes, or Resource Graph/ARM disagreement
+block the gate. The policy's
 `approvedManagementGroupAncestry` is a separately reviewed copy of the expected path; a changed path
 requires new review.
 
@@ -350,8 +359,10 @@ while ($null -ne $NextUrl) {
 ```
 
 Do not drop, reorder, or manually splice pages. Each returned `nextLink` must be the following page's
-request URL, and the last response must not contain a next link. Preserve the service-issued query
-key spelling: Role Assignments API `2022-04-01` continuation URLs use exact `$skipToken`.
+request URL, and the last page wrapper must contain literal `nextLink` set to null. Preserve the
+service-issued query key spelling: ARM authorization continuation URLs use exactly one non-empty
+`$skipToken`. ARM page wrappers reject `@odata.nextLink`, case aliases, duplicate fields,
+whitespace, and empty cursors.
 
 The target-scope query does not cover role assignments on individual workload resources or sibling
 resource groups. Collect a second, complete subscription-descendant inventory for the effective
@@ -400,6 +411,82 @@ complete transitive security-group ID, including empty result sets. If the API r
 management-group, subscription, or target assignments, retain them; the verifier accepts only
 corroborated ancestors or subscription descendants and deduplicates the final union.
 
+Also collect complete, unfiltered deny-assignment evidence. One collection uses exact
+`$filter=atScope()` at the target resource group to capture every deny effective at the target or an
+ancestor. A second collection lists the complete subscription inventory without a principal or
+scope filter so All Principals, exclusions, and descendant-scope denies cannot be omitted.
+
+```powershell
+$DenyFilter = [uri]::EscapeDataString('atScope()')
+$DenyCollectionSpecifications = @(
+  [ordered]@{
+    collectionType = 'target-and-ancestors'
+    apiVersion = '2022-04-01'
+    scope = $TargetResourceGroupId
+    filter = 'atScope()'
+    initialUrl = (
+      "https://management.azure.com$TargetResourceGroupId/" +
+      "providers/Microsoft.Authorization/denyAssignments" +
+      "?api-version=2022-04-01&`$filter=$DenyFilter"
+    )
+  },
+  [ordered]@{
+    collectionType = 'subscription-inventory'
+    apiVersion = '2022-04-01'
+    scope = "/subscriptions/$SubscriptionId"
+    filter = $null
+    initialUrl = (
+      "https://management.azure.com/subscriptions/$SubscriptionId/" +
+      "providers/Microsoft.Authorization/denyAssignments" +
+      '?api-version=2022-04-01'
+    )
+  }
+)
+
+$DenyCollections = @()
+foreach ($Specification in $DenyCollectionSpecifications) {
+  $NextUrl = $Specification.initialUrl
+  $Pages = @()
+  while ($null -ne $NextUrl) {
+    $RequestUrl = $NextUrl
+    $ResponseJson = az rest --method get --url $RequestUrl --output json
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed deny-assignment collection $($Specification.collectionType)"
+    }
+    $Response = $ResponseJson | ConvertFrom-Json
+    $Pages += [ordered]@{
+      requestUrl = $RequestUrl
+      statusCode = 200
+      value = @($Response.value)
+      nextLink = $Response.nextLink
+    }
+    $NextUrl = $Response.nextLink
+  }
+  $Collection = [ordered]@{
+    collectionType = $Specification.collectionType
+    apiVersion = $Specification.apiVersion
+    scope = $Specification.scope
+    pages = @($Pages)
+  }
+  if ($null -ne $Specification.filter) {
+    $Collection['filter'] = $Specification.filter
+  }
+  $DenyCollections += $Collection
+}
+
+$DenyAssignments = [ordered]@{
+  method = 'arm'
+  collections = @($DenyCollections)
+}
+```
+
+Retain the same byte-equivalent `$DenyAssignments` object under every principal artifact. The
+verifier evaluates the service-principal object ID, every transitive security group, All Principals,
+`excludePrincipals`, scope inheritance, and `doNotApplyToChildScopes`. Any applicable deny with a
+condition blocks conservatively because the offline gate does not execute Azure ABAC expressions.
+Missing collections, incomplete pagination, collection disagreement, or a deny that might invalidate
+approved access stops release.
+
 When the Azure CLI is used instead, retain the exact successful argument list and raw output. The
 equivalent scoped command is:
 
@@ -419,8 +506,10 @@ Do not use `--assignee`, omit either include flag, combine `--all` with `--scope
 `--resource-group`, or `--query`, use equals-form duplicate options, or transform the JSON output.
 Option names must be exact lowercase ASCII and fixed values such as `--output json` are
 case-sensitive. Decoded request-URL query keys must use the exact spelling defined by their
-endpoint and remain unique after percent decoding. ARM Role Assignments continuations use
-`$skipToken`; Graph continuations use `$skiptoken` where documented. Aliases, duplicates, and case
+endpoint and remain unique after percent decoding. ARM authorization continuations require exactly
+one non-empty `$skipToken`; Graph continuations require exactly one non-empty `$skiptoken` and
+reject `$skip`. ARM page wrappers use literal `nextLink`; Graph page wrappers use literal
+`@odata.nextLink`. Cross-endpoint aliases, duplicates, whitespace, ambiguous cursor fields, and case
 variants fail closed. Single-dash-prefixed values are rejected rather than treated as positional
 data.
 
@@ -446,11 +535,11 @@ policy uses `approvedAssignments`; never populate it by copying the observed out
 `assignedPrincipalType`, and `effectivePrincipalId`.
 
 The RBAC envelope uses the same `$CollectionRunId`, bounded timestamps, and SHA-256 bindings for the
-reviewed policy, target, hierarchy, membership, and both role-assignment collections. Its embedded
-manifest must be byte-equivalent to the what-if manifest and use the same
-`$DeploymentExecutionId`, reviewed `deploymentTarget`, and release ledger. The independently
-reviewed manifest digest must not be regenerated after evidence changes. Each separation rule must
-include the reviewed IDs in
+reviewed policy, target, hierarchy, membership, both role-assignment collections, and both complete
+deny-assignment collections. Its embedded manifest must be byte-equivalent to the what-if manifest
+and use the same `$DeploymentExecutionId`, reviewed `deploymentTarget`, and release ledger. The
+independently reviewed manifest digest must not be regenerated after evidence changes. Each
+separation rule must include the reviewed IDs in
 `forbiddenRoleDefinitionIds` as well as their display names:
 
 ```powershell

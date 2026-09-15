@@ -32,6 +32,16 @@ The latest exact-SHA review found three remaining provenance and compatibility g
 - one global lowercase query-key rule rejected the documented ARM `$skipToken` continuation while
   Graph requires the distinct `$skiptoken` spelling.
 
+The next exact-SHA review reproduced five additional fail-open paths:
+
+- authorization-affecting Key Vault, federated identity, Microsoft Graph, and equivalent credential
+  grant mutations were not classified with the already blocked authorization families;
+- generic page parsing accepted cross-endpoint next-link aliases and empty or inappropriate cursor
+  forms;
+- approved role grants were evaluated without complete deny-assignment evidence;
+- the Management Groups subscription tenant field was still retrieved case-insensitively; and
+- input size validation performed a pathname `stat` followed by a separate pathname read.
+
 Freshness does not prove single use, and the pure what-if evaluator does not yet derive the
 post-deployment principal, role, condition, and inherited scope needed to apply the reviewed
 separation policy to an authorization mutation.
@@ -74,13 +84,16 @@ Use the following guarded preflight contract:
    JSON output, and no exclusions, transforms, or unknown options are valid. JSON mode requires one
    template file and one `@file.json`; `.bicepparam` mode passes one direct `.bicepparam` path and
    forbids `--template-file`. Any non-empty diagnostic blocks release.
-8. Creates or modifies under any `Microsoft.Authorization` or `Microsoft.ManagedServices` family,
-   plus `Microsoft.Resources/deploymentScripts`, remain blocked until their post-deployment effects
-   are fully evaluated.
-9. RBAC provenance URL query keys are unique after decoding and use exact endpoint-specific ASCII
-   spelling. ARM Role Assignments API `2022-04-01` continuations use `$skipToken`; Graph
-   continuations retain exact `$skiptoken` where documented. CLI evidence uses exact ASCII option
-   names and case-sensitive fixed values.
+8. Creates or modifies under any `Microsoft.Authorization`, `Microsoft.ManagedServices`, or
+   Microsoft Graph family; Key Vault access-policy resources or
+   `accessPolicies`/`enableRbacAuthorization` property mutations; managed-identity federated
+   credentials; equivalent app-role, delegated-permission, or identity-credential grants; and
+   `Microsoft.Resources/deploymentScripts` remain blocked until their post-deployment effects are
+   fully evaluated.
+9. Paged evidence uses endpoint-exact fields and cursors. ARM pages require literal `nextLink` and
+   exactly one non-empty `$skipToken` on continuation URLs. Graph pages require literal
+   `@odata.nextLink` and exactly one non-empty `$skiptoken`; `$skip` is not accepted. Cross-endpoint
+   aliases, whitespace, duplicates, case variants, and ambiguous cursor fields fail.
 10. Canonical paths have a 4096-character limit and one evaluation-wide generated-path item and
     character budget, checked before concatenation or candidate materialization.
 11. The release ledger must be beneath a separately supplied fixed trusted root. Every existing path
@@ -106,9 +119,19 @@ Use the following guarded preflight contract:
 16. POSIX ledger reads add nonblocking/no-follow flags and require a regular file from `fstat`.
     Writer and reader share one 64-KiB record bound checked before file creation.
 17. Management Groups Get Subscription API `2020-05-01` evidence is retained in its documented raw
-    shape and validated from `properties.tenant`. The manifest binds the complete raw RBAC payload;
-    the verifier derives hierarchy metadata in memory rather than inserting an unbound normalized
-    tenant alias into the response.
+    shape and requires one literal, case-sensitive `properties.tenant` key. `Tenant`, `tenantId`,
+    duplicate/case aliases, and conflicts are invalid. The manifest binds the complete raw RBAC
+    payload; the verifier derives hierarchy metadata in memory rather than inserting an unbound
+    normalized tenant alias into the response.
+18. Every effective principal carries the same complete ARM deny-assignment evidence: an exact
+    target-resource-group `atScope()` collection and an unfiltered subscription inventory, both
+    fully paged. The verifier checks the effective principal, transitive groups, All Principals,
+    exclusions, scope inheritance, `doNotApplyToChildScopes`, and conditions. Any conditional or
+    otherwise applicable deny that might invalidate approved access fails conservatively.
+19. Every JSON input is opened once as a binary descriptor, using no-follow/nonblocking flags where
+    available. The verifier requires a regular file by `fstat`, reads no more than the configured
+    bound plus one byte from that descriptor, rejects overflow or concurrent descriptor metadata
+    change, and performs strict UTF-8 decoding only after the bounded read.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -139,8 +162,12 @@ blocked output is returned.
   `--no-prompt true` for both subscription and resource-group what-if commands.
 - Guarded RBAC artifacts must retain Management Groups Get Subscription `properties.tenant`
   unchanged and regenerate the raw-evidence binding when that response changes.
-- ARM and Graph continuation query keys are validated against their own endpoint contracts rather
-  than one global lowercase rule.
+- Guarded principal artifacts must add byte-equivalent, complete deny-assignment evidence and
+  regenerate the raw-evidence binding.
+- ARM and Graph page fields and continuation query keys are validated against their own endpoint
+  contracts rather than generic aliases.
+- Evidence path replacement cannot redirect an already opened descriptor, while growth beyond the
+  bound and POSIX symlink or special-file inputs fail deterministically.
 - The legacy module entry point remains available for compatibility but is not the guarded
   deployment gate.
 - Authorization mutations remain deliberately unavailable rather than being accepted without
@@ -175,11 +202,17 @@ surrounding-whitespace aliases, JSON and `.bicepparam` request modes, required
 `--no-pretty-print`, exact `--no-prompt true` for both deployment scopes, Windows junction/reparse
 paths, POSIX symlink/no-follow behavior, and a 14,000-leaf deterministic linear-work snapshot
 regression. RBAC compatibility tests use the official Management Groups subscription
-`properties.tenant` shape and exact two-page ARM `$skipToken` continuations, while rejecting the
-legacy tenant alias, tenant mismatches, Graph/ARM cursor spelling swaps, duplicates, and casefold
-collisions. Windows tests include a synchronized junction swap between validation and file open;
-ledger tests also cover outside nonexistent paths, invalid UTF-8 collection/binding records, POSIX
-FIFO/socket rejection, and symmetric record-size bounds. Scope regressions cover parent/child
-management groups and management-group-to-resource matching in both directions. Token tests cover
-whitespace and Unicode aliases, lone surrogates, single-dash values, and exact deployment/file
-grammars.
+`properties.tenant` shape and exact two-page ARM `$skipToken` continuations, while rejecting tenant
+case/legacy aliases and conflicts, Graph/ARM cursor spelling swaps, wrong next-link fields, empty or
+whitespace cursors, duplicates, and casefold collisions. Deny-assignment regressions cover missing
+collections, pagination, direct and group principals, All Principals, exclusions, inheritance,
+conditions, unrelated scopes, and cross-principal collection disagreement. Provider-family tests
+cover Key Vault access policies/RBAC mode, managed-identity federated credentials, Microsoft Graph
+permission grants, and existing authorization/imperative families. Input tests prove single binary
+open, maximum-plus-one reads, deterministic growth rejection, POSIX replacement stability,
+no-follow symlink rejection, and nonblocking FIFO rejection. Windows tests include a synchronized
+junction swap between validation and file open; ledger tests also cover outside nonexistent paths,
+invalid UTF-8 collection/binding records, POSIX FIFO/socket rejection, and symmetric record-size
+bounds. Scope regressions cover parent/child management groups and management-group-to-resource
+matching in both directions. Token tests cover whitespace and Unicode aliases, lone surrogates,
+single-dash values, and exact deployment/file grammars.
