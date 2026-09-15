@@ -1538,10 +1538,16 @@ output wc016ApprovedConfiguration object = {
       ? wc016Runtime!.outputs.notificationQueueName
       : ''
     feedSigningKeyUriWithVersion: acceptanceResources.outputs.incidentFeedV2SigningKeyUriWithVersion
+    feedSigningKeyFingerprint: incidentFeedV2SigningKeyFingerprint
     reportSigningKeyUriWithVersion: acceptanceResources.outputs.incidentReportSigningKeyUriWithVersion
+    reportSigningKeyFingerprint: incidentReportSigningKeyFingerprint
     guidanceSigningKeyUriWithVersion: acceptanceResources.outputs.incidentGuidanceSigningKeyUriWithVersion
+    guidanceSigningKeyFingerprint: incidentGuidanceSigningKeyFingerprint
     enrichmentSigningKeyUriWithVersion: acceptanceResources.outputs.incidentEnrichmentSigningKeyUriWithVersion
+    enrichmentSigningKeyFingerprint: incidentEnrichmentSigningKeyFingerprint
     notificationSigningKeyUriWithVersion: acceptanceResources.outputs.incidentNotificationSigningKeyUriWithVersion
+    notificationSigningKeyFingerprint: incidentNotificationSigningKeyFingerprint
+    incidentSigningKeyFingerprint: signingKeyFingerprint
   }
   wc027DeploymentReadiness: {
     producer: {

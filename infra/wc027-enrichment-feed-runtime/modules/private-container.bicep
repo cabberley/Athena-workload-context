@@ -25,3 +25,6 @@ resource container 'Microsoft.Storage/storageAccounts/blobServices/containers@20
 
 output name string = container.name
 output resourceId string = container.id
+output versioningEnabled bool = blobService.properties.isVersioningEnabled == true
+  ? true
+  : fail('WC-027 guidance-authority storage Blob versioning must be enabled')

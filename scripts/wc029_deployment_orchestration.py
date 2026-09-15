@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -13,6 +17,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID, uuid5
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -58,10 +65,14 @@ MAX_GRAPH_MEMBERSHIP_PAGES = 128
 MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
 MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS = 32
 MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS = 5
+MINIMUM_RSA_KEY_SIZE_BITS = 2048
+REVIEWED_RSA_KEY_SIZE_BITS = 3072
+REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
-PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v3"
+PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v5"
 HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v2"
 RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v1"
+AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v1"
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -100,6 +111,10 @@ PLAN_FIELDS = frozenset(
         "allowedChangeResourceIds",
         "rotationTransitionAssignmentIds",
         "legacyCryptoUserMigrationAssignmentIds",
+        "authorityBlobInventory",
+        "priorStageHandoffPath",
+        "priorStageHandoffSha256",
+        "priorStageReceipt",
         "foundationHandoffPath",
         "foundationHandoffSha256",
         "producerHandoffPath",
@@ -148,11 +163,17 @@ FOUNDATION_OUTPUT_FIELDS = frozenset(
 FOUNDATION_ORCHESTRATION_FIELDS = frozenset(
     {
         "notificationQueueName",
+        "incidentSigningKeyFingerprint",
         "feedSigningKeyUriWithVersion",
+        "feedSigningKeyFingerprint",
         "reportSigningKeyUriWithVersion",
+        "reportSigningKeyFingerprint",
         "guidanceSigningKeyUriWithVersion",
+        "guidanceSigningKeyFingerprint",
         "enrichmentSigningKeyUriWithVersion",
+        "enrichmentSigningKeyFingerprint",
         "notificationSigningKeyUriWithVersion",
+        "notificationSigningKeyFingerprint",
     }
 )
 FOUNDATION_BINDING_FIELDS = frozenset({"foundationParametersSha256"})
@@ -357,6 +378,39 @@ def _read_json(path: Path) -> object:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise OrchestrationError(f"cannot read valid JSON from {path}: {exc}") from exc
+
+
+def _read_json_artifact(
+    path: Path,
+    *,
+    field: str,
+) -> tuple[object, str]:
+    try:
+        path_stat = path.lstat()
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or bool(getattr(path_stat, "st_file_attributes", 0) & reparse_attribute)
+        ):
+            raise OrchestrationError(f"{field} must be one non-reparse regular file")
+        with path.open("rb") as handle:
+            opened_stat = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (opened_stat.st_dev, opened_stat.st_ino)
+            ):
+                raise OrchestrationError(f"{field} changed before it could be read")
+            raw = handle.read()
+    except OrchestrationError:
+        raise
+    except OSError as exc:
+        raise OrchestrationError(f"cannot read {field} from {path}: {exc}") from exc
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise OrchestrationError(f"{field} is not valid UTF-8 JSON: {exc}") from exc
+    return document, _sha256_bytes(raw)
 
 
 def _ensure_clean_worktree() -> None:
@@ -621,6 +675,17 @@ def _sha256_digest(value: object, *, field: str) -> str:
     return digest
 
 
+def _git_commit_sha(value: object, *, field: str) -> str:
+    commit_sha = _string(value, field=field)
+    if (
+        len(commit_sha) != 40
+        or commit_sha != commit_sha.lower()
+        or any(character not in "0123456789abcdef" for character in commit_sha)
+    ):
+        raise OrchestrationError(f"{field} must be one lowercase full Git commit SHA")
+    return commit_sha
+
+
 def _digest_pinned_image(value: object, *, field: str) -> str:
     image = _string(value, field=field)
     if image != image.lower() or image.count("@sha256:") != 1:
@@ -822,8 +887,17 @@ def _digest_json_string(value: str) -> str:
     return _sha256_bytes(value.encode("utf-8"))
 
 
-def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
-    handoff = _mapping(_read_json(path), field="handoff")
+def _load_handoff(
+    path: Path,
+    *,
+    expected_stage: str,
+    expected_source_commit: str = SOURCE_COMMIT,
+    document: object | None = None,
+) -> dict[str, Any]:
+    handoff = _mapping(
+        _read_json(path) if document is None else document,
+        field="handoff",
+    )
     _require_exact_fields(handoff, HANDOFF_FIELDS, field="deployment handoff")
     if handoff.get("schemaVersion") != HANDOFF_SCHEMA_VERSION:
         raise OrchestrationError("unsupported WC-029 deployment handoff schema")
@@ -831,9 +905,9 @@ def _load_handoff(path: Path, *, expected_stage: str) -> dict[str, Any]:
         raise OrchestrationError(
             f"expected {expected_stage} handoff, found {handoff.get('stage')!r}"
         )
-    if handoff.get("sourceCommit") != SOURCE_COMMIT:
+    if handoff.get("sourceCommit") != expected_source_commit:
         raise OrchestrationError(
-            "deployment handoffs must be produced from the current exact source commit"
+            "deployment handoff source commit does not match its trusted receipt"
         )
     handoff_subscription = _canonical_subscription_id(
         handoff.get("subscriptionId"),
@@ -1020,9 +1094,13 @@ def _load_plan_manifest(
     path: Path,
     *,
     expected_stage: str | None = None,
+    document: object | None = None,
 ) -> dict[str, Any]:
     _ensure_evidence_directory_outside_repository(path.parent)
-    manifest = _mapping(_read_json(path), field="plan manifest")
+    manifest = _mapping(
+        _read_json(path) if document is None else document,
+        field="plan manifest",
+    )
     _require_exact_fields(manifest, PLAN_FIELDS, field="plan manifest")
     if manifest.get("schemaVersion") != PLAN_SCHEMA_VERSION:
         raise OrchestrationError("unsupported WC-029 deployment plan schema")
@@ -1154,6 +1232,59 @@ def _load_plan_manifest(
         legacy_crypto_user_migration_assignments
     ):
         raise OrchestrationError("plan legacy Crypto User migration assignment IDs must be sorted")
+    authority_blob_inventory = _validated_authority_blob_inventory(
+        manifest.get("authorityBlobInventory"),
+        subscription_id=subscription_id,
+    )
+    if stage == "foundation" and authority_blob_inventory is not None:
+        raise OrchestrationError("foundation plan cannot contain authority Blob inventory")
+    if stage != "foundation" and authority_blob_inventory is None:
+        raise OrchestrationError("WC-027 plan is missing authority Blob inventory")
+    prior_handoff_path = manifest.get("priorStageHandoffPath")
+    prior_handoff_sha256 = manifest.get("priorStageHandoffSha256")
+    prior_receipt_value = manifest.get("priorStageReceipt")
+    prior_values = (
+        prior_handoff_path,
+        prior_handoff_sha256,
+        prior_receipt_value,
+    )
+    if any(value is not None for value in prior_values) and not all(
+        value is not None for value in prior_values
+    ):
+        raise OrchestrationError("plan prior same-stage evidence is incomplete")
+    if any(value is not None for value in prior_values):
+        if stage not in {"producer", "publisher"}:
+            raise OrchestrationError("plan prior same-stage evidence is invalid for this stage")
+        _string(prior_handoff_path, field="plan prior stage handoff path")
+        _sha256_digest(
+            prior_handoff_sha256,
+            field="plan prior stage handoff SHA-256",
+        )
+        prior_receipt = _mapping(
+            prior_receipt_value,
+            field="plan prior stage receipt",
+        )
+        _require_exact_fields(
+            prior_receipt,
+            PREDECESSOR_RECEIPT_REFERENCE_FIELDS,
+            field="plan prior stage receipt",
+        )
+        _string(
+            prior_receipt.get("path"),
+            field="plan prior stage receipt path",
+        )
+        receipt_digest = _sha256_digest(
+            prior_receipt.get("sha256"),
+            field="plan prior stage receipt SHA-256",
+        )
+        if (
+            _sha256_digest(
+                prior_receipt.get("reviewedSha256"),
+                field="plan prior reviewed receipt SHA-256",
+            )
+            != receipt_digest
+        ):
+            raise OrchestrationError("plan prior stage receipt was not independently reviewed")
     violations = evaluate_what_if(
         what_if,
         allowed_change_ids=frozenset(allowed_changes),
@@ -1222,12 +1353,15 @@ def _load_verified_predecessor(
         reviewed_receipt_sha256,
         field=f"{expected_stage} reviewed receipt SHA-256",
     )
-    actual_receipt_digest = _sha256_file(receipt_path)
+    receipt_document, actual_receipt_digest = _read_json_artifact(
+        receipt_path,
+        field=f"{expected_stage} receipt",
+    )
     if actual_receipt_digest != reviewed_digest:
         raise OrchestrationError(
             f"{expected_stage} receipt does not match its trusted approval digest"
         )
-    receipt = _mapping(_read_json(receipt_path), field=f"{expected_stage} receipt")
+    receipt = _mapping(receipt_document, field=f"{expected_stage} receipt")
     _require_exact_fields(receipt, RECEIPT_FIELDS, field=f"{expected_stage} receipt")
     if receipt.get("schemaVersion") != RECEIPT_SCHEMA_VERSION:
         raise OrchestrationError("unsupported WC-029 deployment receipt schema")
@@ -1266,7 +1400,11 @@ def _load_verified_predecessor(
         receipt.get("reviewedPlanSha256"),
         field=f"{expected_stage} reviewed plan SHA-256",
     )
-    if plan_digest != reviewed_plan_digest or _sha256_file(plan_path) != plan_digest:
+    plan_document, actual_plan_digest = _read_json_artifact(
+        plan_path,
+        field=f"{expected_stage} plan",
+    )
+    if plan_digest != reviewed_plan_digest or actual_plan_digest != plan_digest:
         raise OrchestrationError(
             f"{expected_stage} receipt does not prove an independently reviewed plan"
         )
@@ -1274,10 +1412,22 @@ def _load_verified_predecessor(
         receipt.get("handoffSha256"),
         field=f"{expected_stage} receipt handoff SHA-256",
     )
-    if _sha256_file(handoff_path) != handoff_digest:
+    handoff_document, actual_handoff_digest = _read_json_artifact(
+        handoff_path,
+        field=f"{expected_stage} handoff",
+    )
+    if actual_handoff_digest != handoff_digest:
         raise OrchestrationError(f"{expected_stage} handoff does not match its deployment receipt")
-    plan = _load_plan_manifest(plan_path, expected_stage=expected_stage)
-    handoff = _load_handoff(handoff_path, expected_stage=expected_stage)
+    plan = _load_plan_manifest(
+        plan_path,
+        expected_stage=expected_stage,
+        document=plan_document,
+    )
+    handoff = _load_handoff(
+        handoff_path,
+        expected_stage=expected_stage,
+        document=handoff_document,
+    )
     receipt_subscription = _canonical_subscription_id(
         receipt.get("subscriptionId"),
         field=f"{expected_stage} receipt subscription",
@@ -1337,6 +1487,385 @@ def _load_verified_predecessor(
         "receiptPath": receipt_path.resolve(),
         "receiptSha256": actual_receipt_digest,
         "reviewedReceiptSha256": reviewed_digest,
+    }
+
+
+def _load_verified_prior_stage_inventory(
+    *,
+    expected_stage: str,
+    handoff_path: Path,
+    receipt_path: Path,
+    reviewed_receipt_sha256: str,
+    subscription_id: str,
+    resource_group: str,
+) -> dict[str, object]:
+    if expected_stage not in {"producer", "publisher"}:
+        raise OrchestrationError("prior same-stage inventory is supported only for WC-027 stages")
+    for artifact in (handoff_path, receipt_path):
+        _ensure_evidence_directory_outside_repository(artifact.parent)
+    reviewed_digest = _sha256_digest(
+        reviewed_receipt_sha256,
+        field="prior stage reviewed receipt SHA-256",
+    )
+    receipt_document, actual_receipt_digest = _read_json_artifact(
+        receipt_path,
+        field="prior stage receipt",
+    )
+    if actual_receipt_digest != reviewed_digest:
+        raise OrchestrationError("prior stage receipt does not match its reviewed SHA-256")
+    receipt = _mapping(receipt_document, field="prior stage receipt")
+    _require_exact_fields(
+        receipt,
+        RECEIPT_FIELDS,
+        field="prior stage receipt",
+    )
+    source_commit = _git_commit_sha(
+        receipt.get("sourceCommit"),
+        field="prior stage source commit",
+    )
+    receipt_subscription = _canonical_subscription_id(
+        receipt.get("subscriptionId"),
+        field="prior stage receipt subscription",
+    )
+    receipt_resource_group = _string(
+        receipt.get("resourceGroup"),
+        field="prior stage receipt resource group",
+    )
+    deployment_name = _string(
+        receipt.get("deploymentName"),
+        field="prior stage receipt deployment name",
+    )
+    if (
+        receipt.get("schemaVersion") != RECEIPT_SCHEMA_VERSION
+        or receipt.get("stage") != expected_stage
+        or receipt_subscription != subscription_id
+        or receipt_resource_group != resource_group
+    ):
+        raise OrchestrationError("prior stage receipt does not match the requested stage scope")
+    receipt_predecessors = _mapping(
+        receipt.get("predecessorReceiptSha256s"),
+        field="prior stage receipt predecessor hashes",
+    )
+    expected_predecessors = frozenset(EXPECTED_PREDECESSOR_STAGES[expected_stage])
+    _require_exact_fields(
+        receipt_predecessors,
+        expected_predecessors,
+        field="prior stage receipt predecessor hashes",
+    )
+    for predecessor, digest in receipt_predecessors.items():
+        _sha256_digest(
+            digest,
+            field=f"prior stage receipt predecessor {predecessor}",
+        )
+    plan_path = Path(
+        _string(
+            receipt.get("planManifestPath"),
+            field="prior stage plan path",
+        )
+    )
+    _ensure_evidence_directory_outside_repository(plan_path.parent)
+    if plan_path.resolve() == receipt_path.resolve():
+        raise OrchestrationError("prior stage receipt cannot be its own plan artifact")
+    receipt_handoff_path = Path(
+        _string(
+            receipt.get("handoffPath"),
+            field="prior stage receipt handoff path",
+        )
+    )
+    if receipt_handoff_path.resolve() != handoff_path.resolve():
+        raise OrchestrationError("prior stage handoff path does not match its receipt")
+    plan_digest = _sha256_digest(
+        receipt.get("planManifestSha256"),
+        field="prior stage plan SHA-256",
+    )
+    plan_document, actual_plan_digest = _read_json_artifact(
+        plan_path,
+        field="prior stage plan",
+    )
+    if (
+        plan_digest
+        != _sha256_digest(
+            receipt.get("reviewedPlanSha256"),
+            field="prior stage reviewed plan SHA-256",
+        )
+        or actual_plan_digest != plan_digest
+    ):
+        raise OrchestrationError(
+            "prior stage receipt does not prove an independently reviewed plan"
+        )
+    handoff_digest = _sha256_digest(
+        receipt.get("handoffSha256"),
+        field="prior stage handoff SHA-256",
+    )
+    handoff_document, actual_handoff_digest = _read_json_artifact(
+        handoff_path,
+        field="prior stage handoff",
+    )
+    if actual_handoff_digest != handoff_digest:
+        raise OrchestrationError("prior stage handoff does not match its receipt")
+    plan = _mapping(plan_document, field="prior stage plan")
+    _require_exact_fields(
+        plan,
+        PLAN_FIELDS,
+        field="prior stage plan",
+    )
+    if plan.get("schemaVersion") != PLAN_SCHEMA_VERSION:
+        raise OrchestrationError("prior stage plan predates authority Blob inventory evidence")
+    plan_subscription = _canonical_subscription_id(
+        plan.get("subscriptionId"),
+        field="prior stage plan subscription",
+    )
+    plan_resource_group = _string(
+        plan.get("resourceGroup"),
+        field="prior stage plan resource group",
+    )
+    if (
+        plan.get("stage") != expected_stage
+        or plan.get("sourceCommit") != source_commit
+        or plan_subscription != receipt_subscription
+        or plan_resource_group != receipt_resource_group
+        or plan.get("deploymentName") != deployment_name
+    ):
+        raise OrchestrationError("prior stage plan does not match its receipt scope")
+    expected_template_path = str(TEMPLATES[expected_stage].relative_to(ROOT)).replace(
+        "\\",
+        "/",
+    )
+    if plan.get("templatePath") != expected_template_path:
+        raise OrchestrationError("prior stage plan template does not match its exact stage")
+    _string(plan.get("location"), field="prior stage plan location")
+    for digest_name in (
+        "templateSha256",
+        "orchestratorSha256",
+        "preflightSha256",
+        "baseParameterSha256",
+        "effectiveParameterSha256",
+        "whatIfSha256",
+    ):
+        _sha256_digest(
+            plan.get(digest_name),
+            field=f"prior stage plan {digest_name}",
+        )
+    for path_name in (
+        "baseParameterPath",
+        "effectiveParameterPath",
+        "whatIfPath",
+    ):
+        _string(
+            plan.get(path_name),
+            field=f"prior stage plan {path_name}",
+        )
+    raw_allowed_changes = plan.get("allowedChangeResourceIds")
+    if not isinstance(raw_allowed_changes, list) or any(
+        not isinstance(item, str) for item in raw_allowed_changes
+    ):
+        raise OrchestrationError("prior stage plan allowed changes must be a string array")
+    allowed_changes = [
+        _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field=f"prior stage plan allowed changes[{index}]",
+        )
+        for index, resource_id in enumerate(raw_allowed_changes)
+    ]
+    if allowed_changes != sorted(allowed_changes) or len(
+        {item.casefold() for item in allowed_changes}
+    ) != len(allowed_changes):
+        raise OrchestrationError(
+            "prior stage plan allowed change resource IDs must be sorted and distinct"
+        )
+    rotation_transition_assignments = _canonical_rotation_transition_assignments(
+        plan.get("rotationTransitionAssignmentIds"),
+        subscription_id=subscription_id,
+        field="prior stage plan rotation transition assignments",
+    )
+    if plan.get("rotationTransitionAssignmentIds") != rotation_transition_assignments:
+        raise OrchestrationError(
+            "prior stage plan rotation transition assignment IDs must be sorted"
+        )
+    legacy_crypto_user_migration_assignments = (
+        _canonical_legacy_crypto_user_migration_assignments(
+            plan.get("legacyCryptoUserMigrationAssignmentIds"),
+            subscription_id=subscription_id,
+            field="prior stage plan legacy Crypto User migration assignments",
+        )
+    )
+    if (
+        plan.get("legacyCryptoUserMigrationAssignmentIds")
+        != legacy_crypto_user_migration_assignments
+    ):
+        raise OrchestrationError(
+            "prior stage plan legacy Crypto User migration assignment IDs must be sorted"
+        )
+    planned_handoff_paths = {
+        predecessor: (
+            None
+            if plan.get(f"{predecessor}HandoffPath") is None
+            else Path(
+                _string(
+                    plan.get(f"{predecessor}HandoffPath"),
+                    field=f"prior stage plan {predecessor} handoff path",
+                )
+            )
+        )
+        for predecessor in ("foundation", "producer", "publisher")
+    }
+    _validate_stage_inputs(
+        stage=expected_stage,
+        resource_group=plan_resource_group,
+        foundation_handoff_path=planned_handoff_paths["foundation"],
+        producer_handoff_path=planned_handoff_paths["producer"],
+        publisher_handoff_path=planned_handoff_paths["publisher"],
+    )
+    for predecessor, predecessor_handoff_path in planned_handoff_paths.items():
+        predecessor_handoff_digest = plan.get(f"{predecessor}HandoffSha256")
+        if predecessor_handoff_path is None:
+            if predecessor_handoff_digest is not None:
+                raise OrchestrationError(
+                    f"prior stage plan {predecessor} handoff digest has no path"
+                )
+            continue
+        _sha256_digest(
+            predecessor_handoff_digest,
+            field=f"prior stage plan {predecessor} handoff SHA-256",
+        )
+    prior_handoff_path = plan.get("priorStageHandoffPath")
+    prior_handoff_sha256 = plan.get("priorStageHandoffSha256")
+    prior_receipt_value = plan.get("priorStageReceipt")
+    prior_values = (
+        prior_handoff_path,
+        prior_handoff_sha256,
+        prior_receipt_value,
+    )
+    if any(value is not None for value in prior_values) and not all(
+        value is not None for value in prior_values
+    ):
+        raise OrchestrationError("prior stage plan has incomplete earlier same-stage evidence")
+    if all(value is not None for value in prior_values):
+        _string(
+            prior_handoff_path,
+            field="prior stage plan earlier handoff path",
+        )
+        _sha256_digest(
+            prior_handoff_sha256,
+            field="prior stage plan earlier handoff SHA-256",
+        )
+        prior_receipt = _mapping(
+            prior_receipt_value,
+            field="prior stage plan earlier receipt",
+        )
+        _require_exact_fields(
+            prior_receipt,
+            PREDECESSOR_RECEIPT_REFERENCE_FIELDS,
+            field="prior stage plan earlier receipt",
+        )
+        _string(
+            prior_receipt.get("path"),
+            field="prior stage plan earlier receipt path",
+        )
+        prior_receipt_digest = _sha256_digest(
+            prior_receipt.get("sha256"),
+            field="prior stage plan earlier receipt SHA-256",
+        )
+        if (
+            _sha256_digest(
+                prior_receipt.get("reviewedSha256"),
+                field="prior stage plan earlier reviewed receipt SHA-256",
+            )
+            != prior_receipt_digest
+        ):
+            raise OrchestrationError(
+                "prior stage plan earlier receipt was not independently reviewed"
+            )
+    plan_predecessors = _mapping(
+        plan.get("predecessorReceipts"),
+        field="prior stage plan predecessor receipts",
+    )
+    _require_exact_fields(
+        plan_predecessors,
+        expected_predecessors,
+        field="prior stage plan predecessor receipts",
+    )
+    for predecessor, raw_reference in plan_predecessors.items():
+        reference = _mapping(
+            raw_reference,
+            field=f"prior stage plan predecessor receipt {predecessor}",
+        )
+        _require_exact_fields(
+            reference,
+            PREDECESSOR_RECEIPT_REFERENCE_FIELDS,
+            field=f"prior stage plan predecessor receipt {predecessor}",
+        )
+        _string(
+            reference.get("path"),
+            field=f"prior stage plan predecessor receipt {predecessor} path",
+        )
+        predecessor_digest = _sha256_digest(
+            reference.get("sha256"),
+            field=f"prior stage plan predecessor receipt {predecessor} SHA-256",
+        )
+        if (
+            predecessor_digest
+            != _sha256_digest(
+                reference.get("reviewedSha256"),
+                field=(
+                    f"prior stage plan predecessor receipt {predecessor} "
+                    "reviewed SHA-256"
+                ),
+            )
+            or predecessor_digest != receipt_predecessors[predecessor]
+        ):
+            raise OrchestrationError(
+                "prior stage plan predecessor receipt chain does not match"
+            )
+    handoff = _load_handoff(
+        handoff_path,
+        expected_stage=expected_stage,
+        expected_source_commit=source_commit,
+        document=handoff_document,
+    )
+    if (
+        handoff.get("subscriptionId") != receipt_subscription
+        or handoff.get("resourceGroup") != receipt_resource_group
+        or handoff.get("deploymentName") != deployment_name
+        or handoff.get("planManifestSha256") != plan_digest
+        or handoff.get("predecessorReceiptSha256s") != receipt_predecessors
+    ):
+        raise OrchestrationError("prior stage handoff does not match its receipt and plan")
+    inventory = _validated_authority_blob_inventory(
+        plan.get("authorityBlobInventory"),
+        subscription_id=subscription_id,
+    )
+    if inventory is None:
+        raise OrchestrationError("prior stage plan is missing authority Blob inventory")
+    handoff_outputs = (
+        _producer_outputs(handoff)
+        if expected_stage == "producer"
+        else _publisher_outputs(handoff)
+    )
+    expected_container_id = _canonical_subscription_resource_id(
+        handoff_outputs[
+            "guidanceAuthoritySourceContainerResourceId"
+            if expected_stage == "producer"
+            else "authorityContainerResourceId"
+        ],
+        subscription_id=subscription_id,
+        field="prior stage handoff authority Blob container",
+    )
+    if inventory["containerResourceId"] != expected_container_id:
+        raise OrchestrationError(
+            "prior stage authority Blob inventory does not match its exact handoff output"
+        )
+    return {
+        "handoffPath": handoff_path.resolve(),
+        "handoffSha256": handoff_digest,
+        "receiptPath": receipt_path.resolve(),
+        "receiptSha256": actual_receipt_digest,
+        "reviewedReceiptSha256": reviewed_digest,
+        "inventory": _post_deployment_authority_inventory(
+            stage=expected_stage,
+            reviewed_inventory=inventory,
+        ),
     }
 
 
@@ -1421,8 +1950,7 @@ def _predecessor_rotation_transition_assignment_ids(
             field=f"verified {predecessor} plan",
         )
         transition_ids.update(
-            resource_id.casefold()
-            for resource_id in _canonical_rotation_transition_assignments(
+            _canonical_rotation_transition_assignments(
                 plan.get("rotationTransitionAssignmentIds"),
                 subscription_id=subscription_id,
                 field=f"{predecessor} rotation transition assignments",
@@ -1485,20 +2013,30 @@ def _foundation_outputs(
     normalized_outputs.update(
         {
             "wc016NotificationQueueName": wc027_foundation.get("notificationQueueName"),
+            "incidentSigningKeyFingerprint": wc027_foundation.get("incidentSigningKeyFingerprint"),
             "incidentFeedV2SigningKeyUriWithVersion": wc027_foundation.get(
                 "feedSigningKeyUriWithVersion"
             ),
+            "feedSigningKeyFingerprint": wc027_foundation.get("feedSigningKeyFingerprint"),
             "incidentReportSigningKeyUriWithVersion": wc027_foundation.get(
                 "reportSigningKeyUriWithVersion"
             ),
+            "reportSigningKeyFingerprint": wc027_foundation.get("reportSigningKeyFingerprint"),
             "incidentGuidanceSigningKeyUriWithVersion": wc027_foundation.get(
                 "guidanceSigningKeyUriWithVersion"
             ),
+            "guidanceSigningKeyFingerprint": wc027_foundation.get("guidanceSigningKeyFingerprint"),
             "incidentEnrichmentSigningKeyUriWithVersion": wc027_foundation.get(
                 "enrichmentSigningKeyUriWithVersion"
             ),
+            "enrichmentSigningKeyFingerprint": wc027_foundation.get(
+                "enrichmentSigningKeyFingerprint"
+            ),
             "incidentNotificationSigningKeyUriWithVersion": wc027_foundation.get(
                 "notificationSigningKeyUriWithVersion"
+            ),
+            "notificationSigningKeyFingerprint": wc027_foundation.get(
+                "notificationSigningKeyFingerprint"
             ),
         }
     )
@@ -1512,11 +2050,17 @@ def _foundation_outputs(
         "wc016ServiceBusNamespace",
         "wc016NotificationQueueName",
         "incidentSigningKeyUriWithVersion",
+        "incidentSigningKeyFingerprint",
         "incidentFeedV2SigningKeyUriWithVersion",
+        "feedSigningKeyFingerprint",
         "incidentReportSigningKeyUriWithVersion",
+        "reportSigningKeyFingerprint",
         "incidentGuidanceSigningKeyUriWithVersion",
+        "guidanceSigningKeyFingerprint",
         "incidentEnrichmentSigningKeyUriWithVersion",
+        "enrichmentSigningKeyFingerprint",
         "incidentNotificationSigningKeyUriWithVersion",
+        "notificationSigningKeyFingerprint",
     )
     for name in required:
         _string(normalized_outputs.get(name), field=f"foundation outputs.{name}")
@@ -1544,8 +2088,24 @@ def _foundation_outputs(
                 raise OrchestrationError(
                     f"foundation output {name} is outside the handoff subscription"
                 )
-    for name in required[-6:]:
+    for name in (
+        "incidentSigningKeyUriWithVersion",
+        "incidentFeedV2SigningKeyUriWithVersion",
+        "incidentReportSigningKeyUriWithVersion",
+        "incidentGuidanceSigningKeyUriWithVersion",
+        "incidentEnrichmentSigningKeyUriWithVersion",
+        "incidentNotificationSigningKeyUriWithVersion",
+    ):
         _key_name(_string(normalized_outputs[name], field=name))
+    for name in (
+        "incidentSigningKeyFingerprint",
+        "feedSigningKeyFingerprint",
+        "reportSigningKeyFingerprint",
+        "guidanceSigningKeyFingerprint",
+        "enrichmentSigningKeyFingerprint",
+        "notificationSigningKeyFingerprint",
+    ):
+        _sha256_digest(normalized_outputs[name], field=name)
     return normalized_outputs
 
 
@@ -2348,7 +2908,7 @@ def _get_resource(resource_id: str, *, subscription_id: str) -> dict[str, Any]:
         subscription_id,
         field="governed subscription",
     )
-    normalized_resource_id = _canonical_subscription_resource_id(
+    canonical_resource_id = _canonical_subscription_resource_id(
         resource_id,
         subscription_id=governed_subscription_id,
         field="Azure resource ID",
@@ -2362,14 +2922,14 @@ def _get_resource(resource_id: str, *, subscription_id: str) -> dict[str, Any]:
                 "--subscription",
                 governed_subscription_id,
                 "--ids",
-                normalized_resource_id,
+                canonical_resource_id,
                 "--only-show-errors",
                 "--output",
                 "json",
             ],
-            field=f"Azure resource {normalized_resource_id}",
+            field=f"Azure resource {canonical_resource_id}",
         ),
-        field=f"Azure resource {normalized_resource_id}",
+        field=f"Azure resource {canonical_resource_id}",
     )
 
 
@@ -2428,6 +2988,351 @@ def _verify_private_blob_container(
     )
     if str(properties.get("publicAccess", "")).casefold() != "none":
         raise OrchestrationError("Blob container public access must be None")
+
+
+def _blob_container_parts(
+    resource_id: str,
+) -> tuple[str, str, str, str]:
+    container_id = _azure_resource_id(
+        resource_id,
+        field="Blob container resource ID",
+    )
+    if _resource_type(container_id) != "microsoft.storage/storageaccounts/blobservices/containers":
+        raise OrchestrationError("authority Blob inventory requires an exact container resource ID")
+    segments = [segment for segment in container_id.split("/") if segment]
+    storage_account_name = segments[7]
+    container_name = segments[11]
+    storage_account_id = "/" + "/".join(segments[:8])
+    blob_service_id = f"{storage_account_id}/blobServices/default"
+    return (
+        storage_account_name,
+        container_name,
+        storage_account_id,
+        blob_service_id,
+    )
+
+
+def _verify_blob_service_versioning(
+    container_resource_id: str,
+    *,
+    subscription_id: str,
+) -> None:
+    _, _, _, blob_service_id = _blob_container_parts(container_resource_id)
+    blob_service = _get_resource(
+        blob_service_id,
+        subscription_id=subscription_id,
+    )
+    _require_resource_id_equal(
+        blob_service.get("id"),
+        blob_service_id,
+        field="Blob service readback",
+    )
+    properties = _mapping(
+        blob_service.get("properties"),
+        field="Blob service properties",
+    )
+    if properties.get("isVersioningEnabled") is not True:
+        raise OrchestrationError("authority Blob service versioning must be enabled")
+
+
+def _blob_inventory_entry(
+    value: object,
+    *,
+    include_version: bool,
+) -> dict[str, object]:
+    item = _mapping(value, field="authority Blob inventory item")
+    properties = _mapping(
+        item.get("properties"),
+        field="authority Blob inventory properties",
+    )
+    entry: dict[str, object] = {
+        "name": _string(item.get("name"), field="authority Blob name"),
+        "etag": _string(
+            properties.get("etag"),
+            field="authority Blob ETag",
+        ),
+        "contentLength": properties.get("contentLength"),
+    }
+    if (
+        not isinstance(entry["contentLength"], int)
+        or isinstance(entry["contentLength"], bool)
+        or entry["contentLength"] < 0
+    ):
+        raise OrchestrationError("authority Blob content length must be a non-negative integer")
+    if include_version:
+        entry["versionId"] = _string(
+            item.get("versionId"),
+            field="authority Blob version ID",
+        )
+        if item.get("isCurrentVersion") not in (True, False):
+            raise OrchestrationError("authority Blob version must declare isCurrentVersion")
+        entry["isCurrentVersion"] = item["isCurrentVersion"]
+    return entry
+
+
+def _authority_blob_inventory(
+    container_resource_id: str,
+    *,
+    subscription_id: str,
+) -> dict[str, object]:
+    container_id = _azure_resource_id(
+        container_resource_id,
+        field="authority Blob container resource ID",
+    )
+    account_name, container_name, _, _ = _blob_container_parts(container_id)
+    _verify_blob_service_versioning(
+        container_id,
+        subscription_id=subscription_id,
+    )
+    existence = _mapping(
+        _run_json(
+            [
+                "az",
+                "storage",
+                "container",
+                "exists",
+                "--subscription",
+                subscription_id,
+                "--account-name",
+                account_name,
+                "--name",
+                container_name,
+                "--auth-mode",
+                "login",
+                "--only-show-errors",
+                "--output",
+                "json",
+            ],
+            field="authority Blob container existence",
+        ),
+        field="authority Blob container existence",
+    )
+    exists = existence.get("exists")
+    if exists not in (True, False):
+        raise OrchestrationError("authority Blob container existence response is invalid")
+    if not exists:
+        return {
+            "schemaVersion": AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION,
+            "containerResourceId": container_id,
+            "containerExists": False,
+            "currentBlobs": [],
+            "versions": [],
+        }
+
+    common_command = [
+        "az",
+        "storage",
+        "blob",
+        "list",
+        "--subscription",
+        subscription_id,
+        "--account-name",
+        account_name,
+        "--container-name",
+        container_name,
+        "--auth-mode",
+        "login",
+        "--num-results",
+        "*",
+        "--only-show-errors",
+        "--output",
+        "json",
+    ]
+    version_document = _run_json(
+        [*common_command, "--include", "v"],
+        field="versioned authority Blob inventory",
+    )
+    if not isinstance(version_document, list):
+        raise OrchestrationError("authority Blob inventory command must return one complete array")
+    versions = [
+        _blob_inventory_entry(item, include_version=True) for item in version_document
+    ]
+    current_blobs = [
+        {
+            "name": item["name"],
+            "etag": item["etag"],
+            "contentLength": item["contentLength"],
+        }
+        for item in versions
+        if item["isCurrentVersion"] is True
+    ]
+    current_blobs.sort(
+        key=lambda item: (
+            str(item["name"]),
+            str(item["etag"]),
+        )
+    )
+    versions.sort(
+        key=lambda item: (
+            str(item["name"]),
+            str(item["versionId"]),
+        )
+    )
+    if len({str(item["name"]) for item in current_blobs}) != len(current_blobs):
+        raise OrchestrationError("authority Blob current inventory contains duplicate names")
+    version_keys = {
+        (
+            str(item["name"]),
+            str(item["versionId"]),
+        )
+        for item in versions
+    }
+    if len(version_keys) != len(versions):
+        raise OrchestrationError("authority Blob version inventory contains duplicates")
+    return {
+        "schemaVersion": AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION,
+        "containerResourceId": container_id,
+        "containerExists": True,
+        "currentBlobs": current_blobs,
+        "versions": versions,
+    }
+
+
+def _validated_authority_blob_inventory(
+    value: object,
+    *,
+    subscription_id: str,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    inventory = _mapping(value, field="authority Blob inventory")
+    _require_exact_fields(
+        inventory,
+        frozenset(
+            {
+                "schemaVersion",
+                "containerResourceId",
+                "containerExists",
+                "currentBlobs",
+                "versions",
+            }
+        ),
+        field="authority Blob inventory",
+    )
+    if inventory.get("schemaVersion") != (AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION):
+        raise OrchestrationError("authority Blob inventory schema is unsupported")
+    _canonical_subscription_resource_id(
+        inventory.get("containerResourceId"),
+        subscription_id=subscription_id,
+        field="authority Blob inventory container",
+    )
+    if inventory.get("containerExists") not in (True, False):
+        raise OrchestrationError("authority Blob inventory existence flag is invalid")
+    for field_name, include_version in (
+        ("currentBlobs", False),
+        ("versions", True),
+    ):
+        items = inventory.get(field_name)
+        if not isinstance(items, list):
+            raise OrchestrationError(f"authority Blob inventory {field_name} must be an array")
+        expected_fields = (
+            frozenset(
+                {
+                    "name",
+                    "etag",
+                    "contentLength",
+                    "versionId",
+                    "isCurrentVersion",
+                }
+            )
+            if include_version
+            else frozenset({"name", "etag", "contentLength"})
+        )
+        for index, raw_item in enumerate(items):
+            item = _mapping(
+                raw_item,
+                field=f"authority Blob inventory {field_name}[{index}]",
+            )
+            _require_exact_fields(
+                item,
+                expected_fields,
+                field=f"authority Blob inventory {field_name}[{index}]",
+            )
+            _string(
+                item.get("name"),
+                field=f"authority Blob inventory {field_name} name",
+            )
+            _string(
+                item.get("etag"),
+                field=f"authority Blob inventory {field_name} ETag",
+            )
+            content_length = item.get("contentLength")
+            if (
+                not isinstance(content_length, int)
+                or isinstance(content_length, bool)
+                or content_length < 0
+            ):
+                raise OrchestrationError(
+                    f"authority Blob inventory {field_name} content length is invalid"
+                )
+            if include_version:
+                _string(
+                    item.get("versionId"),
+                    field="authority Blob inventory version ID",
+                )
+                if item.get("isCurrentVersion") not in (True, False):
+                    raise OrchestrationError(
+                        "authority Blob inventory current-version flag is invalid"
+                    )
+    if inventory["containerExists"] is False and (
+        inventory["currentBlobs"] or inventory["versions"]
+    ):
+        raise OrchestrationError("absent authority Blob container cannot contain inventory")
+    current_blobs = inventory["currentBlobs"]
+    versions = inventory["versions"]
+    if current_blobs != sorted(
+        current_blobs,
+        key=lambda item: (
+            str(item["name"]),
+            str(item["etag"]),
+        ),
+    ) or versions != sorted(
+        versions,
+        key=lambda item: (
+            str(item["name"]),
+            str(item["versionId"]),
+        ),
+    ):
+        raise OrchestrationError("authority Blob inventory entries must be sorted")
+    if len({str(item["name"]) for item in current_blobs}) != len(current_blobs):
+        raise OrchestrationError("authority Blob current inventory contains duplicate names")
+    if len(
+        {
+            (
+                str(item["name"]),
+                str(item["versionId"]),
+            )
+            for item in versions
+        }
+    ) != len(versions):
+        raise OrchestrationError("authority Blob version inventory contains duplicates")
+    projected_current_blobs = [
+        {
+            "name": item["name"],
+            "etag": item["etag"],
+            "contentLength": item["contentLength"],
+        }
+        for item in versions
+        if item["isCurrentVersion"] is True
+    ]
+    projected_current_blobs.sort(
+        key=lambda item: (
+            str(item["name"]),
+            str(item["etag"]),
+        )
+    )
+    if len({str(item["name"]) for item in projected_current_blobs}) != len(
+        projected_current_blobs
+    ):
+        raise OrchestrationError(
+            "authority Blob version inventory marks one name current more than once"
+        )
+    if (
+        inventory["containerExists"] is True
+        and current_blobs != projected_current_blobs
+    ):
+        raise OrchestrationError("authority Blob current and version inventories conflict")
+    return inventory
 
 
 def _verify_private_key_vault(
@@ -2618,8 +3523,8 @@ ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE = {
 }
 
 
-def _identity_bindings(value: object) -> dict[str, str]:
-    bindings: dict[str, str] = {}
+def _identity_bindings(value: object) -> dict[str, tuple[str, str]]:
+    bindings: dict[str, tuple[str, str]] = {}
 
     def visit(item: object) -> None:
         if isinstance(item, dict):
@@ -2627,20 +3532,27 @@ def _identity_bindings(value: object) -> dict[str, str]:
                 if not key.casefold().endswith("identityresourceid"):
                     continue
                 client_key = f"{key.removesuffix('ResourceId')}ClientId"
-                normalized_resource_id = _azure_resource_id(
+                original_resource_id = _azure_resource_id(
                     resource_id,
                     field="configured identity resource ID",
-                ).casefold()
+                )
+                normalized_resource_id = original_resource_id.casefold()
                 configured_client_id = _string(
                     item.get(client_key),
                     field="configured identity client ID",
                 )
                 existing = bindings.get(normalized_resource_id)
-                if existing is not None and existing.casefold() != configured_client_id.casefold():
+                if (
+                    existing is not None
+                    and existing[1].casefold() != configured_client_id.casefold()
+                ):
                     raise OrchestrationError(
                         "one identity resource ID has conflicting configured client IDs"
                     )
-                bindings[normalized_resource_id] = configured_client_id
+                bindings[normalized_resource_id] = (
+                    original_resource_id,
+                    configured_client_id,
+                )
             for child in item.values():
                 visit(child)
         elif isinstance(item, list):
@@ -2660,27 +3572,42 @@ def _verify_identities(
 ) -> dict[str, str]:
     bindings = _identity_bindings(configuration)
     identity_resource_ids = {
-        *bindings,
-        *(item.casefold() for item in additional_identity_resource_ids),
+        normalized_resource_id: original_and_client_id[0]
+        for normalized_resource_id, original_and_client_id in bindings.items()
     }
-    rbac_identity_ids = {item.casefold() for item in rbac_identity_resource_ids}
+    for resource_id in additional_identity_resource_ids:
+        original_resource_id = _azure_resource_id(
+            resource_id,
+            field="additional identity resource ID",
+        )
+        identity_resource_ids.setdefault(
+            original_resource_id.casefold(),
+            original_resource_id,
+        )
+    rbac_identity_ids = {
+        _azure_resource_id(
+            item,
+            field="RBAC identity resource ID",
+        ).casefold()
+        for item in rbac_identity_resource_ids
+    }
     principal_ids: dict[str, str] = {}
-    for normalized_resource_id in identity_resource_ids:
+    for normalized_resource_id, original_resource_id in identity_resource_ids.items():
         identity = _get_resource(
-            normalized_resource_id,
+            original_resource_id,
             subscription_id=subscription_id,
         )
         _require_resource_id_equal(
             identity.get("id"),
-            normalized_resource_id,
+            original_resource_id,
             field="managed identity readback",
         )
         properties = _mapping(identity.get("properties"), field="identity properties")
-        configured_client_id = bindings.get(normalized_resource_id)
-        if configured_client_id is not None:
+        configured_binding = bindings.get(normalized_resource_id)
+        if configured_binding is not None:
             _require_equal(
                 str(properties.get("clientId", "")).casefold(),
-                configured_client_id.casefold(),
+                configured_binding[1].casefold(),
                 field="managed identity client ID",
             )
         principal_id = _string(
@@ -4017,7 +4944,7 @@ def _verify_legacy_crypto_user_migration(
     assignments_by_scope: dict[str, set[str]] = {}
     for assignment_id, expected in expected_assignments.items():
         assignments_by_scope.setdefault(expected.scope.casefold(), set()).add(assignment_id)
-    observed_ids: set[str] = set()
+    observed_resource_ids: dict[str, str] = {}
     for normalized_scope, expected_ids in assignments_by_scope.items():
         scope = next(
             expected.scope
@@ -4045,14 +4972,19 @@ def _verify_legacy_crypto_user_migration(
             ],
             field=f"legacy Crypto User assignments at {scope}",
         )
-        scope_ids = {
-            _string(
-                assignment.get("id"),
-                field="legacy Crypto User assignment ID",
-            ).casefold()
-            for assignment in assignments
+        scope_resource_ids = {
+            resource_id.casefold(): resource_id
+            for resource_id in (
+                _string(
+                    assignment.get("id"),
+                    field="legacy Crypto User assignment ID",
+                )
+                for assignment in assignments
+            )
         }
-        observed_ids.update(expected_ids & scope_ids)
+        for assignment_id in expected_ids & set(scope_resource_ids):
+            observed_resource_ids[assignment_id] = scope_resource_ids[assignment_id]
+    observed_ids = set(observed_resource_ids)
     if migration_state == "present":
         if observed_ids != reviewed_ids:
             raise OrchestrationError(
@@ -4061,7 +4993,12 @@ def _verify_legacy_crypto_user_migration(
             )
         if observed_ids:
             _verify_rbac_resources(
-                {"rbacResourceIds": sorted(observed_ids)},
+                {
+                    "rbacResourceIds": [
+                        observed_resource_ids[assignment_id]
+                        for assignment_id in sorted(observed_ids)
+                    ]
+                },
                 expected_assignments={
                     assignment_id: expected_assignments[assignment_id]
                     for assignment_id in observed_ids
@@ -4103,7 +5040,7 @@ def _verify_complete_trigger_queue_assignment_set(
     current_principal_ids = {
         expected.principal_id.casefold() for expected in current_expected_assignments.values()
     }
-    transition_assignment_ids: set[str] = set()
+    transition_resource_ids: dict[str, str] = {}
     for resource_id in approved_transition_assignment_ids:
         normalized_resource_id = _canonical_subscription_resource_id(
             resource_id,
@@ -4117,8 +5054,10 @@ def _verify_complete_trigger_queue_assignment_set(
             != trigger_queue_scope.casefold()
         ):
             continue
-        transition_assignment_ids.add(normalized_resource_id.casefold())
-    transition_assignment_ids.difference_update(current_expected_assignments)
+        transition_resource_ids[normalized_resource_id.casefold()] = normalized_resource_id
+    for current_assignment_id in current_expected_assignments:
+        transition_resource_ids.pop(current_assignment_id, None)
+    transition_assignment_ids = set(transition_resource_ids)
     if len(transition_assignment_ids) > MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS:
         raise OrchestrationError(
             "approved trigger-queue transition assignments exceed the bounded maximum"
@@ -4145,13 +5084,17 @@ def _verify_complete_trigger_queue_assignment_set(
         ],
         field="complete trigger-queue role assignments",
     )
-    observed_assignment_ids = {
-        _string(
-            assignment.get("id"),
-            field="trigger-queue role assignment ID",
-        ).casefold()
-        for assignment in scoped_assignments
+    observed_resource_ids = {
+        resource_id.casefold(): resource_id
+        for resource_id in (
+            _string(
+                assignment.get("id"),
+                field="trigger-queue role assignment ID",
+            )
+            for assignment in scoped_assignments
+        )
     }
+    observed_assignment_ids = set(observed_resource_ids)
     allowed_assignment_ids = {
         *current_expected_assignments,
         *transition_assignment_ids,
@@ -4171,7 +5114,12 @@ def _verify_complete_trigger_queue_assignment_set(
         {}
         if not observed_current_expectations
         else _verify_rbac_resources(
-            {"rbacResourceIds": sorted(observed_current_expectations)},
+            {
+                "rbacResourceIds": [
+                    observed_resource_ids[assignment_id]
+                    for assignment_id in sorted(observed_current_expectations)
+                ]
+            },
             expected_assignments=observed_current_expectations,
             subscription_id=subscription_id,
         )
@@ -4189,13 +5137,14 @@ def _verify_complete_trigger_queue_assignment_set(
         ).casefold(),
     }
     for assignment_id in sorted(observed_transition_ids):
+        original_assignment_id = transition_resource_ids[assignment_id]
         resource = _get_resource(
-            assignment_id,
+            original_assignment_id,
             subscription_id=subscription_id,
         )
         _require_resource_id_equal(
             resource.get("id"),
-            assignment_id,
+            original_assignment_id,
             field="approved trigger-queue transition assignment readback",
         )
         properties = _mapping(
@@ -4225,7 +5174,7 @@ def _verify_complete_trigger_queue_assignment_set(
                 "Data Receiver or Data Sender"
             )
         _require_resource_id_equal(
-            _role_assignment_scope(assignment_id),
+            _role_assignment_scope(original_assignment_id),
             trigger_queue_scope,
             field="approved trigger-queue transition scope",
         )
@@ -4340,8 +5289,8 @@ def _rotation_transition_assignment_ids(
     approved_transition_ids: set[str] | frozenset[str],
     *,
     subscription_id: str,
-) -> set[str]:
-    transition_ids: set[str] = set()
+) -> dict[str, str]:
+    transition_ids: dict[str, str] = {}
     for resource_id in approved_transition_ids:
         canonical = _canonical_subscription_resource_id(
             resource_id,
@@ -4350,7 +5299,7 @@ def _rotation_transition_assignment_ids(
         )
         if "/providers/microsoft.authorization/roleassignments/" not in canonical.casefold():
             raise OrchestrationError("rotation transition approval must identify a role assignment")
-        transition_ids.add(canonical.casefold())
+        transition_ids[canonical.casefold()] = canonical
     if len(transition_ids) > MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS:
         raise OrchestrationError(
             "approved rotation transition assignments exceed the bounded maximum"
@@ -4367,19 +5316,22 @@ def _verify_reviewed_rotation_transitions(
 ) -> None:
     if transition_state not in {"present", "absent"}:
         raise OrchestrationError("rotation transition state is invalid")
-    transition_ids = _rotation_transition_assignment_ids(
+    transition_resource_ids = _rotation_transition_assignment_ids(
         approved_transition_ids,
         subscription_id=subscription_id,
     )
+    transition_ids = set(transition_resource_ids)
     if not transition_ids:
         return
     transition_ids_by_scope: dict[str, set[str]] = {}
-    for assignment_id in transition_ids:
-        scope = _role_assignment_scope(assignment_id)
+    scope_resource_ids: dict[str, str] = {}
+    for assignment_id, original_assignment_id in transition_resource_ids.items():
+        scope = _role_assignment_scope(original_assignment_id)
+        scope_resource_ids.setdefault(scope.casefold(), scope)
         transition_ids_by_scope.setdefault(scope.casefold(), set()).add(assignment_id)
     observed_transition_ids: set[str] = set()
     for normalized_scope, scoped_transition_ids in transition_ids_by_scope.items():
-        scope = _role_assignment_scope(next(iter(scoped_transition_ids)))
+        scope = scope_resource_ids[normalized_scope]
         assignments = _merge_effective_role_assignment_documents(
             [
                 _run_json(
@@ -4427,13 +5379,14 @@ def _verify_reviewed_rotation_transitions(
         principal_id.casefold() for principal_id in current_principal_ids
     }
     for assignment_id in sorted(observed_transition_ids):
+        original_assignment_id = transition_resource_ids[assignment_id]
         resource = _get_resource(
-            assignment_id,
+            original_assignment_id,
             subscription_id=subscription_id,
         )
         _require_resource_id_equal(
             resource.get("id"),
-            assignment_id,
+            original_assignment_id,
             field="approved rotation transition assignment readback",
         )
         properties = _mapping(
@@ -4452,7 +5405,7 @@ def _verify_reviewed_rotation_transitions(
             raise OrchestrationError(
                 "approved rotation transition principal type must be ServicePrincipal"
             )
-        scope = _role_assignment_scope(assignment_id)
+        scope = _role_assignment_scope(original_assignment_id)
         if properties.get("scope") is not None:
             _require_resource_id_equal(
                 properties.get("scope"),
@@ -5183,12 +6136,47 @@ def _parse_key_time(value: object, *, field: str) -> datetime | None:
     raise OrchestrationError(f"{field} is not a valid timestamp")
 
 
+def _base64url_uint(value: object, *, field: str) -> int:
+    encoded = _string(value, field=field)
+    if "=" in encoded or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in encoded
+    ):
+        raise OrchestrationError(f"{field} must be canonical base64url")
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    except (ValueError, binascii.Error) as exc:
+        raise OrchestrationError(f"{field} is invalid base64url") from exc
+    if (
+        not decoded
+        or decoded[0] == 0
+        or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != encoded
+    ):
+        raise OrchestrationError(f"{field} must be a canonical unsigned integer")
+    return int.from_bytes(decoded, "big")
+
+
 def _verify_key(
     versioned_key_uri: str,
     *,
     subscription_id: str,
     required_operations: frozenset[str],
+    expected_fingerprint: str,
+    expected_key_size_bits: int = REVIEWED_RSA_KEY_SIZE_BITS,
 ) -> None:
+    parsed = urlparse(versioned_key_uri)
+    vault_name = parsed.netloc.split(".", 1)[0]
+    key_name = _key_name(versioned_key_uri)
+    if (
+        parsed.scheme != "https"
+        or not vault_name
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise OrchestrationError(
+            f"expected an exact versioned Key Vault key URI: {versioned_key_uri}"
+        )
     document = _mapping(
         _run_json(
             [
@@ -5198,8 +6186,10 @@ def _verify_key(
                 "show",
                 "--subscription",
                 subscription_id,
-                "--id",
-                versioned_key_uri,
+                "--vault-name",
+                vault_name,
+                "--name",
+                key_name,
                 "--only-show-errors",
                 "--output",
                 "json",
@@ -5222,14 +6212,53 @@ def _verify_key(
     if expires is not None and expires <= now:
         raise OrchestrationError(f"Key Vault key is expired: {versioned_key_uri}")
     key = _mapping(document.get("key"), field="key material")
+    _require_equal(
+        key.get("kid"),
+        versioned_key_uri,
+        field="Key Vault key version",
+    )
+    _require_equal(key.get("kty"), "RSA", field="Key Vault key type")
+    modulus = _base64url_uint(key.get("n"), field="Key Vault RSA modulus")
+    exponent = _base64url_uint(key.get("e"), field="Key Vault RSA exponent")
+    try:
+        public_key = rsa.RSAPublicNumbers(
+            exponent,
+            modulus,
+        ).public_key()
+    except ValueError as exc:
+        raise OrchestrationError("Key Vault RSA public material is invalid") from exc
+    if public_key.key_size < MINIMUM_RSA_KEY_SIZE_BITS:
+        raise OrchestrationError("Key Vault RSA key is below the minimum size")
+    if public_key.key_size != expected_key_size_bits:
+        raise OrchestrationError("Key Vault RSA key size does not match the reviewed size")
+    spki = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    actual_fingerprint = f"{SHA256_PREFIX}{hashlib.sha256(spki).hexdigest()}"
+    _require_equal(
+        actual_fingerprint,
+        _sha256_digest(
+            expected_fingerprint,
+            field="configured key fingerprint",
+        ),
+        field="Key Vault public key fingerprint",
+    )
     key_operations = key.get("keyOps")
     if not isinstance(key_operations, list) or any(
-        not isinstance(item, str) for item in key_operations
+        not isinstance(item, str) or not item for item in key_operations
     ):
         raise OrchestrationError("Key Vault key operations are absent")
-    if not required_operations.issubset({item.casefold() for item in key_operations}):
+    normalized_operations = [item.casefold() for item in key_operations]
+    if len(set(normalized_operations)) != len(normalized_operations):
+        raise OrchestrationError("Key Vault key operations must be distinct")
+    actual_operations = frozenset(normalized_operations)
+    if actual_operations != REVIEWED_RSA_KEY_OPERATIONS or not required_operations.issubset(
+        actual_operations
+    ):
         raise OrchestrationError(
-            f"Key Vault key lacks required operations {sorted(required_operations)}: "
+            f"Key Vault key operations do not match reviewed operations "
+            f"{sorted(REVIEWED_RSA_KEY_OPERATIONS)}: "
             f"{versioned_key_uri}"
         )
 
@@ -5274,8 +6303,8 @@ def _verify_latest_key_uri(
             vault_name=vault_name,
             key_name=key_name,
             subscription_id=subscription_id,
-        ).casefold()
-        != versioned_key_uri.casefold()
+        )
+        != versioned_key_uri
     ):
         raise OrchestrationError(
             f"current Key Vault key version drifted from the foundation handoff: {key_name}"
@@ -5288,15 +6317,33 @@ def _verify_foundation_key_heads(
     subscription_id: str,
 ) -> None:
     outputs = _foundation_outputs(foundation)
-    for name in (
-        "incidentSigningKeyUriWithVersion",
-        "incidentFeedV2SigningKeyUriWithVersion",
-        "incidentReportSigningKeyUriWithVersion",
-        "incidentGuidanceSigningKeyUriWithVersion",
-        "incidentEnrichmentSigningKeyUriWithVersion",
-        "incidentNotificationSigningKeyUriWithVersion",
+    for uri_name, fingerprint_name in (
+        (
+            "incidentSigningKeyUriWithVersion",
+            "incidentSigningKeyFingerprint",
+        ),
+        (
+            "incidentFeedV2SigningKeyUriWithVersion",
+            "feedSigningKeyFingerprint",
+        ),
+        (
+            "incidentReportSigningKeyUriWithVersion",
+            "reportSigningKeyFingerprint",
+        ),
+        (
+            "incidentGuidanceSigningKeyUriWithVersion",
+            "guidanceSigningKeyFingerprint",
+        ),
+        (
+            "incidentEnrichmentSigningKeyUriWithVersion",
+            "enrichmentSigningKeyFingerprint",
+        ),
+        (
+            "incidentNotificationSigningKeyUriWithVersion",
+            "notificationSigningKeyFingerprint",
+        ),
     ):
-        key_uri = _string(outputs[name], field=name)
+        key_uri = _string(outputs[uri_name], field=uri_name)
         _verify_latest_key_uri(
             key_uri,
             subscription_id=subscription_id,
@@ -5305,6 +6352,10 @@ def _verify_foundation_key_heads(
             key_uri,
             subscription_id=subscription_id,
             required_operations=frozenset({"sign", "verify"}),
+            expected_fingerprint=_sha256_digest(
+                outputs[fingerprint_name],
+                field=fingerprint_name,
+            ),
         )
 
 
@@ -5433,7 +6484,7 @@ def _verify_publisher_binding_key_head(
         key_name=key_name,
         subscription_id=subscription_id,
     )
-    if current_uri.casefold() != expected_uri.casefold():
+    if current_uri != expected_uri:
         raise OrchestrationError(
             "publisher binding key version does not match the producer trust binding"
         )
@@ -5714,6 +6765,10 @@ def _verify_producer_resources(
         _string(collector_key["keyVaultKeyId"], field="collector key URI"),
         subscription_id=subscription_id,
         required_operations=frozenset({"verify"}),
+        expected_fingerprint=_sha256_digest(
+            collector_key.get("keyFingerprint"),
+            field="collector key fingerprint",
+        ),
     )
     configured_keys = _mapping(configuration["keys"], field="producer keys")
     for parameter_name, configured_key in (
@@ -5767,6 +6822,10 @@ def _verify_producer_resources(
                 frozenset({"sign"})
                 if name in {"report", "guidance", "enrichment", "feed", "notification"}
                 else frozenset({"verify"})
+            ),
+            expected_fingerprint=_sha256_digest(
+                configured_key.get("keyFingerprint"),
+                field=f"producer key {name} fingerprint",
             ),
         )
     expected_foundation_keys = {
@@ -6039,6 +7098,10 @@ def _verify_publisher_resources(
             key_uri,
             subscription_id=subscription_id,
             required_operations=required_operations,
+            expected_fingerprint=_sha256_digest(
+                key.get("keyFingerprint"),
+                field=f"{key_name}.keyFingerprint",
+            ),
         )
     binding_key_resource_id = _azure_resource_id(
         _parameter_value(effective_parameters, "bindingKeyResourceId"),
@@ -6190,6 +7253,154 @@ def _bindings_as_parameters(
     bindings: Mapping[str, object],
 ) -> dict[str, dict[str, object]]:
     return {name: {"value": value} for name, value in bindings.items()}
+
+
+def _authority_container_resource_id_for_stage(
+    *,
+    stage: str,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    verified_predecessors: Mapping[str, Mapping[str, object]],
+) -> str | None:
+    if stage == "foundation":
+        return None
+    if stage == "producer":
+        storage_account_id = _azure_resource_id(
+            _parameter_value(
+                effective_parameters,
+                "correlationSourceStorageAccountResourceId",
+            ),
+            field="producer authority storage account",
+        )
+        container_name = _string(
+            _parameter_value(
+                effective_parameters,
+                "guidanceAuthoritySourceContainerName",
+            ),
+            field="producer authority container name",
+        )
+        return f"{storage_account_id}/blobServices/default/containers/{container_name}"
+    predecessor_name = "producer" if stage == "publisher" else "publisher"
+    predecessor = _mapping(
+        verified_predecessors[predecessor_name].get("handoff"),
+        field=f"verified {predecessor_name} handoff",
+    )
+    outputs = (
+        _producer_outputs(predecessor) if stage == "publisher" else _publisher_outputs(predecessor)
+    )
+    output_name = (
+        "guidanceAuthoritySourceContainerResourceId"
+        if stage == "publisher"
+        else "authorityContainerResourceId"
+    )
+    return _azure_resource_id(
+        outputs[output_name],
+        field=f"{stage} authority container",
+    )
+
+
+def _verify_planned_authority_blob_inventory(
+    *,
+    stage: str,
+    current_inventory: Mapping[str, object] | None,
+    trusted_inventory: Mapping[str, object] | None,
+) -> None:
+    if stage == "foundation":
+        if current_inventory is not None or trusted_inventory is not None:
+            raise OrchestrationError("foundation stage cannot contain authority Blob inventory")
+        return
+    if current_inventory is None:
+        raise OrchestrationError("authority Blob inventory is required for WC-027 planning")
+    if trusted_inventory is not None:
+        if _canonical_json_bytes(trusted_inventory) != _canonical_json_bytes(current_inventory):
+            raise OrchestrationError(
+                "authority Blob inventory conflicts with trusted predecessor evidence"
+            )
+        return
+    if stage != "producer":
+        raise OrchestrationError(
+            "authority Blob inventory requires independently reviewed predecessor evidence"
+        )
+    if (
+        current_inventory.get("containerExists") is not False
+        or current_inventory.get("currentBlobs") != []
+        or current_inventory.get("versions") != []
+    ):
+        raise OrchestrationError(
+            "fresh producer planning requires the authority container to be absent; "
+            "every pre-existing container requires a reviewed prior producer receipt and handoff"
+        )
+
+
+def _verify_post_deployment_authority_inventory(
+    *,
+    stage: str,
+    reviewed_inventory: Mapping[str, object] | None,
+    current_inventory: Mapping[str, object] | None,
+) -> None:
+    if stage == "foundation":
+        if reviewed_inventory is not None or current_inventory is not None:
+            raise OrchestrationError("foundation stage cannot contain authority Blob inventory")
+        return
+    if reviewed_inventory is None or current_inventory is None:
+        raise OrchestrationError("authority Blob inventory is required for WC-027 readiness")
+    expected_inventory = _post_deployment_authority_inventory(
+        stage=stage,
+        reviewed_inventory=reviewed_inventory,
+    )
+    if stage == "producer" and reviewed_inventory.get("containerExists") is False:
+        if (
+            current_inventory.get("containerExists") is not True
+            or current_inventory.get("currentBlobs") != []
+            or current_inventory.get("versions") != []
+        ):
+            raise OrchestrationError(
+                "fresh authority container must contain zero current and versioned blobs"
+            )
+        return
+    if _canonical_json_bytes(expected_inventory) != _canonical_json_bytes(current_inventory):
+        raise OrchestrationError(
+            "authority Blob content/version inventory changed from the independently reviewed plan"
+        )
+
+
+def _post_deployment_authority_inventory(
+    *,
+    stage: str,
+    reviewed_inventory: Mapping[str, object],
+) -> dict[str, object]:
+    if stage == "producer" and reviewed_inventory.get("containerExists") is False:
+        return {
+            **reviewed_inventory,
+            "containerExists": True,
+            "currentBlobs": [],
+            "versions": [],
+        }
+    return dict(reviewed_inventory)
+
+
+def _predecessor_authority_blob_inventory(
+    *,
+    stage: str,
+    verified_predecessors: Mapping[str, Mapping[str, object]],
+    subscription_id: str,
+) -> dict[str, object] | None:
+    if stage not in {"publisher", "live-acceptance"}:
+        return None
+    predecessor_name = "producer" if stage == "publisher" else "publisher"
+    plan = _mapping(
+        verified_predecessors[predecessor_name].get("plan"),
+        field=f"verified {predecessor_name} plan",
+    )
+    inventory = _validated_authority_blob_inventory(
+        plan.get("authorityBlobInventory"),
+        subscription_id=subscription_id,
+    )
+    if inventory is None:
+        raise OrchestrationError(f"{predecessor_name} plan is missing authority Blob inventory")
+    return _post_deployment_authority_inventory(
+        stage=predecessor_name,
+        reviewed_inventory=inventory,
+    )
 
 
 def _verify_live_dependencies(
@@ -6464,6 +7675,47 @@ def plan(args: argparse.Namespace) -> Path:
         )
     if args.stage != "producer" and legacy_crypto_user_migration_assignments:
         raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
+    prior_stage_handoff = getattr(args, "prior_stage_handoff", None)
+    prior_stage_receipt = getattr(args, "prior_stage_receipt", None)
+    prior_stage_reviewed_receipt_sha256 = getattr(
+        args,
+        "prior_stage_reviewed_receipt_sha256",
+        None,
+    )
+    prior_stage_values = (
+        prior_stage_handoff,
+        prior_stage_receipt,
+        prior_stage_reviewed_receipt_sha256,
+    )
+    if any(value is not None for value in prior_stage_values) and not all(
+        value is not None for value in prior_stage_values
+    ):
+        raise OrchestrationError(
+            "prior same-stage evidence requires handoff, receipt, and "
+            "independently reviewed receipt SHA-256"
+        )
+    if any(value is not None for value in prior_stage_values) and args.stage not in {
+        "producer",
+        "publisher",
+    }:
+        raise OrchestrationError("prior same-stage evidence is supported only for WC-027 stages")
+    prior_stage_record = (
+        None
+        if prior_stage_handoff is None
+        or prior_stage_receipt is None
+        or prior_stage_reviewed_receipt_sha256 is None
+        else _load_verified_prior_stage_inventory(
+            expected_stage=args.stage,
+            handoff_path=prior_stage_handoff,
+            receipt_path=prior_stage_receipt,
+            reviewed_receipt_sha256=prior_stage_reviewed_receipt_sha256,
+            subscription_id=subscription_id,
+            resource_group=_string(
+                args.resource_group,
+                field="prior stage resource group",
+            ),
+        )
+    )
     _ensure_clean_worktree()
     effective = build_effective_parameters(
         stage=args.stage,
@@ -6605,6 +7857,34 @@ def plan(args: argparse.Namespace) -> Path:
             subscription_id=subscription_id,
             rotation_transition_assignment_ids=(predecessor_rotation_transition_ids),
         )
+    authority_container_id = _authority_container_resource_id_for_stage(
+        stage=args.stage,
+        effective_parameters=effective,
+        verified_predecessors=verified_predecessors,
+    )
+    authority_blob_inventory = (
+        None
+        if authority_container_id is None
+        else _authority_blob_inventory(
+            authority_container_id,
+            subscription_id=subscription_id,
+        )
+    )
+    predecessor_authority_inventory = _predecessor_authority_blob_inventory(
+        stage=args.stage,
+        verified_predecessors=verified_predecessors,
+        subscription_id=subscription_id,
+    )
+    trusted_prior_inventory = (
+        prior_stage_record["inventory"]
+        if prior_stage_record is not None
+        else predecessor_authority_inventory
+    )
+    _verify_planned_authority_blob_inventory(
+        stage=args.stage,
+        current_inventory=authority_blob_inventory,
+        trusted_inventory=trusted_prior_inventory,
+    )
     stem = f"{args.stage}-{args.deployment_name}"
     effective_path = args.evidence_directory / f"{stem}.parameters.json"
     what_if_path = args.evidence_directory / f"{stem}.what-if.json"
@@ -6667,6 +7947,22 @@ def plan(args: argparse.Namespace) -> Path:
         "allowedChangeResourceIds": sorted(allowed_changes),
         "rotationTransitionAssignmentIds": rotation_transition_assignments,
         "legacyCryptoUserMigrationAssignmentIds": (legacy_crypto_user_migration_assignments),
+        "authorityBlobInventory": authority_blob_inventory,
+        "priorStageHandoffPath": (
+            None if prior_stage_record is None else str(prior_stage_record["handoffPath"])
+        ),
+        "priorStageHandoffSha256": (
+            None if prior_stage_record is None else prior_stage_record["handoffSha256"]
+        ),
+        "priorStageReceipt": (
+            None
+            if prior_stage_record is None
+            else {
+                "path": str(prior_stage_record["receiptPath"]),
+                "sha256": prior_stage_record["receiptSha256"],
+                "reviewedSha256": prior_stage_record["reviewedReceiptSha256"],
+            }
+        ),
         "foundationHandoffPath": (
             None if args.foundation_handoff is None else str(args.foundation_handoff.resolve())
         ),
@@ -6772,6 +8068,10 @@ def apply(args: argparse.Namespace) -> Path:
             field="legacy Crypto User migration assignments",
         )
     )
+    reviewed_authority_blob_inventory = _validated_authority_blob_inventory(
+        manifest.get("authorityBlobInventory"),
+        subscription_id=subscription_id,
+    )
     violations = evaluate_what_if(
         what_if,
         allowed_change_ids=frozenset(allowed_change_ids),
@@ -6785,6 +8085,46 @@ def apply(args: argparse.Namespace) -> Path:
         if resource_group_value is None
         else _string(resource_group_value, field="resource group")
     )
+    prior_stage_handoff_value = manifest.get("priorStageHandoffPath")
+    prior_stage_receipt_value = manifest.get("priorStageReceipt")
+    prior_stage_record = None
+    if prior_stage_handoff_value is not None:
+        prior_stage_receipt = _mapping(
+            prior_stage_receipt_value,
+            field="prior stage receipt reference",
+        )
+        prior_stage_record = _load_verified_prior_stage_inventory(
+            expected_stage=stage,
+            handoff_path=Path(
+                _string(
+                    prior_stage_handoff_value,
+                    field="prior stage handoff path",
+                )
+            ),
+            receipt_path=Path(
+                _string(
+                    prior_stage_receipt.get("path"),
+                    field="prior stage receipt path",
+                )
+            ),
+            reviewed_receipt_sha256=_string(
+                prior_stage_receipt.get("reviewedSha256"),
+                field="prior stage reviewed receipt SHA-256",
+            ),
+            subscription_id=subscription_id,
+            resource_group=_string(
+                resource_group,
+                field="prior stage resource group",
+            ),
+        )
+        _require_equal(
+            prior_stage_record["handoffSha256"],
+            _sha256_digest(
+                manifest.get("priorStageHandoffSha256"),
+                field="prior stage handoff SHA-256",
+            ),
+            field="prior stage handoff SHA-256",
+        )
     deployment_name = _string(manifest.get("deploymentName"), field="deployment name")
     foundation_path = manifest.get("foundationHandoffPath")
     producer_path = manifest.get("producerHandoffPath")
@@ -6871,6 +8211,38 @@ def apply(args: argparse.Namespace) -> Path:
             transition_state="absent",
             subscription_id=subscription_id,
         )
+    authority_container_id = _authority_container_resource_id_for_stage(
+        stage=stage,
+        effective_parameters=effective_parameters,
+        verified_predecessors=verified_predecessors,
+    )
+    if authority_container_id is None:
+        if reviewed_authority_blob_inventory is not None:
+            raise OrchestrationError("foundation plan cannot contain authority Blob inventory")
+    else:
+        if reviewed_authority_blob_inventory is None:
+            raise OrchestrationError("reviewed plan is missing authority Blob inventory")
+        _require_resource_id_equal(
+            reviewed_authority_blob_inventory["containerResourceId"],
+            authority_container_id,
+            field="reviewed authority Blob inventory container",
+        )
+        current_authority_blob_inventory = _authority_blob_inventory(
+            authority_container_id,
+            subscription_id=subscription_id,
+        )
+        if _canonical_json_bytes(current_authority_blob_inventory) != (
+            _canonical_json_bytes(reviewed_authority_blob_inventory)
+        ):
+            raise OrchestrationError(
+                "authority Blob content/version inventory changed after plan review"
+            )
+        if prior_stage_record is not None and _canonical_json_bytes(
+            prior_stage_record["inventory"]
+        ) != _canonical_json_bytes(reviewed_authority_blob_inventory):
+            raise OrchestrationError(
+                "reviewed authority Blob inventory is not bound to the prior same-stage receipt"
+            )
     foundation = (
         None
         if "foundation" not in verified_predecessors
@@ -7077,6 +8449,19 @@ def apply(args: argparse.Namespace) -> Path:
             approved_transition_assignment_ids=set(reviewed_rotation_transition_ids),
             require_transition_revoked=True,
         )
+    post_deployment_authority_inventory = (
+        None
+        if authority_container_id is None
+        else _authority_blob_inventory(
+            authority_container_id,
+            subscription_id=subscription_id,
+        )
+    )
+    _verify_post_deployment_authority_inventory(
+        stage=stage,
+        reviewed_inventory=reviewed_authority_blob_inventory,
+        current_inventory=post_deployment_authority_inventory,
+    )
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
     predecessor_receipt_hashes = _predecessor_receipt_hashes(verified_predecessors)
@@ -7151,6 +8536,9 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
     )
+    plan_parser.add_argument("--prior-stage-handoff", type=Path)
+    plan_parser.add_argument("--prior-stage-receipt", type=Path)
+    plan_parser.add_argument("--prior-stage-reviewed-receipt-sha256")
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--plan-manifest", type=Path, required=True)
     apply_parser.add_argument("--reviewed-plan-sha256", required=True)

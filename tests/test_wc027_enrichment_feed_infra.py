@@ -14,6 +14,9 @@ KEY_VERIFIER_RBAC = (
 KEY_SIGN_VERIFY_RBAC = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-sign-verify-rbac.bicep"
 )
+PRIVATE_CONTAINER = (
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "private-container.bicep"
+)
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -233,6 +236,10 @@ def test_wc027_source_readers_and_key_verifier_are_exact_and_non_mutating() -> N
     assert "roleDefinitionId: verifierRole.id" in key_verifier
     assert "principalId: identity.properties.principalId" in key_verifier
     assert "param identityPrincipalId" not in key_verifier
+
+    private_container = PRIVATE_CONTAINER.read_text(encoding="utf-8")
+    assert "isVersioningEnabled == true" in private_container
+    assert "guidance-authority storage Blob versioning must be enabled" in (private_container)
 
 
 def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:

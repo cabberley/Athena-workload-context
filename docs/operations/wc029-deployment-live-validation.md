@@ -277,11 +277,30 @@ Run the four orchestration stages in order. Use a unique deployment name and a n
 directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
 `apply`; the apply command rejects any changed byte.
 
-The plan schema is `athena.wc029DeploymentPlan.v3`. Every Azure deployment validate, what-if, and
+The plan schema is `athena.wc029DeploymentPlan.v5`. Every Azure deployment validate, what-if, and
 create command includes `--no-prompt true`, and the subprocess receives no stdin. Before any Azure
 validation, the orchestrator compiles the exact Bicep template and requires the effective parameter
 document to contain every template parameter without a default value. Missing reviewed values
 cannot be supplied interactively.
+
+For producer, publisher, and live-acceptance stages the plan also records
+`authorityBlobInventory`. Blob service versioning must be enabled. The inventory is canonical,
+complete, and independently reviewable: one version-inclusive listing supplies every version ID,
+current-version flag, exact case-sensitive Blob name, ETag, and content length; the current-Blob
+projection must exactly equal the versions marked current. Publisher and live-acceptance planning
+compare it with the trusted predecessor plan. Apply requires the live inventory to still match
+before create and again after deployment. The only fresh exception is a producer plan that proved
+the container was absent; post-deployment verification then requires the newly created container
+to contain zero current and versioned blobs.
+
+Producer upgrades and publisher recovery must additionally supply
+`--prior-stage-handoff`, `--prior-stage-receipt`, and
+`--prior-stage-reviewed-receipt-sha256`. The reviewed prior same-stage receipt may come from an
+earlier source commit, but its receipt, plan, handoff, stage scope, and inventory hashes must remain
+internally exact, including deployment name and predecessor-receipt lineage. Every pre-existing
+producer authority container, even an empty one, requires prior producer evidence; an out-of-band or
+partially failed deployment cannot establish a new baseline. Publisher recovery binds to the prior
+publisher inventory rather than silently replacing it with the producer's older empty baseline.
 
 Use `--rotation-transition-assignment <exact-role-assignment-id>` for retired-principal
 assignments. Producer upgrades from the earlier signer grants use the distinct
@@ -357,7 +376,10 @@ governed WC-027 scope for any attached, submitter, or reader identity; any unrev
 management-group assignment, which is conservatively treated as inherited by every governed
 resource unless separate reviewed hierarchy evidence is introduced; incomplete Microsoft Graph
 membership or Azure assignment evidence; any public/non-RBAC parent Key Vault behind an external
-trust key; any assignment whose resolved role permissions include Blob read without the exact
+trust key; any current Key Vault `kid`, RSA type/size, modulus, exponent, SPKI fingerprint, or
+key-operation drift from the same current-version read; any authority Blob service without
+versioning or any missing/conflicting authority
+content/version inventory; any assignment whose resolved role permissions include Blob read without the exact
 canonical condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact
 Active, non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource
 ID before validation or what-if; and any final WC-013 readiness readback that differs from the two

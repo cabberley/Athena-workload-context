@@ -133,6 +133,29 @@ Both Python and WC-013 Bicep readiness also require scaler metadata to contain e
 `namespace`, `queueName`, `messageCount`, `cloud`, and `isSessionsEnabled`; legacy
 `activationMessageCount` and every other extra field fail closed.
 
+Every configured Key Vault trust anchor is read back by its exact versioned `kid`. Verification
+reads the current key by vault and name and requires that same response's `kid` to equal the
+reviewed version exactly. It then requires RSA public material, the reviewed 3072-bit size (and
+never less than 2048 bits), canonical base64url modulus and exponent, exact `sign`/`verify` key
+operations, and an SPKI DER SHA-256 fingerprint equal to the configured `keyFingerprint`. Missing
+public material, EC keys, version drift, wrong fingerprints, or extra/missing key operations fail
+before readiness.
+
+The guidance-authority storage account must have Blob versioning enabled. Each reviewed
+`athena.wc029DeploymentPlan.v5` records the authority container's exact current Blob and version
+inventory from one version-inclusive listing, including exact case-sensitive names, version IDs,
+current-version flags, ETags, and content lengths. The current projection must exactly match the
+versions marked current. A fresh producer deployment must prove the container absent and then
+create an empty container with zero current and versioned blobs. Every pre-existing producer
+container, including an empty one, requires prior same-stage evidence. Publisher recovery, producer
+upgrade, and live acceptance must match the inventory carried by the trusted predecessor plan and
+the newly reviewed plan before and after deployment.
+
+For a producer upgrade or publisher recovery, pass the independently reviewed prior same-stage
+handoff and receipt. The new plan reads each reviewed artifact once, verifies the exact historical
+deployment scope and predecessor-receipt lineage, and carries its post-deployment inventory
+forward; it cannot approve out-of-band content merely by observing it again.
+
 Upgrades from the earlier built-in Key Vault Crypto User assignments use a separate reviewed
 same-principal migration list. Supply each of the five exact legacy deterministic assignment IDs
 with `--legacy-crypto-user-migration-assignment` during producer planning. Planning requires the
