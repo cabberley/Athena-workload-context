@@ -611,6 +611,36 @@ def load_wc027_guidance_authority_publisher_configuration(
     return Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(raw)
 
 
+def _abandon_retryable_publisher_message(
+    receiver: object,
+    message: object,
+    *,
+    now: datetime,
+) -> None:
+    from azure.servicebus.exceptions import ServiceBusError
+
+    lock_deadlines = tuple(
+        deadline
+        for deadline in (
+            getattr(message, "locked_until_utc", None),
+            getattr(getattr(receiver, "session", None), "locked_until_utc", None),
+        )
+        if deadline is not None
+    )
+    if any(
+        not isinstance(deadline, datetime)
+        or deadline.tzinfo is None
+        or deadline.utcoffset() != UTC.utcoffset(now)
+        or now >= deadline
+        for deadline in lock_deadlines
+    ):
+        return
+    try:
+        receiver.abandon_message(message)  # type: ignore[attr-defined]
+    except ServiceBusError:
+        return
+
+
 def run_wc027_guidance_authority_publisher_worker(
     *,
     configuration: Wc027GuidanceAuthorityPublisherConfiguration,
@@ -618,6 +648,7 @@ def run_wc027_guidance_authority_publisher_worker(
 ) -> bool:
     from azure.identity import ManagedIdentityCredential
     from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusClient
+    from azure.servicebus.exceptions import ServiceBusError
 
     if not 1 <= max_wait_time_seconds <= 300:
         raise ValueError("max_wait_time_seconds must be between 1 and 300")
@@ -695,9 +726,14 @@ def run_wc027_guidance_authority_publisher_worker(
             HttpResponseError,
             ServiceRequestError,
             ServiceResponseError,
+            ServiceBusError,
             OSError,
         ):
-            receiver.abandon_message(message)
+            _abandon_retryable_publisher_message(
+                receiver,
+                message,
+                now=_utc_now_milliseconds(),
+            )
             return False
         except ValidationError, ValueError:
             receiver.dead_letter_message(

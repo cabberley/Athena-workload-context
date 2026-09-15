@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -146,9 +146,28 @@ class _Outbox:
 
 
 class _Sender:
-    def __init__(self, *, fail_once_after_send: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_once_after_send: bool = False,
+        on_open=None,
+    ) -> None:
         self.calls = []
+        self.open_calls = 0
         self.fail_once_after_send = fail_once_after_send
+        self.on_open = on_open
+
+    def open(self):
+        self.open_calls += 1
+        if self.on_open is not None:
+            self.on_open()
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
 
     def enqueue(
         self,
@@ -292,6 +311,7 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
         for item in outbox.calls
     )
     assert len(sender.calls) == 1
+    assert sender.open_calls == 1
     sent, sent_reference, ttl, delivery_budget = sender.calls[0]
     assert sent == publication_request
     assert sent_reference == receipt.outbox_reference
@@ -356,6 +376,7 @@ def test_invalid_key_signature_draft_or_stale_input_has_zero_output_io(
 
     assert outbox.calls == []
     assert sender.calls == []
+    assert sender.open_calls == 0
 
 
 def test_end_to_end_budget_boundary_has_zero_outbox_writes_and_sends() -> None:
@@ -411,6 +432,13 @@ def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
             expires_at - timedelta(seconds=90),
         )
     )
+    events: list[str] = []
+    selected_sender = _Sender(on_open=lambda: events.append("open"))
+
+    def operation_clock():
+        events.append("clock")
+        return next(operation_times)
+
     (
         _fixture_value,
         _request_value,
@@ -423,7 +451,8 @@ def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
         sender,
     ) = _producer(
         request=request,
-        clock=lambda: next(operation_times),
+        sender=selected_sender,
+        clock=operation_clock,
     )
 
     with pytest.raises(
@@ -433,7 +462,9 @@ def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
         producer.produce(request, now=evaluated_at)
 
     assert len(outbox.calls) == 1
+    assert sender.open_calls == 1
     assert sender.calls == []
+    assert events == ["clock", "open", "clock"]
 
 
 def test_current_occurrence_mismatch_has_zero_output_io() -> None:
@@ -1403,3 +1434,185 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
         assert len(receiver.dead_lettered) == 1
         assert publisher.calls == []
     assert len(outbox_reader.calls) == expected_outbox_reads
+
+
+@pytest.mark.parametrize("failure_point", ("trigger", "completion"))
+def test_publisher_worker_retries_service_bus_failure_without_duplicate_activation(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    import azure.identity
+    import azure.servicebus
+    from azure.servicebus.exceptions import ServiceBusError
+
+    (
+        fixture,
+        incident_bound_request,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        _outbox,
+        _sender,
+    ) = _producer()
+    produced = producer.produce(
+        incident_bound_request,
+        now=_stable_evaluated_at(
+            incident_bound_request,
+            fixture.incident_publication.occurrence,
+        ),
+    )
+    request = produced.request
+    message = SimpleNamespace(
+        body=(request.canonical_bytes(),),
+        content_type="application/json",
+        message_id=request.request_id,
+        session_id=request.incident_bound_request.incident_subject.incident_id,
+        application_properties=guidance_publication_request_broker_properties(
+            request,
+            outbox_reference=produced.outbox_reference,
+            delivery_budget=_DELIVERY_BUDGET,
+        ),
+        locked_until_utc=request.expires_at,
+    )
+    configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+        json.dumps(_bicep_generated_publisher_configuration())
+    )
+
+    class _Credential:
+        def __init__(self, *, client_id: str) -> None:
+            self.client_id = client_id
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(locked_until_utc=request.expires_at)
+            self.abandoned = []
+            self.completed = []
+            self.completion_attempts = 0
+            self.dead_lettered = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def receive_messages(self, **_kwargs):
+            return [message]
+
+        def complete_message(self, selected) -> None:
+            self.completion_attempts += 1
+            if failure_point == "completion" and self.completion_attempts == 1:
+                raise ServiceBusError("synthetic uncertain completion")
+            self.completed.append(selected)
+
+        def abandon_message(self, selected) -> None:
+            self.abandoned.append(selected)
+
+        def dead_letter_message(self, selected, **kwargs) -> None:
+            self.dead_lettered.append((selected, kwargs))
+
+    class _QueueSender:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    receiver = _Receiver()
+    queue_sender = _QueueSender()
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_queue_receiver(self, **_kwargs):
+            return receiver
+
+        def get_queue_sender(self, **_kwargs):
+            return queue_sender
+
+    class _OutboxReader:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def read(self, reference):
+            self.calls.append(reference)
+            return request.canonical_bytes()
+
+    class _ReplayPublisher:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.activation_ids: set[str] = set()
+
+        def publish(self, selected, *, now) -> None:
+            self.calls += 1
+            self.activation_ids.add(selected.request_id)
+            if failure_point == "trigger" and self.calls == 1:
+                raise ServiceBusError("synthetic uncertain trigger send")
+
+    outbox_reader = _OutboxReader()
+    publisher = _ReplayPublisher()
+    monkeypatch.setattr(azure.identity, "ManagedIdentityCredential", _Credential)
+    monkeypatch.setattr(azure.servicebus, "ServiceBusClient", _Client)
+    monkeypatch.setattr(
+        guidance_production,
+        "_correlation_reader",
+        lambda *_args, **_kwargs: outbox_reader,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "build_wc027_guidance_authority_publisher",
+        lambda *_args, **_kwargs: publisher,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "_utc_now_milliseconds",
+        lambda: request.evaluated_at.astimezone(UTC),
+    )
+
+    first_processed = run_wc027_guidance_authority_publisher_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+    second_processed = run_wc027_guidance_authority_publisher_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+
+    assert first_processed is False
+    assert second_processed is True
+    assert receiver.abandoned == [message]
+    assert receiver.completed == [message]
+    assert receiver.dead_lettered == []
+    assert publisher.calls == 2
+    assert publisher.activation_ids == {request.request_id}
+    assert outbox_reader.calls == [
+        produced.outbox_reference,
+        produced.outbox_reference,
+    ]
+
+
+def test_publisher_retry_does_not_abandon_an_expired_lock() -> None:
+    abandoned = []
+    lock_deadline = _fixture().guidance_binding.evaluated_at
+    receiver = SimpleNamespace(
+        session=SimpleNamespace(locked_until_utc=lock_deadline),
+        abandon_message=lambda message: abandoned.append(message),
+    )
+    message = SimpleNamespace(locked_until_utc=lock_deadline)
+
+    guidance_production._abandon_retryable_publisher_message(
+        receiver,
+        message,
+        now=lock_deadline,
+    )
+
+    assert abandoned == []

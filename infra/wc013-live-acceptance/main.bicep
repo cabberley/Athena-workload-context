@@ -563,6 +563,7 @@ var wc027ProducerJobResourceIdRawSegments = split(
 )
 var wc027PublisherJobResourceIdRawSegments = split(wc027PublisherJobResourceId, '/')
 var wc027PublisherJobResourceIdSegments = concat(
+  wc027PublisherJobResourceIdRawSegments,
   [
     ''
     ''
@@ -573,8 +574,7 @@ var wc027PublisherJobResourceIdSegments = concat(
     ''
     ''
     ''
-  ],
-  wc027PublisherJobResourceIdRawSegments
+  ]
 )
 var wc027PublisherJobResourceIdValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027PublisherJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027PublisherJobResourceIdSegments[7]) == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8])
 var wc027PublisherConfigurationDigestHex = replace(wc027PublisherConfigurationDigest, 'sha256:', '')

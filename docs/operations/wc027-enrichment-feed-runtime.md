@@ -206,7 +206,9 @@ only and has exactly one reviewed container with the exact digest-pinned image, 
 environment, resources, empty probe/init-container/volume/secret and managed-identity lifecycle
 surfaces, complete replica/concurrency and scaler configuration, registry identity, configuration
 value and digest tag, embedded producer-runtime digest, attached identities, and deterministic RBAC
-binding evidence.
+binding evidence. Canonical publisher Job IDs are evaluated from their parsed segments before
+safety padding, including valid cross-subscription/resource-group references; malformed provider,
+type, child-resource, and empty-name IDs fail readiness.
 When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
 equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
 `wc027PublisherReady=true`.

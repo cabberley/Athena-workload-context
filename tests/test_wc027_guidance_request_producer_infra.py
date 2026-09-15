@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = ROOT / "infra" / "wc027-guidance-publication-request-producer" / "main.bicep"
 KEY_PUBLIC_READER = (
@@ -21,6 +23,34 @@ KEY_SIGNER = (
 DOCKERFILE = ROOT / "apps" / "guidance-publication-request-producer" / "Dockerfile"
 PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 ROOT_ACCEPTANCE = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
+
+
+def _evaluate_publisher_job_resource_id(
+    source: str,
+    resource_id: str,
+) -> tuple[list[str], bool]:
+    declaration = source.split(
+        "var wc027PublisherJobResourceIdSegments = concat(",
+        maxsplit=1,
+    )[1].split(
+        "var wc027PublisherJobResourceIdValid",
+        maxsplit=1,
+    )[0]
+    raw_segments = resource_id.split("/")
+    padding = [""] * 9
+    raw_segments_first = declaration.index(
+        "wc027PublisherJobResourceIdRawSegments"
+    ) < declaration.index("[")
+    segments = [*raw_segments, *padding] if raw_segments_first else [*padding, *raw_segments]
+    valid = (
+        len(raw_segments) == 9
+        and segments[1] == "subscriptions"
+        and segments[3] == "resourceGroups"
+        and segments[6].casefold() == "microsoft.app"
+        and segments[7].casefold() == "jobs"
+        and bool(segments[8])
+    )
+    return segments, valid
 
 
 def test_request_producer_is_a_separate_private_idempotent_job() -> None:
@@ -316,6 +346,57 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
         "output requestOutboxContainerName string",
     ):
         assert expected in publisher
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "expected_valid"),
+    (
+        (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/publisher-job",
+            True,
+        ),
+        (
+            "/subscriptions/22222222-2222-2222-2222-222222222222/"
+            "resourceGroups/rg-cross-scope/providers/Microsoft.App/jobs/publisher-job",
+            True,
+        ),
+        (
+            "subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/publisher-job",
+            False,
+        ),
+        (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-publisher/providers/Microsoft.ContainerApps/jobs/publisher-job",
+            False,
+        ),
+        (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/",
+            False,
+        ),
+        (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/"
+            "publisher-job/executions/run-1",
+            False,
+        ),
+    ),
+)
+def test_publisher_job_resource_id_is_evaluated_from_canonical_segments(
+    resource_id: str,
+    expected_valid: bool,
+) -> None:
+    source = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
+
+    segments, valid = _evaluate_publisher_job_resource_id(source, resource_id)
+
+    assert valid is expected_valid
+    if expected_valid:
+        assert segments[2] == resource_id.split("/")[2]
+        assert segments[4] == resource_id.split("/")[4]
+        assert segments[8] == "publisher-job"
 
 
 def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -> None:

@@ -84,8 +84,10 @@ closed. The writer has create-only permission; a separate reader has exact read 
 Blob listing denied. Immediately before persistence and enqueue, the producer requires more than
 the reviewed 90-second downstream budget: the publisher's 30-second KEDA polling interval plus a
 60-second startup and processing allowance. After persistence, the producer re-reads the signed
-lifecycle authority and the exact immutable context authority. Only then does a distinct Service
-Bus sender identity send the canonical request to `wc027-guidance-authority-requests`, using
+lifecycle authority and the exact immutable context authority. It then establishes the sender,
+resamples the trusted clock, and calculates TTL immediately before message construction and send.
+Only then does a distinct Service Bus sender identity send the canonical request to
+`wc027-guidance-authority-requests`, using
 `requestId` as `MessageId`, incident ID as `SessionId`, a bounded TTL, and occurrence, incident,
 context-authority, request, outbox, and delivery-budget binding metadata. Service Bus duplicate
 detection and immutable outbox recovery make an uncertain send safely retryable with
@@ -102,6 +104,9 @@ metadata and exact-reads the referenced Blob version, requiring byte-for-byte eq
 canonical signed request. A correctly signed request without durable outbox evidence therefore
 cannot activate guidance authority. The publisher also requires the same configured delivery
 budget and rejects requests that no longer retain its 60-second startup and processing allowance.
+Service Bus failures from the enrichment trigger send or input completion are retryable; the worker
+abandons only under a valid delivery/session lock, and immutable activation replay prevents a
+duplicate activation after an uncertain send.
 
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and

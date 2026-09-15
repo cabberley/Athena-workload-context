@@ -94,8 +94,10 @@ is the publisher's 30-second scale-to-zero polling interval plus a 60-second sta
 margin. A request at or inside the first boundary is abandoned without reserving or writing its
 occurrence-keyed outbox path. If revalidation consumes the budget, the persisted request is not
 sent and the input is abandoned. After persistence, the worker revalidates lifecycle and context
-authority, then sends to the existing `wc027-guidance-authority-requests` queue with a distinct
-sender identity:
+authority, establishes the managed-identity Service Bus sender, resamples the trusted clock, and
+only then calculates TTL and constructs/sends the message. Sender creation cannot complete the
+input delivery. The request is sent to the existing `wc027-guidance-authority-requests` queue with
+a distinct sender identity:
 
 | Field | Value |
 |---|---|
@@ -189,6 +191,9 @@ request-producer sender identity used in the generated configuration.
 - Current authority temporarily unavailable or changed, Blob uncertainty, Key Vault transport
   failure, insufficient pre-persistence lifetime, expiry during revalidation, or Service Bus
   uncertainty: abandon and retry.
+- Publisher trigger-send or input-completion `ServiceBusError`: abandon only while the delivery or
+  session lock remains valid. A retry reuses the same immutable request/activation identity and
+  cannot create a second activation.
 - Signer output that fails separate public-key verification: reject before persistence.
 
 Never delete immutable outbox evidence to retry and never bypass the publisher activation path.

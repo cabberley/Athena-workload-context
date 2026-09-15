@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -142,7 +143,7 @@ class GuidancePublicationRequestOutboxPort(Protocol):
     ) -> VersionPinnedBlobReference: ...
 
 
-class GuidancePublicationRequestSenderPort(Protocol):
+class GuidancePublicationRequestSenderSessionPort(Protocol):
     def enqueue(
         self,
         request: GuidanceAuthorityPublicationRequest,
@@ -151,6 +152,12 @@ class GuidancePublicationRequestSenderPort(Protocol):
         time_to_live_seconds: int,
         delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None: ...
+
+
+class GuidancePublicationRequestSenderPort(Protocol):
+    def open(
+        self,
+    ) -> AbstractContextManager[GuidancePublicationRequestSenderSessionPort]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,19 +306,20 @@ class GuidancePublicationRequestProducer:
                 "published context authority changed after request persistence"
             )
 
-        operation_now = self._operation_time(persistence_now)
-        remaining = self._require_remaining_delivery_budget(
-            publication_request,
-            at=operation_now,
-            phase="enqueue",
-        )
-        remaining_seconds = int(remaining.total_seconds())
-        self.sender.enqueue(
-            publication_request,
-            outbox_reference=outbox_reference,
-            time_to_live_seconds=remaining_seconds,
-            delivery_budget=self.delivery_budget,
-        )
+        with self.sender.open() as sender:
+            operation_now = self._operation_time(persistence_now)
+            remaining = self._require_remaining_delivery_budget(
+                publication_request,
+                at=operation_now,
+                phase="enqueue",
+            )
+            remaining_seconds = int(remaining.total_seconds())
+            sender.enqueue(
+                publication_request,
+                outbox_reference=outbox_reference,
+                time_to_live_seconds=remaining_seconds,
+                delivery_budget=self.delivery_budget,
+            )
         return GuidancePublicationRequestReceipt(
             request=publication_request,
             outbox_reference=outbox_reference,
@@ -648,6 +656,7 @@ __all__ = [
     "GuidancePublicationRequestProducer",
     "GuidancePublicationRequestReceipt",
     "GuidancePublicationRequestSenderPort",
+    "GuidancePublicationRequestSenderSessionPort",
     "MAX_WC027_GUIDANCE_REQUEST_INPUT_BYTES",
     "WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION",
     "WC027_GUIDANCE_REQUEST_INPUT_SCHEMA_VERSION",

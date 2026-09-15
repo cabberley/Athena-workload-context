@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any, cast
 
@@ -29,6 +31,7 @@ from athena_context.contracts import (
 )
 from athena_context.guidance.request_publication import (
     GuidancePublicationRequestDeliveryBudget,
+    GuidancePublicationRequestSenderSessionPort,
     guidance_publication_request_broker_properties,
 )
 
@@ -164,6 +167,11 @@ class AzureServiceBusGuidancePublicationRequestSender:
     def __init__(self, sender: object) -> None:
         self._sender = sender
 
+    def open(
+        self,
+    ) -> AbstractContextManager[GuidancePublicationRequestSenderSessionPort]:
+        return nullcontext(self)
+
     def enqueue(
         self,
         request: GuidanceAuthorityPublicationRequest,
@@ -214,14 +222,8 @@ class ManagedIdentityGuidancePublicationRequestSender:
         self._queue_name = queue_name
         self._managed_identity_client_id = managed_identity_client_id
 
-    def enqueue(
-        self,
-        request: GuidanceAuthorityPublicationRequest,
-        *,
-        outbox_reference: VersionPinnedBlobReference,
-        time_to_live_seconds: int,
-        delivery_budget: GuidancePublicationRequestDeliveryBudget,
-    ) -> None:
+    @contextmanager
+    def open(self) -> Iterator[GuidancePublicationRequestSenderSessionPort]:
         from azure.identity import ManagedIdentityCredential
         from azure.servicebus import ServiceBusClient
 
@@ -234,12 +236,7 @@ class ManagedIdentityGuidancePublicationRequestSender:
             ) as client,
             client.get_queue_sender(queue_name=self._queue_name) as sender,
         ):
-            AzureServiceBusGuidancePublicationRequestSender(sender).enqueue(
-                request,
-                outbox_reference=outbox_reference,
-                time_to_live_seconds=time_to_live_seconds,
-                delivery_budget=delivery_budget,
-            )
+            yield AzureServiceBusGuidancePublicationRequestSender(sender)
 
 
 __all__ = [
