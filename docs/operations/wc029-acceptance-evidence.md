@@ -20,8 +20,9 @@ The harness:
   including schema-specific signed preimages and exact versioned Key Vault key IDs;
 - rejects incomplete, duplicate, unlisted, linked, escaping, malformed, noncanonical, oversized,
   or internally inconsistent inputs; and
-- captures the validated directory into an immutable in-memory snapshot using stable no-follow
-  file handles, file identities, link-count checks, and before/after directory identities; and
+- opens every validated file through a stable no-follow handle before reading any bytes, then
+  captures an immutable in-memory snapshot using platform change identity, link-count checks, and
+  before/after directory identities; and
 - creates one new record exclusively outside the input directory. It never overwrites a prior
   record.
 
@@ -42,12 +43,12 @@ Instead, include their already captured outputs as evidence:
 
 | Existing path | Evidence supplied to this harness |
 | --- | --- |
-| WC-029 deployment orchestration | Exact plan, raw what-if, output handoff, and successful deployment read-back for every inventoried deployment |
+| WC-029 deployment orchestration | Exact inventory-pinned plan, raw what-if, output handoff, and successful deployment read-back for every inventoried deployment |
 | WC-029 preflight | Digest-bound successful `what-if` and `rbac` receipts, captured effective RBAC, and reviewed RBAC policy |
 | Container Apps Jobs | Execution capture and post-run read-back |
 | WC-028/WC-025/WC-026 | Monitoring, change, report, and report-attestation artifacts |
-| WC-016/WC-027 | Active/resolved incident, guidance, enrichment, feed, and notification artifacts |
-| Context publication | Exact manifest document, cited clauses, publication authority, and independent authority signature |
+| WC-016/WC-027 | Active/resolved incident, guidance, enrichment, authoritative v1 source indexes, v2 feed indexes, and notification artifacts |
+| Context publication | Exact canonical manifest document, resolved profile and dependency digests, cited clauses, publication authority, and independent authority signature |
 | Private endpoint probes | Canonical URL probe receipts |
 | Service Bus checks | Baseline, scenario-drain, and final zero-count queue receipts |
 | Scenario operator | Plan, apply receipt, observation, recovery action, and recovery proof |
@@ -93,20 +94,29 @@ The output directory must already exist and must be outside `wc029-capture/`. Th
 must remain unchanged while the tool captures its private snapshot. Any file or parent-directory
 identity drift fails the run.
 
+On Windows, the harness uses reparse-safe handles that deny write and delete sharing while the
+snapshot is captured and compares native file change time. On POSIX, it retains `O_NOFOLLOW`
+descriptors for every file and compares `st_ctime_ns` through final verification. Restoring the
+original size and modification time after transiently substituting bytes does not make the capture
+acceptable.
+
 ## Version inventory
 
 The index names exactly one canonical `athena.wc029VersionInventory.v1` artifact. It records:
 
 - the exact 40-character source commit;
-- every deployment ID, stage, subscription, resource group, location, template path/SHA-256,
-  base/effective parameter SHA-256, and exact upstream deployment roots;
+- every deployment ID, stage, subscription, resource group, location, exact plan artifact ID and
+  SHA-256, template path/SHA-256, base/effective parameter SHA-256, reviewed what-if allowlist,
+  orchestrator SHA-256, and exact upstream deployment roots;
 - every lowercase digest-pinned container image;
 - every approved HTTPS endpoint origin and exact probed path;
 - every managed-identity boundary, forbidden role set, and forbidden scope set whose effective
   RBAC must be present;
 - every scenario target/action capability and whether a deployed IncidentState producer exists;
-- the exact published manifest artifact, authority artifact, independent authority attestation,
-  clause set, version, profile, and digests; and
+- the exact published canonical manifest artifact, approved `PublishedRuntimeContextBinding`,
+  authority artifact, independent authority attestation, effective clause set, semantic version,
+  resolved profile digest, dependency graph digest, and full dependency-path/coverage-bound
+  context-binding payload digest; and
 - every signing purpose, exact versioned Key Vault key ID, public-key fingerprint, and captured
   public-key artifact ID.
 
@@ -115,6 +125,11 @@ what-if, successful what-if receipt, output handoff, and `Succeeded` deployment 
 binds the what-if bytes, the output binds the exact plan SHA-256, and the read-back binds the output
 handoff plus identical deployment outputs. Source commit, stage, deployment name, scope, and
 template digest must agree with the inventory.
+
+The trusted inventory must pin the complete reviewed plan bytes before the harness calls the
+existing what-if evaluator. A plan with an unpinned artifact ID or digest, stage/root/scope,
+template, parameters, allowlist, orchestrator digest, or named upstream handoff fails without
+evaluating its bundle-selected allowlist.
 
 The caller obtains the inventory SHA-256 through the reviewed release channel, not from the bundle
 being checked. A digest calculated from an unreviewed bundle is not approval.
@@ -173,6 +188,10 @@ Every scenario has all five phases:
 
 The NSG connectivity scenario also requires signed change evidence.
 
+Every signed phase window has positive duration and is strictly separated from the following
+window. Mutation, recovery, recovered-state capture, Job start, Job completion, Job read-back, and
+recovery proof timestamps must be strictly increasing; equal timestamps fail.
+
 ### Correlation-only
 
 A correlation-only scenario requires canonical `athena.wc029IncidentOmission.v1` evidence stating
@@ -189,10 +208,12 @@ An incident-producing scenario additionally requires:
 - guidance and attestation;
 - enrichment manifest and attestation;
 - active feed evidence and attestation;
+- signed authoritative v1 active source index and attestation;
 - active feed index and index attestation;
 - active notification provenance;
 - resolved IncidentState and attestation;
 - resolved feed evidence and attestation;
+- signed authoritative v1 resolved source index and attestation;
 - resolved feed index and index attestation;
 - resolved notification provenance; and
 - a scenario-scoped zero-count queue capture in `verify`.
@@ -204,7 +225,10 @@ not chosen by the index. The harness verifies:
 - WC-025 change-evidence signatures;
 - WC-026 report publication statements and signatures;
 - WC-016 active/resolved IncidentState signatures;
-- WC-027 guidance, enrichment, feed-pointer, feed-index, and notification signatures;
+- WC-027 guidance, enrichment, feed-pointer, authoritative v1 source-index, v2 feed-index, and
+  notification signatures;
+- each v2 feed index against the canonical digest of its corresponding signed v1 active-state
+  source index through the shared feed-index validator;
 - an independent signed scenario-execution manifest that covers every plan/apply/observe/recover/
   verify artifact, its exact bytes, phase, input/request digest, execution ID, target, action, and
   bounded chronological window; and
@@ -243,9 +267,11 @@ Harness-owned canonical receipts include:
 - `athena.wc029ScenarioPlan.v1`, `athena.wc029MutationReceipt.v1`, and
   `athena.wc029RecoveryAction.v1`: one target-bound plan/apply/recover chain.
 - `athena.wc029ScenarioExecutionManifest.v1` and its independent RSA attestation: complete
-  execution lineage and phase windows for every scenario artifact.
+  execution lineage and positive, strictly separated phase windows for every scenario artifact.
 - `athena.wc029PublishedManifest.v1`, `athena.wc029PublicationAuthority.v1`, and its independent
-  attestation: exact manifest content, resolved cited clauses, publication record/audit heads, and
+  attestation: an exact `CanonicalWorkloadManifest`, native approved-profile resolution, the exact
+  shared `PublishedRuntimeContextBinding`, recomputed resolved-profile/dependency/full-authority
+  digests, exact effective constraint/control content, publication record/audit heads, and
   authority proof used by report publication.
 - `athena.wc029ManifestCitation.v1`: the exact published manifest/profile/digest, clause IDs,
   active IncidentState digest, and WC-026 report ID/digest.

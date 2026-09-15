@@ -15,8 +15,12 @@ from pydantic import BaseModel
 
 import athena_context.wc029_acceptance_evidence as acceptance
 from athena_context.contracts import (
+    ActiveIncidentEntry,
+    ActiveIncidentIndex,
+    ActiveIncidentIndexAttestation,
     ChangeEvidenceArtifact,
     CorrelationReport,
+    DependencyPath,
     IncidentEnrichmentAssetReference,
     IncidentEnrichmentAttestation,
     IncidentEnrichmentFeedPointer,
@@ -40,6 +44,7 @@ from athena_context.contracts import (
     PublishedCorrelationReportAssetReference,
     PublishedCorrelationReportAttestation,
     PublishedCorrelationReportStatement,
+    PublishedRuntimeContextBinding,
     VersionPinnedBlobReference,
     build_incident_enrichment_feed_pointer,
     build_incident_feed_index_v2,
@@ -47,12 +52,14 @@ from athena_context.contracts import (
     canonicalize_json,
     compute_artifact_digest,
     incident_state_signature_preimage,
+    resolve_manifest_profile,
     sha256_hex,
 )
 from athena_context.contracts.change_ingestion import (
     change_evidence_attestation_preimage,
 )
 from athena_context.contracts.monitoring import monitoring_handoff_preimage
+from athena_context.fixtures import load_canonical_manifest
 from test_presentation_asset_gateway import _resolved_feed_v2_source_fixture
 from test_wc024_monitoring_contract import _trusted_signed_handoff
 from test_wc026_correlation_contract import _change_pair
@@ -107,10 +114,14 @@ class IncidentAssets:
     enrichment_attestation: IncidentEnrichmentAttestation
     active_feed: IncidentEnrichmentFeedPointer
     active_feed_attestation: IncidentEnrichmentFeedPointerAttestation
+    active_source_index: ActiveIncidentIndex
+    active_source_index_attestation: ActiveIncidentIndexAttestation
     active_feed_index: IncidentFeedIndexV2
     active_feed_index_attestation: IncidentFeedIndexAttestationV2
     resolved_feed: IncidentEnrichmentFeedPointer
     resolved_feed_attestation: IncidentEnrichmentFeedPointerAttestation
+    resolved_source_index: ActiveIncidentIndex
+    resolved_source_index_attestation: ActiveIncidentIndexAttestation
     resolved_feed_index: IncidentFeedIndexV2
     resolved_feed_index_attestation: IncidentFeedIndexAttestationV2
     active_notification: IncidentNotificationEnvelopeV2
@@ -210,62 +221,142 @@ def _private_key_material(
 
 def _publication_assets() -> tuple[PublicationAssets, rsa.RSAPrivateKey]:
     key, private_key = _private_key_material("context-authority", "a")
-    manifest_document = {
-        "manifestId": "manifest-synthetic",
-        "manifestVersion": "2026.09.14.1",
-        "profiles": {
-            "production": {
-                "profileId": "production",
-                "status": "approved",
-            }
-        },
-        "constraints": [
-            {
-                "clauseId": "synthetic-availability",
-                "kind": "availability",
-                "required": True,
-            }
-        ],
-    }
-    manifest_digest = compute_artifact_digest(manifest_document)
-    clause_digest = compute_artifact_digest(manifest_document["constraints"][0])
-    manifest = acceptance.Wc029PublishedManifestEvidence(
-        schemaVersion=acceptance.PUBLISHED_MANIFEST_SCHEMA_VERSION,
-        workloadId="synthetic-wc029",
-        manifestId="manifest-synthetic",
-        manifestVersion="2026.09.14.1",
-        profileId="production",
-        manifestDocument=manifest_document,
-        citedClauses=(
-            acceptance.Wc029PublishedClause(
-                clauseId="synthetic-availability",
-                jsonPointer="/constraints/0",
-                clauseDigest=clause_digest,
+    manifest_document = load_canonical_manifest()
+    workload_id = "synthetic-wc029"
+    published_at = _SCENARIO_BASE - timedelta(hours=1)
+    publication_record_digest = "sha256:" + ("1" * 64)
+    audit_head_digest = "sha256:" + ("2" * 64)
+    resolved_profile = resolve_manifest_profile(
+        manifest_document,
+        "production",
+        as_of=published_at,
+        _validate_complete_graph=False,
+    )
+    dependency_graph_digest = compute_artifact_digest(
+        {
+            "manifestId": manifest_document.manifest_id,
+            "manifestVersion": manifest_document.manifest_version,
+            "profileId": resolved_profile.profile_id,
+            "relationships": [
+                item.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                for item in sorted(
+                    resolved_profile.relationships,
+                    key=lambda item: item.canonical_json(),
+                )
+            ],
+        }
+    )
+    relationship = next(
+        item
+        for item in resolved_profile.relationships
+        if item.relationship_id == "production-worker-depends-db"
+    )
+    dependency_path_payload: dict[str, object] = {
+        "pathClass": "declared",
+        "sourceRoleRef": "worker",
+        "targetRoleRef": "database-primary",
+        "relationshipIds": (relationship.relationship_id,),
+        "resourceIds": (
+            (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourcegroups/rg-synthetic/providers/microsoft.compute/"
+                "virtualmachines/database-primary"
+            ),
+            (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourcegroups/rg-synthetic/providers/microsoft.compute/"
+                "virtualmachines/worker-01"
             ),
         ),
-        publicationRecordDigest="sha256:" + ("1" * 64),
-        auditHeadDigest="sha256:" + ("2" * 64),
-        publishedAt=_SCENARIO_BASE - timedelta(hours=1),
-        manifestDigest=manifest_digest,
+    }
+    dependency_path_digest = compute_artifact_digest(_json_value(dependency_path_payload))
+    dependency_path = DependencyPath(
+        **dependency_path_payload,
+        pathId=("path-" + dependency_path_digest.removeprefix("sha256:")[:32]),
+        pathDigest=dependency_path_digest,
     )
+    context_binding_payload: dict[str, object] = {
+        "workloadId": workload_id,
+        "manifestId": manifest_document.manifest_id,
+        "manifestVersion": manifest_document.manifest_version,
+        "manifestDigest": manifest_document.compatibility.artifact_digest,
+        "profileId": resolved_profile.profile_id,
+        "resolvedProfileDigest": resolved_profile.resolved_profile_digest,
+        "dependencyGraphDigest": dependency_graph_digest,
+        "dependencyPaths": (dependency_path,),
+        "requiredCoverageScopeDigests": ("sha256:" + ("7" * 64),),
+    }
+    context_binding_payload_digest = compute_artifact_digest(_json_value(context_binding_payload))
     authority_payload: dict[str, object] = {
-        "workloadId": manifest.workload_id,
-        "manifestId": manifest.manifest_id,
-        "manifestVersion": manifest.manifest_version,
-        "manifestDigest": manifest.manifest_digest,
-        "profileId": manifest.profile_id,
-        "resolvedProfileDigest": "sha256:" + ("3" * 64),
-        "dependencyGraphDigest": "sha256:" + ("4" * 64),
-        "contextBindingPayloadDigest": "sha256:" + ("5" * 64),
-        "publicationRecordDigest": manifest.publication_record_digest,
-        "auditHeadDigest": manifest.audit_head_digest,
-        "publishedAt": manifest.published_at,
+        "workloadId": workload_id,
+        "manifestId": manifest_document.manifest_id,
+        "manifestVersion": manifest_document.manifest_version,
+        "manifestDigest": manifest_document.compatibility.artifact_digest,
+        "profileId": resolved_profile.profile_id,
+        "resolvedProfileDigest": resolved_profile.resolved_profile_digest,
+        "dependencyGraphDigest": dependency_graph_digest,
+        "contextBindingPayloadDigest": context_binding_payload_digest,
+        "publicationRecordDigest": publication_record_digest,
+        "auditHeadDigest": audit_head_digest,
+        "publishedAt": published_at,
     }
     authority_digest = compute_artifact_digest(_json_value(authority_payload))
     authority = PublishedContextAuthority(
         **authority_payload,
         authorityId=("publication-authority-" + authority_digest.removeprefix("sha256:")[:32]),
         authorityDigest=authority_digest,
+    )
+    authority_reference = VersionPinnedBlobReference(
+        name=f"context-authority/{authority.authority_id}/authority.json",
+        version="2026-09-10T00:45:00.0000000Z",
+        contentDigest=sha256_hex(authority.canonical_bytes()),
+    )
+    context_binding_document: dict[str, object] = {
+        **context_binding_payload,
+        "bindingMode": "publishedRuntime",
+        "publicationAuthority": authority,
+        "publicationAuthorityReference": authority_reference,
+        "previewOnly": False,
+    }
+    context_binding = PublishedRuntimeContextBinding(
+        **context_binding_document,
+        bindingDigest=compute_artifact_digest(_json_value(context_binding_document)),
+    )
+    clause = manifest_document.profiles["production"].constraints[0]
+    clause_digest = compute_artifact_digest(
+        clause.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    )
+    manifest = acceptance.Wc029PublishedManifestEvidence(
+        schemaVersion=acceptance.PUBLISHED_MANIFEST_SCHEMA_VERSION,
+        workloadId=workload_id,
+        manifestId=manifest_document.manifest_id,
+        manifestVersion=manifest_document.manifest_version,
+        profileId=resolved_profile.profile_id,
+        manifestDocument=manifest_document,
+        contextBinding=context_binding,
+        citedClauses=(
+            acceptance.Wc029PublishedClause(
+                clauseKind="constraint",
+                clauseId=clause.constraint_id,
+                jsonPointer="/profiles/production/constraints/0",
+                clauseDigest=clause_digest,
+            ),
+        ),
+        publicationRecordDigest=publication_record_digest,
+        auditHeadDigest=audit_head_digest,
+        publishedAt=published_at,
+        manifestDigest=manifest_document.compatibility.artifact_digest,
+        resolvedProfileDigest=resolved_profile.resolved_profile_digest,
+        dependencyGraphDigest=dependency_graph_digest,
+        contextBindingPayloadDigest=context_binding_payload_digest,
     )
     authority_evidence = acceptance.Wc029PublicationAuthorityEvidence(
         schemaVersion=acceptance.PUBLICATION_AUTHORITY_SCHEMA_VERSION,
@@ -823,6 +914,35 @@ def _trusted_incident_assets(
             contentDigest=sha256_hex(active_feed_attestation.canonical_bytes()),
         ),
     )
+    active_source_index = ActiveIncidentIndex(
+        schemaVersion="athena.activeIncidentIndex.v1",
+        incidents=(
+            ActiveIncidentEntry(
+                incidentId=active_state.incident_id,
+                scenario=active_state.scenario,
+                lifecycle="active",
+                workloadRole=active_state.workload_role,
+                pointerPath=f"./{active_feed.source_pointer_reference.name}",
+                pointerSha256=(active_feed.source_pointer_reference.content_digest),
+                detectedAt=active_state.detected_at,
+                updatedAt=active_state.updated_at,
+            ),
+        ),
+        indexAttestationPath=("./incidents/index-attestations/" + ("c" * 64) + ".json"),
+        keyId=keys["incident"].key_id,
+        keyFingerprint=keys["incident"].fingerprint,
+        publishedAt=active_feed.published_at,
+    )
+    active_source_index_attestation = ActiveIncidentIndexAttestation(
+        schemaVersion="athena.activeIncidentIndexAttestation.v1",
+        indexDigest=sha256_hex(active_source_index.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=keys["incident"].key_id,
+        detachedSignature=sign(
+            "incident",
+            active_source_index.canonical_bytes(),
+        ),
+    )
     active_feed_index = build_incident_feed_index_v2(
         active=(active_entry,),
         recently_resolved=(),
@@ -830,7 +950,7 @@ def _trusted_incident_assets(
         resolved_history_truncated=False,
         resolved_history_total_count=0,
         omitted_resolved_count=None,
-        source_active_index_digest="sha256:" + ("6" * 64),
+        source_active_index_digest=sha256_hex(active_source_index.canonical_bytes()),
         key_id=keys["feed"].key_id,
         key_fingerprint=keys["feed"].fingerprint,
         published_at=active_feed.published_at + timedelta(seconds=1),
@@ -992,6 +1112,24 @@ def _trusted_incident_assets(
             contentDigest=sha256_hex(resolved_feed_attestation.canonical_bytes()),
         ),
     )
+    resolved_source_index = ActiveIncidentIndex(
+        schemaVersion="athena.activeIncidentIndex.v1",
+        incidents=(),
+        indexAttestationPath=("./incidents/index-attestations/" + ("d" * 64) + ".json"),
+        keyId=keys["incident"].key_id,
+        keyFingerprint=keys["incident"].fingerprint,
+        publishedAt=source_pointer.published_at,
+    )
+    resolved_source_index_attestation = ActiveIncidentIndexAttestation(
+        schemaVersion="athena.activeIncidentIndexAttestation.v1",
+        indexDigest=sha256_hex(resolved_source_index.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=keys["incident"].key_id,
+        detachedSignature=sign(
+            "incident",
+            resolved_source_index.canonical_bytes(),
+        ),
+    )
     resolved_feed_index = build_incident_feed_index_v2(
         active=(),
         recently_resolved=(resolved_entry,),
@@ -999,7 +1137,7 @@ def _trusted_incident_assets(
         resolved_history_truncated=False,
         resolved_history_total_count=1,
         omitted_resolved_count=None,
-        source_active_index_digest="sha256:" + ("b" * 64),
+        source_active_index_digest=sha256_hex(resolved_source_index.canonical_bytes()),
         key_id=keys["feed"].key_id,
         key_fingerprint=keys["feed"].fingerprint,
         published_at=resolved_feed.published_at + timedelta(seconds=1),
@@ -1047,10 +1185,14 @@ def _trusted_incident_assets(
         enrichment_attestation=enrichment_attestation,
         active_feed=active_feed,
         active_feed_attestation=active_feed_attestation,
+        active_source_index=active_source_index,
+        active_source_index_attestation=(active_source_index_attestation),
         active_feed_index=active_feed_index,
         active_feed_index_attestation=active_feed_index_attestation,
         resolved_feed=resolved_feed,
         resolved_feed_attestation=resolved_feed_attestation,
+        resolved_source_index=resolved_source_index,
+        resolved_source_index_attestation=(resolved_source_index_attestation),
         resolved_feed_index=resolved_feed_index,
         resolved_feed_index_attestation=(resolved_feed_index_attestation),
         active_notification=active_notification,
@@ -1311,7 +1453,7 @@ def _manifest_citation(
         "correlationReportId": report.report_id,
         "correlationReportDigest": report.report_digest,
         "incidentStateResultDigest": state.result_digest,
-        "clauseIds": ("synthetic-availability",),
+        "clauseIds": (publication.manifest.cited_clauses[0].clause_id,),
     }
     return _digest_bound_model(
         acceptance.Wc029ManifestCitationEvidence,
@@ -1495,6 +1637,10 @@ def _scenario_input_digest(
         return value.pointer_digest
     if isinstance(value, IncidentEnrichmentFeedPointerAttestation):
         return value.pointer_digest
+    if isinstance(value, ActiveIncidentIndex):
+        return sha256_hex(value.canonical_bytes())
+    if isinstance(value, ActiveIncidentIndexAttestation):
+        return value.index_digest
     if isinstance(value, IncidentFeedIndexV2):
         return sha256_hex(value.canonical_bytes())
     if isinstance(value, IncidentFeedIndexAttestationV2):
@@ -2282,6 +2428,30 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
     ]
     base_parameter_sha256 = "sha256:" + ("4" * 64)
     effective_parameter_sha256 = "sha256:" + ("5" * 64)
+    parameter_bindings_sha256 = sha256_hex(canonicalize_json({"location": "australiaeast"}))
+    what_if = {"status": "Succeeded", "properties": {"changes": []}}
+    what_if_sha256 = sha256_hex(_canonical_bytes(what_if))
+    orchestrator_sha256 = "sha256:" + ("6" * 64)
+    trusted_plan = acceptance.Wc029DeploymentPlanEvidence(
+        schemaVersion="athena.wc029DeploymentPlan.v1",
+        stage="foundation",
+        sourceCommit=_SOURCE_COMMIT,
+        subscriptionId="00000000-0000-0000-0000-000000000000",
+        location="australiaeast",
+        deploymentName="wc029-foundation-synthetic",
+        templatePath="infra/wc013-live-acceptance/main.bicep",
+        templateSha256=_TEMPLATE_DIGEST,
+        orchestratorSha256=orchestrator_sha256,
+        preflightSha256=acceptance._preflight_implementation_sha256(),
+        baseParameterPath="C:/synthetic/wc029.parameters.json",
+        baseParameterSha256=base_parameter_sha256,
+        effectiveParameterPath="C:/synthetic/foundation.parameters.json",
+        effectiveParameterSha256=effective_parameter_sha256,
+        whatIfPath="C:/synthetic/foundation.what-if.json",
+        whatIfSha256=what_if_sha256,
+        allowedChangeResourceIds=(),
+    )
+    trusted_plan_sha256 = sha256_hex(_model_bytes(trusted_plan))
     deployment = acceptance.Wc029DeploymentVersion(
         deploymentId="foundation",
         deploymentName="wc029-foundation-synthetic",
@@ -2292,7 +2462,11 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         templateSha256=_TEMPLATE_DIGEST,
         baseParameterSha256=base_parameter_sha256,
         effectiveParameterSha256=effective_parameter_sha256,
-        parameterBindingsSha256=sha256_hex(canonicalize_json({"location": "australiaeast"})),
+        parameterBindingsSha256=parameter_bindings_sha256,
+        planArtifactId="foundation-plan",
+        planArtifactSha256=trusted_plan_sha256,
+        orchestratorSha256=orchestrator_sha256,
+        allowedChangeResourceIds=(),
         upstreamHandoffs=(),
     )
     inventory = acceptance.Wc029VersionInventory(
@@ -2320,6 +2494,9 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             manifestVersion=publication.manifest.manifest_version,
             profileId=publication.manifest.profile_id,
             manifestDigest=publication.manifest.manifest_digest,
+            resolvedProfileDigest=(publication.manifest.resolved_profile_digest),
+            dependencyGraphDigest=(publication.manifest.dependency_graph_digest),
+            contextBindingPayloadDigest=(publication.manifest.context_binding_payload_digest),
             publicationStatus="published",
             manifestArtifactId=manifest_id,
             manifestArtifactSha256=artifact_digests[manifest_id],
@@ -2355,7 +2532,6 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
     )
     approved_inventory_sha256 = artifact_digests[inventory_id]
 
-    what_if = {"status": "Succeeded", "properties": {"changes": []}}
     what_if_id = add(
         "foundation-what-if",
         "deployment-what-if",
@@ -2363,25 +2539,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         global_evidence=True,
         deployment_id="foundation",
     )
-    plan = acceptance.Wc029DeploymentPlanEvidence(
-        schemaVersion="athena.wc029DeploymentPlan.v1",
-        stage=deployment.stage,
-        sourceCommit=_SOURCE_COMMIT,
-        subscriptionId=deployment.subscription_id,
-        location=deployment.location,
-        deploymentName=deployment.deployment_name,
-        templatePath=deployment.template_path,
-        templateSha256=deployment.template_sha256,
-        orchestratorSha256="sha256:" + ("6" * 64),
-        preflightSha256=acceptance._preflight_implementation_sha256(),
-        baseParameterPath="C:/synthetic/wc029.parameters.json",
-        baseParameterSha256=deployment.base_parameter_sha256,
-        effectiveParameterPath="C:/synthetic/foundation.parameters.json",
-        effectiveParameterSha256=deployment.effective_parameter_sha256,
-        whatIfPath="C:/synthetic/foundation.what-if.json",
-        whatIfSha256=artifact_digests[what_if_id],
-        allowedChangeResourceIds=(),
-    )
+    plan = trusted_plan
     plan_id = add(
         "foundation-plan",
         "deployment-plan",
@@ -2765,6 +2923,19 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 phase="observe",
                 binds_artifact_id=active_feed_id,
             )
+            active_source_index_id = add_scenario(
+                "source-index-active",
+                "source-index-active",
+                incident.active_source_index,
+                phase="observe",
+            )
+            add_scenario(
+                "source-index-active-attestation",
+                "source-index-active-attestation",
+                incident.active_source_index_attestation,
+                phase="observe",
+                binds_artifact_id=active_source_index_id,
+            )
             active_index_id = add_scenario(
                 "feed-index-active",
                 "feed-index-active",
@@ -2884,6 +3055,19 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 incident.resolved_feed_attestation,
                 phase="verify",
                 binds_artifact_id=resolved_feed_id,
+            )
+            resolved_source_index_id = add_scenario(
+                "source-index-resolved",
+                "source-index-resolved",
+                incident.resolved_source_index,
+                phase="verify",
+            )
+            add_scenario(
+                "source-index-resolved-attestation",
+                "source-index-resolved-attestation",
+                incident.resolved_source_index_attestation,
+                phase="verify",
+                binds_artifact_id=resolved_source_index_id,
             )
             resolved_index_id = add_scenario(
                 "feed-index-resolved",
@@ -4396,6 +4580,401 @@ def test_deployment_scope_parameters_handoffs_and_capabilities_are_trusted(
         match="unapproved named handoffs",
     ):
         _aggregate(upstream)
+
+
+@pytest.mark.parametrize(
+    ("field", "unreviewed_value"),
+    (
+        (
+            "allowedChangeResourceIds",
+            [
+                (
+                    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                    "resourceGroups/rg-unreviewed/providers/Microsoft.Compute/"
+                    "virtualMachines/unreviewed"
+                )
+            ],
+        ),
+        ("orchestratorSha256", "sha256:" + ("f" * 64)),
+    ),
+)
+def test_unreviewed_plan_cannot_reach_what_if_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    unreviewed_value: object,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    plan_path = bundle.artifact_paths["foundation-plan"]
+    plan = _read_json(plan_path)
+    plan[field] = unreviewed_value
+    _write(plan_path, plan)
+    evaluator_called = False
+
+    def unexpected_evaluator(
+        _document: object,
+        *,
+        allowed_change_ids: frozenset[str],
+    ) -> tuple[object, ...]:
+        nonlocal evaluator_called
+        evaluator_called = True
+        return ()
+
+    monkeypatch.setattr(acceptance, "evaluate_what_if", unexpected_evaluator)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="deployment plan foundation does not match inventory",
+    ):
+        _aggregate(bundle)
+
+    assert not evaluator_called
+
+
+def test_trusted_inventory_requires_exact_plan_pin_before_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    inventory_path = bundle.artifact_paths["version-inventory"]
+    inventory = _read_json(inventory_path)
+    inventory["deployments"][0].pop("planArtifactSha256")
+    _write(inventory_path, inventory)
+    bundle = replace(
+        bundle,
+        approved_inventory_sha256=sha256_hex(inventory_path.read_bytes()),
+    )
+    evaluator_called = False
+
+    def unexpected_evaluator(
+        _document: object,
+        *,
+        allowed_change_ids: frozenset[str],
+    ) -> tuple[object, ...]:
+        nonlocal evaluator_called
+        evaluator_called = True
+        return ()
+
+    monkeypatch.setattr(acceptance, "evaluate_what_if", unexpected_evaluator)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="version-inventory.*violates",
+    ):
+        _aggregate(bundle)
+
+    assert not evaluator_called
+
+
+def test_published_manifest_requires_canonical_profile_and_derived_digests(
+    tmp_path: Path,
+) -> None:
+    non_semver = _build_bundle(tmp_path / "non-semver")
+    manifest_path = non_semver.artifact_paths["published-manifest"]
+    manifest = _read_json(manifest_path)
+    manifest["manifestVersion"] = "2026.09.14.1"
+    manifest["manifestDocument"]["manifestVersion"] = "2026.09.14.1"
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="published-manifest.*violates",
+    ):
+        _aggregate(non_semver)
+
+    profile = _build_bundle(tmp_path / "profile")
+    manifest_path = profile.artifact_paths["published-manifest"]
+    manifest = _read_json(manifest_path)
+    manifest["profileId"] = "unapproved-profile"
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="published-manifest.*violates",
+    ):
+        _aggregate(profile)
+
+    for field in (
+        "resolvedProfileDigest",
+        "dependencyGraphDigest",
+        "contextBindingPayloadDigest",
+    ):
+        derived_digest = _build_bundle(tmp_path / field)
+        manifest_path = derived_digest.artifact_paths["published-manifest"]
+        manifest = _read_json(manifest_path)
+        manifest[field] = "sha256:" + ("f" * 64)
+        _write(manifest_path, manifest)
+        with pytest.raises(
+            acceptance.Wc029AcceptanceEvidenceError,
+            match="published-manifest.*violates",
+        ):
+            _aggregate(derived_digest)
+
+    clause_membership = _build_bundle(tmp_path / "clause-membership")
+    manifest_path = clause_membership.artifact_paths["published-manifest"]
+    manifest = _read_json(manifest_path)
+    manifest["citedClauses"][0]["clauseKind"] = "control"
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="published-manifest.*violates",
+    ):
+        _aggregate(clause_membership)
+
+    shadowed_clause = _build_bundle(tmp_path / "shadowed-clause")
+    manifest_path = shadowed_clause.artifact_paths["published-manifest"]
+    manifest = _read_json(manifest_path)
+    root_clause = manifest["manifestDocument"]["constraints"][0]
+    manifest["citedClauses"][0] = {
+        "clauseKind": "constraint",
+        "clauseId": root_clause["constraintId"],
+        "jsonPointer": "/constraints/0",
+        "clauseDigest": compute_artifact_digest(root_clause),
+    }
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="published-manifest.*violates",
+    ):
+        _aggregate(shadowed_clause)
+
+    authority_binding = _build_bundle(tmp_path / "authority-binding")
+    manifest_path = authority_binding.artifact_paths["published-manifest"]
+    manifest = _read_json(manifest_path)
+    context_binding = manifest["contextBinding"]
+    context_binding["requiredCoverageScopeDigests"] = ["sha256:" + ("e" * 64)]
+    binding_payload = dict(context_binding)
+    binding_payload.pop("bindingDigest")
+    context_binding["bindingDigest"] = compute_artifact_digest(binding_payload)
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="published-manifest.*violates",
+    ):
+        _aggregate(authority_binding)
+
+
+def test_v2_feed_indexes_require_signed_authoritative_v1_sources(
+    tmp_path: Path,
+) -> None:
+    missing = _build_bundle(tmp_path / "missing")
+    scenario = _scenario(missing, "web-tier-failure")
+    missing_ids = {
+        "scenario-web-tier-failure-source-index-active",
+        "scenario-web-tier-failure-source-index-active-attestation",
+    }
+    scenario["phases"]["observe"] = [
+        artifact_id
+        for artifact_id in scenario["phases"]["observe"]
+        if artifact_id not in missing_ids
+    ]
+    missing.index["artifacts"] = [
+        item for item in missing.index["artifacts"] if item["artifactId"] not in missing_ids
+    ]
+    for artifact_id in missing_ids:
+        missing.artifact_paths[artifact_id].unlink()
+    _rewrite_index(missing)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="acceptance index failed closed validation",
+    ):
+        _aggregate(missing)
+
+    substituted = _build_bundle(tmp_path / "substituted")
+    source_id = "scenario-web-tier-failure-source-index-active"
+    attestation_id = f"{source_id}-attestation"
+    source_path = substituted.artifact_paths[source_id]
+    source = ActiveIncidentIndex.model_validate_json(source_path.read_bytes())
+    changed_source = source.model_copy(
+        update={"published_at": source.published_at + timedelta(seconds=1)}
+    )
+    _write(source_path, changed_source)
+    signature = (
+        base64.urlsafe_b64encode(
+            substituted.private_keys["incident"].sign(
+                changed_source.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    _write(
+        substituted.artifact_paths[attestation_id],
+        ActiveIncidentIndexAttestation(
+            schemaVersion="athena.activeIncidentIndexAttestation.v1",
+            indexDigest=sha256_hex(changed_source.canonical_bytes()),
+            signatureAlgorithm="RS256",
+            keyVaultKeyId=substituted.keys["incident"].key_id,
+            detachedSignature=signature,
+        ),
+    )
+    _refresh_scenario_execution_binding(
+        substituted,
+        "web-tier-failure",
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="v2 feed indexes do not bind authoritative v1 source indexes",
+    ):
+        _aggregate(substituted)
+
+
+def test_private_snapshot_blocks_or_detects_restored_mtime_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    victim = bundle.artifact_paths["global-job-readback"]
+    original = victim.read_bytes()
+    original_stat = victim.stat()
+    replacement = bytes([original[0] ^ 1]) + original[1:]
+    assert len(replacement) == len(original)
+    real_read = acceptance._read_pinned_file
+    race_attempted = False
+    write_blocked = False
+    delete_blocked = False
+
+    def race_before_first_read(
+        pinned: acceptance._PinnedFileHandle,
+        *,
+        maximum_bytes: int,
+        label: str,
+    ) -> bytes:
+        nonlocal delete_blocked, race_attempted, write_blocked
+        if not race_attempted:
+            race_attempted = True
+            if os.name == "nt":
+                try:
+                    with victim.open("r+b", buffering=0):
+                        pass
+                except OSError:
+                    write_blocked = True
+                try:
+                    victim.unlink()
+                except OSError:
+                    delete_blocked = True
+            else:
+                with victim.open("r+b", buffering=0) as stream:
+                    stream.write(replacement)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    stream.seek(0)
+                    stream.write(original)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.utime(
+                    victim,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns,
+                    ),
+                )
+        return real_read(
+            pinned,
+            maximum_bytes=maximum_bytes,
+            label=label,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_read_pinned_file",
+        race_before_first_read,
+    )
+
+    if os.name == "nt":
+        _aggregate(bundle)
+        assert write_blocked
+        assert delete_blocked
+    else:
+        with pytest.raises(
+            acceptance.Wc029AcceptanceEvidenceError,
+            match="changed while its pinned handle|identity changed",
+        ):
+            _aggregate(bundle)
+        assert not write_blocked
+
+    assert race_attempted
+    assert victim.read_bytes() == original
+    assert victim.stat().st_size == original_stat.st_size
+    assert victim.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+
+def test_phase_windows_and_lifecycle_timestamps_are_strictly_ordered(
+    tmp_path: Path,
+) -> None:
+    zero_duration = _build_bundle(tmp_path / "zero-duration")
+    scenario = _scenario(zero_duration, "disk-capacity-pressure")
+    manifest_id = next(
+        artifact_id
+        for artifact_id in scenario["phases"]["verify"]
+        if _declaration(zero_duration, artifact_id)["evidenceClass"]
+        == "scenario-execution-manifest"
+    )
+    manifest_path = zero_duration.artifact_paths[manifest_id]
+    manifest = _read_json(manifest_path)
+    manifest["phaseWindows"][0]["completedAt"] = manifest["phaseWindows"][0]["startedAt"]
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="execution-manifest.*violates",
+    ):
+        _aggregate(zero_duration)
+
+    adjacent = _build_bundle(tmp_path / "adjacent")
+    scenario = _scenario(adjacent, "disk-capacity-pressure")
+    manifest_id = next(
+        artifact_id
+        for artifact_id in scenario["phases"]["verify"]
+        if _declaration(adjacent, artifact_id)["evidenceClass"] == "scenario-execution-manifest"
+    )
+    manifest_path = adjacent.artifact_paths[manifest_id]
+    manifest = _read_json(manifest_path)
+    manifest["phaseWindows"][0]["completedAt"] = manifest["phaseWindows"][1]["startedAt"]
+    _write(manifest_path, manifest)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="execution-manifest.*violates",
+    ):
+        _aggregate(adjacent)
+
+    equal_lifecycle = _build_bundle(tmp_path / "equal-lifecycle")
+    scenario_class = "disk-capacity-pressure"
+    recovered_id = f"scenario-{scenario_class}-recovered-state"
+    execution_id = f"scenario-{scenario_class}-verify-execution"
+    readback_id = f"scenario-{scenario_class}-verify-readback"
+    proof_id = f"scenario-{scenario_class}-recovery-proof"
+    recovered_state = acceptance.Wc029ResourceStateEvidence.model_validate_json(
+        equal_lifecycle.artifact_paths[recovered_id].read_bytes()
+    )
+    execution_path = equal_lifecycle.artifact_paths[execution_id]
+    execution = _read_json(execution_path)
+    execution["startedAt"] = recovered_state.captured_at.isoformat().replace("+00:00", "Z")
+    execution_payload = dict(execution)
+    execution_payload.pop("executionDigest")
+    execution["executionDigest"] = compute_artifact_digest(execution_payload)
+    _write(execution_path, execution)
+
+    readback_path = equal_lifecycle.artifact_paths[readback_id]
+    readback = _read_json(readback_path)
+    readback["executionDigest"] = execution["executionDigest"]
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+
+    proof_path = equal_lifecycle.artifact_paths[proof_id]
+    proof = _read_json(proof_path)
+    proof["postRecoveryJobReadback"]["contentSha256"] = sha256_hex(readback_path.read_bytes())
+    _write(proof_path, proof)
+    _refresh_scenario_execution_binding(
+        equal_lifecycle,
+        scenario_class,
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="chronology is not strictly ordered",
+    ):
+        _aggregate(equal_lifecycle)
 
 
 def test_incident_state_digest_and_recursive_json_fail_closed(
