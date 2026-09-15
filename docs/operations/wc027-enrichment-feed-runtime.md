@@ -111,14 +111,19 @@ container/table IDs with the Job resource ID for the root readiness gate. The pr
 creates no guidance-authority bytes and grants no authority writer role.
 
 Deployment verification derives an exact assignment-ID-to-principal, scope, role-definition, and
-condition mapping for every RBAC assignment emitted by both WC-027 roots. Principal swaps and any
-extra, missing, or differently conditioned assignment fail closed. Every assignment whose resolved
-role permissions include Blob read — including the custom feed-v2 writer role — must retain
-condition version `2.0` and the exact canonical no-`Blob.List` expression; absent, altered, or
-duplicated condition forms fail closed. It also requires the producer trigger, publisher request,
-and notification outbox queues to be `Active`, non-forwarding, explicitly non-auto-deleting, and to
-match their exact stage-specific session, duplicate-detection window, TTL, lock, delivery-count,
-capacity, batching, partitioning, and message-size profiles.
+condition mapping for every RBAC assignment emitted by both WC-027 roots. Each custom role is also
+bound to exact per-assignment `actions`, `notActions`, `dataActions`, and `notDataActions` sets, so
+a sign-only role cannot replace a verification role and a verification role cannot replace the
+binding signer. Principal swaps and any extra, missing, differently conditioned, or permission-
+swapped assignment fail closed. Every assignment whose resolved role permissions include Blob read
+— including the custom feed-v2 writer role — must retain condition version `2.0` and the exact
+canonical no-`Blob.List` expression; absent, altered, or duplicated condition forms fail closed.
+Effective RBAC includes every transitive Microsoft Entra group membership and each group’s direct,
+descendant, and inherited assignments; incomplete membership or assignment pagination fails
+closed. It also requires the producer trigger, publisher request, and notification outbox queues
+to be `Active`, non-forwarding, explicitly non-auto-deleting, and to match their exact
+stage-specific session, duplicate-detection window, TTL, lock, delivery-count, capacity, batching,
+partitioning, and message-size profiles.
 
 For WC-029 deployment, do not deploy this root as an untracked side step. Use the governed
 foundation -> producer -> publisher -> live-acceptance sequence in
@@ -143,6 +148,9 @@ publisher:
 - the `Wc027GuidanceActivation` Table;
 - one event-triggered Container Apps Job with distinct broker, authority reader/writer,
   activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
+- publisher ACR pull deployed in the exact registry resource group derived from
+  `registryResourceId` (`rg-athena-platform-dev` in the fixed topology), rather than in the runtime
+  resource group;
 - a create-only authority Blob identity plus a separate exact-version readback identity;
 - Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
 - exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
@@ -260,6 +268,11 @@ rejected. The publisher must be ready and the WC-016 runtime must be enabled.
 - Notification enqueue uncertainty: abandon the trigger. A retry reconstructs and verifies the
   feed and emits the same deterministic Notification v2 ID; Service Bus duplicate detection
   suppresses a prior successful enqueue.
+- Publisher deployment recovery, publisher retry, and later producer upgrades may encounter the
+  already-created publisher sender assignment on `wc027-enrichment-feed-requests`. Producer
+  verification accepts only the deterministic exact assignment ID and revalidates its broker
+  principal, queue scope, Service Bus Data Sender role, principal type, and absent condition.
+  Fresh deployment requires no such assignment, and no broad publisher RBAC exemption is allowed.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.

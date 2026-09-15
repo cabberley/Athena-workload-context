@@ -222,9 +222,17 @@ allowlist and rerun the gate.
 
 ## Phase 3: effective RBAC
 
-Record both assignment sets for every managed identity. `--all` enumerates assignments at or below
-the subscription but does not return parent management-group grants, so run the scoped inherited
-query separately and review the de-duplicated union by assignment ID:
+The deployment operator must be able to call Microsoft Graph with `Application.Read.All`.
+For every managed-identity service principal, first enumerate
+`/servicePrincipals/{id}/transitiveMemberOf/microsoft.graph.group` with `$count=true`, follow every
+`@odata.nextLink`, and require the final unique group count to match `@odata.count`. Missing
+permissions, unavailable pages, cycles, untrusted continuation URLs, duplicate groups, or a
+truncated count fail closed.
+
+Record both assignment sets for the service principal and for every resolved transitive group.
+`--all` enumerates assignments at or below the subscription but does not return parent
+management-group grants, so run the scoped inherited query separately and review the
+de-duplicated union by assignment ID:
 
 ```powershell
 $atOrBelowSubscription = az role assignment list `
@@ -254,6 +262,11 @@ Required separation:
 Without separate reviewed management-group hierarchy evidence, treat every assignment returned by
 the inherited query at a management-group scope as applying to every governed subscription
 resource and reject it unless that exact assignment is explicitly reviewed.
+
+The orchestrator performs these membership and assignment queries itself. Azure CLI must return a
+fully materialized assignment array for every principal and group; a leaked continuation object,
+malformed response, or unavailable assignment query fails closed rather than being interpreted as
+an empty page.
 
 ## Phase 4: deploy
 
@@ -326,16 +339,27 @@ continuing with the mis-tagged Job. Apply also rejects a non-succeeded deploymen
 root output, mismatched queue/container/table/key output, unexpected Job identity, tag, command,
 scaler, registry, environment, init container, volume, secret, secret reference, or secret-backed
 authentication; any RBAC assignment whose exact assignment ID is not bound to its reviewed
-principal, scope, role definition, and condition; any effective broad inherited grant on a
-governed identity; any unreviewed effective assignment intersecting a governed WC-027 scope for
-any attached, submitter, or reader identity; any unreviewed management-group assignment, which is
-conservatively treated as inherited by every governed resource unless separate reviewed hierarchy
-evidence is introduced; any public/non-RBAC parent Key Vault behind an external trust key; any
-assignment whose resolved role permissions include Blob read without the exact canonical
-condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact Active,
-non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource ID
-before validation or what-if; and any final WC-013 readiness readback that differs from the two
+principal, scope, role definition, condition, and — for a custom role — exact `actions`,
+`notActions`, `dataActions`, and `notDataActions` sets; any effective broad inherited or transitive
+group-derived grant on a governed identity; any unreviewed effective assignment intersecting a
+governed WC-027 scope for any attached, submitter, or reader identity; any unreviewed
+management-group assignment, which is conservatively treated as inherited by every governed
+resource unless separate reviewed hierarchy evidence is introduced; incomplete Microsoft Graph
+membership or Azure assignment evidence; any public/non-RBAC parent Key Vault behind an external
+trust key; any assignment whose resolved role permissions include Blob read without the exact
+canonical condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact
+Active, non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource
+ID before validation or what-if; and any final WC-013 readiness readback that differs from the two
 accepted WC-027 handoffs.
+
+The publisher ACR pull module is deployed at the exact subscription and resource group parsed from
+`registryResourceId`; for the fixed topology this is `rg-athena-platform-dev`, not the WC-027
+runtime resource group. Producer verification also models the publisher transition explicitly.
+Before a publisher exists, no extra sender assignment is required. During partial recovery,
+publisher retry, or a later producer upgrade, only the deterministic assignment ID produced by
+`guid(triggerQueue.id, brokerIdentity.id, serviceBusDataSenderRoleDefinitionId)` is accepted, and
+its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
+No other publisher-binding assignment or role-ID allowlist is admitted.
 
 ### Publisher invocation boundary
 

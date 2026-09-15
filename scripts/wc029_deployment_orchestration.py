@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from uuid import UUID
+from uuid import UUID, uuid5
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -44,6 +44,10 @@ TEMPLATES = {
 }
 SUBSCRIPTION_STAGES = frozenset({"foundation", "live-acceptance"})
 SHA256_PREFIX = "sha256:"
+ARM_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
+GRAPH_HOST = "graph.microsoft.com"
+MAX_TRANSITIVE_GROUPS = 10_000
+MAX_GRAPH_MEMBERSHIP_PAGES = 128
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
 PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v2"
 HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v2"
@@ -291,6 +295,14 @@ class OrchestrationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class _RolePermissionProfile:
+    actions: frozenset[str] = frozenset()
+    not_actions: frozenset[str] = frozenset()
+    data_actions: frozenset[str] = frozenset()
+    not_data_actions: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
 class _ExpectedRoleAssignment:
     label: str
     principal_id: str
@@ -298,6 +310,7 @@ class _ExpectedRoleAssignment:
     role_definition_id: str
     condition_version: str | None = None
     condition: str | None = None
+    custom_role_permissions: _RolePermissionProfile | None = None
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -2372,6 +2385,20 @@ TABLE_DATA_CONTRIBUTOR_ROLE_ID = "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
 TABLE_DATA_READER_ROLE_ID = "76199698-9eea-4c19-bc75-cec21354c6b6"
 KEY_VAULT_CRYPTO_USER_ROLE_ID = "12338af0-0e69-4776-bea7-57ae8d297424"
 BLOB_READ_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+BLOB_WRITE_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+BLOB_ADD_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+TABLE_ENTITY_READ_DATA_ACTION = (
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read"
+)
+TABLE_ENTITY_ADD_DATA_ACTION = (
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action"
+)
+TABLE_ENTITY_UPDATE_DATA_ACTION = (
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action"
+)
+KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
+KEY_VERIFY_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/verify/action"
+KEY_SIGN_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/sign/action"
 BUILT_IN_DATA_ROLE_IDS = frozenset(
     {
         ACR_PULL_ROLE_ID,
@@ -2387,29 +2414,32 @@ BLOB_LIST_DENY_CONDITION = (
     "(!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/"
     "containers/blobs/read'} AND SubOperationMatches{'Blob.List'}))"
 )
-ALLOWED_CUSTOM_DATA_ACTIONS = frozenset(
+FEED_BLOB_WRITER_PERMISSION_PROFILE = _RolePermissionProfile(
+    data_actions=frozenset({BLOB_READ_DATA_ACTION, BLOB_WRITE_DATA_ACTION})
+)
+IMMUTABLE_BLOB_CREATOR_PERMISSION_PROFILE = _RolePermissionProfile(
+    data_actions=frozenset({BLOB_ADD_DATA_ACTION})
+)
+TABLE_CAS_PERMISSION_PROFILE = _RolePermissionProfile(
+    data_actions=frozenset(
+        {
+            TABLE_ENTITY_READ_DATA_ACTION,
+            TABLE_ENTITY_ADD_DATA_ACTION,
+            TABLE_ENTITY_UPDATE_DATA_ACTION,
+        }
+    )
+)
+KEY_VERIFY_PERMISSION_PROFILE = _RolePermissionProfile(
+    data_actions=frozenset({KEY_READ_DATA_ACTION, KEY_VERIFY_DATA_ACTION})
+)
+KEY_SIGN_PERMISSION_PROFILE = _RolePermissionProfile(data_actions=frozenset({KEY_SIGN_DATA_ACTION}))
+APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES = frozenset(
     {
-        frozenset(
-            {
-                BLOB_READ_DATA_ACTION,
-                "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
-            }
-        ),
-        frozenset({"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"}),
-        frozenset(
-            {
-                "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read",
-                "Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action",
-                "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action",
-            }
-        ),
-        frozenset(
-            {
-                "Microsoft.KeyVault/vaults/keys/read",
-                "Microsoft.KeyVault/vaults/keys/verify/action",
-            }
-        ),
-        frozenset({"Microsoft.KeyVault/vaults/keys/sign/action"}),
+        FEED_BLOB_WRITER_PERMISSION_PROFILE,
+        IMMUTABLE_BLOB_CREATOR_PERMISSION_PROFILE,
+        TABLE_CAS_PERMISSION_PROFILE,
+        KEY_VERIFY_PERMISSION_PROFILE,
+        KEY_SIGN_PERMISSION_PROFILE,
     }
 )
 ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE = {
@@ -2431,41 +2461,18 @@ ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE = {
     ),
     "microsoft.keyvault/vaults/keys": frozenset({KEY_VAULT_CRYPTO_USER_ROLE_ID}),
 }
-ALLOWED_CUSTOM_ACTIONS_BY_SCOPE_TYPE = {
+ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE = {
     "microsoft.storage/storageaccounts/blobservices/containers": frozenset(
         {
-            frozenset(
-                {
-                    BLOB_READ_DATA_ACTION,
-                    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
-                }
-            ),
-            frozenset(
-                {"Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"}
-            ),
+            FEED_BLOB_WRITER_PERMISSION_PROFILE,
+            IMMUTABLE_BLOB_CREATOR_PERMISSION_PROFILE,
         }
     ),
     "microsoft.storage/storageaccounts/tableservices/tables": frozenset(
-        {
-            frozenset(
-                {
-                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read",
-                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action",
-                    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action",
-                }
-            )
-        }
+        {TABLE_CAS_PERMISSION_PROFILE}
     ),
     "microsoft.keyvault/vaults/keys": frozenset(
-        {
-            frozenset(
-                {
-                    "Microsoft.KeyVault/vaults/keys/read",
-                    "Microsoft.KeyVault/vaults/keys/verify/action",
-                }
-            ),
-            frozenset({"Microsoft.KeyVault/vaults/keys/sign/action"}),
-        }
+        {KEY_VERIFY_PERMISSION_PROFILE, KEY_SIGN_PERMISSION_PROFILE}
     ),
 }
 
@@ -2542,6 +2549,12 @@ def _verify_identities(
         if normalized_resource_id in rbac_identity_ids:
             principal_ids[normalized_resource_id] = principal_id
     return principal_ids
+
+
+def _arm_guid(*values: str) -> str:
+    if not values or any(not value for value in values):
+        raise OrchestrationError("ARM guid inputs must be non-empty strings")
+    return str(uuid5(ARM_GUID_NAMESPACE, "-".join(values)))
 
 
 def _built_in_role_definition_id(subscription_id: str, role_id: str) -> str:
@@ -2626,6 +2639,7 @@ def _expected_role_assignment(
     role_definition_id: str,
     condition_version: str | None = None,
     condition: str | None = None,
+    custom_role_permissions: _RolePermissionProfile | None = None,
 ) -> _ExpectedRoleAssignment:
     return _ExpectedRoleAssignment(
         label=label,
@@ -2638,6 +2652,7 @@ def _expected_role_assignment(
         role_definition_id=role_definition_id,
         condition_version=condition_version,
         condition=condition,
+        custom_role_permissions=custom_role_permissions,
     )
 
 
@@ -2915,6 +2930,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=feed_container_id,
             role_definition_id=role_definition_ids[0],
+            custom_role_permissions=FEED_BLOB_WRITER_PERMISSION_PROFILE,
             **blob_condition,
         ),
         _expected_role_assignment(
@@ -3007,6 +3023,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=incident_key_id,
             role_definition_id=role_definition_ids[1],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "producer correlation-binding key verifier",
@@ -3014,6 +3031,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=correlation_binding_key_id,
             role_definition_id=role_definition_ids[2],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "producer guidance-binding key verifier",
@@ -3021,6 +3039,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=guidance_binding_key_id,
             role_definition_id=role_definition_ids[3],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "producer change key verifier",
@@ -3028,6 +3047,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=change_key_id,
             role_definition_id=role_definition_ids[4],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "producer monitoring-intent key verifier",
@@ -3035,6 +3055,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=monitoring_intent_key_id,
             role_definition_id=role_definition_ids[5],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "producer monitoring-collector key verifier",
@@ -3042,6 +3063,7 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=monitoring_collector_key_id,
             role_definition_id=role_definition_ids[6],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
     ]
     for name, scope in (
@@ -3086,6 +3108,47 @@ def _producer_expected_rbac_assignments(
         expected,
         root_name="producer",
     )
+
+
+def _prospective_publisher_sender_assignment(
+    *,
+    configuration: Mapping[str, object],
+    outputs: Mapping[str, object],
+    principal_ids_by_identity: Mapping[str, str],
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    service_bus = _mapping(
+        configuration.get("serviceBus"),
+        field="producer service bus",
+    )
+    broker_identity_id = _azure_resource_id(
+        service_bus.get("brokerIdentityResourceId"),
+        field="producer broker identity",
+    )
+    trigger_queue_id = _azure_resource_id(
+        outputs.get("triggerQueueResourceId"),
+        field="producer trigger queue resource ID",
+    )
+    assignment_name = _arm_guid(
+        trigger_queue_id,
+        broker_identity_id,
+        SERVICE_BUS_DATA_SENDER_ROLE_ID,
+    )
+    assignment_id = (
+        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+    )
+    return {
+        assignment_id.casefold(): _expected_role_assignment(
+            "prospective publisher producer-trigger sender",
+            identity_resource_id=broker_identity_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=trigger_queue_id,
+            role_definition_id=_built_in_role_definition_id(
+                subscription_id,
+                SERVICE_BUS_DATA_SENDER_ROLE_ID,
+            ),
+        )
+    }
 
 
 def _publisher_expected_rbac_assignments(
@@ -3228,6 +3291,7 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=authority_container_id,
             role_definition_id=role_definition_ids[0],
+            custom_role_permissions=IMMUTABLE_BLOB_CREATOR_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "publisher authority reader",
@@ -3243,6 +3307,7 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=activation_table_id,
             role_definition_id=role_definition_ids[1],
+            custom_role_permissions=TABLE_CAS_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "publisher request key verifier",
@@ -3250,6 +3315,7 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=request_key_id,
             role_definition_id=role_definition_ids[2],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "publisher binding key verifier",
@@ -3257,6 +3323,7 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=binding_key_id,
             role_definition_id=role_definition_ids[3],
+            custom_role_permissions=KEY_VERIFY_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "publisher binding signer",
@@ -3264,6 +3331,7 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=binding_key_id,
             role_definition_id=role_definition_ids[4],
+            custom_role_permissions=KEY_SIGN_PERMISSION_PROFILE,
         ),
         _expected_role_assignment(
             "publisher registry pull",
@@ -3319,23 +3387,32 @@ def _role_assignment_scope(resource_id: str) -> str:
     return resource_id[: normalized.rindex(marker)]
 
 
-def _verify_custom_role(resource: Mapping[str, object]) -> frozenset[str]:
+def _verify_custom_role(resource: Mapping[str, object]) -> _RolePermissionProfile:
     properties = _mapping(resource.get("properties"), field="custom role properties")
     permissions = properties.get("permissions")
     if not isinstance(permissions, list) or len(permissions) != 1:
         raise OrchestrationError("custom role must contain exactly one permission block")
     permission = _mapping(permissions[0], field="custom role permission")
-    for field in ("actions", "notActions", "notDataActions"):
-        if permission.get(field) not in (None, []):
-            raise OrchestrationError(f"custom data role has unexpected {field}")
-    data_actions = permission.get("dataActions")
-    if not isinstance(data_actions, list) or any(
-        not isinstance(item, str) for item in data_actions
-    ):
-        raise OrchestrationError("custom data role has invalid data actions")
-    if frozenset(data_actions) not in ALLOWED_CUSTOM_DATA_ACTIONS:
+
+    def permission_set(json_field: str) -> frozenset[str]:
+        values = permission.get(json_field)
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item for item in values
+        ):
+            raise OrchestrationError(f"custom role {json_field} must be a string array")
+        if len(set(values)) != len(values):
+            raise OrchestrationError(f"custom role {json_field} must contain distinct values")
+        return frozenset(values)
+
+    profile = _RolePermissionProfile(
+        actions=permission_set("actions"),
+        not_actions=permission_set("notActions"),
+        data_actions=permission_set("dataActions"),
+        not_data_actions=permission_set("notDataActions"),
+    )
+    if profile not in APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES:
         raise OrchestrationError("custom data role permissions do not match an approved profile")
-    return frozenset(data_actions)
+    return profile
 
 
 def _verify_rbac_resources(
@@ -3372,7 +3449,7 @@ def _verify_rbac_resources(
             field="RBAC resource readback",
         )
         resources[resource_id.casefold()] = resource
-    custom_roles: dict[str, frozenset[str]] = {}
+    custom_roles: dict[str, _RolePermissionProfile] = {}
     for resource_id in resource_ids:
         normalized_id = resource_id.casefold()
         if "/providers/microsoft.authorization/roledefinitions/" in normalized_id:
@@ -3428,9 +3505,24 @@ def _verify_rbac_resources(
                 f"{expected.label} role assignment principal type must be ServicePrincipal"
             )
 
-        custom_actions = custom_roles.get(role_definition_id.casefold())
+        custom_permissions = custom_roles.get(role_definition_id.casefold())
+        if expected.custom_role_permissions is None and custom_permissions is not None:
+            raise OrchestrationError(
+                f"{expected.label} unexpectedly references a custom role definition"
+            )
+        if expected.custom_role_permissions is not None:
+            if custom_permissions is None:
+                raise OrchestrationError(
+                    f"{expected.label} does not reference its exact custom role definition"
+                )
+            if custom_permissions != expected.custom_role_permissions:
+                raise OrchestrationError(
+                    f"{expected.label} custom role does not match its exact "
+                    "per-assignment permission profile"
+                )
         grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
-            custom_actions is not None and BLOB_READ_DATA_ACTION in custom_actions
+            custom_permissions is not None
+            and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
         )
         if grants_blob_read and (
             properties.get("conditionVersion") != "2.0"
@@ -3459,15 +3551,15 @@ def _verify_rbac_resources(
                     "role assignment role does not match its exact resource scope"
                 )
             continue
-        if custom_actions is None:
+        if custom_permissions is None:
             raise OrchestrationError(
                 "role assignment references a custom role outside the deployment binding"
             )
-        allowed_custom_actions = ALLOWED_CUSTOM_ACTIONS_BY_SCOPE_TYPE.get(
+        allowed_custom_profiles = ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE.get(
             scope_type,
             frozenset(),
         )
-        if custom_actions not in allowed_custom_actions:
+        if custom_permissions not in allowed_custom_profiles:
             raise OrchestrationError(
                 "custom role permissions do not match the assignment resource scope"
             )
@@ -3475,6 +3567,230 @@ def _verify_rbac_resources(
     if used_custom_roles != set(custom_roles):
         raise OrchestrationError("deployment binding contains an unused or unassigned custom role")
     return assignment_ids_by_principal
+
+
+def _verify_present_expected_assignments(
+    expected_assignments: Mapping[str, _ExpectedRoleAssignment],
+    *,
+    subscription_id: str,
+) -> dict[str, set[str]]:
+    verified: dict[str, set[str]] = {}
+    assignments_by_scope: dict[str, set[str]] = {}
+    for assignment_id, expected in expected_assignments.items():
+        normalized_scope = expected.scope.casefold()
+        scoped_assignment_ids = assignments_by_scope.get(normalized_scope)
+        if scoped_assignment_ids is None:
+            scoped_assignments = _run_json(
+                [
+                    "az",
+                    "role",
+                    "assignment",
+                    "list",
+                    "--subscription",
+                    subscription_id,
+                    "--scope",
+                    expected.scope,
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                field=f"role assignments at prospective scope {expected.scope}",
+            )
+            scoped_assignment_ids = {
+                _string(
+                    assignment.get("id"),
+                    field="prospective scope role assignment ID",
+                ).casefold()
+                for assignment in _merge_effective_role_assignment_documents(
+                    [scoped_assignments],
+                    field="prospective scope role assignments",
+                )
+            }
+            assignments_by_scope[normalized_scope] = scoped_assignment_ids
+        if assignment_id not in scoped_assignment_ids:
+            continue
+        assignment_binding = {"rbacResourceIds": [assignment_id]}
+        assignment_verified = _verify_rbac_resources(
+            assignment_binding,
+            expected_assignments={assignment_id: expected},
+            subscription_id=subscription_id,
+        )
+        for principal_id, assignment_ids in assignment_verified.items():
+            verified.setdefault(principal_id, set()).update(assignment_ids)
+    return verified
+
+
+def _canonical_directory_object_id(value: object, *, field: str) -> str:
+    object_id = _string(value, field=field)
+    try:
+        return str(UUID(object_id))
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} must be one directory object UUID") from exc
+
+
+def _validate_graph_membership_url(url: str, *, principal_id: str) -> None:
+    parsed = urlparse(url)
+    expected_path = (
+        f"/v1.0/servicePrincipals/{principal_id}/transitiveMemberOf/microsoft.graph.group"
+    )
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != GRAPH_HOST
+        or parsed.path.casefold() != expected_path.casefold()
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise OrchestrationError(
+            "Microsoft Graph group-membership pagination returned an untrusted continuation URL"
+        )
+
+
+def _transitive_group_ids(principal_id: str) -> set[str]:
+    canonical_principal_id = _canonical_directory_object_id(
+        principal_id,
+        field="managed identity principal ID",
+    )
+    next_url: str | None = (
+        f"https://{GRAPH_HOST}/v1.0/servicePrincipals/{canonical_principal_id}/"
+        "transitiveMemberOf/microsoft.graph.group"
+        "?$select=id&$count=true&$top=999"
+    )
+    expected_count: int | None = None
+    group_ids: set[str] = set()
+    seen_urls: set[str] = set()
+    page_number = 0
+    while next_url is not None:
+        page_number += 1
+        if page_number > MAX_GRAPH_MEMBERSHIP_PAGES:
+            raise OrchestrationError(
+                "Microsoft Graph group-membership pagination exceeded its page bound"
+            )
+        _validate_graph_membership_url(
+            next_url,
+            principal_id=canonical_principal_id,
+        )
+        if next_url in seen_urls:
+            raise OrchestrationError("Microsoft Graph group-membership pagination contains a cycle")
+        seen_urls.add(next_url)
+        page = _mapping(
+            _run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    next_url,
+                    "--headers",
+                    "ConsistencyLevel=eventual",
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                field=(
+                    "transitive Microsoft Entra group memberships for "
+                    f"{canonical_principal_id} page {page_number}"
+                ),
+            ),
+            field="Microsoft Graph group-membership page",
+        )
+        page_count = page.get("@odata.count")
+        if page_number == 1:
+            if (
+                not isinstance(page_count, int)
+                or isinstance(page_count, bool)
+                or page_count < 0
+                or page_count > MAX_TRANSITIVE_GROUPS
+            ):
+                raise OrchestrationError(
+                    "Microsoft Graph group-membership response is missing a "
+                    "bounded authoritative count"
+                )
+            expected_count = page_count
+        elif page_count is not None and page_count != expected_count:
+            raise OrchestrationError("Microsoft Graph group-membership count changed across pages")
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise OrchestrationError(
+                "Microsoft Graph group-membership page must contain a value array"
+            )
+        for index, raw_group in enumerate(values):
+            group = _mapping(
+                raw_group,
+                field=f"Microsoft Graph group-membership item {index}",
+            )
+            object_type = group.get("@odata.type")
+            if object_type not in (None, "#microsoft.graph.group"):
+                raise OrchestrationError(
+                    "Microsoft Graph transitive membership returned a non-group object"
+                )
+            group_id = _canonical_directory_object_id(
+                group.get("id"),
+                field="Microsoft Graph group ID",
+            )
+            if group_id in group_ids:
+                raise OrchestrationError(
+                    "Microsoft Graph group-membership pages contain a duplicate group"
+                )
+            group_ids.add(group_id)
+            if len(group_ids) > MAX_TRANSITIVE_GROUPS:
+                raise OrchestrationError(
+                    "Microsoft Graph group membership exceeds its bounded maximum"
+                )
+        continuation = page.get("@odata.nextLink")
+        if continuation is None:
+            next_url = None
+        elif not isinstance(continuation, str) or not continuation:
+            raise OrchestrationError("Microsoft Graph group-membership continuation is invalid")
+        else:
+            next_url = continuation
+    if expected_count is None or len(group_ids) != expected_count:
+        raise OrchestrationError("Microsoft Graph group-membership pagination is incomplete")
+    return group_ids
+
+
+def _merge_effective_role_assignment_documents(
+    documents: Sequence[object],
+    *,
+    field: str,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for document_index, document in enumerate(documents):
+        if not isinstance(document, list):
+            raise OrchestrationError(f"{field} document {document_index} must be an array")
+        for assignment_index, raw_assignment in enumerate(document):
+            assignment = _mapping(
+                raw_assignment,
+                field=f"{field} document {document_index} item {assignment_index}",
+            )
+            assignment_id = _string(
+                assignment.get("id"),
+                field=f"{field} assignment ID",
+            ).casefold()
+            existing = merged.get(assignment_id)
+            if existing is None:
+                merged[assignment_id] = assignment
+                continue
+            for property_name in (
+                "principalId",
+                "roleDefinitionId",
+                "roleDefinitionName",
+                "scope",
+            ):
+                existing_value = existing.get(property_name)
+                incoming_value = assignment.get(property_name)
+                if (
+                    existing_value not in (None, "")
+                    and incoming_value not in (None, "")
+                    and str(existing_value).casefold() != str(incoming_value).casefold()
+                ):
+                    raise OrchestrationError(
+                        f"{field} returned conflicting duplicate assignment {assignment_id}"
+                    )
+                if existing_value in (None, "") and incoming_value not in (None, ""):
+                    existing[property_name] = incoming_value
+    return list(merged.values())
 
 
 def _effective_role_assignments(
@@ -3522,42 +3838,37 @@ def _effective_role_assignments(
             field=f"{field} inherited from subscription ancestors",
         ),
     )
-    merged: dict[str, dict[str, Any]] = {}
-    for document in query_documents:
-        if not isinstance(document, list):
-            raise OrchestrationError(f"{field} must be an array")
-        for index, raw_assignment in enumerate(document):
-            assignment = _mapping(
-                raw_assignment,
-                field=f"{field} item {index}",
+    return _merge_effective_role_assignment_documents(
+        query_documents,
+        field=field,
+    )
+
+
+def _resolved_effective_role_assignments(
+    principal_id: str,
+    *,
+    subscription_id: str,
+    field: str,
+) -> list[dict[str, Any]]:
+    documents: list[object] = [
+        _effective_role_assignments(
+            principal_id,
+            subscription_id=subscription_id,
+            field=f"{field} for service principal {principal_id}",
+        )
+    ]
+    for group_id in sorted(_transitive_group_ids(principal_id)):
+        documents.append(
+            _effective_role_assignments(
+                group_id,
+                subscription_id=subscription_id,
+                field=f"{field} for transitive group {group_id}",
             )
-            assignment_id = _string(
-                assignment.get("id"),
-                field=f"{field} assignment ID",
-            ).casefold()
-            existing = merged.get(assignment_id)
-            if existing is None:
-                merged[assignment_id] = assignment
-                continue
-            for property_name in (
-                "principalId",
-                "roleDefinitionId",
-                "roleDefinitionName",
-                "scope",
-            ):
-                existing_value = existing.get(property_name)
-                incoming_value = assignment.get(property_name)
-                if (
-                    existing_value not in (None, "")
-                    and incoming_value not in (None, "")
-                    and str(existing_value).casefold() != str(incoming_value).casefold()
-                ):
-                    raise OrchestrationError(
-                        f"{field} returned conflicting duplicate assignment {assignment_id}"
-                    )
-                if existing_value in (None, "") and incoming_value not in (None, ""):
-                    existing[property_name] = incoming_value
-    return list(merged.values())
+        )
+    return _merge_effective_role_assignment_documents(
+        documents,
+        field=field,
+    )
 
 
 def _verify_no_broad_effective_assignments(
@@ -3567,7 +3878,7 @@ def _verify_no_broad_effective_assignments(
 ) -> dict[str, list[dict[str, Any]]]:
     assignments_by_principal: dict[str, list[dict[str, Any]]] = {}
     for principal_id in sorted(principal_ids):
-        assignments = _effective_role_assignments(
+        assignments = _resolved_effective_role_assignments(
             principal_id,
             subscription_id=subscription_id,
             field=f"effective role assignments for {principal_id}",
@@ -3578,17 +3889,6 @@ def _verify_no_broad_effective_assignments(
             details = "; ".join(f"{item.code}: {item.detail}" for item in violations)
             raise OrchestrationError(f"governed identity has prohibited broad RBAC: {details}")
     return assignments_by_principal
-
-
-def _role_assignment_ids(binding: Mapping[str, object]) -> set[str]:
-    return {
-        resource_id.casefold()
-        for resource_id in _string_list(
-            binding.get("rbacResourceIds"),
-            field="deployment binding RBAC resource IDs",
-        )
-        if "/providers/microsoft.authorization/roleassignments/" in resource_id.casefold()
-    }
 
 
 def _governed_rbac_scopes(assignment_ids: set[str]) -> set[str]:
@@ -3618,46 +3918,38 @@ def _scopes_overlap(first: str, second: str) -> bool:
 def _verify_exact_effective_assignments(
     expected_assignments_by_principal: Mapping[str, set[str]],
     *,
-    additional_allowed_assignment_ids: set[str],
+    additional_allowed_assignments_by_principal: Mapping[str, set[str]],
     subscription_id: str,
     effective_assignments_by_principal: Mapping[str, list[dict[str, Any]]] | None = None,
 ) -> None:
-    additional_assignment_ids_by_principal: dict[str, set[str]] = {}
-    for assignment_id in sorted(additional_allowed_assignment_ids):
-        assignment = _get_resource(
-            assignment_id,
-            subscription_id=subscription_id,
-        )
-        _require_resource_id_equal(
-            assignment.get("id"),
-            assignment_id,
-            field="additional reviewed RBAC assignment readback",
-        )
-        properties = _mapping(
-            assignment.get("properties"),
-            field="additional reviewed RBAC assignment properties",
-        )
-        principal_id = _string(
-            properties.get("principalId"),
-            field="additional reviewed RBAC assignment principal ID",
-        ).casefold()
-        if properties.get("principalType") != "ServicePrincipal":
-            raise OrchestrationError(
-                "additional reviewed RBAC assignment principal type must be ServicePrincipal"
-            )
-        additional_assignment_ids_by_principal.setdefault(principal_id, set()).add(
-            assignment_id.casefold()
-        )
-    for principal_id, expected_assignment_ids in sorted(expected_assignments_by_principal.items()):
-        allowed_assignment_ids = {
-            assignment_id.casefold() for assignment_id in expected_assignment_ids
-        }
-        allowed_assignment_ids.update(
-            additional_assignment_ids_by_principal.get(principal_id.casefold(), set())
-        )
-        governed_scopes = _governed_rbac_scopes(expected_assignment_ids)
+    reviewed_assignments_by_principal: dict[str, set[str]] = {}
+    assignment_principals: dict[str, str] = {}
+    for source in (
+        expected_assignments_by_principal,
+        additional_allowed_assignments_by_principal,
+    ):
+        for principal_id, assignment_ids in source.items():
+            normalized_principal_id = principal_id.casefold()
+            normalized_assignment_ids = {
+                assignment_id.casefold() for assignment_id in assignment_ids
+            }
+            for assignment_id in normalized_assignment_ids:
+                existing_principal = assignment_principals.get(assignment_id)
+                if existing_principal is not None and existing_principal != normalized_principal_id:
+                    raise OrchestrationError(
+                        "one reviewed role assignment is bound to multiple principals"
+                    )
+                assignment_principals[assignment_id] = normalized_principal_id
+            reviewed_assignments_by_principal.setdefault(
+                normalized_principal_id,
+                set(),
+            ).update(normalized_assignment_ids)
+    governed_scopes = _governed_rbac_scopes(set(assignment_principals))
+    principal_ids = set(reviewed_assignments_by_principal)
+    for principal_id in sorted(principal_ids):
+        allowed_assignment_ids = reviewed_assignments_by_principal[principal_id]
         assignments = (
-            _effective_role_assignments(
+            _resolved_effective_role_assignments(
                 principal_id,
                 subscription_id=subscription_id,
                 field=f"exact role assignments for {principal_id}",
@@ -3669,6 +3961,7 @@ def _verify_exact_effective_assignments(
             raise OrchestrationError(
                 "effective role assignment evidence is missing a governed principal"
             )
+        observed_assignment_ids: set[str] = set()
         for index, raw_assignment in enumerate(assignments):
             assignment = _mapping(
                 raw_assignment,
@@ -3678,6 +3971,7 @@ def _verify_exact_effective_assignments(
                 assignment.get("id"),
                 field="effective role assignment ID",
             ).casefold()
+            observed_assignment_ids.add(assignment_id)
             assignment_scope = _string(
                 assignment.get("scope"),
                 field="effective role assignment scope",
@@ -3696,6 +3990,11 @@ def _verify_exact_effective_assignments(
                 raise OrchestrationError(
                     "governed runtime identity has an unreviewed effective role assignment"
                 )
+        missing_assignment_ids = allowed_assignment_ids - observed_assignment_ids
+        if missing_assignment_ids:
+            raise OrchestrationError(
+                "effective role assignment evidence is incomplete for a governed principal"
+            )
 
 
 def _verify_job_deployment_binding(
@@ -4229,8 +4528,7 @@ def _verify_producer_resources(
     foundation: Mapping[str, object],
     effective_parameters: Mapping[str, Mapping[str, object]],
     subscription_id: str,
-    additional_rbac_bindings: Sequence[Mapping[str, object]] = (),
-) -> None:
+) -> dict[str, set[str]]:
     foundation_values = _foundation_outputs(foundation)
     validated_outputs = _producer_outputs({"outputs": dict(outputs)})
     configuration = _mapping(
@@ -4353,12 +4651,19 @@ def _verify_producer_resources(
         allowed_principal_ids,
         subscription_id=subscription_id,
     )
-    additional_allowed_assignment_ids: set[str] = set()
-    for additional_binding in additional_rbac_bindings:
-        additional_allowed_assignment_ids.update(_role_assignment_ids(additional_binding))
+    prospective_publisher_sender = _prospective_publisher_sender_assignment(
+        configuration=configuration,
+        outputs=validated_outputs,
+        principal_ids_by_identity=identity_principal_ids,
+        subscription_id=subscription_id,
+    )
+    prospective_assignment_ids_by_principal = _verify_present_expected_assignments(
+        prospective_publisher_sender,
+        subscription_id=subscription_id,
+    )
     _verify_exact_effective_assignments(
         assignment_ids_by_principal,
-        additional_allowed_assignment_ids=additional_allowed_assignment_ids,
+        additional_allowed_assignments_by_principal=(prospective_assignment_ids_by_principal),
         subscription_id=subscription_id,
         effective_assignments_by_principal=effective_assignments_by_principal,
     )
@@ -4543,6 +4848,7 @@ def _verify_producer_resources(
             expected_uri,
             field=f"producer exact {name} key version",
         )
+    return assignment_ids_by_principal
 
 
 def _verify_publisher_resources(
@@ -4550,8 +4856,9 @@ def _verify_publisher_resources(
     *,
     producer: Mapping[str, object],
     effective_parameters: Mapping[str, Mapping[str, object]],
+    producer_assignment_ids_by_principal: Mapping[str, set[str]],
     subscription_id: str,
-) -> None:
+) -> dict[str, set[str]]:
     validated_outputs = _publisher_outputs({"outputs": dict(outputs)})
     configuration = _mapping(
         json.loads(
@@ -4677,23 +4984,9 @@ def _verify_publisher_resources(
         allowed_principal_ids,
         subscription_id=subscription_id,
     )
-    producer_configuration_for_rbac = _mapping(
-        json.loads(
-            _string(
-                producer_outputs["deployedRuntimeConfigurationJson"],
-                field="producer configuration",
-            )
-        ),
-        field="producer configuration",
-    )
-    producer_binding_for_rbac = _mapping(
-        producer_configuration_for_rbac.get("deploymentBinding"),
-        field="producer deployment binding",
-    )
-    additional_allowed_assignment_ids = _role_assignment_ids(producer_binding_for_rbac)
     _verify_exact_effective_assignments(
         assignment_ids_by_principal,
-        additional_allowed_assignment_ids=additional_allowed_assignment_ids,
+        additional_allowed_assignments_by_principal=(producer_assignment_ids_by_principal),
         subscription_id=subscription_id,
         effective_assignments_by_principal=effective_assignments_by_principal,
     )
@@ -4861,6 +5154,7 @@ def _verify_publisher_resources(
         ),
         subscription_id=subscription_id,
     )
+    return assignment_ids_by_principal
 
 
 def _parameter_bindings(
@@ -4960,31 +5254,17 @@ def _verify_live_dependencies(
     subscription_id: str,
 ) -> None:
     _verify_foundation_resources(foundation, subscription_id=subscription_id)
-    publisher_outputs = _publisher_outputs(publisher)
-    publisher_configuration = _mapping(
-        json.loads(
-            _string(
-                publisher_outputs["deployedPublisherConfigurationJson"],
-                field="publisher configuration",
-            )
-        ),
-        field="publisher configuration",
-    )
-    publisher_binding = _mapping(
-        publisher_configuration.get("deploymentBinding"),
-        field="publisher deployment binding",
-    )
-    _verify_producer_resources(
+    producer_assignment_ids_by_principal = _verify_producer_resources(
         _mapping(producer["outputs"], field="producer outputs"),
         foundation=foundation,
         effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
         subscription_id=subscription_id,
-        additional_rbac_bindings=(publisher_binding,),
     )
     _verify_publisher_resources(
         _mapping(publisher["outputs"], field="publisher outputs"),
         producer=producer,
         effective_parameters=_bindings_as_parameters(_handoff_bindings(publisher)),
+        producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
         subscription_id=subscription_id,
     )
 
@@ -5689,30 +5969,17 @@ def apply(args: argparse.Namespace) -> Path:
     elif stage == "publisher":
         if foundation is None or producer is None:
             raise OrchestrationError("publisher plan lost required handoffs")
-        deployed_publisher_configuration = _mapping(
-            json.loads(
-                _string(
-                    outputs["deployedPublisherConfigurationJson"],
-                    field="publisher configuration",
-                )
-            ),
-            field="publisher configuration",
-        )
-        deployed_publisher_binding = _mapping(
-            deployed_publisher_configuration.get("deploymentBinding"),
-            field="publisher deployment binding",
-        )
-        _verify_producer_resources(
+        producer_assignment_ids_by_principal = _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
-            additional_rbac_bindings=(deployed_publisher_binding,),
         )
         _verify_publisher_resources(
             outputs,
             producer=producer,
             effective_parameters=effective_parameters,
+            producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
             subscription_id=subscription_id,
         )
     bindings = _parameter_bindings(stage, effective_parameters)

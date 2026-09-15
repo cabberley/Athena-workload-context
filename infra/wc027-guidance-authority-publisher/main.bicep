@@ -117,10 +117,12 @@ var authorityContainerName = runtimeAuthorityAssets.containerName == 'wc027-guid
   : fail('runtime guidanceAuthoritySource container must be wc027-guidance-authority')
 var activationTableName = runtimeActivation.tableName
 var activationPartitionKey = runtimeActivation.partitionKey
+var registrySubscriptionId = split(registryResourceId, '/')[2]
+var registryResourceGroupName = split(registryResourceId, '/')[4]
 
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
   name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
+  scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -348,6 +350,7 @@ module bindingSigner 'modules/key-signer-rbac.bicep' = {
 
 module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-publisher-acr-pull'
+  scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)
   params: {
     registryName: registry.name
     identityResourceId: brokerIdentity.id
