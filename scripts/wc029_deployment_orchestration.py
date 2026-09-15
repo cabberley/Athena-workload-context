@@ -76,7 +76,20 @@ FOUNDATION_ORCHESTRATION_FIELDS = frozenset(
     }
 )
 FOUNDATION_BINDING_FIELDS = frozenset({"foundationParametersSha256"})
-LIVE_ACCEPTANCE_OUTPUT_FIELDS = frozenset({"wc027DeploymentReadiness"})
+LIVE_ACCEPTANCE_OUTPUT_FIELDS = frozenset(
+    {
+        "wc027DeploymentReadiness",
+        "publisherInvocationBoundary",
+    }
+)
+PUBLISHER_INVOCATION_BOUNDARY = {
+    "schemaVersion": "athena.wc029PublisherInvocationBoundary.v1",
+    "automaticRequestProducerPresent": False,
+    "runtimeInvocationValidated": False,
+    "requiredRequestSchemaVersion": (
+        "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+    ),
+}
 PRODUCER_OUTPUT_FIELDS = frozenset(
     {
         "producerJobResourceId",
@@ -1823,6 +1836,7 @@ def _verify_rbac_resources(
     *,
     allowed_principal_ids: set[str],
     subscription_id: str,
+    required_assignments: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> dict[str, set[str]]:
     resource_ids = _string_list(
         binding.get("rbacResourceIds"),
@@ -1847,6 +1861,7 @@ def _verify_rbac_resources(
             continue
     used_custom_roles: set[str] = set()
     assignment_ids_by_principal: dict[str, set[str]] = {}
+    verified_assignments: set[tuple[str, str, str]] = set()
     for resource_id in resource_ids:
         normalized_id = resource_id.casefold()
         if "/providers/microsoft.authorization/roledefinitions/" in normalized_id:
@@ -1877,6 +1892,7 @@ def _verify_rbac_resources(
         )
         role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
         scope = _role_assignment_scope(resource_id)
+        verified_assignments.add((scope.casefold(), principal_id, role_id))
         if properties.get("scope") is not None:
             _require_resource_id_equal(
                 properties.get("scope"),
@@ -1915,6 +1931,10 @@ def _verify_rbac_resources(
     if used_custom_roles != set(custom_roles):
         raise OrchestrationError(
             "deployment binding contains an unused or unassigned custom role"
+        )
+    if not required_assignments.issubset(verified_assignments):
+        raise OrchestrationError(
+            "deployment binding is missing an exact required role assignment"
         )
     return assignment_ids_by_principal
 
@@ -2680,10 +2700,46 @@ def _verify_producer_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    required_assignments = {
+        (
+            _string(
+                validated_outputs["triggerQueueResourceId"],
+                field="producer trigger queue resource ID",
+            ).casefold(),
+            identity_principal_ids[broker_identity_resource_id.casefold()],
+            "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
+        ),
+        (
+            _string(
+                validated_outputs["notificationQueueResourceId"],
+                field="producer notification queue resource ID",
+            ).casefold(),
+            identity_principal_ids[broker_identity_resource_id.casefold()],
+            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+        ),
+    }
+    required_assignments.update(
+        (
+            _string(
+                validated_outputs["triggerQueueResourceId"],
+                field="producer trigger queue resource ID",
+            ).casefold(),
+            identity_principal_ids[identity_resource_id.casefold()],
+            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+        )
+        for identity_resource_id in _string_list(
+            _parameter_value(
+                effective_parameters,
+                "triggerSubmitterIdentityResourceIds",
+            ),
+            field="producer trigger submitter identities",
+        )
+    )
     assignment_ids_by_principal = _verify_rbac_resources(
         binding,
         allowed_principal_ids=allowed_principal_ids,
         subscription_id=subscription_id,
+        required_assignments=frozenset(required_assignments),
     )
     _verify_no_broad_effective_assignments(
         allowed_principal_ids,
@@ -2994,10 +3050,43 @@ def _verify_publisher_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    required_assignments = {
+        (
+            _string(
+                validated_outputs["requestQueueResourceId"],
+                field="publisher request queue resource ID",
+            ).casefold(),
+            identity_principal_ids[broker_identity_resource_id.casefold()],
+            "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d",
+        ),
+        (
+            _string(
+                validated_outputs["triggerQueueResourceId"],
+                field="publisher trigger queue resource ID",
+            ).casefold(),
+            identity_principal_ids[broker_identity_resource_id.casefold()],
+            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+        ),
+    }
+    required_assignments.update(
+        (
+            _string(
+                validated_outputs["requestQueueResourceId"],
+                field="publisher request queue resource ID",
+            ).casefold(),
+            identity_principal_ids[identity_resource_id.casefold()],
+            "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+        )
+        for identity_resource_id in _string_list(
+            additional_identity_ids,
+            field="publisher request submitter identities",
+        )
+    )
     assignment_ids_by_principal = _verify_rbac_resources(
         binding,
         allowed_principal_ids=allowed_principal_ids,
         subscription_id=subscription_id,
+        required_assignments=frozenset(required_assignments),
     )
     _verify_no_broad_effective_assignments(
         allowed_principal_ids,
@@ -3043,6 +3132,11 @@ def _verify_publisher_resources(
             ),
             field=f"publisher {output_name}",
         )
+    _require_resource_id_equal(
+        validated_outputs["triggerQueueResourceId"],
+        producer_outputs["triggerQueueResourceId"],
+        field="publisher-to-producer trigger queue handoff",
+    )
     authority_storage_id = _azure_resource_id(
         _parameter_value(effective_parameters, "authorityStorageAccountResourceId"),
         field="publisher authority storage",
@@ -3254,7 +3348,10 @@ def _handoff_outputs(
             "wc027DeploymentReadiness": _mapping(
                 approved_configuration.get("wc027DeploymentReadiness"),
                 field="live-acceptance WC-027 readiness",
-            )
+            ),
+            "publisherInvocationBoundary": dict(
+                PUBLISHER_INVOCATION_BOUNDARY
+            ),
         }
         _validate_live_acceptance_handoff_outputs(projected)
         return projected
@@ -3386,6 +3483,20 @@ def _validate_live_acceptance_handoff_outputs(
         outputs,
         LIVE_ACCEPTANCE_OUTPUT_FIELDS,
         field="live-acceptance deployment outputs",
+    )
+    invocation_boundary = _mapping(
+        outputs.get("publisherInvocationBoundary"),
+        field="publisher invocation boundary",
+    )
+    _require_exact_fields(
+        invocation_boundary,
+        frozenset(PUBLISHER_INVOCATION_BOUNDARY),
+        field="publisher invocation boundary",
+    )
+    _require_equal(
+        invocation_boundary,
+        PUBLISHER_INVOCATION_BOUNDARY,
+        field="publisher invocation boundary",
     )
     _readiness_sections(outputs)
 

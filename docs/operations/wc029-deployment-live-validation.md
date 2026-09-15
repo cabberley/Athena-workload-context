@@ -63,10 +63,11 @@ sequence is therefore:
    broker, source identities, and guidance-binding key resource from step 2. Capture its exact Job
    resource ID, image, generated configuration JSON and SHA-256 digest, attached identities, RBAC
    evidence, exact queue/container/table resource IDs, and versioned binding key.
-4. **Live-acceptance gate**: redeploy `infra/wc013-live-acceptance/main.bicep` with both readiness
-   flags true and only the exact producer and publisher handoffs from steps 2 and 3. The root then
-   reads both deployed Jobs and fails closed on image, command, scaler, registry, configuration,
-   identity, RBAC, embedded-runtime, or key-binding drift. Its
+4. **Deployment activation gate (`live-acceptance`)**: redeploy
+   `infra/wc013-live-acceptance/main.bicep` with both readiness flags true and only the exact
+   producer and publisher handoffs from steps 2 and 3. The root then reads both deployed Jobs and
+   fails closed on image, command, scaler, registry, configuration, identity, RBAC,
+   embedded-runtime, or key-binding drift. Its
    `wc016ApprovedConfiguration.wc027DeploymentReadiness` output must read back the exact accepted
    Job IDs, images, configuration digests, embedded producer digest, and RBAC evidence.
 
@@ -83,6 +84,14 @@ binding. The foundation handoff carries one canonical SHA-256 over every non-WC-
 parameter rather than an open-ended parameter object. Missing, extra, cross-scope, changed, or
 internally inconsistent handoffs and deployment outputs fail closed. Never call a later stage
 without the complete preceding handoff set.
+
+This four-stage tool establishes deployment wiring, not a publisher runtime invocation. The
+merged production publisher can publish `PublishedGuidanceAuthorityBinding.v2` to the producer
+trigger queue, and the orchestrator validates that exact shared queue plus the publisher broker's
+Service Bus Data Sender assignment. It does not construct, sign, or submit
+`GuidanceAuthorityPublicationRequest.v1`. The final deployment handoff therefore records
+`automaticRequestProducerPresent=false` and `runtimeInvocationValidated=false`; do not describe it
+as end-to-end WC-029 completion.
 
 `bootstrap-ampls.bicep` is not a repeatable deployment root. It sets AMPLS access modes to
 `Open/Open` and is resource-group scoped. Verify an existing AMPLS read-only. A missing AMPLS may
@@ -288,6 +297,28 @@ broad inherited grant on a governed identity; any unreviewed effective assignmen
 governed WC-027 scope for any attached, submitter, or reader identity; any public/non-RBAC parent
 Key Vault behind an external trust key; and any final WC-013 readiness readback that differs from
 the two accepted WC-027 handoffs.
+
+### Publisher invocation boundary
+
+No merged production component automatically constructs and submits
+`GuidanceAuthorityPublicationRequest.v1`. After deployment activation, an authorized operator or a
+future separately governed request producer must:
+
+1. construct an already-authoritative canonical signed publication request from the exact current
+   occurrence, approved context, correlation request, requested actions, evaluation time, and
+   expiry;
+2. submit it to `wc027-guidance-authority-requests` with
+   `athena-context wc027-guidance-authority-submit`;
+3. prove one publisher Job execution consumed that request and created the exact immutable
+   authority, signed binding, and current signed activation;
+4. prove the publisher broker sent that binding to the exact
+   `wc027-enrichment-feed-requests` queue and the producer consumed it; and
+5. retain signed producer readback through enrichment, registry admission, feed-v2 commit, and
+   Notification v2 before claiming end-to-end behavior.
+
+This runtime evidence is outside `scripts/wc029_deployment_orchestration.py`. Root deployment,
+successful what-if, and `wc027DeploymentReadiness` prove only the dormant production path and its
+least-privilege wiring.
 
 After deployment:
 

@@ -250,7 +250,7 @@ param incidentNotificationSigningKeyFingerprint string
 @description('Activates WC-016 queues and Jobs only after the deployed incident key public material is pinned in both presentation verification layers.')
 param wc016RuntimeEnabled bool = false
 
-@description('Enables WC-027 notification v2 only after its separate enrichment/feed-v2 producer is deployed and healthy.')
+@description('Enables bounded WC-027 runtime acceptance only after the enrichment/feed-v2 producer deployment wiring is proven. This flag is not end-to-end completion evidence.')
 param wc027FeedV2ProducerReady bool = false
 
 @description('Exact deployed WC-027 enrichment/feed producer Job resource ID. Required before notification v2 can be enabled.')
@@ -265,7 +265,7 @@ param wc027EnrichmentFeedProducerConfigurationJson string = ''
 @description('Exact digest-pinned image deployed to the WC-027 enrichment/feed producer Job.')
 param wc027EnrichmentFeedProducerImage string = ''
 
-@description('Explicit confirmation that the separately governed PublishedGuidanceAuthorityBinding.v2 publisher is deployed and ready. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
+@description('Confirms the separately governed PublishedGuidanceAuthorityBinding.v2 publisher deployment wiring is ready for bounded runtime acceptance. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
 param wc027PublisherReady bool = false
 
 @description('Exact deployed WC-027 guidance-authority publisher Job resource ID.')

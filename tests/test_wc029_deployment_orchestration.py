@@ -931,6 +931,9 @@ def test_handoff_outputs_are_narrowed_to_exact_stage_contracts() -> None:
     )
     assert set(projected_live) == orchestration.LIVE_ACCEPTANCE_OUTPUT_FIELDS
     assert "unrelatedRootOutput" not in projected_live
+    assert projected_live["publisherInvocationBoundary"] == (
+        orchestration.PUBLISHER_INVOCATION_BOUNDARY
+    )
 
 
 def test_job_binding_rejects_missing_identity_or_mismatched_tags() -> None:
@@ -1134,6 +1137,54 @@ def test_rbac_role_must_match_its_exact_resource_scope(
             {"rbacResourceIds": [assignment_id]},
             allowed_principal_ids={principal_id},
             subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_publisher_trigger_handoff_requires_exact_sender_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trigger_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    assignment_id = (
+        f"{trigger_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "88888888-8888-8888-8888-888888888888"
+    )
+    principal_id = "99999999-9999-9999-9999-999999999999"
+
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d"
+                ),
+                "scope": trigger_scope,
+            },
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="exact required"):
+        orchestration._verify_rbac_resources(
+            {"rbacResourceIds": [assignment_id]},
+            allowed_principal_ids={principal_id},
+            subscription_id=SUBSCRIPTION_ID,
+            required_assignments=frozenset(
+                {
+                    (
+                        trigger_scope.casefold(),
+                        principal_id,
+                        "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+                    )
+                }
+            ),
         )
 
 
@@ -1415,7 +1466,36 @@ def test_runbook_keeps_wc027_roots_and_order_governed() -> None:
     sequence = source.index("sequence is therefore")
     producer_step = source.index("2. **Producer**", sequence)
     publisher_step = source.index("3. **Publisher**", producer_step)
-    acceptance_step = source.index("4. **Live-acceptance gate**", publisher_step)
+    acceptance_step = source.index(
+        "4. **Deployment activation gate (`live-acceptance`)**",
+        publisher_step,
+    )
     assert producer in source[producer_step:publisher_step]
     assert publisher in source[publisher_step:acceptance_step]
     assert acceptance in source[acceptance_step:]
+
+
+def test_publisher_runtime_exists_but_automatic_request_invocation_is_separate() -> None:
+    production = (
+        ROOT / "src" / "athena_context" / "guidance" / "production.py"
+    ).read_text(encoding="utf-8")
+    azure = (
+        ROOT / "src" / "athena_context" / "guidance" / "azure.py"
+    ).read_text(encoding="utf-8")
+    orchestrator = (
+        ROOT / "scripts" / "wc029_deployment_orchestration.py"
+    ).read_text(encoding="utf-8")
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "client.get_queue_sender(" in production
+    assert "queue_name=configuration.trigger_queue_name" in production
+    assert "AzureServiceBusGuidanceAuthorityTrigger(trigger_sender)" in production
+    assert "cast(Any, self._sender).send_messages(message)" in azure
+    assert "publisher-to-producer trigger queue handoff" in orchestrator
+    assert "submit_wc027_guidance_authority_request" not in orchestrator
+    assert '"automaticRequestProducerPresent": False' in orchestrator
+    assert '"runtimeInvocationValidated": False' in orchestrator
+    assert "This four-stage tool establishes deployment wiring" in runbook
+    assert "No merged production component automatically constructs and submits" in (
+        runbook
+    )

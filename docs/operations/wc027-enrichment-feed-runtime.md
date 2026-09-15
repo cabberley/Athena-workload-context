@@ -154,6 +154,20 @@ athena-context wc027-guidance-authority-submit `
   --managed-identity-client-id <authorized-submitter-identity-client-id>
 ```
 
+The merged production publisher does publish the resulting exact
+`PublishedGuidanceAuthorityBinding.v2` to `wc027-enrichment-feed-requests`: the worker consumes the
+signed publication request, creates and verifies the binding and activation, and uses the
+publisher broker identity to send the canonical binding to the producer trigger queue. There is
+still no automatic production component that constructs and submits
+`GuidanceAuthorityPublicationRequest.v1`. The command above is the bounded operator invocation
+boundary for an already-authoritative signed request.
+
+The WC-029 deployment orchestrator validates the exact shared trigger queue plus the publisher
+broker's sender assignment, but it does not mint, sign, or submit a publication request and does
+not claim that a runtime invocation occurred. Its final deployment handoff records
+`runtimeInvocationValidated=false`; end-to-end acceptance requires the separate bounded invocation
+and signed readback evidence described in the WC-029 runbook.
+
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
 create-or-recovers the deterministic authority and binding; signs and verifies binding and
@@ -171,7 +185,7 @@ location. Do not grant workload Reader to the producer identities.
 The job must be attached to every identity named in the runtime configuration. The Bicep module
 rejects duplicate attached identity IDs/client IDs. Its image must be digest-pinned.
 
-## Activation gate
+## Deployment activation and runtime acceptance
 
 Keep:
 
@@ -180,18 +194,25 @@ wc027PublisherReady=false
 wc027FeedV2ProducerReady=false
 ```
 
-until all of the following are evidenced:
+until the deployment-wiring conditions are evidenced:
 
 1. the publisher and producer Jobs and their exact generated configurations are deployed;
 2. the trigger and notification queues are private and RBAC-only;
 3. every source reader can read only its configured exact container;
-4. each signing identity can use only its dedicated exact key;
-5. a partial-write retry reaches the same immutable assets and registry row;
-6. feed-v2 CAS reconciliation commits the exact entry; and
-7. a stale or non-current binding is rejected by activation verification; and
-8. Notification v2 is observed only after the feed entry is verifiable.
+4. each signing identity can use only its dedicated exact key; and
+5. the publisher broker has the exact sender assignment on the producer trigger queue.
 
-Code delivery does not flip either readiness flag. To assert publisher readiness, supply
+After those checks, the WC-029 deployment activation stage may set both flags true to enable one
+bounded runtime invocation. The flags mean **deployment wiring is ready**; they do not mean
+end-to-end behavior has completed. WC-029 runtime acceptance still requires:
+
+1. a partial-write retry reaching the same immutable assets and registry row;
+2. feed-v2 CAS reconciliation committing the exact entry;
+3. a stale or non-current binding being rejected by activation verification; and
+4. Notification v2 being observed only after the feed entry is verifiable.
+
+Code delivery alone does not flip either readiness flag. To assert publisher deployment
+readiness, supply
 `wc027PublisherJobResourceId`, `wc027PublisherConfigurationDigest`, and
 `wc027PublisherConfigurationJson`, and `wc027PublisherImage` from the deployed publisher module.
 The root template reads the existing Job and fails closed unless the exact digest-pinned image,
