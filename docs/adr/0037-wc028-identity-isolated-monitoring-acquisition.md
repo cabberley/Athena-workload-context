@@ -37,6 +37,16 @@ The coordinator:
   `ManagedIdentityCredential(client_id=<reviewed client ID>)`; after identity proof succeeds, the
   adapter passes that exact credential object to each Azure client so the SDK can legitimately
   acquire its own service-audience token without exposing or parsing ARM or Log Analytics tokens;
+- implements those five production clients over Azure Core authenticated transports with fixed
+  public Azure endpoints and audiences: resource-centric Azure Monitor Logs, exact-resource
+  Activity Log filters, generated bounded Resource Graph change queries, per-VM Resource Health
+  availability history, and the contract-pinned Network Watcher IP Flow operation; redirects,
+  caller-selected endpoints, unbounded pagination, malformed JSON, partial query errors, oversized
+  payloads, and unsuccessful responses fail closed;
+- normalizes Azure service values, resource IDs, UTC timestamps, enums, dynamic resource-candidate
+  arrays, row ordering, truncation markers, and response byte counts into the existing strict
+  acquisition result contracts while retaining duplicate source rows for downstream ambiguity
+  detection;
 - obtains identity proof before the first source read by requesting only the Athena-owned
   single-tenant `api://athena-monitoring-identity-proof` audience, then validates RS256 signature
   through tenant-pinned JWKS, token version `1.0`, exact issuer and audience, tenant, `oid`,
@@ -94,6 +104,10 @@ The coordinator:
   TCP or UDP, derives the local target from direction, and requires that target to be an approved
   in-scope VM; mismatched ports, protocols, directions, or non-VM targets become unavailable
   coverage with zero IP Flow calls;
+- before that call, also constructs the complete persistable network-flow record, requires a
+  retained `ruleResourceId`, and proves that every retained field represents exactly the complete
+  published resource scope; unusable rows therefore issue zero IP Flow calls, and every successful
+  IP Flow exchange is required to map one-to-one to a retained network-flow record;
 - rejects Traffic Analytics responses with more than one row before issuing any IP Flow calls, and
   rejects all further reads once the authority's total acquisition-call budget is exhausted;
 - when a selected Traffic Analytics query returns no usable flow row, emits unavailable network
@@ -201,6 +215,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Tests prove the exact same `ManagedIdentityCredential` object reaches all five Azure clients,
   fake source identity values cannot change receipt identity, and `DefaultAzureCredential` cannot
   enter the production receipt path.
+- Mocked Azure SDK transport contracts prove all five production clients use their reviewed
+  endpoint, token audience, resource scope, request shape, bounded response handling, and
+  deterministic normalization.
+- Synthetic source clients are bound by a closure to each exact adapter instance, with an
+  adversarial two-adapter execution proving construction and requests cannot cross-route through
+  shared mutable fixture state.
 - An authority issued for another context binding, required-coverage set, or control selection
   fails before credential acquisition and produces zero source calls.
 - Missing or incorrect IP Flow role ID, exact Network Watcher scope, two-action allowlist, or
@@ -214,6 +234,9 @@ ambiguous incident transitions fail before the persistence transaction is entere
   Flow exchange, and a valid receipt v4 with no orphan source proof.
 - Mismatched Traffic Analytics port, protocol, direction, or non-VM local target produces
   unavailable coverage and zero IP Flow calls before any point-in-time verification request.
+- Missing `ruleResourceId` or a row whose retained fields cannot represent the full published flow
+  scope produces unavailable coverage, zero IP Flow calls, zero IP Flow exchanges, and no retained
+  network-flow record; valid calls retain exactly one record per exchange.
 - Log request v2 tests bind current and prior windows, collector execution time, and exact
   authority coverage without module globals; zero-row network queries retain that exact scope.
 - IaC and contract tests require the exact Resource Health role ID, one allowed operation, and all

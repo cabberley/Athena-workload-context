@@ -187,9 +187,6 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
     _SyntheticJwks.advance_clock_seconds = 0
     _SyntheticJwt.advance_clock_seconds = 0
     _SyntheticClaims.advance_clock_seconds = 0
-    _SyntheticAzureClient.active_port = None
-    _SyntheticAzureClient.credentials.clear()
-    _SyntheticAzureClient.contracts.clear()
 
     class _SigningKey:
         key = _TOKEN_PRIVATE_KEY.public_key()
@@ -236,18 +233,6 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
         "_system_utc_now",
         lambda: _SyntheticClock.now,
     )
-    for name in (
-        "AzureLogAnalyticsAcquisitionClient",
-        "AzureActivityLogAcquisitionClient",
-        "AzureResourceGraphAcquisitionClient",
-        "AzureResourceHealthAcquisitionClient",
-        "AzureIpFlowVerifyAcquisitionClient",
-    ):
-        monkeypatch.setattr(
-            monitoring_acquisition_module,
-            name,
-            _SyntheticAzureClient,
-        )
 
 
 class _ReceiptSigner:
@@ -514,6 +499,8 @@ class _AcquisitionPort:
         traffic_protocol: str = "Tcp",
         traffic_destination_port: int = 1433,
         traffic_destination_resource_id: str = DB_ID,
+        traffic_enforcement_resource_id: str = NSG_ID,
+        traffic_rule_resource_id: str | None = NSG_RULE_ID,
         backdated_ip_flow: bool = False,
         mismatched_aggregate_proof: bool = False,
         future_aggregate_proof: bool = False,
@@ -545,12 +532,16 @@ class _AcquisitionPort:
         self.traffic_protocol = traffic_protocol
         self.traffic_destination_port = traffic_destination_port
         self.traffic_destination_resource_id = traffic_destination_resource_id
+        self.traffic_enforcement_resource_id = traffic_enforcement_resource_id
+        self.traffic_rule_resource_id = traffic_rule_resource_id
         self.backdated_ip_flow = backdated_ip_flow
         self.mismatched_aggregate_proof = mismatched_aggregate_proof
         self.future_aggregate_proof = future_aggregate_proof
         self.truncated_heartbeat = truncated_heartbeat
         self.ip_flow_calls = 0
         self.requests: list[object] = []
+        self.azure_client_credentials: list[object] = []
+        self.azure_client_contracts: list[object] = []
 
     def _collected_at(self):
         return NOW - timedelta(minutes=1) if self.stale else NOW
@@ -661,8 +652,8 @@ class _AcquisitionPort:
                 destinationAddress="192.0.2.20",
                 sourcePort=443,
                 destinationPort=self.traffic_destination_port,
-                enforcementResourceId=NSG_ID,
-                ruleResourceId=NSG_RULE_ID,
+                enforcementResourceId=self.traffic_enforcement_resource_id,
+                ruleResourceId=self.traffic_rule_resource_id,
                 trafficAnalyticsLimitation="aggregatedNotPacketCausal",
                 observedStart=request.window_start,
                 observedEnd=request.window_end,
@@ -889,16 +880,16 @@ class _AcquisitionPort:
 
 
 class _SyntheticAzureClient:
-    active_port: _AcquisitionPort | None = None
-    credentials: list[object] = []
-    contracts: list[object] = []
-
-    def __init__(self, *, credential: object, reviewed_contract: object) -> None:
-        if self.active_port is None:
-            raise AssertionError("synthetic Azure client requires an active port")
-        self.port = self.active_port
-        self.credentials.append(credential)
-        self.contracts.append(reviewed_contract)
+    def __init__(
+        self,
+        *,
+        port: _AcquisitionPort,
+        credential: object,
+        reviewed_contract: object,
+    ) -> None:
+        self.port = port
+        port.azure_client_credentials.append(credential)
+        port.azure_client_contracts.append(reviewed_contract)
 
     def query_log_analytics(
         self,
@@ -931,13 +922,35 @@ class _SyntheticAzureClient:
         return self.port.query_ip_flow_verify(request)
 
 
+def _synthetic_client_factory(port: _AcquisitionPort):
+    def create_clients(credential, reviewed_contract):
+        clients = tuple(
+            _SyntheticAzureClient(
+                port=port,
+                credential=credential,
+                reviewed_contract=reviewed_contract,
+            )
+            for _ in range(5)
+        )
+        return monitoring_acquisition_module._AzureMonitoringClients(
+            log_analytics=clients[0],
+            activity_log=clients[1],
+            resource_graph=clients[2],
+            resource_health=clients[3],
+            ip_flow_verify=clients[4],
+        )
+
+    return create_clients
+
+
 def _adapter(
     port: _AcquisitionPort,
 ):
-    _SyntheticAzureClient.active_port = port
-    return AzureMonitoringAdapter(
+    adapter = AzureMonitoringAdapter(
         reviewed_collector_contract=_acquisition_collector_contract(),
     )
+    adapter._client_factory = _synthetic_client_factory(port)
+    return adapter
 
 
 def _coordinator(
@@ -1161,8 +1174,6 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
 
 
 def test_production_adapter_passes_one_managed_identity_object_to_every_client() -> None:
-    port = _AcquisitionPort()
-    _SyntheticAzureClient.active_port = port
     adapter = AzureMonitoringAdapter(
         reviewed_collector_contract=_acquisition_collector_contract(),
     )
@@ -1172,13 +1183,22 @@ def test_production_adapter_passes_one_managed_identity_object_to_every_client()
     assert proof.client_id == READER_CLIENT_ID
     assert len(_SyntheticManagedIdentityCredential.instances) == 1
     credential = _SyntheticManagedIdentityCredential.instances[0]
-    assert _SyntheticAzureClient.credentials == [credential] * 5
-    assert _SyntheticAzureClient.contracts == [adapter.reviewed_collector_contract] * 5
+    clients = adapter._clients
+    assert clients is not None
+    client_values = (
+        clients.log_analytics,
+        clients.activity_log,
+        clients.resource_graph,
+        clients.resource_health,
+        clients.ip_flow_verify,
+    )
+    assert [item._credential for item in client_values] == [credential] * 5
+    assert [item._reviewed_contract for item in client_values] == [
+        adapter.reviewed_collector_contract
+    ] * 5
 
 
 def test_production_adapter_refreshes_identity_proof_for_each_execution() -> None:
-    port = _AcquisitionPort()
-    _SyntheticAzureClient.active_port = port
     adapter = AzureMonitoringAdapter(
         reviewed_collector_contract=_acquisition_collector_contract(),
     )
@@ -1191,7 +1211,69 @@ def test_production_adapter_refreshes_identity_proof_for_each_execution() -> Non
     assert second.verified_at == NOW + timedelta(seconds=30)
     assert first.proof_digest != second.proof_digest
     assert _SyntheticManagedIdentityCredential.instances[0].calls == 2
-    assert len(_SyntheticAzureClient.credentials) == 5
+    clients = adapter._clients
+    assert clients is not None
+    assert (
+        len(
+            {
+                id(clients.log_analytics),
+                id(clients.activity_log),
+                id(clients.resource_graph),
+                id(clients.resource_health),
+                id(clients.ip_flow_verify),
+            }
+        )
+        == 5
+    )
+
+
+def test_synthetic_client_factories_are_isolated_per_adapter() -> None:
+    context, intent, controls = _authority()
+    acquisition_authority = _acquisition_authority(
+        required_control_ids=_required_control_ids(context, controls),
+        context_binding=context,
+        controls=controls,
+    )
+    first_port = _AcquisitionPort()
+    second_port = _AcquisitionPort(traffic_analytics_rows=0)
+    first_coordinator = _coordinator(first_port, acquisition_authority)
+    second_coordinator = _coordinator(second_port, acquisition_authority)
+
+    def execute(coordinator, commit):
+        return coordinator.execute(
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collected_at=NOW,
+            change_scope=_scope_contract(),
+            commit_port=commit,
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first_commit = _CommitPort()
+    first = execute(first_coordinator, first_commit)
+    second_commit = _CommitPort()
+    second = execute(second_coordinator, second_commit)
+
+    assert first_commit.calls == second_commit.calls == 1
+    assert first_port.ip_flow_calls == 1
+    assert second_port.ip_flow_calls == 0
+    assert len(first_port.azure_client_credentials) == 5
+    assert len(second_port.azure_client_credentials) == 5
+    assert len({id(item) for item in first_port.azure_client_credentials}) == 1
+    assert len({id(item) for item in second_port.azure_client_credentials}) == 1
+    assert first_port.azure_client_credentials[0] is not second_port.azure_client_credentials[0]
+    first_receipt = first.prepared.monitoring_bundle.acquisition_receipt
+    second_receipt = second.prepared.monitoring_bundle.acquisition_receipt
+    assert first_receipt is not None
+    assert second_receipt is not None
+    assert any(item.source == "ipFlowVerify" for item in first_receipt.exchanges)
+    assert not any(item.source == "ipFlowVerify" for item in second_receipt.exchanges)
 
 
 def test_identity_proof_time_follows_token_jwks_signature_and_claim_validation() -> None:
@@ -1980,7 +2062,7 @@ def test_invalid_identity_proof_fails_before_first_source_io(
 
     assert len(_SyntheticManagedIdentityCredential.instances) == 1
     assert _SyntheticManagedIdentityCredential.instances[0].calls == 1
-    assert _SyntheticAzureClient.credentials == []
+    assert port.azure_client_credentials == []
     assert port.requests == []
 
 
@@ -2013,7 +2095,7 @@ def test_overlong_identity_proof_fails_before_first_source_io() -> None:
             expires_at=NOW + timedelta(minutes=10),
         )
 
-    assert _SyntheticAzureClient.credentials == []
+    assert port.azure_client_credentials == []
     assert port.requests == []
 
 
@@ -2238,6 +2320,41 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     assert type(receipt).model_validate_json(receipt.model_dump_json(by_alias=True)) == receipt
     assert first.batch.canonical_bytes() == second.batch.canonical_bytes()
     assert receipt.canonical_json() == second_receipt.canonical_json()
+
+
+def test_each_ip_flow_exchange_maps_one_retained_network_flow_record() -> None:
+    outcome, commit, _ = _execute(_AcquisitionPort())
+
+    assert commit.calls == 1
+    retained = tuple(
+        item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
+    )
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    exchanges = tuple(item for item in receipt.exchanges if item.source == "ipFlowVerify")
+    assert len(exchanges) == len(retained) == 1
+
+
+@pytest.mark.parametrize(
+    "port",
+    (
+        _AcquisitionPort(traffic_rule_resource_id=None),
+        _AcquisitionPort(traffic_enforcement_resource_id=NSG_RULE_ID),
+    ),
+)
+def test_unpersistable_traffic_rows_skip_ip_flow_before_exchange(
+    port: _AcquisitionPort,
+) -> None:
+    outcome, commit, _ = _execute(port)
+
+    assert commit.calls == 1
+    assert port.ip_flow_calls == 0
+    assert not any(isinstance(item, NetworkWatcherFlowRecord) for item in outcome.batch.records)
+    coverage = next(item for item in outcome.batch.coverage if item.family == "networkFlow")
+    assert coverage.status == "unavailable"
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert not any(item.source == "ipFlowVerify" for item in receipt.exchanges)
 
 
 @pytest.mark.parametrize(

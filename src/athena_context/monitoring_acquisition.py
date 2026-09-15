@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Protocol, cast
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import jwt
+from azure.core.exceptions import AzureError
+from azure.core.pipeline import Pipeline
+from azure.core.pipeline.policies import BearerTokenCredentialPolicy
+from azure.core.pipeline.transport import (
+    HttpRequest,
+    HttpResponse,
+    HttpTransport,
+    RequestsTransport,
+)
 from azure.identity import ManagedIdentityCredential
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -67,6 +78,17 @@ MAX_ACQUISITION_CALLS = 32
 EVENT_LOOKBACK_SECONDS = 900
 _MAX_IDENTITY_PROOF_TOKEN_BYTES = 32 * 1024
 _MIN_IDENTITY_PROOF_TOKEN_REMAINING_SECONDS = 30
+_AZURE_ARM_ENDPOINT = "https://management.azure.com"
+_AZURE_ARM_SCOPE = "https://management.azure.com/.default"
+_AZURE_LOGS_ENDPOINT = "https://api.loganalytics.io"
+_AZURE_LOGS_SCOPE = "https://api.loganalytics.io/.default"
+_LOG_ANALYTICS_API_VERSION = "v1"
+_ACTIVITY_LOG_API_VERSION = "2015-04-01"
+_RESOURCE_GRAPH_API_VERSION = "2022-10-01"
+_RESOURCE_HEALTH_API_VERSION = "2025-05-01"
+_NETWORK_API_VERSION = "2025-09-01"
+_MAX_ARM_POLL_SECONDS = 75
+_MAX_ARM_POLL_ATTEMPTS = 16
 _COMPACT_JWT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 _READER_IDENTITY_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/"
@@ -1287,113 +1309,1266 @@ class MonitoringIpFlowVerifyClient(Protocol):
     ) -> IpFlowVerifyResult: ...
 
 
-class AzureLogAnalyticsAcquisitionClient:
-    """Credential-bound Log Analytics client composition slot."""
+type _AzureHttpTransport = HttpTransport[HttpRequest, HttpResponse]
+
+
+@dataclass(frozen=True, slots=True)
+class _AzureJsonResponse:
+    status_code: int
+    headers: Mapping[str, str]
+    payload: object | None
+    response_bytes: int
+
+
+class _AzureJsonPipeline:
+    """Bounded Azure SDK pipeline with one fixed endpoint and token audience."""
+
+    def __init__(
+        self,
+        *,
+        credential: ManagedIdentityCredential,
+        endpoint: str,
+        scope: str,
+        transport: _AzureHttpTransport | None = None,
+    ) -> None:
+        self._endpoint = endpoint.rstrip("/")
+        self._transport = (
+            cast(
+                _AzureHttpTransport,
+                RequestsTransport(connection_timeout=10, read_timeout=30),
+            )
+            if transport is None
+            else transport
+        )
+        self._pipeline: Pipeline[HttpRequest, HttpResponse] = Pipeline(
+            transport=self._transport,
+            policies=[BearerTokenCredentialPolicy(credential, scope)],
+        )
+
+    def request_json(
+        self,
+        *,
+        method: Literal["GET", "POST"],
+        path: str,
+        max_bytes: int,
+        accepted_statuses: tuple[int, ...] = (200,),
+        body: Mapping[str, object] | None = None,
+        headers: Mapping[str, str] | None = None,
+        allow_empty: bool = False,
+    ) -> _AzureJsonResponse:
+        parsed_path = urlsplit(path)
+        if (
+            not path.startswith("/")
+            or parsed_path.scheme
+            or parsed_path.netloc
+            or parsed_path.fragment
+            or max_bytes < 1
+        ):
+            raise MonitoringAcquisitionError("Azure request escaped its reviewed endpoint")
+        request_headers = {"Accept": "application/json"}
+        if headers is not None:
+            request_headers.update(headers)
+        data: bytes | None = None
+        if body is not None:
+            request_headers["Content-Type"] = "application/json"
+            data = json.dumps(
+                _json_value(body),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        request = HttpRequest(
+            method,
+            self._endpoint + path,
+            headers=request_headers,
+            data=data,
+        )
+        try:
+            pipeline_response = self._pipeline.run(request, stream=True)
+            response = pipeline_response.http_response
+            chunks: list[bytes] = []
+            response_bytes = 0
+            for chunk in response.stream_download(self._pipeline):
+                normalized_chunk = bytes(chunk)
+                response_bytes += len(normalized_chunk)
+                if response_bytes > max_bytes:
+                    raise MonitoringAcquisitionError(
+                        "Azure response exceeded its reviewed byte bound"
+                    )
+                chunks.append(normalized_chunk)
+        except MonitoringAcquisitionError:
+            raise
+        except (AzureError, OSError, TimeoutError) as exc:
+            raise MonitoringAcquisitionError("Azure monitoring transport failed closed") from exc
+        if type(response.status_code) is not int or response.status_code not in accepted_statuses:
+            raise MonitoringAcquisitionError("Azure monitoring request was unsuccessful")
+        response_headers = {
+            str(name).casefold(): str(value) for name, value in response.headers.items()
+        }
+        raw = b"".join(chunks)
+        if not raw:
+            if allow_empty:
+                return _AzureJsonResponse(
+                    status_code=response.status_code,
+                    headers=response_headers,
+                    payload=None,
+                    response_bytes=response_bytes,
+                )
+            raise MonitoringAcquisitionError("Azure monitoring response was empty")
+        content_type = response_headers.get("content-type")
+        if content_type is None or not content_type.casefold().startswith("application/json"):
+            raise MonitoringAcquisitionError("Azure monitoring response was not JSON")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MonitoringAcquisitionError("Azure monitoring response was not JSON") from exc
+        return _AzureJsonResponse(
+            status_code=response.status_code,
+            headers=response_headers,
+            payload=payload,
+            response_bytes=response_bytes,
+        )
+
+    def sleep(self, seconds: int) -> None:
+        self._transport.sleep(seconds)
+
+
+def _azure_mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise MonitoringAcquisitionError(f"{label} must be one JSON object")
+    return cast(Mapping[str, object], value)
+
+
+def _azure_list(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise MonitoringAcquisitionError(f"{label} must be one JSON array")
+    return value
+
+
+def _azure_text(value: object, label: str, *, maximum: int = 2048) -> str:
+    if isinstance(value, Mapping):
+        value = value.get("value")
+    if type(value) is not str:
+        raise MonitoringAcquisitionError(f"{label} must be text")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum:
+        raise MonitoringAcquisitionError(f"{label} is outside its text bound")
+    return normalized
+
+
+def _azure_optional_text(value: object, label: str, *, maximum: int = 2048) -> str | None:
+    if value is None:
+        return None
+    return _azure_text(value, label, maximum=maximum)
+
+
+def _azure_integer(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise MonitoringAcquisitionError(f"{label} must be an integer")
+    return value
+
+
+def _azure_optional_integer(value: object, label: str) -> int | None:
+    return None if value is None else _azure_integer(value, label)
+
+
+def _azure_datetime(value: object, label: str) -> datetime:
+    text = _azure_text(value, label, maximum=64)
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise MonitoringAcquisitionError(f"{label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise MonitoringAcquisitionError(f"{label} must be UTC")
+    utc_value = parsed.astimezone(UTC)
+    return utc_value.replace(microsecond=(utc_value.microsecond // 1000) * 1000)
+
+
+def _azure_datetime_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise MonitoringAcquisitionError("Azure request timestamp must be UTC")
+    if value.microsecond:
+        return value.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _azure_resource_candidates(value: object, label: str) -> tuple[str, ...]:
+    candidate_value = value
+    if type(candidate_value) is str:
+        try:
+            candidate_value = json.loads(candidate_value)
+        except json.JSONDecodeError as exc:
+            raise MonitoringAcquisitionError(f"{label} was not a JSON array") from exc
+    candidates = _azure_list(candidate_value, label)
+    if not candidates:
+        raise MonitoringAcquisitionError(f"{label} must not be empty")
+    return tuple(_azure_text(item, label) for item in candidates)
+
+
+def _selected_value(value: str, allowed: tuple[str, ...]) -> str | None:
+    matches = tuple(item for item in allowed if item.casefold() == value.casefold())
+    if len(matches) > 1:
+        raise MonitoringAcquisitionError("Azure response matched an ambiguous reviewed filter")
+    return None if not matches else matches[0]
+
+
+def _azure_direction(value: object) -> Literal["inbound", "outbound"]:
+    normalized = _azure_text(value, "Azure direction", maximum=16).casefold()
+    if normalized in {"i", "inbound"}:
+        return "inbound"
+    if normalized in {"o", "outbound"}:
+        return "outbound"
+    raise MonitoringAcquisitionError("Azure direction was outside the reviewed values")
+
+
+def _azure_protocol(value: object) -> Literal["Tcp", "Udp", "Icmp", "Any"]:
+    normalized = _azure_text(value, "Azure protocol", maximum=16).casefold()
+    values: dict[str, Literal["Tcp", "Udp", "Icmp", "Any"]] = {
+        "6": "Tcp",
+        "17": "Udp",
+        "any": "Any",
+        "icmp": "Icmp",
+        "tcp": "Tcp",
+        "udp": "Udp",
+    }
+    try:
+        return values[normalized]
+    except KeyError as exc:
+        raise MonitoringAcquisitionError("Azure protocol was outside the reviewed values") from exc
+
+
+def _azure_decision(value: object) -> Literal["allowed", "denied", "unknown"]:
+    normalized = _azure_text(value, "Azure flow decision", maximum=16).casefold()
+    values: dict[str, Literal["allowed", "denied", "unknown"]] = {
+        "allow": "allowed",
+        "allowed": "allowed",
+        "deny": "denied",
+        "denied": "denied",
+        "unknown": "unknown",
+    }
+    try:
+        return values[normalized]
+    except KeyError as exc:
+        raise MonitoringAcquisitionError(
+            "Azure flow decision was outside the reviewed values"
+        ) from exc
+
+
+def _azure_connection_status(
+    value: object,
+) -> Literal["succeeded", "failed", "degraded", "unknown"]:
+    normalized = _azure_text(value, "Azure connection status", maximum=16).casefold()
+    if normalized not in {"succeeded", "failed", "degraded", "unknown"}:
+        raise MonitoringAcquisitionError("Azure connection status was outside the reviewed values")
+    return cast(
+        Literal["succeeded", "failed", "degraded", "unknown"],
+        normalized,
+    )
+
+
+def _azure_health_status(
+    value: object,
+    label: str,
+) -> Literal["Available", "Degraded", "Unavailable", "Unknown"]:
+    normalized = _azure_text(value, label, maximum=32).casefold()
+    values: dict[
+        str,
+        Literal["Available", "Degraded", "Unavailable", "Unknown"],
+    ] = {
+        "available": "Available",
+        "degraded": "Degraded",
+        "unavailable": "Unavailable",
+        "unknown": "Unknown",
+    }
+    try:
+        return values[normalized]
+    except KeyError as exc:
+        raise MonitoringAcquisitionError(
+            "Azure Resource Health status was outside the reviewed values"
+        ) from exc
+
+
+def _azure_reason_type(
+    value: object | None,
+) -> Literal["PlatformInitiated", "UserInitiated", "Unknown"]:
+    if value is None:
+        return "Unknown"
+    normalized = _azure_text(value, "Azure Resource Health reason", maximum=64).casefold()
+    if normalized in {
+        "outage",
+        "planned",
+        "platform initiated",
+        "platforminitiated",
+        "unplanned",
+    }:
+        return "PlatformInitiated"
+    if normalized in {"user initiated", "userinitiated"}:
+        return "UserInitiated"
+    return "Unknown"
+
+
+def _resource_health_event_status(
+    current: Literal["Available", "Degraded", "Unavailable", "Unknown"],
+    previous: Literal["Available", "Degraded", "Unavailable", "Unknown"],
+) -> Literal["Active", "In Progress", "Resolved", "Updated"]:
+    if current == previous:
+        return "Updated"
+    if current == "Available":
+        return "Resolved"
+    if previous == "Available":
+        return "Active"
+    return "In Progress"
+
+
+def _sorted_rows[RowT: _StrictAcquisitionModel](
+    rows: list[RowT],
+) -> tuple[RowT, ...]:
+    return tuple(sorted(rows, key=lambda row: row.canonical_json()))
+
+
+def _remaining_response_bytes(limit: int, used: int) -> int:
+    remaining = limit - used
+    if remaining < 1:
+        raise MonitoringAcquisitionError("Azure responses exceeded their reviewed byte bound")
+    return remaining
+
+
+def _validated_azure_client_contract(
+    reviewed_contract: MonitoringCollectorContract,
+) -> MonitoringCollectorContract:
+    if type(reviewed_contract) is not MonitoringCollectorContract:
+        raise TypeError("Azure acquisition client requires an exact collector contract")
+    if reviewed_contract.schema_version != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+        raise MonitoringAcquisitionError(
+            "Azure acquisition client requires collector contract schema v6"
+        )
+    return reviewed_contract
+
+
+def _arm_subscription_id(resource_id: str) -> str:
+    segments = resource_id.strip("/").split("/")
+    if (
+        len(segments) < 2
+        or segments[0].casefold() != "subscriptions"
+        or _GUID_PATTERN.fullmatch(segments[1].casefold()) is None
+    ):
+        raise MonitoringAcquisitionError("Azure request resource has no valid subscription")
+    return segments[1].casefold()
+
+
+def _resource_is_within(resource_id: str, scope_id: str) -> bool:
+    resource = resource_id.casefold().rstrip("/")
+    scope = scope_id.casefold().rstrip("/")
+    return resource == scope or resource.startswith(scope + "/")
+
+
+class _AzureAcquisitionClientBase:
+    def __init__(
+        self,
+        *,
+        credential: ManagedIdentityCredential,
+        reviewed_contract: MonitoringCollectorContract,
+        endpoint: str,
+        scope: str,
+        transport: _AzureHttpTransport | None,
+    ) -> None:
+        self._credential = credential
+        self._reviewed_contract = _validated_azure_client_contract(reviewed_contract)
+        self._reviewed_contract_digest = self._reviewed_contract.compute_artifact_digest_value()
+        self._http = _AzureJsonPipeline(
+            credential=credential,
+            endpoint=endpoint,
+            scope=scope,
+            transport=transport,
+        )
+
+    def _require_request_contract(self, request: _AcquisitionRequest) -> None:
+        if (
+            request.monitoring_reader_identity_id
+            != self._reviewed_contract.collector_identity_resource_id.casefold().rstrip("/")
+            or request.collector_contract_digest != self._reviewed_contract_digest
+        ):
+            raise MonitoringAcquisitionError(
+                "Azure request does not bind the reviewed collector contract"
+            )
+
+
+def _normalize_log_analytics_row(
+    request: LogAnalyticsQueryRequest,
+    values: object,
+) -> LogAnalyticsRow:
+    row_values = _azure_list(values, "Log Analytics row")
+    if len(row_values) != len(request.expected_columns):
+        raise MonitoringAcquisitionError(
+            "Log Analytics row does not match the reviewed column count"
+        )
+    row = dict(zip(request.expected_columns, row_values, strict=True))
+    if request.table == "Heartbeat":
+        return HeartbeatRow(
+            rowKind="heartbeat",
+            resourceId=_azure_text(row["resourceId"], "Heartbeat resourceId"),
+            observedStart=_azure_datetime(row["observedStart"], "Heartbeat observedStart"),
+            observedEnd=_azure_datetime(row["observedEnd"], "Heartbeat observedEnd"),
+            heartbeatCount=_azure_optional_integer(
+                row["heartbeatCount"],
+                "Heartbeat heartbeatCount",
+            ),
+        )
+    if request.table == "VMConnection":
+        return VmConnectionRow(
+            rowKind="vmConnection",
+            sourceAddress=_azure_text(row["sourceAddress"], "VMConnection sourceAddress"),
+            destinationAddress=_azure_text(
+                row["destinationAddress"],
+                "VMConnection destinationAddress",
+            ),
+            subjectResourceCandidates=_azure_resource_candidates(
+                row["subjectResourceCandidates"],
+                "VMConnection subjectResourceCandidates",
+            ),
+            backendResourceCandidates=_azure_resource_candidates(
+                row["backendResourceCandidates"],
+                "VMConnection backendResourceCandidates",
+            ),
+            pathId=_azure_text(row["pathId"], "VMConnection pathId"),
+            observedStart=_azure_datetime(
+                row["observedStart"],
+                "VMConnection observedStart",
+            ),
+            observedEnd=_azure_datetime(
+                row["observedEnd"],
+                "VMConnection observedEnd",
+            ),
+            failedConnectionCount=_azure_optional_integer(
+                row["failedConnectionCount"],
+                "VMConnection failedConnectionCount",
+            ),
+        )
+    if request.table == "NWConnectionMonitorTestResult":
+        return ConnectionMonitorRow(
+            rowKind="connectionMonitor",
+            subjectResourceId=_azure_text(
+                row["subjectResourceId"],
+                "Connection Monitor subjectResourceId",
+            ),
+            pathId=_azure_text(row["pathId"], "Connection Monitor pathId"),
+            monitorResourceId=_azure_text(
+                row["monitorResourceId"],
+                "Connection Monitor monitorResourceId",
+            ),
+            sourceResourceId=_azure_text(
+                row["sourceResourceId"],
+                "Connection Monitor sourceResourceId",
+            ),
+            destinationResourceId=_azure_text(
+                row["destinationResourceId"],
+                "Connection Monitor destinationResourceId",
+            ),
+            sourceAddress=_azure_text(
+                row["sourceAddress"],
+                "Connection Monitor sourceAddress",
+            ),
+            destinationAddress=_azure_text(
+                row["destinationAddress"],
+                "Connection Monitor destinationAddress",
+            ),
+            direction=_azure_direction(row["direction"]),
+            protocol=_azure_protocol(row["protocol"]),
+            sourcePort=_azure_optional_integer(
+                row["sourcePort"],
+                "Connection Monitor sourcePort",
+            ),
+            destinationPort=_azure_optional_integer(
+                row["destinationPort"],
+                "Connection Monitor destinationPort",
+            ),
+            status=_azure_connection_status(row["status"]),
+            testConfigurationReference=_azure_text(
+                row["testConfigurationReference"],
+                "Connection Monitor testConfigurationReference",
+            ),
+            testConfigurationDigest=_azure_text(
+                row["testConfigurationDigest"],
+                "Connection Monitor testConfigurationDigest",
+            ),
+            observedStart=_azure_datetime(
+                row["observedStart"],
+                "Connection Monitor observedStart",
+            ),
+            observedEnd=_azure_datetime(
+                row["observedEnd"],
+                "Connection Monitor observedEnd",
+            ),
+        )
+    return TrafficAnalyticsRow(
+        rowKind="trafficAnalytics",
+        subjectResourceCandidates=_azure_resource_candidates(
+            row["subjectResourceCandidates"],
+            "Traffic Analytics subjectResourceCandidates",
+        ),
+        pathId=_azure_text(row["pathId"], "Traffic Analytics pathId"),
+        decision=_azure_decision(row["decision"]),
+        direction=_azure_direction(row["direction"]),
+        protocol=_azure_protocol(row["protocol"]),
+        sourceResourceCandidates=_azure_resource_candidates(
+            row["sourceResourceCandidates"],
+            "Traffic Analytics sourceResourceCandidates",
+        ),
+        destinationResourceCandidates=_azure_resource_candidates(
+            row["destinationResourceCandidates"],
+            "Traffic Analytics destinationResourceCandidates",
+        ),
+        sourceAddress=_azure_text(
+            row["sourceAddress"],
+            "Traffic Analytics sourceAddress",
+        ),
+        destinationAddress=_azure_text(
+            row["destinationAddress"],
+            "Traffic Analytics destinationAddress",
+        ),
+        sourcePort=_azure_optional_integer(
+            row["sourcePort"],
+            "Traffic Analytics sourcePort",
+        ),
+        destinationPort=_azure_optional_integer(
+            row["destinationPort"],
+            "Traffic Analytics destinationPort",
+        ),
+        enforcementResourceId=_azure_text(
+            row["enforcementResourceId"],
+            "Traffic Analytics enforcementResourceId",
+        ),
+        ruleResourceId=_azure_optional_text(
+            row["ruleResourceId"],
+            "Traffic Analytics ruleResourceId",
+        ),
+        trafficAnalyticsLimitation="aggregatedNotPacketCausal",
+        observedStart=_azure_datetime(
+            row["observedStart"],
+            "Traffic Analytics observedStart",
+        ),
+        observedEnd=_azure_datetime(
+            row["observedEnd"],
+            "Traffic Analytics observedEnd",
+        ),
+    )
+
+
+class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
+    """Credential-bound resource-centric Azure Monitor Logs client."""
 
     def __init__(
         self,
         *,
         credential: ManagedIdentityCredential,
         reviewed_contract: MonitoringCollectorContract,
+        _transport: _AzureHttpTransport | None = None,
     ) -> None:
-        self._credential = credential
-        self._reviewed_contract = reviewed_contract
+        super().__init__(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+            endpoint=_AZURE_LOGS_ENDPOINT,
+            scope=_AZURE_LOGS_SCOPE,
+            transport=_transport,
+        )
 
     def query_log_analytics(
         self,
         request: LogAnalyticsQueryRequest,
     ) -> LogAnalyticsQueryResult:
-        del request
-        raise MonitoringAcquisitionError(
-            "direct Azure Log Analytics acquisition client is not configured"
+        if type(request) is not LogAnalyticsQueryRequest:
+            raise TypeError("Azure Log Analytics requires an exact query request")
+        self._require_request_contract(request)
+        allowed_targets = {
+            self._reviewed_contract.workspace_resource_id.casefold().rstrip("/"),
+            *(
+                item.casefold().rstrip("/")
+                for item in self._reviewed_contract.signal_read_scope_ids
+            ),
+        }
+        if (
+            request.table not in self._reviewed_contract.log_analytics_allowed_tables
+            or request.query_target_resource_id not in allowed_targets
+            or request.collector_execution_time is None
+            or request.coverage_scope is None
+        ):
+            raise MonitoringAcquisitionError(
+                "Log Analytics request escaped the reviewed table or resource scope"
+            )
+        response = self._http.request_json(
+            method="POST",
+            path=(
+                f"/{_LOG_ANALYTICS_API_VERSION}"
+                f"{quote(request.query_target_resource_id, safe='/')}/query"
+            ),
+            body={
+                "query": request.query,
+                "timespan": (
+                    f"{_azure_datetime_text(request.window_start)}/"
+                    f"{_azure_datetime_text(request.window_end)}"
+                ),
+            },
+            max_bytes=request.max_bytes,
+        )
+        payload = _azure_mapping(response.payload, "Log Analytics response")
+        if payload.get("error") is not None:
+            raise MonitoringAcquisitionError("Log Analytics returned a partial or failed query")
+        tables = _azure_list(payload.get("tables"), "Log Analytics tables")
+        if len(tables) != 1:
+            raise MonitoringAcquisitionError(
+                "Log Analytics response must contain exactly one result table"
+            )
+        table = _azure_mapping(tables[0], "Log Analytics table")
+        columns = tuple(
+            _azure_text(
+                _azure_mapping(item, "Log Analytics column").get("name"),
+                "Log Analytics column name",
+                maximum=128,
+            )
+            for item in _azure_list(table.get("columns"), "Log Analytics columns")
+        )
+        if columns != request.expected_columns:
+            raise MonitoringAcquisitionError(
+                "Log Analytics columns do not match the reviewed schema"
+            )
+        raw_rows = _azure_list(table.get("rows"), "Log Analytics rows")
+        normalized_rows = _sorted_rows(
+            [_normalize_log_analytics_row(request, row) for row in raw_rows]
+        )
+        truncated = len(raw_rows) > request.max_rows
+        rows = normalized_rows[: request.max_rows]
+        return LogAnalyticsQueryResult(
+            schemaVersion="athena.wc028LogAnalyticsQueryResult.v1",
+            source="logAnalytics",
+            table=request.table,
+            requestDigest=request.request_digest,
+            sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
+            collectedAt=request.collector_execution_time,
+            columns=request.expected_columns,
+            coverageDescriptor=_log_coverage_descriptor(request.coverage_scope),
+            aggregateCompletenessProof=None,
+            truncated=truncated,
+            responseBytes=response.response_bytes,
+            rows=rows,
         )
 
 
-class AzureActivityLogAcquisitionClient:
-    """Credential-bound Activity Log client composition slot."""
+def _normalize_activity_log_row(
+    value: object,
+    *,
+    requested_resource_id: str,
+    request: ActivityLogQueryRequest,
+) -> ActivityLogRow | None:
+    row = _azure_mapping(value, "Activity Log row")
+    target_resource_id = _canonical_resource_id(
+        _azure_text(row.get("resourceId"), "Activity Log resourceId")
+    )
+    if target_resource_id != requested_resource_id:
+        raise MonitoringAcquisitionError("Activity Log response escaped its exact resource filter")
+    category = _azure_text(row.get("category"), "Activity Log category", maximum=256)
+    operation_name = _azure_text(
+        row.get("operationName"),
+        "Activity Log operationName",
+        maximum=256,
+    )
+    result_type = _azure_text(row.get("status"), "Activity Log status", maximum=256)
+    level = _azure_text(row.get("level"), "Activity Log level", maximum=32)
+    selected_category = _selected_value(category, request.categories)
+    selected_operation = _selected_value(operation_name, request.operation_names)
+    selected_result = _selected_value(result_type, request.result_types)
+    selected_level = _selected_value(level, request.levels)
+    if (
+        selected_category is None
+        or selected_operation is None
+        or selected_result is None
+        or selected_level is None
+    ):
+        return None
+    occurred_at = _azure_datetime(
+        row.get("eventTimestamp"),
+        "Activity Log eventTimestamp",
+    )
+    if not request.window_start <= occurred_at <= request.window_end:
+        raise MonitoringAcquisitionError("Activity Log response escaped its exact time filter")
+    return ActivityLogRow(
+        category=selected_category,
+        operationName=selected_operation,
+        resultType=selected_result,
+        level=cast(
+            Literal["Critical", "Error", "Informational", "Verbose", "Warning"],
+            selected_level,
+        ),
+        targetResourceId=target_resource_id,
+        correlationId=_azure_text(
+            row.get("correlationId"),
+            "Activity Log correlationId",
+            maximum=64,
+        ).casefold(),
+        occurredAt=occurred_at,
+    )
+
+
+class AzureActivityLogAcquisitionClient(_AzureAcquisitionClientBase):
+    """Credential-bound Activity Log client scoped to exact requested resources."""
 
     def __init__(
         self,
         *,
         credential: ManagedIdentityCredential,
         reviewed_contract: MonitoringCollectorContract,
+        _transport: _AzureHttpTransport | None = None,
     ) -> None:
-        self._credential = credential
-        self._reviewed_contract = reviewed_contract
+        super().__init__(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+            endpoint=_AZURE_ARM_ENDPOINT,
+            scope=_AZURE_ARM_SCOPE,
+            transport=_transport,
+        )
 
     def query_activity_log(
         self,
         request: ActivityLogQueryRequest,
     ) -> ActivityLogQueryResult:
-        del request
-        raise MonitoringAcquisitionError(
-            "direct Azure Activity Log acquisition client is not configured"
+        if type(request) is not ActivityLogQueryRequest:
+            raise TypeError("Azure Activity Log requires an exact query request")
+        self._require_request_contract(request)
+        subscription_id = _arm_subscription_id(self._reviewed_contract.workload_resource_group_id)
+        workload_scope = self._reviewed_contract.workload_resource_group_id
+        if any(
+            _arm_subscription_id(resource_id) != subscription_id
+            or not _resource_is_within(resource_id, workload_scope)
+            for resource_id in request.resource_ids
+        ):
+            raise MonitoringAcquisitionError(
+                "Activity Log request escaped the reviewed workload scope"
+            )
+        rows: list[ActivityLogRow] = []
+        response_bytes = 0
+        truncated = False
+        select = "category,operationName,status,level,resourceId,correlationId,eventTimestamp"
+        for resource_id in request.resource_ids:
+            filter_value = (
+                f"eventTimestamp ge '{_azure_datetime_text(request.window_start)}' and "
+                f"eventTimestamp le '{_azure_datetime_text(request.window_end)}' and "
+                f"resourceUri eq '{resource_id}'"
+            )
+            query = urlencode(
+                {
+                    "api-version": _ACTIVITY_LOG_API_VERSION,
+                    "$filter": filter_value,
+                    "$select": select,
+                },
+                quote_via=quote,
+            )
+            response = self._http.request_json(
+                method="GET",
+                path=(
+                    f"/subscriptions/{subscription_id}/providers/Microsoft.Insights/"
+                    f"eventtypes/management/values?{query}"
+                ),
+                headers={"Prefer": "wait=30"},
+                max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
+            )
+            response_bytes += response.response_bytes
+            payload = _azure_mapping(response.payload, "Activity Log response")
+            next_link = payload.get("nextLink")
+            if next_link is not None:
+                _azure_text(next_link, "Activity Log nextLink", maximum=4096)
+                truncated = True
+            for item in _azure_list(payload.get("value"), "Activity Log value"):
+                normalized = _normalize_activity_log_row(
+                    item,
+                    requested_resource_id=resource_id,
+                    request=request,
+                )
+                if normalized is not None:
+                    rows.append(normalized)
+        normalized_rows = _sorted_rows(rows)
+        if len(normalized_rows) > request.max_rows:
+            truncated = True
+        return ActivityLogQueryResult(
+            schemaVersion="athena.wc028ActivityLogQueryResult.v1",
+            source="activityLog",
+            requestDigest=request.request_digest,
+            sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
+            collectedAt=request.window_end,
+            columns=request.expected_columns,
+            truncated=truncated,
+            responseBytes=response_bytes,
+            rows=normalized_rows[: request.max_rows],
         )
 
 
-class AzureResourceGraphAcquisitionClient:
-    """Credential-bound Resource Graph client composition slot."""
+def _resource_graph_query(request: ResourceGraphChangeQueryRequest) -> str:
+    resource_ids = ", ".join(
+        f"'{resource_id.replace("'", "''")}'" for resource_id in request.resource_ids
+    )
+    return "\n".join(
+        (
+            "resourcechanges",
+            (
+                "| extend targetResourceId=tolower(tostring(properties.targetResourceId)), "
+                "occurredAt=todatetime(properties.changeAttributes.timestamp), "
+                "correlationId=tolower(tostring(properties.changeAttributes.correlationId)), "
+                "operationName=tostring(properties.changeAttributes.operation)"
+            ),
+            f"| where targetResourceId in~ ({resource_ids})",
+            (
+                "| where occurredAt between "
+                f"(datetime({_azure_datetime_text(request.window_start)}) .. "
+                f"datetime({_azure_datetime_text(request.window_end)}))"
+            ),
+            (
+                "| project targetResourceId, correlationId, occurredAt, operationName, "
+                "resultType='Succeeded', id, properties"
+            ),
+            "| order by occurredAt asc, targetResourceId asc, correlationId asc",
+            f"| take {request.max_rows + 1}",
+        )
+    )
+
+
+def _normalize_resource_graph_row(
+    value: object,
+    *,
+    request: ResourceGraphChangeQueryRequest,
+) -> ResourceGraphChangeRow:
+    row = _azure_mapping(value, "Resource Graph row")
+    target_resource_id = _canonical_resource_id(
+        _azure_text(row.get("targetResourceId"), "Resource Graph targetResourceId")
+    )
+    if target_resource_id not in request.resource_ids:
+        raise MonitoringAcquisitionError(
+            "Resource Graph response escaped the reviewed resource scope"
+        )
+    occurred_at = _azure_datetime(
+        row.get("occurredAt"),
+        "Resource Graph occurredAt",
+    )
+    if not request.window_start <= occurred_at <= request.window_end:
+        raise MonitoringAcquisitionError("Resource Graph response escaped the reviewed time window")
+    properties = _azure_mapping(
+        row.get("properties"),
+        "Resource Graph change properties",
+    )
+    return ResourceGraphChangeRow(
+        targetResourceId=target_resource_id,
+        correlationId=_azure_text(
+            row.get("correlationId"),
+            "Resource Graph correlationId",
+            maximum=64,
+        ).casefold(),
+        occurredAt=occurred_at,
+        operationName=_azure_text(
+            row.get("operationName"),
+            "Resource Graph operationName",
+            maximum=256,
+        ),
+        resultType=_azure_text(
+            row.get("resultType"),
+            "Resource Graph resultType",
+            maximum=256,
+        ),
+        change={
+            "id": _azure_text(row.get("id"), "Resource Graph change id"),
+            "properties": dict(properties),
+        },
+    )
+
+
+class AzureResourceGraphAcquisitionClient(_AzureAcquisitionClientBase):
+    """Credential-bound Resource Graph change-history client."""
 
     def __init__(
         self,
         *,
         credential: ManagedIdentityCredential,
         reviewed_contract: MonitoringCollectorContract,
+        _transport: _AzureHttpTransport | None = None,
     ) -> None:
-        self._credential = credential
-        self._reviewed_contract = reviewed_contract
+        super().__init__(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+            endpoint=_AZURE_ARM_ENDPOINT,
+            scope=_AZURE_ARM_SCOPE,
+            transport=_transport,
+        )
 
     def query_resource_graph_changes(
         self,
         request: ResourceGraphChangeQueryRequest,
     ) -> ResourceGraphChangeQueryResult:
-        del request
-        raise MonitoringAcquisitionError(
-            "direct Azure Resource Graph acquisition client is not configured"
+        if type(request) is not ResourceGraphChangeQueryRequest:
+            raise TypeError("Azure Resource Graph requires an exact query request")
+        self._require_request_contract(request)
+        subscription_id = _arm_subscription_id(self._reviewed_contract.workload_resource_group_id)
+        workload_scope = self._reviewed_contract.workload_resource_group_id
+        if any(
+            _arm_subscription_id(resource_id) != subscription_id
+            or not _resource_is_within(resource_id, workload_scope)
+            for resource_id in request.resource_ids
+        ):
+            raise MonitoringAcquisitionError(
+                "Resource Graph request escaped the reviewed workload scope"
+            )
+        query_text = _resource_graph_query(request)
+        if len(query_text.encode("utf-8")) > 32 * 1024:
+            raise MonitoringAcquisitionError(
+                "Resource Graph generated query exceeded its reviewed byte bound"
+            )
+        response = self._http.request_json(
+            method="POST",
+            path=(
+                "/providers/Microsoft.ResourceGraph/resources"
+                f"?api-version={_RESOURCE_GRAPH_API_VERSION}"
+            ),
+            body={
+                "subscriptions": [subscription_id],
+                "query": query_text,
+                "options": {
+                    "$top": request.max_rows + 1,
+                    "resultFormat": "ObjectArray",
+                },
+            },
+            max_bytes=request.max_bytes,
+        )
+        payload = _azure_mapping(response.payload, "Resource Graph response")
+        marker = payload.get("resultTruncated")
+        if marker is False or marker == "false":
+            truncated = False
+        elif marker is True or marker == "true":
+            truncated = True
+        else:
+            raise MonitoringAcquisitionError(
+                "Resource Graph response truncation marker was invalid"
+            )
+        if payload.get("$skipToken") is not None or payload.get("skipToken") is not None:
+            truncated = True
+        raw_rows = _azure_list(payload.get("data"), "Resource Graph data")
+        normalized_rows = _sorted_rows(
+            [_normalize_resource_graph_row(row, request=request) for row in raw_rows]
+        )
+        if len(raw_rows) > request.max_rows:
+            truncated = True
+        return ResourceGraphChangeQueryResult(
+            schemaVersion="athena.wc028ResourceGraphChangeQueryResult.v1",
+            source="resourceGraph",
+            requestDigest=request.request_digest,
+            sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
+            collectedAt=request.window_end,
+            columns=request.expected_columns,
+            truncated=truncated,
+            responseBytes=response.response_bytes,
+            rows=normalized_rows[: request.max_rows],
         )
 
 
-class AzureResourceHealthAcquisitionClient:
-    """Credential-bound Resource Health client composition slot."""
+def _normalize_resource_health_row(
+    value: object,
+    *,
+    requested_resource_id: str,
+    request: ResourceHealthQueryRequest,
+) -> ResourceHealthRow | None:
+    row = _azure_mapping(value, "Resource Health row")
+    properties = _azure_mapping(
+        row.get("properties"),
+        "Resource Health properties",
+    )
+    response_resource_id = properties.get("targetResourceId")
+    resource_id = (
+        requested_resource_id
+        if response_resource_id is None
+        else _canonical_resource_id(
+            _azure_text(
+                response_resource_id,
+                "Resource Health targetResourceId",
+            )
+        )
+    )
+    if resource_id != requested_resource_id:
+        raise MonitoringAcquisitionError(
+            "Resource Health response escaped its exact resource scope"
+        )
+    if properties.get("availabilityState") is None:
+        return None
+    current_status = _azure_health_status(
+        properties.get("availabilityState"),
+        "Resource Health availabilityState",
+    )
+    previous_status = _azure_health_status(
+        properties.get("previousAvailabilityState"),
+        "Resource Health previousAvailabilityState",
+    )
+    event_status = _resource_health_event_status(current_status, previous_status)
+    reason_type = _azure_reason_type(
+        properties.get("healthEventCause", properties.get("reasonType"))
+    )
+    if (
+        _selected_value(event_status, request.event_statuses) is None
+        or _selected_value(current_status, request.current_statuses) is None
+        or _selected_value(previous_status, request.previous_statuses) is None
+        or _selected_value(reason_type, request.reason_types) is None
+    ):
+        return None
+    occurred_at = _azure_datetime(
+        properties.get("occurredTime"),
+        "Resource Health occurredTime",
+    )
+    if not request.window_start <= occurred_at <= request.window_end:
+        return None
+    return ResourceHealthRow(
+        resourceId=resource_id,
+        eventStatus=event_status,
+        currentStatus=current_status,
+        previousStatus=previous_status,
+        reasonType=reason_type,
+        observedStart=occurred_at,
+        observedEnd=occurred_at,
+    )
+
+
+class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
+    """Credential-bound Resource Health availability-history client."""
 
     def __init__(
         self,
         *,
         credential: ManagedIdentityCredential,
         reviewed_contract: MonitoringCollectorContract,
+        _transport: _AzureHttpTransport | None = None,
     ) -> None:
-        self._credential = credential
-        self._reviewed_contract = reviewed_contract
+        super().__init__(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+            endpoint=_AZURE_ARM_ENDPOINT,
+            scope=_AZURE_ARM_SCOPE,
+            transport=_transport,
+        )
 
     def query_resource_health(
         self,
         request: ResourceHealthQueryRequest,
     ) -> ResourceHealthQueryResult:
-        del request
-        raise MonitoringAcquisitionError(
-            "direct Azure Resource Health acquisition client is not configured"
+        if type(request) is not ResourceHealthQueryRequest:
+            raise TypeError("Azure Resource Health requires an exact query request")
+        self._require_request_contract(request)
+        approved_resources = {
+            item.casefold().rstrip("/")
+            for item in cast(
+                tuple[str, ...],
+                self._reviewed_contract.resource_health_scope_ids,
+            )
+        }
+        if not set(request.resource_ids).issubset(approved_resources):
+            raise MonitoringAcquisitionError(
+                "Resource Health request escaped the exact reviewed VM scopes"
+            )
+        rows: list[ResourceHealthRow] = []
+        response_bytes = 0
+        truncated = False
+        for resource_id in request.resource_ids:
+            response = self._http.request_json(
+                method="GET",
+                path=(
+                    f"{quote(resource_id, safe='/')}/providers/"
+                    "Microsoft.ResourceHealth/availabilityStatuses"
+                    f"?api-version={_RESOURCE_HEALTH_API_VERSION}"
+                ),
+                max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
+            )
+            response_bytes += response.response_bytes
+            payload = _azure_mapping(response.payload, "Resource Health response")
+            next_link = payload.get("nextLink")
+            if next_link is not None:
+                _azure_text(next_link, "Resource Health nextLink", maximum=4096)
+                truncated = True
+            for item in _azure_list(payload.get("value"), "Resource Health value"):
+                normalized = _normalize_resource_health_row(
+                    item,
+                    requested_resource_id=resource_id,
+                    request=request,
+                )
+                if normalized is not None:
+                    rows.append(normalized)
+        normalized_rows = _sorted_rows(rows)
+        if len(normalized_rows) > request.max_rows:
+            truncated = True
+        return ResourceHealthQueryResult(
+            schemaVersion="athena.wc028ResourceHealthQueryResult.v1",
+            source="resourceHealth",
+            requestDigest=request.request_digest,
+            sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
+            collectedAt=request.window_end,
+            columns=request.expected_columns,
+            truncated=truncated,
+            responseBytes=response_bytes,
+            rows=normalized_rows[: request.max_rows],
         )
 
 
-class AzureIpFlowVerifyAcquisitionClient:
-    """Credential-bound Network Watcher IP Flow Verify client composition slot."""
+def _arm_poll_path(location: str, *, subscription_id: str) -> str:
+    parsed = urlsplit(location)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != "management.azure.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in {None, 443}
+        or parsed.fragment
+        or not parsed.path.casefold().startswith(f"/subscriptions/{subscription_id}/")
+        or "/providers/microsoft.network/" not in parsed.path.casefold()
+        or query not in ({}, {"api-version": [_NETWORK_API_VERSION]})
+    ):
+        raise MonitoringAcquisitionError("IP Flow Verify polling escaped the reviewed ARM endpoint")
+    return parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+
+class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
+    """Credential-bound Network Watcher IP Flow Verify client."""
 
     def __init__(
         self,
         *,
         credential: ManagedIdentityCredential,
         reviewed_contract: MonitoringCollectorContract,
+        _transport: _AzureHttpTransport | None = None,
     ) -> None:
-        self._credential = credential
-        self._reviewed_contract = reviewed_contract
+        super().__init__(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+            endpoint=_AZURE_ARM_ENDPOINT,
+            scope=_AZURE_ARM_SCOPE,
+            transport=_transport,
+        )
 
     def query_ip_flow_verify(
         self,
         request: IpFlowVerifyRequest,
     ) -> IpFlowVerifyResult:
-        del request
-        raise MonitoringAcquisitionError(
-            "direct Azure IP Flow Verify acquisition client is not configured"
+        if type(request) is not IpFlowVerifyRequest:
+            raise TypeError("Azure IP Flow Verify requires an exact query request")
+        self._require_request_contract(request)
+        approved_targets = {
+            item.casefold().rstrip("/") for item in self._reviewed_contract.signal_read_scope_ids
+        }
+        watcher_id = _canonical_resource_id(
+            cast(str, self._reviewed_contract.ip_flow_verify_scope_id)
+        )
+        subscription_id = _arm_subscription_id(watcher_id)
+        if (
+            request.target_resource_id not in approved_targets
+            or request.protocol not in {"Tcp", "Udp"}
+            or _arm_subscription_id(request.target_resource_id) != subscription_id
+            or ipaddress.ip_address(request.source_address).version != 4
+            or ipaddress.ip_address(request.destination_address).version != 4
+        ):
+            raise MonitoringAcquisitionError(
+                "IP Flow Verify request escaped the exact reviewed VM or protocol scope"
+            )
+        if request.direction == "inbound":
+            local_address = request.destination_address
+            local_port = request.destination_port
+            remote_address = request.source_address
+            remote_port = request.source_port
+        else:
+            local_address = request.source_address
+            local_port = request.source_port
+            remote_address = request.destination_address
+            remote_port = request.destination_port
+        body = {
+            "targetResourceId": request.target_resource_id,
+            "direction": request.direction.title(),
+            "protocol": request.protocol.upper(),
+            "localPort": "*" if local_port is None else str(local_port),
+            "remotePort": "*" if remote_port is None else str(remote_port),
+            "localIPAddress": local_address,
+            "remoteIPAddress": remote_address,
+        }
+        response_bytes = 0
+        response = self._http.request_json(
+            method="POST",
+            path=(f"{quote(watcher_id, safe='/')}/ipFlowVerify?api-version={_NETWORK_API_VERSION}"),
+            body=body,
+            max_bytes=request.max_bytes,
+            accepted_statuses=(200, 202),
+            allow_empty=True,
+        )
+        response_bytes += response.response_bytes
+        elapsed_seconds = 0
+        attempts = 1
+        while response.status_code == 202:
+            if attempts >= _MAX_ARM_POLL_ATTEMPTS:
+                raise MonitoringAcquisitionError("IP Flow Verify polling exceeded its bound")
+            location = response.headers.get("location")
+            if location is None:
+                raise MonitoringAcquisitionError(
+                    "IP Flow Verify polling response omitted its exact location"
+                )
+            retry_after_text = response.headers.get("retry-after", "1")
+            try:
+                retry_after = int(retry_after_text)
+            except ValueError as exc:
+                raise MonitoringAcquisitionError(
+                    "IP Flow Verify polling delay was invalid"
+                ) from exc
+            if retry_after < 0 or retry_after > 15:
+                raise MonitoringAcquisitionError(
+                    "IP Flow Verify polling delay was outside its bound"
+                )
+            elapsed_seconds += retry_after
+            if elapsed_seconds > _MAX_ARM_POLL_SECONDS:
+                raise MonitoringAcquisitionError("IP Flow Verify polling exceeded its time bound")
+            self._http.sleep(retry_after)
+            response = self._http.request_json(
+                method="GET",
+                path=_arm_poll_path(location, subscription_id=subscription_id),
+                max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
+                accepted_statuses=(200, 202),
+                allow_empty=True,
+            )
+            response_bytes += response.response_bytes
+            attempts += 1
+        payload = _azure_mapping(response.payload, "IP Flow Verify response")
+        if payload.get("access") is None and isinstance(payload.get("properties"), Mapping):
+            payload = _azure_mapping(
+                payload.get("properties"),
+                "IP Flow Verify response properties",
+            )
+        access_text = _azure_text(payload.get("access"), "IP Flow Verify access", maximum=16)
+        access_lookup: dict[str, Literal["Allow", "Deny"]] = {
+            "allow": "Allow",
+            "deny": "Deny",
+        }
+        try:
+            access = access_lookup[access_text.casefold()]
+        except KeyError as exc:
+            raise MonitoringAcquisitionError(
+                "IP Flow Verify access was outside the reviewed values"
+            ) from exc
+        rule_name = _azure_optional_text(
+            payload.get("ruleName"),
+            "IP Flow Verify ruleName",
+        )
+        rule_resource_id = (
+            _canonical_resource_id(rule_name)
+            if rule_name is not None and rule_name.startswith("/")
+            else None
+        )
+        return IpFlowVerifyResult(
+            schemaVersion="athena.wc028IpFlowVerifyResult.v1",
+            source="ipFlowVerify",
+            requestDigest=request.request_digest,
+            sourceIdentityId=self._reviewed_contract.collector_identity_resource_id,
+            collectedAt=request.checked_at,
+            checkedAt=request.checked_at,
+            access=access,
+            ruleResourceId=rule_resource_id,
+            responseBytes=response_bytes,
+            limitation="pointInTimeNotHistorical",
         )
 
 
@@ -1621,6 +2796,40 @@ class _AzureMonitoringClients:
     ip_flow_verify: MonitoringIpFlowVerifyClient
 
 
+type _AzureMonitoringClientFactory = Callable[
+    [ManagedIdentityCredential, MonitoringCollectorContract],
+    _AzureMonitoringClients,
+]
+
+
+def _production_azure_monitoring_clients(
+    credential: ManagedIdentityCredential,
+    reviewed_contract: MonitoringCollectorContract,
+) -> _AzureMonitoringClients:
+    return _AzureMonitoringClients(
+        log_analytics=AzureLogAnalyticsAcquisitionClient(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+        ),
+        activity_log=AzureActivityLogAcquisitionClient(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+        ),
+        resource_graph=AzureResourceGraphAcquisitionClient(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+        ),
+        resource_health=AzureResourceHealthAcquisitionClient(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+        ),
+        ip_flow_verify=AzureIpFlowVerifyAcquisitionClient(
+            credential=credential,
+            reviewed_contract=reviewed_contract,
+        ),
+    )
+
+
 class AzureMonitoringAdapter:
     """Production-only composition root for one managed identity and all Azure clients."""
 
@@ -1639,11 +2848,12 @@ class AzureMonitoringAdapter:
             != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
         ):
             raise MonitoringAcquisitionError(
-                "Azure monitoring acquisition requires collector contract schema v5"
+                "Azure monitoring acquisition requires collector contract schema v6"
             )
         self._credential = ManagedIdentityCredential(
             client_id=self._reviewed_contract.collector_identity_client_id
         )
+        self._client_factory: _AzureMonitoringClientFactory = _production_azure_monitoring_clients
         self._identity_proof: MonitoringIdentityProof | None = None
         self._clients: _AzureMonitoringClients | None = None
 
@@ -1669,28 +2879,9 @@ class AzureMonitoringAdapter:
                 "managed identity proof acquisition failed before Azure monitoring I/O"
             ) from exc
         if self._clients is None:
-            contract = self._reviewed_contract
-            self._clients = _AzureMonitoringClients(
-                log_analytics=AzureLogAnalyticsAcquisitionClient(
-                    credential=self._credential,
-                    reviewed_contract=contract,
-                ),
-                activity_log=AzureActivityLogAcquisitionClient(
-                    credential=self._credential,
-                    reviewed_contract=contract,
-                ),
-                resource_graph=AzureResourceGraphAcquisitionClient(
-                    credential=self._credential,
-                    reviewed_contract=contract,
-                ),
-                resource_health=AzureResourceHealthAcquisitionClient(
-                    credential=self._credential,
-                    reviewed_contract=contract,
-                ),
-                ip_flow_verify=AzureIpFlowVerifyAcquisitionClient(
-                    credential=self._credential,
-                    reviewed_contract=contract,
-                ),
+            self._clients = self._client_factory(
+                self._credential,
+                self._reviewed_contract,
             )
         self._identity_proof = proof
         return proof
@@ -2748,6 +3939,9 @@ class MonitoringAcquisitionCoordinator:
                 raise MonitoringAcquisitionError("log response table does not match the request")
             responses.append((request, result))
 
+        ip_flow_exchanges_before = sum(
+            item.source == "ipFlowVerify" for item in execution.exchanges
+        )
         normalized: list[MonitoringCollectionRecord] = []
         partial = False
         reasons: list[str] = []
@@ -2937,6 +4131,17 @@ class MonitoringAcquisitionCoordinator:
                 continue
             representable_records.append(record)
         normalized = representable_records
+        if table == "NTANetAnalytics":
+            ip_flow_exchanges_after = sum(
+                item.source == "ipFlowVerify" for item in execution.exchanges
+            )
+            retained_flow_records = sum(
+                isinstance(item, NetworkWatcherFlowRecord) for item in normalized
+            )
+            if ip_flow_exchanges_after - ip_flow_exchanges_before != retained_flow_records:
+                raise MonitoringAcquisitionError(
+                    "each IP Flow Verify exchange must bind exactly one retained network-flow row"
+                )
 
         limitations: tuple[str, ...] = ()
         if table == "NTANetAnalytics":
@@ -3126,6 +4331,12 @@ class MonitoringAcquisitionCoordinator:
                 "Traffic Analytics IP-to-resource mapping was ambiguous and no "
                 "causality was claimed",
             )
+        if row.rule_resource_id is None:
+            return (
+                None,
+                "Traffic Analytics row omitted the ruleResourceId required for "
+                "retained network-flow evidence",
+            )
         coverage_scope = control_binding.coverage_scope
         local_target_resource_id = (
             row.destination_resource_candidates[0]
@@ -3145,6 +4356,47 @@ class MonitoringAcquisitionCoordinator:
                 None,
                 "Traffic Analytics row did not match the exact authority-approved "
                 "TCP/UDP VM-local IP Flow scope",
+            )
+        source_record_id = _record_id(
+            "traffic-analytics",
+            request.request_digest,
+            row,
+        )
+        base_record = NetworkWatcherFlowRecord(
+            recordKind="networkWatcherFlow",
+            controlId=control.control_id,
+            sourceRecordId=source_record_id,
+            subjectResourceId=row.subject_resource_candidates[0],
+            pathId=row.path_id,
+            decision=row.decision,
+            direction=row.direction,
+            protocol=row.protocol,
+            sourceResourceId=row.source_resource_candidates[0],
+            destinationResourceId=row.destination_resource_candidates[0],
+            sourceAddress=row.source_address,
+            destinationAddress=row.destination_address,
+            sourcePort=row.source_port,
+            destinationPort=row.destination_port,
+            enforcementResourceId=row.enforcement_resource_id,
+            ruleResourceId=row.rule_resource_id,
+            observedStart=row.observed_start,
+            observedEnd=row.observed_end,
+            queryDigest=signal.query_digest,
+            queryTargetResourceId=signal.query_target_resource_id,
+            evaluationWindowSeconds=signal.evaluation_window_seconds,
+            frequencySeconds=signal.frequency_seconds,
+            queryExecutionDigest=_query_execution_digest(
+                control=control,
+                source_record_id=source_record_id,
+                observed_start=row.observed_start,
+                observed_end=row.observed_end,
+            ),
+        )
+        if _record_scope_resources(base_record) != set(control.scope.resource_ids):
+            return (
+                None,
+                "Traffic Analytics row could not represent the complete published "
+                "network-flow persistence scope",
             )
         checked_at = execution.adapter.utc_now()
         verification_request = _build_request(
@@ -3227,47 +4479,22 @@ class MonitoringAcquisitionCoordinator:
             if (matched_change is not None and attribution_rule_id is not None)
             else None
         )
-        source_record_id = _record_id(
-            "traffic-analytics",
-            request.request_digest,
-            row,
-        )
+        retained_record = base_record
+        if matched_change is not None and attribution is not None:
+            retained_record = NetworkWatcherFlowRecord.model_validate(
+                {
+                    **base_record.model_dump(
+                        mode="python",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
+                    "changeCorrelationId": matched_change.correlation_id,
+                    "attributionMethod": "ipFlowVerify",
+                    "attributionEvidence": attribution,
+                }
+            )
         return (
-            NetworkWatcherFlowRecord(
-                recordKind="networkWatcherFlow",
-                controlId=control.control_id,
-                sourceRecordId=source_record_id,
-                subjectResourceId=row.subject_resource_candidates[0],
-                pathId=row.path_id,
-                decision=row.decision,
-                direction=row.direction,
-                protocol=row.protocol,
-                sourceResourceId=row.source_resource_candidates[0],
-                destinationResourceId=row.destination_resource_candidates[0],
-                sourceAddress=row.source_address,
-                destinationAddress=row.destination_address,
-                sourcePort=row.source_port,
-                destinationPort=row.destination_port,
-                enforcementResourceId=row.enforcement_resource_id,
-                ruleResourceId=row.rule_resource_id,
-                changeCorrelationId=(
-                    None if matched_change is None else matched_change.correlation_id
-                ),
-                attributionMethod=(None if matched_change is None else "ipFlowVerify"),
-                attributionEvidence=attribution,
-                observedStart=row.observed_start,
-                observedEnd=row.observed_end,
-                queryDigest=signal.query_digest,
-                queryTargetResourceId=signal.query_target_resource_id,
-                evaluationWindowSeconds=signal.evaluation_window_seconds,
-                frequencySeconds=signal.frequency_seconds,
-                queryExecutionDigest=_query_execution_digest(
-                    control=control,
-                    source_record_id=source_record_id,
-                    observed_start=row.observed_start,
-                    observed_end=row.observed_end,
-                ),
-            ),
+            retained_record,
             "IP Flow Verify result was retained only as a point-in-time limitation and "
             "was combined with change evidence only when one exact rule match existed",
         )
