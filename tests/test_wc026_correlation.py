@@ -122,6 +122,9 @@ class _MonitoringVerifier:
         self._calls.append(f"acquisition:{as_of.isoformat()}")
         return receipt.receipt_digest
 
+    def verify_persisted_scope(self, bundle, intent):
+        del bundle, intent
+
 
 class _ChangeVerifier:
     def __init__(self, calls: list[str]) -> None:
@@ -473,9 +476,7 @@ def test_public_service_requires_separate_reader_identities() -> None:
             ),
             monitoring_verifier=object.__new__(TrustedMonitoringHandoffVerifier),
             change_verifier=object.__new__(TrustedChangeArtifactVerifier),
-            monitoring_intent_verifier=object.__new__(
-                TrustedMonitoringIntentAssetVerifier
-            ),
+            monitoring_intent_verifier=object.__new__(TrustedMonitoringIntentAssetVerifier),
         )
 
 
@@ -504,9 +505,7 @@ def test_public_service_requires_separate_storage_containers() -> None:
             ),
             monitoring_verifier=object.__new__(TrustedMonitoringHandoffVerifier),
             change_verifier=object.__new__(TrustedChangeArtifactVerifier),
-            monitoring_intent_verifier=object.__new__(
-                TrustedMonitoringIntentAssetVerifier
-            ),
+            monitoring_intent_verifier=object.__new__(TrustedMonitoringIntentAssetVerifier),
         )
 
 
@@ -1032,7 +1031,7 @@ def test_nsg_chain_prefers_post_change_monitor_and_endpoint() -> None:
         observed_end=current_endpoint.observed_start,
         status="degraded",
     )
-    assert historical_monitor.observation_id < current_monitor.observation_id
+    assert historical_monitor.observed_start < current_monitor.observed_start
     combined = _bundle(
         observations=tuple(
             sorted(
@@ -1978,9 +1977,7 @@ def test_report_contract_requires_one_final_omission_hypothesis() -> None:
         [hypotheses[0]],
     )
 
-    misplaced = correlation_verification._rank_hypotheses(
-        (first_omission, hypotheses[0])
-    )
+    misplaced = correlation_verification._rank_hypotheses((first_omission, hypotheses[0]))
     with pytest.raises(ValueError, match="final rank"):
         CorrelationReport.model_validate(
             correlation_verification._report_document(
@@ -2000,9 +1997,7 @@ def test_report_contract_requires_one_final_omission_hypothesis() -> None:
             )
         )
 
-    omission_only = correlation_verification._rank_hypotheses(
-        (first_omission,)
-    )
+    omission_only = correlation_verification._rank_hypotheses((first_omission,))
     with pytest.raises(ValueError, match="one omission hypothesis"):
         CorrelationReport.model_validate(
             correlation_verification._report_document(

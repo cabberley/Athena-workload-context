@@ -35,6 +35,9 @@ WORKLOAD_READER_RBAC = (
 NETWORK_WATCHER_READER_RBAC = (
     WC024_ROOT / "modules" / "network-watcher-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
+RBAC_ATTESTOR = (
+    WC024_ROOT / "modules" / "monitoring-rbac-attestor.bicep"
+).read_text(encoding="utf-8")
 DCR_ASSOCIATIONS = (WC024_ROOT / "modules" / "dcr-associations.bicep").read_text(
     encoding="utf-8"
 )
@@ -605,7 +608,7 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert not (WC024_ROOT / "modules" / "monitoring-evidence-reader-role.bicep").exists()
     assert "3b03c2da-16b3-4a49-8834-0f8130efdd3b" in READER_RBAC
     assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" in READER_RBAC
-    assert "conditionVersion: '2.0'" in READER_RBAC
+    assert "conditionVersion: '2.0'" not in READER_RBAC
     assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in READER_RBAC
     for table in (
         "Heartbeat",
@@ -635,7 +638,8 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         COLLECTOR_CONTRACT
     )
     assert "AzureNetworkAnalytics_CL" not in COLLECTOR_CONTRACT
-    assert "scope: workspace" in READER_RBAC
+    assert "scope: workspace" not in READER_RBAC
+    assert "resource collectorWorkspaceDataReader" not in READER_RBAC
     assert "scope: dataCollectionEndpoint" in READER_RBAC
     assert "scope: dataCollectionRule" in READER_RBAC
     assert "scope: privateLinkScopes[index]" in READER_RBAC
@@ -659,27 +663,96 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         vm_signal_assignment
     )
     assert "roleDefinitionId: readerRoleDefinitionId" not in vm_signal_assignment
+    resource_health_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorVmResourceHealthReaders",
+        maxsplit=1,
+    )[1].split("resource collectorDcrAssociationReaders", maxsplit=1)[0]
+    assert "scope: approvedVms[index]" in resource_health_assignment
+    assert "roleDefinitionId: resourceHealthRoleDefinition.id" in (
+        resource_health_assignment
+    )
+    assert "roleDefinitionId: readerRoleDefinitionId" not in resource_health_assignment
+    assert "0790d6f2-9553-5b63-84ac-56596b7e4072" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceHealth/AvailabilityStatuses/current/read" in (
+        WORKLOAD_READER_RBAC
+    )
+    assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
+    assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
+    for operation in (
+        "Microsoft.Insights/Logs/Heartbeat/Read",
+        "Microsoft.Insights/Logs/Perf/Read",
+        "Microsoft.Insights/Logs/InsightsMetrics/Read",
+        "Microsoft.Insights/Logs/Syslog/Read",
+        "Microsoft.Insights/Logs/VMConnection/Read",
+    ):
+        assert operation in WORKLOAD_READER_RBAC
+    assert "Microsoft.Insights/logs/NTANetAnalytics/read" not in WORKLOAD_READER_RBAC
+    assert (
+        "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read"
+        not in WORKLOAD_READER_RBAC
+    )
+    assert "Microsoft.Insights/logs/*/read" not in WORKLOAD_READER_RBAC
+    assert "f33a4363-5d9a-5d50-9871-c08582234978" in WORKLOAD_READER_RBAC
+    resource_log_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorVmResourceLogReaders",
+        maxsplit=1,
+    )[1].split("resource collectorVmResourceHealthReaders", maxsplit=1)[0]
+    assert "scope: approvedVms[index]" in resource_log_assignment
+    assert "roleDefinitionId: resourceLogReaderRoleDefinition.id" in (
+        resource_log_assignment
+    )
+    assert "scope: resourceGroup()" not in resource_log_assignment
     assert "signalReaderAssignableScopes" in WORKLOAD_READER_RBAC
     assert "length(signalReaderRoleDefinition.properties.permissions) == 1" in (
         WORKLOAD_READER_RBAC
     )
-    assert "scope: flowLog" in NETWORK_WATCHER_READER_RBAC
-    assert "scope: networkWatcher" not in NETWORK_WATCHER_READER_RBAC
-    combined_rbac = READER_RBAC + WORKLOAD_READER_RBAC + NETWORK_WATCHER_READER_RBAC
+    flow_log_assignment = NETWORK_WATCHER_READER_RBAC.split(
+        "resource collectorFlowLogReader",
+        maxsplit=1,
+    )[1].split("output readerRoleDefinitionId", maxsplit=1)[0]
+    assert "scope: flowLog" in flow_log_assignment
+    assert "roleDefinitionId: readerRoleDefinitionId" in flow_log_assignment
+    assert "scope: networkWatcher" not in flow_log_assignment
+    assert "collectorIpFlowVerifier" not in NETWORK_WATCHER_READER_RBAC
+    assert "ipFlowVerify/action" not in NETWORK_WATCHER_READER_RBAC
+    assert "ipFlowVerify/read" not in NETWORK_WATCHER_READER_RBAC
+    assert "Microsoft.Network/networkWatchers/read" not in NETWORK_WATCHER_READER_RBAC
+    for operation in (
+        "Microsoft.Authorization/roleAssignments/read",
+        "Microsoft.Authorization/roleDefinitions/read",
+        "Microsoft.Authorization/denyAssignments/read",
+        "Microsoft.Authorization/roleAssignmentScheduleInstances/read",
+    ):
+        assert operation in RBAC_ATTESTOR
+    assert "dataActions: []" in RBAC_ATTESTOR
+    assert "notActions: []" in RBAC_ATTESTOR
+    assert "scope: subscription()" in RBAC_ATTESTOR
+    combined_rbac = (
+        READER_RBAC
+        + WORKLOAD_READER_RBAC
+        + NETWORK_WATCHER_READER_RBAC
+        + RBAC_ATTESTOR
+    )
     assert "Owner" not in combined_rbac
     assert "Contributor" not in combined_rbac
     assert "collectorPrincipalId" in combined_rbac
-    for forbidden_identity in ("context", "presentation", "correlation", "mcp"):
+    for forbidden_identity in (
+        "athenacontext",
+        "presentation",
+        "correlation",
+        "mcpidentity",
+    ):
         assert forbidden_identity not in combined_rbac.lower()
     assert "collectorIdentity.properties.principalId" in EVIDENCE_SEAMS
+    assert "collectorIdentity.properties.tenantId" in EVIDENCE_SEAMS
     assert "scope: monitoringEvidenceContainer" in EVIDENCE_SEAMS
     assert "scope: signingKey" in EVIDENCE_SEAMS
     assert "listKeys" not in EVIDENCE_SEAMS
 
 
-def test_wc024_uses_exact_resource_scopes_without_creating_a_custom_role() -> None:
+def test_wc024_uses_exact_resource_scopes_and_separate_rbac_attestor() -> None:
     assert "workloadSubscriptionId" not in MAIN
     assert "networkWatcherSubscriptionId" not in MAIN
     assert "collectorRoleDefinitionGuid" not in MAIN
@@ -693,9 +766,12 @@ def test_wc024_uses_exact_resource_scopes_without_creating_a_custom_role() -> No
     assert "module monitoringEvidenceReaderAssignments" in MAIN
     assert "module workloadEvidenceReaderAssignments" in MAIN
     assert "module networkWatcherEvidenceReaderAssignment" in MAIN
+    assert "module monitoringRbacAttestor" in MAIN
     assert "targetScope = 'resourceGroup'" in READER_RBAC
     assert "targetScope = 'resourceGroup'" in WORKLOAD_READER_RBAC
     assert "targetScope = 'resourceGroup'" in NETWORK_WATCHER_READER_RBAC
+    assert "ipFlowVerifyRoleDefinitionGuid" not in NETWORK_WATCHER_READER_RBAC
+    assert "2a8d9aea-2688-5841-a7e4-82f23d0f1bac" in RBAC_ATTESTOR
     assert "scope: resourceGroup(workloadResourceGroupName)" in MAIN
     assert "scope: resourceGroup(networkWatcherResourceGroupName)" in MAIN
     workload_assignment = MAIN.split(
@@ -728,7 +804,50 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     )
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v8" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringAcquisitionReceipt.v5" in COLLECTOR_CONTRACT
+    assert "validatedAcquisitionWorkspaceAccessControlMode" in COLLECTOR_CONTRACT
+    assert "resource-context Log Analytics mode" in COLLECTOR_CONTRACT
+    assert "effectiveRbacInventory: effectiveRbacInventory" in COLLECTOR_CONTRACT
+    assert "monitoringEffectiveRbacInventory" in MAIN
+    assert "validatedMonitoringEffectiveRbacInventory" in MAIN
+    assert "loadJsonContent('effective-rbac-inventory.example.json')" in (
+        (WC024_ROOT / "main.example.bicepparam").read_text(encoding="utf-8")
+    )
+    assert "ipFlowVerifyRoleDefinitionId" not in COLLECTOR_CONTRACT
+    assert "ipFlowVerifyScopeId" not in COLLECTOR_CONTRACT
+    assert "ipFlowVerifyAllowedOperations" not in COLLECTOR_CONTRACT
+    assert "flowTableAcquisitionMode: 'unsupportedUnavailable'" in COLLECTOR_CONTRACT
+    assert "workspaceResourceContextAccessEnabled" in COLLECTOR_CONTRACT
+    assert "workspaceSkuName: workspaceSkuName" in COLLECTOR_CONTRACT
+    assert "resourceContextTablePlans: resourceContextTablePlans" in COLLECTOR_CONTRACT
+    assert "resourceIdColumn: '_ResourceId'" in COLLECTOR_CONTRACT
+    assert "logQueryPreferHeader: 'include-permissions=true'" in COLLECTOR_CONTRACT
+    assert "rbacAttestorIdentityResourceId" in COLLECTOR_CONTRACT
+    assert "rbacAttestorRoleDefinitionId" in COLLECTOR_CONTRACT
+    assert "rbacAttestorAllowedOperations" in COLLECTOR_CONTRACT
+    assert "collectorTenantId: collectorTenantId" in COLLECTOR_CONTRACT
+    assert "identityProofAudience: 'api://athena-monitoring-identity-proof'" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "identityProofTokenVersion: '1.0'" in COLLECTOR_CONTRACT
+    assert (
+        "identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'"
+        in COLLECTOR_CONTRACT
+    )
+    assert "identityProofMaximumLifetimeSeconds: 7200" in COLLECTOR_CONTRACT
+    assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "resourceHealthScopeIds: resourceHealthScopeIds" in COLLECTOR_CONTRACT
+    assert "resourceHealthAllowedOperations: resourceHealthAllowedOperations" in (
+        COLLECTOR_CONTRACT
+    )
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
+    assert "resourceContextTablePlans" in DATA_PLATFORM
+    assert "plan: resourceContextTables[index].properties.plan == 'Analytics'" in (
+        DATA_PLATFORM
+    )
     assert "'workspaceAndResourceContext'" in MAIN
     assert "'workspaceOnly'" in MAIN
     assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (

@@ -89,7 +89,7 @@ The only assignable built-in roles are:
 
 - **Reader** at each approved workload resource group. Its official `*/read` permission covers
   inventory, metrics, activity logs, and
-  `Microsoft.ResourceHealth/availabilityStatuses/read`. No duplicate Monitoring Reader or
+  `Microsoft.ResourceHealth/availabilityStatuses/current/read`. No duplicate Monitoring Reader or
   nonexistent Resource Health Reader assignment is added.
 - **Log Analytics Data Reader** at each approved workspace. Its permissions are limited to
   workspace/query reads and table data reads; it has no export, action, write, or delete permission.

@@ -8,7 +8,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from athena_context.artifacts import ArtifactReadRequest
 from athena_context.azure_adapters import (
@@ -28,6 +28,8 @@ from athena_context.contracts.common import (
 from athena_context.contracts.correlation import (
     CORRELATION_MAX_CANONICAL_BYTES,
     CORRELATION_REPORT_SCHEMA_VERSION,
+    CORRELATION_REQUEST_SCHEMA_VERSION,
+    ConnectionMonitorObservation,
     CorrelationReport,
     CorrelationRequest,
     EndpointHealthObservation,
@@ -72,6 +74,13 @@ from athena_context.eventing.change_ingestion import (
     MAX_CHANGE_EVIDENCE_AGE,
     KeyVaultChangeEvidenceSigner,
 )
+from athena_context.monitoring_incident import (
+    MonitoringIncidentSample,
+    MonitoringIncidentSelectionError,
+    build_selected_incident,
+    monitoring_health_source_record_reference,
+    select_monitoring_incident,
+)
 
 _MAX_COLLECTION_TRUST_DELAY = timedelta(minutes=20)
 
@@ -98,6 +107,12 @@ class MonitoringHandoffVerifier(Protocol):
         *,
         as_of: UtcDateTime,
     ) -> str: ...
+
+    def verify_persisted_scope(
+        self,
+        bundle: MonitoringEvidenceBundle,
+        intent: PublishedMonitoringIntent,
+    ) -> None: ...
 
 
 class ChangeArtifactVerifier(Protocol):
@@ -160,10 +175,6 @@ class TrustedMonitoringHandoffVerifier:
     trusted_key_anchor: TrustedKeyAnchor
     key_resolver: KeyVaultTrustedKeyResolver
     expected_acquisition_authority_digest: str | None = None
-    expected_authenticated_principal_id: str | None = None
-    expected_athena_context_identity_id: str | None = None
-    expected_deployment_identity_contract_digest: str | None = None
-    expected_receipt_signing_key_id: str | None = None
     acquisition_receipt_maximum_age_seconds: int = 900
     receipt_trusted_key_anchor: TrustedKeyAnchor | None = None
     receipt_key_resolver: KeyVaultTrustedKeyResolver | None = None
@@ -173,19 +184,13 @@ class TrustedMonitoringHandoffVerifier:
             raise TypeError(
                 "production monitoring verification requires KeyVaultTrustedKeyResolver"
             )
-        if (self.receipt_trusted_key_anchor is None) != (
-            self.receipt_key_resolver is None
-        ):
-            raise TypeError(
-                "receipt key anchor and resolver must be configured together"
-            )
+        if (self.receipt_trusted_key_anchor is None) != (self.receipt_key_resolver is None):
+            raise TypeError("receipt key anchor and resolver must be configured together")
         if (
             self.receipt_key_resolver is not None
             and type(self.receipt_key_resolver) is not KeyVaultTrustedKeyResolver
         ):
-            raise TypeError(
-                "production receipt verification requires KeyVaultTrustedKeyResolver"
-            )
+            raise TypeError("production receipt verification requires KeyVaultTrustedKeyResolver")
 
     def verify(
         self,
@@ -208,26 +213,15 @@ class TrustedMonitoringHandoffVerifier:
         *,
         as_of: UtcDateTime,
     ) -> str:
-        if (
-            self.expected_acquisition_authority_digest is None
-            or self.expected_authenticated_principal_id is None
-            or self.expected_athena_context_identity_id is None
-            or self.expected_deployment_identity_contract_digest is None
-            or self.expected_receipt_signing_key_id is None
-        ):
-            raise ValueError(
-                "production acquisition verification requires deployed identity policy"
-            )
+        if self.expected_acquisition_authority_digest is None:
+            raise ValueError("production acquisition verification requires deployed authority")
         receipt_anchor = self.receipt_trusted_key_anchor
         receipt_resolver = self.receipt_key_resolver
         if receipt_anchor is None or receipt_resolver is None:
-            if (
-                self.expected_receipt_signing_key_id.casefold().rstrip("/")
-                != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/")
-            ):
-                raise ValueError(
-                    "distinct receipt signing key requires a dedicated trusted anchor"
-                )
+            if self.reviewed_contract.signing_key_resource_id.casefold().rstrip(
+                "/"
+            ) != self.trusted_key_anchor.key_vault_key_id.casefold().rstrip("/"):
+                raise ValueError("distinct receipt signing key requires a dedicated trusted anchor")
             receipt_anchor = self.trusted_key_anchor
             receipt_resolver = self.key_resolver
         verify_monitoring_acquisition_receipt_attestation(
@@ -235,27 +229,22 @@ class TrustedMonitoringHandoffVerifier:
             as_of=as_of,
             trusted_key_anchor=receipt_anchor,
             key_resolver=receipt_resolver,
-            expected_acquisition_authority_digest=(
-                self.expected_acquisition_authority_digest
-            ),
-            expected_authenticated_principal_id=(
-                self.expected_authenticated_principal_id
-            ),
-            expected_athena_context_identity_id=(
-                self.expected_athena_context_identity_id
-            ),
-            expected_deployment_identity_contract_digest=(
-                self.expected_deployment_identity_contract_digest
-            ),
-            expected_collector_contract_digest=(
-                self.reviewed_contract.compute_artifact_digest_value()
-            ),
-            expected_receipt_signing_key_id=self.expected_receipt_signing_key_id,
-            maximum_receipt_age_seconds=(
-                self.acquisition_receipt_maximum_age_seconds
-            ),
+            reviewed_collector_contract=self.reviewed_contract,
+            expected_acquisition_authority_digest=(self.expected_acquisition_authority_digest),
+            maximum_receipt_age_seconds=(self.acquisition_receipt_maximum_age_seconds),
         )
         return receipt.receipt_digest
+
+    def verify_persisted_scope(
+        self,
+        bundle: MonitoringEvidenceBundle,
+        intent: PublishedMonitoringIntent,
+    ) -> None:
+        _verify_persisted_monitoring_scope(
+            bundle,
+            intent,
+            self.reviewed_contract,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,13 +290,9 @@ class TrustedMonitoringIntentAssetVerifier:
 
     def __post_init__(self) -> None:
         if type(self.signer) is not KeyVaultRsaSigner:
-            raise TypeError(
-                "production monitoring intent verification requires KeyVaultRsaSigner"
-            )
+            raise TypeError("production monitoring intent verification requires KeyVaultRsaSigner")
         if self.signer.trusted_key_anchor.key_vault_key_id != self.trusted_key_id:
-            raise ValueError(
-                "monitoring intent verifier key does not match the trusted key"
-            )
+            raise ValueError("monitoring intent verifier key does not match the trusted key")
 
     def verify(
         self,
@@ -333,23 +318,16 @@ def _verify_signed_monitoring_intent(
 ) -> PublishedMonitoringIntent:
     evidence_reference = request.monitoring_bundle.monitoring_intent_reference
     if evidence_reference is None or reader is None or verifier is None:
-        raise ValueError(
-            "production correlation requires signed monitoring intent assets"
-        )
+        raise ValueError("production correlation requires signed monitoring intent assets")
     intent_bytes = reader.read(evidence_reference.intent_reference)
     attestation_bytes = reader.read(evidence_reference.attestation_reference)
     if (
         sha256_hex(intent_bytes) != evidence_reference.intent_reference.content_digest
-        or sha256_hex(attestation_bytes)
-        != evidence_reference.attestation_reference.content_digest
+        or sha256_hex(attestation_bytes) != evidence_reference.attestation_reference.content_digest
     ):
-        raise ValueError(
-            "monitoring intent Blob bytes do not match immutable references"
-        )
+        raise ValueError("monitoring intent Blob bytes do not match immutable references")
     intent = PublishedMonitoringIntent.model_validate_json(intent_bytes)
-    attestation = PublishedMonitoringIntentAttestation.model_validate_json(
-        attestation_bytes
-    )
+    attestation = PublishedMonitoringIntentAttestation.model_validate_json(attestation_bytes)
     reference = PublishedMonitoringIntentAssetReference(
         schemaVersion="athena.wc028PublishedMonitoringIntentAssetReference.v1",
         referenceId=evidence_reference.asset_reference_id,
@@ -377,9 +355,7 @@ def _verify_signed_monitoring_intent(
     ):
         provenance = item.control_provenance
         if provenance is None:
-            raise ValueError(
-                "monitoring evidence lacks signed control provenance"
-            )
+            raise ValueError("monitoring evidence lacks signed control provenance")
         control = controls.get(provenance.control_id)
         if (
             control is None
@@ -390,6 +366,144 @@ def _verify_signed_monitoring_intent(
                 "monitoring evidence control provenance does not resolve in signed intent"
             )
     return intent
+
+
+def _scope_contains(scope_id: str, resource_id: str) -> bool:
+    scope = scope_id.casefold().rstrip("/")
+    resource = resource_id.casefold().rstrip("/")
+    return resource == scope or resource.startswith(scope + "/")
+
+
+def _verify_persisted_monitoring_scope(
+    bundle: MonitoringEvidenceBundle,
+    intent: PublishedMonitoringIntent,
+    contract: MonitoringCollectorContract,
+) -> None:
+    if contract.workspace_access_control_mode != "workspaceAndResourceContext":
+        raise ValueError("production monitoring evidence requires resource-context Log Analytics")
+    controls = {item.control_id: item for item in intent.controls}
+    signal_scopes = {item.casefold().rstrip("/") for item in contract.signal_read_scope_ids}
+    health_scopes = {
+        item.casefold().rstrip("/") for item in contract.resource_health_scope_ids or ()
+    }
+    for control in intent.controls:
+        signal = control.signal
+        if isinstance(signal, LogQueryMonitoringSignal):
+            if signal.query_target_resource_id.casefold().rstrip("/") not in signal_scopes:
+                raise ValueError("signed log query target is outside exact collector VM scopes")
+        elif isinstance(signal, ResourceHealthMonitoringSignal) and (
+            set(control.scope.resource_ids) - health_scopes
+        ):
+            raise ValueError("signed Resource Health control escapes exact collector VM scopes")
+    for observation in bundle.observations:
+        provenance = observation.control_provenance
+        if provenance is None:
+            raise ValueError("persisted monitoring observation lacks control provenance")
+        control = controls[provenance.control_id]
+        workload_resources = set(control.scope.resource_ids)
+        evidence_resources = set(control.scope.evidence_resource_ids or ())
+        if isinstance(observation, GuestSignalObservation):
+            if (
+                observation.subject_resource_id not in workload_resources
+                or observation.subject_resource_id not in signal_scopes
+            ):
+                raise ValueError("persisted guest observation escapes exact collector VM scopes")
+        elif isinstance(observation, EndpointHealthObservation):
+            resources = {
+                observation.subject_resource_id,
+                *observation.backend_resource_ids,
+            }
+            if not resources.issubset(workload_resources) or not resources.issubset(signal_scopes):
+                raise ValueError("persisted endpoint observation escapes exact collector VM scopes")
+        elif isinstance(observation, PlatformHealthObservation):
+            if (
+                observation.subject_resource_id not in workload_resources
+                or observation.subject_resource_id not in health_scopes
+            ):
+                raise ValueError("persisted Resource Health observation escapes exact VM scopes")
+        elif isinstance(observation, ConnectionMonitorObservation):
+            workload = {
+                observation.subject_resource_id,
+                observation.source_resource_id,
+                observation.destination_resource_id,
+            }
+            if (
+                not workload.issubset(workload_resources)
+                or not workload.issubset(signal_scopes)
+                or observation.monitor_resource_id not in evidence_resources
+                or not _scope_contains(
+                    contract.monitoring_resource_group_id,
+                    observation.monitor_resource_id,
+                )
+            ):
+                raise ValueError(
+                    "persisted Connection Monitor observation escapes collector scopes"
+                )
+        elif isinstance(observation, NetworkFlowObservation):
+            ip_flow_provenance = observation.ip_flow_provenance
+            vm_resources = {
+                observation.subject_resource_id,
+                observation.source_resource_id,
+                observation.destination_resource_id,
+            }
+            network_resources = {
+                observation.enforcement_resource_id,
+                *(() if observation.rule_resource_id is None else (observation.rule_resource_id,)),
+                *(
+                    ()
+                    if ip_flow_provenance is None
+                    or ip_flow_provenance.result_rule_resource_id is None
+                    else (ip_flow_provenance.result_rule_resource_id,)
+                ),
+                *(
+                    ()
+                    if observation.ip_flow_rule_resource_id is None
+                    else (observation.ip_flow_rule_resource_id,)
+                ),
+            }
+            if (
+                not vm_resources.issubset(workload_resources)
+                or not vm_resources.issubset(signal_scopes)
+                or not network_resources.issubset(workload_resources)
+                or any(
+                    not _scope_contains(
+                        contract.workload_resource_group_id,
+                        resource_id,
+                    )
+                    for resource_id in network_resources
+                )
+            ):
+                raise ValueError("persisted network-flow observation escapes collector scopes")
+    for coverage in bundle.coverage:
+        provenance = coverage.control_provenance
+        if provenance is None:
+            raise ValueError("persisted monitoring coverage lacks control provenance")
+        control = controls[provenance.control_id]
+        resources = set(coverage.scope.resource_ids)
+        if not resources.issubset(control.scope.resource_ids):
+            raise ValueError("persisted monitoring coverage escapes signed control scope")
+        if coverage.family == "platformHealth":
+            if not resources.issubset(health_scopes):
+                raise ValueError("persisted Resource Health coverage escapes exact VM scopes")
+        else:
+            for resource_id in resources:
+                if resource_id in signal_scopes or _scope_contains(
+                    contract.workload_resource_group_id,
+                    resource_id,
+                ):
+                    continue
+                raise ValueError("persisted query coverage escapes collector contract scope")
+        permission_evidence = coverage.log_permission_evidence
+        if permission_evidence is not None and (
+            permission_evidence.workspace_resource_id
+            != contract.workspace_resource_id.casefold().rstrip("/")
+            or permission_evidence.query_target_resource_id not in signal_scopes
+            or permission_evidence.table
+            not in {item.table for item in contract.resource_context_table_plans or ()}
+        ):
+            raise ValueError(
+                "persisted Logs permission evidence escapes the reviewed resource context"
+            )
 
 
 def _verify_request_source_freshness(
@@ -422,8 +536,7 @@ def _verify_request_source_freshness(
             is_query_observation = item.query_execution_digest is not None
         if isinstance(signal, LogQueryMonitoringSignal):
             maximum_age = timedelta(
-                seconds=signal.evaluation_window_seconds
-                + signal.frequency_seconds
+                seconds=signal.evaluation_window_seconds + signal.frequency_seconds
             )
             if (
                 observed_end > request.trusted_as_of
@@ -434,9 +547,7 @@ def _verify_request_source_freshness(
                     != timedelta(seconds=signal.evaluation_window_seconds)
                 )
             ):
-                raise ValueError(
-                    "query-derived evidence exceeds its trustedAsOf freshness limit"
-                )
+                raise ValueError("query-derived evidence exceeds its trustedAsOf freshness limit")
         elif isinstance(signal, ResourceHealthMonitoringSignal):
             maximum_age = timedelta(seconds=signal.maximum_event_age_seconds)
             if (
@@ -444,23 +555,16 @@ def _verify_request_source_freshness(
                 or request.trusted_as_of - observed_start > maximum_age
                 or request.trusted_as_of - observed_end > maximum_age
             ):
-                raise ValueError(
-                    "Resource Health evidence exceeds its trustedAsOf freshness limit"
-                )
+                raise ValueError("Resource Health evidence exceeds its trustedAsOf freshness limit")
         else:
-            raise ValueError(
-                "monitoring evidence references an unsupported signed control signal"
-            )
+            raise ValueError("monitoring evidence references an unsupported signed control signal")
     if any(
         artifact.evidence.occurred_at > request.trusted_as_of
         or artifact.evidence.received_at > request.trusted_as_of
-        or request.trusted_as_of - artifact.evidence.occurred_at
-        > MAX_CHANGE_EVIDENCE_AGE
+        or request.trusted_as_of - artifact.evidence.occurred_at > MAX_CHANGE_EVIDENCE_AGE
         for artifact in request.change_artifacts
     ):
-        raise ValueError(
-            "change evidence exceeds its trustedAsOf freshness limit"
-        )
+        raise ValueError("change evidence exceeds its trustedAsOf freshness limit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +589,11 @@ class _CorrelationVerificationService:
         request = CorrelationRequest.model_validate_json(request.model_dump_json(by_alias=True))
         assert_catalog_digest()
         assert_contract_compatibility()
+        if (
+            self.require_signed_monitoring_intent
+            and request.schema_version != CORRELATION_REQUEST_SCHEMA_VERSION
+        ):
+            raise ValueError("production correlation requires incident-bound request v4")
         if evaluated_at < request.trusted_as_of:
             raise ValueError("verification time must not precede request trustedAsOf")
         if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
@@ -509,6 +618,7 @@ class _CorrelationVerificationService:
         persisted_bundle = MonitoringEvidenceBundle.model_validate_json(monitoring_bytes)
         if persisted_bundle != request.monitoring_bundle:
             raise ValueError("monitoring bundle does not match the immutable Blob")
+        verified_intent: PublishedMonitoringIntent | None = None
         if self.require_signed_monitoring_intent:
             verified_intent = _verify_signed_monitoring_intent(
                 request,
@@ -516,6 +626,10 @@ class _CorrelationVerificationService:
                 verifier=self.monitoring_intent_verifier,
             )
             _verify_request_source_freshness(request, verified_intent)
+            self.monitoring_verifier.verify_persisted_scope(
+                request.monitoring_bundle,
+                verified_intent,
+            )
         _verify_canonical_incident_anchor(request)
         _verify_network_rule_parents(request)
         if (
@@ -556,6 +670,7 @@ class _CorrelationVerificationService:
                 != acquisition_receipt.receipt_digest
             ):
                 raise ValueError("acquisition receipt verification proof is invalid")
+            _verify_collector_incident_selection(request, acquisition_receipt)
 
         for artifact, handoff in zip(
             request.change_artifacts,
@@ -642,16 +757,9 @@ class CorrelationService:
 
     def __post_init__(self) -> None:
         if type(self.monitoring_intent_reader) is not AzureBlobCorrelationArtifactReader:
-            raise TypeError(
-                "production correlation requires monitoring intent artifact reader"
-            )
-        if (
-            type(self.monitoring_intent_verifier)
-            is not TrustedMonitoringIntentAssetVerifier
-        ):
-            raise TypeError(
-                "production correlation requires TrustedMonitoringIntentAssetVerifier"
-            )
+            raise TypeError("production correlation requires monitoring intent artifact reader")
+        if type(self.monitoring_intent_verifier) is not TrustedMonitoringIntentAssetVerifier:
+            raise TypeError("production correlation requires TrustedMonitoringIntentAssetVerifier")
         readers = (
             self.monitoring_reader,
             self.change_reader,
@@ -695,8 +803,7 @@ class CorrelationService:
         if not isinstance(request.context_binding, PublishedRuntimeContextBinding):
             raise ValueError("production correlation requires published runtime context")
         if self._require_signed_monitoring_intent and (
-            self.monitoring_intent_reader is None
-            or self.monitoring_intent_verifier is None
+            self.monitoring_intent_reader is None or self.monitoring_intent_verifier is None
         ):
             raise ValueError(
                 "production correlation requires signed monitoring intent verification"
@@ -1029,21 +1136,160 @@ def _verify_canonical_incident_anchor(request: CorrelationRequest) -> None:
         )
 
 
+def _verify_collector_incident_selection(
+    request: CorrelationRequest,
+    receipt: MonitoringAcquisitionReceipt,
+) -> None:
+    signed_selection = receipt.selected_incident
+    if signed_selection is None or request.selected_incident != signed_selection:
+        raise ValueError("production request does not bind receipt selectedIncident")
+    observations = {item.observation_id: item for item in request.monitoring_bundle.observations}
+    samples: list[MonitoringIncidentSample] = []
+    for observation in request.monitoring_bundle.observations:
+        state = _observation_health_state(observation)
+        provenance = observation.control_provenance
+        if state not in {"healthy", "degraded", "unhealthy", "unavailable"} or provenance is None:
+            continue
+        samples.append(
+            MonitoringIncidentSample(
+                resource_id=observation.subject_resource_id,
+                control_id=provenance.control_id,
+                payload_id=observation.observation_id,
+                selection_key=observation.source_record_reference,
+                observed_start=observation.observed_start,
+                observed_end=observation.observed_end,
+                state=cast(
+                    Literal["healthy", "degraded", "unhealthy", "unavailable"],
+                    state,
+                ),
+            )
+        )
+    try:
+        reconstructed = select_monitoring_incident(tuple(samples))
+    except MonitoringIncidentSelectionError as exc:
+        raise ValueError(
+            "persisted observations cannot reconstruct collector incident selection"
+        ) from exc
+
+    def resolve_record_id(record_id: str) -> HealthObservation:
+        references = {
+            monitoring_health_source_record_reference(record_kind, record_id)
+            for record_kind in (
+                "amaHeartbeat",
+                "vmConnectionHealth",
+                "resourceHealth",
+            )
+        }
+        matches = tuple(
+            _require_health_observation(item)
+            for item in observations.values()
+            if item.source_record_reference in references
+        )
+        if len(matches) != 1:
+            raise ValueError("selectedIncident record ID must resolve to exactly one observation")
+        return matches[0]
+
+    previous_observation = resolve_record_id(signed_selection.previous_record_id)
+    current_observations = tuple(
+        resolve_record_id(record_id) for record_id in signed_selection.current_record_ids
+    )
+    rebuilt_selection = build_selected_incident(
+        incident_resource_id=reconstructed.incident_resource_id,
+        previous_record_id=signed_selection.previous_record_id,
+        current_record_ids=signed_selection.current_record_ids,
+        current_state=reconstructed.current_state,
+    )
+    reconstructed_current = {
+        (item.selection_key, item.payload_id) for item in reconstructed.current
+    }
+    resolved_current = {
+        (item.source_record_reference, item.observation_id) for item in current_observations
+    }
+    anchor = request.incident_anchor
+    anchor_current_ids = {item.evidence_id for item in anchor.current_state_evidence}
+    resolved_current_ids = {item.observation_id for item in current_observations}
+    if (
+        rebuilt_selection.incident_resource_id != signed_selection.incident_resource_id
+        or rebuilt_selection.previous_record_id != signed_selection.previous_record_id
+        or rebuilt_selection.current_record_ids != signed_selection.current_record_ids
+        or rebuilt_selection.current_state != signed_selection.current_state
+        or rebuilt_selection.transition_digest != signed_selection.transition_digest
+        or reconstructed.previous.selection_key != previous_observation.source_record_reference
+        or reconstructed.previous.payload_id != previous_observation.observation_id
+        or reconstructed_current != resolved_current
+        or anchor_current_ids != resolved_current_ids
+        or tuple(item.evidence_id for item in anchor.previous_state_evidence)
+        != (previous_observation.observation_id,)
+    ):
+        raise ValueError("reconstructed incident does not match signed selectedIncident")
+    evidence_by_id = {item.evidence_id: item for item in request.evidence_index}
+    current_citations = tuple(evidence_by_id[item.observation_id] for item in current_observations)
+    previous_citation = evidence_by_id[previous_observation.observation_id]
+    anchor_payload: dict[str, object] = {
+        "affectedResourceId": rebuilt_selection.incident_resource_id,
+        "previousState": "healthy",
+        "currentState": rebuilt_selection.current_state,
+        "observedStart": min(item.observed_start for item in current_citations),
+        "observedEnd": max(item.observed_end for item in current_citations),
+        "previousStateEvidence": (previous_citation,),
+        "currentStateEvidence": tuple(sorted(current_citations, key=lambda item: item.evidence_id)),
+    }
+    digest_payload = {
+        **anchor_payload,
+        "previousStateEvidence": [
+            previous_citation.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        ],
+        "currentStateEvidence": [
+            item.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+            for item in sorted(
+                current_citations,
+                key=lambda item: item.evidence_id,
+            )
+        ],
+    }
+    transition_digest = compute_artifact_digest(digest_payload)
+    reconstructed_anchor = type(anchor).model_validate(
+        {
+            **anchor_payload,
+            "transitionId": (f"transition-{transition_digest.removeprefix('sha256:')[:32]}"),
+            "transitionDigest": transition_digest,
+        }
+    )
+    if anchor != reconstructed_anchor:
+        raise ValueError("canonical incident transition does not match signed selectedIncident")
+
+
 def _verify_network_rule_parents(request: CorrelationRequest) -> None:
     marker = "/securityrules/"
     for observation in request.monitoring_bundle.observations:
-        if (
-            not isinstance(observation, NetworkFlowObservation)
-            or observation.rule_resource_id is None
-        ):
+        if not isinstance(observation, NetworkFlowObservation):
             continue
-        parent_nsg_id, separator, _ = observation.rule_resource_id.rpartition(marker)
-        if (
-            not separator
-            or not parent_nsg_id
-            or observation.enforcement_resource_id != parent_nsg_id
+        for rule_resource_id in (
+            observation.rule_resource_id,
+            (
+                observation.ip_flow_provenance.result_rule_resource_id
+                if observation.ip_flow_provenance is not None
+                else None
+            ),
+            observation.ip_flow_rule_resource_id,
         ):
-            raise ValueError("network flow rule does not belong to the enforcement NSG")
+            if rule_resource_id is None:
+                continue
+            parent_nsg_id, separator, _ = rule_resource_id.rpartition(marker)
+            if (
+                not separator
+                or not parent_nsg_id
+                or observation.enforcement_resource_id != parent_nsg_id
+            ):
+                raise ValueError("network flow rule does not belong to the enforcement NSG")
 
 
 def _observation_health_state(

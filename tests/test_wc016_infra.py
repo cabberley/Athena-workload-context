@@ -213,6 +213,7 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "Athena WC016 Approved Signal Reader" in signal_role
     assert "Microsoft.Compute/virtualMachines/instanceView/read" in signal_role
     assert "Microsoft.Insights/metrics/read" in signal_role
+    assert "Microsoft.Insights/logs/" not in signal_role
     assert "roleDefinitionId: wc016SignalReaderRole!.outputs.roleDefinitionId" in source
     assert (
         "module wc016SignalReaderRole 'modules/wc016-signal-reader-role.bicep' = "

@@ -14,7 +14,9 @@ from athena_context.contracts import (
     CORRELATION_ALGORITHM_ID,
     CORRELATION_REQUEST_SCHEMA_VERSION,
     MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidenceArtifact,
@@ -36,7 +38,10 @@ from athena_context.contracts import (
     MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
     MonitoringIntentEvidenceReference,
+    MonitoringIpFlowProvenance,
+    MonitoringLogPermissionEvidence,
     MonitoringObservation,
+    MonitoringSelectedIncident,
     NetworkFlowObservation,
     NormalizedChangeEvidence,
     PlatformHealthObservation,
@@ -59,6 +64,10 @@ from athena_context.eventing.change_ingestion import (
     ChangeEvidenceArtifactSigner,
     build_change_evidence_artifact,
     normalize_resource_graph_change,
+)
+from athena_context.monitoring_incident import (
+    build_selected_incident,
+    monitoring_source_record_reference,
 )
 
 MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
@@ -167,6 +176,10 @@ class _LogQueryCollectionRecord(_WindowedCollectionRecord):
         le=3600,
     )
     query_execution_digest: Sha256Digest = Field(alias="queryExecutionDigest")
+    permission_evidence_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="permissionEvidenceDigest",
+    )
 
     @model_validator(mode="after")
     def validate_query_window(self) -> _LogQueryCollectionRecord:
@@ -348,6 +361,10 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
         min_length=1,
         max_length=2048,
     )
+    ip_flow_provenance: MonitoringIpFlowProvenance | None = Field(
+        default=None,
+        alias="ipFlowProvenance",
+    )
     change_correlation_id: str | None = Field(
         default=None,
         alias="changeCorrelationId",
@@ -366,6 +383,27 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
 
     @model_validator(mode="after")
     def validate_attribution_pair(self) -> NetworkWatcherFlowRecord:
+        provenance = self.ip_flow_provenance
+        if provenance is not None and provenance.checked_at < self.observed_end:
+            raise ValueError("network flow IP Flow checkedAt must not predate historical evidence")
+        if provenance is not None and (
+            provenance.historical_decision != self.decision
+            or self.rule_resource_id is None
+            or provenance.historical_rule_resource_id.casefold().rstrip("/")
+            != self.rule_resource_id.casefold().rstrip("/")
+            or provenance.source_resource_id.casefold().rstrip("/")
+            != self.source_resource_id.casefold().rstrip("/")
+            or provenance.destination_resource_id.casefold().rstrip("/")
+            != self.destination_resource_id.casefold().rstrip("/")
+            or provenance.direction != self.direction
+            or provenance.protocol != self.protocol
+            or provenance.source_address != self.source_address
+            or provenance.destination_address != self.destination_address
+            or provenance.source_port != self.source_port
+            or provenance.destination_port != self.destination_port
+            or provenance.causal_change_correlation_id != self.change_correlation_id
+        ):
+            raise ValueError("network flow IP Flow provenance does not bind the retained flow")
         values = (
             self.change_correlation_id,
             self.attribution_method,
@@ -375,6 +413,15 @@ class NetworkWatcherFlowRecord(_LogQueryCollectionRecord):
             value is not None for value in values
         ):
             raise ValueError("flow attribution requires correlation ID, method, and exact evidence")
+        if self.attribution_method == "ipFlowVerify" and (
+            provenance is None
+            or provenance.access != "Deny"
+            or provenance.result_rule_resource_id is None
+            or self.rule_resource_id is None
+            or provenance.result_rule_resource_id.casefold().rstrip("/")
+            != self.rule_resource_id.casefold().rstrip("/")
+        ):
+            raise ValueError("IP Flow attribution requires an exact denied point-in-time rule")
         return self
 
 
@@ -488,6 +535,10 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
         alias="queryExecutionDigests",
         max_length=1440,
     )
+    log_permission_evidence: MonitoringLogPermissionEvidence | None = Field(
+        default=None,
+        alias="logPermissionEvidence",
+    )
     status: Literal["complete", "partial", "unavailable", "truncated"]
     detail: str | None = Field(default=None, min_length=1, max_length=500)
 
@@ -500,7 +551,11 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
             self.frequency_seconds,
         )
         if self.family == "platformHealth":
-            if any(value is not None for value in query_values) or self.query_execution_digests:
+            if (
+                any(value is not None for value in query_values)
+                or self.query_execution_digests
+                or self.log_permission_evidence is not None
+            ):
                 raise ValueError("platform health coverage cannot claim query execution")
             return self
         if any(value is None for value in query_values):
@@ -509,10 +564,9 @@ class MonitoringCoverageRecord(_WindowedCollectionRecord):
             raise ValueError("complete query coverage requires executed query digests")
         if self.status == "unavailable" and self.query_execution_digests:
             raise ValueError("unavailable query coverage cannot claim executed queries")
-        if (
-            self.query_execution_digests != tuple(sorted(self.query_execution_digests))
-            or len(self.query_execution_digests) != len(set(self.query_execution_digests))
-        ):
+        if self.query_execution_digests != tuple(sorted(self.query_execution_digests)) or len(
+            self.query_execution_digests
+        ) != len(set(self.query_execution_digests)):
             raise ValueError("queryExecutionDigests must be sorted unique values")
         return self
 
@@ -581,6 +635,8 @@ class PreparedMonitoringCollection:
     monitoring_bundle: MonitoringEvidenceBundle
     change_artifacts: tuple[ChangeEvidenceArtifact, ...]
     incident_resource_id: str
+    previous_health_source_record_id: str
+    current_health_source_record_ids: tuple[str, ...]
     previous_health_observation_id: str
     current_health_observation_ids: tuple[str, ...]
     current_health_state: Literal["degraded", "unhealthy", "unavailable"]
@@ -643,7 +699,7 @@ def _monitoring_intent_evidence_reference(
 
 
 def _record_reference(prefix: str, source_record_id: str) -> str:
-    return _opaque_reference(prefix, source_record_id)
+    return monitoring_source_record_reference(prefix, source_record_id)
 
 
 def _json_value(value: object) -> object:
@@ -725,6 +781,8 @@ def _coverage(
     }
     if record.query_execution_digests:
         payload["queryExecutionDigests"] = record.query_execution_digests
+    if record.log_permission_evidence is not None:
+        payload["logPermissionEvidence"] = record.log_permission_evidence
     digest = compute_artifact_digest(_json_value(payload))
     return EvidenceCoverage.model_validate(
         {
@@ -903,9 +961,7 @@ def _validate_record_window(
     trusted_as_of: datetime,
 ) -> None:
     if record.observed_end > collected_at or record.observed_end > trusted_as_of:
-        raise MonitoringCollectionError(
-            "collector record is newer than collectedAt or trustedAsOf"
-        )
+        raise MonitoringCollectionError("collector record is newer than collectedAt or trustedAsOf")
 
 
 def _heartbeat_observation(
@@ -943,6 +999,7 @@ def _heartbeat_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": (
             "guest.heartbeat-review"
             if condition is None
@@ -1001,6 +1058,7 @@ def _endpoint_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": (
             "endpoint.vm-connection-review"
             if condition is None
@@ -1139,8 +1197,7 @@ def _validate_coverage_query_binding(
     if (
         coverage.observed_end > collected_at
         or coverage.observed_end > trusted_as_of
-        or (coverage.observed_end - coverage.observed_start).total_seconds()
-        <= 0
+        or (coverage.observed_end - coverage.observed_start).total_seconds() <= 0
         or (collected_at - coverage.observed_end).total_seconds()
         > signal.evaluation_window_seconds + signal.frequency_seconds
         or (trusted_as_of - coverage.observed_end).total_seconds()
@@ -1160,9 +1217,7 @@ def _validate_coverage_query_binding(
             records_by_execution[digest] for digest in coverage.query_execution_digests
         )
     except KeyError as exc:
-        raise MonitoringCollectionError(
-            "coverage references an unknown query execution"
-        ) from exc
+        raise MonitoringCollectionError("coverage references an unknown query execution") from exc
     if any(
         record.control_id != coverage.control_id
         or record.query_digest != coverage.query_digest
@@ -1173,9 +1228,12 @@ def _validate_coverage_query_binding(
         or not _record_matches_coverage_scope(record, coverage)
         for record in executions
     ):
-        raise MonitoringCollectionError(
-            "coverage does not bind exact query executions and scope"
-        )
+        raise MonitoringCollectionError("coverage does not bind exact query executions and scope")
+    if coverage.log_permission_evidence is not None and any(
+        record.permission_evidence_digest != coverage.log_permission_evidence.evidence_digest
+        for record in executions
+    ):
+        raise MonitoringCollectionError("coverage does not bind exact Logs permission evidence")
     ordered = tuple(
         sorted(
             executions,
@@ -1191,13 +1249,9 @@ def _validate_coverage_query_binding(
         or ordered[0].observed_start != coverage.observed_start
         or ordered[-1].observed_end != coverage.observed_end
         or any(
-            (
-                current.observed_start - previous.observed_start
-            ).total_seconds()
+            (current.observed_start - previous.observed_start).total_seconds()
             != signal.frequency_seconds
-            or (
-                current.observed_end - previous.observed_end
-            ).total_seconds()
+            or (current.observed_end - previous.observed_end).total_seconds()
             != signal.frequency_seconds
             for previous, current in zip(ordered, ordered[1:], strict=False)
         )
@@ -1259,6 +1313,7 @@ def _connection_monitor_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
+        "permissionEvidenceDigest": record.permission_evidence_digest,
         "summaryCode": f"network.connection-monitor-{record.status}",
         "pathId": record.path_id,
         "monitorResourceId": monitor_id,
@@ -1364,6 +1419,9 @@ def _network_flow_observation(
     destination_id = normalized[2]
     enforcement_id = normalized[3]
     rule_id = normalized[4] if len(normalized) == 5 else None
+    provenance = record.ip_flow_provenance
+    if provenance is not None and provenance.result_rule_resource_id is not None:
+        _require_resources(control, provenance.result_rule_resource_id)
     _require_path(control, record.path_id, context, normalized)
     tuple_payload = _tuple_payload(
         record,
@@ -1398,12 +1456,18 @@ def _network_flow_observation(
         ),
         "controlProvenance": _control_provenance(control),
         "queryExecutionDigest": record.query_execution_digest,
-        "summaryCode": f"network.flow-{record.decision}",
+        "permissionEvidenceDigest": record.permission_evidence_digest,
+        "summaryCode": (
+            f"network.flow-{record.decision}"
+            if provenance is None
+            else f"network.flow-{record.decision}-ipflow-{provenance.access.casefold()}"
+        ),
         "pathId": record.path_id,
         "decision": record.decision,
         **tuple_payload,
         "enforcementResourceId": enforcement_id,
         "ruleResourceId": rule_id,
+        "ipFlowProvenance": provenance,
         "fiveTupleDigest": compute_artifact_digest(tuple_payload),
         "effectiveRuleAttribution": attributed,
         "attributionMethod": record.attribution_method if attributed else None,
@@ -1459,14 +1523,11 @@ def _resource_health_observation(
     if (
         record.observed_end > collected_at
         or record.observed_end > trusted_as_of
-        or (collected_at - record.observed_start).total_seconds()
-        > signal.maximum_event_age_seconds
-        or (collected_at - record.observed_end).total_seconds()
-        > signal.maximum_event_age_seconds
+        or (collected_at - record.observed_start).total_seconds() > signal.maximum_event_age_seconds
+        or (collected_at - record.observed_end).total_seconds() > signal.maximum_event_age_seconds
         or (trusted_as_of - record.observed_start).total_seconds()
         > signal.maximum_event_age_seconds
-        or (trusted_as_of - record.observed_end).total_seconds()
-        > signal.maximum_event_age_seconds
+        or (trusted_as_of - record.observed_end).total_seconds() > signal.maximum_event_age_seconds
     ):
         raise MonitoringCollectionError(
             "resource-health record is outside the reviewed freshness limit"
@@ -1585,8 +1646,8 @@ def _validate_request_window(
         raise MonitoringCollectionError("correlation request window is invalid")
 
 
-class MonitoringCollectionTransaction:
-    """Prepare one all-or-nothing normalized evidence transaction for persistence."""
+class _MonitoringCollectionTransactionCore:
+    """Internal normalization core shared with explicit test compatibility code."""
 
     def __init__(
         self,
@@ -1606,9 +1667,7 @@ class MonitoringCollectionTransaction:
         self._change_signer = change_signer
         self._change_signing_key_id = change_signing_key_id
         self._monitoring_intent_trusted_key_id = monitoring_intent_trusted_key_id
-        self._monitoring_intent_signature_verifier = (
-            monitoring_intent_signature_verifier
-        )
+        self._monitoring_intent_signature_verifier = monitoring_intent_signature_verifier
         self._monitoring_intent_asset_loader = monitoring_intent_asset_loader
 
     def prepare(
@@ -1668,14 +1727,12 @@ class MonitoringCollectionTransaction:
                     "collection acquisition receipt failed strict revalidation"
                 ) from exc
             if (
-                acquisition_receipt.collector_contract_digest
-                != collector_contract_digest
+                acquisition_receipt.collector_contract_digest != collector_contract_digest
                 or acquisition_receipt.execution_started_at != batch.collected_at
                 or acquisition_receipt.receipt_issued_at > trusted_as_of
                 or acquisition_receipt.intent_id != monitoring_intent.intent_id
                 or acquisition_receipt.intent_digest != monitoring_intent.intent_digest
-                or acquisition_receipt.context_binding_digest
-                != context_binding.binding_digest
+                or acquisition_receipt.context_binding_digest != context_binding.binding_digest
                 or acquisition_receipt.collection_batch_digest
                 != sha256_hex(batch.canonical_bytes())
             ):
@@ -1726,8 +1783,7 @@ class MonitoringCollectionTransaction:
             if (
                 evidence.occurred_at > trusted_as_of
                 or evidence.received_at > trusted_as_of
-                or trusted_as_of - evidence.occurred_at
-                > MAX_CHANGE_EVIDENCE_AGE
+                or trusted_as_of - evidence.occurred_at > MAX_CHANGE_EVIDENCE_AGE
             ):
                 raise MonitoringCollectionError(
                     "resource change is outside its trustedAsOf freshness limit"
@@ -1854,9 +1910,19 @@ class MonitoringCollectionTransaction:
                 for item in acquisition_receipt.exchanges
                 if item.source in {"logAnalytics", "resourceHealth"}
             }
-            if receipt_coverage_ids != {
-                item.source_record_id for item in batch.coverage
-            }:
+            coverage_by_id = {item.source_record_id: item for item in batch.coverage}
+            unsupported_coverage = tuple(
+                item
+                for coverage_id, item in coverage_by_id.items()
+                if coverage_id not in receipt_coverage_ids
+            )
+            if not receipt_coverage_ids.issubset(coverage_by_id) or any(
+                item.status != "unavailable"
+                or item.family not in {"networkFlow", "connectionMonitor"}
+                or item.query_execution_digests
+                or item.log_permission_evidence is not None
+                for item in unsupported_coverage
+            ):
                 raise MonitoringCollectionError(
                     "acquisition receipt does not exactly bind collection coverage"
                 )
@@ -1930,26 +1996,18 @@ class MonitoringCollectionTransaction:
         acquisition_manifest = None
         if acquisition_receipt is not None:
             manifest_payload = {
-                "schemaVersion": (
-                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
-                ),
+                "schemaVersion": ("athena.wc028MonitoringAcquisitionEvidenceManifest.v1"),
                 "collectionBatchDigest": acquisition_receipt.collection_batch_digest,
-                "normalizedEvidenceDigest": (
-                    acquisition_receipt.normalized_evidence_digest
-                ),
+                "normalizedEvidenceDigest": (acquisition_receipt.normalized_evidence_digest),
                 "exchanges": [
                     item.model_dump(mode="json", by_alias=True, exclude_none=True)
                     for item in acquisition_receipt.exchanges
                 ],
             }
             acquisition_manifest = MonitoringAcquisitionEvidenceManifest(
-                schemaVersion=(
-                    "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
-                ),
+                schemaVersion=("athena.wc028MonitoringAcquisitionEvidenceManifest.v1"),
                 collectionBatchDigest=acquisition_receipt.collection_batch_digest,
-                normalizedEvidenceDigest=(
-                    acquisition_receipt.normalized_evidence_digest
-                ),
+                normalizedEvidenceDigest=(acquisition_receipt.normalized_evidence_digest),
                 exchanges=acquisition_receipt.exchanges,
                 manifestDigest=compute_artifact_digest(manifest_payload),
             )
@@ -2055,6 +2113,8 @@ class MonitoringCollectionTransaction:
             monitoring_bundle=bundle,
             change_artifacts=artifacts,
             incident_resource_id=incident_resource_id,
+            previous_health_source_record_id=(batch.previous_health_source_record_id),
+            current_health_source_record_ids=(batch.current_health_source_record_ids),
             previous_health_observation_id=previous.observation_id,
             current_health_observation_ids=tuple(
                 sorted(item.observation_id for item in expanded_current)
@@ -2111,6 +2171,93 @@ class MonitoringCollectionTransaction:
                 expires_at=expires_at,
             )
         return prepared, committed, request
+
+
+class MonitoringCollectionTransaction(_MonitoringCollectionTransactionCore):
+    """Production transaction that requires a trusted acquisition receipt."""
+
+    def __init__(
+        self,
+        *,
+        acquisition_receipt_verifier: Callable[[MonitoringAcquisitionReceipt, datetime], None],
+        change_signer: ChangeEvidenceArtifactSigner,
+        change_signing_key_id: str,
+        monitoring_intent_trusted_key_id: str,
+        monitoring_intent_signature_verifier: Callable[[bytes, str], bool],
+        monitoring_intent_asset_loader: Callable[
+            [PublishedMonitoringIntent],
+            tuple[
+                PublishedMonitoringIntentAssetReference,
+                PublishedMonitoringIntentAttestation,
+            ],
+        ],
+    ) -> None:
+        super().__init__(
+            change_signer=change_signer,
+            change_signing_key_id=change_signing_key_id,
+            monitoring_intent_trusted_key_id=monitoring_intent_trusted_key_id,
+            monitoring_intent_signature_verifier=monitoring_intent_signature_verifier,
+            monitoring_intent_asset_loader=monitoring_intent_asset_loader,
+        )
+        self._acquisition_receipt_verifier = acquisition_receipt_verifier
+
+    def _prepare_receipt_candidate(
+        self,
+        batch: MonitoringCollectionBatch,
+        *,
+        monitoring_intent: PublishedMonitoringIntent,
+        context_binding: PublishedRuntimeContextBinding,
+        expected_active_context_authority_digest: str,
+        collector_contract_digest: str,
+        change_scope: ApprovedChangeScope,
+        trusted_as_of: datetime,
+    ) -> PreparedMonitoringCollection:
+        """Normalize a candidate only so its digest can be bound into the receipt."""
+
+        return super().prepare(
+            batch,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            expected_active_context_authority_digest=(expected_active_context_authority_digest),
+            collector_contract_digest=collector_contract_digest,
+            change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
+        )
+
+    def prepare(
+        self,
+        batch: MonitoringCollectionBatch,
+        *,
+        monitoring_intent: PublishedMonitoringIntent,
+        context_binding: PublishedRuntimeContextBinding,
+        expected_active_context_authority_digest: str,
+        collector_contract_digest: str,
+        change_scope: ApprovedChangeScope,
+        trusted_as_of: datetime,
+        acquisition_receipt: MonitoringAcquisitionReceipt | None = None,
+    ) -> PreparedMonitoringCollection:
+        if acquisition_receipt is None:
+            raise MonitoringCollectionError(
+                "production collection requires a signed acquisition receipt"
+            )
+        if type(acquisition_receipt) is not MonitoringAcquisitionReceipt:
+            raise TypeError("collection requires an exact acquisition receipt")
+        try:
+            self._acquisition_receipt_verifier(acquisition_receipt, trusted_as_of)
+        except (TypeError, ValueError) as exc:
+            raise MonitoringCollectionError(
+                "collection acquisition receipt cryptographic verification failed"
+            ) from exc
+        return super().prepare(
+            batch,
+            monitoring_intent=monitoring_intent,
+            context_binding=context_binding,
+            expected_active_context_authority_digest=(expected_active_context_authority_digest),
+            collector_contract_digest=collector_contract_digest,
+            change_scope=change_scope,
+            trusted_as_of=trusted_as_of,
+            acquisition_receipt=acquisition_receipt,
+        )
 
 
 def _observation_family(observation: MonitoringObservation) -> EvidenceFamily:
@@ -2214,7 +2361,22 @@ def _build_evidence_index(
 def _build_transition(
     prepared: PreparedMonitoringCollection,
     evidence_index: tuple[CorrelationEvidenceCitation, ...],
-) -> IncidentHealthTransition:
+) -> tuple[IncidentHealthTransition, MonitoringSelectedIncident]:
+    selected = build_selected_incident(
+        incident_resource_id=prepared.incident_resource_id,
+        previous_record_id=prepared.previous_health_source_record_id,
+        current_record_ids=prepared.current_health_source_record_ids,
+        current_state=prepared.current_health_state,
+    )
+    selected_incident = MonitoringSelectedIncident.model_validate(
+        {
+            "incidentResourceId": selected.incident_resource_id,
+            "previousRecordId": selected.previous_record_id,
+            "currentRecordIds": selected.current_record_ids,
+            "currentState": selected.current_state,
+            "transitionDigest": selected.transition_digest,
+        }
+    )
     citations = {item.evidence_id: item for item in evidence_index}
     previous = citations[prepared.previous_health_observation_id]
     current = tuple(citations[item] for item in prepared.current_health_observation_ids)
@@ -2228,12 +2390,15 @@ def _build_transition(
         "currentStateEvidence": tuple(sorted(current, key=lambda item: item.evidence_id)),
     }
     digest = compute_artifact_digest(_json_value(payload))
-    return IncidentHealthTransition.model_validate(
-        {
-            **payload,
-            "transitionId": f"transition-{digest.removeprefix('sha256:')[:32]}",
-            "transitionDigest": digest,
-        }
+    return (
+        IncidentHealthTransition.model_validate(
+            {
+                **payload,
+                "transitionId": f"transition-{digest.removeprefix('sha256:')[:32]}",
+                "transitionDigest": digest,
+            }
+        ),
+        selected_incident,
     )
 
 
@@ -2281,7 +2446,13 @@ def build_collected_correlation_request(
         change_handoffs=ordered_handoffs,
     )
     evidence_index = _build_evidence_index(prepared, committed)
-    transition = _build_transition(prepared, evidence_index)
+    transition, selected_incident = _build_transition(prepared, evidence_index)
+    request_schema_version = (
+        CORRELATION_REQUEST_SCHEMA_VERSION
+        if acquisition_receipt is not None
+        and acquisition_receipt.schema_version == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        else PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
+    )
     change_digests = tuple(
         sorted(sha256_hex(item.canonical_bytes()) for item in prepared.change_artifacts)
     )
@@ -2304,9 +2475,7 @@ def build_collected_correlation_request(
                 "controlDigest": control_digest,
                 "sourceClausePath": source_clause_path,
             }
-            for control_id, control_digest, source_clause_path in sorted(
-                control_provenance
-            )
+            for control_id, control_digest, source_clause_path in sorted(control_provenance)
         ]
     )
     source_references: tuple[VersionPinnedBlobReference, ...] = tuple(
@@ -2324,7 +2493,11 @@ def build_collected_correlation_request(
     inventory_payload: dict[str, object] = {
         "ruleCatalogDigest": CORRELATION_RULE_CATALOG_DIGEST,
         "contextBindingDigest": context_binding.binding_digest,
-        "incidentTransitionDigest": transition.transition_digest,
+        "incidentTransitionDigest": (
+            selected_incident.transition_digest
+            if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            else transition.transition_digest
+        ),
         "monitoringHandoffDigest": (committed.monitoring_handoff.compute_artifact_digest_value()),
         "monitoringBundleDigest": sha256_hex(prepared.monitoring_bundle.canonical_bytes()),
         "changeArtifactDigests": change_digests,
@@ -2348,7 +2521,7 @@ def build_collected_correlation_request(
         }
     )
     request_payload: dict[str, object] = {
-        "schemaVersion": CORRELATION_REQUEST_SCHEMA_VERSION,
+        "schemaVersion": request_schema_version,
         "algorithmId": CORRELATION_ALGORITHM_ID,
         "ruleCatalogDigest": CORRELATION_RULE_CATALOG_DIGEST,
         "incidentRevision": incident_revision,
@@ -2356,6 +2529,11 @@ def build_collected_correlation_request(
         "trustedAsOf": trusted_as_of,
         "expiresAt": expires_at,
         "contextBinding": context_binding,
+        "selectedIncident": (
+            selected_incident
+            if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            else None
+        ),
         "incidentAnchor": transition,
         "monitoringHandoff": committed.monitoring_handoff,
         "monitoringBundle": prepared.monitoring_bundle,

@@ -34,6 +34,14 @@ resource collectorIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@202
   })
 }
 
+resource rbacAttestorIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
+  name: '${namePrefix}-monitoring-rbac-attestor-id'
+  location: location
+  tags: union(resourceTags, {
+    identityPurpose: 'isolated-effective-rbac-attestor'
+  })
+}
+
 resource signingKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' = {
   name: keyVaultName
   location: location
@@ -113,5 +121,14 @@ resource collectorSigningKeyUser 'Microsoft.Authorization/roleAssignments@2022-0
 output collectorIdentityResourceId string = collectorIdentity.id
 output collectorIdentityClientId string = collectorIdentity.properties.clientId
 output collectorIdentityPrincipalId string = collectorIdentity.properties.principalId
+output collectorIdentityTenantId string = collectorIdentity.properties.tenantId
+output rbacAttestorIdentityResourceId string = rbacAttestorIdentity.id
+output rbacAttestorIdentityClientId string = rbacAttestorIdentity.properties.clientId
+output rbacAttestorIdentityPrincipalId string = rbacAttestorIdentity.properties.principalId
+output rbacAttestorIdentityTenantId string = rbacAttestorIdentity.properties.tenantId
 output keyVaultResourceId string = signingKeyVault.id
+output signingKeyArmResourceId string = signingKey.id
 output signingKeyResourceId string = signingKey.properties.keyUriWithVersion
+output signingKeyCryptoUserRoleDefinitionId string = keyVaultCryptoUserRoleDefinitionId
+output evidenceContainerResourceId string = validatedMonitoringEvidenceContainerResourceId
+output evidenceWriterRoleDefinitionId string = storageBlobDataContributorRoleDefinitionId

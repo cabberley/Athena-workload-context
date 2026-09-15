@@ -88,13 +88,23 @@ intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health con
 required freshness bound. Version 1 assets are rejected rather than silently treating unbound
 coverage or unbounded health events as activation eligible.
 
-The new wire contracts are `athena.wc028MonitoringEvidenceBundle.v2` and
-`athena.wc028CorrelationRequest.v3`. The legacy
-`athena.wc026MonitoringEvidenceBundle.v1` and `athena.wc026CorrelationRequest.v2` variants remain
-parseable, but they reject the new WC-028 fields rather than changing an existing strict schema in
-place. WC-028 always emits the new pair. The production `CorrelationService` fails closed for the
-legacy unsigned variant, while the explicitly non-production compatibility harness can continue
-to evaluate previously persisted WC-026 fixtures.
+Production acquisition uses `athena.wc028MonitoringEvidenceBundle.v3`,
+`athena.wc028MonitoringAcquisitionReceipt.v5`, and
+`athena.wc028CorrelationRequest.v4`. Receipt v5 signs a minimal `selectedIncident` containing the
+canonical incident resource, exact previous/current normalized source-record IDs, selected adverse
+state, and transition digest. Correlation request v4 carries the same value and reconstructs both
+the selection and canonical citation-bearing transition from persisted evidence.
+
+Current production acquisition does not query Traffic Analytics, custom flow tables, Connection
+Monitor workspace tables, or IP Flow Verify. Without a dedicated or ABAC-isolated workspace/table
+boundary, those controls persist deterministic unavailable coverage with zero source calls and no
+network-flow observation. Historical v3 requests may retain their prior versioned flow evidence,
+but production request v4 accepts only permission-attested resource-context log evidence.
+
+`athena.wc028MonitoringEvidenceBundle.v2` with
+`athena.wc028CorrelationRequest.v3`, plus the legacy WC-026 v1/v2 pair, remain parseable for
+historical and explicitly non-production compatibility only. Production `CorrelationService`
+rejects those older request versions.
 
 ## Consequences
 

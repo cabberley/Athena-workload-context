@@ -6,6 +6,9 @@ param collectorIdentityResourceId string
 @description('Client ID of the isolated monitoring evidence collector identity.')
 param collectorIdentityClientId string
 
+@description('Tenant ID that owns the isolated monitoring evidence collector identity.')
+param collectorTenantId string
+
 @description('Resource ID of the monitoring-owned resource group.')
 param monitoringResourceGroupId string
 
@@ -42,14 +45,86 @@ param authorizationMode string
 ])
 param workspaceAccessControlMode string
 
+@description('Observed workspace resource-context access flag.')
+param workspaceResourceContextAccessEnabled bool
+
+@description('Observed adopted workspace SKU.')
+param workspaceSkuName string
+
+@description('Observed exact Analytics plans for supported resource-context tables.')
+@minLength(5)
+@maxLength(5)
+param resourceContextTablePlans array
+
 @description('Built-in Reader role definition resource ID.')
 param readerRoleDefinitionId string
 
 @description('Existing narrow VM signal-reader role definition resource ID.')
 param signalReaderRoleDefinitionId string
 
+@description('Exact deployed narrow VM signal-reader role name.')
+param signalReaderRoleName string
+
+@description('Exact custom role definition for resource-context Log Analytics reads.')
+param resourceLogReaderRoleDefinitionId string
+
+@description('Exact custom role name for resource-context Log Analytics reads.')
+param resourceLogReaderRoleName string
+
+@description('Exact registered resource-context log-table actions granted only at approved VMs.')
+@minLength(5)
+@maxLength(5)
+param resourceLogAllowedOperations array
+
+@description('Exact approved VM scopes receiving the resource-context log role.')
+@minLength(11)
+@maxLength(11)
+param resourceLogReadScopeIds array
+
 @description('Built-in Log Analytics Data Reader role definition resource ID.')
 param logAnalyticsDataReaderRoleDefinitionId string
+
+@description('Exact custom role definition resource ID for Resource Health availability reads.')
+param resourceHealthRoleDefinitionId string
+
+@description('Exact custom role name for Resource Health availability reads.')
+param resourceHealthRoleName string
+
+@description('Exact approved VM resource IDs receiving Resource Health availability-read assignments.')
+@minLength(11)
+@maxLength(11)
+param resourceHealthScopeIds array
+
+@description('Exact Resource Health management-plane operation allowlist.')
+@minLength(1)
+@maxLength(1)
+param resourceHealthAllowedOperations array
+
+@description('Resource ID of the isolated effective RBAC attestor identity.')
+param rbacAttestorIdentityResourceId string
+
+@description('Client ID of the isolated effective RBAC attestor identity.')
+param rbacAttestorIdentityClientId string
+
+@description('Principal ID of the isolated effective RBAC attestor identity.')
+param rbacAttestorPrincipalId string
+
+@description('Tenant ID of the isolated effective RBAC attestor identity.')
+param rbacAttestorTenantId string
+
+@description('Exact custom role definition used only by the RBAC attestor.')
+param rbacAttestorRoleDefinitionId string
+
+@description('Exact custom role name used only by the RBAC attestor.')
+param rbacAttestorRoleName string
+
+@description('Exact subscription scope receiving the RBAC attestor assignment.')
+param rbacAttestorScopeId string
+
+@description('Exact read-only Azure RBAC operations granted to the attestor.')
+@minLength(4)
+@maxLength(4)
+param rbacAttestorAllowedOperations array
 
 @description('Exact Log Analytics table names permitted by the role-assignment condition.')
 @minLength(13)
@@ -72,8 +147,23 @@ param signalReadScopeIds array
 @description('Resource ID of the non-exportable collector signing key.')
 param signingKeyResourceId string
 
+@description('ARM resource ID of the non-exportable collector signing key.')
+param signingKeyArmResourceId string
+
+@description('Exact Key Vault Crypto User role definition resource ID.')
+param signingKeyCryptoUserRoleDefinitionId string
+
 @description('Resource ID of the monitoring-owned immutable evidence storage account.')
 param evidenceStorageAccountResourceId string
+
+@description('Exact monitoring evidence container receiving immutable evidence writes.')
+param evidenceContainerResourceId string
+
+@description('Exact Storage Blob Data Contributor role definition resource ID.')
+param evidenceWriterRoleDefinitionId string
+
+@description('Externally collected, hierarchy-complete effective RBAC inventory for both identities.')
+param effectiveRbacInventory object
 
 @description('Maximum accepted age for a signed evidence handoff.')
 @minValue(60)
@@ -141,7 +231,55 @@ var collectorContract = {
 
 output collectorContract object = collectorContract
 
+var validatedAcquisitionWorkspaceAccessControlMode = workspaceAccessControlMode == 'workspaceAndResourceContext'
+  ? workspaceAccessControlMode
+  : fail('production monitoring acquisition requires resource-context Log Analytics mode')
+
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v3'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v8'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
+  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v5'
+  workspaceAccessControlMode: validatedAcquisitionWorkspaceAccessControlMode
+  workspaceResourceContextAccessEnabled: workspaceResourceContextAccessEnabled
+  workspaceSkuName: workspaceSkuName
+  resourceContextTablePlans: resourceContextTablePlans
+  resourceIdColumn: '_ResourceId'
+  logQueryPreferHeader: 'include-permissions=true'
+  flowTableAcquisitionMode: 'unsupportedUnavailable'
+  collectorTenantId: collectorTenantId
+  signalReaderRoleName: signalReaderRoleName
+  resourceLogReaderRoleDefinitionId: resourceLogReaderRoleDefinitionId
+  resourceLogReaderRoleName: resourceLogReaderRoleName
+  resourceLogAllowedOperations: resourceLogAllowedOperations
+  resourceLogReadScopeIds: resourceLogReadScopeIds
+  rbacAttestorIdentityResourceId: rbacAttestorIdentityResourceId
+  rbacAttestorIdentityClientId: rbacAttestorIdentityClientId
+  rbacAttestorPrincipalId: rbacAttestorPrincipalId
+  rbacAttestorTenantId: rbacAttestorTenantId
+  rbacAttestorRoleDefinitionId: rbacAttestorRoleDefinitionId
+  rbacAttestorRoleName: rbacAttestorRoleName
+  rbacAttestorScopeId: rbacAttestorScopeId
+  rbacAttestorAllowedOperations: rbacAttestorAllowedOperations
+  rbacAttestorIdentitySeparationEnforced: true
+  identityProofAudience: 'api://athena-monitoring-identity-proof'
+  identityProofTokenVersion: '1.0'
+  identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'
+  identityProofMaximumLifetimeSeconds: 7200
+  resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
+  resourceHealthRoleName: resourceHealthRoleName
+  resourceHealthScopeIds: resourceHealthScopeIds
+  resourceHealthAllowedOperations: resourceHealthAllowedOperations
+  signingKeyArmResourceId: signingKeyArmResourceId
+  signingKeyCryptoUserRoleDefinitionId: signingKeyCryptoUserRoleDefinitionId
+  evidenceContainerResourceId: evidenceContainerResourceId
+  evidenceWriterRoleDefinitionId: evidenceWriterRoleDefinitionId
+  effectiveRbacInventory: effectiveRbacInventory
+  allowedReadOperations: concat(
+    filter(
+      collectorContract.allowedReadOperations,
+      operation => !startsWith(toLower(operation), 'microsoft.operationalinsights/workspaces')
+    ),
+    resourceHealthAllowedOperations,
+    resourceLogAllowedOperations
+  )
 })
