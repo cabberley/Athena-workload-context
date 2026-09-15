@@ -500,8 +500,8 @@ def build_incident_occurrence_receipt(
             incident_state_signature_preimage(state)
         )
         or state_attestation.result_digest != state.result_digest
-        or state_attestation.key_vault_key_id != pointer.key_id
-        or pointer_attestation.key_vault_key_id != pointer.key_id
+        or state_attestation.key_vault_key_id
+        != pointer_attestation.key_vault_key_id
         or pointer.incident_id != state.incident_id
         or pointer.state_sha256 != sha256_hex(state_bytes)
         or pointer.state_path.removeprefix("./")

@@ -117,8 +117,11 @@ attempt for routine producer lag. If the bounded in-process retry window expires
 abandoned for a later broker delivery rather than explicitly dead-lettered as invalid. Invalid
 signatures and immutable lifecycle, occurrence, or guidance substitutions still fail closed.
 Keep `wc027FeedV2ProducerReady=false` until deployment evidence confirms that producer and its
-reconciliation path are healthy; in that state the orchestrator and dispatcher remain on v1 and do
-not pretend the feed-v2 data exists.
+reconciliation path are healthy. Enabling it also requires the exact deployed
+`wc027EnrichmentFeedProducerJobResourceId`; the root Bicep deployment rejects the flag without a
+`Microsoft.App/jobs` resource ID. In the disabled state the orchestrator and dispatcher remain on
+v1 and do not pretend the feed-v2 data exists. See
+`docs/operations/wc027-enrichment-feed-runtime.md`.
 
 Notification messages use a deterministic SHA-256 ID from transition ID plus lifecycle and use the
 incident ID as the Service Bus session. Publication succeeds before notification enqueue. The

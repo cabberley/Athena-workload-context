@@ -14,6 +14,8 @@ from azure.core.exceptions import (
     ResourceExistsError,
     ResourceModifiedError,
     ResourceNotFoundError,
+    ServiceRequestError,
+    ServiceResponseError,
 )
 from azure.data.tables import TableServiceClient, UpdateMode
 from pydantic import ValidationError
@@ -24,13 +26,16 @@ from athena_context.azure_adapters import (
 from athena_context.contracts import UtcDateTime
 from athena_context.enrichment.feed_registry import (
     MAX_FEED_V2_REGISTRY_RECORDS,
+    IncidentFeedRegistryAuthorityReaderPort,
     IncidentFeedRegistryCapacityError,
     IncidentFeedRegistryConflictError,
     IncidentFeedRegistryError,
     IncidentFeedRegistryPrunePlan,
     IncidentFeedRegistryRecord,
     _validated_prune_plan,
+    validate_incident_feed_registry_record_authority,
 )
+from athena_context.presentation_assets import CurrentIncidentStateSnapshot
 
 _TABLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]{2,62}$")
 _TABLE_ENDPOINT = re.compile(r"^[a-z0-9]{3,24}\.table\.core\.windows\.net$")
@@ -59,6 +64,7 @@ class AzureTableIncidentFeedRegistry:
         table_name: str,
         partition_key: str,
         managed_identity_client_id: str,
+        current_incident_reader: IncidentFeedRegistryAuthorityReaderPort,
     ) -> None:
         parsed = urlsplit(endpoint)
         if (
@@ -88,12 +94,28 @@ class AzureTableIncidentFeedRegistry:
             ),
         ).get_table_client(table_name)
         self._partition_key = partition_key
+        self._current_incident_reader = current_incident_reader
 
-    def put(self, record: IncidentFeedRegistryRecord) -> None:
+    def put(
+        self,
+        record: IncidentFeedRegistryRecord,
+        *,
+        authority: CurrentIncidentStateSnapshot,
+    ) -> None:
         if type(record) is not IncidentFeedRegistryRecord:
             raise TypeError("record must be an exact IncidentFeedRegistryRecord")
         record = IncidentFeedRegistryRecord.model_validate_json(
             record.model_dump_json(by_alias=True)
+        )
+        expected_authority, _occurrence = (
+            validate_incident_feed_registry_record_authority(
+                record,
+                authority,
+            )
+        )
+        self._require_current_authority(
+            record,
+            expected=expected_authority,
         )
         snapshot = self._read_snapshot()
         current = next(
@@ -110,17 +132,30 @@ class AzureTableIncidentFeedRegistry:
             )
         if current is not None:
             existing = self._parse_entity(current)
-            if existing.entry.updated_at > record.entry.updated_at:
-                raise IncidentFeedRegistryConflictError("stale feed registry update was rejected")
-            if existing.entry.updated_at == record.entry.updated_at:
-                if existing == record:
-                    return
+            if existing == record:
+                self._require_current_authority(
+                    record,
+                    expected=expected_authority,
+                )
+                return
+            try:
+                validate_incident_feed_registry_record_authority(
+                    existing,
+                    expected_authority,
+                )
+            except IncidentFeedRegistryConflictError:
+                pass
+            else:
                 raise IncidentFeedRegistryConflictError(
-                    "conflicting feed registry update has the same timestamp"
+                    "conflicting feed registry update has the same current authority"
                 )
 
         entity = self._entity(record)
         try:
+            self._require_current_authority(
+                record,
+                expected=expected_authority,
+            )
             if current is None:
                 capacity_etag = self._entity_etag(
                     snapshot.capacity_entity,
@@ -161,6 +196,14 @@ class AzureTableIncidentFeedRegistry:
                     "feed registry changed during conditional write"
                 ) from exc
             raise IncidentFeedRegistryError("feed registry write failed") from exc
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise IncidentFeedRegistryError(
+                "feed registry write outcome is uncertain"
+            ) from exc
+        self._require_current_authority(
+            record,
+            expected=expected_authority,
+        )
 
     def list_records(
         self,
@@ -181,6 +224,25 @@ class AzureTableIncidentFeedRegistry:
                 key=lambda record: record.entry.incident_id,
             )
         )
+
+    def _require_current_authority(
+        self,
+        record: IncidentFeedRegistryRecord,
+        *,
+        expected: CurrentIncidentStateSnapshot,
+    ) -> CurrentIncidentStateSnapshot:
+        current = self._current_incident_reader.read_current_incident_state(
+            incident_id=record.entry.incident_id
+        )
+        validated, _occurrence = validate_incident_feed_registry_record_authority(
+            record,
+            current,
+        )
+        if validated != expected:
+            raise IncidentFeedRegistryConflictError(
+                "feed registry current occurrence changed during admission"
+            )
+        return validated
 
     def prune_expired(
         self,

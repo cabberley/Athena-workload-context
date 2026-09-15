@@ -78,7 +78,8 @@ class _Registry:
     calls: int = 0
     prune_calls: int = 0
 
-    def put(self, record) -> None:
+    def put(self, record, *, authority) -> None:
+        del authority
         raise AssertionError(f"unexpected registry write: {record}")
 
     def list_records(self, *, as_of):
@@ -305,6 +306,34 @@ def test_publication_fails_before_writes_when_active_record_is_missing() -> None
         service.publish(published_at=PUBLISHED_AT)
 
     assert publisher.commits == []
+
+
+def test_same_timestamp_conflict_reports_verified_winner_time() -> None:
+    resolved = _record(
+        2,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(minutes=1),
+    )
+    source = _source(_active_index(()))
+    publisher = _Publisher()
+    publisher.current = _candidate_snapshot(
+        source=source,
+        records=(),
+        published_at=PUBLISHED_AT,
+    )
+    service, _ = _service(
+        source=source,
+        records=(resolved,),
+        publisher=publisher,
+    )
+
+    with pytest.raises(
+        IncidentFeedIndexPublicationConflictError,
+        match="same timestamp",
+    ) as captured:
+        service.publish(published_at=PUBLISHED_AT)
+
+    assert captured.value.winner_published_at == PUBLISHED_AT
 
 
 def test_publication_rejects_v1_pointer_digest_mismatch() -> None:

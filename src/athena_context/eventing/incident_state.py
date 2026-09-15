@@ -62,6 +62,7 @@ def build_signed_incident_state(
     reasoning: Sequence[str],
     signer: PresentationSigner,
     signing_key_id: str,
+    signing_key_vault_key_id: str | None = None,
 ) -> tuple[IncidentState, IncidentStateAttestation]:
     if not findings or not reasoning:
         raise ValueError("verified findings and reasoning are required")
@@ -128,7 +129,7 @@ def build_signed_incident_state(
         schemaVersion="athena.incidentStateAttestation.v1",
         resultDigest=result_digest,
         signatureAlgorithm="RS256",
-        keyVaultKeyId=signing_key_id,
+        keyVaultKeyId=signing_key_vault_key_id or signing_key_id,
         detachedSignature=_base64url_signature(signer.sign_preimage(preimage)),
     )
     return state, attestation
@@ -158,6 +159,7 @@ def build_active_incident_index_heartbeat(
     key_fingerprint: str,
     signer: PresentationSigner,
     active_index_snapshot: ActiveIncidentIndexSnapshot | None,
+    key_vault_key_id: str | None = None,
 ) -> ActiveIncidentIndexPublicationRequest:
     entries = (
         ()
@@ -168,6 +170,7 @@ def build_active_incident_index_heartbeat(
         entries=entries,
         published_at=published_at,
         key_id=key_id,
+        key_vault_key_id=key_vault_key_id or key_id,
         key_fingerprint=key_fingerprint,
         signer=signer,
         active_index_snapshot=active_index_snapshot,
@@ -184,6 +187,7 @@ def build_incident_publication(
     key_fingerprint: str,
     signer: PresentationSigner,
     active_index_snapshot: ActiveIncidentIndexSnapshot | None = None,
+    key_vault_key_id: str | None = None,
 ) -> IncidentPublicationRequest:
     published_at = max(published_at, state.updated_at)
     digest_suffix = state.result_digest.removeprefix("sha256:")
@@ -220,7 +224,7 @@ def build_incident_publication(
         schemaVersion="athena.incidentFeedAttestation.v1",
         pointerDigest=sha256_hex(pointer_bytes),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=key_id,
+        keyVaultKeyId=key_vault_key_id or key_id,
         detachedSignature=_base64url_signature(signer.sign_preimage(pointer_bytes)),
     )
     pointer_attestation_bytes = pointer_attestation.canonical_bytes()
@@ -261,6 +265,7 @@ def build_incident_publication(
         entries=ordered_entries,
         published_at=published_at,
         key_id=key_id,
+        key_vault_key_id=key_vault_key_id or key_id,
         key_fingerprint=key_fingerprint,
         signer=signer,
         active_index_snapshot=active_index_snapshot,
@@ -296,6 +301,7 @@ def _build_active_incident_index_publication(
     entries: Sequence[ActiveIncidentEntry],
     published_at: datetime,
     key_id: str,
+    key_vault_key_id: str,
     key_fingerprint: str,
     signer: PresentationSigner,
     active_index_snapshot: ActiveIncidentIndexSnapshot | None,
@@ -352,7 +358,7 @@ def _build_active_incident_index_publication(
         schemaVersion="athena.activeIncidentIndexAttestation.v1",
         indexDigest=sha256_hex(active_index_bytes),
         signatureAlgorithm="RS256",
-        keyVaultKeyId=key_id,
+        keyVaultKeyId=key_vault_key_id,
         detachedSignature=_base64url_signature(
             signer.sign_preimage(active_index_bytes)
         ),

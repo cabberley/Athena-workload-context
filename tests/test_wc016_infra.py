@@ -170,6 +170,15 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "module wc016Runtime '../wc016-event-reassessment/main.bicep'" in source
     assert "param wc016RuntimeEnabled bool = false" in source
     assert "param wc027FeedV2ProducerReady bool = false" in source
+    assert "param wc027EnrichmentFeedProducerJobResourceId string = ''" in source
+    assert (
+        "param wc027EnrichmentFeedProducerConfigurationDigest string = ''"
+        in source
+    )
+    assert (
+        "param wc027EnrichmentFeedProducerConfigurationJson string = ''"
+        in source
+    )
     assert "param wc016LegacyCleanupConfirmed bool = false" in source
     assert "= if (validatedWc016RuntimeEnabled)" in source
     assert "wc016RuntimeEnabled && !wc016LegacyCleanupConfirmed" in source
@@ -181,6 +190,7 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "wc016DetectorIdentity" in source
     assert "wc016OrchestratorIdentity" in source
     assert "wc016NotificationIdentity" in source
+    assert "validatedWc027FeedV2ProducerReady" in source
     assert "${namePrefix}-wc016-detector-v2-id" in source
     assert "${namePrefix}-wc016-orchestrator-v2-id" in source
     assert "${namePrefix}-wc016-notification-v2-id" in source
