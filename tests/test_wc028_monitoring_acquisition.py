@@ -2131,6 +2131,34 @@ def test_traffic_analytics_cardinality_is_rejected_before_ip_flow_calls() -> Non
     assert len(port.requests) <= 32
 
 
+def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> None:
+    first_port = _AcquisitionPort(traffic_analytics_rows=0)
+    first, first_commit, _ = _execute(first_port)
+    second_port = _AcquisitionPort(traffic_analytics_rows=0)
+    second, second_commit, _ = _execute(second_port)
+
+    assert first_commit.calls == second_commit.calls == 1
+    assert first_port.ip_flow_calls == second_port.ip_flow_calls == 0
+    network_coverage = next(item for item in first.batch.coverage if item.family == "networkFlow")
+    assert network_coverage.status == "unavailable"
+    receipt = first.prepared.monitoring_bundle.acquisition_receipt
+    second_receipt = second.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert second_receipt is not None
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v4"
+    assert receipt.collector_contract_digest == COLLECTOR_CONTRACT_DIGEST
+    assert receipt.credential_proofs is None
+    assert receipt.identity_proof is not None
+    assert not any(item.source == "ipFlowVerify" for item in receipt.exchanges)
+    assert all(
+        item.identity_proof_digest == receipt.identity_proof.proof_digest
+        for item in receipt.exchanges
+    )
+    assert type(receipt).model_validate_json(receipt.model_dump_json(by_alias=True)) == receipt
+    assert first.batch.canonical_bytes() == second.batch.canonical_bytes()
+    assert receipt.canonical_json() == second_receipt.canonical_json()
+
+
 def test_total_acquisition_call_budget_fails_before_extra_read() -> None:
     port = _AcquisitionPort()
     with pytest.raises(

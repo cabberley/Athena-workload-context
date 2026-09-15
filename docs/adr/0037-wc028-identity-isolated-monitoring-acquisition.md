@@ -84,6 +84,9 @@ The coordinator:
   successful, earlier, deny-introducing change matches its exact denied rule result;
 - rejects Traffic Analytics responses with more than one row before issuing any IP Flow calls, and
   rejects all further reads once the authority's total acquisition-call budget is exhausted;
+- when a selected Traffic Analytics query returns no usable flow row, emits unavailable network
+  coverage and its actual Log Analytics exchange only; no IP Flow call or source-specific proof is
+  created, while the acquisition-wide Athena identity proof remains bound to every emitted exchange;
 - always marks Traffic Analytics coverage partial and records both its aggregation limitation and
   IP Flow Verify's point-in-time limitation;
 - marks missing, truncated, ambiguous, or otherwise incomplete results as unavailable, truncated,
@@ -188,6 +191,8 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Ambiguous VMConnection mappings do not become endpoint evidence.
 - IP Flow Verify has an independent exact request/result binding and cannot be smuggled inside
   Traffic Analytics rows.
+- Empty or unusable Traffic Analytics results produce deterministic unavailable coverage, no IP
+  Flow exchange, and a valid receipt v4 with no orphan source proof.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
   correlation boundary.
 - Forged source identity claims, caller-backdated collection/IP Flow time, unproved aggregate zero,
