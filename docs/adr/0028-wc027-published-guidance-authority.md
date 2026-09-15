@@ -90,6 +90,10 @@ uncertain send safely retryable with byte-identical identity.
 
 The publisher accepts exactly one configured request submitter identity, which must be the
 producer's dedicated sender and must not overlap any publisher, signer, reader, or runtime identity.
+Every other request-producer identity is disjoint from the complete enrichment-runtime deployment
+identity set and from every identity attached to the publisher Job. The sender-to-submitter
+authorization is the only cross-component identity handoff and does not attach the sender identity
+to the publisher Job.
 Before publication, a separate publisher outbox-reader identity validates the complete broker
 metadata and exact-reads the referenced Blob version, requiring byte-for-byte equality with the
 canonical signed request. A correctly signed request without durable outbox evidence therefore
@@ -140,7 +144,9 @@ read/add/update permission, and its binding signer has only exact-key sign permi
 - Readiness remains an operational assertion. Shipping the publisher and feed runtime does not
   set `wc027RequestProducerReady`, `wc027PublisherReady`, or
   `wc027FeedV2ProducerReady`; all remain false until exact deployed Job/configuration/RBAC evidence
-  and end-to-end behavior are proven.
+  and end-to-end behavior are proven. Readiness requires user-assigned-only identity mode, exactly
+  one reviewed container, and the complete environment, command, resource, probe, replica, scaler,
+  registry, volume, secret, and managed-identity lifecycle surfaces to match.
 
 ## Alternatives considered
 

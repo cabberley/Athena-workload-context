@@ -325,7 +325,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             raise ValueError(
                 "guidance authority signer identity must be distinct"
             )
-        publisher_identity_pairs = (
+        publisher_owned_identity_pairs = (
             (
                 self.broker_identity_client_id,
                 self.broker_identity_resource_id,
@@ -351,12 +351,15 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 self.binding_signing_key.identity_resource_id,
             ),
             (
-                binding_trust.identity_client_id,
-                binding_trust.identity_resource_id,
-            ),
-            (
                 self.request_outbox.identity_client_id,
                 self.request_outbox.identity_resource_id,
+            ),
+        )
+        publisher_identity_pairs = (
+            *publisher_owned_identity_pairs,
+            (
+                binding_trust.identity_client_id,
+                binding_trust.identity_resource_id,
             ),
         )
         if (
@@ -372,6 +375,74 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
         ):
             raise ValueError(
                 "guidance publisher managed identities must be distinct"
+            )
+        runtime_identity_pairs = (
+            (
+                runtime.broker_identity_client_id,
+                runtime.broker_identity_resource_id,
+            ),
+            (
+                runtime.incident_lifecycle_assets.identity_client_id,
+                runtime.incident_lifecycle_assets.identity_resource_id,
+            ),
+            (
+                runtime.enrichment_feed_assets.reader_identity_client_id,
+                runtime.enrichment_feed_assets.reader_identity_resource_id,
+            ),
+            (
+                runtime.enrichment_feed_assets.writer_identity_client_id,
+                runtime.enrichment_feed_assets.writer_identity_resource_id,
+            ),
+            (
+                runtime.registry_identity_client_id,
+                runtime.registry_identity_resource_id,
+            ),
+            (
+                runtime.guidance_activation.identity_client_id,
+                runtime.guidance_activation.identity_resource_id,
+            ),
+            *(
+                (source.identity_client_id, source.identity_resource_id)
+                for source in (
+                    runtime.monitoring_source,
+                    runtime.change_source,
+                    runtime.context_authority_source,
+                    runtime.monitoring_intent_source,
+                    runtime.guidance_authority_source,
+                )
+            ),
+            *(
+                (key.identity_client_id, key.identity_resource_id)
+                for key in (
+                    runtime.monitoring_collector_key.authority,
+                    runtime.change_key,
+                    runtime.monitoring_intent_key,
+                    runtime.incident_key,
+                    runtime.correlation_binding_key,
+                    runtime.guidance_binding_key,
+                    runtime.report_key,
+                    runtime.guidance_key,
+                    runtime.enrichment_key,
+                    runtime.feed_key,
+                    runtime.notification_key,
+                )
+            ),
+        )
+        runtime_client_ids = {
+            client_id.casefold() for client_id, _ in runtime_identity_pairs
+        }
+        runtime_resource_ids = {
+            resource_id.casefold() for _, resource_id in runtime_identity_pairs
+        }
+        if {
+            client_id.casefold()
+            for client_id, _ in publisher_owned_identity_pairs
+        }.intersection(runtime_client_ids) or {
+            resource_id.casefold()
+            for _, resource_id in publisher_owned_identity_pairs
+        }.intersection(runtime_resource_ids):
+            raise ValueError(
+                "guidance publisher identities must be separate from runtime identities"
             )
         expected = {
             self.broker_identity_resource_id,
@@ -415,9 +486,11 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
         }
         if (
             self.request_submitter_identity_resource_id.casefold()
-            in {item.casefold() for item in expected}
+            in runtime_resource_ids.union(item.casefold() for item in expected)
             or self.request_submitter_identity_client_id.casefold()
-            in {item.casefold() for item in expected_client_ids}
+            in runtime_client_ids.union(
+                item.casefold() for item in expected_client_ids
+            )
         ):
             raise ValueError(
                 "guidance publisher request submitter identity must be dedicated"

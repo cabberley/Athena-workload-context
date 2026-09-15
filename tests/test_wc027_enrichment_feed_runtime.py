@@ -559,6 +559,47 @@ def test_publisher_configuration_requires_dedicated_request_submitter() -> None:
         )
 
 
+def test_publisher_configuration_rejects_submitter_reusing_unattached_runtime_identity() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    runtime_identity = payload["enrichmentRuntimeConfiguration"]["keys"][  # type: ignore[index]
+        "feed"
+    ]
+    payload["serviceBus"]["requestSubmitterIdentityClientId"] = runtime_identity[  # type: ignore[index]
+        "identityClientId"
+    ]
+    payload["serviceBus"]["requestSubmitterIdentityResourceId"] = runtime_identity[  # type: ignore[index]
+        "identityResourceId"
+    ]
+
+    with pytest.raises(ValueError, match="submitter identity must be dedicated"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_publisher_configuration_rejects_owned_identity_reusing_runtime_identity() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    previous_resource_id = payload["serviceBus"]["brokerIdentityResourceId"]  # type: ignore[index]
+    runtime_identity = payload["enrichmentRuntimeConfiguration"]["keys"][  # type: ignore[index]
+        "feed"
+    ]
+    payload["serviceBus"]["brokerIdentityClientId"] = runtime_identity[  # type: ignore[index]
+        "identityClientId"
+    ]
+    payload["serviceBus"]["brokerIdentityResourceId"] = runtime_identity[  # type: ignore[index]
+        "identityResourceId"
+    ]
+    attached = payload["deploymentBinding"]["attachedIdentityResourceIds"]  # type: ignore[index]
+    attached[attached.index(previous_resource_id)] = runtime_identity[  # type: ignore[union-attr]
+        "identityResourceId"
+    ]
+
+    with pytest.raises(ValueError, match="separate from runtime identities"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
 def test_publisher_configuration_requires_exact_request_outbox() -> None:
     payload = _bicep_generated_publisher_configuration()
     payload["requestOutbox"]["containerName"] = "different-outbox"  # type: ignore[index]

@@ -161,10 +161,14 @@ The module grants each configured reader only its exact container with `Blob.Lis
 grants the trust-reader identity only exact-key read/verify data actions on the configured
 verification keys. Publisher authority and activation destinations are derived from the embedded
 runtime configuration, and startup fails closed if either location differs from the runtime read
-location. Do not grant workload Reader to the producer identities.
+location. Publisher-owned identities must not intersect the complete runtime deployment identity
+set. The only runtime identities attached to the publisher Job are the exact source readers and
+shared upstream trust reader consumed by publication; the module derives and validates that
+subset after normalizing resource IDs, so casing aliases cannot bypass uniqueness or submitter
+separation. Do not grant workload Reader to the producer identities.
 
-The job must be attached to every identity named in the runtime configuration. The Bicep module
-rejects duplicate attached identity IDs/client IDs. Its image must be digest-pinned.
+The Bicep module rejects duplicate attached identity IDs/client IDs. Its image must be
+digest-pinned.
 
 ## Activation gate
 
@@ -194,9 +198,12 @@ evidence. Confirm separately that the publisher request queue grants sender acce
 request-producer sender identity. To assert publisher readiness, supply
 `wc027PublisherJobResourceId`, `wc027PublisherConfigurationDigest`, and
 `wc027PublisherConfigurationJson`, and `wc027PublisherImage` from the deployed publisher module.
-The root template reads the existing Job and fails closed unless the exact digest-pinned image,
-command/arguments, scaler and registry identity, configuration value and digest tag, embedded
-producer-runtime digest, attached identities, and deterministic RBAC binding evidence match.
+The root template reads the existing Job and fails closed unless it uses user-assigned identities
+only and has exactly one reviewed container with the exact digest-pinned image, command/arguments,
+environment, resources, empty probe/init-container/volume/secret and managed-identity lifecycle
+surfaces, complete replica/concurrency and scaler configuration, registry identity, configuration
+value and digest tag, embedded producer-runtime digest, attached identities, and deterministic RBAC
+binding evidence.
 When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
 equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
 `wc027PublisherReady=true`.

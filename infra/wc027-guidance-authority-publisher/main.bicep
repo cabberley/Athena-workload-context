@@ -29,8 +29,8 @@ param bindingTrustReaderIdentityResourceId string
 param requestOutboxReaderIdentityResourceId string
 
 @description('Exact additional runtime source/trust identities referenced by enrichmentRuntimeConfigurationJson and required by the publisher.')
-@minLength(1)
-@maxLength(16)
+@minLength(5)
+@maxLength(5)
 param sourceIdentityResourceIds array
 
 @description('Exact storage account resource ID hosting enrichmentRuntimeConfigurationJson.guidanceAuthoritySource.')
@@ -82,6 +82,59 @@ var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
 var runtimeAuthorityAssets = parsedEnrichmentRuntimeConfiguration.guidanceAuthoritySource
 var runtimeActivation = parsedEnrichmentRuntimeConfiguration.guidanceActivation
+var runtimeConfiguredIdentityResourceIds = map([
+  parsedEnrichmentRuntimeConfiguration.serviceBus.brokerIdentityResourceId
+  parsedEnrichmentRuntimeConfiguration.incidentLifecycleAssets.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.enrichmentFeedAssets.readerIdentityResourceId
+  parsedEnrichmentRuntimeConfiguration.enrichmentFeedAssets.writerIdentityResourceId
+  parsedEnrichmentRuntimeConfiguration.feedRegistry.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.monitoring.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.change.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.contextAuthority.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.monitoringIntent.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.guidanceAuthoritySource.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.guidanceActivation.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.monitoringCollectorKey.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.incident.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.correlationBinding.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.change.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.monitoringIntent.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.report.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.guidance.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.enrichment.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.feed.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.keys.notification.identityResourceId
+], identityResourceId => toLower(identityResourceId))
+var distinctRuntimeConfiguredIdentityResourceIds = union(
+  runtimeConfiguredIdentityResourceIds,
+  runtimeConfiguredIdentityResourceIds
+)
+var runtimeDeploymentAttachedIdentityResourceIds = map(
+  parsedEnrichmentRuntimeConfiguration.deploymentBinding.attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var distinctRuntimeDeploymentAttachedIdentityResourceIds = union(
+  runtimeDeploymentAttachedIdentityResourceIds,
+  runtimeDeploymentAttachedIdentityResourceIds
+)
+var validatedRuntimeIdentityResourceIds = length(runtimeDeploymentAttachedIdentityResourceIds) == length(distinctRuntimeDeploymentAttachedIdentityResourceIds) && length(distinctRuntimeConfiguredIdentityResourceIds) == length(distinctRuntimeDeploymentAttachedIdentityResourceIds) && length(union(distinctRuntimeConfiguredIdentityResourceIds, distinctRuntimeDeploymentAttachedIdentityResourceIds)) == length(distinctRuntimeConfiguredIdentityResourceIds)
+  ? distinctRuntimeConfiguredIdentityResourceIds
+  : fail('embedded WC-027 runtime identities do not exactly match its deployment binding')
+var expectedSourceIdentityResourceIds = map([
+  parsedEnrichmentRuntimeConfiguration.incidentLifecycleAssets.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.monitoring.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.change.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.contextAuthority.identityResourceId
+  parsedEnrichmentRuntimeConfiguration.correlationSources.monitoringIntent.identityResourceId
+], identityResourceId => toLower(identityResourceId))
+var normalizedSourceIdentityResourceIds = map(
+  sourceIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var validatedSourceIdentityResourceIds = length(normalizedSourceIdentityResourceIds) == length(union(normalizedSourceIdentityResourceIds, normalizedSourceIdentityResourceIds)) && length(expectedSourceIdentityResourceIds) == length(normalizedSourceIdentityResourceIds) && length(union(expectedSourceIdentityResourceIds, normalizedSourceIdentityResourceIds)) == length(expectedSourceIdentityResourceIds)
+  ? sourceIdentityResourceIds
+  : fail('WC-027 guidance publisher source identities must exactly match the embedded runtime readers')
 var runtimeTrustDomainFingerprints = [
   parsedEnrichmentRuntimeConfiguration.monitoringCollectorKey.keyFingerprint
   parsedEnrichmentRuntimeConfiguration.keys.change.keyFingerprint
@@ -201,22 +254,58 @@ resource requestOutboxReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIden
   scope: resourceGroup(split(requestOutboxReaderIdentityResourceId, '/')[2], split(requestOutboxReaderIdentityResourceId, '/')[4])
 }
 
-var attachedIdentityResourceIds = concat([
+var publisherOwnedIdentityResourceIds = [
   brokerIdentity.id
   authorityReaderIdentity.id
   authorityWriterIdentity.id
   activationWriterIdentity.id
   bindingSignerIdentity.id
   requestTrustReaderIdentity.id
-  bindingTrustReaderIdentity.id
   requestOutboxReaderIdentity.id
-], sourceIdentityResourceIds)
-var validatedAttachedIdentityResourceIds = length(union(attachedIdentityResourceIds, attachedIdentityResourceIds)) == length(attachedIdentityResourceIds)
+]
+var normalizedPublisherOwnedIdentityResourceIds = map(
+  publisherOwnedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var publisherRuntimeIdentityOverlap = intersection(
+  normalizedPublisherOwnedIdentityResourceIds,
+  validatedRuntimeIdentityResourceIds
+)
+var validatedPublisherOwnedIdentityResourceIds = length(union(normalizedPublisherOwnedIdentityResourceIds, normalizedPublisherOwnedIdentityResourceIds)) == length(normalizedPublisherOwnedIdentityResourceIds) && empty(publisherRuntimeIdentityOverlap)
+  ? publisherOwnedIdentityResourceIds
+  : fail('WC-027 guidance publisher identities must be distinct and separate from runtime identities')
+var validatedBindingTrustReaderIdentityResourceId = toLower(bindingTrustReaderIdentity.id) == toLower(parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.identityResourceId)
+  ? bindingTrustReaderIdentity.id
+  : fail('WC-027 guidance publisher binding trust reader must match the embedded runtime trust identity')
+var attachedIdentityResourceIds = concat(
+  validatedPublisherOwnedIdentityResourceIds,
+  [
+    validatedBindingTrustReaderIdentityResourceId
+  ],
+  validatedSourceIdentityResourceIds
+)
+var normalizedAttachedIdentityResourceIds = map(
+  attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var validatedAttachedIdentityResourceIds = length(union(normalizedAttachedIdentityResourceIds, normalizedAttachedIdentityResourceIds)) == length(normalizedAttachedIdentityResourceIds)
   ? attachedIdentityResourceIds
   : fail('WC-027 guidance publisher identities must be distinct')
-var validatedRequestSubmitterIdentityResourceIds = length(requestSubmitterIdentityResourceIds) == 1 && length(union(requestSubmitterIdentityResourceIds, validatedAttachedIdentityResourceIds)) == length(validatedAttachedIdentityResourceIds) + 1
+var normalizedRequestSubmitterIdentityResourceIds = map(
+  requestSubmitterIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var requestSubmitterRuntimeIdentityOverlap = intersection(
+  normalizedRequestSubmitterIdentityResourceIds,
+  validatedRuntimeIdentityResourceIds
+)
+var requestSubmitterAttachedIdentityOverlap = intersection(
+  normalizedRequestSubmitterIdentityResourceIds,
+  normalizedAttachedIdentityResourceIds
+)
+var validatedRequestSubmitterIdentityResourceIds = length(requestSubmitterIdentityResourceIds) == 1 && empty(requestSubmitterRuntimeIdentityOverlap) && empty(requestSubmitterAttachedIdentityOverlap)
   ? requestSubmitterIdentityResourceIds
-  : fail('WC-027 guidance publisher requires one dedicated request submitter identity')
+  : fail('WC-027 guidance publisher requires one dedicated request submitter identity separate from publisher and runtime identities')
 var jobIdentityMap = reduce(
   validatedAttachedIdentityResourceIds,
   {},
@@ -520,6 +609,7 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
               name: 'wc027-guidance-authority-request'
               type: 'azure-servicebus'
               identity: brokerIdentity.id
+              auth: []
               metadata: {
                 namespace: serviceBusNamespaceName
                 queueName: requestQueue.name

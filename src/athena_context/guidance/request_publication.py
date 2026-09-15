@@ -50,6 +50,8 @@ WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION = (
 )
 _REQUEST_OUTBOX_PREFIX = "guidance-publication-requests"
 _MAX_DETACHED_SIGNATURE_CHARS = 8192
+_MIN_PRE_PERSISTENCE_REMAINING_LIFETIME = timedelta(seconds=30)
+_MAX_PUBLICATION_REQUEST_LIFETIME = timedelta(minutes=5)
 _ALLOWED_REQUESTED_ACTIONS = frozenset(
     {
         "investigationCheck",
@@ -179,6 +181,17 @@ class GuidancePublicationRequestProducer:
             now=now,
         )
         payload = publication_request.canonical_bytes()
+        persistence_now = self._operation_time(now)
+        remaining_before_persistence = publication_request.expires_at - persistence_now
+        if not (
+            _MIN_PRE_PERSISTENCE_REMAINING_LIFETIME
+            < remaining_before_persistence
+            <= _MAX_PUBLICATION_REQUEST_LIFETIME
+        ):
+            raise GuidanceAuthoritySourceNotReadyError(
+                "guidance publication request lacks the remaining lifetime required "
+                "for persistence, authority revalidation, and enqueue"
+            )
         outbox_reference = self.outbox.create_or_recover(
             ArtifactWriteRequest(
                 blob_name=guidance_publication_request_outbox_path(
@@ -215,10 +228,12 @@ class GuidancePublicationRequestProducer:
                 "published context authority changed after request persistence"
             )
 
-        operation_now = self._operation_time(now)
+        operation_now = self._operation_time(persistence_now)
         remaining_seconds = int((publication_request.expires_at - operation_now).total_seconds())
         if not 1 <= remaining_seconds <= 300:
-            raise ValueError("guidance publication request expired before enqueue")
+            raise GuidanceAuthoritySourceNotReadyError(
+                "guidance publication request expired before enqueue"
+            )
         self.sender.enqueue(
             publication_request,
             outbox_reference=outbox_reference,

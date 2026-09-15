@@ -67,7 +67,7 @@ def test_request_producer_is_a_separate_private_idempotent_job() -> None:
         assert expected in source
 
     assert "PublishedGuidanceAuthorityBinding" not in source
-    assert "guidanceActivation" not in source
+    assert "runtimeActivation" not in source
     assert "tables/entities" not in source
     assert "listKeys(" not in source
     assert "allowSharedKeyAccess: true" not in source
@@ -165,6 +165,43 @@ def test_request_producer_configuration_and_publisher_handoff_are_derived() -> N
         assert expected in source
 
 
+def test_request_producer_rejects_every_runtime_identity_intersection() -> None:
+    source = PRODUCER.read_text(encoding="utf-8")
+
+    for expected in (
+        "parsedRuntimeConfiguration.serviceBus.brokerIdentityResourceId",
+        "parsedRuntimeConfiguration.incidentLifecycleAssets.identityResourceId",
+        "parsedRuntimeConfiguration.enrichmentFeedAssets.readerIdentityResourceId",
+        "parsedRuntimeConfiguration.enrichmentFeedAssets.writerIdentityResourceId",
+        "parsedRuntimeConfiguration.feedRegistry.identityResourceId",
+        "parsedRuntimeConfiguration.correlationSources.monitoring.identityResourceId",
+        "parsedRuntimeConfiguration.correlationSources.change.identityResourceId",
+        "parsedRuntimeConfiguration.correlationSources.contextAuthority.identityResourceId",
+        "parsedRuntimeConfiguration.correlationSources.monitoringIntent.identityResourceId",
+        "parsedRuntimeConfiguration.guidanceAuthoritySource.identityResourceId",
+        "parsedRuntimeConfiguration.guidanceActivation.identityResourceId",
+        "parsedRuntimeConfiguration.monitoringCollectorKey.identityResourceId",
+        "parsedRuntimeConfiguration.keys.incident.identityResourceId",
+        "parsedRuntimeConfiguration.keys.correlationBinding.identityResourceId",
+        "parsedRuntimeConfiguration.keys.guidanceBinding.identityResourceId",
+        "parsedRuntimeConfiguration.keys.change.identityResourceId",
+        "parsedRuntimeConfiguration.keys.monitoringIntent.identityResourceId",
+        "parsedRuntimeConfiguration.keys.report.identityResourceId",
+        "parsedRuntimeConfiguration.keys.guidance.identityResourceId",
+        "parsedRuntimeConfiguration.keys.enrichment.identityResourceId",
+        "parsedRuntimeConfiguration.keys.feed.identityResourceId",
+        "parsedRuntimeConfiguration.keys.notification.identityResourceId",
+        "parsedRuntimeConfiguration.deploymentBinding.attachedIdentityResourceIds",
+        "validatedRuntimeIdentityResourceIds",
+        "normalizedAttachedIdentityResourceIds",
+        "producerRuntimeIdentityOverlap = intersection(",
+        "normalizedInputSubmitterIdentityResourceIds",
+        "inputSubmitterProducerIdentityOverlap = intersection(",
+        "producer identities must be separate from every runtime identity",
+    ):
+        assert expected in source
+
+
 def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
     root = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
     publisher = PUBLISHER.read_text(encoding="utf-8")
@@ -202,3 +239,92 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
         "output requestOutboxContainerName string",
     ):
         assert expected in publisher
+
+
+def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -> None:
+    root = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
+
+    for expected in (
+        "wc027RequestProducerConfigurationIdentitiesMatchBinding",
+        "wc027PublisherConfigurationIdentitiesMatchBinding",
+        "wc027RequestProducerRuntimeIdentityOverlap = intersection(",
+        "wc027RequestProducerPublisherIdentityOverlap = intersection(",
+        "wc027PublisherOwnedRuntimeIdentityOverlap = intersection(",
+        "wc027PublisherRequestSubmitterRuntimeIdentityOverlap = intersection(",
+        "wc027PublisherRequestSubmitterAttachedIdentityOverlap = intersection(",
+        "request producer identities overlap the enrichment runtime identity boundary",
+        "request producer identities overlap the publisher identity boundary",
+        "publisher-owned identities overlap the enrichment runtime identity boundary",
+        "publisher request submitter overlaps the enrichment runtime identity boundary",
+        "publisher request submitter does not match the dedicated request producer sender",
+        (
+            "toLower(wc027ParsedPublisherConfiguration.serviceBus."
+            "requestSubmitterIdentityResourceId) != "
+            "toLower(wc027ParsedRequestProducerConfiguration.serviceBus."
+            "senderIdentityResourceId)"
+        ),
+    ):
+        assert expected in root
+
+    for prefix in ("wc027RequestProducer", "wc027Publisher"):
+        assert f"var {prefix}HasExactContainerCount" in root
+        assert f"var {prefix}IdentityTypeMatches" in root
+        assert f"var {prefix}HasExactScalerRuleCount" in root
+        assert f"var {prefix}HasExactRegistryCount" in root
+        assert f"var {prefix}TagsMatch" in root
+        assert f"length({prefix}Job!.properties.template.containers) == 1" in root
+        assert f"({prefix}Job!.identity.?type ?? '') == 'UserAssigned'" in root
+        assert f"length({prefix}Job!.properties.template.containers[0].env) == 2" in root
+        assert f"empty({prefix}Job!.properties.template.containers[0].?probes ?? [])" in root
+        assert f"empty({prefix}Job!.properties.template.containers[0].?volumeMounts ?? [])" in root
+        assert f"empty({prefix}Job!.properties.template.?initContainers ?? [])" in root
+        assert f"empty({prefix}Job!.properties.template.?volumes ?? [])" in root
+        assert f"empty({prefix}Job!.properties.configuration.?identitySettings ?? [])" in root
+        assert f"empty({prefix}Job!.properties.configuration.?secrets ?? [])" in root
+        assert f"{prefix}Job!.properties.configuration.replicaTimeout == 900" in root
+        assert f"{prefix}Job!.properties.configuration.replicaRetryLimit == 0" in root
+        assert f"{prefix}Job!.properties.configuration.eventTriggerConfig.parallelism == 1" in root
+        assert (
+            f"{prefix}Job!.properties.configuration.eventTriggerConfig.replicaCompletionCount == 1"
+        ) in root
+        assert (
+            f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale.minExecutions == 0"
+        ) in root
+        assert (
+            f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1"
+        ) in root
+        assert (
+            f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale.pollingInterval == 30"
+        ) in root
+        assert (
+            f"empty({prefix}Job!.properties.configuration.eventTriggerConfig.scale."
+            "rules[0].?auth ?? [])"
+        ) in root
+        assert (
+            f"length(items({prefix}Job!.properties.configuration.eventTriggerConfig."
+            "scale.rules[0].metadata)) == 5"
+        ) in root
+        assert (f"length(items({prefix}Job!.properties.configuration.registries[0])) == 2") in root
+
+    request_gate = root.split("var validatedWc027RequestProducerReady =", maxsplit=1)[1].split(
+        "var wc027ProducerJobResourceIdRawSegments",
+        maxsplit=1,
+    )[0]
+    publisher_gate = root.split("var validatedWc027PublisherReady =", maxsplit=1)[1].split(
+        "var wc027ProducerJobResourceIdSegments",
+        maxsplit=1,
+    )[0]
+    assert "wc027RequestProducerJob!" not in request_gate
+    assert "wc027PublisherJob!" not in publisher_gate
+
+    for expected in (
+        "wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityClientId",
+        "wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityClientId",
+        "metadata.messageCount == '1'",
+        "metadata.cloud == 'AzurePublicCloud'",
+        "metadata.isSessionsEnabled == 'true'",
+        "properties.environmentId == azureMcp.outputs.managedEnvironmentResourceId",
+        "properties.template.containers[0].resources.cpu == 1",
+        "properties.template.containers[0].resources.memory == '2Gi'",
+    ):
+        assert expected in root

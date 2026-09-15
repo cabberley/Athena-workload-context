@@ -76,6 +76,45 @@ var runtimeIncidentAssets = parsedRuntimeConfiguration.incidentLifecycleAssets
 var runtimeContextAuthority = parsedRuntimeConfiguration.correlationSources.contextAuthority
 var runtimeIncidentKey = parsedRuntimeConfiguration.keys.incident
 var runtimeCorrelationBindingKey = parsedRuntimeConfiguration.keys.correlationBinding
+var runtimeConfiguredIdentityResourceIds = map([
+  parsedRuntimeConfiguration.serviceBus.brokerIdentityResourceId
+  parsedRuntimeConfiguration.incidentLifecycleAssets.identityResourceId
+  parsedRuntimeConfiguration.enrichmentFeedAssets.readerIdentityResourceId
+  parsedRuntimeConfiguration.enrichmentFeedAssets.writerIdentityResourceId
+  parsedRuntimeConfiguration.feedRegistry.identityResourceId
+  parsedRuntimeConfiguration.correlationSources.monitoring.identityResourceId
+  parsedRuntimeConfiguration.correlationSources.change.identityResourceId
+  parsedRuntimeConfiguration.correlationSources.contextAuthority.identityResourceId
+  parsedRuntimeConfiguration.correlationSources.monitoringIntent.identityResourceId
+  parsedRuntimeConfiguration.guidanceAuthoritySource.identityResourceId
+  parsedRuntimeConfiguration.guidanceActivation.identityResourceId
+  parsedRuntimeConfiguration.monitoringCollectorKey.identityResourceId
+  parsedRuntimeConfiguration.keys.incident.identityResourceId
+  parsedRuntimeConfiguration.keys.correlationBinding.identityResourceId
+  parsedRuntimeConfiguration.keys.guidanceBinding.identityResourceId
+  parsedRuntimeConfiguration.keys.change.identityResourceId
+  parsedRuntimeConfiguration.keys.monitoringIntent.identityResourceId
+  parsedRuntimeConfiguration.keys.report.identityResourceId
+  parsedRuntimeConfiguration.keys.guidance.identityResourceId
+  parsedRuntimeConfiguration.keys.enrichment.identityResourceId
+  parsedRuntimeConfiguration.keys.feed.identityResourceId
+  parsedRuntimeConfiguration.keys.notification.identityResourceId
+], identityResourceId => toLower(identityResourceId))
+var distinctRuntimeConfiguredIdentityResourceIds = union(
+  runtimeConfiguredIdentityResourceIds,
+  runtimeConfiguredIdentityResourceIds
+)
+var runtimeDeploymentAttachedIdentityResourceIds = map(
+  parsedRuntimeConfiguration.deploymentBinding.attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var distinctRuntimeDeploymentAttachedIdentityResourceIds = union(
+  runtimeDeploymentAttachedIdentityResourceIds,
+  runtimeDeploymentAttachedIdentityResourceIds
+)
+var validatedRuntimeIdentityResourceIds = length(runtimeDeploymentAttachedIdentityResourceIds) == length(distinctRuntimeDeploymentAttachedIdentityResourceIds) && length(distinctRuntimeConfiguredIdentityResourceIds) == length(distinctRuntimeDeploymentAttachedIdentityResourceIds) && length(union(distinctRuntimeConfiguredIdentityResourceIds, distinctRuntimeDeploymentAttachedIdentityResourceIds)) == length(distinctRuntimeConfiguredIdentityResourceIds)
+  ? distinctRuntimeConfiguredIdentityResourceIds
+  : fail('embedded WC-027 runtime identities do not exactly match its deployment binding')
 var validatedServiceBusNamespaceName = parsedRuntimeConfiguration.serviceBus.namespace == '${toLower(serviceBusNamespaceName)}.servicebus.windows.net'
   ? serviceBusNamespaceName
   : fail('serviceBusNamespaceName must match the embedded WC-027 runtime namespace')
@@ -235,10 +274,29 @@ var attachedIdentityResourceIds = [
   requestSignerIdentity.id
   requestVerifierIdentity.id
 ]
-var validatedAttachedIdentityResourceIds = length(union(attachedIdentityResourceIds, attachedIdentityResourceIds)) == length(attachedIdentityResourceIds)
+var normalizedAttachedIdentityResourceIds = map(
+  attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var validatedDistinctAttachedIdentityResourceIds = length(union(normalizedAttachedIdentityResourceIds, normalizedAttachedIdentityResourceIds)) == length(normalizedAttachedIdentityResourceIds)
   ? attachedIdentityResourceIds
   : fail('WC-027 guidance publication-request producer identities must be distinct')
-var validatedInputSubmitterIdentityResourceIds = length(union(inputSubmitterIdentityResourceIds, inputSubmitterIdentityResourceIds)) == length(inputSubmitterIdentityResourceIds) && length(union(inputSubmitterIdentityResourceIds, validatedAttachedIdentityResourceIds)) == length(inputSubmitterIdentityResourceIds) + length(validatedAttachedIdentityResourceIds)
+var producerRuntimeIdentityOverlap = intersection(
+  normalizedAttachedIdentityResourceIds,
+  validatedRuntimeIdentityResourceIds
+)
+var validatedAttachedIdentityResourceIds = empty(producerRuntimeIdentityOverlap)
+  ? validatedDistinctAttachedIdentityResourceIds
+  : fail('WC-027 guidance publication-request producer identities must be separate from every runtime identity')
+var normalizedInputSubmitterIdentityResourceIds = map(
+  inputSubmitterIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var inputSubmitterProducerIdentityOverlap = intersection(
+  normalizedInputSubmitterIdentityResourceIds,
+  normalizedAttachedIdentityResourceIds
+)
+var validatedInputSubmitterIdentityResourceIds = length(union(normalizedInputSubmitterIdentityResourceIds, normalizedInputSubmitterIdentityResourceIds)) == length(normalizedInputSubmitterIdentityResourceIds) && empty(inputSubmitterProducerIdentityOverlap)
   ? inputSubmitterIdentityResourceIds
   : fail('WC-027 guidance request input submitters must be unique and separate from producer identities')
 var jobIdentityMap = reduce(

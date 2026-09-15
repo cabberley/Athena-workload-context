@@ -360,8 +360,10 @@ def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() 
         "string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration)"
         in source
     )
-    assert "eventTriggerConfig.scale.rules) != 1" in source
-    assert "configuration.registries) != 1" in source
+    assert "wc027PublisherScalerMatches" in source
+    assert "eventTriggerConfig.scale.rules) == 1" in source
+    assert "wc027PublisherRegistryMatches" in source
+    assert "configuration.registries) == 1" in source
     assert "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON" in source
     assert "wc027PublisherRbacEvidenceMatches" in source
     assert "wc027PublisherIdentitiesMatch" in source
@@ -384,7 +386,10 @@ def test_wc027_readiness_rejects_missing_or_mismatched_publisher_and_bindings() 
     )
 
     # Readiness derives the exact identity set from the deployed configuration.
-    assert "items(wc027ProducerJob!.identity.userAssignedIdentities)" in source
+    assert (
+        "items(wc027ProducerJob!.identity.?userAssignedIdentities ?? {})"
+        in source
+    )
     assert (
         "wc027ParsedConfiguration.deploymentBinding.attachedIdentityResourceIds"
         in source

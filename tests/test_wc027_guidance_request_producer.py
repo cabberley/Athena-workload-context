@@ -40,7 +40,6 @@ from athena_context.guidance.request_production import (
     load_wc027_guidance_publication_request_producer_configuration,
     run_wc027_guidance_publication_request_producer_worker,
 )
-from athena_context.presentation_assets import PresentationAssetUnavailableError
 from test_wc026_correlation_contract import _request
 from test_wc027_enrichment_feed_runtime import (
     _bicep_generated_publisher_configuration,
@@ -178,6 +177,7 @@ def _producer(
     outbox: _Outbox | None = None,
     sender: _Sender | None = None,
     incident_key_vault_key_id: str | None = None,
+    clock=None,
 ):
     fixture = _fixture()
     selected_request = request or fixture.guidance_binding.incident_bound_request
@@ -206,6 +206,7 @@ def _producer(
         outbox=selected_outbox,
         sender=selected_sender,
         requested_actions=requested_actions,
+        clock=clock,
     )
     return (
         fixture,
@@ -343,6 +344,42 @@ def test_invalid_key_signature_draft_or_stale_input_has_zero_output_io(
 
     with pytest.raises(ValueError):
         producer.produce(request, now=now)
+
+    assert outbox.calls == []
+    assert sender.calls == []
+
+
+def test_persistence_margin_boundary_has_zero_outbox_writes_and_sends() -> None:
+    fixture = _fixture()
+    request = fixture.guidance_binding.incident_bound_request
+    evaluated_at = _stable_evaluated_at(
+        request,
+        fixture.incident_publication.occurrence,
+    )
+    expires_at = min(
+        evaluated_at + timedelta(minutes=5),
+        request.correlation_request.expires_at,
+    )
+    (
+        _fixture_value,
+        _request_value,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        outbox,
+        sender,
+    ) = _producer(
+        request=request,
+        clock=lambda: expires_at - timedelta(seconds=30),
+    )
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match="remaining lifetime required",
+    ):
+        producer.produce(request, now=evaluated_at)
 
     assert outbox.calls == []
     assert sender.calls == []
@@ -975,7 +1012,7 @@ def test_request_body_digest_matches_outbox_evidence() -> None:
     assert receipt.outbox_reference.content_digest == sha256_hex(receipt.request.canonical_bytes())
 
 
-def test_worker_abandons_when_current_incident_authority_is_unavailable(
+def test_worker_abandons_when_persistence_margin_is_insufficient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import azure.identity
@@ -1069,7 +1106,7 @@ def test_worker_abandons_when_current_incident_authority_is_unavailable(
 
     class _UnavailableProducer:
         def produce(self, *_args, **_kwargs):
-            raise PresentationAssetUnavailableError("synthetic current authority unavailable")
+            raise GuidanceAuthoritySourceNotReadyError("synthetic remaining lifetime required")
 
     monkeypatch.setattr(
         azure.identity,

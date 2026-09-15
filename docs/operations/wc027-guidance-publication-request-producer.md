@@ -88,8 +88,12 @@ The occurrence-keyed path means:
   occurrence fail closed; and
 - concurrent workers converge on one request identity.
 
-After persistence, the worker revalidates lifecycle and context authority, then sends to the
-existing `wc027-guidance-authority-requests` queue with a distinct sender identity:
+Immediately before persistence, the worker consults its trusted clock and requires more than 30
+seconds of remaining request lifetime for immutable persistence, lifecycle/context revalidation,
+and enqueue. A request at or inside that boundary is abandoned without reserving or writing its
+occurrence-keyed outbox path. After persistence, the worker revalidates lifecycle and context
+authority, then sends to the existing `wc027-guidance-authority-requests` queue with a distinct
+sender identity:
 
 | Field | Value |
 |---|---|
@@ -118,6 +122,12 @@ prior successful send.
 - a publisher handoff containing the existing output queue, sender identity, exact request key
   binding, producer Job resource ID, and configuration digest.
 
+The module derives the complete identity boundary from the embedded enrichment-runtime
+configuration and its deployment binding. None of the receiver, sender, source reader, outbox
+reader/writer, upstream trust reader, request signer, or request verifier identities may intersect
+that runtime boundary. Resource IDs are normalized before uniqueness and overlap checks so casing
+aliases cannot bypass the separation.
+
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that
 singleton queue-scoped sender role. Give the publisher a separate no-list outbox-reader identity
@@ -141,11 +151,17 @@ wc027PublisherReady=false
 wc027FeedV2ProducerReady=false
 ```
 
-The root live acceptance template checks the exact deployed request-producer Job, digest-pinned
-image, command, scaler, queue names, registry identity, generated configuration, attached
-identities, configuration digest, and deterministic RBAC evidence. When both jobs are asserted
-ready, it requires the publisher's queue plus logical/physical request-key binding to match the
-producer. The complete feed-v2 chain cannot be marked ready unless both jobs are ready.
+The root live acceptance template checks the exact deployed request-producer Job,
+user-assigned-only identity mode, exactly one reviewed container, digest-pinned image,
+command/arguments, both environment values, resources, empty probe/init-container/volume/secret
+and managed-identity lifecycle surfaces, complete replica and scaler settings, queue names,
+registry identity, generated configuration, attached identities, configuration digest, and
+deterministic RBAC evidence. It derives the request-producer, publisher-owned, delegated-runtime,
+and runtime deployment identity sets and rejects every request-producer intersection. When both
+jobs are asserted ready, it allows only the producer sender to appear as the publisher's separately
+modeled request submitter and requires the publisher's queue plus logical/physical request-key
+binding to match the producer. The complete feed-v2 chain cannot be marked ready unless both jobs
+are ready.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is
@@ -162,7 +178,8 @@ request-producer sender identity used in the generated configuration.
 - Different request in an existing occurrence slot: dead-letter as
   `AthenaWc027GuidanceRequestConflict`.
 - Current authority temporarily unavailable or changed, Blob uncertainty, Key Vault transport
-  failure, or Service Bus uncertainty: abandon and retry.
+  failure, insufficient pre-persistence lifetime, expiry during revalidation, or Service Bus
+  uncertainty: abandon and retry.
 - Signer output that fails separate public-key verification: reject before persistence.
 
 Never delete immutable outbox evidence to retry and never bypass the publisher activation path.
