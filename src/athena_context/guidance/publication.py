@@ -21,6 +21,8 @@ from athena_context.contracts import (
     CorrelationReport,
     CorrelationRequest,
     GuidanceAuthorityPublicationRequest,
+    IncidentBoundCorrelationRequest,
+    IncidentOccurrenceReceipt,
     NoRunbookGuidanceSelection,
     PublishedGuidanceAuthority,
     PublishedGuidanceAuthorityActivation,
@@ -104,6 +106,159 @@ class GuidanceAuthorityIncidentReaderPort(Protocol):
         *,
         incident_id: str,
     ) -> CurrentIncidentStateSnapshot | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GuidanceIncidentAuthoritySnapshot:
+    current: CurrentIncidentStateSnapshot
+    active: ActiveIncidentIndexSnapshot
+
+
+def verify_incident_bound_request_signatures(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    incident_key_vault_key_id: str,
+    incident_signature_verifier: SignatureVerifier,
+    correlation_binding_key_id: str,
+    correlation_binding_signature_verifier: SignatureVerifier,
+) -> None:
+    """Verify all nested signatures before any guidance output write."""
+
+    if type(request) is not IncidentBoundCorrelationRequest:
+        raise TypeError(
+            "request must be an exact IncidentBoundCorrelationRequest"
+        )
+    request = IncidentBoundCorrelationRequest.model_validate_json(
+        request.canonical_bytes()
+    )
+    subject = request.incident_subject
+    state = subject.incident_state
+    if (
+        type(incident_key_vault_key_id) is not str
+        or not incident_key_vault_key_id
+        or type(correlation_binding_key_id) is not str
+        or not correlation_binding_key_id
+        or subject.incident_state_attestation.key_vault_key_id
+        != incident_key_vault_key_id
+        or subject.incident_state_attestation.result_digest
+        != state.result_digest
+        or incident_signature_verifier(
+            incident_state_signature_preimage(state),
+            subject.incident_state_attestation.detached_signature,
+        )
+        is not True
+        or subject.subject_attestation.key_vault_key_id
+        != incident_key_vault_key_id
+        or incident_signature_verifier(
+            incident_correlation_subject_signature_preimage(subject),
+            subject.subject_attestation.detached_signature,
+        )
+        is not True
+        or request.binding_attestation.key_vault_key_id
+        != correlation_binding_key_id
+        or correlation_binding_signature_verifier(
+            incident_bound_correlation_request_signature_preimage(request),
+            request.binding_attestation.detached_signature,
+        )
+        is not True
+    ):
+        raise ValueError("nested authority signature is invalid")
+
+
+def read_current_guidance_incident_authority(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    incident_key_id: str,
+    incident_authority: GuidanceAuthorityIncidentReaderPort,
+    expected_occurrence: IncidentOccurrenceReceipt | None = None,
+) -> GuidanceIncidentAuthoritySnapshot:
+    """Read and bind the current signed occurrence and active incident index."""
+
+    if type(request) is not IncidentBoundCorrelationRequest:
+        raise TypeError(
+            "request must be an exact IncidentBoundCorrelationRequest"
+        )
+    if type(incident_key_id) is not str or not incident_key_id:
+        raise ValueError("incident logical key ID is invalid")
+    if (
+        expected_occurrence is not None
+        and type(expected_occurrence) is not IncidentOccurrenceReceipt
+    ):
+        raise TypeError(
+            "expected_occurrence must be an exact IncidentOccurrenceReceipt"
+        )
+    subject = request.incident_subject
+    current = incident_authority.read_current_incident_state(
+        incident_id=subject.incident_id
+    )
+    active = incident_authority.read_active_incident_index()
+    if current is None or current.occurrence is None or active is None:
+        raise GuidanceAuthoritySourceNotReadyError(
+            "current signed incident occurrence is unavailable"
+        )
+    occurrence = current.occurrence
+    entry = next(
+        (
+            item
+            for item in active.index.incidents
+            if item.incident_id == subject.incident_id
+        ),
+        None,
+    )
+    if (
+        current.state != subject.incident_state
+        or current.pointer.incident_id != subject.incident_id
+        or current.pointer.key_id != incident_key_id
+        or active.index.key_id != incident_key_id
+        or current.pointer.key_fingerprint != active.index.key_fingerprint
+        or occurrence.incident_id != subject.incident_id
+        or occurrence.transition_id != subject.incident_transition_id
+        or occurrence.state_result_digest != subject.incident_state_digest
+        or occurrence.state_reference != subject.state_reference
+        or occurrence.state_attestation_reference
+        != subject.attestation_reference
+        or (
+            expected_occurrence is not None
+            and occurrence != expected_occurrence
+        )
+        or current.pointer_sha256
+        != occurrence.pointer_reference.content_digest
+        or entry is None
+        or entry.lifecycle != "active"
+        or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
+        or entry.pointer_sha256 != current.pointer_sha256
+    ):
+        raise ValueError(
+            "incident request is stale for current signed incident authority"
+        )
+    return GuidanceIncidentAuthoritySnapshot(
+        current=current,
+        active=active,
+    )
+
+
+def require_unchanged_guidance_incident_authority(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    expected: GuidanceIncidentAuthoritySnapshot,
+    incident_key_id: str,
+    incident_authority: GuidanceAuthorityIncidentReaderPort,
+    expected_occurrence: IncidentOccurrenceReceipt | None = None,
+) -> None:
+    if type(expected) is not GuidanceIncidentAuthoritySnapshot:
+        raise TypeError(
+            "expected must be an exact GuidanceIncidentAuthoritySnapshot"
+        )
+    current = read_current_guidance_incident_authority(
+        request,
+        incident_key_id=incident_key_id,
+        incident_authority=incident_authority,
+        expected_occurrence=expected_occurrence,
+    )
+    if current != expected:
+        raise GuidanceAuthoritySourceNotReadyError(
+            "signed incident authority changed during guidance publication"
+        )
 
 
 class GuidanceAuthorityActivationConflictError(RuntimeError):
@@ -314,9 +469,6 @@ class GuidanceAuthorityPublisher:
         self,
         request: GuidanceAuthorityPublicationRequest,
     ) -> None:
-        bound = request.incident_bound_request
-        subject = bound.incident_subject
-        state = subject.incident_state
         if (
             request.request_attestation.key_id != self.request_key_id
             or self.request_signature_verifier(
@@ -326,84 +478,37 @@ class GuidanceAuthorityPublisher:
                 request.request_attestation.detached_signature,
             )
             is not True
-            or subject.incident_state_attestation.key_vault_key_id
-            != self.incident_key_vault_key_id
-            or subject.incident_state_attestation.result_digest
-            != state.result_digest
-            or self.incident_signature_verifier(
-                incident_state_signature_preimage(state),
-                subject.incident_state_attestation.detached_signature,
-            )
-            is not True
-            or subject.subject_attestation.key_vault_key_id
-            != self.incident_key_vault_key_id
-            or self.incident_signature_verifier(
-                incident_correlation_subject_signature_preimage(subject),
-                subject.subject_attestation.detached_signature,
-            )
-            is not True
-            or bound.binding_attestation.key_vault_key_id
-            != self.correlation_binding_key_id
-            or self.correlation_binding_signature_verifier(
-                incident_bound_correlation_request_signature_preimage(bound),
-                bound.binding_attestation.detached_signature,
-            )
-            is not True
         ):
             raise ValueError(
                 "guidance publication request or nested authority signature is invalid"
             )
+        verify_incident_bound_request_signatures(
+            request.incident_bound_request,
+            incident_key_vault_key_id=self.incident_key_vault_key_id,
+            incident_signature_verifier=self.incident_signature_verifier,
+            correlation_binding_key_id=self.correlation_binding_key_id,
+            correlation_binding_signature_verifier=(
+                self.correlation_binding_signature_verifier
+            ),
+        )
+
+    def _read_incident_authority_snapshot(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+    ) -> GuidanceIncidentAuthoritySnapshot:
+        return read_current_guidance_incident_authority(
+            request.incident_bound_request,
+            incident_key_id=self.incident_key_id,
+            incident_authority=self.incident_authority,
+            expected_occurrence=request.incident_occurrence,
+        )
 
     def _read_current_authority(
         self,
         request: GuidanceAuthorityPublicationRequest,
     ) -> tuple[CurrentIncidentStateSnapshot, ActiveIncidentIndexSnapshot]:
-        incident_id = request.incident_bound_request.incident_subject.incident_id
-        current = self.incident_authority.read_current_incident_state(
-            incident_id=incident_id
-        )
-        active = self.incident_authority.read_active_incident_index()
-        if current is None or current.occurrence is None or active is None:
-            raise GuidanceAuthoritySourceNotReadyError(
-                "current signed incident occurrence is unavailable"
-            )
-        self._validate_current_authority(request, current=current, active=active)
-        return current, active
-
-    @staticmethod
-    def _validate_current_authority(
-        request: GuidanceAuthorityPublicationRequest,
-        *,
-        current: CurrentIncidentStateSnapshot,
-        active: ActiveIncidentIndexSnapshot,
-    ) -> None:
-        subject = request.incident_bound_request.incident_subject
-        occurrence = current.occurrence
-        if occurrence is None:
-            raise ValueError("current signed incident occurrence is unavailable")
-        entry = next(
-            (
-                item
-                for item in active.index.incidents
-                if item.incident_id == subject.incident_id
-            ),
-            None,
-        )
-        if (
-            current.state != subject.incident_state
-            or occurrence.state_reference != subject.state_reference
-            or occurrence.state_attestation_reference
-            != subject.attestation_reference
-            or occurrence != request.incident_occurrence
-            or current.pointer_sha256 != occurrence.pointer_reference.content_digest
-            or entry is None
-            or entry.lifecycle != "active"
-            or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
-            or entry.pointer_sha256 != current.pointer_sha256
-        ):
-            raise ValueError(
-                "guidance publication request is stale for current signed incident authority"
-            )
+        snapshot = self._read_incident_authority_snapshot(request)
+        return snapshot.current, snapshot.active
 
     def _require_unchanged_authority(
         self,
@@ -412,11 +517,16 @@ class GuidanceAuthorityPublisher:
         current: CurrentIncidentStateSnapshot,
         active: ActiveIncidentIndexSnapshot,
     ) -> None:
-        reread, reindex = self._read_current_authority(request)
-        if reread != current or reindex != active:
-            raise GuidanceAuthoritySourceNotReadyError(
-                "signed incident authority changed during publication"
-            )
+        require_unchanged_guidance_incident_authority(
+            request.incident_bound_request,
+            expected=GuidanceIncidentAuthoritySnapshot(
+                current=current,
+                active=active,
+            ),
+            incident_key_id=self.incident_key_id,
+            incident_authority=self.incident_authority,
+            expected_occurrence=request.incident_occurrence,
+        )
 
     def _build_binding(
         self,
@@ -462,7 +572,9 @@ class GuidanceAuthorityPublisher:
         }
         preimage_digest = compute_artifact_digest(_json_payload(unsigned_payload))
         preimage = _canonical_payload(unsigned_payload)
-        signature = _base64url_signature(self.binding_signer.sign_preimage(preimage))
+        signature = normalize_guidance_detached_signature(
+            self.binding_signer.sign_preimage(preimage)
+        )
         if self.binding_signature_verifier(preimage, signature) is not True:
             raise ValueError("guidance authority binding signer failed verification")
         attestation = PublishedGuidanceAuthorityBindingAttestation.model_validate(
@@ -521,7 +633,9 @@ class GuidanceAuthorityPublisher:
             "expiresAt": request.expires_at,
         }
         preimage = _canonical_payload(unsigned_payload)
-        signature = _base64url_signature(self.binding_signer.sign_preimage(preimage))
+        signature = normalize_guidance_detached_signature(
+            self.binding_signer.sign_preimage(preimage)
+        )
         if self.binding_signature_verifier(preimage, signature) is not True:
             raise ValueError("guidance activation signer failed verification")
         attestation = PublishedGuidanceAuthorityActivationAttestation(
@@ -638,7 +752,7 @@ def _json_payload(value: object) -> object:
     return value
 
 
-def _base64url_signature(value: str) -> str:
+def normalize_guidance_detached_signature(value: str) -> str:
     try:
         raw = base64.b64decode(value, validate=True)
     except (TypeError, ValueError, binascii.Error):
@@ -688,9 +802,14 @@ def verify_guidance_authority_activation(
 __all__ = [
     "GuidanceAuthorityActivationConflictError",
     "GuidanceAuthorityActivationSnapshot",
+    "GuidanceIncidentAuthoritySnapshot",
     "GuidanceAuthorityPublisher",
     "GuidanceAuthorityPublicationReceipt",
     "GuidanceAuthoritySourceNotReadyError",
+    "normalize_guidance_detached_signature",
     "parse_guidance_authority_publication_request",
+    "read_current_guidance_incident_authority",
+    "require_unchanged_guidance_incident_authority",
+    "verify_incident_bound_request_signatures",
     "verify_guidance_authority_activation",
 ]

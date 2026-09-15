@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-11
+- **Last updated:** 2026-09-15
 
 ADR 0029 advances the pre-runtime guidance authority wire contracts to v2 so runbook references
 carry immutable versions and content digests.
@@ -59,6 +60,34 @@ request and every nested lifecycle/subject/correlation-binding signature before 
 assets, re-reads the signed current occurrence and active index, and recomputes correlation rather
 than trusting a caller-supplied report.
 
+The publication request is now produced by a separate production runtime rather than by the
+authority publisher or a caller-side submit command. That producer consumes only the exact
+canonical signed `IncidentBoundCorrelationRequest.v1` from a private session-enabled queue. Before
+any output Blob or Service Bus write it verifies the nested incident-state, incident-subject, and
+incident-bound request signatures against exact pinned key versions; reads the current signed
+occurrence, pointer, and active index from the lifecycle authority; rejects draft context; and
+reads the exact version-pinned `PublishedContextAuthority` bytes to prove the manifest, resolved
+profile, dependency graph, context payload, publication record, and audit-head binding.
+
+`evaluatedAt` is derived deterministically from stable signed inputs: the maximum of the
+correlation request `trustedAsOf`, current occurrence `publishedAt`, and published-context
+authority `publishedAt`. It is never derived from wall-clock time. Expiry is the earlier of five
+minutes after that stable time or the nested correlation expiry. The producer signs with a
+dedicated request-signing identity, normalizes the detached signature with the same guidance
+signing rules as the publisher, and immediately verifies it using a separate exact-key public-key
+reader identity.
+
+Before enqueue, the producer create-or-recovers the exact canonical request in an isolated
+immutable Blob outbox. Its logical path is keyed only by the signed occurrence ID, so an identical
+retry recovers the same version while a different request for the same occurrence conflicts
+closed. The writer has create-only permission; a separate reader has exact read permission with
+Blob listing denied. After persistence, the producer re-reads the signed lifecycle authority and
+the exact immutable context authority. Only then does a distinct Service Bus sender identity send
+the canonical request to `wc027-guidance-authority-requests`, using `requestId` as `MessageId`,
+incident ID as `SessionId`, a bounded TTL, and occurrence, incident, context-authority, request,
+and outbox binding metadata. Service Bus duplicate detection and immutable outbox recovery make an
+uncertain send safely retryable with byte-identical identity.
+
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and
 immediately verifies the binding, then create-or-recovers the binding Blob. Existing paths are
@@ -80,6 +109,12 @@ configuration only. The lifecycle pointer and active-index `keyId` are checked a
 configured logical lifecycle ID, while lifecycle attestations and cryptographic verification are
 checked against the separately configured versioned Key Vault URI.
 
+The request producer, authority publisher, and enrichment/feed producer are separate runtime Jobs.
+The request producer does not create or activate `PublishedGuidanceAuthorityBinding.v2`, does not
+trigger enrichment, does not execute actions, and does not fabricate correlation or occurrence
+evidence. The authority publisher remains the only component that creates and activates the
+binding.
+
 The publisher configuration is rejected unless its authority Blob endpoint/container and
 activation Table endpoint/name/partition exactly match the embedded feed runtime's read
 locations. The publisher deployment derives those destinations from that runtime configuration.
@@ -96,8 +131,9 @@ read/add/update permission, and its binding signer has only exact-key sign permi
 - Manifest authoring must later add an applicable operator-guidance control before production
   authorities can contain selectable options.
 - Readiness remains an operational assertion. Shipping the publisher and feed runtime does not
-  set `wc027PublisherReady` or `wc027FeedV2ProducerReady`; both remain false until exact deployed
-  Job/configuration/RBAC evidence and end-to-end behavior are proven.
+  set `wc027RequestProducerReady`, `wc027PublisherReady`, or
+  `wc027FeedV2ProducerReady`; all remain false until exact deployed Job/configuration/RBAC evidence
+  and end-to-end behavior are proven.
 
 ## Alternatives considered
 
@@ -117,3 +153,9 @@ read/add/update permission, and its binding signer has only exact-key sign permi
   mismatched occurrence authority, deterministic retries, conflicting activation, changed
   authority before activation/enqueue, strict request bytes, logical/physical key separation,
   and activation expiry/currentness.
+- Adversarial publication-request producer tests cover invalid nested signatures and key versions,
+  draft or stale inputs with zero output I/O, current occurrence and immutable context-authority
+  mismatch, separate signer verification failure, occurrence-keyed immutable outbox conflict,
+  retry after uncertain enqueue, exact replay/concurrency identity, broker metadata, strict
+  configuration and identity separation, required Blob versioning, digest-pinned non-root image,
+  least-privilege Bicep/RBAC, and the separate root readiness gate.

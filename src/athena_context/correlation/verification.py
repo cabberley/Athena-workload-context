@@ -82,6 +82,45 @@ class ImmutableArtifactReader(Protocol):
     def read(self, reference: VersionPinnedBlobReference) -> bytes: ...
 
 
+def verify_published_context_authority(
+    binding: PublishedRuntimeContextBinding,
+    *,
+    authority_reader: ImmutableArtifactReader,
+) -> PublishedContextAuthority:
+    """Verify one exact immutable published-context authority reference."""
+
+    if type(binding) is not PublishedRuntimeContextBinding:
+        raise TypeError(
+            "binding must be an exact PublishedRuntimeContextBinding"
+        )
+    if not hasattr(authority_reader, "read"):
+        raise TypeError("authority_reader must support exact immutable reads")
+    binding = PublishedRuntimeContextBinding.model_validate_json(
+        binding.canonical_bytes()
+    )
+    authority = binding.publication_authority
+    authority_reference = binding.publication_authority_reference
+    authority_bytes = authority_reader.read(authority_reference)
+    if (
+        type(authority_bytes) is not bytes
+        or not authority_bytes
+        or sha256_hex(authority_bytes) != authority_reference.content_digest
+    ):
+        raise ValueError(
+            "publication authority Blob bytes do not match the immutable reference"
+        )
+    persisted_authority = PublishedContextAuthority.model_validate_json(
+        authority_bytes
+    )
+    if authority_bytes != persisted_authority.canonical_bytes():
+        raise ValueError("publication authority Blob bytes are not canonical")
+    if persisted_authority != authority:
+        raise ValueError(
+            "publication authority does not match immutable published state"
+        )
+    return persisted_authority
+
+
 class MonitoringHandoffVerifier(Protocol):
     def verify(
         self,
@@ -463,20 +502,11 @@ class _CorrelationVerificationService:
             if self.change_verifier.verify(artifact, as_of=evaluated_at) != artifact_digest:
                 raise ValueError("change artifact verification proof is invalid")
 
-        if isinstance(
-            request.context_binding,
-            PublishedRuntimeContextBinding,
-        ):
-            authority = request.context_binding.publication_authority
-            authority_reference = request.context_binding.publication_authority_reference
-            authority_bytes = self.authority_reader.read(authority_reference)
-            if sha256_hex(authority_bytes) != authority_reference.content_digest:
-                raise ValueError(
-                    "publication authority Blob bytes do not match the immutable reference"
-                )
-            persisted_authority = PublishedContextAuthority.model_validate_json(authority_bytes)
-            if persisted_authority != authority:
-                raise ValueError("publication authority does not match immutable published state")
+        if isinstance(request.context_binding, PublishedRuntimeContextBinding):
+            verify_published_context_authority(
+                request.context_binding,
+                authority_reader=self.authority_reader,
+            )
 
         return _compute_hypotheses(
             request,

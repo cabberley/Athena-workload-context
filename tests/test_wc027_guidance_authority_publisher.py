@@ -26,7 +26,9 @@ from test_wc027_incident_enrichment_publication import (
 
 _REQUEST_KEY_ID = "synthetic-key://wc027/guidance-publication-request"
 _BINDING_KEY_ID = "synthetic-key://wc027/guidance-authority-binding"
-_INCIDENT_LOGICAL_KEY_ID = "synthetic-key://wc016/incidents-rs256-v1"
+_INCIDENT_LOGICAL_KEY_ID = (
+    "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
+)
 
 
 def _json_value(value):

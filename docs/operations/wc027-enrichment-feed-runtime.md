@@ -106,6 +106,17 @@ every runtime value from them. Supply `runtimeConfigurationDigest` as the extern
 Record the `deployedRuntimeConfigurationDigest`, `attachedIdentityResourceIds`, and
 `bindingEvidenceDigest` outputs with the Job resource ID for the root readiness gate.
 
+## Guidance publication-request producer
+
+`infra/wc027-guidance-publication-request-producer/main.bicep` deploys the separate production
+request producer documented in
+`docs/operations/wc027-guidance-publication-request-producer.md`. It consumes a canonical signed
+incident-bound request, verifies the current signed occurrence and immutable published-context
+authority, deterministically signs and self-verifies one request, persists occurrence-keyed
+immutable outbox evidence, revalidates authority, and sends the canonical request to the existing
+publisher queue. It does not create or activate guidance authority and it does not trigger this
+enrichment runtime.
+
 ## Guidance-authority publisher
 
 `infra/wc027-guidance-authority-publisher/main.bicep` deploys the separately governed production
@@ -130,15 +141,9 @@ configuration separately carries exact versioned Key Vault URIs. Lifecycle point
 `keyId` checks use the logical lifecycle ID; lifecycle attestation verification uses the physical
 versioned Key Vault URI.
 
-Submit one canonical, already-signed publication request:
-
-```powershell
-athena-context wc027-guidance-authority-submit `
-  --request .\guidance-authority-publication-request.json `
-  --service-bus-namespace <private-namespace>.servicebus.windows.net `
-  --request-queue wc027-guidance-authority-requests `
-  --managed-identity-client-id <authorized-submitter-identity-client-id>
-```
+Production publication requests arrive from the separate request-producer sender identity and
+carry the exact occurrence-keyed outbox reference in their broker metadata. The bounded direct
+submit command remains available for diagnostics but must not receive production sender RBAC.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -162,13 +167,15 @@ rejects duplicate attached identity IDs/client IDs. Its image must be digest-pin
 Keep:
 
 ```text
+wc027RequestProducerReady=false
 wc027PublisherReady=false
 wc027FeedV2ProducerReady=false
 ```
 
 until all of the following are evidenced:
 
-1. the publisher and producer Jobs and their exact generated configurations are deployed;
+1. the request producer, publisher, and enrichment/feed producer Jobs and their exact generated
+   configurations are deployed;
 2. the trigger and notification queues are private and RBAC-only;
 3. every source reader can read only its configured exact container;
 4. each signing identity can use only its dedicated exact key;
@@ -177,12 +184,18 @@ until all of the following are evidenced:
 7. a stale or non-current binding is rejected by activation verification; and
 8. Notification v2 is observed only after the feed entry is verifiable.
 
-Code delivery does not flip either readiness flag. To assert publisher readiness, supply
+Code delivery does not flip any readiness flag. Assert request-producer readiness with the exact
+Job ID, configuration JSON/digest, digest-pinned image, attached identities, and deterministic RBAC
+evidence. Confirm separately that the publisher request queue grants sender access only to the
+request-producer sender identity. To assert publisher readiness, supply
 `wc027PublisherJobResourceId`, `wc027PublisherConfigurationDigest`, and
 `wc027PublisherConfigurationJson`, and `wc027PublisherImage` from the deployed publisher module.
 The root template reads the existing Job and fails closed unless the exact digest-pinned image,
 command/arguments, scaler and registry identity, configuration value and digest tag, embedded
 producer-runtime digest, attached identities, and deterministic RBAC binding evidence match.
+When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
+equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
+`wc027PublisherReady=true`.
 
 To assert producer readiness, supply
 `wc027EnrichmentFeedProducerJobResourceId` with the exact deployed `Microsoft.App/jobs` resource
@@ -196,6 +209,11 @@ match, the publisher is ready, and the WC-016 runtime is enabled.
 
 ## Failure and retry
 
+- Request-producer invalid canonical/signature/key/draft/stale inputs: dead-letter with zero output
+  writes.
+- Request-producer immutable occurrence-slot conflict: dead-letter; never overwrite or delete.
+- Request-producer current authority or transport uncertainty: abandon and recover the same
+  occurrence-keyed request.
 - Transient absence of current occurrence/active-index authority: abandon and retry.
 - Noncanonical, expired, signature-invalid, occurrence-mismatched, or replay-conflicting
   publication request: dead-letter as `AthenaWc027GuidanceAuthorityRejected` without publishing.

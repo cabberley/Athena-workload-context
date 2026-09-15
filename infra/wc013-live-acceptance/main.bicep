@@ -262,6 +262,21 @@ param wc027EnrichmentFeedProducerConfigurationDigest string = ''
 @description('Exact non-secret runtime configuration JSON deployed to the WC-027 producer Job.')
 param wc027EnrichmentFeedProducerConfigurationJson string = ''
 
+@description('Explicit confirmation that the separate WC-027 guidance publication-request producer is deployed and ready. False by default keeps the complete production chain fail-closed.')
+param wc027RequestProducerReady bool = false
+
+@description('Exact deployed WC-027 guidance publication-request producer Job resource ID.')
+param wc027RequestProducerJobResourceId string = ''
+
+@description('SHA-256 digest of the exact deployed guidance publication-request producer configuration.')
+param wc027RequestProducerConfigurationDigest string = ''
+
+@description('Exact non-secret configuration JSON deployed to the guidance publication-request producer Job.')
+param wc027RequestProducerConfigurationJson string = ''
+
+@description('Exact digest-pinned image deployed to the guidance publication-request producer Job.')
+param wc027RequestProducerImage string = ''
+
 @description('Explicit confirmation that the separately governed PublishedGuidanceAuthorityBinding.v2 publisher is deployed and ready. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
 param wc027PublisherReady bool = false
 
@@ -317,6 +332,135 @@ var validatedWc016RuntimeEnabled = wc016RuntimeEnabled && !wc016LegacyCleanupCon
   : wc016RuntimeEnabled && signingKeyFingerprint == rejectedIncidentFixtureFingerprint
     ? fail('WC-016 cannot be activated with the checked-in incident trust fixture; pin the deployed key first')
     : wc016RuntimeEnabled
+var wc027RequestProducerJobResourceIdRawSegments = split(
+  wc027RequestProducerJobResourceId,
+  '/'
+)
+var wc027RequestProducerJobResourceIdSegments = concat(
+  wc027RequestProducerJobResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027RequestProducerJobResourceIdValid = length(wc027RequestProducerJobResourceIdRawSegments) == 9 && wc027RequestProducerJobResourceIdSegments[1] == 'subscriptions' && wc027RequestProducerJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027RequestProducerJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027RequestProducerJobResourceIdSegments[7]) == 'jobs' && !empty(wc027RequestProducerJobResourceIdSegments[8])
+var wc027RequestProducerConfigurationDigestHex = replace(
+  wc027RequestProducerConfigurationDigest,
+  'sha256:',
+  ''
+)
+var wc027RequestProducerConfigurationDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerConfigurationDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027RequestProducerConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerConfigurationDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027RequestProducerConfigurationDigestValid = length(wc027RequestProducerConfigurationDigest) == 71 && wc027RequestProducerConfigurationDigest == toLower(
+  wc027RequestProducerConfigurationDigest
+) && empty(wc027RequestProducerConfigurationDigestInvalidCharacters)
+var wc027RequestProducerImageDigest = contains(wc027RequestProducerImage, '@sha256:')
+  ? last(split(wc027RequestProducerImage, '@sha256:'))
+  : ''
+var wc027RequestProducerImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerImageDigest,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027RequestProducerImageInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027RequestProducerImageValid = wc027RequestProducerImage == toLower(wc027RequestProducerImage) && length(wc027RequestProducerImageDigest) == 64 && empty(wc027RequestProducerImageInvalidCharacters) && wc027RequestProducerImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
+var wc027ParsedRequestProducerConfiguration = json(
+  empty(wc027RequestProducerConfigurationJson)
+    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
+    : wc027RequestProducerConfigurationJson
+)
+var wc027RequestProducerImageRegistryServer = first(split(wc027RequestProducerImage, '/'))
+var wc027RequestProducerExpectedIdentityResourceIds = map(
+  wc027ParsedRequestProducerConfiguration.deploymentBinding.attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var wc027RequestProducerRbacResourceIds = wc027ParsedRequestProducerConfiguration.deploymentBinding.rbacResourceIds
+var wc027RequestProducerRbacEvidenceMatches = !empty(wc027RequestProducerRbacResourceIds) && guid(
+  join(wc027RequestProducerRbacResourceIds, '|')
+) == wc027ParsedRequestProducerConfiguration.deploymentBinding.bindingEvidenceId
+var wc027RequestProducerAttachedIdentityResourceIds = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? map(items(wc027RequestProducerJob!.identity.userAssignedIdentities), identity => toLower(identity.key))
+  : []
+var wc027RequestProducerIdentitiesMatch = !empty(wc027RequestProducerExpectedIdentityResourceIds) && length(
+  wc027RequestProducerAttachedIdentityResourceIds
+) == length(wc027RequestProducerExpectedIdentityResourceIds) && length(union(
+  wc027RequestProducerAttachedIdentityResourceIds,
+  wc027RequestProducerExpectedIdentityResourceIds
+)) == length(wc027RequestProducerExpectedIdentityResourceIds)
+var validatedWc027RequestProducerReady = wc027RequestProducerReady && !wc027RequestProducerJobResourceIdValid
+  ? fail('wc027RequestProducerJobResourceId must identify one Microsoft.App/jobs resource')
+  : wc027RequestProducerReady && !wc027RequestProducerConfigurationDigestValid
+    ? fail('WC-027 request producer requires the exact deployed configuration digest')
+    : wc027RequestProducerReady && empty(wc027RequestProducerConfigurationJson)
+      ? fail('WC-027 request producer requires the exact deployed configuration JSON')
+      : wc027RequestProducerReady && !wc027RequestProducerImageValid
+        ? fail('WC-027 request producer requires the exact digest-pinned deployed image')
+        : wc027RequestProducerReady && wc027RequestProducerJob!.properties.template.containers[0].image != wc027RequestProducerImage
+          ? fail('WC-027 request producer Job image does not match')
+          : wc027RequestProducerReady && length(wc027RequestProducerJob!.properties.template.containers[0].command) != 1
+            ? fail('WC-027 request producer Job command array does not match')
+            : wc027RequestProducerReady && wc027RequestProducerJob!.properties.template.containers[0].command[0] != 'athena-context'
+              ? fail('WC-027 request producer Job command does not match')
+              : wc027RequestProducerReady && length(wc027RequestProducerJob!.properties.template.containers[0].args) != 1
+                ? fail('WC-027 request producer Job arguments array does not match')
+                : wc027RequestProducerReady && wc027RequestProducerJob!.properties.template.containers[0].args[0] != 'wc027-guidance-publication-request-producer'
+                  ? fail('WC-027 request producer Job arguments do not match')
+                  : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.triggerType != 'Event'
+                    ? fail('WC-027 request producer Job trigger type does not match')
+                    : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions != 1
+                      ? fail('WC-027 request producer Job concurrency does not match')
+                      : wc027RequestProducerReady && length(wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) != 1
+                        ? fail('WC-027 request producer Job scaler rules do not match')
+                        : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].type != 'azure-servicebus'
+                          ? fail('WC-027 request producer Job scaler type does not match')
+                          : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity != wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+                            ? fail('WC-027 request producer Job scaler identity does not match')
+                            : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace != first(split(wc027ParsedRequestProducerConfiguration.serviceBus.namespace, '.'))
+                              ? fail('WC-027 request producer Job scaler namespace does not match')
+                              : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName != wc027ParsedRequestProducerConfiguration.serviceBus.inputQueueName
+                                ? fail('WC-027 request producer Job scaler queue does not match')
+                                : wc027RequestProducerReady && wc027ParsedRequestProducerConfiguration.serviceBus.inputQueueName != 'wc027-guidance-publication-inputs'
+                                  ? fail('WC-027 request producer input queue does not match the production chain')
+                                  : wc027RequestProducerReady && wc027ParsedRequestProducerConfiguration.serviceBus.outputQueueName != 'wc027-guidance-authority-requests'
+                                    ? fail('WC-027 request producer output queue does not match the authority publisher')
+                                    : wc027RequestProducerReady && length(wc027RequestProducerJob!.properties.configuration.registries) != 1
+                                      ? fail('WC-027 request producer Job registry array does not match')
+                                      : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.registries[0].identity != wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+                                        ? fail('WC-027 request producer Job registry identity does not match')
+                                        : wc027RequestProducerReady && wc027RequestProducerJob!.properties.configuration.registries[0].server != wc027RequestProducerImageRegistryServer
+                                          ? fail('WC-027 request producer Job registry server does not match')
+                                          : wc027RequestProducerReady && wc027RequestProducerJob!.tags.runtimeConfigurationDigest != wc027RequestProducerConfigurationDigest
+                                            ? fail('WC-027 request producer Job configuration digest tag does not match')
+                                            : wc027RequestProducerReady && wc027RequestProducerJob!.tags.enrichmentRuntimeConfigurationDigest != wc027EnrichmentFeedProducerConfigurationDigest
+                                              ? fail('WC-027 request producer embedded runtime configuration does not match')
+                                              : wc027RequestProducerReady && wc027RequestProducerJob!.properties.template.containers[0].env[1].name != 'ATHENA_WC027_GUIDANCE_REQUEST_PRODUCER_CONFIG_JSON'
+                                                ? fail('WC-027 request producer Job does not contain the exact configuration')
+                                                : wc027RequestProducerReady && wc027RequestProducerJob!.properties.template.containers[0].env[1].value != wc027RequestProducerConfigurationJson
+                                                  ? fail('WC-027 request producer Job configuration does not match')
+                                                  : wc027RequestProducerReady && !wc027RequestProducerRbacEvidenceMatches
+                                                    ? fail('WC-027 request producer RBAC evidence does not match its deployed configuration')
+                                                    : wc027RequestProducerReady && !wc027RequestProducerIdentitiesMatch
+                                                      ? fail('WC-027 request producer identities do not match its deployed configuration')
+                                                      : wc027RequestProducerReady
 var wc027ProducerJobResourceIdRawSegments = split(
   wc027EnrichmentFeedProducerJobResourceId,
   '/'
@@ -392,10 +536,20 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
     ? fail('WC-027 publisher requires the exact deployed configuration digest')
     : wc027PublisherReady && empty(wc027PublisherConfigurationJson)
       ? fail('WC-027 publisher requires the exact deployed configuration JSON')
-      : wc027PublisherReady && !wc027PublisherImageValid
-        ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
-        : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].image != wc027PublisherImage
-          ? fail('WC-027 publisher Job image does not match')
+      : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.namespace != wc027ParsedRequestProducerConfiguration.serviceBus.namespace
+          ? fail('WC-027 publisher namespace does not match the request producer')
+          : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.requestQueueName != wc027ParsedRequestProducerConfiguration.serviceBus.outputQueueName
+            ? fail('WC-027 publisher request queue does not match the request producer output queue')
+            : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyId
+              ? fail('WC-027 publisher request logical key does not match the request producer')
+              : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyVaultKeyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyVaultKeyId
+                ? fail('WC-027 publisher request key version does not match the request producer')
+                : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyFingerprint != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyFingerprint
+                  ? fail('WC-027 publisher request key fingerprint does not match the request producer')
+                  : wc027PublisherReady && !wc027PublisherImageValid
+                    ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
+                    : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].image != wc027PublisherImage
+                      ? fail('WC-027 publisher Job image does not match')
           : wc027PublisherReady && length(wc027PublisherJob!.properties.template.containers[0].command) != 1
             ? fail('WC-027 publisher Job command array does not match')
           : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].command[0] != 'athena-context'
@@ -541,9 +695,11 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
             ? fail('WC-027 producer Job does not contain the exact activation configuration')
             : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
               ? fail('WC-027 producer Job configuration does not match the activation input')
-              : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
-                ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
-                : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
+              : wc027FeedV2ProducerReady && !validatedWc027RequestProducerReady
+                ? fail('WC-027 Notification v2 requires an explicitly ready guidance publication-request producer (wc027RequestProducerReady)')
+                : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
+                  ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
+                  : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
                   ? fail('WC-027 Notification v2 requires deployment-derived RBAC binding evidence')
                   : wc027FeedV2ProducerReady && !wc027RbacEvidenceMatchesConfiguration
                     ? fail('WC-027 runtime configuration RBAC resources do not match its binding evidence')
@@ -725,6 +881,14 @@ resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027Fe
   scope: resourceGroup(
     wc027ProducerJobResourceIdSegments[2],
     wc027ProducerJobResourceIdSegments[4]
+  )
+}
+
+resource wc027RequestProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid) {
+  name: wc027RequestProducerJobResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027RequestProducerJobResourceIdSegments[2],
+    wc027RequestProducerJobResourceIdSegments[4]
   )
 }
 
