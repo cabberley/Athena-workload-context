@@ -5,13 +5,25 @@ PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 ROOT_DEPLOYMENT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 BLOB_CREATOR = (
-    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "blob-create-rbac.bicep"
+    ROOT
+    / "infra"
+    / "wc027-guidance-authority-publisher"
+    / "modules"
+    / "blob-create-rbac.bicep"
 )
 TABLE_CAS = (
-    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "table-cas-rbac.bicep"
+    ROOT
+    / "infra"
+    / "wc027-guidance-authority-publisher"
+    / "modules"
+    / "table-cas-rbac.bicep"
 )
 KEY_SIGNER = (
-    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "key-signer-rbac.bicep"
+    ROOT
+    / "infra"
+    / "wc027-guidance-authority-publisher"
+    / "modules"
+    / "key-signer-rbac.bicep"
 )
 
 
@@ -98,7 +110,10 @@ def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:
     table = TABLE_CAS.read_text(encoding="utf-8")
     signer = KEY_SIGNER.read_text(encoding="utf-8")
 
-    assert "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action" in blob
+    assert (
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+        in blob
+    )
     for forbidden in (
         "blobs/read",
         "blobs/write",
