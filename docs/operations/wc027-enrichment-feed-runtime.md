@@ -270,9 +270,14 @@ rejected. The publisher must be ready and the WC-016 runtime must be enabled.
   suppresses a prior successful enqueue.
 - Publisher deployment recovery, publisher retry, and later producer upgrades may encounter the
   already-created publisher sender assignment on `wc027-enrichment-feed-requests`. Producer
-  verification accepts only the deterministic exact assignment ID and revalidates its broker
-  principal, queue scope, Service Bus Data Sender role, principal type, and absent condition.
-  Fresh deployment requires no such assignment, and no broad publisher RBAC exemption is allowed.
+  verification enumerates the complete direct assignment set at that queue. It accepts only current
+  producer assignments, the deterministic current publisher assignment, and up to four exact
+  retired queue-assignment IDs explicitly approved in the reviewed plan. Fresh deployment requires no
+  publisher assignment. Planning proves each approved retired assignment is present and exact;
+  controlled operator revocation must then remove it before `apply` reruns the final what-if or
+  performs any deployment. Post-deployment readiness checks the queue again before emitting a
+  handoff. The orchestrator performs no automatic RBAC deletion and allows no broad publisher
+  exemption.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.

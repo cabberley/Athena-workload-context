@@ -48,6 +48,7 @@ ARM_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 GRAPH_HOST = "graph.microsoft.com"
 MAX_TRANSITIVE_GROUPS = 10_000
 MAX_GRAPH_MEMBERSHIP_PAGES = 128
+MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
 PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v2"
 HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v2"
@@ -157,6 +158,7 @@ PUBLISHER_INVOCATION_BOUNDARY = {
     "requiredRequestSchemaVersion": ("athena.wc027GuidanceAuthorityPublicationRequest.v1"),
 }
 SERVICE_BUS_NON_AUTO_DELETE_DURATION = "P10675199DT2H48M5.4775807S"
+PRODUCER_TRIGGER_QUEUE_NAME = "wc027-enrichment-feed-requests"
 PRODUCER_TRIGGER_QUEUE_PROFILE = {
     "status": "Active",
     "autoDeleteOnIdle": SERVICE_BUS_NON_AUTO_DELETE_DURATION,
@@ -2557,6 +2559,19 @@ def _arm_guid(*values: str) -> str:
     return str(uuid5(ARM_GUID_NAMESPACE, "-".join(values)))
 
 
+def _deterministic_role_assignment_id(
+    scope: str,
+    identity_resource_id: str,
+    role_id: str,
+) -> str:
+    assignment_name = _arm_guid(
+        scope,
+        identity_resource_id,
+        role_id,
+    )
+    return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+
+
 def _built_in_role_definition_id(subscription_id: str, role_id: str) -> str:
     return (
         f"/subscriptions/{subscription_id}/providers/"
@@ -3129,13 +3144,10 @@ def _prospective_publisher_sender_assignment(
         outputs.get("triggerQueueResourceId"),
         field="producer trigger queue resource ID",
     )
-    assignment_name = _arm_guid(
+    assignment_id = _deterministic_role_assignment_id(
         trigger_queue_id,
         broker_identity_id,
         SERVICE_BUS_DATA_SENDER_ROLE_ID,
-    )
-    assignment_id = (
-        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
     )
     return {
         assignment_id.casefold(): _expected_role_assignment(
@@ -3149,6 +3161,120 @@ def _prospective_publisher_sender_assignment(
             ),
         )
     }
+
+
+def _planned_trigger_queue_assignments(
+    *,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    resource_group: str,
+    subscription_id: str,
+) -> dict[str, _ExpectedRoleAssignment]:
+    namespace_name = _string(
+        _parameter_value(effective_parameters, "serviceBusNamespaceName"),
+        field="planned producer Service Bus namespace",
+    )
+    trigger_queue_scope = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}/"
+        "providers/Microsoft.ServiceBus/namespaces/"
+        f"{namespace_name}/queues/{PRODUCER_TRIGGER_QUEUE_NAME}"
+    )
+    broker_identity_id = _azure_resource_id(
+        _parameter_value(effective_parameters, "brokerIdentityResourceId"),
+        field="planned producer broker identity",
+    )
+    submitter_identity_ids = _string_list(
+        _parameter_value(
+            effective_parameters,
+            "triggerSubmitterIdentityResourceIds",
+        ),
+        field="planned producer trigger submitter identities",
+    )
+    identity_ids = list(
+        {
+            broker_identity_id.casefold(): broker_identity_id,
+            **{
+                identity_resource_id.casefold(): identity_resource_id
+                for identity_resource_id in submitter_identity_ids
+            },
+        }.values()
+    )
+    principal_ids_by_identity = _verify_identities(
+        {},
+        additional_identity_resource_ids=identity_ids,
+        rbac_identity_resource_ids=identity_ids,
+        subscription_id=subscription_id,
+    )
+    receiver_role_definition_id = _built_in_role_definition_id(
+        subscription_id,
+        SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+    )
+    sender_role_definition_id = _built_in_role_definition_id(
+        subscription_id,
+        SERVICE_BUS_DATA_SENDER_ROLE_ID,
+    )
+    expected: dict[str, _ExpectedRoleAssignment] = {}
+
+    def add_assignment(
+        label: str,
+        *,
+        identity_resource_id: str,
+        role_id: str,
+        role_definition_id: str,
+    ) -> None:
+        assignment_id = _deterministic_role_assignment_id(
+            trigger_queue_scope,
+            identity_resource_id,
+            role_id,
+        )
+        expected[assignment_id.casefold()] = _expected_role_assignment(
+            label,
+            identity_resource_id=identity_resource_id,
+            principal_ids_by_identity=principal_ids_by_identity,
+            scope=trigger_queue_scope,
+            role_definition_id=role_definition_id,
+        )
+
+    add_assignment(
+        "planned producer trigger receiver",
+        identity_resource_id=broker_identity_id,
+        role_id=SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+        role_definition_id=receiver_role_definition_id,
+    )
+    add_assignment(
+        "planned prospective publisher trigger sender",
+        identity_resource_id=broker_identity_id,
+        role_id=SERVICE_BUS_DATA_SENDER_ROLE_ID,
+        role_definition_id=sender_role_definition_id,
+    )
+    for index, identity_resource_id in enumerate(submitter_identity_ids):
+        add_assignment(
+            f"planned producer trigger submitter {index}",
+            identity_resource_id=identity_resource_id,
+            role_id=SERVICE_BUS_DATA_SENDER_ROLE_ID,
+            role_definition_id=sender_role_definition_id,
+        )
+    return expected
+
+
+def _verify_planned_trigger_queue_transition_state(
+    *,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    resource_group: str,
+    approved_transition_assignment_ids: set[str],
+    transition_state: str,
+    subscription_id: str,
+) -> None:
+    _verify_complete_trigger_queue_assignment_set(
+        current_expected_assignments=_planned_trigger_queue_assignments(
+            effective_parameters=effective_parameters,
+            resource_group=resource_group,
+            subscription_id=subscription_id,
+        ),
+        required_current_assignment_ids=set(),
+        approved_transition_assignment_ids=approved_transition_assignment_ids,
+        transition_state=transition_state,
+        subscription_id=subscription_id,
+    )
 
 
 def _publisher_expected_rbac_assignments(
@@ -3569,18 +3695,58 @@ def _verify_rbac_resources(
     return assignment_ids_by_principal
 
 
-def _verify_present_expected_assignments(
-    expected_assignments: Mapping[str, _ExpectedRoleAssignment],
+def _verify_complete_trigger_queue_assignment_set(
     *,
+    current_expected_assignments: Mapping[str, _ExpectedRoleAssignment],
+    required_current_assignment_ids: set[str],
+    approved_transition_assignment_ids: set[str],
+    transition_state: str,
     subscription_id: str,
 ) -> dict[str, set[str]]:
-    verified: dict[str, set[str]] = {}
-    assignments_by_scope: dict[str, set[str]] = {}
-    for assignment_id, expected in expected_assignments.items():
-        normalized_scope = expected.scope.casefold()
-        scoped_assignment_ids = assignments_by_scope.get(normalized_scope)
-        if scoped_assignment_ids is None:
-            scoped_assignments = _run_json(
+    if transition_state not in {"present", "absent"}:
+        raise OrchestrationError("trigger-queue transition state is invalid")
+    if not current_expected_assignments:
+        raise OrchestrationError("trigger-queue verification requires current expected assignments")
+    trigger_queue_scopes = {
+        expected.scope.casefold() for expected in current_expected_assignments.values()
+    }
+    if len(trigger_queue_scopes) != 1:
+        raise OrchestrationError("trigger-queue expectations do not share one exact queue scope")
+    trigger_queue_scope = next(iter(current_expected_assignments.values())).scope
+    normalized_required_ids = {
+        assignment_id.casefold() for assignment_id in required_current_assignment_ids
+    }
+    if not normalized_required_ids.issubset(current_expected_assignments):
+        raise OrchestrationError(
+            "required trigger-queue assignments are outside the current expected set"
+        )
+    current_principal_ids = {
+        expected.principal_id.casefold() for expected in current_expected_assignments.values()
+    }
+    transition_assignment_ids: set[str] = set()
+    for resource_id in approved_transition_assignment_ids:
+        normalized_resource_id = _canonical_subscription_resource_id(
+            resource_id,
+            subscription_id=subscription_id,
+            field="approved trigger-queue transition assignment",
+        )
+        if (
+            "/providers/microsoft.authorization/roleassignments/"
+            not in normalized_resource_id.casefold()
+            or _role_assignment_scope(normalized_resource_id).casefold()
+            != trigger_queue_scope.casefold()
+        ):
+            continue
+        transition_assignment_ids.add(normalized_resource_id.casefold())
+    transition_assignment_ids.difference_update(current_expected_assignments)
+    if len(transition_assignment_ids) > MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS:
+        raise OrchestrationError(
+            "approved trigger-queue transition assignments exceed the bounded maximum"
+        )
+
+    scoped_assignments = _merge_effective_role_assignment_documents(
+        [
+            _run_json(
                 [
                     "az",
                     "role",
@@ -3589,35 +3755,161 @@ def _verify_present_expected_assignments(
                     "--subscription",
                     subscription_id,
                     "--scope",
-                    expected.scope,
+                    trigger_queue_scope,
                     "--only-show-errors",
                     "--output",
                     "json",
                 ],
-                field=f"role assignments at prospective scope {expected.scope}",
+                field=f"complete role assignments at {trigger_queue_scope}",
             )
-            scoped_assignment_ids = {
-                _string(
-                    assignment.get("id"),
-                    field="prospective scope role assignment ID",
-                ).casefold()
-                for assignment in _merge_effective_role_assignment_documents(
-                    [scoped_assignments],
-                    field="prospective scope role assignments",
-                )
-            }
-            assignments_by_scope[normalized_scope] = scoped_assignment_ids
-        if assignment_id not in scoped_assignment_ids:
-            continue
-        assignment_binding = {"rbacResourceIds": [assignment_id]}
-        assignment_verified = _verify_rbac_resources(
-            assignment_binding,
-            expected_assignments={assignment_id: expected},
+        ],
+        field="complete trigger-queue role assignments",
+    )
+    observed_assignment_ids = {
+        _string(
+            assignment.get("id"),
+            field="trigger-queue role assignment ID",
+        ).casefold()
+        for assignment in scoped_assignments
+    }
+    allowed_assignment_ids = {
+        *current_expected_assignments,
+        *transition_assignment_ids,
+    }
+    if observed_assignment_ids - allowed_assignment_ids:
+        raise OrchestrationError("trigger queue contains an unreviewed or obsolete role assignment")
+    if normalized_required_ids - observed_assignment_ids:
+        raise OrchestrationError(
+            "trigger-queue assignment evidence is incomplete for the current binding"
+        )
+
+    observed_current_expectations = {
+        assignment_id: current_expected_assignments[assignment_id]
+        for assignment_id in observed_assignment_ids & set(current_expected_assignments)
+    }
+    verified_current_assignments = (
+        {}
+        if not observed_current_expectations
+        else _verify_rbac_resources(
+            {"rbacResourceIds": sorted(observed_current_expectations)},
+            expected_assignments=observed_current_expectations,
             subscription_id=subscription_id,
         )
-        for principal_id, assignment_ids in assignment_verified.items():
-            verified.setdefault(principal_id, set()).update(assignment_ids)
-    return verified
+    )
+
+    observed_transition_ids = transition_assignment_ids & observed_assignment_ids
+    allowed_transition_role_definition_ids = {
+        _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
+        ).casefold(),
+        _built_in_role_definition_id(
+            subscription_id,
+            SERVICE_BUS_DATA_SENDER_ROLE_ID,
+        ).casefold(),
+    }
+    for assignment_id in sorted(observed_transition_ids):
+        resource = _get_resource(
+            assignment_id,
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            resource.get("id"),
+            assignment_id,
+            field="approved trigger-queue transition assignment readback",
+        )
+        properties = _mapping(
+            resource.get("properties"),
+            field="approved trigger-queue transition assignment properties",
+        )
+        principal_id = _canonical_directory_object_id(
+            properties.get("principalId"),
+            field="retired trigger-queue principal ID",
+        )
+        if principal_id in current_principal_ids:
+            raise OrchestrationError(
+                "approved trigger-queue transition assignment is not bound to a retired principal"
+            )
+        if properties.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                "approved trigger-queue transition principal type must be ServicePrincipal"
+            )
+        transition_role_definition_id = _canonical_subscription_resource_id(
+            properties.get("roleDefinitionId"),
+            subscription_id=subscription_id,
+            field="approved trigger-queue transition role definition",
+        )
+        if transition_role_definition_id.casefold() not in allowed_transition_role_definition_ids:
+            raise OrchestrationError(
+                "approved trigger-queue transition role must be Service Bus "
+                "Data Receiver or Data Sender"
+            )
+        _require_resource_id_equal(
+            _role_assignment_scope(assignment_id),
+            trigger_queue_scope,
+            field="approved trigger-queue transition scope",
+        )
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                trigger_queue_scope,
+                field="approved trigger-queue transition scope property",
+            )
+        if (
+            properties.get("conditionVersion") is not None
+            or properties.get("condition") is not None
+        ):
+            raise OrchestrationError(
+                "approved trigger-queue transition assignment must have no condition"
+            )
+    if transition_state == "present" and (transition_assignment_ids - observed_assignment_ids):
+        raise OrchestrationError("approved trigger-queue transition evidence is incomplete")
+    if observed_transition_ids and transition_state == "absent":
+        raise OrchestrationError(
+            "retired trigger-queue assignments require controlled revocation before readiness"
+        )
+    return verified_current_assignments
+
+
+def _verify_trigger_queue_assignment_set(
+    *,
+    producer_expected_assignments: Mapping[str, _ExpectedRoleAssignment],
+    prospective_publisher_assignments: Mapping[str, _ExpectedRoleAssignment],
+    approved_transition_assignment_ids: set[str],
+    require_transition_revoked: bool,
+    subscription_id: str,
+) -> dict[str, set[str]]:
+    if len(prospective_publisher_assignments) != 1:
+        raise OrchestrationError(
+            "producer verification requires one exact prospective publisher assignment"
+        )
+    prospective_id, prospective_expected = next(iter(prospective_publisher_assignments.items()))
+    trigger_queue_scope = prospective_expected.scope
+    producer_queue_expectations = {
+        assignment_id: expected
+        for assignment_id, expected in producer_expected_assignments.items()
+        if expected.scope.casefold() == trigger_queue_scope.casefold()
+    }
+    if not producer_queue_expectations:
+        raise OrchestrationError("producer binding contains no exact trigger-queue assignments")
+    current_expectations = {
+        **producer_queue_expectations,
+        **prospective_publisher_assignments,
+    }
+    verified_current_assignments = _verify_complete_trigger_queue_assignment_set(
+        current_expected_assignments=current_expectations,
+        required_current_assignment_ids=set(producer_queue_expectations),
+        approved_transition_assignment_ids=approved_transition_assignment_ids,
+        transition_state=("absent" if require_transition_revoked else "present"),
+        subscription_id=subscription_id,
+    )
+    prospective_assignment_ids = verified_current_assignments.get(
+        prospective_expected.principal_id.casefold(),
+        set(),
+    )
+    if prospective_id not in prospective_assignment_ids:
+        return {}
+    return {prospective_expected.principal_id.casefold(): {prospective_id.casefold()}}
 
 
 def _canonical_directory_object_id(value: object, *, field: str) -> str:
@@ -3995,6 +4287,29 @@ def _verify_exact_effective_assignments(
             raise OrchestrationError(
                 "effective role assignment evidence is incomplete for a governed principal"
             )
+
+
+def _verify_publisher_effective_assignments(
+    *,
+    publisher_principal_ids: set[str],
+    publisher_assignment_ids_by_principal: Mapping[str, set[str]],
+    producer_assignment_ids_by_principal: Mapping[str, set[str]],
+    subscription_id: str,
+) -> None:
+    required_principal_ids = {
+        *(principal_id.casefold() for principal_id in publisher_principal_ids),
+        *(principal_id.casefold() for principal_id in producer_assignment_ids_by_principal),
+    }
+    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
+        required_principal_ids,
+        subscription_id=subscription_id,
+    )
+    _verify_exact_effective_assignments(
+        publisher_assignment_ids_by_principal,
+        additional_allowed_assignments_by_principal=(producer_assignment_ids_by_principal),
+        subscription_id=subscription_id,
+        effective_assignments_by_principal=effective_assignments_by_principal,
+    )
 
 
 def _verify_job_deployment_binding(
@@ -4528,6 +4843,8 @@ def _verify_producer_resources(
     foundation: Mapping[str, object],
     effective_parameters: Mapping[str, Mapping[str, object]],
     subscription_id: str,
+    approved_transition_assignment_ids: set[str] | frozenset[str] = frozenset(),
+    require_transition_revoked: bool = True,
 ) -> dict[str, set[str]]:
     foundation_values = _foundation_outputs(foundation)
     validated_outputs = _producer_outputs({"outputs": dict(outputs)})
@@ -4647,18 +4964,21 @@ def _verify_producer_resources(
         expected_assignments=expected_assignments,
         subscription_id=subscription_id,
     )
-    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
-        allowed_principal_ids,
-        subscription_id=subscription_id,
-    )
     prospective_publisher_sender = _prospective_publisher_sender_assignment(
         configuration=configuration,
         outputs=validated_outputs,
         principal_ids_by_identity=identity_principal_ids,
         subscription_id=subscription_id,
     )
-    prospective_assignment_ids_by_principal = _verify_present_expected_assignments(
-        prospective_publisher_sender,
+    prospective_assignment_ids_by_principal = _verify_trigger_queue_assignment_set(
+        producer_expected_assignments=expected_assignments,
+        prospective_publisher_assignments=prospective_publisher_sender,
+        approved_transition_assignment_ids=set(approved_transition_assignment_ids),
+        require_transition_revoked=require_transition_revoked,
+        subscription_id=subscription_id,
+    )
+    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
+        allowed_principal_ids,
         subscription_id=subscription_id,
     )
     _verify_exact_effective_assignments(
@@ -4980,15 +5300,11 @@ def _verify_publisher_resources(
         expected_assignments=expected_assignments,
         subscription_id=subscription_id,
     )
-    effective_assignments_by_principal = _verify_no_broad_effective_assignments(
-        allowed_principal_ids,
+    _verify_publisher_effective_assignments(
+        publisher_principal_ids=allowed_principal_ids,
+        publisher_assignment_ids_by_principal=assignment_ids_by_principal,
+        producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
         subscription_id=subscription_id,
-    )
-    _verify_exact_effective_assignments(
-        assignment_ids_by_principal,
-        additional_allowed_assignments_by_principal=(producer_assignment_ids_by_principal),
-        subscription_id=subscription_id,
-        effective_assignments_by_principal=effective_assignments_by_principal,
     )
     _verify_service_bus_queue(
         job_resource_id=publisher_job_id,
@@ -5512,6 +5828,16 @@ def plan(args: argparse.Namespace) -> Path:
             foundation,
             subscription_id=subscription_id,
         )
+        _verify_planned_trigger_queue_transition_state(
+            effective_parameters=effective,
+            resource_group=_string(
+                args.resource_group,
+                field="producer resource group",
+            ),
+            approved_transition_assignment_ids=set(allowed_changes),
+            transition_state="present",
+            subscription_id=subscription_id,
+        )
     elif args.stage == "publisher":
         foundation = _mapping(
             verified_predecessors["foundation"]["handoff"],
@@ -5539,6 +5865,8 @@ def plan(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
+            approved_transition_assignment_ids=set(allowed_changes),
+            require_transition_revoked=False,
         )
         _verify_publisher_binding_key_head(
             effective,
@@ -5844,6 +6172,16 @@ def apply(args: argparse.Namespace) -> Path:
             foundation,
             subscription_id=subscription_id,
         )
+        _verify_planned_trigger_queue_transition_state(
+            effective_parameters=effective_parameters,
+            resource_group=_string(
+                resource_group,
+                field="producer resource group",
+            ),
+            approved_transition_assignment_ids=set(allowed_change_ids),
+            transition_state="absent",
+            subscription_id=subscription_id,
+        )
     elif stage == "publisher":
         if foundation is None or producer is None:
             raise OrchestrationError("publisher plan lost required handoffs")
@@ -5865,6 +6203,8 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
+            approved_transition_assignment_ids=set(allowed_change_ids),
+            require_transition_revoked=True,
         )
         _verify_publisher_binding_key_head(
             effective_parameters,
@@ -5956,6 +6296,8 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=effective_parameters,
             subscription_id=subscription_id,
+            approved_transition_assignment_ids=set(allowed_change_ids),
+            require_transition_revoked=True,
         )
     elif stage == "live-acceptance":
         if foundation is None or producer is None or publisher is None:
@@ -5974,6 +6316,8 @@ def apply(args: argparse.Namespace) -> Path:
             foundation=foundation,
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
+            approved_transition_assignment_ids=set(allowed_change_ids),
+            require_transition_revoked=True,
         )
         _verify_publisher_resources(
             outputs,

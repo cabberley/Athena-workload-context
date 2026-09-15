@@ -2094,13 +2094,33 @@ def test_prospective_publisher_sender_transition_is_exact(
     if publisher_assignment_present:
         effective_assignments.append({"id": prospective_id, "scope": trigger_queue_id})
     evidence = {principal_id: effective_assignments}
+    producer_expected = {
+        own_assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label="producer trigger receiver",
+            principal_id=principal_id,
+            scope=trigger_queue_id,
+            role_definition_id=(
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+        )
+    }
 
     def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
-        assert transition_path in {
-            "partial-recovery",
-            "producer-upgrade",
-            "publisher-retry",
-        }
+        if resource_id == own_assignment_id.casefold():
+            return {
+                "id": own_assignment_id,
+                "properties": {
+                    "principalId": principal_id,
+                    "principalType": "ServicePrincipal",
+                    "roleDefinitionId": producer_expected[
+                        own_assignment_id.casefold()
+                    ].role_definition_id,
+                    "scope": trigger_queue_id,
+                },
+            }
+        assert transition_path != "fresh-deploy"
         assert resource_id == prospective_id
         return {
             "id": prospective_id,
@@ -2116,14 +2136,13 @@ def test_prospective_publisher_sender_transition_is_exact(
     monkeypatch.setattr(
         orchestration,
         "_run_json",
-        lambda command, *, field: (
-            [{"id": prospective_id, "scope": trigger_queue_id}]
-            if publisher_assignment_present
-            else []
-        ),
+        lambda command, *, field: effective_assignments,
     )
-    additional = orchestration._verify_present_expected_assignments(
-        prospective,
+    additional = orchestration._verify_trigger_queue_assignment_set(
+        producer_expected_assignments=producer_expected,
+        prospective_publisher_assignments=prospective,
+        approved_transition_assignment_ids=set(),
+        require_transition_revoked=True,
         subscription_id=SUBSCRIPTION_ID,
     )
     assert bool(additional) is publisher_assignment_present
@@ -2162,12 +2181,22 @@ def test_prospective_publisher_sender_rejects_nondeterministic_assignment_id(
         principal_ids_by_identity={broker_identity_id.casefold(): principal_id},
         subscription_id=SUBSCRIPTION_ID,
     )
-    evidence = {
-        principal_id: [
-            {"id": own_assignment_id, "scope": trigger_queue_id},
-            {"id": decoy_assignment_id, "scope": trigger_queue_id},
-        ]
+    producer_expected = {
+        own_assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label="producer trigger receiver",
+            principal_id=principal_id,
+            scope=trigger_queue_id,
+            role_definition_id=(
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+        )
     }
+    scope_assignments = [
+        {"id": own_assignment_id, "scope": trigger_queue_id},
+        {"id": decoy_assignment_id, "scope": trigger_queue_id},
+    ]
     monkeypatch.setattr(
         orchestration,
         "_get_resource",
@@ -2178,23 +2207,19 @@ def test_prospective_publisher_sender_rejects_nondeterministic_assignment_id(
     monkeypatch.setattr(
         orchestration,
         "_run_json",
-        lambda command, *, field: [{"id": decoy_assignment_id, "scope": trigger_queue_id}],
+        lambda command, *, field: scope_assignments,
     )
 
-    additional = orchestration._verify_present_expected_assignments(
-        prospective,
-        subscription_id=SUBSCRIPTION_ID,
-    )
-    assert additional == {}
     with pytest.raises(
         orchestration.OrchestrationError,
-        match="unreviewed effective role assignment",
+        match="unreviewed or obsolete role assignment",
     ):
-        orchestration._verify_exact_effective_assignments(
-            {principal_id: {own_assignment_id.casefold()}},
-            additional_allowed_assignments_by_principal=additional,
+        orchestration._verify_trigger_queue_assignment_set(
+            producer_expected_assignments=producer_expected,
+            prospective_publisher_assignments=prospective,
+            approved_transition_assignment_ids=set(),
+            require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
-            effective_assignments_by_principal=evidence,
         )
 
 
@@ -2212,6 +2237,22 @@ def test_prospective_publisher_sender_rejects_wrong_existing_principal(
         "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
         "wc027-enrichment-feed-requests"
     )
+    own_assignment_id = (
+        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/"
+        "93939393-3333-4333-8333-333333333333"
+    )
+    producer_expected = {
+        own_assignment_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label="producer trigger receiver",
+            principal_id=expected_principal_id,
+            scope=trigger_queue_id,
+            role_definition_id=(
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+        )
+    }
     prospective = orchestration._prospective_publisher_sender_assignment(
         configuration={"serviceBus": {"brokerIdentityResourceId": broker_identity_id}},
         outputs={"triggerQueueResourceId": trigger_queue_id},
@@ -2222,12 +2263,26 @@ def test_prospective_publisher_sender_rejects_wrong_existing_principal(
     monkeypatch.setattr(
         orchestration,
         "_run_json",
-        lambda command, *, field: [{"id": prospective_id, "scope": trigger_queue_id}],
+        lambda command, *, field: [
+            {"id": own_assignment_id, "scope": trigger_queue_id},
+            {"id": prospective_id, "scope": trigger_queue_id},
+        ],
     )
-    monkeypatch.setattr(
-        orchestration,
-        "_get_resource",
-        lambda resource_id, *, subscription_id: {
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        if resource_id == own_assignment_id.casefold():
+            return {
+                "id": own_assignment_id,
+                "properties": {
+                    "principalId": expected_principal_id,
+                    "principalType": "ServicePrincipal",
+                    "roleDefinitionId": producer_expected[
+                        own_assignment_id.casefold()
+                    ].role_definition_id,
+                    "scope": trigger_queue_id,
+                },
+            }
+        return {
             "id": resource_id,
             "properties": {
                 "principalId": wrong_principal_id,
@@ -2235,17 +2290,199 @@ def test_prospective_publisher_sender_rejects_wrong_existing_principal(
                 "roleDefinitionId": expected.role_definition_id,
                 "scope": trigger_queue_id,
             },
-        },
-    )
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
 
     with pytest.raises(
         orchestration.OrchestrationError,
         match="exact intended principal",
     ):
-        orchestration._verify_present_expected_assignments(
-            prospective,
+        orchestration._verify_trigger_queue_assignment_set(
+            producer_expected_assignments=producer_expected,
+            prospective_publisher_assignments=prospective,
+            approved_transition_assignment_ids=set(),
+            require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
         )
+
+
+def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_broker_identity_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ManagedIdentity/userAssignedIdentities/current-broker"
+    )
+    retired_broker_identity_id = current_broker_identity_id.replace(
+        "current-broker",
+        "retired-broker",
+    )
+    current_principal_id = "95959595-1111-4111-8111-111111111111"
+    retired_principal_id = "95959595-2222-4222-8222-222222222222"
+    trigger_queue_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    current_receiver_id = (
+        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/"
+        "95959595-3333-4333-8333-333333333333"
+    )
+    retired_sender_id = (
+        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/"
+        f"{
+            orchestration._arm_guid(
+                trigger_queue_id,
+                retired_broker_identity_id,
+                orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID,
+            )
+        }"
+    )
+    producer_expected = {
+        current_receiver_id.casefold(): orchestration._ExpectedRoleAssignment(
+            label="producer trigger receiver",
+            principal_id=current_principal_id,
+            scope=trigger_queue_id,
+            role_definition_id=(
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+        )
+    }
+    prospective = orchestration._prospective_publisher_sender_assignment(
+        configuration={"serviceBus": {"brokerIdentityResourceId": current_broker_identity_id}},
+        outputs={"triggerQueueResourceId": trigger_queue_id},
+        principal_ids_by_identity={current_broker_identity_id.casefold(): current_principal_id},
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    scope_assignments = [
+        {"id": current_receiver_id, "scope": trigger_queue_id},
+        {"id": retired_sender_id, "scope": trigger_queue_id},
+    ]
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda command, *, field: list(scope_assignments),
+    )
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        if resource_id == current_receiver_id.casefold():
+            return {
+                "id": current_receiver_id,
+                "properties": {
+                    "principalId": current_principal_id,
+                    "principalType": "ServicePrincipal",
+                    "roleDefinitionId": producer_expected[
+                        current_receiver_id.casefold()
+                    ].role_definition_id,
+                    "scope": trigger_queue_id,
+                },
+            }
+        assert resource_id == retired_sender_id.casefold()
+        return {
+            "id": retired_sender_id,
+            "properties": {
+                "principalId": retired_principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}"
+                ),
+                "scope": trigger_queue_id,
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    approved_transition_ids = {retired_sender_id}
+
+    assert (
+        orchestration._verify_trigger_queue_assignment_set(
+            producer_expected_assignments=producer_expected,
+            prospective_publisher_assignments=prospective,
+            approved_transition_assignment_ids=approved_transition_ids,
+            require_transition_revoked=False,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+        == {}
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="controlled revocation before readiness",
+    ):
+        orchestration._verify_trigger_queue_assignment_set(
+            producer_expected_assignments=producer_expected,
+            prospective_publisher_assignments=prospective,
+            approved_transition_assignment_ids=approved_transition_ids,
+            require_transition_revoked=True,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+    assert any(assignment["id"] == retired_sender_id for assignment in scope_assignments)
+
+    scope_assignments[:] = [{"id": current_receiver_id, "scope": trigger_queue_id}]
+    assert (
+        orchestration._verify_trigger_queue_assignment_set(
+            producer_expected_assignments=producer_expected,
+            prospective_publisher_assignments=prospective,
+            approved_transition_assignment_ids=approved_transition_ids,
+            require_transition_revoked=True,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+        == {}
+    )
+
+
+def test_fresh_producer_plan_allows_empty_trigger_queue_assignment_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "96969696-1111-4111-8111-111111111111"
+    trigger_queue_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-enrichment-feed-requests"
+    )
+    future_assignment_id = (
+        f"{trigger_queue_id}/providers/Microsoft.Authorization/roleAssignments/"
+        "96969696-2222-4222-8222-222222222222"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda command, *, field: [],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fresh planning must not read absent queue assignments"
+        ),
+    )
+
+    assert (
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={
+                future_assignment_id.casefold(): (
+                    orchestration._ExpectedRoleAssignment(
+                        label="planned producer trigger receiver",
+                        principal_id=principal_id,
+                        scope=trigger_queue_id,
+                        role_definition_id=(
+                            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                            "Microsoft.Authorization/roleDefinitions/"
+                            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+                        ),
+                    )
+                )
+            },
+            required_current_assignment_ids=set(),
+            approved_transition_assignment_ids=set(),
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+        == {}
+    )
 
 
 def test_publisher_trigger_handoff_requires_exact_sender_role(
@@ -2677,6 +2914,61 @@ def test_exact_effective_assignments_use_global_governed_scope_set() -> None:
         )
 
 
+@pytest.mark.parametrize("path", ("publisher-apply", "publisher-recovery"))
+def test_publisher_verification_collects_separated_producer_principal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    producer_principal = "88818181-1111-4111-8111-111111111111"
+    publisher_principal = "88818181-2222-4222-8222-222222222222"
+    producer_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+        "containers/wc027-enrichment-feed-v2"
+    )
+    publisher_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena-wc016-events/queues/"
+        "wc027-guidance-authority-requests"
+    )
+    producer_assignment = (
+        f"{producer_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "88818181-3333-4333-8333-333333333333"
+    )
+    publisher_assignment = (
+        f"{publisher_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "88818181-4444-4444-8444-444444444444"
+    )
+    queried_principals: list[set[str]] = []
+
+    def verified_evidence(
+        principal_ids: set[str],
+        *,
+        subscription_id: str,
+    ) -> dict[str, list[dict[str, object]]]:
+        assert path in {"publisher-apply", "publisher-recovery"}
+        queried_principals.append(set(principal_ids))
+        return {
+            producer_principal: [{"id": producer_assignment, "scope": producer_scope}],
+            publisher_principal: [{"id": publisher_assignment, "scope": publisher_scope}],
+        }
+
+    monkeypatch.setattr(
+        orchestration,
+        "_verify_no_broad_effective_assignments",
+        verified_evidence,
+    )
+    orchestration._verify_publisher_effective_assignments(
+        publisher_principal_ids={publisher_principal},
+        publisher_assignment_ids_by_principal={
+            publisher_principal: {publisher_assignment.casefold()}
+        },
+        producer_assignment_ids_by_principal={producer_principal: {producer_assignment.casefold()}},
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assert queried_principals == [{producer_principal, publisher_principal}]
+
+
 def test_management_group_service_bus_data_owner_is_treated_as_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3042,6 +3334,25 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert "_verify_rbac_resources(" in source
     assert "_verify_job_behavior(" in source
     assert "_verify_identities(" in source
+
+
+def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    plan_start = source.index("def plan(")
+    plan_transition_check = source.index(
+        'transition_state="present"',
+        plan_start,
+    )
+    plan_what_if = source.index('operation="what-if"', plan_transition_check)
+    assert plan_transition_check < plan_what_if
+
+    apply_start = source.index("def apply(")
+    apply_source = source[apply_start:]
+    apply_transition_check = apply_source.index('transition_state="absent"')
+    current_what_if = apply_source.index("current_what_if = _run_json(")
+    deployment_create = apply_source.index('operation="create"', current_what_if)
+    assert apply_transition_check < current_what_if < deployment_create
+    assert "require_transition_revoked=False" not in apply_source
 
 
 def test_runbook_keeps_wc027_roots_and_order_governed() -> None:

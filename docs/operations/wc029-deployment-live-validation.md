@@ -359,7 +359,23 @@ Before a publisher exists, no extra sender assignment is required. During partia
 publisher retry, or a later producer upgrade, only the deterministic assignment ID produced by
 `guid(triggerQueue.id, brokerIdentity.id, serviceBusDataSenderRoleDefinitionId)` is accepted, and
 its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
-No other publisher-binding assignment or role-ID allowlist is admitted.
+The complete set of direct assignments at the dedicated trigger queue must contain only the current
+producer assignments, the current deterministic publisher assignment when present, and at most
+four exact retired transition IDs explicitly recorded in the reviewed plan's `--allow-change`
+entries. Planning requires each approved transition assignment to be present and validates its
+retired service principal, exact queue scope, Service Bus Data Receiver or Data Sender role, and
+absent condition. After the plan is independently reviewed, an operator performs separately
+approved controlled revocation. `apply` then requires every transition ID to be absent before it
+reruns the final byte-exact what-if or starts deployment, and the post-deployment readiness check
+repeats that absence requirement before emitting a handoff. The orchestrator never deletes RBAC
+automatically. Any stale unapproved assignment, current-principal duplicate, missing current
+assignment, or leaked assignment page fails closed.
+
+Publisher verification re-queries effective RBAC for the union of publisher principals and every
+producer principal proven by the independently approved producer binding. Separated producer-only
+readers, writers, and signers therefore retain complete direct, group-derived, and inherited
+evidence during publisher apply and recovery; the expected producer assignment set is never
+reduced to the identities attached to the publisher.
 
 ### Publisher invocation boundary
 
