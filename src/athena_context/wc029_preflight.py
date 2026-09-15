@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, TextIO
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
@@ -20,6 +20,8 @@ MAX_POLICY_ITEMS = 512
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100000
 MAX_JSON_INTEGER_DIGITS = 1024
+MAX_JSON_DECIMAL_DIGITS = 1024
+MAX_JSON_DECIMAL_EXPONENT = 1024
 MAX_VIOLATIONS = 256
 MAX_RENDER_BYTES = 1024 * 1024
 MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
@@ -66,6 +68,27 @@ _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
 _RESOURCE_ROOT_PATH = "<resource>"
+_RESOURCE_ROOT_ALIASES = frozenset(
+    {
+        ".",
+        _RESOURCE_ROOT_PATH,
+        f"{_RESOURCE_ROOT_PATH}.",
+    }
+)
+_PROPERTY_NAME_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$-]*"
+_PROPERTY_NAME = re.compile(rf"^{_PROPERTY_NAME_PATTERN}$")
+_PROPERTY_COMPONENT = re.compile(
+    rf"^(?P<name>{_PROPERTY_NAME_PATTERN})"
+    r"(?P<indexes>(?:\[(?:0|[1-9][0-9]*)\])*)$"
+)
+_PROPERTY_INDEX = re.compile(r"\[(0|[1-9][0-9]*)\]")
+_AUTHORIZATION_MUTATION_TYPES = frozenset(
+    {
+        "microsoft.authorization/roleassignments",
+        "microsoft.authorization/roledefinitions",
+    }
+)
+_MANIFEST_SCHEMA_VERSION = "athena.wc029PreflightManifest.v1"
 _ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
 _GRAPH_MEMBERSHIP_METHODS = frozenset(
     {
@@ -82,6 +105,17 @@ _MANIFEST_BINDING_NAMES = frozenset(
         "rbacEvidenceDigest",
         "templateDigest",
         "whatIfDigest",
+    }
+)
+_MANIFEST_FIELD_NAMES = frozenset(
+    {
+        "bindings",
+        "collectedat",
+        "collectionrunid",
+        "deploymentexecutionid",
+        "deploymenttarget",
+        "expiresat",
+        "schemaversion",
     }
 )
 _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
@@ -109,8 +143,17 @@ class PreflightViolation:
 
 
 @dataclass(frozen=True, slots=True)
+class DeploymentTarget:
+    tenant_id: str
+    subscription_id: str
+    resource_group_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AttestationManifest:
     collection_run_id: str
+    deployment_execution_id: str
+    deployment_target: DeploymentTarget
     collected_at: datetime
     expires_at: datetime
     bindings: dict[str, str]
@@ -196,6 +239,7 @@ class RbacPolicy:
 
 type PreflightKind = Literal["rbac", "what-if"]
 type PreflightOutputFormat = Literal["json", "text"]
+type PropertyPathToken = str | int
 
 
 def _normalized(value: str) -> str:
@@ -247,6 +291,23 @@ def _parse_json_integer(value: str) -> int:
         return int(value)
     except ValueError as exc:
         raise PreflightInputError("JSON integer is invalid") from exc
+
+
+def _parse_json_decimal(value: str) -> Decimal:
+    digits = sum(character.isdigit() for character in value)
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise PreflightInputError("JSON decimal is invalid") from exc
+    exponent = parsed.as_tuple().exponent
+    if (
+        digits > MAX_JSON_DECIMAL_DIGITS
+        or not parsed.is_finite()
+        or not isinstance(exponent, int)
+        or abs(exponent) > MAX_JSON_DECIMAL_EXPONENT
+    ):
+        raise PreflightInputError("JSON decimal exceeds its precision or exponent bound")
+    return parsed
 
 
 def _reject_ambiguous_object_pairs(
@@ -305,28 +366,59 @@ def _canonical_role_id(value: str) -> str:
     return segments[-1]
 
 
-def _canonical_property_path(value: str) -> str:
+def _property_path_tokens(value: str) -> tuple[PropertyPathToken, ...]:
     normalized = value.lower()
     if normalized != value.casefold():
         raise PreflightInputError("property path has ambiguous Unicode case folding")
     if _contains_non_ascii_case_alias(value):
         raise PreflightInputError("property path contains a non-ASCII case alias")
-    if normalized in {"", ".", _RESOURCE_ROOT_PATH, f"{_RESOURCE_ROOT_PATH}."}:
-        return _RESOURCE_ROOT_PATH
+    if value in _RESOURCE_ROOT_ALIASES:
+        return ()
+    if not value.isascii():
+        raise PreflightInputError("property path must use ASCII")
     prefix = f"{_RESOURCE_ROOT_PATH}."
-    if normalized.startswith(prefix):
+    if normalized.startswith(_RESOURCE_ROOT_PATH):
+        if not value.startswith(prefix):
+            raise PreflightInputError("property path has an unsupported resource-root suffix")
         normalized = normalized.removeprefix(prefix)
-    if any(not component for component in normalized.split(".")):
-        raise PreflightInputError("property path contains an empty component")
-    return normalized
+    if not normalized:
+        raise PreflightInputError("property path is empty")
+    tokens: list[PropertyPathToken] = []
+    for component in normalized.split("."):
+        match = _PROPERTY_COMPONENT.fullmatch(component)
+        if match is None:
+            raise PreflightInputError(
+                "property path must use dotted ASCII names and canonical numeric indexes"
+            )
+        tokens.append(match.group("name"))
+        tokens.extend(
+            int(index.group(1)) for index in _PROPERTY_INDEX.finditer(match.group("indexes"))
+        )
+    return tuple(tokens)
+
+
+def _format_property_path(tokens: Sequence[PropertyPathToken]) -> str:
+    if not tokens:
+        return _RESOURCE_ROOT_PATH
+    components: list[str] = []
+    for token in tokens:
+        if isinstance(token, str):
+            components.append(token)
+        elif not components:
+            raise PreflightInputError("property path cannot start with an array index")
+        else:
+            components[-1] += f"[{token}]"
+    return ".".join(components)
+
+
+def _canonical_property_path(value: str) -> str:
+    return _format_property_path(_property_path_tokens(value))
 
 
 def _property_path_contains(ancestor: str, descendant: str) -> bool:
-    return (
-        ancestor == _RESOURCE_ROOT_PATH
-        or descendant == ancestor
-        or descendant.startswith(ancestor + ".")
-    )
+    ancestor_tokens = _property_path_tokens(ancestor)
+    descendant_tokens = _property_path_tokens(descendant)
+    return descendant_tokens[: len(ancestor_tokens)] == ancestor_tokens
 
 
 def _canonical_scope(value: str) -> str:
@@ -396,13 +488,44 @@ def _canonical_guid(value: object, *, field_name: str) -> str:
     return guid
 
 
+def _canonical_decimal(value: Decimal) -> str:
+    if not value.is_finite():
+        raise PreflightInputError("JSON decimal must be finite")
+    if value == 0:
+        return "0"
+    rendered = format(value.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
+def _canonical_json_text(value: object) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    if isinstance(value, Decimal):
+        return _canonical_decimal(value)
+    if type(value) is str:
+        return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical_json_text(item) for item in value) + "]"
+    if isinstance(value, dict) and all(type(key) is str for key in value):
+        return (
+            "{"
+            + ",".join(
+                json.dumps(key, ensure_ascii=True) + ":" + _canonical_json_text(value[key])
+                for key in sorted(value)
+            )
+            + "}"
+        )
+    raise PreflightInputError("canonical JSON contains an unsupported value")
+
+
 def _canonical_json_digest(value: object) -> str:
-    serialized = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
+    serialized = _canonical_json_text(value).encode("utf-8")
     return "sha256:" + hashlib.sha256(serialized).hexdigest()
 
 
@@ -466,10 +589,71 @@ def _validate_attestation_window(
         raise PreflightInputError("attestation has expired")
 
 
+def _parse_deployment_target(value: object) -> DeploymentTarget:
+    target = _mapping(
+        value,
+        field_name="manifest deploymentTarget",
+    )
+    if {key.casefold() for key in target} != {
+        "resourcegroupids",
+        "subscriptionid",
+        "tenantid",
+    }:
+        raise PreflightInputError("manifest deploymentTarget has an invalid envelope")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="manifest deploymentTarget tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="manifest deploymentTarget subscriptionId",
+    )
+    resource_group_scopes: set[str] = set()
+    for raw_scope in _sequence(
+        _get_case_insensitive(target, "resourceGroupIds"),
+        field_name="manifest deploymentTarget resourceGroupIds",
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        scope = _canonical_scope(
+            _require_string(
+                raw_scope,
+                field_name="manifest deploymentTarget resourceGroupId",
+            )
+        )
+        if (
+            _RESOURCE_GROUP_SCOPE.fullmatch(scope) is None
+            or _resource_group_subscription_id(scope) != subscription_id
+        ):
+            raise PreflightInputError(
+                "manifest deploymentTarget resourceGroupIds must belong to subscriptionId"
+            )
+        if scope in resource_group_scopes:
+            raise PreflightInputError(
+                "manifest deploymentTarget contains a duplicate resourceGroupId"
+            )
+        resource_group_scopes.add(scope)
+    if not resource_group_scopes:
+        raise PreflightInputError("manifest deploymentTarget resourceGroupIds must not be empty")
+    return DeploymentTarget(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        resource_group_scopes=tuple(sorted(resource_group_scopes)),
+    )
+
+
+def _deployment_target_payload(target: DeploymentTarget) -> dict[str, object]:
+    return {
+        "tenantId": target.tenant_id,
+        "subscriptionId": target.subscription_id,
+        "resourceGroupIds": list(target.resource_group_scopes),
+    }
+
+
 def _parse_attestation_manifest(
     value: object,
     *,
     expected_collection_run_id: str,
+    expected_deployment_execution_id: str,
     expected_manifest_digest: str,
     now: datetime,
 ) -> AttestationManifest:
@@ -477,6 +661,17 @@ def _parse_attestation_manifest(
         value,
         field_name="attestation manifest",
     )
+    if {key.casefold() for key in manifest} != _MANIFEST_FIELD_NAMES:
+        raise PreflightInputError("attestation manifest has an invalid envelope")
+    if (
+        _require_string(
+            _get_case_insensitive(manifest, "schemaVersion"),
+            field_name="manifest schemaVersion",
+            maximum_length=64,
+        )
+        != _MANIFEST_SCHEMA_VERSION
+    ):
+        raise PreflightInputError("attestation manifest schemaVersion is unsupported")
     collection_run_id = _canonical_guid(
         _get_case_insensitive(manifest, "collectionRunId"),
         field_name="manifest collectionRunId",
@@ -486,6 +681,20 @@ def _parse_attestation_manifest(
         field_name="expected collectionRunId",
     ):
         raise PreflightInputError("manifest collectionRunId does not match the reviewed run")
+    deployment_execution_id = _canonical_guid(
+        _get_case_insensitive(manifest, "deploymentExecutionId"),
+        field_name="manifest deploymentExecutionId",
+    )
+    if deployment_execution_id != _canonical_guid(
+        expected_deployment_execution_id,
+        field_name="expected deploymentExecutionId",
+    ):
+        raise PreflightInputError(
+            "manifest deploymentExecutionId does not match the immutable deployment execution"
+        )
+    deployment_target = _parse_deployment_target(
+        _get_case_insensitive(manifest, "deploymentTarget")
+    )
     collected_at = _parse_utc_timestamp(
         _get_case_insensitive(manifest, "collectedAt"),
         field_name="manifest collectedAt",
@@ -520,6 +729,8 @@ def _parse_attestation_manifest(
     }
     return AttestationManifest(
         collection_run_id=collection_run_id,
+        deployment_execution_id=deployment_execution_id,
+        deployment_target=deployment_target,
         collected_at=collected_at,
         expires_at=expires_at,
         bindings=normalized_bindings,
@@ -565,6 +776,11 @@ def _validate_artifact_attestation(
             field_name="attestation expiresAt",
         )
         != manifest.expires_at
+        or _canonical_guid(
+            _get_case_insensitive(attestation, "deploymentExecutionId"),
+            field_name="attestation deploymentExecutionId",
+        )
+        != manifest.deployment_execution_id
     ):
         raise PreflightInputError("artifact attestation does not match the reviewed manifest")
     if (
@@ -653,6 +869,63 @@ def _scope_contains(ancestor: str, descendant: str) -> bool:
     return ancestor == "/" or descendant == ancestor or descendant.startswith(ancestor + "/")
 
 
+def _validate_deployment_resource_id(
+    resource_id: str,
+    *,
+    deployment_target: DeploymentTarget,
+    field_name: str,
+) -> str:
+    canonical_resource_id = _canonical_scope(resource_id)
+    subscription_prefix = f"/subscriptions/{deployment_target.subscription_id}/"
+    if not canonical_resource_id.startswith(subscription_prefix):
+        raise PreflightInputError(f"{field_name} is outside the reviewed deployment subscription")
+    if not any(
+        _scope_contains(resource_group_scope, canonical_resource_id)
+        for resource_group_scope in deployment_target.resource_group_scopes
+    ):
+        raise PreflightInputError(
+            f"{field_name} is outside the reviewed deployment resource-group boundary"
+        )
+    return canonical_resource_id
+
+
+def _validate_rbac_deployment_target(
+    collection: RbacCollection,
+    *,
+    deployment_target: DeploymentTarget,
+) -> None:
+    if (
+        collection.tenant_id != deployment_target.tenant_id
+        or collection.subscription_id != deployment_target.subscription_id
+        or collection.resource_group_scope not in deployment_target.resource_group_scopes
+    ):
+        raise PreflightInputError(
+            "RBAC evidence target does not match the reviewed manifest deploymentTarget"
+        )
+
+
+def _validate_what_if_snapshot_ids(
+    change: dict[str, Any],
+    *,
+    canonical_resource_id: str,
+    deployment_target: DeploymentTarget | None,
+) -> None:
+    for snapshot_name in ("before", "after"):
+        if not _has_case_insensitive(change, snapshot_name):
+            continue
+        snapshot = _get_case_insensitive(change, snapshot_name)
+        if not isinstance(snapshot, dict) or not any(
+            _has_case_insensitive(snapshot, field_name) for field_name in ("id", "name", "type")
+        ):
+            continue
+        _validate_resource_snapshot(
+            snapshot,
+            resource_id=canonical_resource_id,
+            field_name=f"{snapshot_name} snapshot",
+            deployment_target=deployment_target,
+        )
+
+
 def _minimal_scope_prefixes(values: Sequence[str]) -> tuple[str, ...]:
     unique = sorted(set(values))
     return tuple(
@@ -736,6 +1009,7 @@ def load_json_file(
         document = json.loads(
             path.read_text(encoding="utf-8"),
             parse_constant=_reject_json_constant,
+            parse_float=_parse_json_decimal,
             parse_int=_parse_json_integer,
             object_pairs_hook=_reject_ambiguous_object_pairs,
         )
@@ -779,9 +1053,11 @@ def _validate_json_shape(value: object) -> None:
         elif isinstance(item, str):
             if len(item) > MAX_INPUT_BYTES:
                 raise PreflightInputError("JSON string exceeds its bound")
-        elif isinstance(item, float):
-            if not math.isfinite(item):
+        elif isinstance(item, Decimal):
+            if not item.is_finite():
                 raise PreflightInputError("JSON contains a non-finite number")
+        elif isinstance(item, float):
+            raise PreflightInputError("JSON floating-point values must be parsed exactly")
         elif item is not None and not isinstance(item, (bool, int)):
             raise PreflightInputError("JSON contains an unsupported value")
 
@@ -875,9 +1151,19 @@ def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _property_child_path(parent: str, key: str) -> str:
-    escaped_key = key.replace("~", "~0").replace(".", "~1")
-    return f"{parent}.{escaped_key}"
+def _property_child_path(parent: str, key: str) -> str | None:
+    if (
+        not key.isascii()
+        or key.lower() != key.casefold()
+        or _contains_non_ascii_case_alias(key)
+        or _PROPERTY_NAME.fullmatch(key) is None
+    ):
+        return None
+    return _format_property_path((*_property_path_tokens(parent), key.lower()))
+
+
+def _property_index_path(parent: str, index: int) -> str:
+    return _format_property_path((*_property_path_tokens(parent), index))
 
 
 def _json_values_equal(left: object, right: object) -> bool:
@@ -911,6 +1197,9 @@ def _derive_snapshot_delta(
             keys = sorted(set(old_value) | set(new_value))
             for key in reversed(keys):
                 child_path = _property_child_path(path, key)
+                if child_path is None:
+                    values.append((path, new_value.get(key), "modify"))
+                    continue
                 if key not in new_value:
                     values.append((child_path, None, "delete"))
                 elif key not in old_value:
@@ -948,6 +1237,9 @@ def _is_meaningful_delta_candidate(path: str, value: object) -> bool:
 
 def _walk_delta(
     items: list[dict[str, Any]],
+    *,
+    snapshot_before: dict[str, Any] | None = None,
+    snapshot_after: dict[str, Any] | None = None,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(items)]
@@ -1015,32 +1307,39 @@ def _walk_delta(
         if property_change_type in {"delete", "remove"}:
             values.append(
                 (
-                    path,
+                    canonical_path,
                     after,
                     property_change_type,
                 )
             )
-        elif property_change_type != "noeffect" and after_supplied:
+        elif property_change_type == "noeffect":
+            _validate_no_effect_entry(
+                item,
+                canonical_path=canonical_path,
+                snapshot_before=snapshot_before,
+                snapshot_after=snapshot_after,
+            )
+        elif after_supplied:
             if before_supplied:
                 values.extend(
                     _derive_snapshot_delta(
                         before,
                         after,
-                        root=path,
+                        root=canonical_path,
                     )
                 )
             else:
                 values.append(
                     (
-                        path,
+                        canonical_path,
                         after,
                         property_change_type,
                     )
                 )
                 if isinstance(after, (dict, list)):
-                    values.extend(_flatten_after(after, root=path))
+                    values.extend(_flatten_after(after, root=canonical_path))
         if child_items:
-            stack.extend((child, path) for child in reversed(child_items))
+            stack.extend((child, canonical_path) for child in reversed(child_items))
     return values
 
 
@@ -1048,47 +1347,81 @@ def _snapshot_value_at_path(
     snapshot: dict[str, Any],
     path: str,
 ) -> tuple[bool, object]:
-    canonical_path = _canonical_property_path(path)
-    if canonical_path == _RESOURCE_ROOT_PATH:
+    tokens = _property_path_tokens(path)
+    if not tokens:
         return True, snapshot
     current: object = snapshot
-    for component in canonical_path.split("."):
-        key_match = re.match(r"^[^\[]*", component)
-        assert key_match is not None
-        raw_key = key_match.group(0)
-        remainder = component[len(raw_key) :]
-        if raw_key:
+    for token in tokens:
+        if isinstance(token, str):
             if not isinstance(current, dict):
                 return False, None
-            key = raw_key.replace("~1", ".").replace("~0", "~")
             matched_key = next(
-                (candidate for candidate in current if candidate.lower() == key),
+                (candidate for candidate in current if candidate.lower() == token),
                 None,
             )
             if matched_key is None:
                 return False, None
             current = current[matched_key]
-        while remainder:
-            index_match = re.match(r"^\[(\d+)\]", remainder)
-            if index_match is None or not isinstance(current, list):
+        else:
+            if not isinstance(current, list) or token >= len(current):
                 return False, None
-            index = int(index_match.group(1))
-            if index >= len(current):
-                return False, None
-            current = current[index]
-            remainder = remainder[index_match.end() :]
+            current = current[token]
     return True, current
 
 
-def _validate_no_change_snapshot(
+def _validate_no_effect_entry(
+    item: dict[str, Any],
+    *,
+    canonical_path: str,
+    snapshot_before: dict[str, Any] | None,
+    snapshot_after: dict[str, Any] | None,
+) -> None:
+    if not _has_case_insensitive(item, "before") or not _has_case_insensitive(
+        item,
+        "after",
+    ):
+        raise PreflightInputError("NoEffect requires before and after evidence")
+    before = _get_case_insensitive(item, "before")
+    after = _get_case_insensitive(item, "after")
+    if not _json_values_equal(before, after):
+        raise PreflightInputError("NoEffect before and after values conflict")
+    if snapshot_before is None or snapshot_after is None:
+        raise PreflightInputError("NoEffect requires complete resource snapshots")
+    before_exists, root_before = _snapshot_value_at_path(
+        snapshot_before,
+        canonical_path,
+    )
+    after_exists, root_after = _snapshot_value_at_path(
+        snapshot_after,
+        canonical_path,
+    )
+    if (
+        not before_exists
+        or not after_exists
+        or not _json_values_equal(root_before, root_after)
+        or not _json_values_equal(before, root_before)
+        or not _json_values_equal(after, root_after)
+    ):
+        raise PreflightInputError("NoEffect does not reconcile with resource snapshots")
+
+
+def _validate_resource_snapshot(
     snapshot: dict[str, Any],
     *,
     resource_id: str,
     field_name: str,
+    deployment_target: DeploymentTarget | None = None,
 ) -> None:
-    snapshot_id = _canonical_scope(
-        _require_string(
-            _get_case_insensitive(snapshot, "id"),
+    raw_snapshot_id = _require_string(
+        _get_case_insensitive(snapshot, "id"),
+        field_name=f"{field_name} id",
+    )
+    snapshot_id = (
+        _canonical_scope(raw_snapshot_id)
+        if deployment_target is None
+        else _validate_deployment_resource_id(
+            raw_snapshot_id,
+            deployment_target=deployment_target,
             field_name=f"{field_name} id",
         )
     )
@@ -1129,12 +1462,12 @@ def _validate_no_change(
     after = _get_case_insensitive(change, "after")
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise PreflightInputError("NoChange before and after snapshots must be objects")
-    _validate_no_change_snapshot(
+    _validate_resource_snapshot(
         before,
         resource_id=resource_id,
         field_name="NoChange before snapshot",
     )
-    _validate_no_change_snapshot(
+    _validate_resource_snapshot(
         after,
         resource_id=resource_id,
         field_name="NoChange after snapshot",
@@ -1173,15 +1506,23 @@ def _validate_no_change(
         )
         if property_change_type not in {"array", "noeffect"}:
             raise PreflightInputError("NoChange contains a non-NoEffect property delta")
+        if property_change_type == "noeffect":
+            _validate_no_effect_entry(
+                item,
+                canonical_path=canonical_path,
+                snapshot_before=before,
+                snapshot_after=after,
+            )
         before_supplied = _has_case_insensitive(item, "before")
         after_supplied = _has_case_insensitive(item, "after")
-        if not before_supplied and not after_supplied and children is None:
-            raise PreflightInputError("NoChange delta omits before and after evidence")
-        if before_supplied != after_supplied or (
-            before_supplied
-            and not _json_values_equal(
-                _get_case_insensitive(item, "before"),
-                _get_case_insensitive(item, "after"),
+        if property_change_type == "array" and (
+            before_supplied != after_supplied
+            or (
+                before_supplied
+                and not _json_values_equal(
+                    _get_case_insensitive(item, "before"),
+                    _get_case_insensitive(item, "after"),
+                )
             )
         ):
             raise PreflightInputError("NoChange delta conflicts with its snapshots")
@@ -1202,14 +1543,18 @@ def _validate_no_change(
             )
         ):
             raise PreflightInputError("NoChange delta path is absent or inconsistent in snapshots")
-        if before_supplied and (
-            not _json_values_equal(
-                _get_case_insensitive(item, "before"),
-                snapshot_before,
-            )
-            or not _json_values_equal(
-                _get_case_insensitive(item, "after"),
-                snapshot_after,
+        if (
+            property_change_type == "array"
+            and before_supplied
+            and (
+                not _json_values_equal(
+                    _get_case_insensitive(item, "before"),
+                    snapshot_before,
+                )
+                or not _json_values_equal(
+                    _get_case_insensitive(item, "after"),
+                    snapshot_after,
+                )
             )
         ):
             raise PreflightInputError("NoChange delta conflicts with root snapshots")
@@ -1224,8 +1569,12 @@ def _validate_no_change(
             ]
             if not child_items:
                 raise PreflightInputError("delta item contains no inspectable children")
-            stack.extend((child, path) for child in reversed(child_items))
-    if _walk_delta(delta):
+            stack.extend((child, canonical_path) for child in reversed(child_items))
+    if _walk_delta(
+        delta,
+        snapshot_before=before,
+        snapshot_after=after,
+    ):
         raise PreflightInputError("NoChange contains an effective property delta")
     _canonical_scope(resource_id)
 
@@ -1240,16 +1589,14 @@ def _flatten_after(
     while stack:
         item, path = stack.pop()
         if isinstance(item, dict):
-            stack.extend(
-                (
-                    child,
-                    _property_child_path(path, key),
-                )
-                for key, child in reversed(list(item.items()))
-            )
+            for key, child in reversed(list(item.items())):
+                child_path = _property_child_path(path, key)
+                if child_path is not None:
+                    stack.append((child, child_path))
         elif isinstance(item, list):
             stack.extend(
-                (child, f"{path}[{index}]") for index, child in reversed(list(enumerate(item)))
+                (child, _property_index_path(path, index))
+                for index, child in reversed(list(enumerate(item)))
             )
         else:
             values.append((path, item, "set"))
@@ -1270,12 +1617,13 @@ def _unsafe_property_violations(
     )
     violations: list[PreflightViolation] = []
     delta = _delta_entries(change)
-    declared_delta_candidates = _walk_delta(delta) if delta else []
     before_payload_supplied = _has_case_insensitive(change, "before")
     after_payload_supplied = _has_case_insensitive(change, "after")
     before_payload = _get_case_insensitive(change, "before")
     after_payload = _get_case_insensitive(change, "after")
     snapshot_delta_candidates: list[tuple[str, object, str]] = []
+    snapshot_before_payload: dict[str, Any] | None = None
+    snapshot_after_payload: dict[str, Any] | None = None
     complete_snapshots = (
         change_type == "modify" and before_payload_supplied and after_payload_supplied
     )
@@ -1285,10 +1633,31 @@ def _unsafe_property_violations(
             dict,
         ):
             raise PreflightInputError("Modify before and after snapshots must both be objects")
+        _validate_resource_snapshot(
+            before_payload,
+            resource_id=resource_id,
+            field_name="Modify before snapshot",
+        )
+        _validate_resource_snapshot(
+            after_payload,
+            resource_id=resource_id,
+            field_name="Modify after snapshot",
+        )
+        snapshot_before_payload = before_payload
+        snapshot_after_payload = after_payload
         snapshot_delta_candidates = _derive_snapshot_delta(
             before_payload,
             after_payload,
         )
+    declared_delta_candidates = (
+        _walk_delta(
+            delta,
+            snapshot_before=snapshot_before_payload,
+            snapshot_after=snapshot_after_payload,
+        )
+        if delta
+        else []
+    )
     effective_delta_candidates = (
         snapshot_delta_candidates if complete_snapshots else declared_delta_candidates
     )
@@ -1685,16 +2054,20 @@ def evaluate_what_if(
     allowed_change_ids: frozenset[str] = frozenset(),
     require_attestation: bool = False,
     expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
     attestation_manifest_digest: str | None = None,
     deployment_digest: str | None = None,
     template_digest: str | None = None,
     parameters_digest: str | None = None,
     now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
+    _validate_json_shape(document)
     normalized_allowlist, allow_change_ids_digest = _allow_change_binding(allowed_change_ids)
+    deployment_target: DeploymentTarget | None = None
     if require_attestation:
         if (
             expected_collection_run_id is None
+            or expected_deployment_execution_id is None
             or attestation_manifest_digest is None
             or deployment_digest is None
             or template_digest is None
@@ -1715,9 +2088,17 @@ def evaluate_what_if(
         manifest = _parse_attestation_manifest(
             _get_case_insensitive(root, "manifest"),
             expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
             expected_manifest_digest=attestation_manifest_digest,
             now=_current_utc(now),
         )
+        deployment_target = manifest.deployment_target
+        for allowed_change_id in normalized_allowlist:
+            _validate_deployment_resource_id(
+                allowed_change_id,
+                deployment_target=deployment_target,
+                field_name="allow-change resource ID",
+            )
         expected_bindings = {
             "allowChangeIdsDigest": allow_change_ids_digest,
             "deploymentDigest": _canonical_sha256_digest(
@@ -1757,7 +2138,14 @@ def evaluate_what_if(
             _get_case_insensitive(potential_change, "resourceId"),
             field_name="potential change resourceId",
         )
-        _canonical_scope(resource_id)
+        if deployment_target is None:
+            _canonical_scope(resource_id)
+        else:
+            _validate_deployment_resource_id(
+                resource_id,
+                deployment_target=deployment_target,
+                field_name="potential change resourceId",
+            )
         violations.append(
             PreflightViolation(
                 code="unpredictable-change",
@@ -1771,7 +2159,20 @@ def evaluate_what_if(
             _get_case_insensitive(change, "resourceId"),
             field_name="resourceId",
         )
-        canonical_resource_id = _canonical_scope(resource_id)
+        canonical_resource_id = (
+            _canonical_scope(resource_id)
+            if deployment_target is None
+            else _validate_deployment_resource_id(
+                resource_id,
+                deployment_target=deployment_target,
+                field_name="resourceId",
+            )
+        )
+        _validate_what_if_snapshot_ids(
+            change,
+            canonical_resource_id=canonical_resource_id,
+            deployment_target=deployment_target,
+        )
         change_type = _normalized(
             _require_string(
                 _get_case_insensitive(change, "changeType"),
@@ -1815,6 +2216,18 @@ def evaluate_what_if(
                     code="unsupported-change-type",
                     subject=resource_id,
                     detail=f"unsupported change type {change_type}",
+                )
+            )
+            continue
+        if _resource_type(canonical_resource_id) in _AUTHORIZATION_MUTATION_TYPES:
+            violations.append(
+                PreflightViolation(
+                    code="authorization-change-unsupported",
+                    subject=resource_id,
+                    detail=(
+                        "planned Microsoft.Authorization role assignment or role "
+                        "definition mutations require a future separation-aware evaluator"
+                    ),
                 )
             )
             continue
@@ -3667,14 +4080,21 @@ def _derive_guarded_role_assignments(
     policy_document: object,
     require_attestation: bool,
     expected_collection_run_id: str | None,
+    expected_deployment_execution_id: str | None,
     attestation_manifest_digest: str | None,
     now: datetime | None,
 ) -> tuple[list[RbacAssignment], RbacCollection]:
     root = _mapping(document, field_name="guarded RBAC evidence")
+    manifest: AttestationManifest | None = None
     if require_attestation:
-        if expected_collection_run_id is None or attestation_manifest_digest is None:
+        if (
+            expected_collection_run_id is None
+            or expected_deployment_execution_id is None
+            or attestation_manifest_digest is None
+        ):
             raise PreflightInputError(
-                "reviewed RBAC collectionRunId and manifest digest are required"
+                "reviewed RBAC collectionRunId, deploymentExecutionId, "
+                "and manifest digest are required"
             )
         if {key.casefold() for key in root} != {
             "attestation",
@@ -3687,6 +4107,7 @@ def _derive_guarded_role_assignments(
         manifest = _parse_attestation_manifest(
             _get_case_insensitive(root, "manifest"),
             expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
             expected_manifest_digest=attestation_manifest_digest,
             now=_current_utc(now),
         )
@@ -3718,6 +4139,11 @@ def _derive_guarded_role_assignments(
             "guarded RBAC evidence requires raw target, hierarchy, and principal artifacts"
         )
     target = _parse_evidence_target(_get_case_insensitive(root, "target"))
+    if manifest is not None:
+        _validate_rbac_deployment_target(
+            target,
+            deployment_target=manifest.deployment_target,
+        )
     if policy.target is None:
         raise PreflightInputError("RBAC policy requires a reviewed target")
     if (
@@ -3843,6 +4269,7 @@ def evaluate_role_assignments(
     require_separation_rules: bool = False,
     require_attestation: bool = False,
     expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
     attestation_manifest_digest: str | None = None,
     now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
@@ -3950,6 +4377,7 @@ def evaluate_role_assignments(
             policy_document=policy_document,
             require_attestation=(require_attestation or require_separation_rules),
             expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
             attestation_manifest_digest=attestation_manifest_digest,
             now=now,
         )
@@ -4119,6 +4547,106 @@ def _escaped_text(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)[1:-1]
 
 
+def _write_release_ledger_json(path: Path, payload: dict[str, object]) -> None:
+    rendered = (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    )
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(rendered)
+
+
+def _validate_release_ledger_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise PreflightInputError("release ledger must be an existing non-symlink directory")
+
+
+def _consume_release_ledger(
+    *,
+    ledger_path: Path,
+    manifest: AttestationManifest,
+    kind: PreflightKind,
+    rendered: str,
+    safe: bool,
+) -> None:
+    _validate_release_ledger_directory(ledger_path)
+    collection_binding: dict[str, object] = {
+        "schemaVersion": "athena.wc029CollectionBinding.v1",
+        "collectionRunId": manifest.collection_run_id,
+        "deploymentExecutionId": manifest.deployment_execution_id,
+        "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
+        "manifestDigest": manifest.digest,
+    }
+    collection_binding_path = ledger_path / (f"{manifest.collection_run_id}.collection.json")
+    try:
+        _write_release_ledger_json(collection_binding_path, collection_binding)
+    except FileExistsError:
+        if collection_binding_path.is_symlink():
+            raise PreflightInputError(
+                "release ledger collection binding must not be a symlink"
+            ) from None
+        existing_collection_binding = load_json_file(
+            collection_binding_path,
+            maximum_bytes=64 * 1024,
+        )
+        if not _json_values_equal(
+            existing_collection_binding,
+            collection_binding,
+        ):
+            raise PreflightInputError(
+                "release ledger collectionRunId is already bound to another "
+                "deployment execution or manifest"
+            ) from None
+    except OSError as exc:
+        raise PreflightInputError("release ledger collection binding could not be created") from exc
+
+    binding: dict[str, object] = {
+        "schemaVersion": "athena.wc029ReleaseBinding.v1",
+        "collectionRunId": manifest.collection_run_id,
+        "deploymentExecutionId": manifest.deployment_execution_id,
+        "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
+        "manifestDigest": manifest.digest,
+    }
+    binding_path = ledger_path / (f"{manifest.deployment_execution_id}.binding.json")
+    try:
+        _write_release_ledger_json(binding_path, binding)
+    except FileExistsError:
+        if binding_path.is_symlink():
+            raise PreflightInputError("release ledger binding must not be a symlink") from None
+        existing_binding = load_json_file(
+            binding_path,
+            maximum_bytes=64 * 1024,
+        )
+        if not _json_values_equal(existing_binding, binding):
+            raise PreflightInputError(
+                "release ledger deployment binding does not match this manifest"
+            ) from None
+    except OSError as exc:
+        raise PreflightInputError("release ledger binding could not be created") from exc
+
+    consumption: dict[str, object] = {
+        **binding,
+        "schemaVersion": "athena.wc029ReleaseConsumption.v1",
+        "artifactKind": kind,
+        "resultDigest": "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "safe": safe,
+    }
+    consumption_path = ledger_path / (f"{manifest.deployment_execution_id}.{kind}.consumed.json")
+    try:
+        _write_release_ledger_json(consumption_path, consumption)
+    except FileExistsError as exc:
+        raise PreflightInputError(
+            f"release ledger already consumed {kind} for this deployment execution"
+        ) from exc
+    except OSError as exc:
+        raise PreflightInputError("release ledger consumption could not be recorded") from exc
+
+
 def run_preflight_check(
     *,
     kind: PreflightKind,
@@ -4131,27 +4659,42 @@ def run_preflight_check(
     require_rbac_policy: bool = False,
     require_attestation: bool = False,
     expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
     attestation_manifest_digest: str | None = None,
     deployment_digest: str | None = None,
     template_digest: str | None = None,
     parameters_digest: str | None = None,
+    release_ledger_path: Path | None = None,
     now: datetime | None = None,
 ) -> int:
     """Run one offline preflight check without adding policy or Azure I/O."""
 
     try:
         document = load_json_file(input_path)
+        validation_now = _current_utc(now) if require_attestation else now
+        if require_attestation:
+            if (
+                expected_collection_run_id is None
+                or expected_deployment_execution_id is None
+                or attestation_manifest_digest is None
+                or release_ledger_path is None
+            ):
+                raise PreflightInputError(
+                    "reviewed deployment execution, manifest, and release ledger are required"
+                )
+            _validate_release_ledger_directory(release_ledger_path)
         if kind == "what-if":
             violations = evaluate_what_if(
                 document,
                 allowed_change_ids=allowed_change_ids,
                 require_attestation=require_attestation,
                 expected_collection_run_id=(expected_collection_run_id),
+                expected_deployment_execution_id=(expected_deployment_execution_id),
                 attestation_manifest_digest=(attestation_manifest_digest),
                 deployment_digest=deployment_digest,
                 template_digest=template_digest,
                 parameters_digest=parameters_digest,
-                now=now,
+                now=validation_now,
             )
         elif kind == "rbac":
             if require_rbac_policy and policy_path is None:
@@ -4167,8 +4710,9 @@ def run_preflight_check(
                 require_separation_rules=require_rbac_policy,
                 require_attestation=require_attestation,
                 expected_collection_run_id=(expected_collection_run_id),
+                expected_deployment_execution_id=(expected_deployment_execution_id),
                 attestation_manifest_digest=(attestation_manifest_digest),
-                now=now,
+                now=validation_now,
             )
         else:
             raise ValueError(f"unsupported preflight kind: {kind}")
@@ -4184,6 +4728,29 @@ def run_preflight_check(
             )
         else:
             raise ValueError(f"unsupported output format: {output_format}")
+        if require_attestation:
+            assert expected_collection_run_id is not None
+            assert expected_deployment_execution_id is not None
+            assert attestation_manifest_digest is not None
+            assert release_ledger_path is not None
+            artifact_root = _mapping(
+                document,
+                field_name=f"attested {kind} artifact",
+            )
+            reviewed_manifest = _parse_attestation_manifest(
+                _get_case_insensitive(artifact_root, "manifest"),
+                expected_collection_run_id=expected_collection_run_id,
+                expected_deployment_execution_id=expected_deployment_execution_id,
+                expected_manifest_digest=attestation_manifest_digest,
+                now=_current_utc(validation_now),
+            )
+            _consume_release_ledger(
+                ledger_path=release_ledger_path,
+                manifest=reviewed_manifest,
+                kind=kind,
+                rendered=rendered,
+                safe=not violations,
+            )
     except PreflightInputError as exc:
         if output_format == "json":
             stderr.write(

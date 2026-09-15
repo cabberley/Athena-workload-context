@@ -457,6 +457,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     what_if_parser.add_argument(
+        "--deployment-execution-id",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--release-ledger",
+        required=True,
+        type=Path,
+    )
+    what_if_parser.add_argument(
         "--attestation-manifest-digest",
         required=True,
     )
@@ -486,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
     rbac_parser.add_argument(
         "--collection-run-id",
         required=True,
+    )
+    rbac_parser.add_argument(
+        "--deployment-execution-id",
+        required=True,
+    )
+    rbac_parser.add_argument(
+        "--release-ledger",
+        required=True,
+        type=Path,
     )
     rbac_parser.add_argument(
         "--attestation-manifest-digest",
@@ -1072,6 +1090,7 @@ def main(
                 require_rbac_policy=args.preflight_kind == "rbac",
                 require_attestation=True,
                 expected_collection_run_id=args.collection_run_id,
+                expected_deployment_execution_id=(args.deployment_execution_id),
                 attestation_manifest_digest=(args.attestation_manifest_digest),
                 deployment_digest=(
                     args.deployment_digest if args.preflight_kind == "what-if" else None
@@ -1082,6 +1101,7 @@ def main(
                 parameters_digest=(
                     args.parameters_digest if args.preflight_kind == "what-if" else None
                 ),
+                release_ledger_path=args.release_ledger,
                 output_format=args.format,
                 stdout=output,
                 stderr=errors,

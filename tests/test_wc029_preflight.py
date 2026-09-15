@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from urllib.parse import urlencode
@@ -15,6 +15,7 @@ from athena_context.cli import main as cli_main
 from athena_context.wc029_preflight import (
     PreflightInputError,
     PreflightViolation,
+    _canonical_json_digest,
     evaluate_role_assignments,
     evaluate_what_if,
     load_json_file,
@@ -34,6 +35,7 @@ _MG_LEAF_SCOPE = "/providers/Microsoft.Management/managementGroups/synthetic-wor
 _MG_ROOT_SCOPE = "/providers/Microsoft.Management/managementGroups/synthetic-root"
 _MANAGEMENT_GROUP_ANCESTRY = [_MG_LEAF_SCOPE, _MG_ROOT_SCOPE]
 _COLLECTION_RUN_ID = "44444444-4444-4444-4444-444444444444"
+_DEPLOYMENT_EXECUTION_ID = "55555555-5555-5555-5555-555555555555"
 _DEPLOYMENT_DIGEST = "sha256:" + "d" * 64
 _TEMPLATE_DIGEST = "sha256:" + "e" * 64
 _PARAMETERS_DIGEST = "sha256:" + "f" * 64
@@ -60,6 +62,7 @@ _KEY_VAULT_ID = (
 )
 _STORAGE_CONTAINER_ID = f"{_STORAGE_ID}/blobServices/default/containers/evidence"
 _KEY_VAULT_KEY_ID = f"{_KEY_VAULT_ID}/keys/report-signing"
+_WC013_RG_SCOPE = f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/rg-athena-wc013-live"
 _ROLE_DEFINITION_PREFIX = (
     f"/subscriptions/{_SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/"
 )
@@ -72,27 +75,46 @@ _TEST_ROLE_IDS = {
 }
 
 
+def _deployment_target(
+    *,
+    tenant_id: str = _TENANT_ID,
+    subscription_id: str = _SUBSCRIPTION_ID,
+    resource_group_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    reviewed_resource_groups = (
+        (_RG_SCOPE, _WC013_RG_SCOPE) if resource_group_ids is None else resource_group_ids
+    )
+    return {
+        "tenantId": tenant_id,
+        "subscriptionId": subscription_id,
+        "resourceGroupIds": sorted(
+            scope.strip().lower().rstrip("/") for scope in reviewed_resource_groups
+        ),
+    }
+
+
 def _json_digest(value: object) -> str:
-    serialized = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(serialized).hexdigest()
+    return _canonical_json_digest(value)
 
 
 def _manifest(
     bindings: dict[str, str],
     *,
     collection_run_id: str = _COLLECTION_RUN_ID,
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
+    deployment_target: dict[str, object] | None = None,
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
     collected = datetime.now(UTC).replace(microsecond=0) if collected_at is None else collected_at
     expires = collected + timedelta(minutes=10) if expires_at is None else expires_at
     return {
+        "schemaVersion": "athena.wc029PreflightManifest.v1",
         "collectionRunId": collection_run_id,
+        "deploymentExecutionId": deployment_execution_id,
+        "deploymentTarget": (
+            _deployment_target() if deployment_target is None else copy.deepcopy(deployment_target)
+        ),
         "collectedAt": collected.isoformat(),
         "expiresAt": expires.isoformat(),
         "bindings": bindings,
@@ -109,6 +131,7 @@ def _attestation(
     return {
         "artifactKind": kind,
         "collectionRunId": manifest["collectionRunId"],
+        "deploymentExecutionId": manifest["deploymentExecutionId"],
         "collectedAt": manifest["collectedAt"],
         "expiresAt": manifest["expiresAt"],
         "manifestDigest": _json_digest(manifest),
@@ -121,6 +144,8 @@ def _attested_what_if(
     *,
     allowed_change_ids: frozenset[str] = frozenset(),
     collection_run_id: str = _COLLECTION_RUN_ID,
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
+    deployment_target: dict[str, object] | None = None,
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -145,6 +170,8 @@ def _attested_what_if(
             "whatIfDigest": _json_digest(document),
         },
         collection_run_id=collection_run_id,
+        deployment_execution_id=deployment_execution_id,
+        deployment_target=deployment_target,
         collected_at=collected_at,
         expires_at=expires_at,
     )
@@ -170,6 +197,8 @@ def _attested_rbac(
     policy: dict[str, object],
     *,
     collection_run_id: str = _COLLECTION_RUN_ID,
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
+    deployment_target: dict[str, object] | None = None,
     collected_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -185,6 +214,8 @@ def _attested_rbac(
             "whatIfDigest": _EMPTY_DIGEST,
         },
         collection_run_id=collection_run_id,
+        deployment_execution_id=deployment_execution_id,
+        deployment_target=deployment_target,
         collected_at=collected_at,
         expires_at=expires_at,
     )
@@ -195,6 +226,69 @@ def _attested_rbac(
     )
     artifact["manifest"] = manifest
     return artifact
+
+
+def _attested_pair(
+    what_if: object,
+    evidence: dict[str, object],
+    policy: dict[str, object],
+    *,
+    allowed_change_ids: frozenset[str] = frozenset(),
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
+    deployment_target: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    allowlist_records = sorted(
+        (
+            {
+                "canonical": value.strip().lower().rstrip("/"),
+                "raw": value.strip(),
+            }
+            for value in allowed_change_ids
+        ),
+        key=lambda item: (item["raw"], item["canonical"]),
+    )
+    rbac_payload = copy.deepcopy(evidence)
+    manifest = _manifest(
+        {
+            "allowChangeIdsDigest": _json_digest({"allowChangeIds": allowlist_records}),
+            "deploymentDigest": _DEPLOYMENT_DIGEST,
+            "parametersDigest": _PARAMETERS_DIGEST,
+            "policyDigest": _json_digest(policy),
+            "rbacEvidenceDigest": _json_digest(rbac_payload),
+            "templateDigest": _TEMPLATE_DIGEST,
+            "whatIfDigest": _json_digest(what_if),
+        },
+        deployment_execution_id=deployment_execution_id,
+        deployment_target=deployment_target,
+    )
+    what_if_manifest = copy.deepcopy(manifest)
+    rbac_manifest = copy.deepcopy(manifest)
+    return (
+        {
+            "attestation": _attestation(
+                "what-if",
+                what_if_manifest,
+                (
+                    "allowChangeIdsDigest",
+                    "deploymentDigest",
+                    "parametersDigest",
+                    "templateDigest",
+                    "whatIfDigest",
+                ),
+            ),
+            "manifest": what_if_manifest,
+            "whatIf": what_if,
+        },
+        {
+            **rbac_payload,
+            "attestation": _attestation(
+                "rbac",
+                rbac_manifest,
+                ("policyDigest", "rbacEvidenceDigest"),
+            ),
+            "manifest": rbac_manifest,
+        },
+    )
 
 
 def _artifact_manifest_digest(input_path: object) -> str:
@@ -208,13 +302,20 @@ def _artifact_manifest_digest(input_path: object) -> str:
 def _what_if_cli_args(
     input_path: object,
     *extra: str,
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
 ) -> list[str]:
+    release_ledger = Path(str(input_path)).parent / "release-ledger"
+    release_ledger.mkdir(exist_ok=True)
     return [
         "wc029-preflight",
         "what-if",
         str(input_path),
         "--collection-run-id",
         _COLLECTION_RUN_ID,
+        "--deployment-execution-id",
+        deployment_execution_id,
+        "--release-ledger",
+        str(release_ledger),
         "--attestation-manifest-digest",
         _artifact_manifest_digest(input_path),
         "--deployment-digest",
@@ -231,7 +332,10 @@ def _rbac_cli_args(
     input_path: object,
     policy_path: object,
     *extra: str,
+    deployment_execution_id: str = _DEPLOYMENT_EXECUTION_ID,
 ) -> list[str]:
+    release_ledger = Path(str(input_path)).parent / "release-ledger"
+    release_ledger.mkdir(exist_ok=True)
     return [
         "wc029-preflight",
         "rbac",
@@ -240,6 +344,10 @@ def _rbac_cli_args(
         str(policy_path),
         "--collection-run-id",
         _COLLECTION_RUN_ID,
+        "--deployment-execution-id",
+        deployment_execution_id,
+        "--release-ledger",
+        str(release_ledger),
         "--attestation-manifest-digest",
         _artifact_manifest_digest(input_path),
         *extra,
@@ -259,6 +367,7 @@ def _evaluate_guarded_rbac(
         require_separation_rules=True,
         require_attestation=True,
         expected_collection_run_id=_COLLECTION_RUN_ID,
+        expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
         attestation_manifest_digest=_json_digest(artifact["manifest"]),
         now=now,
     )
@@ -279,6 +388,22 @@ def _resource_type_for_test(resource_id: str) -> str:
     namespace = segments[provider_index + 1]
     type_segments = segments[provider_index + 2 :: 2]
     return "/".join((namespace, *type_segments))
+
+
+def _resource_snapshot(
+    resource_id: str,
+    *,
+    properties: dict[str, object] | None = None,
+    **values: object,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "id": resource_id,
+        "name": resource_id.rstrip("/").rsplit("/", 1)[-1],
+        "type": _resource_type_for_test(resource_id),
+        "properties": {} if properties is None else properties,
+    }
+    snapshot.update(values)
+    return snapshot
 
 
 def _change(
@@ -939,7 +1064,7 @@ def test_no_change_requires_complete_consistent_zero_delta_evidence() -> None:
                     ]
                 }
             ),
-            "delta conflicts with its snapshots",
+            "NoEffect before and after values conflict",
         ),
         (
             lambda change: change.update(
@@ -952,7 +1077,7 @@ def test_no_change_requires_complete_consistent_zero_delta_evidence() -> None:
                     ]
                 }
             ),
-            "empty component",
+            "property path",
         ),
     ],
 )
@@ -997,7 +1122,7 @@ def test_no_change_reconciles_snapshot_identity_and_delta_values() -> None:
     ]
     with pytest.raises(
         PreflightInputError,
-        match="conflicts with root snapshots",
+        match="does not reconcile with resource snapshots",
     ):
         evaluate_what_if(_what_if(contradictory))
 
@@ -1020,7 +1145,7 @@ def test_no_change_reconciles_snapshot_identity_and_delta_values() -> None:
     ]
     with pytest.raises(
         PreflightInputError,
-        match="delta conflicts with its snapshots",
+        match="NoEffect before and after values conflict",
     ):
         evaluate_what_if(_what_if(object_delta))
 
@@ -1071,6 +1196,50 @@ def test_what_if_rejects_malformed_potential_changes() -> None:
         match="potential change resourceId",
     ):
         evaluate_what_if(document)
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "change_type"),
+    [
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Authorization/roleAssignments/"
+            "66666666-6666-6666-6666-666666666666",
+            "Create",
+        ),
+        (
+            f"{_RG_SCOPE}/providers/Microsoft.Authorization/roleAssignments/"
+            "66666666-6666-6666-6666-666666666666",
+            "Modify",
+        ),
+        (
+            f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.Authorization/roleDefinitions/"
+            "77777777-7777-7777-7777-777777777777",
+            "Create",
+        ),
+        (
+            f"{_SUBSCRIPTION_SCOPE}/providers/Microsoft.Authorization/roleDefinitions/"
+            "77777777-7777-7777-7777-777777777777",
+            "Modify",
+        ),
+    ],
+)
+def test_what_if_fails_closed_on_authorization_mutations(
+    resource_id: str,
+    change_type: str,
+) -> None:
+    change = _change(
+        resource_id,
+        change_type,
+        path="tags.release",
+        after="wc029",
+    )
+
+    violations = evaluate_what_if(
+        _what_if(change),
+        allowed_change_ids=frozenset({resource_id}),
+    )
+
+    assert {violation.code for violation in violations} == {"authorization-change-unsupported"}
 
 
 def test_what_if_rejects_mixed_result_envelopes() -> None:
@@ -1619,6 +1788,7 @@ def test_what_if_rejects_resource_id_only_and_nested_unsafe_delta() -> None:
                 "id": _CONTAINER_APP_ID,
                 "name": "athena-presentation",
                 "type": "Microsoft.App/containerApps",
+                "properties": {},
             },
         },
         {
@@ -1652,18 +1822,6 @@ def test_what_if_rejects_resource_id_only_and_nested_unsafe_delta() -> None:
             "delta": [
                 {
                     "path": "properties.template.revisionSuffix",
-                    "propertyChangeType": "NoEffect",
-                    "before": "same",
-                    "after": "different",
-                }
-            ],
-        },
-        {
-            "resourceId": _CONTAINER_APP_ID,
-            "changeType": "Modify",
-            "delta": [
-                {
-                    "path": "properties.template.revisionSuffix",
                     "propertyChangeType": "Modify",
                     "before": "same",
                     "after": "same",
@@ -1675,13 +1833,15 @@ def test_what_if_rejects_resource_id_only_and_nested_unsafe_delta() -> None:
             "changeType": "Modify",
             "before": {
                 "id": _CONTAINER_APP_ID,
-                "name": "athena-presentation-before",
+                "name": "athena-presentation",
                 "type": "Microsoft.App/containerApps",
+                "properties": {},
             },
             "after": {
                 "id": _CONTAINER_APP_ID,
-                "name": "athena-presentation-after",
+                "name": "athena-presentation",
                 "type": "Microsoft.App/containerApps",
+                "properties": {},
             },
         },
     ],
@@ -1697,37 +1857,262 @@ def test_modify_requires_meaningful_effective_property_delta(
     assert "uninspectable-change" in {item.code for item in violations}
 
 
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {
+            "path": "tags.release",
+            "propertyChangeType": "NoEffect",
+            "after": "wc029",
+        },
+        {
+            "path": "tags.release",
+            "propertyChangeType": "NoEffect",
+            "before": "wc029",
+        },
+        {
+            "path": "tags.release",
+            "propertyChangeType": "NoEffect",
+            "before": "wc029",
+            "after": "changed",
+        },
+        {
+            "path": "properties.configuration.ingress.external",
+            "propertyChangeType": "NoEffect",
+            "before": False,
+            "after": 0,
+        },
+    ],
+)
+def test_modify_rejects_incomplete_or_changed_noeffect(
+    delta: dict[str, object],
+) -> None:
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": _resource_snapshot(
+            _CONTAINER_APP_ID,
+            properties={
+                "configuration": {"ingress": {"external": False}},
+            },
+            tags={"release": "wc029"},
+        ),
+        "after": _resource_snapshot(
+            _CONTAINER_APP_ID,
+            properties={
+                "configuration": {"ingress": {"external": False}},
+            },
+            tags={"release": "wc029"},
+        ),
+        "delta": [delta],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="NoEffect requires before and after|NoEffect before and after values conflict",
+    ):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_modify_requires_noeffect_resource_snapshot_reconciliation() -> None:
+    without_snapshots = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "delta": [
+                {
+                    "path": "tags.release",
+                    "propertyChangeType": "NoEffect",
+                    "before": "wc029",
+                    "after": "wc029",
+                }
+            ],
+        }
+    )
+    with pytest.raises(PreflightInputError, match="complete resource snapshots"):
+        evaluate_what_if(
+            without_snapshots,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+    conflicting_snapshot = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "before": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={"template": {"revisionSuffix": "before"}},
+                tags={"release": "wc029"},
+            ),
+            "after": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={"template": {"revisionSuffix": "after"}},
+                tags={"release": "changed"},
+            ),
+            "delta": [
+                {
+                    "path": "tags.release",
+                    "propertyChangeType": "NoEffect",
+                    "before": "wc029",
+                    "after": "wc029",
+                },
+                {
+                    "path": "properties.template.revisionSuffix",
+                    "propertyChangeType": "Modify",
+                    "before": "before",
+                    "after": "after",
+                },
+            ],
+        }
+    )
+    with pytest.raises(PreflightInputError, match="does not reconcile"):
+        evaluate_what_if(
+            conflicting_snapshot,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_modify_accepts_reconciled_noeffect_with_meaningful_delta() -> None:
+    change = _what_if(
+        {
+            "resourceId": _CONTAINER_APP_ID,
+            "changeType": "Modify",
+            "before": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={"template": {"revisionSuffix": "before"}},
+                tags={"release": "wc029"},
+            ),
+            "after": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={"template": {"revisionSuffix": "after"}},
+                tags={"release": "wc029"},
+            ),
+            "delta": [
+                {
+                    "path": "tags.release",
+                    "propertyChangeType": "NoEffect",
+                    "before": "wc029",
+                    "after": "wc029",
+                },
+                {
+                    "path": "properties.template.revisionSuffix",
+                    "propertyChangeType": "Modify",
+                    "before": "before",
+                    "after": "after",
+                },
+            ],
+        }
+    )
+
+    assert (
+        evaluate_what_if(
+            change,
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["id", "name", "type", "properties"],
+)
+def test_modify_complete_snapshots_require_full_resource_identity(
+    missing_field: str,
+) -> None:
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties={"template": {"revisionSuffix": "before"}},
+    )
+    after = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties={"template": {"revisionSuffix": "after"}},
+    )
+    before.pop(missing_field)
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+    }
+
+    with pytest.raises(PreflightInputError, match=missing_field):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "properties": {},
+        },
+        {
+            **_resource_snapshot(
+                _STORAGE_ID,
+                properties={},
+                tags={"release": "wc029"},
+            ),
+            "type": "Microsoft.Authorization/roleAssignments",
+        },
+    ],
+)
+def test_snapshot_type_cannot_reclassify_authorization_change(
+    after: dict[str, object],
+) -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Create",
+        "after": after,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="snapshot id|type does not match resourceId",
+    ):
+        evaluate_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
 def test_modify_derives_and_validates_complete_snapshot_delta() -> None:
     safe = _what_if(
         {
             "resourceId": _CONTAINER_APP_ID,
             "changeType": "Modify",
-            "before": {
-                "id": _CONTAINER_APP_ID,
-                "properties": {
+            "before": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={
                     "template": {"revisionSuffix": "before"},
                 },
-            },
-            "after": {
-                "id": _CONTAINER_APP_ID,
-                "properties": {
+            ),
+            "after": _resource_snapshot(
+                _CONTAINER_APP_ID,
+                properties={
                     "template": {"revisionSuffix": "after"},
                 },
-            },
+            ),
         }
     )
     unsafe = _what_if(
         {
             "resourceId": _STORAGE_ID,
             "changeType": "Modify",
-            "before": {
-                "id": _STORAGE_ID,
-                "properties": {"allowSharedKeyAccess": False},
-            },
-            "after": {
-                "id": _STORAGE_ID,
-                "properties": {"allowSharedKeyAccess": True},
-            },
+            "before": _resource_snapshot(
+                _STORAGE_ID,
+                properties={"allowSharedKeyAccess": False},
+            ),
+            "after": _resource_snapshot(
+                _STORAGE_ID,
+                properties={"allowSharedKeyAccess": True},
+            ),
         }
     )
 
@@ -1970,9 +2355,24 @@ def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:
         ("properties..allowSharedKeyAccess", "Modify"),
         ("properties.allowSharedKeyAccess.", "Modify"),
         ("<resource>..properties.allowSharedKeyAccess", "Modify"),
+        ("<resource>/", "Delete"),
+        ("<resource>\\", "Delete"),
+        ("<RESOURCE>", "Delete"),
+        ("/", "Delete"),
+        ("\\", "Delete"),
+        ("properties/allowSharedKeyAccess", "Modify"),
+        ("properties\\allowSharedKeyAccess", "Modify"),
+        ("properties~1allowSharedKeyAccess", "Modify"),
+        ("properties~0allowSharedKeyAccess", "Modify"),
+        ("properties.allowSharedKeyAccess[", "Modify"),
+        ("properties.allowSharedKeyAccess[]", "Modify"),
+        ("properties.allowSharedKeyAccess[-1]", "Modify"),
+        ("properties.allowSharedKeyAccess[01]", "Modify"),
+        ("properties.allowSharedKeyAccess[0]suffix", "Modify"),
+        ("[0].properties.allowSharedKeyAccess", "Modify"),
     ],
 )
-def test_property_paths_reject_empty_non_root_components(
+def test_property_paths_reject_every_unsupported_grammar_form(
     path: str,
     property_change_type: str,
 ) -> None:
@@ -1988,7 +2388,7 @@ def test_property_paths_reject_empty_non_root_components(
     assert isinstance(item, dict)
     item["propertyChangeType"] = property_change_type
 
-    with pytest.raises(PreflightInputError, match="empty component"):
+    with pytest.raises(PreflightInputError, match="property path"):
         evaluate_what_if(
             _what_if(change),
             allowed_change_ids=frozenset({_STORAGE_ID}),
@@ -2040,6 +2440,7 @@ def test_security_identifiers_reject_kelvin_aliases_and_bind_raw_allowlists() ->
             allowed_change_ids=frozenset({_KEY_VAULT_ID.upper()}),
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(ascii_artifact["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -2055,6 +2456,7 @@ def test_security_identifiers_reject_kelvin_aliases_and_bind_raw_allowlists() ->
             allowed_change_ids=frozenset({kelvin_allowlist_id}),
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(ascii_artifact["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -2974,6 +3376,47 @@ def test_json_parser_rejects_casefold_key_collisions(
         load_json_file(collision)
 
 
+def test_json_decimals_remain_exact_for_digest_and_noeffect(
+    tmp_path,
+) -> None:
+    lower_path = tmp_path / "lower.json"
+    higher_path = tmp_path / "higher.json"
+    lower_path.write_text('{"value":9007199254740992.0}', encoding="utf-8")
+    higher_path.write_text('{"value":9007199254740993.0}', encoding="utf-8")
+    lower = load_json_file(lower_path)
+    higher = load_json_file(higher_path)
+
+    assert lower != higher
+    assert _json_digest(lower) != _json_digest(higher)
+
+    change = _change(_STORAGE_ID, "NoChange")
+    assert isinstance(change["before"], dict)
+    assert isinstance(change["after"], dict)
+    change["before"]["properties"] = {"ratio": "EXACT_LOWER"}
+    change["after"]["properties"] = {"ratio": "EXACT_LOWER"}
+    change["delta"] = [
+        {
+            "path": "properties.ratio",
+            "propertyChangeType": "NoEffect",
+            "before": "EXACT_LOWER",
+            "after": "EXACT_HIGHER",
+        }
+    ]
+    exact_path = tmp_path / "exact-noeffect.json"
+    exact_path.write_text(
+        json.dumps(_what_if(change))
+        .replace('"EXACT_LOWER"', "9007199254740992.0")
+        .replace('"EXACT_HIGHER"', "9007199254740993.0"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="NoEffect before and after values conflict",
+    ):
+        evaluate_what_if(load_json_file(exact_path))
+
+
 def test_cli_exit_codes_and_json_output(tmp_path, capsys) -> None:
     safe_path = tmp_path / "safe.json"
     safe_path.write_text(
@@ -3024,6 +3467,192 @@ def test_public_cli_emits_deterministic_human_readable_success(tmp_path) -> None
     assert exit_code == 0
     assert stdout.getvalue() == ("WC-029 preflight: SAFE\nCheck: what-if\nBlockers: 0\n")
     assert stderr.getvalue() == ""
+
+
+def test_public_cli_consumes_shared_manifest_once_per_artifact_kind(
+    tmp_path,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    what_if_artifact, rbac_artifact = _attested_pair(
+        _what_if(_change(_STORAGE_ID, "NoChange")),
+        _guarded_evidence([assignment]),
+        policy,
+    )
+    what_if_path = tmp_path / "what-if.json"
+    rbac_path = tmp_path / "rbac.json"
+    policy_path = tmp_path / "policy.json"
+    what_if_path.write_text(json.dumps(what_if_artifact), encoding="utf-8")
+    rbac_path.write_text(json.dumps(rbac_artifact), encoding="utf-8")
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    assert (
+        cli_main(
+            _what_if_cli_args(what_if_path),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+        == 0
+    )
+    assert (
+        cli_main(
+            _rbac_cli_args(rbac_path, policy_path),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+        == 0
+    )
+
+    what_if_error = StringIO()
+    assert (
+        cli_main(
+            _what_if_cli_args(what_if_path),
+            stdout=StringIO(),
+            stderr=what_if_error,
+        )
+        == 3
+    )
+    assert "already consumed what-if" in what_if_error.getvalue()
+
+    rbac_error = StringIO()
+    assert (
+        cli_main(
+            _rbac_cli_args(rbac_path, policy_path),
+            stdout=StringIO(),
+            stderr=rbac_error,
+        )
+        == 3
+    )
+    assert "already consumed rbac" in rbac_error.getvalue()
+
+    ledger_files = sorted(path.name for path in (tmp_path / "release-ledger").iterdir())
+    assert ledger_files == [
+        f"{_COLLECTION_RUN_ID}.collection.json",
+        f"{_DEPLOYMENT_EXECUTION_ID}.binding.json",
+        f"{_DEPLOYMENT_EXECUTION_ID}.rbac.consumed.json",
+        f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json",
+    ]
+
+
+def test_public_cli_rejects_cross_artifact_manifest_rebinding(tmp_path) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    what_if_document = _what_if(_change(_STORAGE_ID, "NoChange"))
+    what_if_artifact, _ = _attested_pair(
+        what_if_document,
+        _guarded_evidence([assignment]),
+        policy,
+    )
+    _, rebound_rbac_artifact = _attested_pair(
+        what_if_document,
+        _guarded_evidence([assignment]),
+        policy,
+        deployment_target=_deployment_target(
+            resource_group_ids=(
+                _RG_SCOPE,
+                _WC013_RG_SCOPE,
+                _SIBLING_RG_SCOPE,
+            ),
+        ),
+    )
+    what_if_path = tmp_path / "what-if.json"
+    rbac_path = tmp_path / "rbac.json"
+    policy_path = tmp_path / "policy.json"
+    what_if_path.write_text(json.dumps(what_if_artifact), encoding="utf-8")
+    rbac_path.write_text(json.dumps(rebound_rbac_artifact), encoding="utf-8")
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    assert (
+        cli_main(
+            _what_if_cli_args(what_if_path),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+        == 0
+    )
+    stderr = StringIO()
+    assert (
+        cli_main(
+            _rbac_cli_args(rbac_path, policy_path),
+            stdout=StringIO(),
+            stderr=stderr,
+        )
+        == 3
+    )
+    assert "collectionRunId is already bound" in stderr.getvalue()
+
+
+def test_public_cli_binds_collection_run_to_one_deployment_execution(
+    tmp_path,
+) -> None:
+    second_execution_id = "88888888-8888-8888-8888-888888888888"
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    what_if_document = _what_if(_change(_STORAGE_ID, "NoChange"))
+    what_if_artifact, _ = _attested_pair(
+        what_if_document,
+        _guarded_evidence([assignment]),
+        policy,
+    )
+    _, rebound_rbac_artifact = _attested_pair(
+        what_if_document,
+        _guarded_evidence([assignment]),
+        policy,
+        deployment_execution_id=second_execution_id,
+    )
+    what_if_path = tmp_path / "what-if.json"
+    rbac_path = tmp_path / "rbac.json"
+    policy_path = tmp_path / "policy.json"
+    what_if_path.write_text(json.dumps(what_if_artifact), encoding="utf-8")
+    rbac_path.write_text(json.dumps(rebound_rbac_artifact), encoding="utf-8")
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    assert (
+        cli_main(
+            _what_if_cli_args(what_if_path),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+        == 0
+    )
+    stderr = StringIO()
+    assert (
+        cli_main(
+            _rbac_cli_args(
+                rbac_path,
+                policy_path,
+                deployment_execution_id=second_execution_id,
+            ),
+            stdout=StringIO(),
+            stderr=stderr,
+        )
+        == 3
+    )
+    assert "collectionRunId is already bound" in stderr.getvalue()
 
 
 def test_public_cli_emits_deterministic_json_and_blocks_delete(tmp_path) -> None:
@@ -3078,6 +3707,7 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             stale,
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(stale["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -3095,6 +3725,7 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             changed,
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(changed["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -3128,6 +3759,7 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             regenerated,
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=trusted_manifest_digest,
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -3143,6 +3775,7 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             artifact,
             require_attestation=True,
             expected_collection_run_id=("55555555-5555-5555-5555-555555555555"),
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(artifact["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
@@ -3159,10 +3792,170 @@ def test_what_if_attestation_rejects_stale_replay_and_digest_changes() -> None:
             allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(artifact["manifest"]),
             deployment_digest=_DEPLOYMENT_DIGEST,
             template_digest=_TEMPLATE_DIGEST,
             parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+
+def test_what_if_attestation_binds_deployment_execution_and_boundary() -> None:
+    document = _what_if(_change(_STORAGE_ID, "NoChange"))
+    artifact = _attested_what_if(document)
+    with pytest.raises(
+        PreflightInputError,
+        match="deploymentExecutionId does not match",
+    ):
+        evaluate_what_if(
+            artifact,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=("66666666-6666-6666-6666-666666666666"),
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    wrong_boundary = _attested_what_if(
+        document,
+        deployment_target=_deployment_target(
+            resource_group_ids=(_RG_SCOPE,),
+        ),
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="outside the reviewed deployment resource-group boundary",
+    ):
+        evaluate_what_if(
+            wrong_boundary,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(wrong_boundary["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    other_subscription = "99999999-9999-9999-9999-999999999999"
+    wrong_subscription = _attested_what_if(
+        document,
+        deployment_target=_deployment_target(
+            subscription_id=other_subscription,
+            resource_group_ids=(f"/subscriptions/{other_subscription}/resourceGroups/synthetic",),
+        ),
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="outside the reviewed deployment subscription",
+    ):
+        evaluate_what_if(
+            wrong_subscription,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(wrong_subscription["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    sibling_resource = f"{_SIBLING_RG_SCOPE}/providers/Microsoft.Storage/storageAccounts/synthetic"
+    out_of_boundary_allowlist = _attested_what_if(
+        document,
+        allowed_change_ids=frozenset({sibling_resource}),
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="allow-change resource ID is outside the reviewed deployment resource-group boundary",
+    ):
+        evaluate_what_if(
+            out_of_boundary_allowlist,
+            allowed_change_ids=frozenset({sibling_resource}),
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(out_of_boundary_allowlist["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+    snapshot_change = _change(
+        _STORAGE_ID,
+        "Create",
+        path="tags.release",
+        after="wc029",
+    )
+    snapshot_change["after"] = {
+        "id": sibling_resource,
+        "tags": {"release": "wc029"},
+    }
+    out_of_boundary_snapshot = _attested_what_if(
+        _what_if(snapshot_change),
+        allowed_change_ids=frozenset({_STORAGE_ID}),
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="after snapshot id is outside the reviewed deployment resource-group boundary",
+    ):
+        evaluate_what_if(
+            out_of_boundary_snapshot,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(out_of_boundary_snapshot["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    "deployment_target",
+    [
+        _deployment_target(
+            tenant_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ),
+        _deployment_target(
+            resource_group_ids=(_WC013_RG_SCOPE,),
+        ),
+    ],
+)
+def test_rbac_attestation_binds_manifest_deployment_target(
+    deployment_target: dict[str, object],
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    artifact = _attested_rbac(
+        _guarded_evidence([assignment]),
+        policy,
+        deployment_target=deployment_target,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="does not match the reviewed manifest deploymentTarget",
+    ):
+        evaluate_role_assignments(
+            artifact,
+            policy_document=policy,
+            require_separation_rules=True,
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
         )
 
 
@@ -3217,6 +4010,7 @@ def test_rbac_attestation_binds_reviewed_inputs(
             require_separation_rules=True,
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(evidence["manifest"]),
         )
 
@@ -3247,6 +4041,7 @@ def test_rbac_attestation_requires_the_shared_collection_run() -> None:
             require_separation_rules=True,
             require_attestation=True,
             expected_collection_run_id=("55555555-5555-5555-5555-555555555555"),
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=_json_digest(artifact["manifest"]),
         )
 
@@ -3312,6 +4107,7 @@ def test_rbac_attestation_cannot_be_regenerated_after_tampering() -> None:
             require_separation_rules=True,
             require_attestation=True,
             expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
             attestation_manifest_digest=trusted_manifest_digest,
         )
 
@@ -4160,7 +4956,7 @@ def test_guarded_rbac_rejects_inconsistent_hierarchy_sources() -> None:
         ("resultTruncated", "true", "explicitly non-truncated"),
         ("resultTruncated", "0", "explicitly non-truncated"),
         ("resultTruncated", 0, "explicitly non-truncated"),
-        ("resultTruncated", 0.0, "explicitly non-truncated"),
+        ("resultTruncated", Decimal("0.0"), "explicitly non-truncated"),
         ("resultTruncated", 1, "explicitly non-truncated"),
         ("resultTruncated", [], "explicitly non-truncated"),
         ("count", 0, "count and totalRecords"),

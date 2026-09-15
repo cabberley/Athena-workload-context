@@ -146,17 +146,29 @@ Evaluate each saved full-resource what-if artifact with the repository CLI. Repe
 `--allow-change` for every exact reviewed `Create` or `Modify` resource ID for that root; omit it
 when the only acceptable result is `NoChange`.
 
-Create one run ID for both what-if and RBAC evidence. The collector envelope records UTC
-`collectedAt`/`expiresAt` with a validity window no longer than 30 minutes and SHA-256 bindings for
-the raw what-if, RBAC payload, reviewed policy, deployment, template, parameters, and normalized
-allowlist. Store one shared manifest in both artifacts and have a reviewer approve its SHA-256
-digest independently of the artifacts.
+Create one collection run ID and one immutable deployment execution ID for both what-if and RBAC
+evidence. Prepare one persistent release-ledger directory in the protected release workspace; it
+must not be a symlink, temporary directory, or artifact-controlled path. Do not delete, clone, or
+replace it after a preflight consumes evidence.
+
+The versioned `athena.wc029PreflightManifest.v1` records UTC `collectedAt`/`expiresAt` with a
+validity window no longer than 30 minutes, the deployment execution ID, and a reviewed
+`deploymentTarget` containing the exact tenant, subscription, and non-empty resource-group boundary
+set. It also contains SHA-256 bindings for the raw what-if, RBAC payload, reviewed policy,
+deployment, template, parameters, and normalized allowlist. Store one byte-equivalent shared
+manifest in both artifacts and have a reviewer approve its SHA-256 digest independently of the
+artifacts. Every what-if resource, snapshot, potential-change, and allowlist ID must be inside the
+manifest boundary. The RBAC target must match its tenant, subscription, and resource group exactly.
 
 ```powershell
 $CollectionRunId = [guid]::NewGuid().ToString()
+$DeploymentExecutionId = [guid]::NewGuid().ToString()
+$ReleaseLedgerPath = (Resolve-Path .\evidence\release-ledger).Path
 $PreflightJson = & athena-context wc029-preflight what-if `
   .\evidence\wc013.what-if.json `
   --collection-run-id $CollectionRunId `
+  --deployment-execution-id $DeploymentExecutionId `
+  --release-ledger $ReleaseLedgerPath `
   --attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
   --deployment-digest 'sha256:<reviewed-deployment-digest>' `
   --template-digest 'sha256:<reviewed-template-digest>' `
@@ -177,7 +189,15 @@ format for an operator-readable summary and retain `--format json` output as rel
 Every `NoChange` row must retain complete identical `before` and `after` resource objects and no
 effective delta. Preserve matching `id`, `name`, `type`, and object-valued `properties`, and retain
 only `NoEffect` entries that exactly reconcile with both snapshots; do not reduce unchanged rows to
-resource IDs.
+resource IDs. Every `NoEffect`, including one inside a `Modify`, requires type-exact equal
+`before`/`after` values and complete resource snapshots that reconcile at its exact path. Complete
+Modify snapshots require matching `id`, `name`, `type`, and object-valued `properties`; partial or
+resource-inconsistent snapshots fail closed.
+
+Only exact root aliases `<resource>`, `<resource>.`, and `.` are accepted. Non-root paths use dotted
+ASCII identifier components and canonical numeric indexes such as `containers[0]`. Slash,
+backslash, tilde escapes, malformed or non-numeric brackets, leading-zero indexes, and any other root
+suffix fail closed.
 
 The checked-in WC-029 artifact is preparation-only: it validates the existing baseline and leaves
 Dependency Agent and Network Watcher Agent deployment disabled. See
@@ -188,6 +208,9 @@ The gate fails on:
 
 - any `Delete`;
 - any `<resource>`, `<resource>.`, or `.` root `Delete`/`Remove` hidden under a non-delete change;
+- any planned `Microsoft.Authorization/roleAssignments` or `roleDefinitions` create or modify,
+  even if its resource ID is allowlisted, until post-deployment authorization derivation is
+  separation-aware;
 - an unapproved `Create` or `Modify`;
 - changes to VNet, subnet, NSG, load balancer, Key Vault, Storage network rules, AMPLS, private DNS,
   or role assignments that are absent from the reviewed change set;
@@ -379,9 +402,10 @@ policy uses `approvedAssignments`; never populate it by copying the observed out
 
 The RBAC envelope uses the same `$CollectionRunId`, bounded timestamps, and SHA-256 bindings for the
 reviewed policy, target, hierarchy, membership, and both role-assignment collections. Its embedded
-manifest must be byte-equivalent to the what-if manifest, and the independently reviewed manifest
-digest must not be regenerated after evidence changes. Each separation rule must include the
-reviewed IDs in
+manifest must be byte-equivalent to the what-if manifest and use the same
+`$DeploymentExecutionId`, reviewed `deploymentTarget`, and release ledger. The independently
+reviewed manifest digest must not be regenerated after evidence changes. Each separation rule must
+include the reviewed IDs in
 `forbiddenRoleDefinitionIds` as well as their display names:
 
 ```powershell
@@ -389,6 +413,8 @@ $RbacPreflightJson = & athena-context wc029-preflight rbac `
   .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json `
   --collection-run-id $CollectionRunId `
+  --deployment-execution-id $DeploymentExecutionId `
+  --release-ledger $ReleaseLedgerPath `
   --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>' `
   --format json
 $RbacPreflightExitCode = $LASTEXITCODE
@@ -397,6 +423,13 @@ if ($RbacPreflightExitCode -ne 0) {
   throw "WC-029 RBAC preflight blocked deployment with exit code $RbacPreflightExitCode"
 }
 ```
+
+Each artifact kind can be consumed once for the deployment execution. A repeated what-if or RBAC
+evaluation, or an attempt to use a different manifest with the same execution ID, exits `3` even
+when `expiresAt` has not elapsed. The ledger also binds each `collectionRunId` to exactly one
+deployment execution and manifest, so a new execution ID cannot make the same collected evidence
+reusable. Retain the collection binding, deployment binding, and both consumption records with the
+release evidence.
 
 Required separation:
 
@@ -411,7 +444,9 @@ Required separation:
 ## Phase 4: deploy
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
-deployment name, what-if digest, and operator identity must be captured before execution.
+deployment name, deployment execution ID, what-if digest, ledger binding, both consumption records,
+and operator identity must be captured before execution. Do not deploy unless both one-time
+preflight consumptions exist for the same shared manifest.
 
 After deployment:
 

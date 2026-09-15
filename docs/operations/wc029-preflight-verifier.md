@@ -27,18 +27,32 @@ Container Apps network values are type checked independently: ingress `external`
 ARM `Ignore` and `Deploy` results fail closed because they do not provide a predictable reviewed
 final state. Any non-empty `potentialChanges` collection also blocks the gate because those
 resources were not resolved into the reviewed `changes` collection.
+Planned `Microsoft.Authorization/roleAssignments` and `roleDefinitions` creates or modifies always
+block, even when their IDs are allowlisted. The what-if gate does not yet derive the resulting
+principal, role, condition, and inherited scope into the separation policy; authorization changes
+therefore require a future separation-aware evaluator rather than being treated as ordinary
+resource mutations.
 `NoChange` is accepted only with complete, object-valued, type-exact, structurally identical
 `before` and `after` snapshots and no effective delta. Each snapshot must contain matching `id`,
-`name`, `type`, and
-object-valued `properties`. Every `NoEffect` path and value is resolved against both root snapshots;
+`name`, `type`, and object-valued `properties`. Every `NoEffect` entry must contain both `before`
+and `after`, those values must be type-exact and equal, and the path and values must reconcile with
+complete resource-level `before` and `after` snapshots. Complete Modify snapshots require matching
+`id`, `name`, `type`, and object-valued `properties`; a partial or type-inconsistent snapshot cannot
+reclassify the resource or supply protected-state evidence. Missing, changed, or
+snapshot-conflicting `NoEffect` evidence is malformed rather than ignored.
+Every `NoEffect` path and value in a `NoChange` row is resolved against both root snapshots;
 missing, duplicate, contradictory, nested type-changing, or out-of-snapshot entries fail. Nested or
 root deletion/removal, conflicting snapshots, or any non-empty effective property change makes the
 artifact malformed rather than silently safe.
 Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
 one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
-names cannot impersonate structurally nested protected settings. Leading, trailing, or repeated
-non-root path separators are rejected rather than treated as aliases. Unicode characters whose case
-fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths.
+names cannot impersonate structurally nested protected settings. Property paths use an allowlisted
+grammar: the only root aliases are exact `<resource>`, `<resource>.`, and `.`; non-root paths use
+dotted ASCII identifier components and canonical numeric indexes such as `containers[0]`. Forward
+slashes, backslashes, tildes/JSON-pointer escapes, non-exact root suffixes, empty components,
+non-numeric or malformed brackets, and leading-zero indexes are rejected. Unicode characters whose
+case fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property
+paths.
 Every `Modify` must contain a meaningful effective property delta. `NoEffect` entries, empty or
 missing deltas backed only by an `after` payload, resource metadata such as `id`, `name`, or `type`,
 and leaves whose `before` and `after` values are unchanged do not make a change inspectable. When
@@ -50,14 +64,28 @@ derived delta.
 separate `after` snapshot appears safe. A root `after` value must be an object, and root deltas are
 treated as ancestors of every protected property.
 
-Production what-if evidence is an attested envelope containing `whatIf` plus `collectionRunId`,
-`collectedAt`, `expiresAt`, and SHA-256 bindings for the what-if result, deployment, template,
-parameters, and normalized `--allow-change` list. The validity window must be positive and no longer
-than 30 minutes; expired or replayed evidence and a collection time more than five minutes in the
-future fail deterministically. Use the same reviewed `collectionRunId` for the RBAC artifact.
-Both artifacts embed the same manifest covering their payload digests, policy digest, timestamps,
-run ID, and reviewed inputs. The CLI requires the independently reviewed SHA-256 digest of that
-manifest; regenerating the manifest after changing evidence does not satisfy the gate.
+Production what-if evidence is an attested envelope containing `whatIf` and the versioned
+`athena.wc029PreflightManifest.v1` manifest. The manifest contains `collectionRunId`, an immutable
+`deploymentExecutionId`, `collectedAt`, `expiresAt`, a reviewed `deploymentTarget`, and SHA-256
+bindings for the what-if result, RBAC evidence, policy, deployment, template, parameters, and
+normalized `--allow-change` list. `deploymentTarget` contains the exact tenant, subscription, and
+non-empty set of resource-group boundaries. Every what-if resource ID, snapshot ID, potential-change
+ID, and allowlist ID must belong to that subscription and one of those resource groups. The RBAC
+target tenant, subscription, and resource group must match the same manifest exactly.
+
+The validity window must be positive and no longer than 30 minutes; a collection time more than five
+minutes in the future fails deterministically. Time validity alone is not replay protection. Both
+artifacts must embed the same byte-equivalent manifest and use the same independently reviewed
+manifest digest, `collectionRunId`, and `deploymentExecutionId`.
+
+The guarded CLI also requires one trusted, persistent `--release-ledger` directory controlled by the
+release workflow. It creates one immutable deployment binding and one create-only consumption record
+for each artifact kind. It also creates an immutable collection-run binding so one
+`collectionRunId` cannot be wrapped in a new manifest or rebound to a second deployment execution.
+The first valid what-if and first valid RBAC evaluation may consume the shared manifest; any repeated
+use of either kind, a different manifest or deployment target for the same execution, a reused
+collection run under another execution, a missing ledger, or a symlink ledger fails with exit `3`.
+Do not delete, clone, replace, or redirect the ledger to make evidence reusable.
 
 Security-bound ARM resource and role-definition IDs, scopes, allowlist values, and request URLs must
 be ASCII. Unicode aliases such as Kelvin sign `K` or long-s `ſ` are rejected before normalization,
@@ -68,7 +96,9 @@ case-folded values.
 ```powershell
 athena-context wc029-preflight what-if .\evidence\what-if.json `
   --collection-run-id '<collection-run-guid>' `
---attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
+  --deployment-execution-id '<deployment-execution-guid>' `
+  --release-ledger .\evidence\release-ledger `
+  --attestation-manifest-digest 'sha256:<reviewed-manifest-digest>' `
   --deployment-digest 'sha256:<deployment-digest>' `
   --template-digest 'sha256:<template-digest>' `
   --parameters-digest 'sha256:<parameters-digest>' `
@@ -99,6 +129,8 @@ python -m athena_context.wc029_preflight what-if .\evidence\what-if.json
 athena-context wc029-preflight rbac .\evidence\role-assignments.json `
   --policy .\evidence\reviewed-rbac-policy.json `
   --collection-run-id '<same-collection-run-guid>' `
+  --deployment-execution-id '<same-deployment-execution-guid>' `
+  --release-ledger .\evidence\release-ledger `
   --attestation-manifest-digest 'sha256:<same-reviewed-manifest-digest>'
 ```
 
@@ -166,11 +198,13 @@ subscription-descendant inventory, then compares it with separately reviewed
 `approvedAssignments`. The legacy module entry point keeps its historical optional-policy and
 list-input behavior for compatibility and must not be used as the guarded deployment gate.
 
-The RBAC envelope uses the same bounded timestamps, `collectionRunId`, and independently reviewed
-manifest digest as the what-if envelope. The manifest binds the reviewed policy and the complete
-RBAC payload, including target, hierarchy, service-principal and membership inputs, and
-ancestor/descendant assignment collections. Mutating evidence and regenerating only its embedded
-digests fails against the externally supplied manifest digest.
+The RBAC envelope uses the same bounded timestamps, `collectionRunId`, `deploymentExecutionId`,
+`deploymentTarget`, independently reviewed manifest digest, and trusted release ledger as the
+what-if envelope. The manifest binds the reviewed policy and the complete RBAC payload, including
+target, hierarchy, service-principal and membership inputs, and ancestor/descendant assignment
+collections. Mutating evidence and regenerating only its embedded digests fails against the
+externally supplied manifest digest. A second RBAC evaluation for the same execution fails even
+while the manifest remains within its validity window.
 
 CLI-equivalent evidence requires two exact collections. The target/ancestor command uses
 `--scope`, `--include-inherited`, and `--include-groups` without `--all`. The subscription-descendant
@@ -273,14 +307,17 @@ Recognized built-in role names must agree with their official IDs; name-only, ID
 entries fail closed. Every production separation rule also requires reviewed
 `forbiddenRoleDefinitionIds`; matching either a forbidden name or ID blocks the assignment, so a
 false display name cannot bypass separation. Oversized integer literals and other parser failures
-are reported as malformed input with exit code `3`.
+are reported as malformed input with exit code `3`. JSON decimals are parsed and hashed exactly
+within bounded precision and exponent limits; distinct decimal values cannot collapse through
+binary floating-point rounding before `NoEffect` or manifest-digest comparison.
 
 Equivalent separation rules are rejected before evaluation. Identical violations from distinct
 non-equivalent rules are emitted once, no result may contain more than 256 unique violations, and
 JSON or text output is bounded to 1 MiB.
 
-The verifier is an offline review gate, not proof of Azure deployment success. Preserve the raw
-Resource Graph, ARM, and Graph responses or the explicitly attested CLI-equivalent collection,
-exact repeated `--allow-change` values, reviewed policy, and machine-readable verifier output beside
-the release evidence. Run both the what-if and RBAC checks; a successful result from one does not
-waive the other.
+The verifier is an offline review gate, not proof of Azure deployment success. It performs no Azure
+network call, but the guarded wrapper writes create-only local release-ledger records. Preserve the
+raw Resource Graph, ARM, and Graph responses or the explicitly attested CLI-equivalent collection,
+exact repeated `--allow-change` values, reviewed policy, shared manifest, ledger directory, and
+machine-readable verifier output beside the release evidence. Run both the what-if and RBAC checks;
+a successful result from one does not waive the other.
