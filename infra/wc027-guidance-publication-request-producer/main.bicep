@@ -286,16 +286,6 @@ resource inputReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource outputSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(outputQueue.id, senderIdentity.id, serviceBusDataSenderRoleDefinitionId)
-  scope: outputQueue
-  properties: {
-    principalId: senderIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataSenderRoleDefinitionId)
-  }
-}
-
 resource inputSubmitterIdentities 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = [for identityResourceId in validatedInputSubmitterIdentityResourceIds: {
   name: last(split(identityResourceId, '/'))
   scope: resourceGroup(split(identityResourceId, '/')[2], split(identityResourceId, '/')[4])
@@ -465,7 +455,6 @@ var publicRequestKeyReaderRoleId = extensionResourceId('/subscriptions/${split(r
 var requestSignerRoleId = extensionResourceId('/subscriptions/${split(requestKeyResourceId, '/')[2]}/resourceGroups/${split(requestKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(requestKey.id, 'athena-wc027-key-signer'))
 var coreRbacResourceIds = [
   inputReceiver.id
-  outputSender.id
   extensionResourceId(incidentContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(incidentContainerResourceId, incidentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(contextAuthorityContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(contextAuthorityContainerResourceId, contextAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   outboxWriterRoleId
@@ -654,6 +643,10 @@ var publisherHandoff = {
     keyId: validatedRequestLogicalKeyId
     keyVaultKeyId: validatedRequestKeyVaultKeyId
     keyFingerprint: validatedRequestKeyFingerprint
+  }
+  requestOutbox: {
+    blobEndpoint: outboxBlobEndpoint
+    containerName: outboxContainerName
   }
   producerJobResourceId: producerJob.id
   producerConfigurationDigest: producerConfigurationDigest

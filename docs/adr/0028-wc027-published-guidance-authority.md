@@ -88,6 +88,13 @@ incident ID as `SessionId`, a bounded TTL, and occurrence, incident, context-aut
 and outbox binding metadata. Service Bus duplicate detection and immutable outbox recovery make an
 uncertain send safely retryable with byte-identical identity.
 
+The publisher accepts exactly one configured request submitter identity, which must be the
+producer's dedicated sender and must not overlap any publisher, signer, reader, or runtime identity.
+Before publication, a separate publisher outbox-reader identity validates the complete broker
+metadata and exact-reads the referenced Blob version, requiring byte-for-byte equality with the
+canonical signed request. A correctly signed request without durable outbox evidence therefore
+cannot activate guidance authority.
+
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and
 immediately verifies the binding, then create-or-recovers the binding Blob. Existing paths are

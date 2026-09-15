@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import athena_context.guidance.production as guidance_production
 import athena_context.guidance.request_production as request_production
 import athena_context.guidance.request_publication as request_publication
 from athena_context.artifacts import ArtifactAlreadyExistsError
@@ -25,6 +26,11 @@ from athena_context.guidance import (
     parse_wc027_guidance_request_input,
     validate_guidance_publication_request_broker_metadata,
     validate_wc027_guidance_request_input_broker_metadata,
+    verify_guidance_publication_request_outbox,
+)
+from athena_context.guidance.production import (
+    Wc027GuidanceAuthorityPublisherConfiguration,
+    run_wc027_guidance_authority_publisher_worker,
 )
 from athena_context.guidance.request_azure import (
     AzureServiceBusGuidancePublicationRequestSender,
@@ -263,6 +269,10 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
         "active",
         "current",
         "active",
+        "current",
+        "active",
+        "current",
+        "active",
     ]
     assert len(context_reader.calls) == 2
     assert [item.blob_name for item in outbox.calls] == [
@@ -370,6 +380,49 @@ def test_current_occurrence_mismatch_has_zero_output_io() -> None:
     assert sender.calls == []
 
 
+def test_stable_lifecycle_index_incoherence_is_retryable() -> None:
+    fixture = _fixture()
+    index = fixture.publication_reader.active_index.index.model_copy(update={"incidents": ()})
+    incoherent_index = type(fixture.publication_reader.active_index)(
+        index=index,
+        payload_sha256=sha256_hex(index.canonical_bytes()),
+    )
+
+    class _IncoherentAuthority:
+        def read_current_incident_state(self, *, incident_id: str):
+            return fixture.publication_reader.read_current_incident_state(incident_id=incident_id)
+
+        def read_active_incident_index(self):
+            return incoherent_index
+
+    (
+        _fixture_value,
+        request,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        outbox,
+        sender,
+    ) = _producer(incident_authority=_IncoherentAuthority())
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match="not coherent",
+    ):
+        producer.produce(
+            request,
+            now=_stable_evaluated_at(
+                request,
+                fixture.incident_publication.occurrence,
+            ),
+        )
+
+    assert outbox.calls == []
+    assert sender.calls == []
+
+
 def test_context_authority_mismatch_has_zero_output_io() -> None:
     (
         fixture,
@@ -462,7 +515,7 @@ def test_oversized_request_is_rejected_before_signing_or_output(
 def test_authority_is_revalidated_after_persistence_before_enqueue() -> None:
     fixture = _fixture()
     incident_authority = _IncidentAuthority(fixture.publication_reader)
-    incident_authority.unavailable_after = 2
+    incident_authority.unavailable_after = 4
     (
         _fixture_value,
         request,
@@ -655,6 +708,32 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
         )
         == receipt.outbox_reference
     )
+
+    class _OutboxReader:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+            self.calls = []
+
+        def read(self, reference):
+            self.calls.append(reference)
+            return self.payload
+
+    reader = _OutboxReader(receipt.request.canonical_bytes())
+    verify_guidance_publication_request_outbox(
+        receipt.request,
+        outbox_reference=receipt.outbox_reference,
+        outbox_reader=reader,
+    )
+    assert reader.calls == [receipt.outbox_reference]
+
+    reader.payload = b"{}"
+    with pytest.raises(ValueError, match="immutable outbox evidence"):
+        verify_guidance_publication_request_outbox(
+            receipt.request,
+            outbox_reference=receipt.outbox_reference,
+            outbox_reader=reader,
+        )
+
     del message.application_properties["outboxBlobVersion"]
     with pytest.raises(ValueError, match="outbox version metadata"):
         validate_guidance_publication_request_broker_metadata(
@@ -860,23 +939,13 @@ def test_publisher_configuration_cannot_be_loaded_as_request_producer() -> None:
         )
 
 
-def test_cli_exposes_the_production_request_worker_path() -> None:
+def test_cli_exposes_only_the_production_request_worker_path() -> None:
     parser = build_parser()
     args = parser.parse_args(["wc027-guidance-publication-request-producer"])
 
     assert args.command == "wc027-guidance-publication-request-producer"
-    diagnostic = parser.parse_args(
-        [
-            "wc027-guidance-authority-submit",
-            "--request",
-            "request.json",
-            "--service-bus-namespace",
-            "athena-wc027.servicebus.windows.net",
-            "--managed-identity-client-id",
-            "10000000-0000-0000-0000-000000000001",
-        ]
-    )
-    assert diagnostic.command == "wc027-guidance-authority-submit"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["wc027-guidance-authority-submit"])
 
 
 def test_request_body_digest_matches_outbox_evidence() -> None:
@@ -1025,3 +1094,167 @@ def test_worker_abandons_when_current_incident_authority_is_unavailable(
     assert receiver.completed == []
     assert receiver.dead_lettered == []
     assert output_sender_opened is False
+
+
+@pytest.mark.parametrize(
+    ("metadata_mode", "outbox_payload", "should_complete"),
+    (
+        ("missing", None, False),
+        ("valid", b"{}", False),
+        ("valid", None, True),
+    ),
+)
+def test_publisher_worker_requires_exact_immutable_outbox_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_mode: str,
+    outbox_payload: bytes | None,
+    should_complete: bool,
+) -> None:
+    import azure.identity
+    import azure.servicebus
+
+    (
+        fixture,
+        incident_bound_request,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        _outbox,
+        _sender,
+    ) = _producer()
+    produced = producer.produce(
+        incident_bound_request,
+        now=_stable_evaluated_at(
+            incident_bound_request,
+            fixture.incident_publication.occurrence,
+        ),
+    )
+    request = produced.request
+    message = SimpleNamespace(
+        body=(request.canonical_bytes(),),
+        content_type="application/json",
+        message_id=request.request_id,
+        session_id=request.incident_bound_request.incident_subject.incident_id,
+        application_properties=(
+            guidance_publication_request_broker_properties(
+                request,
+                outbox_reference=produced.outbox_reference,
+            )
+            if metadata_mode == "valid"
+            else None
+        ),
+    )
+
+    class _Credential:
+        def __init__(self, *, client_id: str) -> None:
+            self.client_id = client_id
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.completed = []
+            self.abandoned = []
+            self.dead_lettered = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def receive_messages(self, **_kwargs):
+            return [message]
+
+        def complete_message(self, selected) -> None:
+            self.completed.append(selected)
+
+        def abandon_message(self, selected) -> None:
+            self.abandoned.append(selected)
+
+        def dead_letter_message(self, selected, **kwargs) -> None:
+            self.dead_lettered.append((selected, kwargs))
+
+    class _QueueSender:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    receiver = _Receiver()
+    queue_sender = _QueueSender()
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_queue_receiver(self, **_kwargs):
+            return receiver
+
+        def get_queue_sender(self, **_kwargs):
+            return queue_sender
+
+    class _OutboxReader:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def read(self, reference):
+            self.calls.append(reference)
+            return request.canonical_bytes() if outbox_payload is None else outbox_payload
+
+    class _Publisher:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def publish(self, selected, *, now) -> None:
+            self.calls.append((selected, now))
+
+    outbox_reader = _OutboxReader()
+    publisher = _Publisher()
+    configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+        json.dumps(_bicep_generated_publisher_configuration())
+    )
+    monkeypatch.setattr(
+        azure.identity,
+        "ManagedIdentityCredential",
+        _Credential,
+    )
+    monkeypatch.setattr(azure.servicebus, "ServiceBusClient", _Client)
+    monkeypatch.setattr(
+        guidance_production,
+        "_correlation_reader",
+        lambda *_args, **_kwargs: outbox_reader,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "build_wc027_guidance_authority_publisher",
+        lambda *_args, **_kwargs: publisher,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "_utc_now_milliseconds",
+        lambda: request.evaluated_at,
+    )
+
+    processed = run_wc027_guidance_authority_publisher_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+
+    assert processed is should_complete
+    if should_complete:
+        assert receiver.completed == [message]
+        assert receiver.dead_lettered == []
+        assert len(publisher.calls) == 1
+        assert outbox_reader.calls == [produced.outbox_reference]
+    else:
+        assert receiver.completed == []
+        assert len(receiver.dead_lettered) == 1
+        assert publisher.calls == []

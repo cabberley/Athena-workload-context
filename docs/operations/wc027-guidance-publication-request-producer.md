@@ -42,10 +42,9 @@ Required metadata:
 | `contextAuthorityDigest` | nested published-context authority digest |
 | `noAutoRemediation` | `true` |
 
-Only explicitly supplied upstream identities receive sender access to this queue. The existing
-authority-request submit command remains a bounded diagnostic tool; the production modules should
-grant `wc027-guidance-authority-requests` sender access only to the request-producer sender
-identity.
+Only explicitly supplied upstream identities receive sender access to this queue. The repository
+does not expose a direct authority-request submit command: production requests must carry verified
+immutable outbox evidence and arrive through the dedicated request-producer sender identity.
 
 ## Verification and deterministic request construction
 
@@ -109,7 +108,7 @@ prior successful send.
 `infra/wc027-guidance-publication-request-producer/main.bicep` deploys:
 
 - the minimal private input queue and receiver RBAC;
-- sender RBAC only on the existing publisher request queue;
+- the dedicated output sender identity and exact publisher queue handoff;
 - exact no-list readers for `incident-assets`, `context-authority`, and request outbox recovery;
 - create-only outbox writer RBAC;
 - one shared upstream exact-public-key reader for the incident and correlation-binding keys;
@@ -120,10 +119,13 @@ prior successful send.
   binding, producer Job resource ID, and configuration digest.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
-production value in `requestSubmitterIdentityResourceIds`. Its outputs expose the exact request
-queue resource ID plus logical key ID, versioned Key Vault URI, fingerprint, and key resource ID.
-Pass those values unchanged to the request-producer module, then use `publisherHandoffJson` and
-both generated configuration digests as the reviewed cross-deployment handoff.
+value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that
+singleton queue-scoped sender role. Give the publisher a separate no-list outbox-reader identity
+and the same versioning-enabled outbox storage account. Its outputs expose the exact request queue
+resource ID plus logical key ID, versioned Key Vault URI, fingerprint, key resource ID, and outbox
+location. Pass those values unchanged to the request-producer module, then use
+`publisherHandoffJson` and both generated configuration digests as the reviewed cross-deployment
+handoff.
 
 The image is built from
 `apps/guidance-publication-request-producer/Dockerfile`, pins both Dockerfile frontend and Python
@@ -144,6 +146,10 @@ image, command, scaler, queue names, registry identity, generated configuration,
 identities, configuration digest, and deterministic RBAC evidence. When both jobs are asserted
 ready, it requires the publisher's queue plus logical/physical request-key binding to match the
 producer. The complete feed-v2 chain cannot be marked ready unless both jobs are ready.
+
+The publisher independently exact-reads every referenced outbox Blob version before invoking its
+existing publication/activation service. Broker metadata without matching durable request bytes is
+rejected.
 
 Before setting `wc027RequestProducerReady=true`, confirm the deployed input submitter allowlist and
 that the publisher request queue grants `Azure Service Bus Data Sender` only to the dedicated

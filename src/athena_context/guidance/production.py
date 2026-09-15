@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from azure.core.exceptions import (
@@ -31,6 +31,8 @@ from athena_context.correlation import (
 )
 from athena_context.enrichment.production import (
     Wc027EnrichmentFeedProductionConfiguration,
+    _blob_source,
+    _BlobSource,
     _client_id,
     _correlation_reader,
     _identity_resource_ids,
@@ -62,6 +64,10 @@ from athena_context.guidance.publication import (
     GuidanceAuthoritySourceNotReadyError,
     parse_guidance_authority_publication_request,
 )
+from athena_context.guidance.request_publication import (
+    validate_guidance_publication_request_broker_metadata,
+    verify_guidance_publication_request_outbox,
+)
 
 _CONFIG_SCHEMA_VERSION = "athena.wc027GuidanceAuthorityPublisherConfiguration.v1"
 
@@ -82,6 +88,9 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     trigger_queue_name: str
     broker_identity_client_id: str
     broker_identity_resource_id: str
+    request_submitter_identity_client_id: str
+    request_submitter_identity_resource_id: str
+    request_outbox: _BlobSource
     authority_assets: _WritableBlobSource
     activation: _ActivationWriter
     request_key: _KeyAuthority
@@ -108,6 +117,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             {
                 "schemaVersion",
                 "serviceBus",
+                "requestOutbox",
                 "authorityAssets",
                 "guidanceActivation",
                 "requestKey",
@@ -130,6 +140,8 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 "triggerQueueName",
                 "brokerIdentityClientId",
                 "brokerIdentityResourceId",
+                "requestSubmitterIdentityClientId",
+                "requestSubmitterIdentityResourceId",
             },
             "serviceBus",
         )
@@ -168,6 +180,18 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             broker_identity_resource_id=_managed_identity_resource_id(
                 service_bus["brokerIdentityResourceId"],
                 "serviceBus.brokerIdentityResourceId",
+            ),
+            request_submitter_identity_client_id=_client_id(
+                service_bus["requestSubmitterIdentityClientId"],
+                "serviceBus.requestSubmitterIdentityClientId",
+            ),
+            request_submitter_identity_resource_id=_managed_identity_resource_id(
+                service_bus["requestSubmitterIdentityResourceId"],
+                "serviceBus.requestSubmitterIdentityResourceId",
+            ),
+            request_outbox=_blob_source(
+                root["requestOutbox"],
+                "requestOutbox",
             ),
             authority_assets=_writable_blob_source(
                 _mapping(root["authorityAssets"], "authorityAssets"),
@@ -231,6 +255,10 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     def _validate_separation(self) -> None:
         runtime = self.enrichment_runtime
         assets = self.authority_assets
+        if self.request_outbox.container != "wc027-guidance-request-outbox":
+            raise ValueError(
+                "publisher request outbox must be exactly wc027-guidance-request-outbox"
+            )
         if (
             assets.endpoint != runtime.guidance_authority_source.endpoint
             or assets.container != runtime.guidance_authority_source.container
@@ -326,6 +354,10 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 binding_trust.identity_client_id,
                 binding_trust.identity_resource_id,
             ),
+            (
+                self.request_outbox.identity_client_id,
+                self.request_outbox.identity_resource_id,
+            ),
         )
         if (
             len({client_id.casefold() for client_id, _ in publisher_identity_pairs})
@@ -348,6 +380,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             self.activation.identity_resource_id,
             self.request_key.identity_resource_id,
             self.binding_signing_key.identity_resource_id,
+            self.request_outbox.identity_resource_id,
             runtime.incident_lifecycle_assets.identity_resource_id,
             runtime.monitoring_source.identity_resource_id,
             runtime.change_source.identity_resource_id,
@@ -360,6 +393,35 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             runtime.incident_key.identity_resource_id,
             runtime.correlation_binding_key.identity_resource_id,
         }
+        expected_client_ids = {
+            self.broker_identity_client_id,
+            assets.reader_identity_client_id,
+            assets.writer_identity_client_id,
+            self.activation.identity_client_id,
+            self.request_key.identity_client_id,
+            self.binding_signing_key.identity_client_id,
+            self.request_outbox.identity_client_id,
+            runtime.incident_lifecycle_assets.identity_client_id,
+            runtime.monitoring_source.identity_client_id,
+            runtime.change_source.identity_client_id,
+            runtime.context_authority_source.identity_client_id,
+            runtime.monitoring_intent_source.identity_client_id,
+            runtime.guidance_binding_key.identity_client_id,
+            runtime.monitoring_collector_key.authority.identity_client_id,
+            runtime.change_key.identity_client_id,
+            runtime.monitoring_intent_key.identity_client_id,
+            runtime.incident_key.identity_client_id,
+            runtime.correlation_binding_key.identity_client_id,
+        }
+        if (
+            self.request_submitter_identity_resource_id.casefold()
+            in {item.casefold() for item in expected}
+            or self.request_submitter_identity_client_id.casefold()
+            in {item.casefold() for item in expected_client_ids}
+        ):
+            raise ValueError(
+                "guidance publisher request submitter identity must be dedicated"
+            )
         if {
             item.casefold() for item in self.attached_identity_resource_ids
         } != {item.casefold() for item in expected}:
@@ -529,57 +591,6 @@ def load_wc027_guidance_authority_publisher_configuration(
     return Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(raw)
 
 
-def submit_wc027_guidance_authority_request(
-    *,
-    request_path: Path,
-    fully_qualified_namespace: str,
-    queue_name: str,
-    managed_identity_client_id: str,
-) -> str:
-    from azure.identity import ManagedIdentityCredential
-    from azure.servicebus import ServiceBusClient, ServiceBusMessage
-
-    request = parse_guidance_authority_publication_request(
-        request_path.read_bytes()
-    )
-    remaining = int(
-        (
-            request.expires_at
-            - request.evaluated_at
-        ).total_seconds()
-    )
-    credential = ManagedIdentityCredential(
-        client_id=_client_id(
-            managed_identity_client_id,
-            "managed_identity_client_id",
-        )
-    )
-    with (
-        ServiceBusClient(
-            fully_qualified_namespace=_service_bus_namespace(
-                fully_qualified_namespace
-            ),
-            credential=credential,
-            logging_enable=False,
-        ) as client,
-        client.get_queue_sender(queue_name=_queue_name(queue_name)) as sender,
-    ):
-        sender.send_messages(
-            ServiceBusMessage(
-                request.canonical_bytes(),
-                content_type="application/json",
-                message_id=request.request_id,
-                session_id=request.incident_bound_request.incident_subject.incident_id,
-                time_to_live=timedelta(seconds=remaining),
-                application_properties={
-                    "schemaVersion": request.schema_version,
-                    "requestDigest": request.request_digest,
-                },
-            )
-        )
-    return request.request_id
-
-
 def run_wc027_guidance_authority_publisher_worker(
     *,
     configuration: Wc027GuidanceAuthorityPublisherConfiguration,
@@ -628,6 +639,20 @@ def run_wc027_guidance_authority_publisher_worker(
                 raise ValueError(
                     "guidance publication request broker metadata is invalid"
                 )
+            outbox_reference = (
+                validate_guidance_publication_request_broker_metadata(
+                    message,
+                    request,
+                )
+            )
+            verify_guidance_publication_request_outbox(
+                request,
+                outbox_reference=outbox_reference,
+                outbox_reader=_correlation_reader(
+                    configuration.request_outbox,
+                    required_prefix="guidance-publication-requests/",
+                ),
+            )
             current = _utc_now_milliseconds()
             if current < request.evaluated_at or current >= request.expires_at:
                 raise ValueError("guidance publication request is stale")
@@ -667,5 +692,4 @@ __all__ = [
     "build_wc027_guidance_authority_publisher",
     "load_wc027_guidance_authority_publisher_configuration",
     "run_wc027_guidance_authority_publisher_worker",
-    "submit_wc027_guidance_authority_request",
 ]

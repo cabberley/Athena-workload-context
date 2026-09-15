@@ -82,7 +82,7 @@ def test_request_producer_rbac_is_exact_and_non_destructive() -> None:
     blob_reader = BLOB_READER.read_text(encoding="utf-8")
 
     assert "scope: inputQueue" in source
-    assert "scope: outputQueue" in source
+    assert "scope: outputQueue" not in source
     assert "serviceBusDataReceiverRoleDefinitionId" in source
     assert "serviceBusDataSenderRoleDefinitionId" in source
     assert "modules/key-public-reader-rbac.bicep" in source
@@ -156,6 +156,9 @@ def test_request_producer_configuration_and_publisher_handoff_are_derived() -> N
         "requestQueueName: validatedOutputQueueName",
         "senderIdentityResourceId: senderIdentity.id",
         "requestKeyResourceId: requestKey.id",
+        "requestOutbox:",
+        "blobEndpoint: outboxBlobEndpoint",
+        "containerName: outboxContainerName",
         "outboxBlobService.properties.isVersioningEnabled == true",
         "outboxStorageAccountResourceId must have Blob versioning enabled",
     ):
@@ -177,6 +180,9 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
         "ATHENA_WC027_GUIDANCE_REQUEST_PRODUCER_CONFIG_JSON",
         "WC-027 Notification v2 requires an explicitly ready guidance publication-request producer",
         "publisher request queue does not match the request producer output queue",
+        "publisher request submitter does not match the dedicated request producer sender",
+        "publisher request outbox endpoint does not match the request producer",
+        "publisher request outbox container does not match the request producer",
         "publisher request key version does not match the request producer",
         "publisher request key fingerprint does not match the request producer",
     ):
@@ -192,5 +198,7 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
         "output requestLogicalKeyId string",
         "output requestKeyVaultKeyId string",
         "output requestKeyFingerprint string",
+        "output requestOutboxBlobEndpoint string",
+        "output requestOutboxContainerName string",
     ):
         assert expected in publisher

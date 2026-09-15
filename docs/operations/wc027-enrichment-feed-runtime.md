@@ -128,10 +128,13 @@ publisher:
 - an immutable `wc027-guidance-authority` Blob container;
 - the `Wc027GuidanceActivation` Table;
 - one event-triggered Container Apps Job with distinct broker, authority reader/writer,
-  activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
+  activation writer, request-trust reader, binding-trust reader, request-outbox reader, and
+  binding-signer identities;
 - a create-only authority Blob identity plus a separate exact-version readback identity;
 - Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
 - exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
+- a singleton request-queue sender assignment for the dedicated request-producer identity plus
+  exact-version, no-list read access to its immutable request outbox; and
 - generated strict configuration in
   `ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON`.
 
@@ -141,9 +144,10 @@ configuration separately carries exact versioned Key Vault URIs. Lifecycle point
 `keyId` checks use the logical lifecycle ID; lifecycle attestation verification uses the physical
 versioned Key Vault URI.
 
-Production publication requests arrive from the separate request-producer sender identity and
-carry the exact occurrence-keyed outbox reference in their broker metadata. The bounded direct
-submit command remains available for diagnostics but must not receive production sender RBAC.
+Production publication requests arrive only from the separate request-producer sender identity,
+carry the exact occurrence-keyed outbox reference in their broker metadata, and are rejected unless
+the publisher can exact-read matching immutable outbox bytes. No direct authority-request submit
+command is exposed.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;

@@ -20,6 +20,7 @@ from athena_context.guidance.request_publication import (
     parse_wc027_guidance_request_input,
     validate_guidance_publication_request_broker_metadata,
     validate_wc027_guidance_request_input_broker_metadata,
+    verify_guidance_publication_request_outbox,
 )
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "require_unchanged_guidance_incident_authority",
     "validate_guidance_publication_request_broker_metadata",
     "validate_wc027_guidance_request_input_broker_metadata",
+    "verify_guidance_publication_request_outbox",
     "verify_incident_bound_request_signatures",
     "verify_guidance_authority_activation",
 ]

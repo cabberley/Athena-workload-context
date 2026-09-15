@@ -406,6 +406,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         identity_resource_id(3),
         identity_resource_id(4),
         identity_resource_id(5),
+        identity_resource_id(6),
         runtime["incidentLifecycleAssets"]["identityResourceId"],  # type: ignore[index]
         runtime["correlationSources"]["monitoring"]["identityResourceId"],  # type: ignore[index]
         runtime["correlationSources"]["change"]["identityResourceId"],  # type: ignore[index]
@@ -428,6 +429,14 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
             "triggerQueueName": "wc027-enrichment-trigger",
             "brokerIdentityClientId": client_id(0),
             "brokerIdentityResourceId": identity_resource_id(0),
+            "requestSubmitterIdentityClientId": client_id(7),
+            "requestSubmitterIdentityResourceId": identity_resource_id(7),
+        },
+        "requestOutbox": {
+            "blobEndpoint": "https://athenawc027.blob.core.windows.net",
+            "containerName": "wc027-guidance-request-outbox",
+            "identityClientId": client_id(6),
+            "identityResourceId": identity_resource_id(6),
         },
         "authorityAssets": {
             "blobEndpoint": "https://athenawc027.blob.core.windows.net",
@@ -530,6 +539,31 @@ def test_publisher_configuration_rejects_reused_managed_identity() -> None:
     ]
 
     with pytest.raises(ValueError, match="managed identities must be distinct"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_publisher_configuration_requires_dedicated_request_submitter() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["serviceBus"]["requestSubmitterIdentityClientId"] = payload[  # type: ignore[index]
+        "serviceBus"
+    ]["brokerIdentityClientId"]  # type: ignore[index]
+    payload["serviceBus"]["requestSubmitterIdentityResourceId"] = payload[  # type: ignore[index]
+        "serviceBus"
+    ]["brokerIdentityResourceId"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="submitter identity must be dedicated"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+            json.dumps(payload)
+        )
+
+
+def test_publisher_configuration_requires_exact_request_outbox() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["requestOutbox"]["containerName"] = "different-outbox"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="request outbox"):
         Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
             json.dumps(payload)
         )

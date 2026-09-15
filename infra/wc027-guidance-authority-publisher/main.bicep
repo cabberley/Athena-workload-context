@@ -16,7 +16,7 @@ param registryResourceId string
 param serviceBusNamespaceName string
 
 @minLength(1)
-@maxLength(8)
+@maxLength(1)
 param requestSubmitterIdentityResourceIds array
 
 param brokerIdentityResourceId string
@@ -26,6 +26,7 @@ param activationWriterIdentityResourceId string
 param bindingSignerIdentityResourceId string
 param requestTrustReaderIdentityResourceId string
 param bindingTrustReaderIdentityResourceId string
+param requestOutboxReaderIdentityResourceId string
 
 @description('Exact additional runtime source/trust identities referenced by enrichmentRuntimeConfigurationJson and required by the publisher.')
 @minLength(1)
@@ -37,6 +38,9 @@ param authorityStorageAccountResourceId string
 
 @description('Exact storage account resource ID hosting enrichmentRuntimeConfigurationJson.guidanceActivation.')
 param activationStorageAccountResourceId string
+
+@description('Exact versioning-enabled storage account resource ID hosting the immutable publication-request outbox.')
+param requestOutboxStorageAccountResourceId string
 
 param requestKeyResourceId string
 param bindingKeyResourceId string
@@ -72,6 +76,7 @@ param tags object = {}
 
 var requestQueueName = 'wc027-guidance-authority-requests'
 var triggerQueueName = 'wc027-enrichment-feed-requests'
+var requestOutboxContainerName = 'wc027-guidance-request-outbox'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
@@ -101,6 +106,7 @@ var validatedBindingKeyFingerprint = bindingKeyFingerprint == parsedEnrichmentRu
   : fail('publisher binding signer fingerprint must match runtime guidance trust')
 var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
 var activationStorageAccountName = last(split(activationStorageAccountResourceId, '/'))
+var requestOutboxStorageAccountName = last(split(requestOutboxStorageAccountResourceId, '/'))
 var expectedAuthorityBlobEndpoint = 'https://${toLower(authorityStorageAccountName)}.blob.${environment().suffixes.storage}'
 var expectedActivationTableEndpoint = 'https://${toLower(activationStorageAccountName)}.table.${environment().suffixes.storage}'
 var validatedAuthorityStorageAccountName = runtimeAuthorityAssets.blobEndpoint == expectedAuthorityBlobEndpoint
@@ -114,6 +120,21 @@ var authorityContainerName = runtimeAuthorityAssets.containerName == 'wc027-guid
   : fail('runtime guidanceAuthoritySource container must be wc027-guidance-authority')
 var activationTableName = runtimeActivation.tableName
 var activationPartitionKey = runtimeActivation.partitionKey
+
+resource requestOutboxStorageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' existing = {
+  name: requestOutboxStorageAccountName
+  scope: resourceGroup(split(requestOutboxStorageAccountResourceId, '/')[2], split(requestOutboxStorageAccountResourceId, '/')[4])
+}
+
+resource requestOutboxBlobService 'Microsoft.Storage/storageAccounts/blobServices@2025-01-01' existing = {
+  parent: requestOutboxStorageAccount
+  name: 'default'
+}
+
+var validatedRequestOutboxStorageAccountName = requestOutboxBlobService.properties.isVersioningEnabled == true
+  ? requestOutboxStorageAccountName
+  : fail('requestOutboxStorageAccountResourceId must have Blob versioning enabled')
+var requestOutboxBlobEndpoint = 'https://${toLower(validatedRequestOutboxStorageAccountName)}.blob.${environment().suffixes.storage}'
 
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
   name: last(split(registryResourceId, '/'))
@@ -175,6 +196,11 @@ resource bindingTrustReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdent
   scope: resourceGroup(split(bindingTrustReaderIdentityResourceId, '/')[2], split(bindingTrustReaderIdentityResourceId, '/')[4])
 }
 
+resource requestOutboxReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  name: last(split(requestOutboxReaderIdentityResourceId, '/'))
+  scope: resourceGroup(split(requestOutboxReaderIdentityResourceId, '/')[2], split(requestOutboxReaderIdentityResourceId, '/')[4])
+}
+
 var attachedIdentityResourceIds = concat([
   brokerIdentity.id
   authorityReaderIdentity.id
@@ -183,10 +209,14 @@ var attachedIdentityResourceIds = concat([
   bindingSignerIdentity.id
   requestTrustReaderIdentity.id
   bindingTrustReaderIdentity.id
+  requestOutboxReaderIdentity.id
 ], sourceIdentityResourceIds)
 var validatedAttachedIdentityResourceIds = length(union(attachedIdentityResourceIds, attachedIdentityResourceIds)) == length(attachedIdentityResourceIds)
   ? attachedIdentityResourceIds
   : fail('WC-027 guidance publisher identities must be distinct')
+var validatedRequestSubmitterIdentityResourceIds = length(requestSubmitterIdentityResourceIds) == 1 && length(union(requestSubmitterIdentityResourceIds, validatedAttachedIdentityResourceIds)) == length(validatedAttachedIdentityResourceIds) + 1
+  ? requestSubmitterIdentityResourceIds
+  : fail('WC-027 guidance publisher requires one dedicated request submitter identity')
 var jobIdentityMap = reduce(
   validatedAttachedIdentityResourceIds,
   {},
@@ -239,12 +269,12 @@ resource triggerSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource submitterIdentities 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = [for identityResourceId in requestSubmitterIdentityResourceIds: {
+resource submitterIdentities 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = [for identityResourceId in validatedRequestSubmitterIdentityResourceIds: {
   name: last(split(identityResourceId, '/'))
   scope: resourceGroup(split(identityResourceId, '/')[2], split(identityResourceId, '/')[4])
 }]
 
-resource requestSubmitters 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (identityResourceId, index) in requestSubmitterIdentityResourceIds: {
+resource requestSubmitters 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (identityResourceId, index) in validatedRequestSubmitterIdentityResourceIds: {
   name: guid(requestQueue.id, submitterIdentities[index].id, serviceBusDataSenderRoleDefinitionId)
   scope: requestQueue
   properties: {
@@ -253,6 +283,28 @@ resource requestSubmitters 'Microsoft.Authorization/roleAssignments@2022-04-01' 
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataSenderRoleDefinitionId)
   }
 }]
+
+module requestOutboxContainer '../wc027-guidance-publication-request-producer/modules/blob-container.bicep' = {
+  name: 'wc027-guidance-request-outbox-container'
+  scope: resourceGroup(split(requestOutboxStorageAccountResourceId, '/')[2], split(requestOutboxStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: validatedRequestOutboxStorageAccountName
+    containerName: requestOutboxContainerName
+  }
+}
+
+module requestOutboxReaderRbac '../wc027-enrichment-feed-runtime/modules/blob-reader-rbac.bicep' = {
+  name: 'wc027-guidance-request-outbox-publisher-reader'
+  scope: resourceGroup(split(requestOutboxStorageAccountResourceId, '/')[2], split(requestOutboxStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: validatedRequestOutboxStorageAccountName
+    containerName: requestOutboxContainerName
+    identityResourceId: requestOutboxReaderIdentity.id
+  }
+  dependsOn: [
+    requestOutboxContainer
+  ]
+}
 
 module authorityWriterRbac 'modules/blob-create-rbac.bicep' = {
   name: 'wc027-guidance-authority-blob-create'
@@ -352,6 +404,8 @@ var authorityContainerResourceId = '${authorityStorageAccountResourceId}/blobSer
 var authorityWriterRoleId = extensionResourceId(authorityResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(authorityContainerResourceId, 'athena-wc027-immutable-blob-creator'))
 var authorityWriterAssignmentId = extensionResourceId(authorityContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(authorityContainerResourceId, authorityWriterIdentity.id, authorityWriterRoleId))
 var authorityReaderAssignmentId = extensionResourceId(authorityContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(authorityContainerResourceId, authorityReaderIdentity.id, '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'))
+var requestOutboxContainerResourceId = '${requestOutboxStorageAccountResourceId}/blobServices/default/containers/${requestOutboxContainerName}'
+var requestOutboxReaderAssignmentId = extensionResourceId(requestOutboxContainerResourceId, 'Microsoft.Authorization/roleAssignments', guid(requestOutboxContainerResourceId, requestOutboxReaderIdentity.id, '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'))
 var activationResourceGroupId = '/subscriptions/${split(activationStorageAccountResourceId, '/')[2]}/resourceGroups/${split(activationStorageAccountResourceId, '/')[4]}'
 var activationTableResourceId = '${activationStorageAccountResourceId}/tableServices/default/tables/${activationTableName}'
 var activationWriterRoleId = extensionResourceId(activationResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(activationTableResourceId, 'athena-wc027-table-cas'))
@@ -363,6 +417,7 @@ var coreRbacResourceIds = [
   authorityWriterRoleId
   authorityWriterAssignmentId
   authorityReaderAssignmentId
+  requestOutboxReaderAssignmentId
   activationWriterRoleId
   activationWriterAssignmentId
   requestKeyVerifierRoleId
@@ -373,7 +428,7 @@ var coreRbacResourceIds = [
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingSignerIdentity.id, bindingSignerRoleId))
   extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, '7f951dda-4ed3-4680-a7ca-43fe172d538d'))
 ]
-var submitterRbacResourceIds = map(requestSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(requestQueue.id, 'Microsoft.Authorization/roleAssignments', guid(requestQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
+var submitterRbacResourceIds = map(validatedRequestSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(requestQueue.id, 'Microsoft.Authorization/roleAssignments', guid(requestQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
 var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)
 var bindingEvidenceDigest = guid(join(rbacResourceIds, '|'))
 
@@ -385,6 +440,14 @@ var publisherConfiguration = {
     triggerQueueName: triggerQueue.name
     brokerIdentityClientId: brokerIdentity.properties.clientId
     brokerIdentityResourceId: brokerIdentity.id
+    requestSubmitterIdentityClientId: submitterIdentities[0].properties.clientId
+    requestSubmitterIdentityResourceId: submitterIdentities[0].id
+  }
+  requestOutbox: {
+    blobEndpoint: requestOutboxBlobEndpoint
+    containerName: requestOutboxContainerName
+    identityClientId: requestOutboxReaderIdentity.properties.clientId
+    identityResourceId: requestOutboxReaderIdentity.id
   }
   authorityAssets: {
     blobEndpoint: runtimeAuthorityAssets.blobEndpoint
@@ -506,6 +569,7 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
   }
   dependsOn: [
     requestSubmitters
+    requestOutboxReaderRbac
     publisherImagePull
   ]
 }
@@ -528,3 +592,5 @@ output requestKeyResourceId string = requestKey.id
 output requestLogicalKeyId string = requestLogicalKeyId
 output requestKeyVaultKeyId string = requestKey.properties.keyUriWithVersion
 output requestKeyFingerprint string = validatedRequestKeyFingerprint
+output requestOutboxBlobEndpoint string = requestOutboxBlobEndpoint
+output requestOutboxContainerName string = requestOutboxContainerName

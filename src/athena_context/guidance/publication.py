@@ -192,9 +192,24 @@ def read_current_guidance_incident_authority(
         incident_id=subject.incident_id
     )
     active = incident_authority.read_active_incident_index()
-    if current is None or current.occurrence is None or active is None:
+    confirmed_current = incident_authority.read_current_incident_state(
+        incident_id=subject.incident_id
+    )
+    confirmed_active = incident_authority.read_active_incident_index()
+    if (
+        current is None
+        or current.occurrence is None
+        or active is None
+        or confirmed_current is None
+        or confirmed_current.occurrence is None
+        or confirmed_active is None
+    ):
         raise GuidanceAuthoritySourceNotReadyError(
             "current signed incident occurrence is unavailable"
+        )
+    if current != confirmed_current or active != confirmed_active:
+        raise GuidanceAuthoritySourceNotReadyError(
+            "signed incident authority changed during snapshot read"
         )
     occurrence = current.occurrence
     entry = next(
@@ -210,7 +225,6 @@ def read_current_guidance_incident_authority(
         or current.pointer.incident_id != subject.incident_id
         or current.pointer.key_id != incident_key_id
         or active.index.key_id != incident_key_id
-        or current.pointer.key_fingerprint != active.index.key_fingerprint
         or occurrence.incident_id != subject.incident_id
         or occurrence.transition_id != subject.incident_transition_id
         or occurrence.state_result_digest != subject.incident_state_digest
@@ -221,6 +235,12 @@ def read_current_guidance_incident_authority(
             expected_occurrence is not None
             and occurrence != expected_occurrence
         )
+    ):
+        raise ValueError(
+            "incident request is stale for current signed incident authority"
+        )
+    if (
+        current.pointer.key_fingerprint != active.index.key_fingerprint
         or current.pointer_sha256
         != occurrence.pointer_reference.content_digest
         or entry is None
@@ -228,8 +248,8 @@ def read_current_guidance_incident_authority(
         or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
         or entry.pointer_sha256 != current.pointer_sha256
     ):
-        raise ValueError(
-            "incident request is stale for current signed incident authority"
+        raise GuidanceAuthoritySourceNotReadyError(
+            "current incident pointer and active index are not coherent"
         )
     return GuidanceIncidentAuthoritySnapshot(
         current=current,

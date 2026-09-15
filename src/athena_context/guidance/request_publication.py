@@ -433,6 +433,32 @@ def validate_guidance_publication_request_broker_metadata(
     return reference
 
 
+def verify_guidance_publication_request_outbox(
+    request: GuidanceAuthorityPublicationRequest,
+    *,
+    outbox_reference: VersionPinnedBlobReference,
+    outbox_reader: ImmutableArtifactReader,
+) -> None:
+    if type(request) is not GuidanceAuthorityPublicationRequest:
+        raise TypeError("request must be an exact GuidanceAuthorityPublicationRequest")
+    if type(outbox_reference) is not VersionPinnedBlobReference:
+        raise TypeError("outbox_reference must be an exact VersionPinnedBlobReference")
+    if not hasattr(outbox_reader, "read"):
+        raise TypeError("outbox_reader must support exact immutable reads")
+    canonical = request.canonical_bytes()
+    if outbox_reference.name != guidance_publication_request_outbox_path(
+        request.incident_occurrence.occurrence_id
+    ) or outbox_reference.content_digest != sha256_hex(canonical):
+        raise ValueError("outbox reference does not bind the exact publication request")
+    persisted = outbox_reader.read(outbox_reference)
+    if (
+        type(persisted) is not bytes
+        or persisted != canonical
+        or sha256_hex(persisted) != outbox_reference.content_digest
+    ):
+        raise ValueError("guidance publication request does not match immutable outbox evidence")
+
+
 def validate_wc027_guidance_request_input_broker_metadata(
     message: object,
     request: IncidentBoundCorrelationRequest,
@@ -510,4 +536,5 @@ __all__ = [
     "parse_wc027_guidance_request_input",
     "validate_guidance_publication_request_broker_metadata",
     "validate_wc027_guidance_request_input_broker_metadata",
+    "verify_guidance_publication_request_outbox",
 ]

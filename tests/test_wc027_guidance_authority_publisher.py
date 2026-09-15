@@ -246,7 +246,7 @@ def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> N
         first.binding_reference.name,
     ]
     assert correlation.calls == 4
-    assert incident.calls == 12
+    assert incident.calls == 24
     assert [call[0].binding_id for call in trigger.calls] == [
         first.activation.binding_id,
         first.activation.binding_id,
@@ -320,7 +320,7 @@ def test_source_change_before_activation_is_retryable_without_enqueue() -> None:
         _publisher()
     )
     request = _request(fixture)
-    incident.unavailable_after = 2
+    incident.unavailable_after = 4
 
     with pytest.raises(GuidanceAuthoritySourceNotReadyError):
         publisher.publish(request, now=request.evaluated_at)

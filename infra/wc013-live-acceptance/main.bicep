@@ -504,7 +504,7 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
+    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedProducerConfiguration = json(
@@ -540,16 +540,22 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
           ? fail('WC-027 publisher namespace does not match the request producer')
           : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.requestQueueName != wc027ParsedRequestProducerConfiguration.serviceBus.outputQueueName
             ? fail('WC-027 publisher request queue does not match the request producer output queue')
-            : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyId
-              ? fail('WC-027 publisher request logical key does not match the request producer')
-              : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyVaultKeyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyVaultKeyId
-                ? fail('WC-027 publisher request key version does not match the request producer')
-                : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyFingerprint != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyFingerprint
-                  ? fail('WC-027 publisher request key fingerprint does not match the request producer')
-                  : wc027PublisherReady && !wc027PublisherImageValid
-                    ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
-                    : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].image != wc027PublisherImage
-                      ? fail('WC-027 publisher Job image does not match')
+            : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.requestSubmitterIdentityResourceId != wc027ParsedRequestProducerConfiguration.serviceBus.senderIdentityResourceId
+              ? fail('WC-027 publisher request submitter does not match the dedicated request producer sender')
+              : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestOutbox.blobEndpoint != wc027ParsedRequestProducerConfiguration.requestOutbox.blobEndpoint
+                ? fail('WC-027 publisher request outbox endpoint does not match the request producer')
+                : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestOutbox.containerName != wc027ParsedRequestProducerConfiguration.requestOutbox.containerName
+                  ? fail('WC-027 publisher request outbox container does not match the request producer')
+                  : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyId
+                    ? fail('WC-027 publisher request logical key does not match the request producer')
+                    : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyVaultKeyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyVaultKeyId
+                      ? fail('WC-027 publisher request key version does not match the request producer')
+                      : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyFingerprint != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyFingerprint
+                        ? fail('WC-027 publisher request key fingerprint does not match the request producer')
+                        : wc027PublisherReady && !wc027PublisherImageValid
+                          ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
+                          : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].image != wc027PublisherImage
+                            ? fail('WC-027 publisher Job image does not match')
           : wc027PublisherReady && length(wc027PublisherJob!.properties.template.containers[0].command) != 1
             ? fail('WC-027 publisher Job command array does not match')
           : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].command[0] != 'athena-context'
