@@ -498,6 +498,9 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     ipFlowVerifyRoleDefinitionId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyRoleDefinitionId
     ipFlowVerifyScopeId: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyScopeId
     ipFlowVerifyAllowedOperations: networkWatcherEvidenceReaderAssignment.outputs.ipFlowVerifyAllowedOperations
+    resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
+    resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
+    resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
     logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
     logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
     resourceReadScopeIds: concat(

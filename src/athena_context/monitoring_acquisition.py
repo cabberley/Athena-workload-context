@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Protocol, cast
@@ -561,6 +561,16 @@ def _canonical_identity_id(value: str) -> str:
     return normalized
 
 
+def _is_virtual_machine_resource_id(value: str) -> bool:
+    segments = _canonical_resource_id(value).split("/")
+    return (
+        len(segments) == 9
+        and segments[5] == "providers"
+        and segments[6] == "microsoft.compute"
+        and segments[7] == "virtualmachines"
+    )
+
+
 def _canonical_ip(value: str) -> str:
     try:
         return str(ipaddress.ip_address(value))
@@ -574,6 +584,25 @@ def _trusted_runtime_time(value: datetime) -> datetime:
             "collector runtime time must use UTC with millisecond precision"
         )
     return value
+
+
+def _traffic_row_five_tuple_digest(row: TrafficAnalyticsRow) -> str:
+    if len(row.source_resource_candidates) != 1 or len(row.destination_resource_candidates) != 1:
+        raise MonitoringAcquisitionError(
+            "Traffic Analytics five-tuple requires unambiguous endpoint resources"
+        )
+    return compute_artifact_digest(
+        {
+            "direction": row.direction,
+            "protocol": row.protocol,
+            "sourceResourceId": row.source_resource_candidates[0],
+            "destinationResourceId": row.destination_resource_candidates[0],
+            "sourceAddress": row.source_address,
+            "destinationAddress": row.destination_address,
+            "sourcePort": row.source_port,
+            "destinationPort": row.destination_port,
+        }
+    )
 
 
 def _json_value(value: object) -> object:
@@ -673,9 +702,10 @@ class _AcquisitionRequest(_StrictAcquisitionModel):
 
 
 class LogAnalyticsQueryRequest(_AcquisitionRequest):
-    schema_version: Literal["athena.wc028LogAnalyticsQueryRequest.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc028LogAnalyticsQueryRequest.v1",
+        "athena.wc028LogAnalyticsQueryRequest.v2",
+    ] = Field(alias="schemaVersion")
     source: Literal["logAnalytics"]
     table: Literal[
         "Heartbeat",
@@ -691,6 +721,14 @@ class LogAnalyticsQueryRequest(_AcquisitionRequest):
         max_length=2048,
     )
     expected_columns: tuple[str, ...] = Field(alias="expectedColumns")
+    collector_execution_time: UtcDateTime | None = Field(
+        default=None,
+        alias="collectorExecutionTime",
+    )
+    coverage_scope: EvidenceCoverageScope | None = Field(
+        default=None,
+        alias="coverageScope",
+    )
 
     @field_validator("query_target_resource_id")
     @classmethod
@@ -703,6 +741,18 @@ class LogAnalyticsQueryRequest(_AcquisitionRequest):
             raise ValueError("log query expected columns do not match the reviewed source schema")
         if self.query_digest != sha256_hex(self.query.encode("utf-8")):
             raise ValueError("queryDigest does not bind the exact reviewed query")
+        if self.schema_version == "athena.wc028LogAnalyticsQueryRequest.v1":
+            if self.collector_execution_time is not None or self.coverage_scope is not None:
+                raise ValueError("legacy log query request cannot contain execution scope")
+        elif (
+            self.collector_execution_time is None
+            or self.coverage_scope is None
+            or self.window_end > self.collector_execution_time
+            or self.coverage_scope.query_scope_digest != self.control_digest
+        ):
+            raise ValueError(
+                "production log query request requires exact execution time and coverage scope"
+            )
         return self
 
 
@@ -1022,6 +1072,19 @@ class LogCoverageDescriptor(_StrictAcquisitionModel):
         if len(normalized) != len(set(normalized)):
             raise ValueError("coverage descriptor resource IDs must be unique")
         return normalized
+
+
+def _log_coverage_descriptor(
+    scope: EvidenceCoverageScope,
+) -> LogCoverageDescriptor:
+    return LogCoverageDescriptor(
+        resourceIds=scope.resource_ids,
+        pathId=scope.path_id,
+        direction=scope.direction,
+        fiveTupleDigest=scope.five_tuple_digest,
+        endpointTestReference=scope.endpoint_test_reference,
+        endpointTestDigest=scope.endpoint_test_digest,
+    )
 
 
 class ActivityLogRow(_StrictAcquisitionModel):
@@ -1344,11 +1407,99 @@ def _system_utc_now() -> datetime:
     return value.replace(microsecond=(value.microsecond // 1000) * 1000)
 
 
+@dataclass(frozen=True, slots=True)
+class _NormalizedIdentityClaims:
+    key_id: str
+    audience: str
+    token_version: str
+    identity_type: str
+    roles: tuple[str, ...]
+    subject: str
+    principal_id: str
+    tenant_id: str
+    client_id: str
+    issued_at: datetime
+    not_before: datetime
+    expires_at: datetime
+
+
+def _validated_identity_claims(
+    header: Mapping[str, object],
+    claims: Mapping[str, object],
+    *,
+    expected_audience: str,
+    expected_token_version: str,
+    expected_role: str,
+    expected_tenant_id: str,
+    expected_principal_id: str,
+    expected_client_id: str,
+) -> _NormalizedIdentityClaims:
+    kid = header.get("kid")
+    audience = claims.get("aud")
+    token_version = claims.get("ver")
+    identity_type = claims.get("idtyp")
+    roles = claims.get("roles")
+    subject = claims.get("sub")
+    principal_id = claims.get("oid")
+    tenant_id = claims.get("tid")
+    client_claims = tuple(
+        value for value in (claims.get("appid"), claims.get("azp")) if value is not None
+    )
+    timestamp_claims = tuple(claims.get(name) for name in ("iat", "nbf", "exp"))
+    if (
+        header.get("alg") != "RS256"
+        or header.get("typ") != "JWT"
+        or not isinstance(kid, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{8,256}", kid) is None
+        or not isinstance(audience, str)
+        or audience != expected_audience
+        or token_version != expected_token_version
+        or identity_type != "app"
+        or not isinstance(roles, list)
+        or any(not isinstance(value, str) for value in roles)
+        or tuple(sorted(roles)) != (expected_role,)
+        or not isinstance(subject, str)
+        or not isinstance(principal_id, str)
+        or not isinstance(tenant_id, str)
+        or not client_claims
+        or any(not isinstance(value, str) for value in client_claims)
+        or len({cast(str, value).casefold() for value in client_claims}) != 1
+        or any(type(value) is not int for value in timestamp_claims)
+    ):
+        raise MonitoringAcquisitionError("Athena identity proof token claims are invalid")
+    client_id = cast(str, client_claims[0]).casefold()
+    principal_id = principal_id.casefold()
+    tenant_id = tenant_id.casefold()
+    subject = subject.casefold()
+    if (
+        tenant_id != expected_tenant_id
+        or principal_id != expected_principal_id
+        or client_id != expected_client_id
+        or subject not in {expected_principal_id, expected_client_id}
+    ):
+        raise MonitoringAcquisitionError(
+            "Athena identity proof does not match the reviewed collector identity"
+        )
+    return _NormalizedIdentityClaims(
+        key_id=kid,
+        audience=audience,
+        token_version=cast(str, token_version),
+        identity_type=cast(str, identity_type),
+        roles=tuple(sorted(cast(list[str], roles))),
+        subject=subject,
+        principal_id=principal_id,
+        tenant_id=tenant_id,
+        client_id=client_id,
+        issued_at=datetime.fromtimestamp(cast(int, claims["iat"]), tz=UTC),
+        not_before=datetime.fromtimestamp(cast(int, claims["nbf"]), tz=UTC),
+        expires_at=datetime.fromtimestamp(cast(int, claims["exp"]), tz=UTC),
+    )
+
+
 def _verified_identity_proof(
     access_token: _AccessToken,
     *,
     reviewed_contract: MonitoringCollectorContract,
-    verified_at: datetime,
 ) -> MonitoringIdentityProof:
     token = access_token.token
     if (
@@ -1414,79 +1565,43 @@ def _verified_identity_proof(
         raise MonitoringAcquisitionError(
             "Athena identity proof token cryptographic verification failed"
         ) from exc
-    kid = header.get("kid")
-    audience = claims.get("aud")
-    token_version = claims.get("ver")
-    identity_type = claims.get("idtyp")
-    roles = claims.get("roles")
-    subject = claims.get("sub")
-    principal_id = claims.get("oid")
-    tenant_id = claims.get("tid")
-    client_claims = tuple(
-        value for value in (claims.get("appid"), claims.get("azp")) if value is not None
+    normalized = _validated_identity_claims(
+        header,
+        claims,
+        expected_audience=expected_audience,
+        expected_token_version=expected_token_version,
+        expected_role=expected_role,
+        expected_tenant_id=expected_tenant_id,
+        expected_principal_id=expected_principal_id,
+        expected_client_id=expected_client_id,
     )
-    timestamp_claims = tuple(claims.get(name) for name in ("iat", "nbf", "exp"))
-    if (
-        header.get("alg") != "RS256"
-        or header.get("typ") != "JWT"
-        or not isinstance(kid, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{8,256}", kid) is None
-        or not isinstance(audience, str)
-        or audience != expected_audience
-        or token_version != expected_token_version
-        or identity_type != "app"
-        or not isinstance(roles, list)
-        or any(not isinstance(value, str) for value in roles)
-        or tuple(sorted(roles)) != (expected_role,)
-        or not isinstance(subject, str)
-        or not isinstance(principal_id, str)
-        or not isinstance(tenant_id, str)
-        or not client_claims
-        or any(not isinstance(value, str) for value in client_claims)
-        or len({cast(str, value).casefold() for value in client_claims}) != 1
-        or any(type(value) is not int for value in timestamp_claims)
-    ):
-        raise MonitoringAcquisitionError("Athena identity proof token claims are invalid")
-    client_id = cast(str, client_claims[0]).casefold()
-    principal_id = principal_id.casefold()
-    tenant_id = tenant_id.casefold()
-    subject = subject.casefold()
-    if (
-        tenant_id != expected_tenant_id
-        or principal_id != expected_principal_id
-        or client_id != expected_client_id
-        or subject not in {expected_principal_id, expected_client_id}
-    ):
-        raise MonitoringAcquisitionError(
-            "Athena identity proof does not match the reviewed collector identity"
-        )
-    issued_at = datetime.fromtimestamp(cast(int, claims["iat"]), tz=UTC)
-    not_before = datetime.fromtimestamp(cast(int, claims["nbf"]), tz=UTC)
-    expires_at = datetime.fromtimestamp(cast(int, claims["exp"]), tz=UTC)
+    verified_at = _trusted_runtime_time(_system_utc_now())
     if (
         type(access_token.expires_on) is not int
-        or access_token.expires_on != cast(int, claims["exp"])
-        or not issued_at <= not_before <= verified_at < expires_at
-        or (expires_at - issued_at).total_seconds() > expected_maximum_lifetime_seconds
-        or (expires_at - verified_at).total_seconds() < _MIN_IDENTITY_PROOF_TOKEN_REMAINING_SECONDS
+        or access_token.expires_on != int(normalized.expires_at.timestamp())
+        or not normalized.issued_at <= normalized.not_before <= verified_at < normalized.expires_at
+        or (normalized.expires_at - normalized.issued_at).total_seconds()
+        > expected_maximum_lifetime_seconds
+        or (normalized.expires_at - verified_at).total_seconds()
+        < _MIN_IDENTITY_PROOF_TOKEN_REMAINING_SECONDS
     ):
         raise MonitoringAcquisitionError("Athena identity proof token is outside its lifetime")
     payload: dict[str, object] = {
         "schemaVersion": "athena.wc028MonitoringIdentityProof.v1",
-        "tokenVersion": token_version,
-        "tenantId": tenant_id,
-        "principalId": principal_id,
-        "clientId": client_id,
-        "subject": subject,
+        "tokenVersion": normalized.token_version,
+        "tenantId": normalized.tenant_id,
+        "principalId": normalized.principal_id,
+        "clientId": normalized.client_id,
+        "subject": normalized.subject,
         "issuer": expected_issuer,
-        "audience": audience,
-        "identityType": identity_type,
-        "roles": tuple(sorted(roles)),
+        "audience": normalized.audience,
+        "identityType": normalized.identity_type,
+        "roles": normalized.roles,
         "tokenHash": sha256_hex(token.encode("ascii")),
-        "keyId": kid,
-        "issuedAt": issued_at,
-        "notBefore": not_before,
-        "expiresAt": expires_at,
+        "keyId": normalized.key_id,
+        "issuedAt": normalized.issued_at,
+        "notBefore": normalized.not_before,
+        "expiresAt": normalized.expires_at,
         "verifiedAt": verified_at,
     }
     return MonitoringIdentityProof.model_validate(
@@ -1541,13 +1656,11 @@ class AzureMonitoringAdapter:
 
     def verify_identity(self) -> MonitoringIdentityProof:
         self._identity_proof = None
-        verified_at = self.utc_now()
         proof_scope = f"{cast(str, self._reviewed_contract.identity_proof_audience)}/.default"
         try:
             proof = _verified_identity_proof(
                 self._credential.get_token(proof_scope),
                 reviewed_contract=self._reviewed_contract,
-                verified_at=verified_at,
             )
         except MonitoringAcquisitionError:
             raise
@@ -1882,9 +1995,27 @@ def _validate_result(
 ) -> None:
     if result.request_digest != request.request_digest:
         raise MonitoringAcquisitionError("source response does not bind the exact request")
-    if result.collected_at != collector_collection_time:
+    expected_collection_time = (
+        request.collector_execution_time
+        if isinstance(request, LogAnalyticsQueryRequest)
+        and request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        else collector_collection_time
+    )
+    if result.collected_at != expected_collection_time:
         raise MonitoringAcquisitionError(
             "source response time claim conflicts with the collector clock"
+        )
+    if (
+        isinstance(request, LogAnalyticsQueryRequest)
+        and request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        and (
+            not isinstance(result, LogAnalyticsQueryResult)
+            or request.coverage_scope is None
+            or result.coverage_descriptor != _log_coverage_descriptor(request.coverage_scope)
+        )
+    ):
+        raise MonitoringAcquisitionError(
+            "log response does not bind the authority-approved coverage scope"
         )
     if result.columns != expected_columns:
         raise MonitoringAcquisitionError("source response columns do not match the strict schema")
@@ -2383,6 +2514,7 @@ class MonitoringAcquisitionCoordinator:
                 if isinstance(control.signal, LogQueryMonitoringSignal):
                     new_records, new_coverage, reasons = self._acquire_log_control(
                         control,
+                        control_binding=bindings_by_id[control.control_id],
                         monitoring_intent=monitoring_intent,
                         collected_at=collected_at,
                         acquired_changes=attribution_changes,
@@ -2536,6 +2668,7 @@ class MonitoringAcquisitionCoordinator:
         self,
         control: PublishedMonitoringIntentControl,
         *,
+        control_binding: MonitoringAcquisitionControlBinding,
         monitoring_intent: PublishedMonitoringIntent,
         collected_at: datetime,
         acquired_changes: tuple[ResourceChangeRecord, ...],
@@ -2563,7 +2696,7 @@ class MonitoringAcquisitionCoordinator:
             _build_request(
                 LogAnalyticsQueryRequest,
                 {
-                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v1",
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
                     "source": "logAnalytics",
                     "monitoringReaderIdentityId": self._monitoring_reader_identity_id,
                     "acquisitionAuthorityId": self._acquisition_authority.authority_id,
@@ -2587,6 +2720,8 @@ class MonitoringAcquisitionCoordinator:
                         signal.query_target_resource_id
                     ),
                     "expectedColumns": _LOG_COLUMNS[table],
+                    "collectorExecutionTime": collected_at,
+                    "coverageScope": control_binding.coverage_scope,
                 },
             )
             for window_start, window_end in windows
@@ -2775,6 +2910,7 @@ class MonitoringAcquisitionCoordinator:
                         row,
                         request=request,
                         control=control,
+                        control_binding=control_binding,
                         signal=signal,
                         acquired_changes=acquired_changes,
                         execution=execution,
@@ -2967,6 +3103,7 @@ class MonitoringAcquisitionCoordinator:
         *,
         request: LogAnalyticsQueryRequest,
         control: PublishedMonitoringIntentControl,
+        control_binding: MonitoringAcquisitionControlBinding,
         signal: LogQueryMonitoringSignal,
         acquired_changes: tuple[ResourceChangeRecord, ...],
         execution: _AcquisitionExecution,
@@ -2989,6 +3126,26 @@ class MonitoringAcquisitionCoordinator:
                 "Traffic Analytics IP-to-resource mapping was ambiguous and no "
                 "causality was claimed",
             )
+        coverage_scope = control_binding.coverage_scope
+        local_target_resource_id = (
+            row.destination_resource_candidates[0]
+            if row.direction == "inbound"
+            else row.source_resource_candidates[0]
+        )
+        if (
+            row.protocol not in {"Tcp", "Udp"}
+            or row.path_id != coverage_scope.path_id
+            or row.direction != coverage_scope.direction
+            or _traffic_row_five_tuple_digest(row) != coverage_scope.five_tuple_digest
+            or coverage_scope.endpoint_test_reference is not None
+            or coverage_scope.endpoint_test_digest is not None
+            or not _is_virtual_machine_resource_id(local_target_resource_id)
+        ):
+            return (
+                None,
+                "Traffic Analytics row did not match the exact authority-approved "
+                "TCP/UDP VM-local IP Flow scope",
+            )
         checked_at = execution.adapter.utc_now()
         verification_request = _build_request(
             IpFlowVerifyRequest,
@@ -3009,7 +3166,7 @@ class MonitoringAcquisitionCoordinator:
                 "maxRows": self._acquisition_authority.max_rows,
                 "maxBytes": self._acquisition_authority.max_bytes,
                 "checkedAt": checked_at,
-                "targetResourceId": row.subject_resource_candidates[0],
+                "targetResourceId": local_target_resource_id,
                 "direction": row.direction,
                 "protocol": row.protocol,
                 "sourceAddress": row.source_address,

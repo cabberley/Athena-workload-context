@@ -795,7 +795,7 @@ class _CommitPort:
             ),
             "collectorContractDigest": bundle.monitoring_contract_digest,
             "collectionId": collection_id,
-            "observedAt": NOW,
+            "observedAt": bundle.observed_end,
             "evidence": reference.model_dump(
                 mode="json",
                 by_alias=True,

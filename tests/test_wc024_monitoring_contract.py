@@ -104,6 +104,11 @@ IP_FLOW_VERIFY_OPERATIONS = (
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
 )
+RESOURCE_HEALTH_ROLE_DEFINITION_ID = (
+    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Authorization/"
+    "roleDefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072"
+)
+RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/read",)
 COLLECTOR_TENANT_ID = "00000000-0000-0000-0000-000000000003"
 REVIEWED_LOG_TABLES = (
     "Heartbeat",
@@ -335,9 +340,13 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             "identityProofMaximumLifetimeSeconds": (
                 MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
             ),
+            "resourceHealthRoleDefinitionId": RESOURCE_HEALTH_ROLE_DEFINITION_ID,
+            "resourceHealthScopeIds": SIGNAL_READ_SCOPE_IDS,
+            "resourceHealthAllowedOperations": RESOURCE_HEALTH_OPERATIONS,
             "allowedReadOperations": (
                 *payload["allowedReadOperations"],
                 *IP_FLOW_VERIFY_OPERATIONS,
+                *RESOURCE_HEALTH_OPERATIONS,
             ),
             "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
             "acquisitionReceiptSchemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
@@ -401,6 +410,8 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     assert contract.ip_flow_verify_allowed_operations == IP_FLOW_VERIFY_OPERATIONS
     assert contract.identity_proof_audience == MONITORING_IDENTITY_PROOF_AUDIENCE
     assert "Microsoft.Network/networkWatchers/read" not in contract.allowed_read_operations
+    assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
+    assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
 
 
 def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
@@ -420,6 +431,9 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
         "identityProofTokenVersion",
         "identityProofRequiredRole",
         "identityProofMaximumLifetimeSeconds",
+        "resourceHealthRoleDefinitionId",
+        "resourceHealthScopeIds",
+        "resourceHealthAllowedOperations",
         "acquisitionReceiptSchemaVersion",
     ):
         payload.pop(field)
@@ -438,11 +452,19 @@ def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
     )
     payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v4"
     payload["acquisitionReceiptSchemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v3"
+    payload["allowedReadOperations"] = tuple(
+        operation
+        for operation in payload["allowedReadOperations"]
+        if operation not in RESOURCE_HEALTH_OPERATIONS
+    )
     for field in (
         "identityProofAudience",
         "identityProofTokenVersion",
         "identityProofRequiredRole",
         "identityProofMaximumLifetimeSeconds",
+        "resourceHealthRoleDefinitionId",
+        "resourceHealthScopeIds",
+        "resourceHealthAllowedOperations",
     ):
         payload.pop(field)
 
@@ -450,6 +472,31 @@ def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
 
     assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v4"
     assert legacy.identity_proof_audience is None
+
+
+def test_legacy_v5_acquisition_collector_contract_remains_readable() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v5"
+    payload["allowedReadOperations"] = tuple(
+        operation
+        for operation in payload["allowedReadOperations"]
+        if operation not in RESOURCE_HEALTH_OPERATIONS
+    )
+    for field in (
+        "resourceHealthRoleDefinitionId",
+        "resourceHealthScopeIds",
+        "resourceHealthAllowedOperations",
+    ):
+        payload.pop(field)
+
+    legacy = MonitoringCollectorContract(**payload)
+
+    assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v5"
+    assert legacy.resource_health_role_definition_id is None
 
 
 @pytest.mark.parametrize(
@@ -469,6 +516,9 @@ def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
         ("identityProofAudience", "api://unreviewed-proof"),
         ("identityProofRequiredRole", None),
         ("identityProofMaximumLifetimeSeconds", None),
+        ("resourceHealthRoleDefinitionId", READER_ROLE_DEFINITION_ID),
+        ("resourceHealthScopeIds", SIGNAL_READ_SCOPE_IDS[:-1]),
+        ("resourceHealthAllowedOperations", ("Microsoft.ResourceHealth/events/read",)),
         ("acquisitionReceiptSchemaVersion", None),
     ),
 )
@@ -503,7 +553,7 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     for operation in _collector_contract().allowed_read_operations:
         assert f"'{operation}'" in source
     assert "output collectorContract object = collectorContract" in source
-    assert "athena.wc028MonitoringCollectorContract.v5" in source
+    assert "athena.wc028MonitoringCollectorContract.v6" in source
     assert "athena.wc028MonitoringEvidenceHandoff.v2" in source
 
 

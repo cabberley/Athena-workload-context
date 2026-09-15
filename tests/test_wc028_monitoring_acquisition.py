@@ -117,6 +117,18 @@ class _SyntheticClock:
     now = NOW
 
 
+class _SyntheticJwks:
+    advance_clock_seconds = 0
+
+
+class _SyntheticJwt:
+    advance_clock_seconds = 0
+
+
+class _SyntheticClaims:
+    advance_clock_seconds = 0
+
+
 @dataclass(frozen=True, slots=True)
 class _SyntheticAccessToken:
     token: str
@@ -127,6 +139,7 @@ class _SyntheticManagedIdentityCredential:
     instances: list[_SyntheticManagedIdentityCredential] = []
     claim_overrides: dict[str, object] = {}
     lifetime_seconds = 3600
+    advance_clock_seconds = 0
 
     def __init__(self, *, client_id: str) -> None:
         assert client_id == READER_CLIENT_ID
@@ -160,6 +173,7 @@ class _SyntheticManagedIdentityCredential:
             algorithm="RS256",
             headers={"kid": "synthetic-kid", "typ": "JWT"},
         )
+        _SyntheticClock.now += timedelta(seconds=self.advance_clock_seconds)
         return _SyntheticAccessToken(token=token, expires_on=expires_on)
 
 
@@ -168,7 +182,11 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
     _SyntheticManagedIdentityCredential.instances.clear()
     _SyntheticManagedIdentityCredential.claim_overrides = {}
     _SyntheticManagedIdentityCredential.lifetime_seconds = 3600
+    _SyntheticManagedIdentityCredential.advance_clock_seconds = 0
     _SyntheticClock.now = NOW
+    _SyntheticJwks.advance_clock_seconds = 0
+    _SyntheticJwt.advance_clock_seconds = 0
+    _SyntheticClaims.advance_clock_seconds = 0
     _SyntheticAzureClient.active_port = None
     _SyntheticAzureClient.credentials.clear()
     _SyntheticAzureClient.contracts.clear()
@@ -184,9 +202,30 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
             assert cache_keys is True
 
         def get_signing_key_from_jwt(self, _token: str) -> _SigningKey:
+            _SyntheticClock.now += timedelta(seconds=_SyntheticJwks.advance_clock_seconds)
             return _SigningKey()
 
     monkeypatch.setattr(jwt, "PyJWKClient", _JwkClient)
+    original_decode = jwt.decode
+
+    def _decode(*args, **kwargs):
+        result = original_decode(*args, **kwargs)
+        _SyntheticClock.now += timedelta(seconds=_SyntheticJwt.advance_clock_seconds)
+        return result
+
+    monkeypatch.setattr(jwt, "decode", _decode)
+    original_claim_validator = monitoring_acquisition_module._validated_identity_claims
+
+    def _validate_claims(*args, **kwargs):
+        result = original_claim_validator(*args, **kwargs)
+        _SyntheticClock.now += timedelta(seconds=_SyntheticClaims.advance_clock_seconds)
+        return result
+
+    monkeypatch.setattr(
+        monitoring_acquisition_module,
+        "_validated_identity_claims",
+        _validate_claims,
+    )
     monkeypatch.setattr(
         monitoring_acquisition_module,
         "ManagedIdentityCredential",
@@ -471,6 +510,10 @@ class _AcquisitionPort:
         missing_current_db_heartbeat: bool = False,
         unproven_current_heartbeat_zero: bool = False,
         traffic_analytics_rows: int = 1,
+        traffic_direction: str = "inbound",
+        traffic_protocol: str = "Tcp",
+        traffic_destination_port: int = 1433,
+        traffic_destination_resource_id: str = DB_ID,
         backdated_ip_flow: bool = False,
         mismatched_aggregate_proof: bool = False,
         future_aggregate_proof: bool = False,
@@ -498,6 +541,10 @@ class _AcquisitionPort:
         self.missing_current_db_heartbeat = missing_current_db_heartbeat
         self.unproven_current_heartbeat_zero = unproven_current_heartbeat_zero
         self.traffic_analytics_rows = traffic_analytics_rows
+        self.traffic_direction = traffic_direction
+        self.traffic_protocol = traffic_protocol
+        self.traffic_destination_port = traffic_destination_port
+        self.traffic_destination_resource_id = traffic_destination_resource_id
         self.backdated_ip_flow = backdated_ip_flow
         self.mismatched_aggregate_proof = mismatched_aggregate_proof
         self.future_aggregate_proof = future_aggregate_proof
@@ -516,7 +563,9 @@ class _AcquisitionPort:
         request: LogAnalyticsQueryRequest,
     ) -> LogAnalyticsQueryResult:
         self._record_request(request)
-        is_current = request.window_end == NOW
+        assert request.collector_execution_time is not None
+        assert request.coverage_scope is not None
+        is_current = request.window_end == request.collector_execution_time
         path = _dependency_path()
         if request.table == "Heartbeat":
             if self.absent_heartbeat or (self.missing_current_heartbeat and is_current):
@@ -604,14 +653,14 @@ class _AcquisitionPort:
                 subjectResourceCandidates=(WEB_ID,),
                 pathId=path.path_id,
                 decision="denied",
-                direction="inbound",
-                protocol="Tcp",
+                direction=self.traffic_direction,
+                protocol=self.traffic_protocol,
                 sourceResourceCandidates=(WEB_ID,),
-                destinationResourceCandidates=(DB_ID,),
+                destinationResourceCandidates=(self.traffic_destination_resource_id,),
                 sourceAddress="192.0.2.10",
                 destinationAddress="192.0.2.20",
                 sourcePort=443,
-                destinationPort=1433,
+                destinationPort=self.traffic_destination_port,
                 enforcementResourceId=NSG_ID,
                 ruleResourceId=NSG_RULE_ID,
                 trafficAnalyticsLimitation="aggregatedNotPacketCausal",
@@ -619,23 +668,14 @@ class _AcquisitionPort:
                 observedEnd=request.window_end,
             )
             rows = tuple(traffic_row for _ in range(self.traffic_analytics_rows))
-        coverage_descriptor = None
-        if request.table == "NWConnectionMonitorTestResult":
-            coverage_descriptor = LogCoverageDescriptor(
-                resourceIds=tuple(sorted((WEB_ID, DB_ID))),
-                pathId=path.path_id,
-                direction="inbound",
-                fiveTupleDigest=_five_tuple_digest(),
-                endpointTestReference="synthetic-web-db-test",
-                endpointTestDigest="sha256:" + "9" * 64,
-            )
-        elif request.table == "NTANetAnalytics":
-            coverage_descriptor = LogCoverageDescriptor(
-                resourceIds=tuple(sorted((WEB_ID, DB_ID, NSG_ID, NSG_RULE_ID))),
-                pathId=path.path_id,
-                direction="inbound",
-                fiveTupleDigest=_five_tuple_digest(),
-            )
+        coverage_descriptor = LogCoverageDescriptor(
+            resourceIds=request.coverage_scope.resource_ids,
+            pathId=request.coverage_scope.path_id,
+            direction=request.coverage_scope.direction,
+            fiveTupleDigest=request.coverage_scope.five_tuple_digest,
+            endpointTestReference=request.coverage_scope.endpoint_test_reference,
+            endpointTestDigest=request.coverage_scope.endpoint_test_digest,
+        )
         aggregate_proof = (
             None
             if request.table not in {"Heartbeat", "VMConnection"}
@@ -645,7 +685,9 @@ class _AcquisitionPort:
             else _aggregate_proof(
                 request,
                 ingestion_complete_through=(
-                    NOW + timedelta(minutes=1) if self.future_aggregate_proof else None
+                    request.collector_execution_time + timedelta(minutes=1)
+                    if self.future_aggregate_proof
+                    else None
                 ),
             )
         )
@@ -666,7 +708,11 @@ class _AcquisitionPort:
             table=request.table,
             requestDigest=request.request_digest,
             sourceIdentityId=self.source_identity_id,
-            collectedAt=self._collected_at(),
+            collectedAt=(
+                request.collector_execution_time - timedelta(minutes=1)
+                if self.stale
+                else request.collector_execution_time
+            ),
             columns=request.expected_columns,
             coverageDescriptor=coverage_descriptor,
             aggregateCompletenessProof=aggregate_proof,
@@ -992,6 +1038,15 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     log_requests = [
         request for request in port.requests if isinstance(request, LogAnalyticsQueryRequest)
     ]
+    bindings_by_id = {
+        item.control_id: item for item in (acquisition_authority.required_control_bindings or ())
+    }
+    assert all(
+        request.schema_version == "athena.wc028LogAnalyticsQueryRequest.v2"
+        and request.collector_execution_time == NOW
+        and request.coverage_scope == bindings_by_id[request.control_id].coverage_scope
+        for request in log_requests
+    )
     assert not any(
         isinstance(request, (ActivityLogQueryRequest, ResourceGraphChangeQueryRequest))
         for request in port.requests
@@ -1063,7 +1118,9 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         request.request_digest for request in port.requests
     )
     ip_flow_exchange = next(item for item in receipt.exchanges if item.source == "ipFlowVerify")
+    ip_flow_request = next(item for item in port.requests if isinstance(item, IpFlowVerifyRequest))
     assert ip_flow_exchange.checked_at == NOW
+    assert ip_flow_request.target_resource_id == DB_ID.casefold()
     assert outcome.committed.monitoring_handoff.acquisition_receipt_digest == receipt.receipt_digest
     tampered_bundle = outcome.prepared.monitoring_bundle.model_dump(
         mode="json",
@@ -1135,6 +1192,30 @@ def test_production_adapter_refreshes_identity_proof_for_each_execution() -> Non
     assert first.proof_digest != second.proof_digest
     assert _SyntheticManagedIdentityCredential.instances[0].calls == 2
     assert len(_SyntheticAzureClient.credentials) == 5
+
+
+def test_identity_proof_time_follows_token_jwks_signature_and_claim_validation() -> None:
+    _SyntheticManagedIdentityCredential.advance_clock_seconds = 5
+    _SyntheticJwks.advance_clock_seconds = 7
+    _SyntheticJwt.advance_clock_seconds = 11
+    _SyntheticClaims.advance_clock_seconds = 13
+    authority = _authority(required_control_names={"heartbeat", "endpoint", "monitor"})
+    port = _AcquisitionPort()
+    outcome, commit, _ = _execute(port, authority=authority)
+
+    assert commit.calls == 1
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert receipt.identity_proof is not None
+    expected_verification_time = NOW + timedelta(seconds=36)
+    assert receipt.identity_proof.verified_at == expected_verification_time
+    assert receipt.execution_started_at == expected_verification_time
+    assert outcome.batch.collected_at == expected_verification_time
+    assert all(
+        request.collector_execution_time == expected_verification_time
+        for request in port.requests
+        if isinstance(request, LogAnalyticsQueryRequest)
+    )
 
 
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
@@ -2157,6 +2238,29 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     assert type(receipt).model_validate_json(receipt.model_dump_json(by_alias=True)) == receipt
     assert first.batch.canonical_bytes() == second.batch.canonical_bytes()
     assert receipt.canonical_json() == second_receipt.canonical_json()
+
+
+@pytest.mark.parametrize(
+    "port",
+    (
+        _AcquisitionPort(traffic_destination_port=443),
+        _AcquisitionPort(traffic_protocol="Icmp"),
+        _AcquisitionPort(traffic_direction="outbound"),
+        _AcquisitionPort(traffic_destination_resource_id=NSG_ID),
+    ),
+)
+def test_unapproved_traffic_tuple_or_local_target_skips_ip_flow(
+    port: _AcquisitionPort,
+) -> None:
+    outcome, commit, _ = _execute(port)
+
+    assert commit.calls == 1
+    assert port.ip_flow_calls == 0
+    network_coverage = next(item for item in outcome.batch.coverage if item.family == "networkFlow")
+    assert network_coverage.status == "unavailable"
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert not any(item.source == "ipFlowVerify" for item in receipt.exchanges)
 
 
 def test_total_acquisition_call_budget_fails_before_extra_read() -> None:

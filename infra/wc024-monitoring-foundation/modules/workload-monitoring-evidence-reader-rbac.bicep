@@ -29,10 +29,34 @@ var expectedSignalReaderActions = [
   'microsoft.compute/virtualmachines/instanceview/read'
   'microsoft.insights/metrics/read'
 ]
+var resourceHealthRoleDefinitionGuid = '0790d6f2-9553-5b63-84ac-56596b7e4072'
+var resourceHealthAllowedOperations = [
+  'Microsoft.ResourceHealth/AvailabilityStatuses/read'
+]
 
 resource signalReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' existing = {
   name: signalReaderRoleDefinitionGuid
   scope: subscription()
+}
+
+resource resourceHealthRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: resourceHealthRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC-028 VM Resource Health Reader'
+    description: 'Read Resource Health availability status only at exact approved workload VMs.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: resourceHealthAllowedOperations
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
 }
 
 var signalReaderPermission = signalReaderRoleDefinition.properties.permissions[0]
@@ -89,6 +113,18 @@ resource collectorVmSignalReaders 'Microsoft.Authorization/roleAssignments@2022-
   }
 ]
 
+resource collectorVmResourceHealthReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for (vmName, index) in approvedVmNames: {
+    name: guid(approvedVms[index].id, collectorPrincipalId, resourceHealthRoleDefinition.id)
+    scope: approvedVms[index]
+    properties: {
+      principalId: collectorPrincipalId
+      principalType: 'ServicePrincipal'
+      roleDefinitionId: resourceHealthRoleDefinition.id
+    }
+  }
+]
+
 resource collectorDcrAssociationReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for (vmName, index) in approvedVmNames: {
     name: guid(adoptedDcrAssociations[index].id, collectorPrincipalId, readerRoleDefinitionId)
@@ -115,6 +151,12 @@ resource collectorDceAssociationReaders 'Microsoft.Authorization/roleAssignments
 
 output readerRoleDefinitionId string = readerRoleDefinitionId
 output signalReaderRoleDefinitionId string = validatedSignalReaderRoleDefinitionId
+output resourceHealthRoleDefinitionId string = resourceHealthRoleDefinition.id
+output resourceHealthScopeIds array = map(
+  approvedVmNames,
+  vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)
+)
+output resourceHealthAllowedOperations array = resourceHealthAllowedOperations
 output signalReadScopeIds array = map(
   approvedVmNames,
   vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)

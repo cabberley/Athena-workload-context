@@ -28,8 +28,11 @@ MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
 MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v4"
 )
-MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v5"
+)
+MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+    "athena.wc028MonitoringCollectorContract.v6"
 )
 MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = "athena.wc024MonitoringEvidenceHandoff.v1"
 MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v4"
@@ -62,10 +65,14 @@ type MonitoringReadOperation = Literal[
     "Microsoft.Network/networkWatchers/flowLogs/read",
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
 ]
 type MonitoringIpFlowVerifyOperation = Literal[
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+]
+type MonitoringResourceHealthOperation = Literal[
+    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
 ]
 type MonitoringLogTable = Literal[
     "Heartbeat",
@@ -97,6 +104,7 @@ _READER_ROLE_DEFINITION_GUID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
 _SIGNAL_READER_ROLE_DEFINITION_GUID = "2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
 _LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
 _IP_FLOW_VERIFY_ROLE_DEFINITION_GUID = "3728cdf6-4efd-5282-bdfc-63b7872fd801"
+_RESOURCE_HEALTH_ROLE_DEFINITION_GUID = "0790d6f2-9553-5b63-84ac-56596b7e4072"
 _REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
 _REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
 _REVIEWED_MONITORING_RESOURCE_GROUP = "rg-athena-demo-monitoring"
@@ -175,9 +183,16 @@ _EXPECTED_IP_FLOW_VERIFY_OPERATIONS: tuple[MonitoringIpFlowVerifyOperation, ...]
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
 )
-_EXPECTED_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
+_EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     *_EXPECTED_READ_OPERATIONS,
     *_EXPECTED_IP_FLOW_VERIFY_OPERATIONS,
+)
+_EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
+    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
+)
+_EXPECTED_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
+    *_EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS,
+    *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
 )
 _MAX_VERIFIED_TOKEN_LIFETIME_SECONDS = 28 * 60 * 60
 
@@ -236,6 +251,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "athena.wc028MonitoringCollectorContract.v3",
         "athena.wc028MonitoringCollectorContract.v4",
         "athena.wc028MonitoringCollectorContract.v5",
+        "athena.wc028MonitoringCollectorContract.v6",
     ] = Field(alias="schemaVersion")
     collector_identity_resource_id: str = Field(
         alias="collectorIdentityResourceId",
@@ -364,6 +380,26 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         default=None,
         alias="identityProofMaximumLifetimeSeconds",
     )
+    resource_health_role_definition_id: str | None = Field(
+        default=None,
+        alias="resourceHealthRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    resource_health_scope_ids: tuple[str, ...] | None = Field(
+        default=None,
+        alias="resourceHealthScopeIds",
+        min_length=len(_EXPECTED_APPROVED_VM_NAMES),
+        max_length=len(_EXPECTED_APPROVED_VM_NAMES),
+    )
+    resource_health_allowed_operations: tuple[MonitoringResourceHealthOperation, ...] | None = (
+        Field(
+            default=None,
+            alias="resourceHealthAllowedOperations",
+            min_length=len(_EXPECTED_RESOURCE_HEALTH_OPERATIONS),
+            max_length=len(_EXPECTED_RESOURCE_HEALTH_OPERATIONS),
+        )
+    )
     log_analytics_allowed_tables: tuple[MonitoringLogTable, ...] = Field(
         alias="logAnalyticsAllowedTables",
         min_length=len(_EXPECTED_LOG_TABLES),
@@ -469,6 +505,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             in {
                 MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             }
             and self.handoff_schema_version != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
@@ -476,15 +513,15 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("collector contract version does not authorize its handoff schema")
         if self.signal_kinds != _EXPECTED_SIGNALS:
             raise ValueError("monitoring signals must use the complete reviewed generic allowlist")
-        expected_read_operations = (
-            _EXPECTED_ACQUISITION_READ_OPERATIONS
-            if self.schema_version
-            in {
-                MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-            }
-            else _EXPECTED_READ_OPERATIONS
-        )
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            expected_read_operations = _EXPECTED_ACQUISITION_READ_OPERATIONS
+        elif self.schema_version in {
+            MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
+            expected_read_operations = _EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS
+        else:
+            expected_read_operations = _EXPECTED_READ_OPERATIONS
         if self.allowed_read_operations != expected_read_operations:
             raise ValueError("monitoring read operations must use the complete reviewed allowlist")
         if self.log_analytics_allowed_tables != _EXPECTED_LOG_TABLES:
@@ -514,6 +551,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.identity_proof_required_role,
             self.identity_proof_maximum_lifetime_seconds,
         )
+        resource_health_fields = (
+            self.resource_health_role_definition_id,
+            self.resource_health_scope_ids,
+            self.resource_health_allowed_operations,
+        )
         if self.schema_version == MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION:
             if any(
                 item is not None
@@ -521,6 +563,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *acquisition_identity_fields,
                     *credential_and_ip_flow_fields,
                     *identity_proof_fields,
+                    *resource_health_fields,
                     self.acquisition_receipt_schema_version,
                 )
             ):
@@ -546,6 +589,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 for item in (
                     *credential_and_ip_flow_fields,
                     *identity_proof_fields,
+                    *resource_health_fields,
                     self.acquisition_receipt_schema_version,
                 )
             )
@@ -555,6 +599,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         if self.schema_version in {
             MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             if any(item is None for item in credential_and_ip_flow_fields):
@@ -571,6 +616,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.schema_version == MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
             and (
                 any(item is not None for item in identity_proof_fields)
+                or any(item is not None for item in resource_health_fields)
                 or self.acquisition_receipt_schema_version
                 != "athena.wc028MonitoringAcquisitionReceipt.v3"
             )
@@ -579,7 +625,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 "legacy credential-bound collector contract must use receipt v3 "
                 "without Athena identity proof policy"
             )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+        if self.schema_version in {
+            MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        } and (
             any(item is None for item in identity_proof_fields)
             or self.identity_proof_audience != MONITORING_IDENTITY_PROOF_AUDIENCE
             or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
@@ -592,6 +641,18 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError(
                 "production collector contract requires the exact Athena identity proof policy"
             )
+        if (
+            self.schema_version == MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and any(item is not None for item in resource_health_fields)
+        ):
+            raise ValueError(
+                "legacy identity-proof collector contract cannot contain Resource Health policy"
+            )
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+            any(item is None for item in resource_health_fields)
+            or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+        ):
+            raise ValueError("production collector contract requires exact Resource Health policy")
         try:
             UUID(self.collector_identity_client_id)
         except ValueError as exc:
@@ -669,6 +730,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         )
         if self.schema_version in {
             MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             expected_ip_flow_role_definition_id = (
@@ -711,6 +773,23 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             scope.casefold() for scope in expected_signal_read_scope_ids
         ):
             raise ValueError("signal-reader scopes must match the exact reviewed VMs")
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            expected_resource_health_role_definition_id = (
+                f"{workload_resource_group_root}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{_RESOURCE_HEALTH_ROLE_DEFINITION_GUID}"
+            )
+            if (
+                cast(str, self.resource_health_role_definition_id).casefold()
+                != expected_resource_health_role_definition_id.casefold()
+            ):
+                raise ValueError(
+                    "Resource Health role definition must match the exact reviewed custom role"
+                )
+            if tuple(
+                scope.casefold() for scope in cast(tuple[str, ...], self.resource_health_scope_ids)
+            ) != tuple(scope.casefold() for scope in expected_signal_read_scope_ids):
+                raise ValueError("Resource Health assignments must match the exact approved VMs")
 
         expected_resource_read_scope_ids = (
             (
@@ -1502,6 +1581,9 @@ def verify_monitoring_acquisition_receipt_attestation(
         or reviewed_collector_contract.identity_proof_token_version is None
         or reviewed_collector_contract.identity_proof_required_role is None
         or reviewed_collector_contract.identity_proof_maximum_lifetime_seconds is None
+        or reviewed_collector_contract.resource_health_role_definition_id is None
+        or reviewed_collector_contract.resource_health_scope_ids is None
+        or reviewed_collector_contract.resource_health_allowed_operations is None
     ):
         raise ValueError(
             "production acquisition verification requires the credential-bound collector contract"
@@ -1629,6 +1711,7 @@ __all__ = [
     "MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION",
     "MONITORING_IDENTITY_PROOF_AUDIENCE",
+    "MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS",
     "MONITORING_IDENTITY_PROOF_REQUIRED_ROLE",
     "MONITORING_IDENTITY_PROOF_TOKEN_VERSION",
@@ -1643,6 +1726,7 @@ __all__ = [
     "MonitoringIdentityProof",
     "MonitoringIpFlowVerifyOperation",
     "MonitoringReadOperation",
+    "MonitoringResourceHealthOperation",
     "MonitoringSignalKind",
     "monitoring_acquisition_receipt_preimage",
     "monitoring_handoff_preimage",

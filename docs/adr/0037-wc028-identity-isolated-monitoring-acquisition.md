@@ -29,6 +29,10 @@ The coordinator:
 - exposes no caller-supplied query, table, column, filter, resource-scope, or time-window input;
 - derives exact Log Analytics queries, Activity Log filters, Resource Graph scopes, Resource
   Health filters, and bounded windows from the verified intent plus reviewed constants;
+- emits Log Analytics request v2 with the collector execution timestamp and the exact
+  authority-selected `EvidenceCoverageScope`; source clients return raw rows plus bounded response
+  metadata while `collectedAt` and coverage remain explicit request-bound values, including prior
+  windows and zero-row network queries;
 - accepts only the production `AzureMonitoringAdapter`, which internally creates one direct
   `ManagedIdentityCredential(client_id=<reviewed client ID>)`; after identity proof succeeds, the
   adapter passes that exact credential object to each Azure client so the SDK can legitimately
@@ -37,6 +41,9 @@ The coordinator:
   single-tenant `api://athena-monitoring-identity-proof` audience, then validates RS256 signature
   through tenant-pinned JWKS, token version `1.0`, exact issuer and audience, tenant, `oid`,
   `appid`/`azp`, app-only `idtyp`, exact application role, and `iat`/`nbf`/`exp`;
+- captures `verifiedAt` only after token acquisition, JWKS retrieval, cryptographic verification,
+  and claim validation, then uses that same trusted time for lifetime checks, normalized proof,
+  collection time, and receipt execution start;
 - persists only one frozen normalized identity proof containing those reviewed fields, signing-key
   ID, token hash, timestamps, the reviewed two-hour maximum lifetime, and a deterministic proof
   digest; the bearer token is discarded, and every exchange plus the signed receipt binds the same
@@ -82,6 +89,11 @@ The coordinator:
 - issues IP Flow Verify as its own identity-bound, request-digest-bound point-in-time read after
   an unambiguous Traffic Analytics mapping, and permits direct NSG attribution only when one
   successful, earlier, deny-introducing change matches its exact denied rule result;
+- before an IP Flow call, requires the Traffic Analytics row to match the selected authority
+  binding's exact path, direction, five-tuple digest, and absent endpoint-test fields, permits only
+  TCP or UDP, derives the local target from direction, and requires that target to be an approved
+  in-scope VM; mismatched ports, protocols, directions, or non-VM targets become unavailable
+  coverage with zero IP Flow calls;
 - rejects Traffic Analytics responses with more than one row before issuing any IP Flow calls, and
   rejects all further reads once the authority's total acquisition-call budget is exhausted;
 - when a selected Traffic Analytics query returns no usable flow row, emits unavailable network
@@ -105,8 +117,13 @@ The coordinator:
   `NetworkWatcher_australiaeast` resource; the existing built-in Reader assignment remains scoped
   only to the canonical flow-log child;
 - publishes the exact IP Flow role-definition ID, Network Watcher assignment scope, and two-action
-  allowlist in production collector contract v5, alongside the collector tenant/client/object
-  identity, Athena proof audience/version/role, and acquisition receipt v4 schema.
+  allowlist in production collector contract v6, alongside the collector tenant/client/object
+  identity, Athena proof audience/version/role/lifetime, acquisition receipt v4 schema, and the
+  Resource Health permission contract;
+- provisions a separate Resource Health custom role containing only
+  `Microsoft.ResourceHealth/AvailabilityStatuses/read`, makes it assignable only in
+  `rg-athena-demo-workload`, and assigns it independently at each exact approved VM; built-in
+  Reader remains limited to the already reviewed DCR/DCE-association and flow-log child resources.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -135,18 +152,18 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Receipt-bearing acquisitions use `athena.wc028MonitoringEvidenceBundle.v3` and
   `athena.wc028MonitoringEvidenceHandoff.v2`; legacy collection paths remain on their existing
   versioned contracts and cannot silently add receipt fields.
-- The deployment publishes `athena.wc028MonitoringCollectorContract.v5` while retaining parse
-  support for WC-024 v2 and legacy WC-028 v3/v4 contracts. Production verification requires the
-  full reviewed v5 contract and its exact proof policy.
+- The deployment publishes `athena.wc028MonitoringCollectorContract.v6` while retaining parse
+  support for WC-024 v2 and legacy WC-028 v3-v5 contracts. Production verification requires the
+  full reviewed v6 contract and its exact proof and Resource Health policies.
 - Legacy acquisition-authority v1-v3 documents remain readable, but only v4 authorities can execute
   production acquisition. Production receipt verification requires receipt v4 and derives deployed
   tenant/client/object/resource identity, proof policy, and IP Flow policy from the full reviewed
   collector contract rather than caller assertions.
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
-- This slice adds exactly one narrow custom role definition and one assignment at the existing
-  regional Network Watcher. It adds no Reader broadening, diagnostic setting, alert, query
-  deployment, Connection Monitor mutation, or write permission.
+- This slice adds the narrow IP Flow role and exact Network Watcher assignment plus one separate
+  narrow Resource Health role with exact per-VM assignments. It adds no Reader broadening,
+  diagnostic setting, alert, query deployment, Connection Monitor mutation, or write permission.
 
 ## Alternatives considered
 
@@ -179,6 +196,8 @@ ambiguous incident transitions fail before the persistence transaction is entere
   times, unauthorized sources, or unauthorized resource scopes fail before any read.
 - Invalid proof signature, token version, issuer, audience, tenant, object ID, client ID, app-only
   identity type, role, or lifetime fails before client construction and the first source I/O.
+- Clock-advance tests prove `verifiedAt` is captured after token and JWKS work and is reused as the
+  exact collection and execution-start timestamp.
 - Tests prove the exact same `ManagedIdentityCredential` object reaches all five Azure clients,
   fake source identity values cannot change receipt identity, and `DefaultAzureCredential` cannot
   enter the production receipt path.
@@ -193,6 +212,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
   Traffic Analytics rows.
 - Empty or unusable Traffic Analytics results produce deterministic unavailable coverage, no IP
   Flow exchange, and a valid receipt v4 with no orphan source proof.
+- Mismatched Traffic Analytics port, protocol, direction, or non-VM local target produces
+  unavailable coverage and zero IP Flow calls before any point-in-time verification request.
+- Log request v2 tests bind current and prior windows, collector execution time, and exact
+  authority coverage without module globals; zero-row network queries retain that exact scope.
+- IaC and contract tests require the exact Resource Health role ID, one allowed operation, and all
+  11 approved VM scopes while proving Reader was not broadened.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
   correlation boundary.
 - Forged source identity claims, caller-backdated collection/IP Flow time, unproved aggregate zero,

@@ -659,6 +659,21 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         vm_signal_assignment
     )
     assert "roleDefinitionId: readerRoleDefinitionId" not in vm_signal_assignment
+    resource_health_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorVmResourceHealthReaders",
+        maxsplit=1,
+    )[1].split("resource collectorDcrAssociationReaders", maxsplit=1)[0]
+    assert "scope: approvedVms[index]" in resource_health_assignment
+    assert "roleDefinitionId: resourceHealthRoleDefinition.id" in (
+        resource_health_assignment
+    )
+    assert "roleDefinitionId: readerRoleDefinitionId" not in resource_health_assignment
+    assert "0790d6f2-9553-5b63-84ac-56596b7e4072" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceHealth/AvailabilityStatuses/read" in (
+        WORKLOAD_READER_RBAC
+    )
+    assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
+    assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "signalReaderAssignableScopes" in WORKLOAD_READER_RBAC
@@ -754,7 +769,7 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     )
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringCollectorContract.v5" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v6" in COLLECTOR_CONTRACT
     assert "athena.wc028MonitoringAcquisitionReceipt.v4" in COLLECTOR_CONTRACT
     assert "ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId" in (
         COLLECTOR_CONTRACT
@@ -773,6 +788,13 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
         in COLLECTOR_CONTRACT
     )
     assert "identityProofMaximumLifetimeSeconds: 7200" in COLLECTOR_CONTRACT
+    assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "resourceHealthScopeIds: resourceHealthScopeIds" in COLLECTOR_CONTRACT
+    assert "resourceHealthAllowedOperations: resourceHealthAllowedOperations" in (
+        COLLECTOR_CONTRACT
+    )
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
     assert "'workspaceAndResourceContext'" in MAIN
     assert "'workspaceOnly'" in MAIN

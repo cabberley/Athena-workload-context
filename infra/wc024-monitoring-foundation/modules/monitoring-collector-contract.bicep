@@ -65,6 +65,19 @@ param ipFlowVerifyScopeId string
 @maxLength(2)
 param ipFlowVerifyAllowedOperations array
 
+@description('Exact custom role definition resource ID for Resource Health availability reads.')
+param resourceHealthRoleDefinitionId string
+
+@description('Exact approved VM resource IDs receiving Resource Health availability-read assignments.')
+@minLength(11)
+@maxLength(11)
+param resourceHealthScopeIds array
+
+@description('Exact Resource Health management-plane operation allowlist.')
+@minLength(1)
+@maxLength(1)
+param resourceHealthAllowedOperations array
+
 @description('Exact Log Analytics table names permitted by the role-assignment condition.')
 @minLength(13)
 @maxLength(13)
@@ -156,7 +169,7 @@ var collectorContract = {
 output collectorContract object = collectorContract
 
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v5'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v6'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
   acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v4'
   collectorTenantId: collectorTenantId
@@ -167,8 +180,12 @@ output acquisitionCollectorContract object = union(collectorContract, {
   identityProofTokenVersion: '1.0'
   identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'
   identityProofMaximumLifetimeSeconds: 7200
+  resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
+  resourceHealthScopeIds: resourceHealthScopeIds
+  resourceHealthAllowedOperations: resourceHealthAllowedOperations
   allowedReadOperations: concat(
     collectorContract.allowedReadOperations,
-    ipFlowVerifyAllowedOperations
+    ipFlowVerifyAllowedOperations,
+    resourceHealthAllowedOperations
   )
 })
