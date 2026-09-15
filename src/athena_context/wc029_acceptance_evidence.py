@@ -48,6 +48,7 @@ from athena_context.contracts import (
     MonitoringEvidenceHandoff,
     PublishedContextAuthority,
     PublishedCorrelationReportAttestation,
+    PublishedCorrelationReportStatement,
     PublishedRuntimeContextBinding,
     UtcDateTime,
     canonicalize_json,
@@ -74,6 +75,9 @@ SIGNING_PUBLIC_KEY_SCHEMA_VERSION = "athena.wc029SigningPublicKey.v1"
 PUBLISHED_MANIFEST_SCHEMA_VERSION = "athena.wc029PublishedManifest.v1"
 PUBLICATION_AUTHORITY_SCHEMA_VERSION = "athena.wc029PublicationAuthority.v1"
 PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION = "athena.wc029PublicationAuthorityAttestation.v1"
+CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION = (
+    "athena.wc029CorrelationOnlyReportAttestation.v1"
+)
 DEPLOYMENT_READBACK_SCHEMA_VERSION = "athena.wc029DeploymentReadback.v1"
 JOB_EXECUTION_SCHEMA_VERSION = "athena.wc029JobExecution.v1"
 JOB_READBACK_SCHEMA_VERSION = "athena.wc029JobReadback.v1"
@@ -93,6 +97,10 @@ URL_PROBE_SCHEMA_VERSION = "athena.wc029UrlProbe.v1"
 MAX_INDEX_BYTES = 512 * 1024
 MAX_TOTAL_EVIDENCE_BYTES = 64 * 1024 * 1024
 MAX_EVIDENCE_FILES = 256
+MAX_EVIDENCE_DIRECTORIES = 256
+MAX_EVIDENCE_PATH_DEPTH = 16
+MAX_EVIDENCE_RELATIVE_PATH_CHARS = 512
+MAX_TOTAL_EVIDENCE_PATH_CHARACTERS = 16 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
 MAX_RECORD_BYTES = 2 * 1024 * 1024
@@ -136,6 +144,7 @@ type EvidenceClass = Literal[
     "correlation-request",
     "correlation-report",
     "correlation-report-attestation",
+    "correlation-only-report-attestation",
     "incident-bound-request",
     "incident-omission",
     "incident-state-active",
@@ -254,6 +263,7 @@ _INCIDENT_ONLY_CLASSES: frozenset[EvidenceClass] = frozenset(
     {
         "incident-state-active",
         "incident-state-active-attestation",
+        "correlation-report-attestation",
         "incident-bound-request",
         "incident-state-resolved",
         "incident-state-resolved-attestation",
@@ -280,6 +290,7 @@ _INCIDENT_ONLY_CLASSES: frozenset[EvidenceClass] = frozenset(
 )
 _ATTESTATION_SUBJECT_CLASSES: dict[EvidenceClass, EvidenceClass] = {
     "correlation-report-attestation": "correlation-report",
+    "correlation-only-report-attestation": "correlation-report",
     "incident-state-active-attestation": "incident-state-active",
     "incident-state-resolved-attestation": "incident-state-resolved",
     "guidance-attestation": "guidance",
@@ -297,6 +308,7 @@ _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
     "monitoring-evidence": "monitoring",
     "change-evidence": "change",
     "correlation-report-attestation": "report",
+    "correlation-only-report-attestation": "report",
     "incident-state-active-attestation": "incident",
     "incident-state-resolved-attestation": "incident",
     "guidance-attestation": "guidance",
@@ -337,6 +349,7 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "correlation-request": "athena.wc026CorrelationRequest.v2",
     "correlation-report": "athena.wc026CorrelationReport.v1",
     "correlation-report-attestation": ("athena.wc027PublishedCorrelationReportAttestation.v1"),
+    "correlation-only-report-attestation": (CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION),
     "incident-bound-request": "athena.wc027IncidentBoundCorrelationRequest.v1",
     "incident-omission": INCIDENT_OMISSION_SCHEMA_VERSION,
     "incident-state-active": "athena.incidentState.v1",
@@ -1008,6 +1021,97 @@ class Wc029PublicationAuthorityAttestation(_StrictAcceptanceModel):
         min_length=1,
         max_length=8192,
     )
+
+
+class Wc029CorrelationOnlyReportStatement(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029CorrelationOnlyReportStatement.v1"] = Field(
+        alias="schemaVersion"
+    )
+    statement_id: str = Field(
+        alias="statementId",
+        pattern=r"^correlation-only-report-[a-f0-9]{32}$",
+    )
+    purpose: Literal["athena.wc029.publish-correlation-only-report"]
+    correlation_request_id: str = Field(
+        alias="correlationRequestId",
+        pattern=r"^request-[a-f0-9]{32}$",
+    )
+    correlation_request_digest: str = Field(
+        alias="correlationRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    context_binding_digest: str = Field(
+        alias="contextBindingDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    report_id: str = Field(
+        alias="reportId",
+        pattern=r"^report-[a-f0-9]{32}$",
+    )
+    report_digest: str = Field(
+        alias="reportDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    report_content_digest: str = Field(
+        alias="reportContentDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    authority_proof_digest: str = Field(
+        alias="authorityProofDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    incident_provenance_absent: Literal[True] = Field(alias="incidentProvenanceAbsent")
+    no_auto_remediation: Literal[True] = Field(alias="noAutoRemediation")
+    statement_digest: str = Field(
+        alias="statementDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_statement(self) -> Wc029CorrelationOnlyReportStatement:
+        payload = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"statement_id", "statement_digest"},
+        )
+        expected = compute_artifact_digest(payload)
+        if (
+            self.statement_digest != expected
+            or self.statement_id
+            != f"correlation-only-report-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("correlation-only statement is not exactly digest-bound")
+        return self
+
+
+class Wc029CorrelationOnlyReportAttestation(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029CorrelationOnlyReportAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    statement: Wc029CorrelationOnlyReportStatement
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: str = Field(
+        alias="signedPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+    @model_validator(mode="after")
+    def validate_attestation(self) -> Wc029CorrelationOnlyReportAttestation:
+        if self.signed_preimage_digest != sha256_hex(self.statement.canonical_bytes()):
+            raise ValueError("correlation-only attestation does not bind its exact statement")
+        return self
 
 
 class Wc029ManifestVersion(_StrictAcceptanceModel):
@@ -2819,7 +2923,6 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             "observe": (
                 "monitoring-evidence",
                 "correlation-report",
-                "correlation-report-attestation",
             ),
             "recover": ("recovery-action",),
             "verify": (
@@ -2853,6 +2956,10 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
         if omission_count > 1:
             raise ValueError("a scenario cannot contain duplicate incident omission evidence")
         if omission_count == 1:
+            if phase_counts["observe"]["correlation-only-report-attestation"] != 1:
+                raise ValueError(
+                    "correlation-only scenarios require one non-incident report attestation"
+                )
             forbidden = {
                 evidence_class
                 for evidence_class in _INCIDENT_ONLY_CLASSES
@@ -2863,7 +2970,12 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
                     "correlation-only scenarios must not contain incident-producing evidence"
                 )
             return
+        if all_counts["correlation-only-report-attestation"]:
+            raise ValueError(
+                "incident-producing scenarios cannot use correlation-only report attestations"
+            )
         required_incident_observe: set[EvidenceClass] = {
+            "correlation-report-attestation",
             "incident-state-active",
             "incident-state-active-attestation",
             "incident-bound-request",
@@ -3048,6 +3160,7 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     "athena.incidentState.v1": IncidentState,
     "athena.incidentStateAttestation.v1": IncidentStateAttestation,
     "athena.wc027IncidentBoundCorrelationRequest.v1": (IncidentBoundCorrelationRequest),
+    CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION: (Wc029CorrelationOnlyReportAttestation),
     "athena.wc027PublishedCorrelationReportAttestation.v1": (PublishedCorrelationReportAttestation),
     "athena.wc027IncidentGuidance.v1": IncidentGuidance,
     "athena.wc027IncidentGuidanceAttestation.v1": IncidentGuidanceAttestation,
@@ -3502,6 +3615,20 @@ def _scan_bundle_tree(
 ) -> tuple[dict[str, _PathIdentity], dict[str, _PathIdentity]]:
     directories: dict[str, _PathIdentity] = {".": _PathIdentity.from_stat(root.lstat())}
     files: dict[str, _PathIdentity] = {}
+    total_path_characters = 0
+
+    def account_path(relative: str) -> None:
+        nonlocal total_path_characters
+        if len(relative) > MAX_EVIDENCE_RELATIVE_PATH_CHARS:
+            raise Wc029AcceptanceEvidenceError("evidence relative path exceeds its length bound")
+        if len(Path(relative).parts) > MAX_EVIDENCE_PATH_DEPTH:
+            raise Wc029AcceptanceEvidenceError("evidence tree exceeds its traversal-depth bound")
+        total_path_characters += len(relative)
+        if total_path_characters > MAX_TOTAL_EVIDENCE_PATH_CHARACTERS:
+            raise Wc029AcceptanceEvidenceError(
+                "evidence tree exceeds its total path-character bound"
+            )
+
     for current_text, directory_names, file_names in os.walk(
         root,
         topdown=True,
@@ -3511,6 +3638,12 @@ def _scan_bundle_tree(
         current = Path(current_text)
         for name in directory_names:
             directory = current / name
+            relative = directory.relative_to(root).as_posix()
+            if len(directories) >= MAX_EVIDENCE_DIRECTORIES:
+                raise Wc029AcceptanceEvidenceError(
+                    "evidence directory exceeds its directory-count bound"
+                )
+            account_path(relative)
             try:
                 directory_stat = directory.lstat()
             except OSError as exc:
@@ -3525,12 +3658,15 @@ def _scan_bundle_tree(
                 raise Wc029AcceptanceEvidenceError(
                     "evidence directory contains a linked or non-directory entry"
                 )
-            directories[directory.relative_to(root).as_posix()] = _PathIdentity.from_stat(
-                directory_stat
-            )
+            directories[relative] = _PathIdentity.from_stat(directory_stat)
         for name in file_names:
             path = current / name
             relative = path.relative_to(root).as_posix()
+            if len(files) >= MAX_EVIDENCE_FILES + 1:
+                raise Wc029AcceptanceEvidenceError(
+                    "evidence directory exceeds its file-count bound"
+                )
+            account_path(relative)
             if not relative.endswith(".json"):
                 raise Wc029AcceptanceEvidenceError(
                     f"evidence directory contains non-JSON file {relative}"
@@ -3560,10 +3696,6 @@ def _scan_bundle_tree(
                 raise Wc029AcceptanceEvidenceError(
                     f"evidence file {relative} cannot be pinned to platform change identity"
                 ) from exc
-            if len(files) > MAX_EVIDENCE_FILES + 1:
-                raise Wc029AcceptanceEvidenceError(
-                    "evidence directory exceeds its file-count bound"
-                )
     return directories, files
 
 
@@ -4445,6 +4577,34 @@ def _validate_signed_artifacts(
                 standard_base64=False,
                 artifact_id=artifact.declaration.artifact_id,
             )
+        elif evidence_class == "correlation-only-report-attestation":
+            correlation_only_attestation = _require_model(
+                artifact,
+                Wc029CorrelationOnlyReportAttestation,
+            )
+            report = _require_model(
+                cast(_LoadedArtifact, subject),
+                CorrelationReport,
+            )
+            correlation_only_statement = correlation_only_attestation.statement
+            if (
+                correlation_only_statement.report_id != report.report_id
+                or correlation_only_statement.report_digest != report.report_digest
+                or correlation_only_statement.report_content_digest
+                != sha256_hex(report.canonical_bytes())
+                or correlation_only_attestation.key_vault_key_id.casefold()
+                != key.key_vault_key_id.casefold()
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "correlation-only attestation does not bind the exact report"
+                )
+            _verify_signature(
+                public_key,
+                preimage=correlation_only_statement.canonical_bytes(),
+                signature=correlation_only_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
         elif evidence_class == "publication-authority-attestation":
             authority_attestation = _require_model(
                 artifact,
@@ -4973,6 +5133,8 @@ def _scenario_artifact_input_digest(
         return model.request_digest
     if isinstance(model, PublishedCorrelationReportAttestation):
         return model.statement.correlation_request_digest
+    if isinstance(model, Wc029CorrelationOnlyReportAttestation):
+        return model.statement.correlation_request_digest
     if isinstance(model, Wc029IncidentOmission):
         return artifact.record.canonical_json_sha256
     if isinstance(model, IncidentState):
@@ -5025,15 +5187,11 @@ def _scenario_artifact_input_digest(
 
 def _monitoring_request_digest(handoff: MonitoringEvidenceHandoff) -> str:
     return compute_artifact_digest(
-        {
-            "collectorContractDigest": handoff.collector_contract_digest,
-            "collectionId": handoff.collection_id,
-            "evidence": handoff.evidence.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-        }
+        handoff.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
     )
 
 
@@ -5062,6 +5220,83 @@ def _validate_incident_manifest_coverage(
         raise Wc029AcceptanceEvidenceError(
             "IncidentState findings are not covered by the exact effective manifest clauses"
         )
+
+
+def _expected_incident_report_statement(
+    bound_request: IncidentBoundCorrelationRequest,
+    report: CorrelationReport,
+    authority: PublishedContextAuthority,
+) -> PublishedCorrelationReportStatement:
+    subject = bound_request.incident_subject
+    payload: dict[str, object] = {
+        "schemaVersion": ("athena.wc027PublishedCorrelationReportStatement.v1"),
+        "purpose": "athena.wc027.publish-correlation-report",
+        "incidentId": subject.incident_id,
+        "incidentTransitionId": subject.incident_transition_id,
+        "incidentRevision": subject.incident_revision,
+        "incidentStateResultDigest": subject.incident_state_digest,
+        "incidentStateReference": subject.state_reference.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        ),
+        "incidentStateAttestationReference": (
+            subject.attestation_reference.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        ),
+        "incidentSubjectId": subject.subject_id,
+        "incidentSubjectDigest": subject.subject_digest,
+        "incidentBoundRequestId": bound_request.request_id,
+        "incidentBoundRequestDigest": bound_request.binding_digest,
+        "correlationRequestDigest": (bound_request.correlation_request.request_digest),
+        "correlationTransitionDigest": (bound_request.correlation_transition_digest),
+        "reportId": report.report_id,
+        "reportDigest": report.report_digest,
+        "reportContentDigest": sha256_hex(report.canonical_bytes()),
+        "authorityProofDigest": sha256_hex(authority.canonical_bytes()),
+        "noAutoRemediation": True,
+    }
+    statement_digest = compute_artifact_digest(payload)
+    return PublishedCorrelationReportStatement.model_validate(
+        {
+            **payload,
+            "statementId": ("report-publication-" + statement_digest.removeprefix("sha256:")[:32]),
+            "statementDigest": statement_digest,
+        }
+    )
+
+
+def _expected_correlation_only_report_statement(
+    request: CorrelationRequest,
+    report: CorrelationReport,
+    authority: PublishedContextAuthority,
+) -> Wc029CorrelationOnlyReportStatement:
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc029CorrelationOnlyReportStatement.v1",
+        "purpose": "athena.wc029.publish-correlation-only-report",
+        "correlationRequestId": request.request_id,
+        "correlationRequestDigest": request.request_digest,
+        "contextBindingDigest": request.context_binding.binding_digest,
+        "reportId": report.report_id,
+        "reportDigest": report.report_digest,
+        "reportContentDigest": sha256_hex(report.canonical_bytes()),
+        "authorityProofDigest": sha256_hex(authority.canonical_bytes()),
+        "incidentProvenanceAbsent": True,
+        "noAutoRemediation": True,
+    }
+    statement_digest = compute_artifact_digest(payload)
+    return Wc029CorrelationOnlyReportStatement.model_validate(
+        {
+            **payload,
+            "statementId": (
+                "correlation-only-report-" + statement_digest.removeprefix("sha256:")[:32]
+            ),
+            "statementDigest": statement_digest,
+        }
+    )
 
 
 def _validate_incident_bound_request(
@@ -5263,14 +5498,14 @@ def _validate_scenario_lifecycle(
         artifacts[inventory.manifest.authority_artifact_id],
         Wc029PublicationAuthorityEvidence,
     ).authority
-    if (
-        report_attestation.statement.incident_id != active_state.incident_id
-        or report_attestation.statement.incident_state_result_digest != active_state.result_digest
-        or report_attestation.statement.authority_proof_digest
-        != sha256_hex(authority.canonical_bytes())
-    ):
+    expected_statement = _expected_incident_report_statement(
+        bound_request,
+        report,
+        authority,
+    )
+    if report_attestation.statement.canonical_bytes() != expected_statement.canonical_bytes():
         raise Wc029AcceptanceEvidenceError(
-            "incident-producing report does not bind the active occurrence"
+            "incident-producing report statement does not match exact captured provenance"
         )
 
     citation = _require_model(
@@ -5496,7 +5731,9 @@ def _validate_scenario_lifecycle(
 def _validate_correlation_request_context(
     request: CorrelationRequest,
     report: CorrelationReport,
-    report_attestation: PublishedCorrelationReportAttestation,
+    report_attestation: (
+        PublishedCorrelationReportAttestation | Wc029CorrelationOnlyReportAttestation
+    ),
     monitoring: MonitoringEvidenceHandoff,
     published_manifest: Wc029PublishedManifestEvidence,
     publication_authority: PublishedContextAuthority,
@@ -5519,6 +5756,19 @@ def _validate_correlation_request_context(
         raise Wc029AcceptanceEvidenceError(
             "captured correlation request context does not match accepted publication"
         )
+    if isinstance(
+        report_attestation,
+        Wc029CorrelationOnlyReportAttestation,
+    ):
+        expected_statement = _expected_correlation_only_report_statement(
+            request,
+            report,
+            publication_authority,
+        )
+        if report_attestation.statement.canonical_bytes() != expected_statement.canonical_bytes():
+            raise Wc029AcceptanceEvidenceError(
+                "correlation-only report statement contains invalid or incident provenance"
+            )
     if (
         request.monitoring_handoff != monitoring
         or report.binding_mode != "publishedRuntime"
@@ -5708,10 +5958,19 @@ def _validate_scenario_evidence(
             )
 
         report = _require_model(selected["correlation-report"], CorrelationReport)
-        report_attestation = _require_model(
-            selected["correlation-report-attestation"],
-            PublishedCorrelationReportAttestation,
+        report_attestation: (
+            PublishedCorrelationReportAttestation | Wc029CorrelationOnlyReportAttestation
         )
+        if capability.evidence_mode == "correlation-only":
+            report_attestation = _require_model(
+                selected["correlation-only-report-attestation"],
+                Wc029CorrelationOnlyReportAttestation,
+            )
+        else:
+            report_attestation = _require_model(
+                selected["correlation-report-attestation"],
+                PublishedCorrelationReportAttestation,
+            )
         request = _require_model(
             selected["correlation-request"],
             CorrelationRequest,
@@ -5971,6 +6230,8 @@ def _validate_global_chronology(
     scenario_execution_ids: list[str] = []
     correlation_request_ids: list[str] = []
     correlation_request_digests: list[str] = []
+    monitoring_handoff_digests: list[str] = []
+    monitoring_collection_ids: list[str] = []
     verification_input_digests: list[str] = []
     report_ids: list[str] = []
     change_request_digests: list[str] = []
@@ -5992,6 +6253,10 @@ def _validate_global_chronology(
             selected["correlation-request"],
             CorrelationRequest,
         )
+        monitoring = _require_model(
+            selected["monitoring-evidence"],
+            MonitoringEvidenceHandoff,
+        )
         intervals.append(
             (
                 execution_manifest.phase_windows[0].started_at,
@@ -6002,6 +6267,8 @@ def _validate_global_chronology(
         scenario_execution_ids.append(plan.scenario_execution_id)
         correlation_request_ids.append(request.request_id)
         correlation_request_digests.append(plan.correlation_request_digest)
+        monitoring_handoff_digests.append(_monitoring_request_digest(monitoring))
+        monitoring_collection_ids.append(monitoring.collection_id)
         verification_input_digests.append(plan.verification_input_digest)
         report_ids.append(report.report_id)
         if plan.change_request_digest is not None:
@@ -6010,6 +6277,8 @@ def _validate_global_chronology(
         ("scenario execution IDs", scenario_execution_ids),
         ("correlation request IDs", correlation_request_ids),
         ("correlation request digests", correlation_request_digests),
+        ("monitoring handoff digests", monitoring_handoff_digests),
+        ("monitoring collection IDs", monitoring_collection_ids),
         ("verification input digests", verification_input_digests),
         ("correlation report IDs", report_ids),
         ("change request digests", change_request_digests),
@@ -6374,11 +6643,16 @@ if __name__ == "__main__":
 __all__ = [
     "ACCEPTANCE_INDEX_SCHEMA_VERSION",
     "ACCEPTANCE_RECORD_SCHEMA_VERSION",
+    "CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION",
     "DEPLOYMENT_READBACK_SCHEMA_VERSION",
     "INCIDENT_OMISSION_SCHEMA_VERSION",
     "JOB_EXECUTION_SCHEMA_VERSION",
     "JOB_READBACK_SCHEMA_VERSION",
     "MANIFEST_CITATION_SCHEMA_VERSION",
+    "MAX_EVIDENCE_DIRECTORIES",
+    "MAX_EVIDENCE_PATH_DEPTH",
+    "MAX_EVIDENCE_RELATIVE_PATH_CHARS",
+    "MAX_TOTAL_EVIDENCE_PATH_CHARACTERS",
     "MUTATION_RECEIPT_SCHEMA_VERSION",
     "PREFLIGHT_RESULT_SCHEMA_VERSION",
     "PUBLISHED_MANIFEST_SCHEMA_VERSION",
@@ -6399,6 +6673,8 @@ __all__ = [
     "Wc029AcceptanceEvidenceError",
     "Wc029AcceptanceEvidenceIndex",
     "Wc029AcceptanceEvidenceRecord",
+    "Wc029CorrelationOnlyReportAttestation",
+    "Wc029CorrelationOnlyReportStatement",
     "Wc029DeploymentHandoffEvidence",
     "Wc029DeploymentPlanEvidence",
     "Wc029DeploymentReadbackEvidence",

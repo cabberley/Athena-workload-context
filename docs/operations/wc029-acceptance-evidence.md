@@ -63,6 +63,10 @@ Subdirectories are allowed. Every file must be JSON. Symbolic links, hard links,
 points, unreadable subtrees, unlisted files, missing files, path traversal, duplicate paths, and
 case-only path aliases fail.
 
+Before retaining child handles, the harness bounds the complete tree to 256 directories, 16 path
+segments, 512 characters per relative path, and 16,384 aggregate relative-path characters. Empty
+directories count toward every applicable bound and cannot exhaust the process handle table.
+
 Example:
 
 ```text
@@ -206,12 +210,19 @@ Signed scenario execution intervals are sorted globally and must be strictly non
 Scenario execution IDs, monitoring/correlation request identities, verification inputs, report
 IDs, and change-request identities must be globally unique.
 
+The monitoring identity is the digest of the complete canonical handoff, including `collectionId`,
+`observedAt`, the exact immutable evidence reference, and the collector attestation. Both that
+digest and `collectionId` must be unique across scenarios; changing only time or signature creates
+a different identity and replaying either value fails.
+
 ### Correlation-only
 
 A correlation-only scenario requires canonical `athena.wc029IncidentOmission.v1` evidence stating
 that no supported incident producer exists, no incident was observed, and no synthetic incident
 evidence was created. IncidentState, guidance, enrichment, feed, and notification evidence is
-forbidden for that scenario.
+forbidden for that scenario. Its report uses the distinct signed
+`athena.wc029CorrelationOnlyReportAttestation.v1`, whose closed statement contains no incident ID,
+transition, revision, state, subject, bound-request, or incident-asset references.
 
 ### Incident-producing
 
@@ -220,6 +231,8 @@ An incident-producing scenario additionally requires:
 - a signed incident-bound correlation request containing the exact active IncidentState and
   canonical correlation request;
 - active IncidentState and attestation;
+- the WC-027 incident report publication statement derived byte-for-byte from the exact bound
+  request, report, authority, active state, transition, revision, and state/attestation references;
 - exact manifest and clause citation evidence;
 - guidance and attestation;
 - enrichment manifest and attestation;

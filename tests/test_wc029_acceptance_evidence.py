@@ -41,6 +41,7 @@ from athena_context.contracts import (
     IncidentGuidanceAssetReference,
     IncidentGuidanceAttestation,
     IncidentGuidanceSourceBinding,
+    IncidentHealthTransition,
     IncidentNotificationEnvelopeV2,
     IncidentNotificationV2,
     IncidentNotificationV2Attestation,
@@ -300,10 +301,17 @@ def _rebind_report_assets(
         }
     )
     if incident_bound_request is not None:
+        subject = incident_bound_request.incident_subject
         statement_payload.update(
             {
-                "incidentSubjectId": (incident_bound_request.incident_subject.subject_id),
-                "incidentSubjectDigest": (incident_bound_request.incident_subject.subject_digest),
+                "incidentId": subject.incident_id,
+                "incidentTransitionId": subject.incident_transition_id,
+                "incidentRevision": subject.incident_revision,
+                "incidentStateResultDigest": subject.incident_state_digest,
+                "incidentStateReference": subject.state_reference,
+                "incidentStateAttestationReference": (subject.attestation_reference),
+                "incidentSubjectId": subject.subject_id,
+                "incidentSubjectDigest": subject.subject_digest,
                 "incidentBoundRequestId": incident_bound_request.request_id,
                 "incidentBoundRequestDigest": (incident_bound_request.binding_digest),
             }
@@ -333,6 +341,53 @@ def _rebind_report_assets(
         ),
     )
     return report, attestation
+
+
+def _correlation_only_report_attestation(
+    request: CorrelationRequest,
+    report: CorrelationReport,
+    authority: PublishedContextAuthority,
+    *,
+    key: KeyMaterial,
+    private_key: rsa.RSAPrivateKey,
+) -> acceptance.Wc029CorrelationOnlyReportAttestation:
+    statement_payload: dict[str, object] = {
+        "schemaVersion": "athena.wc029CorrelationOnlyReportStatement.v1",
+        "purpose": "athena.wc029.publish-correlation-only-report",
+        "correlationRequestId": request.request_id,
+        "correlationRequestDigest": request.request_digest,
+        "contextBindingDigest": request.context_binding.binding_digest,
+        "reportId": report.report_id,
+        "reportDigest": report.report_digest,
+        "reportContentDigest": sha256_hex(report.canonical_bytes()),
+        "authorityProofDigest": sha256_hex(authority.canonical_bytes()),
+        "incidentProvenanceAbsent": True,
+        "noAutoRemediation": True,
+    }
+    statement_digest = compute_artifact_digest(_json_value(statement_payload))
+    statement = acceptance.Wc029CorrelationOnlyReportStatement(
+        **statement_payload,
+        statementId=("correlation-only-report-" + statement_digest.removeprefix("sha256:")[:32]),
+        statementDigest=statement_digest,
+    )
+    return acceptance.Wc029CorrelationOnlyReportAttestation(
+        schemaVersion=(acceptance.CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION),
+        statement=statement,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=key.key_id,
+        signedPreimageDigest=sha256_hex(statement.canonical_bytes()),
+        detachedSignature=(
+            base64.urlsafe_b64encode(
+                private_key.sign(
+                    statement.canonical_bytes(),
+                    padding.PKCS1v15(),
+                    hashes.SHA256(),
+                )
+            )
+            .decode("ascii")
+            .rstrip("=")
+        ),
+    )
 
 
 def _publication_assets() -> tuple[PublicationAssets, rsa.RSAPrivateKey]:
@@ -1607,6 +1662,20 @@ def _correlation_request_for_context(
         by_alias=True,
         exclude={"collector_attestation"},
     )
+    collection_id = (
+        "wc024-"
+        + sha256_hex(f"{rule_catalog_digest}:{trusted_as_of.isoformat()}").removeprefix("sha256:")[
+            :12
+        ]
+    )
+    evidence_reference = source.monitoring_handoff.evidence.model_copy(
+        update={"name": f"wc024-monitoring/{collection_id}/evidence.json"}
+    )
+    handoff_payload["collectionId"] = collection_id
+    handoff_payload["evidence"] = evidence_reference.model_dump(
+        mode="python",
+        by_alias=True,
+    )
     handoff_payload["observedAt"] = trusted_as_of - timedelta(minutes=1)
     handoff_preimage = monitoring_handoff_preimage(handoff_payload)
     handoff_preimage_bytes = canonicalize_json(handoff_preimage).encode("utf-8")
@@ -1623,6 +1692,36 @@ def _correlation_request_for_context(
         ).decode("ascii"),
     }
     monitoring_handoff = MonitoringEvidenceHandoff.model_validate(handoff_payload)
+    evidence_index = tuple(
+        item.model_copy(update={"source_reference": monitoring_handoff.evidence})
+        if item.source_reference == source.monitoring_handoff.evidence
+        else item
+        for item in source.evidence_index
+    )
+    evidence_by_id = {item.evidence_id: item for item in evidence_index}
+    transition_payload = source.incident_anchor.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"transition_id", "transition_digest"},
+    )
+    transition_payload.update(
+        {
+            "previousStateEvidence": tuple(
+                evidence_by_id[item.evidence_id]
+                for item in source.incident_anchor.previous_state_evidence
+            ),
+            "currentStateEvidence": tuple(
+                evidence_by_id[item.evidence_id]
+                for item in source.incident_anchor.current_state_evidence
+            ),
+        }
+    )
+    transition_digest = compute_artifact_digest(_json_value(transition_payload))
+    incident_anchor = IncidentHealthTransition(
+        **transition_payload,
+        transitionId=("transition-" + transition_digest.removeprefix("sha256:")[:32]),
+        transitionDigest=transition_digest,
+    )
     source_references = [
         monitoring_handoff.evidence,
         context_binding.publication_authority_reference,
@@ -1643,7 +1742,18 @@ def _correlation_request_for_context(
     inventory_payload.update(
         {
             "contextBindingDigest": context_binding.binding_digest,
+            "incidentTransitionDigest": incident_anchor.transition_digest,
             "monitoringHandoffDigest": (monitoring_handoff.compute_artifact_digest_value()),
+            "evidenceIndexDigest": compute_artifact_digest(
+                [
+                    item.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                    for item in evidence_index
+                ]
+            ),
             "sourceReferences": tuple(
                 sorted(
                     source_references,
@@ -1671,7 +1781,9 @@ def _correlation_request_for_context(
             "trustedAsOf": trusted_as_of,
             "expiresAt": trusted_as_of + timedelta(minutes=9),
             "contextBinding": context_binding,
+            "incidentAnchor": incident_anchor,
             "monitoringHandoff": monitoring_handoff,
+            "evidenceIndex": evidence_index,
             "evidenceInventory": evidence_inventory,
         }
     )
@@ -2133,6 +2245,8 @@ def _scenario_input_digest(
     if isinstance(value, CorrelationReport):
         return value.request_digest
     if isinstance(value, PublishedCorrelationReportAttestation):
+        return value.statement.correlation_request_digest
+    if isinstance(value, acceptance.Wc029CorrelationOnlyReportAttestation):
         return value.statement.correlation_request_digest
     if isinstance(value, acceptance.Wc029IncidentOmission):
         return sha256_hex(
@@ -3385,13 +3499,20 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 monitoring_key=monitoring_key,
                 monitoring_private_key=monitoring_private,
             )
-            scenario_report, scenario_report_attestation = _rebind_report_assets(
+            scenario_report, _ = _rebind_report_assets(
                 incident.report,
                 incident.report_attestation,
                 correlation_request=scenario_request,
                 active_state=incident.active_state,
                 active_state_attestation=incident.active_state_attestation,
                 authority=publication.authority.authority,
+                key=incident.keys["report"],
+                private_key=incident.private_keys["report"],
+            )
+            scenario_report_attestation = _correlation_only_report_attestation(
+                scenario_request,
+                scenario_report,
+                publication.authority.authority,
                 key=incident.keys["report"],
                 private_key=incident.private_keys["report"],
             )
@@ -3470,7 +3591,11 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         )
         add_scenario(
             "report-attestation",
-            "correlation-report-attestation",
+            (
+                "correlation-report-attestation"
+                if capability.evidence_mode == "incident-producing"
+                else "correlation-only-report-attestation"
+            ),
             scenario_report_attestation,
             phase="observe",
             binds_artifact_id=report_id,
@@ -4874,43 +4999,18 @@ def test_scenario_mode_is_derived_and_stale_monitoring_is_rejected(
         reportDigest=report_digest,
     )
     _write(unrelated.artifact_paths[report_id], changed_report)
-    old_attestation = PublishedCorrelationReportAttestation.model_validate_json(
-        unrelated.artifact_paths[report_attestation_id].read_bytes()
+    request = CorrelationRequest.model_validate_json(
+        unrelated.artifact_paths[f"scenario-{scenario_class}-correlation-request"].read_bytes()
     )
-    statement_payload = old_attestation.statement.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"statement_id", "statement_digest"},
-    )
-    statement_payload.update(
-        {
-            "correlationRequestDigest": changed_report.request_digest,
-            "reportId": changed_report.report_id,
-            "reportDigest": changed_report.report_digest,
-            "reportContentDigest": sha256_hex(changed_report.canonical_bytes()),
-        }
-    )
-    statement_digest = compute_artifact_digest(_json_value(statement_payload))
-    changed_statement = PublishedCorrelationReportStatement(
-        **statement_payload,
-        statementId=("report-publication-" + statement_digest.removeprefix("sha256:")[:32]),
-        statementDigest=statement_digest,
-    )
-    changed_attestation = PublishedCorrelationReportAttestation(
-        schemaVersion=("athena.wc027PublishedCorrelationReportAttestation.v1"),
-        statement=changed_statement,
-        signatureAlgorithm="RS256",
-        keyVaultKeyId=unrelated.keys["report"].key_id,
-        signedPreimageDigest=sha256_hex(changed_statement.canonical_bytes()),
-        detachedSignature=base64.urlsafe_b64encode(
-            unrelated.private_keys["report"].sign(
-                changed_statement.canonical_bytes(),
-                padding.PKCS1v15(),
-                hashes.SHA256(),
-            )
-        )
-        .decode("ascii")
-        .rstrip("="),
+    authority = acceptance.Wc029PublicationAuthorityEvidence.model_validate_json(
+        unrelated.artifact_paths["publication-authority"].read_bytes()
+    ).authority
+    changed_attestation = _correlation_only_report_attestation(
+        request,
+        changed_report,
+        authority,
+        key=unrelated.keys["report"],
+        private_key=unrelated.private_keys["report"],
     )
     _write(
         unrelated.artifact_paths[report_attestation_id],
@@ -4934,7 +5034,12 @@ def test_report_and_attestation_require_the_accepted_context_binding(
     report = CorrelationReport.model_validate_json(
         context_mismatch.artifact_paths[report_id].read_bytes()
     )
-    attestation = PublishedCorrelationReportAttestation.model_validate_json(
+    request = CorrelationRequest.model_validate_json(
+        context_mismatch.artifact_paths[
+            f"scenario-{scenario_class}-correlation-request"
+        ].read_bytes()
+    )
+    attestation = acceptance.Wc029CorrelationOnlyReportAttestation.model_validate_json(
         context_mismatch.artifact_paths[attestation_id].read_bytes()
     )
     authority = acceptance.Wc029PublicationAuthorityEvidence.model_validate_json(
@@ -4952,41 +5057,12 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         reportId=("report-" + report_digest.removeprefix("sha256:")[:32]),
         reportDigest=report_digest,
     )
-    statement_payload = attestation.statement.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"statement_id", "statement_digest"},
-    )
-    statement_payload.update(
-        {
-            "reportId": changed_report.report_id,
-            "reportDigest": changed_report.report_digest,
-            "reportContentDigest": sha256_hex(changed_report.canonical_bytes()),
-        }
-    )
-    statement_digest = compute_artifact_digest(_json_value(statement_payload))
-    statement = PublishedCorrelationReportStatement(
-        **statement_payload,
-        statementId=("report-publication-" + statement_digest.removeprefix("sha256:")[:32]),
-        statementDigest=statement_digest,
-    )
-    changed_attestation = PublishedCorrelationReportAttestation(
-        schemaVersion="athena.wc027PublishedCorrelationReportAttestation.v1",
-        statement=statement,
-        signatureAlgorithm="RS256",
-        keyVaultKeyId=context_mismatch.keys["report"].key_id,
-        signedPreimageDigest=sha256_hex(statement.canonical_bytes()),
-        detachedSignature=(
-            base64.urlsafe_b64encode(
-                context_mismatch.private_keys["report"].sign(
-                    statement.canonical_bytes(),
-                    padding.PKCS1v15(),
-                    hashes.SHA256(),
-                )
-            )
-            .decode("ascii")
-            .rstrip("=")
-        ),
+    changed_attestation = _correlation_only_report_attestation(
+        request,
+        changed_report,
+        authority,
+        key=context_mismatch.keys["report"],
+        private_key=context_mismatch.private_keys["report"],
     )
     _write(context_mismatch.artifact_paths[report_id], changed_report)
     _write(
@@ -5015,13 +5091,23 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         ].read_bytes()
     )
     wrong_request = _request(dependency_paths=published_manifest.context_binding.dependency_paths)
-    wrong_report, wrong_attestation = _rebind_report_assets(
+    incident_attestation = PublishedCorrelationReportAttestation.model_validate_json(
+        context_mismatch.artifact_paths["scenario-web-tier-failure-report-attestation"].read_bytes()
+    )
+    wrong_report, _ = _rebind_report_assets(
         report,
-        attestation,
+        incident_attestation,
         correlation_request=wrong_request,
         active_state=active_state,
         active_state_attestation=active_state_attestation,
         authority=authority,
+        key=context_mismatch.keys["report"],
+        private_key=context_mismatch.private_keys["report"],
+    )
+    wrong_correlation_only_attestation = _correlation_only_report_attestation(
+        wrong_request,
+        wrong_report,
+        authority,
         key=context_mismatch.keys["report"],
         private_key=context_mismatch.private_keys["report"],
     )
@@ -5032,26 +5118,36 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         acceptance._validate_correlation_request_context(
             wrong_request,
             wrong_report,
-            wrong_attestation,
+            wrong_correlation_only_attestation,
             wrong_request.monitoring_handoff,
             published_manifest,
             authority,
             plan,
         )
 
-    attestation_mismatch = _build_bundle(tmp_path / "attestation")
-    report = CorrelationReport.model_validate_json(
-        attestation_mismatch.artifact_paths[report_id].read_bytes()
-    )
+    smuggled = _build_bundle(tmp_path / "smuggled")
+    smuggled_path = smuggled.artifact_paths[attestation_id]
+    smuggled_attestation = _read_json(smuggled_path)
+    smuggled_attestation["statement"]["incidentId"] = "inc-000000000000"
+    _write(smuggled_path, smuggled_attestation)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="report-attestation.*violates",
+    ):
+        _aggregate(smuggled)
+
+    incident_mismatch = _build_bundle(tmp_path / "incident")
+    scenario_class = "web-tier-failure"
+    attestation_id = f"scenario-{scenario_class}-report-attestation"
     attestation = PublishedCorrelationReportAttestation.model_validate_json(
-        attestation_mismatch.artifact_paths[attestation_id].read_bytes()
+        incident_mismatch.artifact_paths[attestation_id].read_bytes()
     )
     statement_payload = attestation.statement.model_dump(
         mode="python",
         by_alias=True,
         exclude={"statement_id", "statement_digest"},
     )
-    statement_payload["correlationRequestDigest"] = "sha256:" + ("e" * 64)
+    statement_payload["incidentRevision"] += 1
     statement_digest = compute_artifact_digest(_json_value(statement_payload))
     statement = PublishedCorrelationReportStatement(
         **statement_payload,
@@ -5062,11 +5158,11 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         schemaVersion="athena.wc027PublishedCorrelationReportAttestation.v1",
         statement=statement,
         signatureAlgorithm="RS256",
-        keyVaultKeyId=attestation_mismatch.keys["report"].key_id,
+        keyVaultKeyId=incident_mismatch.keys["report"].key_id,
         signedPreimageDigest=sha256_hex(statement.canonical_bytes()),
         detachedSignature=(
             base64.urlsafe_b64encode(
-                attestation_mismatch.private_keys["report"].sign(
+                incident_mismatch.private_keys["report"].sign(
                     statement.canonical_bytes(),
                     padding.PKCS1v15(),
                     hashes.SHA256(),
@@ -5077,15 +5173,15 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         ),
     )
     _write(
-        attestation_mismatch.artifact_paths[attestation_id],
+        incident_mismatch.artifact_paths[attestation_id],
         changed_attestation,
     )
-    _refresh_scenario_execution_binding(attestation_mismatch, scenario_class)
+    _refresh_scenario_execution_binding(incident_mismatch, scenario_class)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match="report attestation does not bind the exact correlation report",
+        match="statement does not match exact captured provenance",
     ):
-        _aggregate(attestation_mismatch)
+        _aggregate(incident_mismatch)
 
 
 def test_verification_job_must_start_after_recovery(
@@ -5946,6 +6042,50 @@ def test_private_snapshot_blocks_or_detects_restored_mtime_race(
     assert victim.stat().st_mtime_ns == original_stat.st_mtime_ns
 
 
+def test_snapshot_rejects_directory_handle_exhaustion_inputs(
+    tmp_path: Path,
+) -> None:
+    directory_count = _build_bundle(tmp_path / "directory-count")
+    for index in range(acceptance.MAX_EVIDENCE_DIRECTORIES):
+        (directory_count.root / f"empty-{index:03d}").mkdir()
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="directory-count bound",
+    ):
+        _aggregate(directory_count)
+
+    traversal_depth = _build_bundle(tmp_path / "depth")
+    current = traversal_depth.root
+    for index in range(acceptance.MAX_EVIDENCE_PATH_DEPTH + 1):
+        current /= f"d{index}"
+        current.mkdir()
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="traversal-depth bound",
+    ):
+        _aggregate(traversal_depth)
+
+    relative_length = _build_bundle(tmp_path / "relative-length")
+    current = relative_length.root
+    for index in range(4):
+        current /= f"{index}-" + ("x" * 170)
+        current.mkdir()
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="relative path exceeds its length bound",
+    ):
+        _aggregate(relative_length)
+
+    total_characters = _build_bundle(tmp_path / "total-characters")
+    for index in range(100):
+        (total_characters.root / (f"{index:03d}-" + ("x" * 170))).mkdir()
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="total path-character bound",
+    ):
+        _aggregate(total_characters)
+
+
 def test_phase_windows_and_lifecycle_timestamps_are_strictly_ordered(
     tmp_path: Path,
 ) -> None:
@@ -6067,9 +6207,39 @@ def test_scenario_execution_intervals_and_request_identities_are_global(
             "scenario-b",
         ),
     )
+    backend_monitoring = MonitoringEvidenceHandoff.model_validate_json(
+        overlap.artifact_paths["scenario-backend-degradation-monitoring"].read_bytes()
+    )
+    disk_monitoring = MonitoringEvidenceHandoff.model_validate_json(
+        overlap.artifact_paths["scenario-disk-capacity-pressure-monitoring"].read_bytes()
+    )
+    assert backend_monitoring.collection_id != disk_monitoring.collection_id
+    assert acceptance._monitoring_request_digest(
+        backend_monitoring
+    ) != acceptance._monitoring_request_digest(disk_monitoring)
+    shifted_monitoring = backend_monitoring.model_copy(
+        update={"observed_at": (backend_monitoring.observed_at + timedelta(seconds=1))}
+    )
+    changed_attestation_monitoring = backend_monitoring.model_copy(
+        update={
+            "collector_attestation": (
+                backend_monitoring.collector_attestation.model_copy(
+                    update={"signature": base64.b64encode(b"different-signature").decode("ascii")}
+                )
+            )
+        }
+    )
+    assert acceptance._monitoring_request_digest(
+        backend_monitoring
+    ) != acceptance._monitoring_request_digest(shifted_monitoring)
+    assert acceptance._monitoring_request_digest(
+        backend_monitoring
+    ) != acceptance._monitoring_request_digest(changed_attestation_monitoring)
     for label in (
         "scenario execution IDs",
         "correlation request digests",
+        "monitoring handoff digests",
+        "monitoring collection IDs",
     ):
         with pytest.raises(
             acceptance.Wc029AcceptanceEvidenceError,
