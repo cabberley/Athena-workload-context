@@ -55,6 +55,7 @@ from athena_context.guidance.request_azure import (
     ManagedIdentityGuidancePublicationRequestSender,
 )
 from athena_context.guidance.request_publication import (
+    GuidancePublicationRequestDeliveryBudget,
     GuidancePublicationRequestProducer,
     parse_wc027_guidance_request_input,
     validate_wc027_guidance_request_input_broker_metadata,
@@ -112,6 +113,7 @@ class Wc027GuidancePublicationRequestProducerConfiguration:
     correlation_binding_key: _KeyAuthority
     request_signing_key: _RequestSigningKey
     requested_actions: tuple[GuidanceActionKind, ...]
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
     binding_evidence_id: str
     attached_identity_resource_ids: tuple[str, ...]
     rbac_resource_ids: tuple[str, ...]
@@ -140,6 +142,7 @@ class Wc027GuidancePublicationRequestProducerConfiguration:
                 "correlationBindingKey",
                 "requestSigningKey",
                 "requestedActions",
+                "deliveryBudget",
                 "deploymentBinding",
             },
             "configuration",
@@ -217,6 +220,9 @@ class Wc027GuidancePublicationRequestProducerConfiguration:
             ),
             request_signing_key=request_signing_key,
             requested_actions=requested_actions,
+            delivery_budget=GuidancePublicationRequestDeliveryBudget.model_validate(
+                root["deliveryBudget"]
+            ),
             binding_evidence_id=_client_id(
                 deployment["bindingEvidenceId"],
                 "deploymentBinding.bindingEvidenceId",
@@ -496,6 +502,7 @@ def build_wc027_guidance_publication_request_producer(
             )
         ),
         requested_actions=configuration.requested_actions,
+        delivery_budget=configuration.delivery_budget,
         clock=_utc_now_milliseconds,
     )
 

@@ -13,6 +13,7 @@ from athena_context.guidance.publication import (
     verify_incident_bound_request_signatures,
 )
 from athena_context.guidance.request_publication import (
+    GuidancePublicationRequestDeliveryBudget,
     GuidancePublicationRequestProducer,
     GuidancePublicationRequestReceipt,
     guidance_publication_request_broker_properties,
@@ -30,6 +31,7 @@ __all__ = [
     "GuidanceAuthorityPublisher",
     "GuidanceAuthorityPublicationReceipt",
     "GuidanceAuthoritySourceNotReadyError",
+    "GuidancePublicationRequestDeliveryBudget",
     "GuidancePublicationRequestProducer",
     "GuidancePublicationRequestReceipt",
     "build_incident_guidance",

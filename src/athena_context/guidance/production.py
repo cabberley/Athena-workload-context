@@ -65,6 +65,7 @@ from athena_context.guidance.publication import (
     parse_guidance_authority_publication_request,
 )
 from athena_context.guidance.request_publication import (
+    GuidancePublicationRequestDeliveryBudget,
     validate_guidance_publication_request_broker_metadata,
     verify_guidance_publication_request_outbox,
 )
@@ -96,6 +97,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     request_key: _KeyAuthority
     binding_signing_key: _KeyAuthority
     enrichment_runtime: Wc027EnrichmentFeedProductionConfiguration
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
     binding_evidence_id: str
     attached_identity_resource_ids: tuple[str, ...]
     rbac_resource_ids: tuple[str, ...]
@@ -121,6 +123,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 "requestKey",
                 "bindingSigningKey",
                 "enrichmentRuntimeConfiguration",
+                "deliveryBudget",
                 "deploymentBinding",
             },
             "configuration",
@@ -229,6 +232,9 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
                     json.dumps(root["enrichmentRuntimeConfiguration"])
                 )
+            ),
+            delivery_budget=GuidancePublicationRequestDeliveryBudget.model_validate(
+                root["deliveryBudget"]
             ),
             binding_evidence_id=_client_id(
                 deployment["bindingEvidenceId"],
@@ -650,7 +656,19 @@ def run_wc027_guidance_authority_publisher_worker(
             outbox_reference = validate_guidance_publication_request_broker_metadata(
                 message,
                 request,
+                expected_delivery_budget=configuration.delivery_budget,
             )
+            current = _utc_now_milliseconds()
+            if current < request.evaluated_at:
+                raise ValueError("guidance publication request is not yet valid")
+            if (
+                request.expires_at - current
+                <= configuration.delivery_budget.publisher_startup_processing_margin
+            ):
+                raise ValueError(
+                    "guidance publication request lacks the reviewed publisher "
+                    "startup and processing margin"
+                )
             verify_guidance_publication_request_outbox(
                 request,
                 outbox_reference=outbox_reference,

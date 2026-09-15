@@ -20,6 +20,7 @@ from athena_context.contracts import (
 )
 from athena_context.guidance import (
     GuidanceAuthoritySourceNotReadyError,
+    GuidancePublicationRequestDeliveryBudget,
     GuidancePublicationRequestProducer,
     guidance_publication_request_broker_properties,
     guidance_publication_request_outbox_path,
@@ -56,6 +57,11 @@ from test_wc027_incident_subject_contract import (
 )
 
 _REQUEST_KEY_ID = "synthetic-key://athena/wc027-guidance-request-rs256-v1"
+_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget(
+    publisher_polling_interval_seconds=30,
+    publisher_startup_processing_margin_seconds=60,
+    minimum_remaining_lifetime_seconds=90,
+)
 
 
 class _Signer:
@@ -150,8 +156,9 @@ class _Sender:
         *,
         outbox_reference,
         time_to_live_seconds: int,
+        delivery_budget,
     ) -> None:
-        self.calls.append((request, outbox_reference, time_to_live_seconds))
+        self.calls.append((request, outbox_reference, time_to_live_seconds, delivery_budget))
         if self.fail_once_after_send:
             self.fail_once_after_send = False
             raise RuntimeError("synthetic uncertain enqueue")
@@ -206,6 +213,7 @@ def _producer(
         outbox=selected_outbox,
         sender=selected_sender,
         requested_actions=requested_actions,
+        delivery_budget=_DELIVERY_BUDGET,
         clock=clock,
     )
     return (
@@ -284,9 +292,10 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
         for item in outbox.calls
     )
     assert len(sender.calls) == 1
-    sent, sent_reference, ttl = sender.calls[0]
+    sent, sent_reference, ttl, delivery_budget = sender.calls[0]
     assert sent == publication_request
     assert sent_reference == receipt.outbox_reference
+    assert delivery_budget == _DELIVERY_BUDGET
     assert ttl == int(
         (publication_request.expires_at - publication_request.evaluated_at).total_seconds()
     )
@@ -349,7 +358,7 @@ def test_invalid_key_signature_draft_or_stale_input_has_zero_output_io(
     assert sender.calls == []
 
 
-def test_persistence_margin_boundary_has_zero_outbox_writes_and_sends() -> None:
+def test_end_to_end_budget_boundary_has_zero_outbox_writes_and_sends() -> None:
     fixture = _fixture()
     request = fixture.guidance_binding.incident_bound_request
     evaluated_at = _stable_evaluated_at(
@@ -372,16 +381,58 @@ def test_persistence_margin_boundary_has_zero_outbox_writes_and_sends() -> None:
         sender,
     ) = _producer(
         request=request,
-        clock=lambda: expires_at - timedelta(seconds=30),
+        clock=lambda: expires_at - timedelta(seconds=90),
     )
 
     with pytest.raises(
         GuidanceAuthoritySourceNotReadyError,
-        match="remaining lifetime required",
+        match="remaining lifetime required before persistence",
     ):
         producer.produce(request, now=evaluated_at)
 
     assert outbox.calls == []
+    assert sender.calls == []
+
+
+def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
+    fixture = _fixture()
+    request = fixture.guidance_binding.incident_bound_request
+    evaluated_at = _stable_evaluated_at(
+        request,
+        fixture.incident_publication.occurrence,
+    )
+    expires_at = min(
+        evaluated_at + timedelta(minutes=5),
+        request.correlation_request.expires_at,
+    )
+    operation_times = iter(
+        (
+            expires_at - timedelta(seconds=91),
+            expires_at - timedelta(seconds=90),
+        )
+    )
+    (
+        _fixture_value,
+        _request_value,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        outbox,
+        sender,
+    ) = _producer(
+        request=request,
+        clock=lambda: next(operation_times),
+    )
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match="remaining lifetime required before enqueue",
+    ):
+        producer.produce(request, now=evaluated_at)
+
+    assert len(outbox.calls) == 1
     assert sender.calls == []
 
 
@@ -724,27 +775,47 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
     adapter.enqueue(
         receipt.request,
         outbox_reference=receipt.outbox_reference,
-        time_to_live_seconds=60,
+        time_to_live_seconds=90,
+        delivery_budget=_DELIVERY_BUDGET,
     )
 
     message = raw_sender.messages[0]
     assert str(message.message_id) == receipt.request.request_id
     assert str(message.session_id) == request.incident_subject.incident_id
     assert message.content_type == "application/json"
-    assert int(message.time_to_live.total_seconds()) == 60
+    assert int(message.time_to_live.total_seconds()) == 90
     assert message.application_properties == (
         guidance_publication_request_broker_properties(
             receipt.request,
             outbox_reference=receipt.outbox_reference,
+            delivery_budget=_DELIVERY_BUDGET,
         )
     )
     assert (
         validate_guidance_publication_request_broker_metadata(
             message,
             receipt.request,
+            expected_delivery_budget=_DELIVERY_BUDGET,
         )
         == receipt.outbox_reference
     )
+    with pytest.raises(ValueError, match="delivery budget"):
+        adapter.enqueue(
+            receipt.request,
+            outbox_reference=receipt.outbox_reference,
+            time_to_live_seconds=89,
+            delivery_budget=_DELIVERY_BUDGET,
+        )
+    assert len(raw_sender.messages) == 1
+    valid_properties = dict(message.application_properties)
+    message.application_properties["minimumRemainingLifetimeSeconds"] = 89
+    with pytest.raises(ValueError, match="broker metadata"):
+        validate_guidance_publication_request_broker_metadata(
+            message,
+            receipt.request,
+            expected_delivery_budget=_DELIVERY_BUDGET,
+        )
+    message.application_properties = valid_properties
 
     class _OutboxReader:
         def __init__(self, payload: bytes) -> None:
@@ -776,6 +847,7 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
         validate_guidance_publication_request_broker_metadata(
             message,
             receipt.request,
+            expected_delivery_budget=_DELIVERY_BUDGET,
         )
 
 
@@ -888,6 +960,11 @@ def _producer_configuration_payload() -> dict[str, object]:
             "verifierIdentityResourceId": identity_resource_id(8),
         },
         "requestedActions": ["investigationCheck"],
+        "deliveryBudget": {
+            "publisherPollingIntervalSeconds": 30,
+            "publisherStartupProcessingMarginSeconds": 60,
+            "minimumRemainingLifetimeSeconds": 90,
+        },
         "deploymentBinding": {
             "bindingEvidenceId": ("20000000-0000-0000-0000-000000000099"),
             "attachedIdentityResourceIds": [identity_resource_id(index) for index in range(9)],
@@ -915,6 +992,7 @@ def test_production_configuration_is_strict_and_identity_separated() -> None:
         configuration.correlation_binding_key.identity_client_id
     )
     assert configuration.requested_actions == ("investigationCheck",)
+    assert configuration.delivery_budget == _DELIVERY_BUDGET
 
     payload["unexpected"] = True
     with pytest.raises(ValueError, match="missing or unknown"):
@@ -931,6 +1009,7 @@ def test_production_configuration_is_strict_and_identity_separated() -> None:
         "key-reuse",
         "physical-logical-key",
         "queue-drift",
+        "delivery-budget",
     ),
 )
 def test_production_configuration_rejects_boundary_reuse(
@@ -959,6 +1038,8 @@ def test_production_configuration_rejects_boundary_reuse(
         payload["requestSigningKey"]["keyId"] = payload[  # type: ignore[index]
             "requestSigningKey"
         ]["keyVaultKeyId"]  # type: ignore[index]
+    elif mutation == "delivery-budget":
+        payload["deliveryBudget"]["minimumRemainingLifetimeSeconds"] = 89  # type: ignore[index]
     else:
         payload["serviceBus"]["outputQueueName"] = "other-output"  # type: ignore[index]
 
@@ -1012,7 +1093,7 @@ def test_request_body_digest_matches_outbox_evidence() -> None:
     assert receipt.outbox_reference.content_digest == sha256_hex(receipt.request.canonical_bytes())
 
 
-def test_worker_abandons_when_persistence_margin_is_insufficient(
+def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import azure.identity
@@ -1104,9 +1185,19 @@ def test_worker_abandons_when_persistence_margin_is_insufficient(
         def register(self, *args, **kwargs) -> None:
             self.registered.append((args, kwargs))
 
-    class _UnavailableProducer:
+    class _BudgetProducer:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def produce(self, *_args, **_kwargs):
-            raise GuidanceAuthoritySourceNotReadyError("synthetic remaining lifetime required")
+            self.calls += 1
+            if self.calls == 1:
+                raise GuidanceAuthoritySourceNotReadyError(
+                    "synthetic downstream remaining lifetime required"
+                )
+            raise ValueError("synthetic incident-bound correlation request is stale")
+
+    budget_producer = _BudgetProducer()
 
     monkeypatch.setattr(
         azure.identity,
@@ -1118,33 +1209,49 @@ def test_worker_abandons_when_persistence_margin_is_insufficient(
     monkeypatch.setattr(
         request_production,
         "build_wc027_guidance_publication_request_producer",
-        lambda *_args, **_kwargs: _UnavailableProducer(),
+        lambda *_args, **_kwargs: budget_producer,
     )
 
-    processed = run_wc027_guidance_publication_request_producer_worker(
+    first_processed = run_wc027_guidance_publication_request_producer_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+    second_processed = run_wc027_guidance_publication_request_producer_worker(
         configuration=configuration,
         max_wait_time_seconds=1,
     )
 
-    assert processed is False
+    assert first_processed is False
+    assert second_processed is False
     assert receiver.abandoned == [message]
     assert receiver.completed == []
-    assert receiver.dead_lettered == []
+    assert len(receiver.dead_lettered) == 1
+    assert receiver.dead_lettered[0][0] is message
+    assert receiver.dead_lettered[0][1]["reason"] == "AthenaWc027GuidanceRequestRejected"
     assert output_sender_opened is False
 
 
 @pytest.mark.parametrize(
-    ("metadata_mode", "outbox_payload", "should_complete"),
     (
-        ("missing", None, False),
-        ("valid", b"{}", False),
-        ("valid", None, True),
+        "metadata_mode",
+        "outbox_payload",
+        "remaining_seconds",
+        "expected_outbox_reads",
+        "should_complete",
+    ),
+    (
+        ("missing", None, 300, 0, False),
+        ("valid", b"{}", 300, 1, False),
+        ("valid", None, 300, 1, True),
+        ("valid", None, 60, 0, False),
     ),
 )
 def test_publisher_worker_requires_exact_immutable_outbox_evidence(
     monkeypatch: pytest.MonkeyPatch,
     metadata_mode: str,
     outbox_payload: bytes | None,
+    remaining_seconds: int,
+    expected_outbox_reads: int,
     should_complete: bool,
 ) -> None:
     import azure.identity
@@ -1178,6 +1285,7 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
             guidance_publication_request_broker_properties(
                 request,
                 outbox_reference=produced.outbox_reference,
+                delivery_budget=_DELIVERY_BUDGET,
             )
             if metadata_mode == "valid"
             else None
@@ -1277,7 +1385,7 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
     monkeypatch.setattr(
         guidance_production,
         "_utc_now_milliseconds",
-        lambda: request.evaluated_at,
+        lambda: request.expires_at - timedelta(seconds=remaining_seconds),
     )
 
     processed = run_wc027_guidance_authority_publisher_worker(
@@ -1290,8 +1398,8 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
         assert receiver.completed == [message]
         assert receiver.dead_lettered == []
         assert len(publisher.calls) == 1
-        assert outbox_reader.calls == [produced.outbox_reference]
     else:
         assert receiver.completed == []
         assert len(receiver.dead_lettered) == 1
         assert publisher.calls == []
+    assert len(outbox_reader.calls) == expected_outbox_reads

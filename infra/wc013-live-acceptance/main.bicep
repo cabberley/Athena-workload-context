@@ -383,11 +383,16 @@ var wc027RequestProducerImageInvalidCharacters = replace(replace(replace(replace
   ''
 ), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
 var wc027RequestProducerImageValid = wc027RequestProducerImage == toLower(wc027RequestProducerImage) && length(wc027RequestProducerImageDigest) == 64 && empty(wc027RequestProducerImageInvalidCharacters) && wc027RequestProducerImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
+var wc027ReviewedPublisherPollingIntervalSeconds = 30
+var wc027ReviewedPublisherStartupProcessingMarginSeconds = 60
+var wc027ReviewedMinimumRemainingLifetimeSeconds = wc027ReviewedPublisherPollingIntervalSeconds + wc027ReviewedPublisherStartupProcessingMarginSeconds
 var wc027ParsedRequestProducerConfiguration = json(
   empty(wc027RequestProducerConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"minimumRemainingLifetimeSeconds":0,"publisherPollingIntervalSeconds":0,"publisherStartupProcessingMarginSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
     : wc027RequestProducerConfigurationJson
 )
+var wc027RequestProducerDeliveryBudget = wc027ParsedRequestProducerConfiguration.deliveryBudget
+var wc027RequestProducerDeliveryBudgetValid = wc027RequestProducerDeliveryBudget.publisherPollingIntervalSeconds == wc027ReviewedPublisherPollingIntervalSeconds && wc027RequestProducerDeliveryBudget.publisherStartupProcessingMarginSeconds == wc027ReviewedPublisherStartupProcessingMarginSeconds && wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds && wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027RequestProducerDeliveryBudget.publisherPollingIntervalSeconds + wc027RequestProducerDeliveryBudget.publisherStartupProcessingMarginSeconds
 var wc027RequestProducerImageRegistryServer = first(split(wc027RequestProducerImage, '/'))
 var wc027RequestProducerExpectedIdentityResourceIds = map(
   wc027ParsedRequestProducerConfiguration.deploymentBinding.attachedIdentityResourceIds,
@@ -545,6 +550,8 @@ var validatedWc027RequestProducerReady = wc027RequestProducerReady && !wc027Requ
                                   ? fail('WC-027 request producer Job registry configuration does not exactly match')
                                   : wc027RequestProducerReady && !wc027RequestProducerTagsMatch
                                     ? fail('WC-027 request producer Job configuration digest tags do not match')
+                                    : wc027RequestProducerReady && !wc027RequestProducerDeliveryBudgetValid
+                                      ? fail('WC-027 request producer delivery budget does not match the reviewed publisher polling and processing allowance')
                                       : wc027RequestProducerReady && !wc027RequestProducerRbacEvidenceMatches
                                         ? fail('WC-027 request producer RBAC evidence does not match its deployed configuration')
                                         : wc027RequestProducerReady && !wc027RequestProducerIdentitiesMatch
@@ -593,7 +600,7 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"minimumRemainingLifetimeSeconds":0,"publisherPollingIntervalSeconds":0,"publisherStartupProcessingMarginSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedProducerConfiguration = json(
@@ -602,6 +609,9 @@ var wc027ParsedProducerConfiguration = json(
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
+var wc027PublisherDeliveryBudget = wc027ParsedPublisherConfiguration.deliveryBudget
+var wc027PublisherDeliveryBudgetValid = wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds == wc027ReviewedPublisherPollingIntervalSeconds && wc027PublisherDeliveryBudget.publisherStartupProcessingMarginSeconds == wc027ReviewedPublisherStartupProcessingMarginSeconds && wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds && wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds == wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds + wc027PublisherDeliveryBudget.publisherStartupProcessingMarginSeconds
+var wc027ProducerPublisherDeliveryBudgetsMatch = !wc027RequestProducerReady || !wc027PublisherReady || (wc027RequestProducerDeliveryBudget.publisherPollingIntervalSeconds == wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds && wc027RequestProducerDeliveryBudget.publisherStartupProcessingMarginSeconds == wc027PublisherDeliveryBudget.publisherStartupProcessingMarginSeconds && wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds)
 var wc027PublisherExpectedIdentityResourceIds = map(
   wc027ParsedPublisherConfiguration.deploymentBinding.attachedIdentityResourceIds,
   identityResourceId => toLower(identityResourceId)
@@ -716,7 +726,7 @@ var wc027PublisherExecutionConfigurationMatches = wc027PublisherReady && wc027Pu
       wc027PublisherJob!.properties.configuration.eventTriggerConfig.replicaCompletionCount == 1
       wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.minExecutions == 0
       wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1
-      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.pollingInterval == 30
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.pollingInterval == wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds
       length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
     ], false)
   : false
@@ -805,13 +815,17 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
                                                   ? fail('WC-027 publisher Job registry configuration does not exactly match')
                                                   : wc027PublisherReady && !wc027PublisherTagsMatch
                                                     ? fail('WC-027 publisher Job configuration digest tags do not match')
-                                                    : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
-                                                      ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
-                                                        : wc027PublisherReady && !wc027PublisherRbacEvidenceMatches
-                                                          ? fail('WC-027 publisher RBAC evidence does not match its deployed configuration')
-                                                          : wc027PublisherReady && !wc027PublisherIdentitiesMatch
-                                                            ? fail('WC-027 publisher identities do not match its deployed configuration')
-                                                            : wc027PublisherReady
+                                                    : wc027PublisherReady && !wc027PublisherDeliveryBudgetValid
+                                                      ? fail('WC-027 publisher delivery budget does not match the reviewed polling and processing allowance')
+                                                      : wc027PublisherReady && !wc027ProducerPublisherDeliveryBudgetsMatch
+                                                        ? fail('WC-027 producer and publisher delivery budgets do not match')
+                                                        : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
+                                                          ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
+                                                          : wc027PublisherReady && !wc027PublisherRbacEvidenceMatches
+                                                            ? fail('WC-027 publisher RBAC evidence does not match its deployed configuration')
+                                                            : wc027PublisherReady && !wc027PublisherIdentitiesMatch
+                                                              ? fail('WC-027 publisher identities do not match its deployed configuration')
+                                                              : wc027PublisherReady
 var wc027ProducerJobResourceIdSegments = concat(
   wc027ProducerJobResourceIdRawSegments,
   [

@@ -50,8 +50,13 @@ WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION = (
 )
 _REQUEST_OUTBOX_PREFIX = "guidance-publication-requests"
 _MAX_DETACHED_SIGNATURE_CHARS = 8192
-_MIN_PRE_PERSISTENCE_REMAINING_LIFETIME = timedelta(seconds=30)
 _MAX_PUBLICATION_REQUEST_LIFETIME = timedelta(minutes=5)
+WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS = 60
+WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS = (
+    WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS
+)
 _ALLOWED_REQUESTED_ACTIONS = frozenset(
     {
         "investigationCheck",
@@ -63,6 +68,71 @@ _ALLOWED_REQUESTED_ACTIONS = frozenset(
     }
 )
 type BrokerPropertyValue = int | float | bytes | bool | str | UUID
+
+
+@dataclass(frozen=True, slots=True)
+class GuidancePublicationRequestDeliveryBudget:
+    publisher_polling_interval_seconds: int
+    publisher_startup_processing_margin_seconds: int
+    minimum_remaining_lifetime_seconds: int
+
+    @classmethod
+    def model_validate(
+        cls,
+        value: object,
+    ) -> GuidancePublicationRequestDeliveryBudget:
+        if type(value) is not dict or set(value) != {
+            "publisherPollingIntervalSeconds",
+            "publisherStartupProcessingMarginSeconds",
+            "minimumRemainingLifetimeSeconds",
+        }:
+            raise ValueError("guidance publication delivery budget fields are invalid")
+        values = (
+            value["publisherPollingIntervalSeconds"],
+            value["publisherStartupProcessingMarginSeconds"],
+            value["minimumRemainingLifetimeSeconds"],
+        )
+        if any(type(item) is not int for item in values):
+            raise ValueError("guidance publication delivery budget values must be integers")
+        return cls(
+            publisher_polling_interval_seconds=values[0],
+            publisher_startup_processing_margin_seconds=values[1],
+            minimum_remaining_lifetime_seconds=values[2],
+        )
+
+    def __post_init__(self) -> None:
+        if (
+            self.publisher_polling_interval_seconds
+            != WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS
+            or self.publisher_startup_processing_margin_seconds
+            != WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS
+            or self.minimum_remaining_lifetime_seconds
+            != WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS
+            or self.minimum_remaining_lifetime_seconds
+            != self.publisher_polling_interval_seconds
+            + self.publisher_startup_processing_margin_seconds
+        ):
+            raise ValueError(
+                "guidance publication delivery budget does not match the reviewed "
+                "publisher polling and processing allowance"
+            )
+
+    @property
+    def minimum_remaining_lifetime(self) -> timedelta:
+        return timedelta(seconds=self.minimum_remaining_lifetime_seconds)
+
+    @property
+    def publisher_startup_processing_margin(self) -> timedelta:
+        return timedelta(seconds=self.publisher_startup_processing_margin_seconds)
+
+    def broker_properties(self) -> dict[str, int]:
+        return {
+            "publisherPollingIntervalSeconds": self.publisher_polling_interval_seconds,
+            "publisherStartupProcessingMarginSeconds": (
+                self.publisher_startup_processing_margin_seconds
+            ),
+            "minimumRemainingLifetimeSeconds": self.minimum_remaining_lifetime_seconds,
+        }
 
 
 class GuidancePublicationRequestOutboxPort(Protocol):
@@ -79,6 +149,7 @@ class GuidancePublicationRequestSenderPort(Protocol):
         *,
         outbox_reference: VersionPinnedBlobReference,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None: ...
 
 
@@ -112,6 +183,7 @@ class GuidancePublicationRequestProducer:
     outbox: GuidancePublicationRequestOutboxPort
     sender: GuidancePublicationRequestSenderPort
     requested_actions: tuple[GuidanceActionKind, ...]
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
     clock: Callable[[], datetime] | None = None
 
     def __post_init__(self) -> None:
@@ -123,6 +195,10 @@ class GuidancePublicationRequestProducer:
         )
         if any(type(item) is not str or not item for item in key_ids):
             raise ValueError("guidance publication request producer key IDs must be non-empty")
+        if type(self.delivery_budget) is not GuidancePublicationRequestDeliveryBudget:
+            raise TypeError(
+                "delivery_budget must be an exact GuidancePublicationRequestDeliveryBudget"
+            )
         if self.request_key_id in {
             self.incident_key_id,
             self.incident_key_vault_key_id,
@@ -182,16 +258,11 @@ class GuidancePublicationRequestProducer:
         )
         payload = publication_request.canonical_bytes()
         persistence_now = self._operation_time(now)
-        remaining_before_persistence = publication_request.expires_at - persistence_now
-        if not (
-            _MIN_PRE_PERSISTENCE_REMAINING_LIFETIME
-            < remaining_before_persistence
-            <= _MAX_PUBLICATION_REQUEST_LIFETIME
-        ):
-            raise GuidanceAuthoritySourceNotReadyError(
-                "guidance publication request lacks the remaining lifetime required "
-                "for persistence, authority revalidation, and enqueue"
-            )
+        self._require_remaining_delivery_budget(
+            publication_request,
+            at=persistence_now,
+            phase="persistence",
+        )
         outbox_reference = self.outbox.create_or_recover(
             ArtifactWriteRequest(
                 blob_name=guidance_publication_request_outbox_path(
@@ -229,15 +300,17 @@ class GuidancePublicationRequestProducer:
             )
 
         operation_now = self._operation_time(persistence_now)
-        remaining_seconds = int((publication_request.expires_at - operation_now).total_seconds())
-        if not 1 <= remaining_seconds <= 300:
-            raise GuidanceAuthoritySourceNotReadyError(
-                "guidance publication request expired before enqueue"
-            )
+        remaining = self._require_remaining_delivery_budget(
+            publication_request,
+            at=operation_now,
+            phase="enqueue",
+        )
+        remaining_seconds = int(remaining.total_seconds())
         self.sender.enqueue(
             publication_request,
             outbox_reference=outbox_reference,
             time_to_live_seconds=remaining_seconds,
+            delivery_budget=self.delivery_budget,
         )
         return GuidancePublicationRequestReceipt(
             request=publication_request,
@@ -341,6 +414,25 @@ class GuidancePublicationRequestProducer:
         _require_millisecond_utc(current, name="producer clock")
         return current
 
+    def _require_remaining_delivery_budget(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+        *,
+        at: datetime,
+        phase: str,
+    ) -> timedelta:
+        remaining = request.expires_at - at
+        if not (
+            self.delivery_budget.minimum_remaining_lifetime
+            < remaining
+            <= _MAX_PUBLICATION_REQUEST_LIFETIME
+        ):
+            raise GuidanceAuthoritySourceNotReadyError(
+                "guidance publication request lacks the reviewed downstream "
+                f"remaining lifetime required before {phase}"
+            )
+        return remaining
+
 
 def parse_wc027_guidance_request_input(
     payload: bytes,
@@ -377,11 +469,14 @@ def guidance_publication_request_broker_properties(
     request: GuidanceAuthorityPublicationRequest,
     *,
     outbox_reference: VersionPinnedBlobReference,
+    delivery_budget: GuidancePublicationRequestDeliveryBudget,
 ) -> dict[str | bytes, BrokerPropertyValue]:
     if type(request) is not GuidanceAuthorityPublicationRequest:
         raise TypeError("request must be an exact GuidanceAuthorityPublicationRequest")
     if type(outbox_reference) is not VersionPinnedBlobReference:
         raise TypeError("outbox_reference must be an exact VersionPinnedBlobReference")
+    if type(delivery_budget) is not GuidancePublicationRequestDeliveryBudget:
+        raise TypeError("delivery_budget must be an exact GuidancePublicationRequestDeliveryBudget")
     expected_name = guidance_publication_request_outbox_path(
         request.incident_occurrence.occurrence_id
     )
@@ -391,7 +486,7 @@ def guidance_publication_request_broker_properties(
     context = request.incident_bound_request.correlation_request.context_binding
     if not isinstance(context, PublishedRuntimeContextBinding):
         raise ValueError("guidance publication request requires published runtime context")
-    return {
+    properties: dict[str | bytes, BrokerPropertyValue] = {
         "schemaVersion": request.schema_version,
         "requestDigest": request.request_digest,
         "incidentBoundRequestId": request.incident_bound_request.request_id,
@@ -407,12 +502,20 @@ def guidance_publication_request_broker_properties(
         "outboxContentDigest": outbox_reference.content_digest,
         "noAutoRemediation": True,
     }
+    properties.update(delivery_budget.broker_properties())
+    return properties
 
 
 def validate_guidance_publication_request_broker_metadata(
     message: object,
     request: GuidanceAuthorityPublicationRequest,
+    *,
+    expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
 ) -> VersionPinnedBlobReference:
+    if type(expected_delivery_budget) is not GuidancePublicationRequestDeliveryBudget:
+        raise TypeError(
+            "expected_delivery_budget must be an exact GuidancePublicationRequestDeliveryBudget"
+        )
     properties = getattr(message, "application_properties", None)
     if type(properties) is not dict:
         raise ValueError("guidance publication request broker metadata is missing")
@@ -442,6 +545,7 @@ def validate_guidance_publication_request_broker_metadata(
         != guidance_publication_request_broker_properties(
             request,
             outbox_reference=reference,
+            delivery_budget=expected_delivery_budget,
         )
     ):
         raise ValueError("guidance publication request broker metadata is invalid")
@@ -539,6 +643,7 @@ def _json_payload(value: object) -> object:
 
 
 __all__ = [
+    "GuidancePublicationRequestDeliveryBudget",
     "GuidancePublicationRequestOutboxPort",
     "GuidancePublicationRequestProducer",
     "GuidancePublicationRequestReceipt",
@@ -546,6 +651,9 @@ __all__ = [
     "MAX_WC027_GUIDANCE_REQUEST_INPUT_BYTES",
     "WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION",
     "WC027_GUIDANCE_REQUEST_INPUT_SCHEMA_VERSION",
+    "WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_POLLING_INTERVAL_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_STARTUP_PROCESSING_MARGIN_SECONDS",
     "guidance_publication_request_broker_properties",
     "guidance_publication_request_outbox_path",
     "parse_wc027_guidance_request_input",

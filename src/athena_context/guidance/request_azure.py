@@ -28,6 +28,7 @@ from athena_context.contracts import (
     VersionPinnedBlobReference,
 )
 from athena_context.guidance.request_publication import (
+    GuidancePublicationRequestDeliveryBudget,
     guidance_publication_request_broker_properties,
 )
 
@@ -169,13 +170,21 @@ class AzureServiceBusGuidancePublicationRequestSender:
         *,
         outbox_reference: VersionPinnedBlobReference,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None:
         from azure.servicebus import ServiceBusMessage
 
         if type(request) is not GuidanceAuthorityPublicationRequest:
             raise TypeError("request must be an exact GuidanceAuthorityPublicationRequest")
-        if not 1 <= time_to_live_seconds <= 300:
-            raise ValueError("guidance publication request TTL must be between 1 and 300 seconds")
+        if type(delivery_budget) is not GuidancePublicationRequestDeliveryBudget:
+            raise TypeError(
+                "delivery_budget must be an exact GuidancePublicationRequestDeliveryBudget"
+            )
+        if not delivery_budget.minimum_remaining_lifetime_seconds <= time_to_live_seconds <= 300:
+            raise ValueError(
+                "guidance publication request TTL does not retain the reviewed "
+                "downstream delivery budget"
+            )
         message = ServiceBusMessage(
             request.canonical_bytes(),
             content_type="application/json",
@@ -185,6 +194,7 @@ class AzureServiceBusGuidancePublicationRequestSender:
             application_properties=guidance_publication_request_broker_properties(
                 request,
                 outbox_reference=outbox_reference,
+                delivery_budget=delivery_budget,
             ),
         )
         cast(Any, self._sender).send_messages(message)
@@ -210,6 +220,7 @@ class ManagedIdentityGuidancePublicationRequestSender:
         *,
         outbox_reference: VersionPinnedBlobReference,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None:
         from azure.identity import ManagedIdentityCredential
         from azure.servicebus import ServiceBusClient
@@ -227,6 +238,7 @@ class ManagedIdentityGuidancePublicationRequestSender:
                 request,
                 outbox_reference=outbox_reference,
                 time_to_live_seconds=time_to_live_seconds,
+                delivery_budget=delivery_budget,
             )
 
 

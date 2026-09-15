@@ -88,10 +88,12 @@ The occurrence-keyed path means:
   occurrence fail closed; and
 - concurrent workers converge on one request identity.
 
-Immediately before persistence, the worker consults its trusted clock and requires more than 30
-seconds of remaining request lifetime for immutable persistence, lifecycle/context revalidation,
-and enqueue. A request at or inside that boundary is abandoned without reserving or writing its
-occurrence-keyed outbox path. After persistence, the worker revalidates lifecycle and context
+Immediately before persistence and again immediately before enqueue, the worker consults its
+trusted clock and requires more than 90 seconds of remaining request lifetime. The reviewed budget
+is the publisher's 30-second scale-to-zero polling interval plus a 60-second startup and processing
+margin. A request at or inside the first boundary is abandoned without reserving or writing its
+occurrence-keyed outbox path. If revalidation consumes the budget, the persisted request is not
+sent and the input is abandoned. After persistence, the worker revalidates lifecycle and context
 authority, then sends to the existing `wc027-guidance-authority-requests` queue with a distinct
 sender identity:
 
@@ -101,11 +103,12 @@ sender identity:
 | Session ID | signed incident ID |
 | TTL | remaining bounded request lifetime, at most five minutes |
 | Body | exact canonical request bytes |
-| Metadata | request, occurrence, incident-state, context-authority, and version-pinned outbox bindings plus `noAutoRemediation=true` |
+| Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, and exact 30/60/90-second delivery-budget bindings plus `noAutoRemediation=true` |
 
 If send completion is uncertain, the input delivery is abandoned. A retry recovers identical
 outbox bytes and sends the same `MessageId`; Service Bus duplicate detection safely suppresses a
-prior successful send.
+prior successful send. Budget exhaustion is retryable without output I/O; once the signed input is
+actually stale, the same delivery is rejected rather than completed.
 
 ## Deployment and identities
 
@@ -117,7 +120,8 @@ prior successful send.
 - create-only outbox writer RBAC;
 - one shared upstream exact-public-key reader for the incident and correlation-binding keys;
 - separate exact-key request signer and request public-key reader identities;
-- ACR pull for the event-trigger identity;
+- ACR pull for the event-trigger identity, deployed at the exact validated subscription and
+  resource group parsed from `registryResourceId`;
 - generated non-secret strict configuration and deterministic RBAC evidence; and
 - a publisher handoff containing the existing output queue, sender identity, exact request key
   binding, producer Job resource ID, and configuration digest.
@@ -127,6 +131,11 @@ configuration and its deployment binding. None of the receiver, sender, source r
 reader/writer, upstream trust reader, request signer, or request verifier identities may intersect
 that runtime boundary. Resource IDs are normalized before uniqueness and overlap checks so casing
 aliases cannot bypass the separation.
+
+The strict producer and publisher configurations both carry the same reviewed delivery budget.
+The publisher's KEDA polling interval is derived from that configuration, broker metadata binds all
+three budget values, and the publisher rejects a request that reaches it without the remaining
+60-second startup and processing allowance.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that

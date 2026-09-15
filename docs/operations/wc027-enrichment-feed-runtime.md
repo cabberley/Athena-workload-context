@@ -147,7 +147,10 @@ versioned Key Vault URI.
 Production publication requests arrive only from the separate request-producer sender identity,
 carry the exact occurrence-keyed outbox reference in their broker metadata, and are rejected unless
 the publisher can exact-read matching immutable outbox bytes. No direct authority-request submit
-command is exposed.
+command is exposed. Producer and publisher configurations bind the same reviewed 90-second
+downstream budget: 30 seconds for the publisher's scale-to-zero polling interval and 60 seconds for
+startup and processing. The broker metadata carries the same values, and publisher startup rejects
+a request that has consumed its processing allowance.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;

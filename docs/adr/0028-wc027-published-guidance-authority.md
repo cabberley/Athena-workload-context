@@ -81,12 +81,15 @@ Before enqueue, the producer create-or-recovers the exact canonical request in a
 immutable Blob outbox. Its logical path is keyed only by the signed occurrence ID, so an identical
 retry recovers the same version while a different request for the same occurrence conflicts
 closed. The writer has create-only permission; a separate reader has exact read permission with
-Blob listing denied. After persistence, the producer re-reads the signed lifecycle authority and
-the exact immutable context authority. Only then does a distinct Service Bus sender identity send
-the canonical request to `wc027-guidance-authority-requests`, using `requestId` as `MessageId`,
-incident ID as `SessionId`, a bounded TTL, and occurrence, incident, context-authority, request,
-and outbox binding metadata. Service Bus duplicate detection and immutable outbox recovery make an
-uncertain send safely retryable with byte-identical identity.
+Blob listing denied. Immediately before persistence and enqueue, the producer requires more than
+the reviewed 90-second downstream budget: the publisher's 30-second KEDA polling interval plus a
+60-second startup and processing allowance. After persistence, the producer re-reads the signed
+lifecycle authority and the exact immutable context authority. Only then does a distinct Service
+Bus sender identity send the canonical request to `wc027-guidance-authority-requests`, using
+`requestId` as `MessageId`, incident ID as `SessionId`, a bounded TTL, and occurrence, incident,
+context-authority, request, outbox, and delivery-budget binding metadata. Service Bus duplicate
+detection and immutable outbox recovery make an uncertain send safely retryable with
+byte-identical identity.
 
 The publisher accepts exactly one configured request submitter identity, which must be the
 producer's dedicated sender and must not overlap any publisher, signer, reader, or runtime identity.
@@ -97,7 +100,8 @@ to the publisher Job.
 Before publication, a separate publisher outbox-reader identity validates the complete broker
 metadata and exact-reads the referenced Blob version, requiring byte-for-byte equality with the
 canonical signed request. A correctly signed request without durable outbox evidence therefore
-cannot activate guidance authority.
+cannot activate guidance authority. The publisher also requires the same configured delivery
+budget and rejects requests that no longer retain its 60-second startup and processing allowance.
 
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and

@@ -432,6 +432,11 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         },
         "requestKey": request_key,
         "bindingSigningKey": binding_signing_key,
+        "deliveryBudget": {
+            "publisherPollingIntervalSeconds": 30,
+            "publisherStartupProcessingMarginSeconds": 60,
+            "minimumRemainingLifetimeSeconds": 90,
+        },
         "enrichmentRuntimeConfiguration": runtime,
         "deploymentBinding": {
             "bindingEvidenceId": "10000000-0000-0000-0000-000000000099",
@@ -468,6 +473,28 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         configuration.binding_signing_key.key_fingerprint
         == configuration.enrichment_runtime.guidance_binding_key.key_fingerprint
     )
+    assert configuration.delivery_budget.publisher_polling_interval_seconds == 30
+    assert configuration.delivery_budget.publisher_startup_processing_margin_seconds == 60
+    assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 90
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("publisherPollingIntervalSeconds", 31),
+        ("publisherStartupProcessingMarginSeconds", 59),
+        ("minimumRemainingLifetimeSeconds", 89),
+    ),
+)
+def test_publisher_configuration_rejects_delivery_budget_drift(
+    field: str,
+    value: int,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["deliveryBudget"][field] = value  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="delivery budget"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:

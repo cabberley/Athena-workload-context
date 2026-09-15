@@ -70,6 +70,14 @@ var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var guidancePublisherPollingIntervalSeconds = 30
+var guidancePublisherStartupProcessingMarginSeconds = 60
+var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherPollingIntervalSeconds + guidancePublisherStartupProcessingMarginSeconds
+var guidancePublicationDeliveryBudget = {
+  publisherPollingIntervalSeconds: guidancePublisherPollingIntervalSeconds
+  publisherStartupProcessingMarginSeconds: guidancePublisherStartupProcessingMarginSeconds
+  minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
+}
 
 var parsedRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
 var runtimeIncidentAssets = parsedRuntimeConfiguration.incidentLifecycleAssets
@@ -193,9 +201,36 @@ var validatedContextAuthorityStorageAccountName = runtimeContextAuthority.blobEn
   ? contextAuthorityStorageAccountName
   : fail('contextAuthorityStorageAccountResourceId must exactly host runtime context-authority')
 
+var registryResourceIdRawSegments = split(registryResourceId, '/')
+var registryResourceIdSegments = concat(
+  registryResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var registryResourceIdValid = length(registryResourceIdRawSegments) == 9 && empty(registryResourceIdSegments[0]) && toLower(registryResourceIdSegments[1]) == 'subscriptions' && !empty(registryResourceIdSegments[2]) && toLower(registryResourceIdSegments[3]) == 'resourcegroups' && !empty(registryResourceIdSegments[4]) && toLower(registryResourceIdSegments[5]) == 'providers' && toLower(registryResourceIdSegments[6]) == 'microsoft.containerregistry' && toLower(registryResourceIdSegments[7]) == 'registries' && !empty(registryResourceIdSegments[8])
+var validatedRegistryScope = registryResourceIdValid
+  ? {
+      subscriptionId: registryResourceIdSegments[2]
+      resourceGroupName: registryResourceIdSegments[4]
+      registryName: registryResourceIdSegments[8]
+    }
+  : fail('registryResourceId must identify one Microsoft.ContainerRegistry/registries resource')
+
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
-  name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
+  name: validatedRegistryScope.registryName
+  scope: resourceGroup(
+    validatedRegistryScope.subscriptionId,
+    validatedRegistryScope.resourceGroupName
+  )
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -496,6 +531,10 @@ module requestKeySigner '../wc027-guidance-authority-publisher/modules/key-signe
 
 module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-request-acr-pull'
+  scope: resourceGroup(
+    validatedRegistryScope.subscriptionId,
+    validatedRegistryScope.resourceGroupName
+  )
   params: {
     registryName: registry.name
     identityResourceId: receiverIdentity.id
@@ -589,6 +628,7 @@ var producerConfiguration = {
   requestedActions: [
     'investigationCheck'
   ]
+  deliveryBudget: guidancePublicationDeliveryBudget
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -706,6 +746,7 @@ var publisherHandoff = {
     blobEndpoint: outboxBlobEndpoint
     containerName: outboxContainerName
   }
+  deliveryBudget: guidancePublicationDeliveryBudget
   producerJobResourceId: producerJob.id
   producerConfigurationDigest: producerConfigurationDigest
 }

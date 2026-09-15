@@ -165,6 +165,83 @@ def test_request_producer_configuration_and_publisher_handoff_are_derived() -> N
         assert expected in source
 
 
+def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> None:
+    producer = PRODUCER.read_text(encoding="utf-8")
+    publisher = PUBLISHER.read_text(encoding="utf-8")
+    root = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
+
+    for source in (producer, publisher):
+        for expected in (
+            "guidancePublisherPollingIntervalSeconds = 30",
+            "guidancePublisherStartupProcessingMarginSeconds = 60",
+            (
+                "guidanceMinimumRemainingLifetimeSeconds = "
+                "guidancePublisherPollingIntervalSeconds + "
+                "guidancePublisherStartupProcessingMarginSeconds"
+            ),
+            "deliveryBudget: guidancePublicationDeliveryBudget",
+        ):
+            assert expected in source
+
+    assert "pollingInterval: guidancePublisherPollingIntervalSeconds" in publisher
+    for expected in (
+        "wc027ReviewedPublisherPollingIntervalSeconds = 30",
+        "wc027ReviewedPublisherStartupProcessingMarginSeconds = 60",
+        "wc027ReviewedMinimumRemainingLifetimeSeconds",
+        "wc027RequestProducerDeliveryBudgetValid",
+        "wc027PublisherDeliveryBudgetValid",
+        "wc027ProducerPublisherDeliveryBudgetsMatch",
+        "producer and publisher delivery budgets do not match",
+        (
+            "eventTriggerConfig.scale.pollingInterval == "
+            "wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds"
+        ),
+    ):
+        assert expected in root
+
+
+def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() -> None:
+    source = PRODUCER.read_text(encoding="utf-8")
+    registry_subscription_id = "11111111-1111-1111-1111-111111111111"
+    registry_resource_group = "rg-shared-acr"
+    producer_resource_group = "rg-athena-runtime"
+    registry_resource_id = (
+        f"/subscriptions/{registry_subscription_id}/resourceGroups/"
+        f"{registry_resource_group}/providers/Microsoft.ContainerRegistry/"
+        "registries/athenashared"
+    )
+
+    assert registry_resource_group != producer_resource_group
+    assert registry_resource_id.split("/")[2] == registry_subscription_id
+    assert registry_resource_id.split("/")[4] == registry_resource_group
+    for expected in (
+        "registryResourceIdRawSegments = split(registryResourceId, '/')",
+        "length(registryResourceIdRawSegments) == 9",
+        "empty(registryResourceIdSegments[0])",
+        "toLower(registryResourceIdSegments[1]) == 'subscriptions'",
+        "toLower(registryResourceIdSegments[3]) == 'resourcegroups'",
+        "toLower(registryResourceIdSegments[5]) == 'providers'",
+        "toLower(registryResourceIdSegments[6]) == 'microsoft.containerregistry'",
+        "toLower(registryResourceIdSegments[7]) == 'registries'",
+        "registryResourceId must identify one Microsoft.ContainerRegistry/registries resource",
+    ):
+        assert expected in source
+
+    registry_block = source.split(
+        "resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing =",
+        maxsplit=1,
+    )[1].split("var expectedRegistryServer", maxsplit=1)[0]
+    image_pull_block = source.split(
+        "module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' =",
+        maxsplit=1,
+    )[1].split("var incidentContainerResourceId", maxsplit=1)[0]
+    for block in (registry_block, image_pull_block):
+        assert "scope: resourceGroup(" in block
+        assert "validatedRegistryScope.subscriptionId" in block
+        assert "validatedRegistryScope.resourceGroupName" in block
+        assert "resourceGroup().name" not in block
+
+
 def test_request_producer_rejects_every_runtime_identity_intersection() -> None:
     source = PRODUCER.read_text(encoding="utf-8")
 
@@ -293,9 +370,16 @@ def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -
         assert (
             f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1"
         ) in root
-        assert (
+        expected_polling_interval = (
             f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale.pollingInterval == 30"
-        ) in root
+            if prefix == "wc027RequestProducer"
+            else (
+                f"{prefix}Job!.properties.configuration.eventTriggerConfig.scale."
+                "pollingInterval == "
+                "wc027PublisherDeliveryBudget.publisherPollingIntervalSeconds"
+            )
+        )
+        assert expected_polling_interval in root
         assert (
             f"empty({prefix}Job!.properties.configuration.eventTriggerConfig.scale."
             "rules[0].?auth ?? [])"
