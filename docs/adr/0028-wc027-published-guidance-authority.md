@@ -135,6 +135,11 @@ trigger enrichment, does not execute actions, and does not fabricate correlation
 evidence. The authority publisher remains the only component that creates and activates the
 binding.
 
+Root readiness accepts those Jobs only by canonical absolute ARM IDs in the current subscription
+and reviewed foundation resource group. Structural parsing is followed by normalized equality
+with each loaded Job `.id`, closing malformed prefixes, provider/type aliases, suffixes, duplicate
+separators, encoded/query/fragment forms, and cross-scope substitution.
+
 The publisher configuration is rejected unless its authority Blob endpoint/container and
 activation Table endpoint/name/partition exactly match the embedded feed runtime's read
 locations. The publisher deployment derives those destinations from that runtime configuration.

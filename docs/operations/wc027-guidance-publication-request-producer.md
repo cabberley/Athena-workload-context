@@ -174,6 +174,12 @@ modeled request submitter and requires the publisher's queue plus logical/physic
 binding to match the producer. The complete feed-v2 chain cannot be marked ready unless both jobs
 are ready.
 
+Request-producer, authority-publisher, and feed-producer Job IDs must be canonical absolute ARM
+IDs in the root deployment subscription and `foundationResourceGroupName`. Readiness rejects
+prefix/provider/type aliases, missing components, child or suffix IDs, duplicate separators,
+query/fragment/encoding forms, and any normalized supplied ID that differs from the loaded Job
+`.id`.
+
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is
 rejected.

@@ -207,8 +207,10 @@ environment, resources, empty probe/init-container/volume/secret and managed-ide
 surfaces, complete replica/concurrency and scaler configuration, registry identity, configuration
 value and digest tag, embedded producer-runtime digest, attached identities, and deterministic RBAC
 binding evidence. Canonical publisher Job IDs are evaluated from their parsed segments before
-safety padding, including valid cross-subscription/resource-group references; malformed provider,
-type, child-resource, and empty-name IDs fail readiness.
+safety padding. All three WC-027 Jobs must resolve to the current subscription and
+`foundationResourceGroupName`; malformed prefixes, provider/type aliases, child resources,
+duplicate separators, query/fragment/encoding aliases, empty components, and cross-scope IDs fail
+readiness. Each normalized supplied ID must also equal the loaded Job's canonical `.id`.
 When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
 equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
 `wc027PublisherReady=true`.

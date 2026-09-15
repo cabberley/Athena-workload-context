@@ -350,7 +350,11 @@ var wc027RequestProducerJobResourceIdSegments = concat(
     ''
   ]
 )
-var wc027RequestProducerJobResourceIdValid = length(wc027RequestProducerJobResourceIdRawSegments) == 9 && wc027RequestProducerJobResourceIdSegments[1] == 'subscriptions' && wc027RequestProducerJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027RequestProducerJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027RequestProducerJobResourceIdSegments[7]) == 'jobs' && !empty(wc027RequestProducerJobResourceIdSegments[8])
+var wc027RequestProducerJobResourceIdShapeValid = length(wc027RequestProducerJobResourceIdRawSegments) == 9 && empty(wc027RequestProducerJobResourceIdSegments[0]) && wc027RequestProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027RequestProducerJobResourceIdSegments[2]) && toLower(wc027RequestProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027RequestProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027RequestProducerJobResourceIdSegments[4]) && toLower(wc027RequestProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027RequestProducerJobResourceIdSegments[5] == 'providers' && wc027RequestProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027RequestProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027RequestProducerJobResourceIdSegments[8]) && !contains(wc027RequestProducerJobResourceId, '//') && !contains(wc027RequestProducerJobResourceId, '?') && !contains(wc027RequestProducerJobResourceId, '#') && !contains(wc027RequestProducerJobResourceId, '%')
+var wc027RequestProducerLoadedJobIdMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdShapeValid
+  ? toLower(wc027RequestProducerJob!.id) == toLower(wc027RequestProducerJobResourceId)
+  : false
+var wc027RequestProducerJobResourceIdValid = wc027RequestProducerJobResourceIdShapeValid && (!wc027RequestProducerReady || wc027RequestProducerLoadedJobIdMatches)
 var wc027RequestProducerConfigurationDigestHex = replace(
   wc027RequestProducerConfigurationDigest,
   'sha256:',
@@ -576,7 +580,11 @@ var wc027PublisherJobResourceIdSegments = concat(
     ''
   ]
 )
-var wc027PublisherJobResourceIdValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027PublisherJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027PublisherJobResourceIdSegments[7]) == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8])
+var wc027PublisherJobResourceIdShapeValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && empty(wc027PublisherJobResourceIdSegments[0]) && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherJobResourceIdSegments[2]) && toLower(wc027PublisherJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherJobResourceIdSegments[4]) && toLower(wc027PublisherJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027PublisherJobResourceIdSegments[5] == 'providers' && wc027PublisherJobResourceIdSegments[6] == 'Microsoft.App' && wc027PublisherJobResourceIdSegments[7] == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8]) && !contains(wc027PublisherJobResourceId, '//') && !contains(wc027PublisherJobResourceId, '?') && !contains(wc027PublisherJobResourceId, '#') && !contains(wc027PublisherJobResourceId, '%')
+var wc027PublisherLoadedJobIdMatches = wc027PublisherReady && wc027PublisherJobResourceIdShapeValid
+  ? toLower(wc027PublisherJob!.id) == toLower(wc027PublisherJobResourceId)
+  : false
+var wc027PublisherJobResourceIdValid = wc027PublisherJobResourceIdShapeValid && (!wc027PublisherReady || wc027PublisherLoadedJobIdMatches)
 var wc027PublisherConfigurationDigestHex = replace(wc027PublisherConfigurationDigest, 'sha256:', '')
 var wc027PublisherConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   wc027PublisherConfigurationDigestHex,
@@ -840,7 +848,11 @@ var wc027ProducerJobResourceIdSegments = concat(
     ''
   ]
 )
-var wc027ProducerJobResourceIdValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027ProducerJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027ProducerJobResourceIdSegments[7]) == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8])
+var wc027ProducerJobResourceIdShapeValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && empty(wc027ProducerJobResourceIdSegments[0]) && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027ProducerJobResourceIdSegments[2]) && toLower(wc027ProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027ProducerJobResourceIdSegments[4]) && toLower(wc027ProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027ProducerJobResourceIdSegments[5] == 'providers' && wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027ProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8]) && !contains(wc027EnrichmentFeedProducerJobResourceId, '//') && !contains(wc027EnrichmentFeedProducerJobResourceId, '?') && !contains(wc027EnrichmentFeedProducerJobResourceId, '#') && !contains(wc027EnrichmentFeedProducerJobResourceId, '%')
+var wc027ProducerLoadedJobIdMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid
+  ? toLower(wc027ProducerJob!.id) == toLower(wc027EnrichmentFeedProducerJobResourceId)
+  : false
+var wc027ProducerJobResourceIdValid = wc027ProducerJobResourceIdShapeValid && (!wc027FeedV2ProducerReady || wc027ProducerLoadedJobIdMatches)
 var wc027ConfigurationDigestHex = replace(
   wc027EnrichmentFeedProducerConfigurationDigest,
   'sha256:',
@@ -1109,7 +1121,7 @@ resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01'
   tags: resourceTags
 }
 
-resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid) {
+resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid) {
   name: wc027ProducerJobResourceIdSegments[8]
   scope: resourceGroup(
     wc027ProducerJobResourceIdSegments[2],
@@ -1117,7 +1129,7 @@ resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027Fe
   )
 }
 
-resource wc027RequestProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid) {
+resource wc027RequestProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027RequestProducerReady && wc027RequestProducerJobResourceIdShapeValid) {
   name: wc027RequestProducerJobResourceIdSegments[8]
   scope: resourceGroup(
     wc027RequestProducerJobResourceIdSegments[2],
@@ -1125,7 +1137,7 @@ resource wc027RequestProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (
   )
 }
 
-resource wc027PublisherJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027PublisherReady && wc027PublisherJobResourceIdValid) {
+resource wc027PublisherJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027PublisherReady && wc027PublisherJobResourceIdShapeValid) {
   name: wc027PublisherJobResourceIdSegments[8]
   scope: resourceGroup(
     wc027PublisherJobResourceIdSegments[2],

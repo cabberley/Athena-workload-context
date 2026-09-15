@@ -304,8 +304,12 @@ def test_wc027_notification_gate_requires_deployed_job_resource_id() -> None:
     assert "param wc027EnrichmentFeedProducerConfigurationDigest string = ''" in source
     assert "param wc027EnrichmentFeedProducerConfigurationJson string = ''" in source
     assert "validatedWc027FeedV2ProducerReady" in source
-    assert "toLower(wc027ProducerJobResourceIdSegments[6]) == 'microsoft.app'" in source
-    assert "toLower(wc027ProducerJobResourceIdSegments[7]) == 'jobs'" in source
+    assert "wc027ProducerJobResourceIdShapeValid" in source
+    assert "wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App'" in source
+    assert "wc027ProducerJobResourceIdSegments[7] == 'jobs'" in source
+    assert (
+        "toLower(wc027ProducerJob!.id) == toLower(wc027EnrichmentFeedProducerJobResourceId)"
+    ) in source
     assert "exact deployed producer configuration digest" in source
     assert "wc027ProducerJob!.tags.runtimeConfigurationDigest" in source
     assert "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON" in source

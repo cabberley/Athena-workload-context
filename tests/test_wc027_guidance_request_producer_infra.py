@@ -25,30 +25,43 @@ PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 ROOT_ACCEPTANCE = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 
 
-def _evaluate_publisher_job_resource_id(
+def _evaluate_job_resource_id(
     source: str,
+    *,
+    prefix: str,
     resource_id: str,
+    loaded_job_id: str,
+    expected_subscription_id: str,
+    expected_resource_group_name: str,
 ) -> tuple[list[str], bool]:
     declaration = source.split(
-        "var wc027PublisherJobResourceIdSegments = concat(",
+        f"var {prefix}JobResourceIdSegments = concat(",
         maxsplit=1,
     )[1].split(
-        "var wc027PublisherJobResourceIdValid",
+        f"var {prefix}JobResourceIdShapeValid",
         maxsplit=1,
     )[0]
     raw_segments = resource_id.split("/")
     padding = [""] * 9
-    raw_segments_first = declaration.index(
-        "wc027PublisherJobResourceIdRawSegments"
-    ) < declaration.index("[")
+    raw_segments_first = declaration.index(f"{prefix}JobResourceIdRawSegments") < declaration.index(
+        "["
+    )
     segments = [*raw_segments, *padding] if raw_segments_first else [*padding, *raw_segments]
     valid = (
         len(raw_segments) == 9
+        and not segments[0]
         and segments[1] == "subscriptions"
+        and bool(segments[2])
+        and segments[2].casefold() == expected_subscription_id.casefold()
         and segments[3] == "resourceGroups"
-        and segments[6].casefold() == "microsoft.app"
-        and segments[7].casefold() == "jobs"
+        and bool(segments[4])
+        and segments[4].casefold() == expected_resource_group_name.casefold()
+        and segments[5] == "providers"
+        and segments[6] == "Microsoft.App"
+        and segments[7] == "jobs"
         and bool(segments[8])
+        and not any(alias in resource_id for alias in ("//", "?", "#", "%"))
+        and loaded_job_id.casefold() == resource_id.casefold()
     )
     return segments, valid
 
@@ -349,54 +362,121 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
 
 
 @pytest.mark.parametrize(
-    ("resource_id", "expected_valid"),
+    ("prefix", "resource_id_parameter", "job_resource"),
     (
         (
-            "/subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/publisher-job",
-            True,
+            "wc027RequestProducer",
+            "wc027RequestProducerJobResourceId",
+            "wc027RequestProducerJob",
         ),
+        ("wc027Publisher", "wc027PublisherJobResourceId", "wc027PublisherJob"),
         (
-            "/subscriptions/22222222-2222-2222-2222-222222222222/"
-            "resourceGroups/rg-cross-scope/providers/Microsoft.App/jobs/publisher-job",
-            True,
-        ),
-        (
-            "subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/publisher-job",
-            False,
-        ),
-        (
-            "/subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-publisher/providers/Microsoft.ContainerApps/jobs/publisher-job",
-            False,
-        ),
-        (
-            "/subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/",
-            False,
-        ),
-        (
-            "/subscriptions/11111111-1111-1111-1111-111111111111/"
-            "resourceGroups/rg-publisher/providers/Microsoft.App/jobs/"
-            "publisher-job/executions/run-1",
-            False,
+            "wc027Producer",
+            "wc027EnrichmentFeedProducerJobResourceId",
+            "wc027ProducerJob",
         ),
     ),
 )
-def test_publisher_job_resource_id_is_evaluated_from_canonical_segments(
-    resource_id: str,
+@pytest.mark.parametrize(
+    ("resource_id_variant", "loaded_id_variant", "expected_valid"),
+    (
+        ("canonical", "same", True),
+        ("missing-leading-slash", "same", False),
+        ("not-subscriptions", "same", False),
+        ("not-resource-groups", "same", False),
+        ("not-providers", "same", False),
+        ("provider-case-alias", "same", False),
+        ("type-case-alias", "same", False),
+        ("empty-name", "same", False),
+        ("child-suffix", "same", False),
+        ("duplicate-separator", "same", False),
+        ("query", "same", False),
+        ("fragment", "same", False),
+        ("encoded-separator", "same", False),
+        ("cross-subscription", "same", False),
+        ("cross-resource-group", "same", False),
+        ("loaded-id-mismatch", "different", False),
+    ),
+)
+def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_loaded_ids(
+    prefix: str,
+    resource_id_parameter: str,
+    job_resource: str,
+    resource_id_variant: str,
+    loaded_id_variant: str,
     expected_valid: bool,
 ) -> None:
     source = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
+    subscription_id = "11111111-1111-1111-1111-111111111111"
+    resource_group_name = "rg-athena-wc013-live"
+    canonical = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group_name}/"
+        "providers/Microsoft.App/jobs/wc027-job"
+    )
+    variants = {
+        "canonical": canonical,
+        "missing-leading-slash": canonical.removeprefix("/"),
+        "not-subscriptions": canonical.replace("/subscriptions/", "/notSubscriptions/"),
+        "not-resource-groups": canonical.replace("/resourceGroups/", "/notResourceGroups/"),
+        "not-providers": canonical.replace("/providers/", "/notProviders/"),
+        "provider-case-alias": canonical.replace("Microsoft.App", "microsoft.app"),
+        "type-case-alias": canonical.replace("/jobs/", "/Jobs/"),
+        "empty-name": canonical.removesuffix("wc027-job"),
+        "child-suffix": canonical + "/executions/run-1",
+        "duplicate-separator": canonical.replace("/providers/", "//providers/"),
+        "query": canonical + "?api-version=2025-01-01",
+        "fragment": canonical + "#publisher",
+        "encoded-separator": canonical.replace("/jobs/", "/jobs%2F"),
+        "cross-subscription": canonical.replace(
+            subscription_id,
+            "22222222-2222-2222-2222-222222222222",
+        ),
+        "cross-resource-group": canonical.replace(
+            resource_group_name,
+            "rg-cross-scope",
+        ),
+        "loaded-id-mismatch": canonical,
+    }
+    selected_resource_id = variants[resource_id_variant]
+    loaded_job_id = (
+        canonical.replace("wc027-job", "other-job")
+        if loaded_id_variant == "different"
+        else selected_resource_id
+    )
 
-    segments, valid = _evaluate_publisher_job_resource_id(source, resource_id)
+    segments, valid = _evaluate_job_resource_id(
+        source,
+        prefix=prefix,
+        resource_id=selected_resource_id,
+        loaded_job_id=loaded_job_id,
+        expected_subscription_id=subscription_id,
+        expected_resource_group_name=resource_group_name,
+    )
 
     assert valid is expected_valid
     if expected_valid:
-        assert segments[2] == resource_id.split("/")[2]
-        assert segments[4] == resource_id.split("/")[4]
-        assert segments[8] == "publisher-job"
+        assert segments[2] == subscription_id
+        assert segments[4] == resource_group_name
+        assert segments[8] == "wc027-job"
+
+    shape = f"var {prefix}JobResourceIdShapeValid"
+    assert shape in source
+    for expected in (
+        f"empty({prefix}JobResourceIdSegments[0])",
+        f"{prefix}JobResourceIdSegments[1] == 'subscriptions'",
+        (f"toLower({prefix}JobResourceIdSegments[2]) == toLower(subscription().subscriptionId)"),
+        f"{prefix}JobResourceIdSegments[3] == 'resourceGroups'",
+        (f"toLower({prefix}JobResourceIdSegments[4]) == toLower(foundationResourceGroupName)"),
+        f"{prefix}JobResourceIdSegments[5] == 'providers'",
+        f"{prefix}JobResourceIdSegments[6] == 'Microsoft.App'",
+        f"{prefix}JobResourceIdSegments[7] == 'jobs'",
+        f"!contains({resource_id_parameter}, '//')",
+        f"!contains({resource_id_parameter}, '?')",
+        f"!contains({resource_id_parameter}, '#')",
+        f"!contains({resource_id_parameter}, '%')",
+        f"toLower({job_resource}!.id) == toLower({resource_id_parameter})",
+    ):
+        assert expected in source
 
 
 def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -> None:
