@@ -16,12 +16,16 @@ from athena_context.contracts import (
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION,
+    MONITORING_IDENTITY_PROOF_AUDIENCE,
+    MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+    MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+    MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
-    MonitoringCredentialProof,
     MonitoringEvidenceAttestation,
     MonitoringEvidenceHandoff,
+    MonitoringIdentityProof,
     TrustedKeyAnchor,
     TrustedKeyRecord,
     VersionPinnedBlobReference,
@@ -325,6 +329,12 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             "ipFlowVerifyRoleDefinitionId": IP_FLOW_VERIFY_ROLE_DEFINITION_ID,
             "ipFlowVerifyScopeId": NETWORK_WATCHER_RESOURCE_ID,
             "ipFlowVerifyAllowedOperations": IP_FLOW_VERIFY_OPERATIONS,
+            "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+            "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+            "identityProofMaximumLifetimeSeconds": (
+                MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+            ),
             "allowedReadOperations": (
                 *payload["allowedReadOperations"],
                 *IP_FLOW_VERIFY_OPERATIONS,
@@ -389,6 +399,8 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     )
     assert contract.ip_flow_verify_scope_id == NETWORK_WATCHER_RESOURCE_ID
     assert contract.ip_flow_verify_allowed_operations == IP_FLOW_VERIFY_OPERATIONS
+    assert contract.identity_proof_audience == MONITORING_IDENTITY_PROOF_AUDIENCE
+    assert "Microsoft.Network/networkWatchers/read" not in contract.allowed_read_operations
 
 
 def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
@@ -404,6 +416,10 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
         "ipFlowVerifyRoleDefinitionId",
         "ipFlowVerifyScopeId",
         "ipFlowVerifyAllowedOperations",
+        "identityProofAudience",
+        "identityProofTokenVersion",
+        "identityProofRequiredRole",
+        "identityProofMaximumLifetimeSeconds",
         "acquisitionReceiptSchemaVersion",
     ):
         payload.pop(field)
@@ -412,6 +428,28 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
 
     assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v3"
     assert legacy.ip_flow_verify_role_definition_id is None
+
+
+def test_legacy_v4_acquisition_collector_contract_remains_readable() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["schemaVersion"] = "athena.wc028MonitoringCollectorContract.v4"
+    payload["acquisitionReceiptSchemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v3"
+    for field in (
+        "identityProofAudience",
+        "identityProofTokenVersion",
+        "identityProofRequiredRole",
+        "identityProofMaximumLifetimeSeconds",
+    ):
+        payload.pop(field)
+
+    legacy = MonitoringCollectorContract(**payload)
+
+    assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v4"
+    assert legacy.identity_proof_audience is None
 
 
 @pytest.mark.parametrize(
@@ -428,6 +466,9 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
             _collector_contract().allowed_read_operations,
         ),
         ("collectorTenantId", None),
+        ("identityProofAudience", "api://unreviewed-proof"),
+        ("identityProofRequiredRole", None),
+        ("identityProofMaximumLifetimeSeconds", None),
         ("acquisitionReceiptSchemaVersion", None),
     ),
 )
@@ -462,7 +503,7 @@ def test_collector_contract_bicep_output_matches_the_production_contract() -> No
     for operation in _collector_contract().allowed_read_operations:
         assert f"'{operation}'" in source
     assert "output collectorContract object = collectorContract" in source
-    assert "athena.wc028MonitoringCollectorContract.v4" in source
+    assert "athena.wc028MonitoringCollectorContract.v5" in source
     assert "athena.wc028MonitoringEvidenceHandoff.v2" in source
 
 
@@ -660,13 +701,16 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
     collector_digest = contract.compute_artifact_digest_value()
     observed_at = datetime(2026, 9, 6, 6, 0, tzinfo=UTC)
     proof_payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringCredentialProof.v1",
+        "schemaVersion": "athena.wc028MonitoringIdentityProof.v1",
+        "tokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
         "tenantId": reader_tenant,
         "principalId": reader_principal,
         "clientId": reader_client,
         "subject": reader_principal,
         "issuer": f"https://sts.windows.net/{reader_tenant}/",
-        "audience": "https://management.azure.com/",
+        "audience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+        "identityType": "app",
+        "roles": [MONITORING_IDENTITY_PROOF_REQUIRED_ROLE],
         "tokenHash": "sha256:" + "6" * 64,
         "keyId": "synthetic-kid",
         "issuedAt": observed_at,
@@ -674,8 +718,11 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         "expiresAt": observed_at.replace(hour=7),
         "verifiedAt": observed_at,
     }
-    proof = MonitoringCredentialProof(
-        **proof_payload,
+    proof = MonitoringIdentityProof(
+        **{
+            **proof_payload,
+            "roles": (MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,),
+        },
         proofDigest=compute_artifact_digest(proof_payload),
     )
     exchange = MonitoringAcquisitionExchange(
@@ -686,7 +733,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         requestedAt=observed_at,
         receivedAt=observed_at,
         checkedAt=observed_at,
-        credentialProofDigest=proof.proof_digest,
+        identityProofDigest=proof.proof_digest,
     )
     payload: dict[str, object] = {
         "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
@@ -707,8 +754,14 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         "executionStartedAt": observed_at,
         "executionCompletedAt": observed_at,
         "receiptIssuedAt": observed_at,
-        "exchanges": [exchange.model_dump(mode="json", by_alias=True)],
-        "credentialProofs": [proof.model_dump(mode="json", by_alias=True)],
+        "exchanges": [
+            exchange.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        ],
+        "identityProof": proof.model_dump(mode="json", by_alias=True),
     }
     receipt_digest = compute_artifact_digest(payload)
     signed_payload = {
@@ -730,7 +783,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         **{
             **signed_payload,
             "exchanges": (exchange,),
-            "credentialProofs": (proof,),
+            "identityProof": proof,
         },
         collectorAttestation=MonitoringEvidenceAttestation(
             signatureAlgorithm="RS256",
@@ -790,7 +843,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             maximum_receipt_age_seconds=600,
         )
 
-    legacy_exchange = exchange.model_copy(update={"credential_proof_digest": None})
+    legacy_exchange = exchange.model_copy(update={"identity_proof_digest": None})
     legacy_payload = {
         key: value
         for key, value in payload.items()
@@ -800,7 +853,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             "authenticatedTenantId",
             "monitoringReaderIdentityId",
             "athenaContextPrincipalId",
-            "credentialProofs",
+            "identityProof",
         }
     }
     legacy_payload.update(
@@ -841,7 +894,7 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         ),
     )
     assert legacy_receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v1"
-    with pytest.raises(ValueError, match="requires credential-bound acquisition receipt v3"):
+    with pytest.raises(ValueError, match="requires Athena-proven acquisition receipt v4"):
         verify_monitoring_acquisition_receipt_attestation(
             legacy_receipt,
             as_of=observed_at,

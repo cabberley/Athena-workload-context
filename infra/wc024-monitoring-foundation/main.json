@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "5772878318930458946"
+      "templateHash": "9335290528917391714"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -3239,7 +3239,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "12793421238153091352"
+              "templateHash": "9872463602190399851"
             }
           },
           "parameters": {
@@ -3481,7 +3481,7 @@
             },
             "acquisitionCollectorContract": {
               "type": "object",
-              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v4', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v3', 'collectorTenantId', parameters('collectorTenantId'), 'ipFlowVerifyRoleDefinitionId', parameters('ipFlowVerifyRoleDefinitionId'), 'ipFlowVerifyScopeId', parameters('ipFlowVerifyScopeId'), 'ipFlowVerifyAllowedOperations', parameters('ipFlowVerifyAllowedOperations'), 'allowedReadOperations', concat(variables('collectorContract').allowedReadOperations, parameters('ipFlowVerifyAllowedOperations'))))]"
+              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v5', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v4', 'collectorTenantId', parameters('collectorTenantId'), 'ipFlowVerifyRoleDefinitionId', parameters('ipFlowVerifyRoleDefinitionId'), 'ipFlowVerifyScopeId', parameters('ipFlowVerifyScopeId'), 'ipFlowVerifyAllowedOperations', parameters('ipFlowVerifyAllowedOperations'), 'identityProofAudience', 'api://athena-monitoring-identity-proof', 'identityProofTokenVersion', '1.0', 'identityProofRequiredRole', 'Athena.MonitoringAcquisition.ProveIdentity', 'identityProofMaximumLifetimeSeconds', 7200, 'allowedReadOperations', concat(variables('collectorContract').allowedReadOperations, parameters('ipFlowVerifyAllowedOperations'))))]"
             }
           }
         }

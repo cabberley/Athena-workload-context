@@ -685,6 +685,7 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "Microsoft.Network/networkWatchers/ipFlowVerify/read" in (
         NETWORK_WATCHER_READER_RBAC
     )
+    assert "Microsoft.Network/networkWatchers/read" not in NETWORK_WATCHER_READER_RBAC
     assert "assignableScopes: [\n      resourceGroup().id\n    ]" in (
         NETWORK_WATCHER_READER_RBAC
     )
@@ -753,8 +754,8 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     )
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringCollectorContract.v4" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringAcquisitionReceipt.v3" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v5" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringAcquisitionReceipt.v4" in COLLECTOR_CONTRACT
     assert "ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId" in (
         COLLECTOR_CONTRACT
     )
@@ -763,6 +764,15 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
         COLLECTOR_CONTRACT
     )
     assert "collectorTenantId: collectorTenantId" in COLLECTOR_CONTRACT
+    assert "identityProofAudience: 'api://athena-monitoring-identity-proof'" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "identityProofTokenVersion: '1.0'" in COLLECTOR_CONTRACT
+    assert (
+        "identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'"
+        in COLLECTOR_CONTRACT
+    )
+    assert "identityProofMaximumLifetimeSeconds: 7200" in COLLECTOR_CONTRACT
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
     assert "'workspaceAndResourceContext'" in MAIN
     assert "'workspaceOnly'" in MAIN

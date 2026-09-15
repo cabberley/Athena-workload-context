@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-13
-- **Amended:** 2026-09-14
+- **Amended:** 2026-09-15
 
 ## Context
 
@@ -29,22 +29,24 @@ The coordinator:
 - exposes no caller-supplied query, table, column, filter, resource-scope, or time-window input;
 - derives exact Log Analytics queries, Activity Log filters, Resource Graph scopes, Resource
   Health filters, and bounded windows from the verified intent plus reviewed constants;
-- sends every request through one production credential-bound adapter that owns the managed
-  identity credential, acquires the ARM and Log Analytics data-plane audiences required by the
-  selected sources, cryptographically verifies each Entra token's tenant, `oid`, and `appid`/`azp`
-  client identity against the full reviewed collector contract before source I/O, and passes the
-  applicable verified token to its Azure call; the coordinator accepts no independently injected
-  principal assertion, and source adapters cannot select a credential;
-- retains only sorted digest-bound credential proofs containing the verified identity, issuer,
-  audience, signing-key ID, bounded lifetime, subject, and token hash; every exchange binds the
-  proof for its service audience and the signed receipt binds the full proof set without persisting
-  any bearer token;
+- accepts only the production `AzureMonitoringAdapter`, which internally creates one direct
+  `ManagedIdentityCredential(client_id=<reviewed client ID>)`; after identity proof succeeds, the
+  adapter passes that exact credential object to each Azure client so the SDK can legitimately
+  acquire its own service-audience token without exposing or parsing ARM or Log Analytics tokens;
+- obtains identity proof before the first source read by requesting only the Athena-owned
+  single-tenant `api://athena-monitoring-identity-proof` audience, then validates RS256 signature
+  through tenant-pinned JWKS, token version `1.0`, exact issuer and audience, tenant, `oid`,
+  `appid`/`azp`, app-only `idtyp`, exact application role, and `iat`/`nbf`/`exp`;
+- persists only one frozen normalized identity proof containing those reviewed fields, signing-key
+  ID, token hash, timestamps, the reviewed two-hour maximum lifetime, and a deterministic proof
+  digest; the bearer token is discarded, and every exchange plus the signed receipt binds the same
+  proof digest;
 - requires a digest-pinned acquisition authority that binds the reader identity, the Athena
   non-reader identity, the collector contract, exact read-only source allowlist, resource
   allowlist, payload limits, freshness limit, total acquisition-call budget, receipt signing key,
   managed-identity tenant/client/object IDs, and a digest of the deployment identity-separation
   contract;
-- requires acquisition-authority v3 to bind the current `contextBindingDigest`, the exact sorted
+- requires acquisition-authority v4 to bind the current `contextBindingDigest`, the exact sorted
   `requiredCoverageScopeDigests`, and a sorted one-to-one binding from every required coverage
   digest to one selected control ID, control digest, and scope digest; the same exact control IDs
   are separately pinned, and all bindings are verified before credential acquisition or entry into
@@ -54,8 +56,8 @@ The coordinator:
   receipt, and issuance times plus every exact request/result digest; IP Flow entries also bind the
   collector-owned `checkedAt`, and the receipt binds the exact normalized collection-batch digest
   plus a deterministic digest of the normalized observations and coverage so it cannot be replayed
-  with altered persisted evidence; receipt v3 additionally binds the verified service-audience
-  credential proofs and their tenant, client, and object identities;
+  with altered persisted evidence; receipt v4 additionally binds the Athena identity proof and its
+  tenant, client, object, app-only role, token-version, issuer, and audience policy;
 - persists that receipt plus an independently digest-bound batch/request/result manifest in the
   WC-028 evidence bundle, binds the receipt digest into the signed monitoring handoff, and requires
   production correlation verification to revalidate the receipt signature, manifest, signed
@@ -100,8 +102,8 @@ The coordinator:
   `NetworkWatcher_australiaeast` resource; the existing built-in Reader assignment remains scoped
   only to the canonical flow-log child;
 - publishes the exact IP Flow role-definition ID, Network Watcher assignment scope, and two-action
-  allowlist in credential-bound collector contract v4, alongside the collector tenant/client/object
-  identity and acquisition receipt v3 schema.
+  allowlist in production collector contract v5, alongside the collector tenant/client/object
+  identity, Athena proof audience/version/role, and acquisition receipt v4 schema.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -112,10 +114,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
   monitoring Reader access.
 - Query authority remains human-owned through the immutable published intent.
 - Reordered source rows produce identical batch bytes.
-- Source-port identity/time claims cannot replace platform-authenticated receipt provenance.
-- An alternate real credential cannot pass by asserting the approved principal: its signed Entra
-  tokens must match the reviewed tenant, object ID, and client ID, and each exact verified token is
-  supplied only to calls for its audience.
+- Source `sourceIdentityId` values remain untrusted compatibility fields and cannot replace adapter
+  proof; a fake source client cannot alter the identity stamped into exchanges or receipts.
+- Different Azure services may acquire different audience tokens, but all clients receive the same
+  structurally owned `ManagedIdentityCredential` object after proof succeeds.
+- `DefaultAzureCredential` and other local credential chains cannot be injected into the production
+  adapter or emit production receipts.
 - Empty aggregate defaults cannot become healthy or complete evidence.
 - Optional controls cannot select an incident outside the required runtime coverage unit.
 - Traffic Analytics cardinality cannot amplify one query into unbounded IP Flow calls.
@@ -128,12 +132,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Receipt-bearing acquisitions use `athena.wc028MonitoringEvidenceBundle.v3` and
   `athena.wc028MonitoringEvidenceHandoff.v2`; legacy collection paths remain on their existing
   versioned contracts and cannot silently add receipt fields.
-- The deployment publishes `athena.wc028MonitoringCollectorContract.v4` for the credential-bound
-  receipt-bearing handoff while retaining the WC-024 v2/v1 collector contract and parse support for
-  legacy WC-028 v3 contracts. Production verification requires the full reviewed v4 contract.
-- Legacy acquisition-authority v1 and v2 documents remain readable, but only v3 authorities can
-  execute credential-bound acquisition. Production receipt verification requires receipt v3 and
-  derives deployed tenant/client/object/resource identity and IP Flow policy from the full reviewed
+- The deployment publishes `athena.wc028MonitoringCollectorContract.v5` while retaining parse
+  support for WC-024 v2 and legacy WC-028 v3/v4 contracts. Production verification requires the
+  full reviewed v5 contract and its exact proof policy.
+- Legacy acquisition-authority v1-v3 documents remain readable, but only v4 authorities can execute
+  production acquisition. Production receipt verification requires receipt v4 and derives deployed
+  tenant/client/object/resource identity, proof policy, and IP Flow policy from the full reviewed
   collector contract rather than caller assertions.
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
@@ -150,6 +154,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - **Trust a runtime principal string beside an independently injected source port:** rejected
   because it cannot prove that the credential named in the receipt is the credential that
   authorized the Azure calls.
+- **Parse Microsoft-owned ARM or Log Analytics tokens as identity evidence:** rejected because
+  Azure Identity exposes no supported principal metadata and clients must treat tokens for those
+  resources as opaque. Only the Athena-owned proof audience is parsed and cryptographically
+  validated.
+- **Use `DefaultAzureCredential` in production:** rejected because a local or chained credential
+  can select an identity other than the reviewed managed identity.
 - **Assign Reader at the Network Watcher:** rejected because IP Flow Verify needs only two exact
   actions and broad Reader would enlarge the management-plane read surface.
 - **Treat no rows as zero:** rejected because ingestion gaps, latency, retention, and truncation are
@@ -164,10 +174,11 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Exact requests are derived from the verified intent and monitoring-reader identity.
 - Invalid intent signatures, acquisition-authority digests, identity reuse, stale collection
   times, unauthorized sources, or unauthorized resource scopes fail before any read.
-- Alternate principal, client, or tenant credentials fail token verification before source I/O;
-  ARM and Log Analytics tokens are independently verified from the same credential, production-
-  representative day-length tokens remain accepted within the reviewed 28-hour ceiling, and every
-  successful exchange carries its audience-specific proof digest retained in receipt v3.
+- Invalid proof signature, token version, issuer, audience, tenant, object ID, client ID, app-only
+  identity type, role, or lifetime fails before client construction and the first source I/O.
+- Tests prove the exact same `ManagedIdentityCredential` object reaches all five Azure clients,
+  fake source identity values cannot change receipt identity, and `DefaultAzureCredential` cannot
+  enter the production receipt path.
 - An authority issued for another context binding, required-coverage set, or control selection
   fails before credential acquisition and produces zero source calls.
 - Missing or incorrect IP Flow role ID, exact Network Watcher scope, two-action allowlist, or

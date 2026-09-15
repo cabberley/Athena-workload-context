@@ -7,10 +7,16 @@ from datetime import datetime, timedelta
 
 import jwt
 import pytest
+from azure.identity import DefaultAzureCredential
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
+import athena_context.monitoring_acquisition as monitoring_acquisition_module
 from athena_context.contracts import (
+    MONITORING_IDENTITY_PROOF_AUDIENCE,
+    MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+    MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+    MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     EvidenceCoverageScope,
     ResourceHealthMonitoringSignal,
     build_published_monitoring_intent,
@@ -23,8 +29,8 @@ from athena_context.monitoring_acquisition import (
     ActivityLogQueryRequest,
     ActivityLogQueryResult,
     ActivityLogRow,
+    AzureMonitoringAdapter,
     ConnectionMonitorRow,
-    CredentialBoundMonitoringAcquisitionAdapter,
     HeartbeatRow,
     IpFlowVerifyRequest,
     IpFlowVerifyResult,
@@ -107,51 +113,49 @@ OUT_OF_SCOPE_ID = (
 _TOKEN_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
+class _SyntheticClock:
+    now = NOW
+
+
 @dataclass(frozen=True, slots=True)
 class _SyntheticAccessToken:
     token: str
     expires_on: int
 
 
-class _Credential:
-    def __init__(
-        self,
-        *,
-        principal_id: str = READER_PRINCIPAL_ID,
-        client_id: str = READER_CLIENT_ID,
-        tenant_id: str = COLLECTOR_TENANT_ID,
-        now: datetime = NOW,
-        lifetime_seconds: int = 3600,
-    ) -> None:
-        self.principal_id = principal_id
+class _SyntheticManagedIdentityCredential:
+    instances: list[_SyntheticManagedIdentityCredential] = []
+    claim_overrides: dict[str, object] = {}
+    lifetime_seconds = 3600
+
+    def __init__(self, *, client_id: str) -> None:
+        assert client_id == READER_CLIENT_ID
         self.client_id = client_id
-        self.tenant_id = tenant_id
-        self.now = now
-        self.lifetime_seconds = lifetime_seconds
         self.calls = 0
+        self.instances.append(self)
 
     def get_token(self, *scopes: str, **_kwargs: object) -> _SyntheticAccessToken:
-        assert len(scopes) == 1
-        scope = scopes[0]
-        audience = {
-            "https://api.loganalytics.io/.default": "https://api.loganalytics.io",
-            "https://management.azure.com/.default": "https://management.azure.com/",
-        }[scope]
+        assert scopes == (f"{MONITORING_IDENTITY_PROOF_AUDIENCE}/.default",)
         self.calls += 1
-        issued_at = int(self.now.timestamp())
+        issued_at = int(NOW.timestamp())
         expires_on = issued_at + self.lifetime_seconds
+        claims: dict[str, object] = {
+            "aud": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "exp": expires_on,
+            "iat": issued_at,
+            "idtyp": "app",
+            "iss": f"https://sts.windows.net/{COLLECTOR_TENANT_ID}/",
+            "nbf": issued_at,
+            "oid": READER_PRINCIPAL_ID,
+            "roles": [MONITORING_IDENTITY_PROOF_REQUIRED_ROLE],
+            "sub": READER_PRINCIPAL_ID,
+            "tid": COLLECTOR_TENANT_ID,
+            "ver": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+            "appid": self.client_id,
+        }
+        claims.update(self.claim_overrides)
         token = jwt.encode(
-            {
-                "aud": audience,
-                "exp": expires_on,
-                "iat": issued_at,
-                "iss": f"https://sts.windows.net/{self.tenant_id}/",
-                "nbf": issued_at,
-                "oid": self.principal_id,
-                "sub": self.principal_id,
-                "tid": self.tenant_id,
-                "appid": self.client_id,
-            },
+            claims,
             _TOKEN_PRIVATE_KEY,
             algorithm="RS256",
             headers={"kid": "synthetic-kid", "typ": "JWT"},
@@ -161,6 +165,14 @@ class _Credential:
 
 @pytest.fixture(autouse=True)
 def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _SyntheticManagedIdentityCredential.instances.clear()
+    _SyntheticManagedIdentityCredential.claim_overrides = {}
+    _SyntheticManagedIdentityCredential.lifetime_seconds = 3600
+    _SyntheticClock.now = NOW
+    _SyntheticAzureClient.active_port = None
+    _SyntheticAzureClient.credentials.clear()
+    _SyntheticAzureClient.contracts.clear()
+
     class _SigningKey:
         key = _TOKEN_PRIVATE_KEY.public_key()
 
@@ -175,6 +187,28 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
             return _SigningKey()
 
     monkeypatch.setattr(jwt, "PyJWKClient", _JwkClient)
+    monkeypatch.setattr(
+        monitoring_acquisition_module,
+        "ManagedIdentityCredential",
+        _SyntheticManagedIdentityCredential,
+    )
+    monkeypatch.setattr(
+        monitoring_acquisition_module,
+        "_system_utc_now",
+        lambda: _SyntheticClock.now,
+    )
+    for name in (
+        "AzureLogAnalyticsAcquisitionClient",
+        "AzureActivityLogAcquisitionClient",
+        "AzureResourceGraphAcquisitionClient",
+        "AzureResourceHealthAcquisitionClient",
+        "AzureIpFlowVerifyAcquisitionClient",
+    ):
+        monkeypatch.setattr(
+            monitoring_acquisition_module,
+            name,
+            _SyntheticAzureClient,
+        )
 
 
 class _ReceiptSigner:
@@ -240,7 +274,7 @@ def _acquisition_authority(
     if required_control_ids is None:
         required_control_ids = tuple(item.control_id for item in required_control_bindings)
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v3",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v4",
         "monitoringReaderIdentityId": reader_identity_id.casefold(),
         "monitoringReaderPrincipalId": reader_principal_id,
         "monitoringReaderClientId": reader_client_id,
@@ -265,6 +299,10 @@ def _acquisition_authority(
             context_binding,
             required_control_bindings,
         ),
+        "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+        "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+        "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+        "identityProofMaximumLifetimeSeconds": (MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS),
         "maxRows": MAX_ACQUISITION_ROWS,
         "maxBytes": MAX_ACQUISITION_RESPONSE_BYTES,
         "maxWindowSeconds": 86400,
@@ -465,31 +503,19 @@ class _AcquisitionPort:
         self.future_aggregate_proof = future_aggregate_proof
         self.truncated_heartbeat = truncated_heartbeat
         self.ip_flow_calls = 0
-        self.access_token_calls = 0
-        self.access_token_audiences: list[tuple[str, str]] = []
         self.requests: list[object] = []
 
     def _collected_at(self):
         return NOW - timedelta(minutes=1) if self.stale else NOW
 
-    def _record_request(self, request: object, access_token: str) -> None:
-        assert access_token.count(".") == 2
-        claims = jwt.decode(access_token, options={"verify_signature": False})
-        source = request.source  # type: ignore[attr-defined]
-        audience = claims["aud"]
-        assert isinstance(source, str)
-        assert isinstance(audience, str)
-        self.access_token_audiences.append((source, audience))
-        self.access_token_calls += 1
+    def _record_request(self, request: object) -> None:
         self.requests.append(request)
 
     def query_log_analytics(
         self,
         request: LogAnalyticsQueryRequest,
-        *,
-        access_token: str,
     ) -> LogAnalyticsQueryResult:
-        self._record_request(request, access_token)
+        self._record_request(request)
         is_current = request.window_end == NOW
         path = _dependency_path()
         if request.table == "Heartbeat":
@@ -653,10 +679,8 @@ class _AcquisitionPort:
     def query_ip_flow_verify(
         self,
         request: IpFlowVerifyRequest,
-        *,
-        access_token: str,
     ) -> IpFlowVerifyResult:
-        self._record_request(request, access_token)
+        self._record_request(request)
         self.ip_flow_calls += 1
         return IpFlowVerifyResult(
             schemaVersion="athena.wc028IpFlowVerifyResult.v1",
@@ -680,10 +704,8 @@ class _AcquisitionPort:
     def query_activity_log(
         self,
         request: ActivityLogQueryRequest,
-        *,
-        access_token: str,
     ) -> ActivityLogQueryResult:
-        self._record_request(request, access_token)
+        self._record_request(request)
         row = ActivityLogRow(
             category="Administrative",
             operationName="Microsoft.Network/networkSecurityGroups/securityRules/write",
@@ -709,10 +731,8 @@ class _AcquisitionPort:
     def query_resource_graph_changes(
         self,
         request: ResourceGraphChangeQueryRequest,
-        *,
-        access_token: str,
     ) -> ResourceGraphChangeQueryResult:
-        self._record_request(request, access_token)
+        self._record_request(request)
         if self.fail_resource_graph:
             raise TimeoutError("synthetic source timeout")
         change_control = _controls()["change"]
@@ -783,10 +803,8 @@ class _AcquisitionPort:
     def query_resource_health(
         self,
         request: ResourceHealthQueryRequest,
-        *,
-        access_token: str,
     ) -> ResourceHealthQueryResult:
-        self._record_request(request, access_token)
+        self._record_request(request)
         rows = (
             ResourceHealthRow(
                 resourceId=WEB_ID,
@@ -824,17 +842,55 @@ class _AcquisitionPort:
         )
 
 
+class _SyntheticAzureClient:
+    active_port: _AcquisitionPort | None = None
+    credentials: list[object] = []
+    contracts: list[object] = []
+
+    def __init__(self, *, credential: object, reviewed_contract: object) -> None:
+        if self.active_port is None:
+            raise AssertionError("synthetic Azure client requires an active port")
+        self.port = self.active_port
+        self.credentials.append(credential)
+        self.contracts.append(reviewed_contract)
+
+    def query_log_analytics(
+        self,
+        request: LogAnalyticsQueryRequest,
+    ) -> LogAnalyticsQueryResult:
+        return self.port.query_log_analytics(request)
+
+    def query_activity_log(
+        self,
+        request: ActivityLogQueryRequest,
+    ) -> ActivityLogQueryResult:
+        return self.port.query_activity_log(request)
+
+    def query_resource_graph_changes(
+        self,
+        request: ResourceGraphChangeQueryRequest,
+    ) -> ResourceGraphChangeQueryResult:
+        return self.port.query_resource_graph_changes(request)
+
+    def query_resource_health(
+        self,
+        request: ResourceHealthQueryRequest,
+    ) -> ResourceHealthQueryResult:
+        return self.port.query_resource_health(request)
+
+    def query_ip_flow_verify(
+        self,
+        request: IpFlowVerifyRequest,
+    ) -> IpFlowVerifyResult:
+        return self.port.query_ip_flow_verify(request)
+
+
 def _adapter(
     port: _AcquisitionPort,
-    *,
-    credential: _Credential | None = None,
-    now: datetime = NOW,
 ):
-    return CredentialBoundMonitoringAcquisitionAdapter(
+    _SyntheticAzureClient.active_port = port
+    return AzureMonitoringAdapter(
         reviewed_collector_contract=_acquisition_collector_contract(),
-        acquisition_port=port,
-        credential=_Credential(now=now) if credential is None else credential,
-        utc_now=lambda: now,
     )
 
 
@@ -843,16 +899,10 @@ def _coordinator(
     authority: MonitoringAcquisitionAuthority,
     *,
     expected_authority_digest: str | None = None,
-    credential: _Credential | None = None,
-    now: datetime = NOW,
     signature_verifier=None,
 ) -> MonitoringAcquisitionCoordinator:
     return MonitoringAcquisitionCoordinator(
-        acquisition_adapter=_adapter(
-            port,
-            credential=credential,
-            now=now,
-        ),
+        acquisition_adapter=_adapter(port),
         acquisition_authority=authority,
         expected_acquisition_authority_digest=(
             authority.authority_digest
@@ -876,8 +926,6 @@ def _execute(
     port: _AcquisitionPort,
     *,
     authority=None,
-    credential: _Credential | None = None,
-    now: datetime = NOW,
     collected_at: datetime = NOW,
     acquisition_authority: MonitoringAcquisitionAuthority | None = None,
 ):
@@ -895,8 +943,6 @@ def _execute(
     outcome = _coordinator(
         port,
         acquisition_authority,
-        credential=credential,
-        now=now,
     ).execute(
         monitoring_intent=intent,
         context_binding=context,
@@ -986,22 +1032,19 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         outcome.committed.monitoring_handoff.schema_version
         == "athena.wc028MonitoringEvidenceHandoff.v2"
     )
-    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v3"
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v4"
     assert receipt.authenticated_principal_id == READER_PRINCIPAL_ID
     assert receipt.authenticated_client_id == READER_CLIENT_ID
     assert receipt.authenticated_tenant_id == COLLECTOR_TENANT_ID
     assert receipt.monitoring_reader_identity_id == READER_ID.casefold()
-    assert receipt.credential_proofs is not None
-    assert {item.audience for item in receipt.credential_proofs} == {
-        "https://api.loganalytics.io",
-        "https://management.azure.com/",
-    }
-    assert all(
-        item.principal_id == READER_PRINCIPAL_ID
-        and item.client_id == READER_CLIENT_ID
-        and item.tenant_id == COLLECTOR_TENANT_ID
-        for item in receipt.credential_proofs
-    )
+    assert receipt.identity_proof is not None
+    assert receipt.identity_proof.principal_id == READER_PRINCIPAL_ID
+    assert receipt.identity_proof.client_id == READER_CLIENT_ID
+    assert receipt.identity_proof.tenant_id == COLLECTOR_TENANT_ID
+    assert receipt.identity_proof.audience == MONITORING_IDENTITY_PROOF_AUDIENCE
+    assert receipt.identity_proof.token_version == MONITORING_IDENTITY_PROOF_TOKEN_VERSION
+    assert receipt.identity_proof.identity_type == "app"
+    assert receipt.identity_proof.roles == (MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,)
     assert receipt.acquisition_authority_digest == acquisition_authority.authority_digest
     assert receipt.collection_batch_digest == sha256_hex(outcome.batch.canonical_bytes())
     assert manifest.collection_batch_digest == receipt.collection_batch_digest
@@ -1012,26 +1055,9 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert manifest.normalized_evidence_digest == receipt.normalized_evidence_digest
     assert manifest.exchanges == receipt.exchanges
     assert len(receipt.exchanges) == len(port.requests)
-    assert port.access_token_calls == len(port.requests)
-    proof_by_digest = {item.proof_digest: item for item in receipt.credential_proofs}
-    assert all(item.credential_proof_digest in proof_by_digest for item in receipt.exchanges)
     assert all(
-        proof_by_digest[item.credential_proof_digest].audience
-        == (
-            "https://api.loganalytics.io"
-            if item.source == "logAnalytics"
-            else "https://management.azure.com/"
-        )
+        item.identity_proof_digest == receipt.identity_proof.proof_digest
         for item in receipt.exchanges
-    )
-    assert all(
-        audience
-        == (
-            "https://api.loganalytics.io"
-            if source == "logAnalytics"
-            else "https://management.azure.com/"
-        )
-        for source, audience in port.access_token_audiences
     )
     assert tuple(item.request_digest for item in receipt.exchanges) == tuple(
         request.request_digest for request in port.requests
@@ -1075,6 +1101,40 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
         type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_evidence))
+
+
+def test_production_adapter_passes_one_managed_identity_object_to_every_client() -> None:
+    port = _AcquisitionPort()
+    _SyntheticAzureClient.active_port = port
+    adapter = AzureMonitoringAdapter(
+        reviewed_collector_contract=_acquisition_collector_contract(),
+    )
+
+    proof = adapter.verify_identity()
+
+    assert proof.client_id == READER_CLIENT_ID
+    assert len(_SyntheticManagedIdentityCredential.instances) == 1
+    credential = _SyntheticManagedIdentityCredential.instances[0]
+    assert _SyntheticAzureClient.credentials == [credential] * 5
+    assert _SyntheticAzureClient.contracts == [adapter.reviewed_collector_contract] * 5
+
+
+def test_production_adapter_refreshes_identity_proof_for_each_execution() -> None:
+    port = _AcquisitionPort()
+    _SyntheticAzureClient.active_port = port
+    adapter = AzureMonitoringAdapter(
+        reviewed_collector_contract=_acquisition_collector_contract(),
+    )
+
+    first = adapter.verify_identity()
+    _SyntheticClock.now = NOW + timedelta(seconds=30)
+    second = adapter.verify_identity()
+
+    assert first.verified_at == NOW
+    assert second.verified_at == NOW + timedelta(seconds=30)
+    assert first.proof_digest != second.proof_digest
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 2
+    assert len(_SyntheticAzureClient.credentials) == 5
 
 
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
@@ -1530,13 +1590,8 @@ def test_stale_context_bound_authority_fails_before_credential_or_source_io() ->
         context_binding=stale_context,
         controls=stale_controls,
     )
-    credential = _Credential()
     port = _AcquisitionPort()
-    coordinator = _coordinator(
-        port,
-        stale_authority,
-        credential=credential,
-    )
+    coordinator = _coordinator(port, stale_authority)
 
     with pytest.raises(
         MonitoringAcquisitionError,
@@ -1557,7 +1612,8 @@ def test_stale_context_bound_authority_fails_before_credential_or_source_io() ->
             expires_at=NOW + timedelta(minutes=10),
         )
 
-    assert credential.calls == 0
+    assert len(_SyntheticManagedIdentityCredential.instances) == 1
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
     assert port.requests == []
 
 
@@ -1623,18 +1679,13 @@ def test_added_replaced_or_omitted_control_binding_fails_before_external_io() ->
     )
 
     for invalid in (added, replaced, omitted):
-        credential = _Credential()
         port = _AcquisitionPort()
         with pytest.raises(
             MonitoringAcquisitionError,
             match="control binding coverage|required control bindings",
         ):
-            _coordinator(
-                port,
-                invalid,
-                credential=credential,
-            )
-        assert credential.calls == 0
+            _coordinator(port, invalid)
+        assert _SyntheticManagedIdentityCredential.instances[-1].calls == 0
         assert port.requests == []
 
 
@@ -1648,18 +1699,14 @@ def test_incorrect_ip_flow_permission_contract_fails_before_external_io() -> Non
             )
         }
     )
-    credential = _Credential()
     port = _AcquisitionPort()
 
     with pytest.raises(ValidationError, match="IP Flow Verify operations"):
-        CredentialBoundMonitoringAcquisitionAdapter(
+        AzureMonitoringAdapter(
             reviewed_collector_contract=invalid,
-            acquisition_port=port,
-            credential=credential,
-            utc_now=lambda: NOW,
         )
 
-    assert credential.calls == 0
+    assert _SyntheticManagedIdentityCredential.instances == []
     assert port.requests == []
 
 
@@ -1691,6 +1738,10 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
             "context_binding_digest",
             "required_coverage_scope_digests",
             "control_selection_digest",
+            "identity_proof_audience",
+            "identity_proof_token_version",
+            "identity_proof_required_role",
+            "identity_proof_maximum_lifetime_seconds",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v1"
@@ -1704,7 +1755,7 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v3"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -1713,6 +1764,7 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
     payload = current.model_dump(
         mode="json",
         by_alias=True,
+        exclude_none=True,
         exclude={
             "authority_id",
             "authority_digest",
@@ -1722,6 +1774,10 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
             "required_coverage_scope_digests",
             "required_control_bindings",
             "control_selection_digest",
+            "identity_proof_audience",
+            "identity_proof_token_version",
+            "identity_proof_required_role",
+            "identity_proof_maximum_lifetime_seconds",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v2"
@@ -1747,62 +1803,154 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v3"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
         _coordinator(_AcquisitionPort(), authority)
 
 
-def test_forged_port_identity_cannot_override_authenticated_principal() -> None:
-    port = _AcquisitionPort(source_identity_id=CONTEXT_ID)
-    with pytest.raises(
-        MonitoringAcquisitionError,
-        match="conflicts with the authenticated principal",
-    ):
-        _execute(port)
-
-
-@pytest.mark.parametrize(
-    "credential",
-    (
-        _Credential(principal_id=CONTEXT_PRINCIPAL_ID),
-        _Credential(client_id="33333333-3333-3333-3333-333333333333"),
-        _Credential(tenant_id="44444444-4444-4444-4444-444444444444"),
-    ),
-)
-def test_alternate_credential_is_fail_closed_before_reads(
-    credential: _Credential,
-) -> None:
-    port = _AcquisitionPort()
-    with pytest.raises(
-        MonitoringAcquisitionError,
-        match=("does not match the reviewed collector identity|cryptographic verification failed"),
-    ):
-        _execute(
-            port,
-            credential=credential,
-        )
-    assert port.requests == []
-
-
-def test_managed_identity_day_lifetime_is_accepted_and_bound() -> None:
-    outcome, commit, _ = _execute(
-        _AcquisitionPort(),
-        credential=_Credential(lifetime_seconds=24 * 60 * 60),
+def test_v3_acquisition_authority_remains_readable_but_not_executable() -> None:
+    current = _acquisition_authority()
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "authority_id",
+            "authority_digest",
+            "identity_proof_audience",
+            "identity_proof_token_version",
+            "identity_proof_required_role",
+            "identity_proof_maximum_lifetime_seconds",
+        },
     )
+    payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v3"
+    digest = compute_artifact_digest(payload)
+    payload["allowedSources"] = tuple(payload["allowedSources"])
+    payload["allowedResourceIds"] = tuple(payload["allowedResourceIds"])
+    payload["requiredControlIds"] = tuple(payload["requiredControlIds"])
+    payload["requiredControlBindings"] = current.required_control_bindings
+    payload["requiredCoverageScopeDigests"] = current.required_coverage_scope_digests
+    authority = MonitoringAcquisitionAuthority(
+        **payload,
+        authorityId=(f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"),
+        authorityDigest=digest,
+    )
+
+    assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3"
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v4"):
+        _coordinator(_AcquisitionPort(), authority)
+
+
+def test_fake_source_identity_cannot_override_adapter_identity_proof() -> None:
+    port = _AcquisitionPort(source_identity_id=CONTEXT_ID)
+    outcome, commit, _ = _execute(port)
 
     assert commit.calls == 1
     receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
-    assert receipt.credential_proofs is not None
-    assert all(
-        (item.expires_at - item.issued_at).total_seconds() == 24 * 60 * 60
-        for item in receipt.credential_proofs
+    assert receipt.authenticated_principal_id == READER_PRINCIPAL_ID
+    assert receipt.identity_proof is not None
+    assert receipt.identity_proof.principal_id == READER_PRINCIPAL_ID
+
+
+@pytest.mark.parametrize(
+    "claim_overrides",
+    (
+        {"oid": CONTEXT_PRINCIPAL_ID},
+        {"appid": "33333333-3333-3333-3333-333333333333"},
+        {"tid": "44444444-4444-4444-4444-444444444444"},
+        {"aud": "api://unreviewed-proof"},
+        {"ver": "2.0"},
+        {"idtyp": "user"},
+        {"roles": ["Athena.MonitoringAcquisition.Other"]},
+        {"exp": int(NOW.timestamp()) - 1},
+    ),
+)
+def test_invalid_identity_proof_fails_before_first_source_io(
+    claim_overrides: dict[str, object],
+) -> None:
+    _SyntheticManagedIdentityCredential.claim_overrides = claim_overrides
+    port = _AcquisitionPort()
+    context, intent, controls = _authority()
+    authority = _acquisition_authority(
+        required_control_ids=_required_control_ids(context, controls),
+        context_binding=context,
+        controls=controls,
     )
+    coordinator = _coordinator(port, authority)
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="identity proof",
+    ):
+        coordinator.execute(
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collected_at=NOW,
+            change_scope=_scope_contract(),
+            commit_port=_CommitPort(),
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert len(_SyntheticManagedIdentityCredential.instances) == 1
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 1
+    assert _SyntheticAzureClient.credentials == []
+    assert port.requests == []
+
+
+def test_overlong_identity_proof_fails_before_first_source_io() -> None:
+    _SyntheticManagedIdentityCredential.lifetime_seconds = (
+        MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS + 1
+    )
+    port = _AcquisitionPort()
+    context, intent, controls = _authority()
+    authority = _acquisition_authority(
+        required_control_ids=_required_control_ids(context, controls),
+        context_binding=context,
+        controls=controls,
+    )
+    coordinator = _coordinator(port, authority)
+
+    with pytest.raises(MonitoringAcquisitionError, match="outside its lifetime"):
+        coordinator.execute(
+            monitoring_intent=intent,
+            context_binding=context,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collected_at=NOW,
+            change_scope=_scope_contract(),
+            commit_port=_CommitPort(),
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert _SyntheticAzureClient.credentials == []
+    assert port.requests == []
+
+
+def test_default_azure_credential_cannot_be_injected_into_production_adapter() -> None:
+    kwargs = {
+        "reviewed_collector_contract": _acquisition_collector_contract(),
+        "credential": DefaultAzureCredential(),
+    }
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        AzureMonitoringAdapter(**kwargs)  # type: ignore[arg-type]
+
+    assert _SyntheticManagedIdentityCredential.instances == []
 
 
 def test_caller_collection_time_cannot_backdate_collector_receipt() -> None:
     outcome, commit, _ = _execute(
         _AcquisitionPort(),
-        now=NOW,
         collected_at=NOW - timedelta(minutes=5),
     )
 

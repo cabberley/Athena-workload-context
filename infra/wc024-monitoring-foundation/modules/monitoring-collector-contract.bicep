@@ -156,13 +156,17 @@ var collectorContract = {
 output collectorContract object = collectorContract
 
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v4'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v5'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
-  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v3'
+  acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v4'
   collectorTenantId: collectorTenantId
   ipFlowVerifyRoleDefinitionId: ipFlowVerifyRoleDefinitionId
   ipFlowVerifyScopeId: ipFlowVerifyScopeId
   ipFlowVerifyAllowedOperations: ipFlowVerifyAllowedOperations
+  identityProofAudience: 'api://athena-monitoring-identity-proof'
+  identityProofTokenVersion: '1.0'
+  identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'
+  identityProofMaximumLifetimeSeconds: 7200
   allowedReadOperations: concat(
     collectorContract.allowedReadOperations,
     ipFlowVerifyAllowedOperations

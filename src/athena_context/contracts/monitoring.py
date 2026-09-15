@@ -25,12 +25,19 @@ MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION = "athena.wc024MonitoringCollectorC
 MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v3"
 )
-MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v4"
 )
+MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+    "athena.wc028MonitoringCollectorContract.v5"
+)
 MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = "athena.wc024MonitoringEvidenceHandoff.v1"
-MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v3"
+MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v4"
 MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
+MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
+MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS = 7200
+MONITORING_IDENTITY_PROOF_REQUIRED_ROLE = "Athena.MonitoringAcquisition.ProveIdentity"
+MONITORING_IDENTITY_PROOF_TOKEN_VERSION = "1.0"  # noqa: S105
 
 type MonitoringSignalKind = Literal[
     "heartbeat",
@@ -228,6 +235,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "athena.wc024MonitoringCollectorContract.v2",
         "athena.wc028MonitoringCollectorContract.v3",
         "athena.wc028MonitoringCollectorContract.v4",
+        "athena.wc028MonitoringCollectorContract.v5",
     ] = Field(alias="schemaVersion")
     collector_identity_resource_id: str = Field(
         alias="collectorIdentityResourceId",
@@ -337,6 +345,25 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=len(_EXPECTED_IP_FLOW_VERIFY_OPERATIONS),
         max_length=len(_EXPECTED_IP_FLOW_VERIFY_OPERATIONS),
     )
+    identity_proof_audience: str | None = Field(
+        default=None,
+        alias="identityProofAudience",
+        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+    )
+    identity_proof_token_version: Literal["1.0"] | None = Field(
+        default=None,
+        alias="identityProofTokenVersion",
+    )
+    identity_proof_required_role: Literal["Athena.MonitoringAcquisition.ProveIdentity"] | None = (
+        Field(
+            default=None,
+            alias="identityProofRequiredRole",
+        )
+    )
+    identity_proof_maximum_lifetime_seconds: Literal[7200] | None = Field(
+        default=None,
+        alias="identityProofMaximumLifetimeSeconds",
+    )
     log_analytics_allowed_tables: tuple[MonitoringLogTable, ...] = Field(
         alias="logAnalyticsAllowedTables",
         min_length=len(_EXPECTED_LOG_TABLES),
@@ -384,7 +411,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "athena.wc028MonitoringEvidenceHandoff.v2",
     ] = Field(alias="handoffSchemaVersion")
     acquisition_receipt_schema_version: (
-        Literal["athena.wc028MonitoringAcquisitionReceipt.v3"] | None
+        Literal[
+            "athena.wc028MonitoringAcquisitionReceipt.v3",
+            "athena.wc028MonitoringAcquisitionReceipt.v4",
+        ]
+        | None
     ) = Field(
         default=None,
         alias="acquisitionReceiptSchemaVersion",
@@ -437,6 +468,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.schema_version
             in {
                 MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             }
             and self.handoff_schema_version != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
@@ -446,7 +478,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("monitoring signals must use the complete reviewed generic allowlist")
         expected_read_operations = (
             _EXPECTED_ACQUISITION_READ_OPERATIONS
-            if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            if self.schema_version
+            in {
+                MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            }
             else _EXPECTED_READ_OPERATIONS
         )
         if self.allowed_read_operations != expected_read_operations:
@@ -471,12 +507,22 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.ip_flow_verify_role_definition_id,
             self.ip_flow_verify_scope_id,
             self.ip_flow_verify_allowed_operations,
-            self.acquisition_receipt_schema_version,
+        )
+        identity_proof_fields = (
+            self.identity_proof_audience,
+            self.identity_proof_token_version,
+            self.identity_proof_required_role,
+            self.identity_proof_maximum_lifetime_seconds,
         )
         if self.schema_version == MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION:
             if any(
                 item is not None
-                for item in (*acquisition_identity_fields, *credential_and_ip_flow_fields)
+                for item in (
+                    *acquisition_identity_fields,
+                    *credential_and_ip_flow_fields,
+                    *identity_proof_fields,
+                    self.acquisition_receipt_schema_version,
+                )
             ):
                 raise ValueError("WC-024 collector contract cannot contain acquisition identities")
         elif any(item is None for item in acquisition_identity_fields):
@@ -495,12 +541,22 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 raise ValueError("collector and Athena context identities must be separate")
         if (
             self.schema_version == MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
-            and any(item is not None for item in credential_and_ip_flow_fields)
+            and any(
+                item is not None
+                for item in (
+                    *credential_and_ip_flow_fields,
+                    *identity_proof_fields,
+                    self.acquisition_receipt_schema_version,
+                )
+            )
         ):
             raise ValueError(
                 "legacy WC-028 collector contract cannot contain credential or IP Flow policy"
             )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+        if self.schema_version in {
+            MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             if any(item is None for item in credential_and_ip_flow_fields):
                 raise ValueError(
                     "credential-bound WC-028 collector contract requires exact IP Flow policy"
@@ -511,6 +567,31 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 UUID(cast(str, self.collector_tenant_id))
             except ValueError as exc:
                 raise ValueError("collector tenant ID must be a UUID") from exc
+        if (
+            self.schema_version == MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and (
+                any(item is not None for item in identity_proof_fields)
+                or self.acquisition_receipt_schema_version
+                != "athena.wc028MonitoringAcquisitionReceipt.v3"
+            )
+        ):
+            raise ValueError(
+                "legacy credential-bound collector contract must use receipt v3 "
+                "without Athena identity proof policy"
+            )
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+            any(item is None for item in identity_proof_fields)
+            or self.identity_proof_audience != MONITORING_IDENTITY_PROOF_AUDIENCE
+            or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
+            or self.identity_proof_required_role != MONITORING_IDENTITY_PROOF_REQUIRED_ROLE
+            or self.identity_proof_maximum_lifetime_seconds
+            != MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+            or self.acquisition_receipt_schema_version
+            != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "production collector contract requires the exact Athena identity proof policy"
+            )
         try:
             UUID(self.collector_identity_client_id)
         except ValueError as exc:
@@ -586,7 +667,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             f"{_REVIEWED_NETWORK_WATCHER_RESOURCE_GROUP}/providers/"
             f"Microsoft.Network/networkWatchers/{_REVIEWED_NETWORK_WATCHER_NAME}"
         )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+        if self.schema_version in {
+            MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             expected_ip_flow_role_definition_id = (
                 f"/subscriptions/{monitoring_subscription}/resourceGroups/"
                 f"{_REVIEWED_NETWORK_WATCHER_RESOURCE_GROUP}/providers/"
@@ -744,7 +828,7 @@ class MonitoringEvidenceAttestation(_StrictMonitoringContract):
 
 
 class MonitoringCredentialProof(_StrictMonitoringContract):
-    """Verified Entra proof for the exact credential whose token authorized Azure calls."""
+    """Legacy proof derived from Azure service tokens; never trusted for production v4 receipts."""
 
     schema_version: Literal["athena.wc028MonitoringCredentialProof.v1"] = Field(
         alias="schemaVersion"
@@ -807,6 +891,66 @@ class MonitoringCredentialProof(_StrictMonitoringContract):
         return self
 
 
+class MonitoringIdentityProof(_StrictMonitoringContract):
+    """Normalized proof from the Athena-owned single-tenant identity-proof audience."""
+
+    schema_version: Literal["athena.wc028MonitoringIdentityProof.v1"] = Field(alias="schemaVersion")
+    token_version: Literal["1.0"] = Field(alias="tokenVersion")
+    tenant_id: str = Field(
+        alias="tenantId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    principal_id: str = Field(
+        alias="principalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    client_id: str = Field(
+        alias="clientId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    subject: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    issuer: str = Field(min_length=1, max_length=256)
+    audience: str = Field(
+        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+    )
+    identity_type: Literal["app"] = Field(alias="identityType")
+    roles: tuple[str, ...] = Field(min_length=1, max_length=8)
+    token_hash: Sha256Digest = Field(alias="tokenHash")
+    key_id: str = Field(alias="keyId", pattern=r"^[A-Za-z0-9_-]{8,256}$")
+    issued_at: UtcDateTime = Field(alias="issuedAt")
+    not_before: UtcDateTime = Field(alias="notBefore")
+    expires_at: UtcDateTime = Field(alias="expiresAt")
+    verified_at: UtcDateTime = Field(alias="verifiedAt")
+    proof_digest: Sha256Digest = Field(alias="proofDigest")
+
+    @model_validator(mode="after")
+    def validate_proof(self) -> MonitoringIdentityProof:
+        if self.issuer != f"https://sts.windows.net/{self.tenant_id}/":
+            raise ValueError("identity proof issuer does not match pinned token version and tenant")
+        if self.subject not in {self.principal_id, self.client_id}:
+            raise ValueError("identity proof subject does not match the reviewed identity")
+        if self.roles != tuple(sorted(self.roles)) or len(self.roles) != len(set(self.roles)):
+            raise ValueError("identity proof roles must be sorted and unique")
+        if not self.issued_at <= self.not_before <= self.verified_at < self.expires_at:
+            raise ValueError("identity proof is outside its verified token lifetime")
+        if (
+            self.expires_at - self.issued_at
+        ).total_seconds() > MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS:
+            raise ValueError("identity proof token lifetime exceeds the reviewed bound")
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"proof_digest"},
+            )
+        )
+        if self.proof_digest != expected:
+            raise ValueError("proofDigest does not bind the normalized identity proof")
+        return self
+
+
 class MonitoringAcquisitionExchange(_StrictMonitoringContract):
     """Collector-timed receipt entry for one exact Azure acquisition call."""
 
@@ -826,6 +970,10 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
     credential_proof_digest: Sha256Digest | None = Field(
         default=None,
         alias="credentialProofDigest",
+    )
+    identity_proof_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="identityProofDigest",
     )
 
     @model_validator(mode="after")
@@ -851,6 +999,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         "athena.wc028MonitoringAcquisitionReceipt.v1",
         "athena.wc028MonitoringAcquisitionReceipt.v2",
         "athena.wc028MonitoringAcquisitionReceipt.v3",
+        "athena.wc028MonitoringAcquisitionReceipt.v4",
     ] = Field(alias="schemaVersion")
     receipt_id: str = Field(
         alias="receiptId",
@@ -930,6 +1079,10 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         min_length=1,
         max_length=2,
     )
+    identity_proof: MonitoringIdentityProof | None = Field(
+        default=None,
+        alias="identityProof",
+    )
     collector_attestation: MonitoringEvidenceAttestation = Field(alias="collectorAttestation")
 
     @model_validator(mode="after")
@@ -941,7 +1094,9 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.authenticated_client_id is not None
                 or self.authenticated_tenant_id is not None
                 or self.credential_proofs is not None
+                or self.identity_proof is not None
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
+                or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
                 raise ValueError("v1 acquisition receipt cannot contain newer identity bindings")
         elif self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v2":
@@ -956,27 +1111,48 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.authenticated_client_id is not None
                 or self.authenticated_tenant_id is not None
                 or self.credential_proofs is not None
+                or self.identity_proof is not None
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
+                or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
                 raise ValueError(
                     "v2 acquisition receipt requires only resource and principal identities"
                 )
+        elif self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v3":
+            if (
+                self.monitoring_reader_identity_id is None
+                or self.athena_context_principal_id is None
+                or self.authenticated_client_id is None
+                or self.authenticated_tenant_id is None
+                or self.credential_proofs is None
+                or self.identity_proof is not None
+                or re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    self.authenticated_principal_id,
+                )
+                is None
+                or any(item.identity_proof_digest is not None for item in self.exchanges)
+            ):
+                raise ValueError("v3 acquisition receipt requires only legacy service-token proofs")
         elif (
             self.monitoring_reader_identity_id is None
             or self.athena_context_principal_id is None
             or self.authenticated_client_id is None
             or self.authenticated_tenant_id is None
-            or self.credential_proofs is None
+            or self.identity_proof is None
+            or self.credential_proofs is not None
             or re.fullmatch(
                 r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
                 self.authenticated_principal_id,
             )
             is None
+            or any(item.credential_proof_digest is not None for item in self.exchanges)
         ):
-            raise ValueError("v3 acquisition receipt requires credential-bound identities")
+            raise ValueError("v4 acquisition receipt requires one Athena identity proof")
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionReceipt.v2",
             "athena.wc028MonitoringAcquisitionReceipt.v3",
+            "athena.wc028MonitoringAcquisitionReceipt.v4",
         } and (
             cast(str, self.monitoring_reader_identity_id).casefold().rstrip("/")
             == self.athena_context_identity_id.casefold().rstrip("/")
@@ -1002,6 +1178,18 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
             ):
                 raise ValueError(
                     "credential proof does not bind every acquisition exchange and identity"
+                )
+        if self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v4":
+            proof = cast(MonitoringIdentityProof, self.identity_proof)
+            if (
+                proof.principal_id != self.authenticated_principal_id
+                or proof.client_id != self.authenticated_client_id
+                or proof.tenant_id != self.authenticated_tenant_id
+                or proof.verified_at != self.execution_started_at
+                or any(item.identity_proof_digest != proof.proof_digest for item in self.exchanges)
+            ):
+                raise ValueError(
+                    "Athena identity proof does not bind every acquisition exchange and identity"
                 )
         if not (self.execution_started_at <= self.execution_completed_at <= self.receipt_issued_at):
             raise ValueError("acquisition receipt times are reversed")
@@ -1310,6 +1498,10 @@ def verify_monitoring_acquisition_receipt_attestation(
         or reviewed_collector_contract.athena_context_identity_id is None
         or reviewed_collector_contract.athena_context_principal_id is None
         or reviewed_collector_contract.collector_tenant_id is None
+        or reviewed_collector_contract.identity_proof_audience is None
+        or reviewed_collector_contract.identity_proof_token_version is None
+        or reviewed_collector_contract.identity_proof_required_role is None
+        or reviewed_collector_contract.identity_proof_maximum_lifetime_seconds is None
     ):
         raise ValueError(
             "production acquisition verification requires the credential-bound collector contract"
@@ -1342,9 +1534,9 @@ def verify_monitoring_acquisition_receipt_attestation(
         or receipt.athena_context_principal_id is None
         or receipt.authenticated_client_id is None
         or receipt.authenticated_tenant_id is None
-        or receipt.credential_proofs is None
+        or receipt.identity_proof is None
     ):
-        raise ValueError("production verification requires credential-bound acquisition receipt v3")
+        raise ValueError("production verification requires Athena-proven acquisition receipt v4")
     deployment_digest = compute_artifact_digest(
         {
             "monitoringReaderIdentityId": (
@@ -1381,12 +1573,18 @@ def verify_monitoring_acquisition_receipt_attestation(
         != expected_athena_context_identity_id.casefold().rstrip("/")
         or receipt.athena_context_principal_id.casefold()
         != expected_athena_context_principal_id.casefold()
-        or any(
-            proof.principal_id.casefold() != expected_authenticated_principal_id.casefold()
-            or proof.client_id.casefold() != expected_authenticated_client_id.casefold()
-            or proof.tenant_id.casefold() != expected_authenticated_tenant_id.casefold()
-            for proof in receipt.credential_proofs
-        )
+        or receipt.identity_proof.principal_id.casefold()
+        != expected_authenticated_principal_id.casefold()
+        or receipt.identity_proof.client_id.casefold()
+        != expected_authenticated_client_id.casefold()
+        or receipt.identity_proof.tenant_id.casefold()
+        != expected_authenticated_tenant_id.casefold()
+        or receipt.identity_proof.audience != reviewed_collector_contract.identity_proof_audience
+        or receipt.identity_proof.token_version
+        != reviewed_collector_contract.identity_proof_token_version
+        or receipt.identity_proof.identity_type != "app"
+        or receipt.identity_proof.roles
+        != (reviewed_collector_contract.identity_proof_required_role,)
     ):
         raise ValueError("acquisition receipt does not match deployed acquisition authority")
     if (
@@ -1430,13 +1628,19 @@ __all__ = [
     "MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION",
     "MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION",
+    "MONITORING_IDENTITY_PROOF_AUDIENCE",
+    "MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS",
+    "MONITORING_IDENTITY_PROOF_REQUIRED_ROLE",
+    "MONITORING_IDENTITY_PROOF_TOKEN_VERSION",
     "MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
+    "MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MonitoringAcquisitionExchange",
     "MonitoringAcquisitionReceipt",
     "MonitoringCollectorContract",
     "MonitoringCredentialProof",
     "MonitoringEvidenceAttestation",
     "MonitoringEvidenceHandoff",
+    "MonitoringIdentityProof",
     "MonitoringIpFlowVerifyOperation",
     "MonitoringReadOperation",
     "MonitoringSignalKind",
