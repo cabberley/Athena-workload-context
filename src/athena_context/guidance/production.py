@@ -108,9 +108,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
         try:
             payload = json.loads(value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "WC-027 guidance publisher configuration is not valid JSON"
-            ) from exc
+            raise ValueError("WC-027 guidance publisher configuration is not valid JSON") from exc
         root = _mapping(payload, "configuration")
         _require_keys(
             root,
@@ -128,9 +126,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             "configuration",
         )
         if root["schemaVersion"] != _CONFIG_SCHEMA_VERSION:
-            raise ValueError(
-                "WC-027 guidance publisher configuration schemaVersion is invalid"
-            )
+            raise ValueError("WC-027 guidance publisher configuration schemaVersion is invalid")
         service_bus = _mapping(root["serviceBus"], "serviceBus")
         _require_keys(
             service_bus,
@@ -168,9 +164,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             "deploymentBinding",
         )
         configuration = cls(
-            service_bus_namespace=_service_bus_namespace(
-                service_bus["namespace"]
-            ),
+            service_bus_namespace=_service_bus_namespace(service_bus["namespace"]),
             request_queue_name=_queue_name(service_bus["requestQueueName"]),
             trigger_queue_name=_queue_name(service_bus["triggerQueueName"]),
             broker_identity_client_id=_client_id(
@@ -269,8 +263,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
         if (
             self.activation.endpoint != runtime.guidance_activation.endpoint
             or self.activation.table_name != runtime.guidance_activation.table
-            or self.activation.partition_key
-            != runtime.guidance_activation.partition_key
+            or self.activation.partition_key != runtime.guidance_activation.partition_key
         ):
             raise ValueError(
                 "publisher activation store does not match runtime guidance activation source"
@@ -278,14 +271,10 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
         binding_trust = runtime.guidance_binding_key
         if (
             self.binding_signing_key.key_id != binding_trust.key_id
-            or self.binding_signing_key.key_vault_key_id
-            != binding_trust.key_vault_key_id
-            or self.binding_signing_key.key_fingerprint
-            != binding_trust.key_fingerprint
+            or self.binding_signing_key.key_vault_key_id != binding_trust.key_vault_key_id
+            or self.binding_signing_key.key_fingerprint != binding_trust.key_fingerprint
         ):
-            raise ValueError(
-                "publisher binding signer does not match runtime guidance trust"
-            )
+            raise ValueError("publisher binding signer does not match runtime guidance trust")
         all_runtime_keys = (
             runtime.monitoring_collector_key.authority,
             runtime.change_key,
@@ -299,22 +288,13 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             runtime.notification_key,
         )
         if (
-            self.request_key.key_id
-            in {item.key_id for item in (*all_runtime_keys, binding_trust)}
+            self.request_key.key_id in {item.key_id for item in (*all_runtime_keys, binding_trust)}
             or self.request_key.key_vault_key_id
-            in {
-                item.key_vault_key_id
-                for item in (*all_runtime_keys, binding_trust)
-            }
+            in {item.key_vault_key_id for item in (*all_runtime_keys, binding_trust)}
             or self.request_key.key_fingerprint
-            in {
-                item.key_fingerprint
-                for item in (*all_runtime_keys, binding_trust)
-            }
+            in {item.key_fingerprint for item in (*all_runtime_keys, binding_trust)}
         ):
-            raise ValueError(
-                "guidance publication request key must use a distinct trust domain"
-            )
+            raise ValueError("guidance publication request key must use a distinct trust domain")
         if self.binding_signing_key.identity_client_id in {
             runtime.report_key.identity_client_id,
             runtime.guidance_key.identity_client_id,
@@ -322,9 +302,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             runtime.feed_key.identity_client_id,
             runtime.notification_key.identity_client_id,
         }:
-            raise ValueError(
-                "guidance authority signer identity must be distinct"
-            )
+            raise ValueError("guidance authority signer identity must be distinct")
         publisher_owned_identity_pairs = (
             (
                 self.broker_identity_client_id,
@@ -362,20 +340,12 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 binding_trust.identity_resource_id,
             ),
         )
-        if (
-            len({client_id.casefold() for client_id, _ in publisher_identity_pairs})
-            != len(publisher_identity_pairs)
-            or len(
-                {
-                    resource_id.casefold()
-                    for _, resource_id in publisher_identity_pairs
-                }
-            )
-            != len(publisher_identity_pairs)
+        if len({client_id.casefold() for client_id, _ in publisher_identity_pairs}) != len(
+            publisher_identity_pairs
+        ) or len({resource_id.casefold() for _, resource_id in publisher_identity_pairs}) != len(
+            publisher_identity_pairs
         ):
-            raise ValueError(
-                "guidance publisher managed identities must be distinct"
-            )
+            raise ValueError("guidance publisher managed identities must be distinct")
         runtime_identity_pairs = (
             (
                 runtime.broker_identity_client_id,
@@ -428,18 +398,12 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 )
             ),
         )
-        runtime_client_ids = {
-            client_id.casefold() for client_id, _ in runtime_identity_pairs
-        }
-        runtime_resource_ids = {
-            resource_id.casefold() for _, resource_id in runtime_identity_pairs
-        }
-        if {
-            client_id.casefold()
-            for client_id, _ in publisher_owned_identity_pairs
-        }.intersection(runtime_client_ids) or {
-            resource_id.casefold()
-            for _, resource_id in publisher_owned_identity_pairs
+        runtime_client_ids = {client_id.casefold() for client_id, _ in runtime_identity_pairs}
+        runtime_resource_ids = {resource_id.casefold() for _, resource_id in runtime_identity_pairs}
+        if {client_id.casefold() for client_id, _ in publisher_owned_identity_pairs}.intersection(
+            runtime_client_ids
+        ) or {
+            resource_id.casefold() for _, resource_id in publisher_owned_identity_pairs
         }.intersection(runtime_resource_ids):
             raise ValueError(
                 "guidance publisher identities must be separate from runtime identities"
@@ -484,23 +448,16 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             runtime.incident_key.identity_client_id,
             runtime.correlation_binding_key.identity_client_id,
         }
-        if (
-            self.request_submitter_identity_resource_id.casefold()
-            in runtime_resource_ids.union(item.casefold() for item in expected)
-            or self.request_submitter_identity_client_id.casefold()
-            in runtime_client_ids.union(
-                item.casefold() for item in expected_client_ids
-            )
+        if self.request_submitter_identity_resource_id.casefold() in runtime_resource_ids.union(
+            item.casefold() for item in expected
+        ) or self.request_submitter_identity_client_id.casefold() in runtime_client_ids.union(
+            item.casefold() for item in expected_client_ids
         ):
-            raise ValueError(
-                "guidance publisher request submitter identity must be dedicated"
-            )
-        if {
-            item.casefold() for item in self.attached_identity_resource_ids
-        } != {item.casefold() for item in expected}:
-            raise ValueError(
-                "publisher deployment identities do not match configuration"
-            )
+            raise ValueError("guidance publisher request submitter identity must be dedicated")
+        if {item.casefold() for item in self.attached_identity_resource_ids} != {
+            item.casefold() for item in expected
+        }:
+            raise ValueError("publisher deployment identities do not match configuration")
 
 
 def _table_endpoint(value: object, name: str) -> str:
@@ -517,9 +474,7 @@ def _utc_now_milliseconds() -> datetime:
 def _build_correlation(
     configuration: Wc027EnrichmentFeedProductionConfiguration,
 ) -> CorrelationService:
-    monitoring_key_verifier = _verifier(
-        configuration.monitoring_collector_key.authority
-    )
+    monitoring_key_verifier = _verifier(configuration.monitoring_collector_key.authority)
     monitoring_record = TrustedKeyRecord(
         anchor=configuration.monitoring_collector_key.authority.anchor,
         public_key=monitoring_key_verifier.public_key,
@@ -552,17 +507,13 @@ def _build_correlation(
         ),
         monitoring_verifier=TrustedMonitoringHandoffVerifier(
             reviewed_contract=configuration.monitoring_collector_contract,
-            trusted_key_anchor=(
-                configuration.monitoring_collector_key.authority.anchor
-            ),
+            trusted_key_anchor=(configuration.monitoring_collector_key.authority.anchor),
             key_resolver=monitoring_resolver,
         ),
         change_verifier=TrustedChangeArtifactVerifier(
             signer=KeyVaultChangeEvidenceSigner(
                 key_vault_key_id=configuration.change_key.key_vault_key_id,
-                managed_identity_client_id=(
-                    configuration.change_key.identity_client_id
-                ),
+                managed_identity_client_id=(configuration.change_key.identity_client_id),
             )
         ),
         monitoring_intent_verifier=TrustedMonitoringIntentAssetVerifier(
@@ -583,22 +534,16 @@ def build_wc027_guidance_authority_publisher(
     correlation_binding_verifier = _verifier(runtime.correlation_binding_key)
     binding_verifier = KeyVaultRsaPublicKeyVerifier(
         trusted_key_anchor=runtime.guidance_binding_key.anchor,
-        managed_identity_client_id=(
-            runtime.guidance_binding_key.identity_client_id
-        ),
+        managed_identity_client_id=(runtime.guidance_binding_key.identity_client_id),
     )
     binding_signer = KeyVaultRsaSigner(
         trusted_key_anchor=configuration.binding_signing_key.anchor,
-        managed_identity_client_id=(
-            configuration.binding_signing_key.identity_client_id
-        ),
+        managed_identity_client_id=(configuration.binding_signing_key.identity_client_id),
     )
     incident_reader = AzureBlobIncidentAssetPublisher(
         blob_endpoint=runtime.incident_lifecycle_assets.endpoint,
         container_name=runtime.incident_lifecycle_assets.container,
-        managed_identity_client_id=(
-            runtime.incident_lifecycle_assets.identity_client_id
-        ),
+        managed_identity_client_id=(runtime.incident_lifecycle_assets.identity_client_id),
         signing_key_id=runtime.incident_key.key_id,
         signing_key_vault_key_id=runtime.incident_key.key_vault_key_id,
         signing_key_fingerprint=runtime.incident_key.key_fingerprint,
@@ -612,9 +557,7 @@ def build_wc027_guidance_authority_publisher(
         incident_key_vault_key_id=runtime.incident_key.key_vault_key_id,
         incident_signature_verifier=lifecycle_verifier.verify_preimage,
         correlation_binding_key_id=runtime.correlation_binding_key.key_id,
-        correlation_binding_signature_verifier=(
-            correlation_binding_verifier.verify_preimage
-        ),
+        correlation_binding_signature_verifier=(correlation_binding_verifier.verify_preimage),
         binding_key_id=configuration.binding_signing_key.key_id,
         binding_signer=binding_signer,
         binding_signature_verifier=binding_verifier.verify_preimage,
@@ -650,9 +593,7 @@ def load_wc027_guidance_authority_publisher_configuration(
         else (
             environment_json
             if environment_json is not None
-            else os.environ.get(
-                "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON"
-            )
+            else os.environ.get("ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON")
         )
     )
     if raw is None:
@@ -674,9 +615,7 @@ def run_wc027_guidance_authority_publisher_worker(
 
     if not 1 <= max_wait_time_seconds <= 300:
         raise ValueError("max_wait_time_seconds must be between 1 and 300")
-    credential = ManagedIdentityCredential(
-        client_id=configuration.broker_identity_client_id
-    )
+    credential = ManagedIdentityCredential(client_id=configuration.broker_identity_client_id)
     with (
         ServiceBusClient(
             fully_qualified_namespace=configuration.service_bus_namespace,
@@ -688,9 +627,7 @@ def run_wc027_guidance_authority_publisher_worker(
             session_id=NEXT_AVAILABLE_SESSION,
             max_wait_time=max_wait_time_seconds,
         ) as receiver,
-        client.get_queue_sender(
-            queue_name=configuration.trigger_queue_name
-        ) as sender,
+        client.get_queue_sender(queue_name=configuration.trigger_queue_name) as sender,
     ):
         messages = receiver.receive_messages(
             max_message_count=1,
@@ -709,14 +646,10 @@ def run_wc027_guidance_authority_publisher_worker(
                 != request.incident_bound_request.incident_subject.incident_id
                 or message.content_type != "application/json"
             ):
-                raise ValueError(
-                    "guidance publication request broker metadata is invalid"
-                )
-            outbox_reference = (
-                validate_guidance_publication_request_broker_metadata(
-                    message,
-                    request,
-                )
+                raise ValueError("guidance publication request broker metadata is invalid")
+            outbox_reference = validate_guidance_publication_request_broker_metadata(
+                message,
+                request,
             )
             verify_guidance_publication_request_outbox(
                 request,
@@ -748,7 +681,7 @@ def run_wc027_guidance_authority_publisher_worker(
         ):
             receiver.abandon_message(message)
             return False
-        except (ValidationError, ValueError):
+        except ValidationError, ValueError:
             receiver.dead_letter_message(
                 message,
                 reason="AthenaWc027GuidanceAuthorityRejected",
