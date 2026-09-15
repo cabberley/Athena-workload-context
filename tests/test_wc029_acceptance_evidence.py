@@ -3753,7 +3753,7 @@ def test_output_write_is_exclusive_and_cleans_failed_staging(
     failed_output = tmp_path / "failed-records"
     failed_output.mkdir()
 
-    def fail_link(_source: Path, _target: Path) -> None:
+    def fail_link(*_args: object, **_kwargs: object) -> None:
         raise OSError("synthetic publish failure")
 
     monkeypatch.setattr(acceptance.os, "link", fail_link)
